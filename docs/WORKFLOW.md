@@ -158,6 +158,16 @@ both ways:
   dated, with the run label, the build (commit or NRO sha256), what was done
   and what the log showed. For an online plugin, include the detector's
   result on both consoles.
+- **Numbers from the logs:** every number the evidence cites should come out
+  of a script in `tools/` that reads the logged files, so a reviewer re-runs
+  it and a later run set updates the doc without anyone's transcript. Test
+  the scripts on the host with synthetic fair data, and name the command
+  next to the numbers. ssbu-gnw-judge-log
+  (https://git.syntaxbyexample.com/intpa/ssbu-gnw-judge-log) is the model:
+  `judge_table.py`, `window_table.py` and `match_report.py` turn the
+  plugin's TSV logs into the tables its README cites, and
+  `test_judge_table.py` checks them, including that a planted bias is
+  flagged and a fair draw is not.
 - **Wording:** short, no promises beyond the tests, no operator quotes.
 
 ## 7. Release and install (operator order only)

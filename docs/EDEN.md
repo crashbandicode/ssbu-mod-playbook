@@ -94,6 +94,14 @@ runner in the background that waits, then runs.
   the runner goes back to waiting instead of stopping.
 - **Run:** route, test, logs, then always `Down`. Put several runs in a list,
   each with its own Up, test and Down.
+- **Retry instead of counting a failed run.** Give each run a precondition
+  the plugin's own log must show soon after the match starts, and abort
+  when it doesn't: ssbu-gnw-judge-log's runner waits 30 s for its
+  `gamewatch session=` line and exits 2 without it, so a wrong fighter pick
+  costs 30 s rather than a match. The batch then runs again under the next
+  label until the wanted number of runs succeeded, with a cap on tries and
+  one line per start and end. `tools/eden-solo/examples/retry-batch.ps1` is
+  that loop (2026-10-30: 10 valid matches in 11 tries).
 - **Start it** with the usual memory and time guard, in the background, with
   a `timeout` longer than the deadline, and write its output to a file.
 

@@ -31,10 +31,14 @@ hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
 4. Run the gates: `cargo test`, then clippy with zero warnings, then the
    no-default-features build, then `cargo skyline build --release`.
 5. In Eden, use a profile copy that has only your NRO and the tile cursor.
-   Script the route to the screen, check the log, and take screenshots.
-   If the plugin runs during online play, also run two consoles with the
-   desync detector on both ([WORKFLOW](docs/WORKFLOW.md) §5).
-6. Write a short README with a full-screen GIF, plus a dated evidence doc.
+   Script the route to the screen, gate each wait on a log line or a
+   screenshot check rather than a fixed sleep, and check the log. Abort a
+   run whose precondition line never comes and retry it under the next
+   label ([EDEN](docs/EDEN.md), "Queue runs"). If the plugin runs during
+   online play, also run two consoles with the desync detector on both
+   ([WORKFLOW](docs/WORKFLOW.md) §5).
+6. Write a short README with a full-screen GIF, plus a dated evidence doc
+   whose numbers a host-tested script regenerates from the logs.
 7. Tag, release and install on the Switch only when the operator orders it.
    Installs go over DBI MTP, with readbacks and a rollback copy kept on the
    card.

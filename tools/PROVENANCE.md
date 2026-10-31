@@ -49,3 +49,5 @@ Changed later on 2026-10-31:
 | `eden-solo/encode.py` | fps `0` keeps the source GIF's frame times | `4fdfec3d1e60f546` |
 | `eden-pair/chain.ps1` | copied again: `-GifWidth`, `-GifFps`, `-GifLead` | `fb12cddc7379d9bf` |
 | `eden-pair/examples/queued-run.ps1` | new: `<session scratchpad>/online-release.ps1` (elite-rematch e26), plus a header comment and the MemAvailable check | `f1fa430873fb7d97` |
+| `eden-solo/examples/retry-batch.ps1` | new: `/home/intpa/ssbu-gnw-judge-log/eden/run_free_batch.ps1` (runs g39–g49), plus a header comment | `0289c04e1564ec0b` |
+| `eden-solo/examples/css_check.py` | new: `/home/intpa/ssbu-gnw-judge-log/eden/css_check.py`, plus a paragraph in the docstring | `35a5938b7f5051cc` |

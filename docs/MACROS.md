@@ -38,7 +38,7 @@ pair.
    and `w:<ms>`. `b:lstick+up` is the tile cursor's L3 + Up.
 2. When a segment lands where it should, add it to the route script with the
    same waits. Round each wait up, because Eden runs slower with more plugins
-   and while it records.
+   and while it records, or replace the wait with a screenshot check (below).
 3. End the script with a screenshot (`gv.py shot`), and check that screenshot
    before you trust anything after it.
 
@@ -61,8 +61,18 @@ pair.
   press timed by sleeps landed with 3 s left on a pop-up's countdown, and the
   rematch then failed with a communication error. `chain.ps1 -DetectStart`
   waits for the detector's next `session slot=` line, and `-Watch s,y` waits
-  for the plugin's diag pop-up line. Keep fixed waits for menus, and for
-  shipped builds that log no events (`-PopupWait`).
+  for the plugin's diag pop-up line. Keep fixed waits only where neither a
+  log line nor a screenshot check exists (shipped builds that log no
+  events: `-PopupWait`).
+- **Gate menu waits on a screenshot check.** The fixed 12 to 15 s per menu
+  in `to-css.ps1` adds about 70 s to a route and still fails when a screen
+  is late. Instead, take a screenshot every second or two, test a cheap
+  marker, and move on as soon as it appears, with a cap.
+  `tools/eden-solo/examples/css_check.py` is such a marker: the fraction of
+  near-black pixels in the P1 panel tells Game & Watch from any other
+  fighter (0.35 against 0.05 for Meta Knight), and the runner pressed A
+  only once it said so. Retry the screenshot itself when it fails: the
+  first one after a load can find no render window yet.
 - **One driver per instance at a time.**
 
 ## Eden input macros
