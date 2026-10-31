@@ -81,6 +81,22 @@ pwsh -File tools/eden-solo/solo.ps1 -Action Down -Label e19
 Stops Eden, the display and the GPU lock, then writes `RELEASED:`. Always run
 it, even after a failed run. The profile is kept.
 
+## Queue runs
+
+`Up` stops when the host is busy. Don't keep checking by hand: start a
+runner in the background that waits, then runs.
+`tools/eden-pair/examples/queued-run.ps1` (elite-rematch run e26) does this:
+
+- **Wait:** it checks every 10 s, up to a deadline, until three things are
+  true: no other owner holds an open claim, no Eden runs on the host, and
+  MemAvailable is at least 10 GiB.
+- **Claim:** if another owner claims first, `Up` fails with `active claim`;
+  the runner goes back to waiting instead of stopping.
+- **Run:** route, test, logs, then always `Down`. Put several runs in a list,
+  each with its own Up, test and Down.
+- **Start it** with the usual memory and time guard, in the background, with
+  a `timeout` longer than the deadline, and write its output to a file.
+
 ## Two instances (online)
 
 - **Same PC:** `pair.ps1` runs instances A (profile `y`, display `:68`) and B

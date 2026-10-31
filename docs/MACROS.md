@@ -56,6 +56,13 @@ pair.
   0.7 s until the stop file appears. `match.ps1` and
   `tools/eden-pair/chain.ps1` (several matches, answering each pop-up) are
   built on it.
+- **Wait for a log line, not a fixed time, wherever one exists.** Online
+  pairing took anywhere from 2 s to 125 s. In elite-rematch's run e25, a
+  press timed by sleeps landed with 3 s left on a pop-up's countdown, and the
+  rematch then failed with a communication error. `chain.ps1 -DetectStart`
+  waits for the detector's next `session slot=` line, and `-Watch s,y` waits
+  for the plugin's diag pop-up line. Keep fixed waits for menus, and for
+  shipped builds that log no events (`-PopupWait`).
 - **One driver per instance at a time.**
 
 ## Eden input macros

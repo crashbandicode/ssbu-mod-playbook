@@ -7,6 +7,13 @@ param(
     [int]$MatchSeconds = 128,
     # Record a GIF on the Surface instance from the first popup.
     [string]$GifName,
+    # Eden's recorder: width 160-1280, fps 1-30, duration up to 120 s.
+    [int]$GifSeconds = 15,
+    [int]$GifWidth = 640,
+    [int]$GifFps = 12,
+    # With -Watch @(): start the recording this many seconds before PopupWait
+    # ends, so the clip has a lead-in before the popup.
+    [int]$GifLead = 0,
     # Instances whose elite-rematch events.log signals the popup.
     [string[]]$Watch = @('s', 'y'),
     # Per match, the instance that runs off the stage once at the start
@@ -36,6 +43,10 @@ function Stamp { (Get-Date).ToUniversalTime().ToString('HH:mm:ss') + 'Z' }
 function Lines([string]$inst) {
     if ($inst -eq 'y' -or (Test-Path "$work/runs/$Label-s")) { @(Get-Content "$work/profiles/$inst/$rel" -ErrorAction SilentlyContinue) }
     else { @(/usr/bin/ssh -o BatchMode=yes intpa@dreamland-surface.lan "Get-Content $work/profiles/s/$rel") }
+}
+function StartGif {
+    $gif = @{ path = "$work/shots/$Label/$GifName"; fps = $GifFps; width = $GifWidth; duration_ms = $GifSeconds * 1000 } | ConvertTo-Json -Compress
+    "$(Stamp) gif: " + (/usr/bin/python3 -I "$e/drive.py" $Label s call recording.start $gif)
 }
 function Shot([string]$name) { foreach ($i in 's', 'y') { /usr/bin/python3 -I "$e/drive.py" $Label $i shot "$Tag-$name" | Out-Null } }
 $start = @{ s = (Lines 's').Count; y = (Lines 'y').Count }
@@ -90,8 +101,16 @@ for ($k = 0; $k -lt $Answers.Count; $k++) {
     }
     & "$e/match.ps1" -Label $Label -Seconds $seconds -ShotSeconds 0 -Tag "$Tag-$k" | Out-Null
     "$(Stamp) match $k keepalive done"
+    $gifNow = $GifName -and $k -eq 0
     if ($Watch.Count -eq 0) {
-        Start-Sleep -Seconds $PopupWait
+        if ($gifNow -and $GifLead -gt 0) {
+            # Start the recording GifLead s before the expected popup.
+            Start-Sleep -Seconds ([Math]::Max(0, $PopupWait - $GifLead))
+            StartGif
+            $gifNow = $false
+            Start-Sleep -Seconds ([Math]::Min($PopupWait, $GifLead))
+        }
+        else { Start-Sleep -Seconds $PopupWait }
         "$(Stamp) popup $k assumed after $PopupWait s"
     }
     else {
@@ -105,10 +124,7 @@ for ($k = 0; $k -lt $Answers.Count; $k++) {
         }
         if (-not ($Watch | Where-Object { $seen[$_] })) { "$(Stamp) no popup after match $k; stopping"; break }
     }
-    if ($GifName -and $k -eq 0) {
-        $gif = @{ path = "$work/shots/$Label/$GifName"; fps = 12; width = 640; duration_ms = 15000 } | ConvertTo-Json -Compress
-        "$(Stamp) gif: " + (/usr/bin/python3 -I "$e/drive.py" $Label s call recording.start $gif)
-    }
+    if ($gifNow) { StartGif }
     Start-Sleep -Milliseconds 1000
     Shot "popup$k"
     $press = $Answers[$k].Split('/')

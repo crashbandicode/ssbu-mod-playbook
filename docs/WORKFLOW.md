@@ -69,6 +69,15 @@ It lists every NRO that refers to an offset, or to one within 0x40 of it. If
 another plugin does, follow [HOOK-SHARING](HOOK-SHARING.md): register with
 that plugin's hook, or share the site, so both plugins keep working.
 
+The scan is a first look, not the guard. It finds an offset only as a
+32- or 64-bit constant or a MOVZ/MOVK pair (low half first, within 8
+instructions), and only in the copy you give it. Offsets built another way
+and plugins that reach the card after the copy don't show
+(ssbu-quiet-elite-switch reached it after elite-rematch's copy). What
+protects a site is reading its words at install time, in every load order,
+and logging the result per site, as [HOOK-SHARING](HOOK-SHARING.md)
+describes. Test that path in Eden with the diag stand-ins (`foreign=`).
+
 ## 3. Log what happened
 
 - **Install line:** one line at boot, to `sd:/ultimate/<plugin>/events.log`
@@ -78,9 +87,11 @@ that plugin's hook, or share the site, so both plugins keep working.
   ```
   It covers each site's outcome, and `heap_allocations` comes from a
   counting global allocator. Hooks shouldn't allocate.
-- **Events:** one line per event. The hook puts the line in a static buffer,
-  and a writer thread appends it to the file (gsp-visualizer's diag build;
-  ssbu-tile-cursor every 100 ms).
+- **Events:** one line per event, in the diag build. The hook puts the line
+  in a static buffer, and a writer thread appends it to the file.
+  gsp-visualizer and elite-rematch keep the buffer and the thread out of the
+  shipped NRO, which writes only its install line; ssbu-tile-cursor, an Eden
+  tool, writes every 100 ms.
 - **Eden-only switches:** these go behind `--features diag`, which reads
   `sd:/ultimate/<plugin>/diag.txt`. They are never in the shipped NRO.
 
@@ -117,6 +128,27 @@ For a sanity check before shipping, use the card's full plugin set, play one
 match to the results screen and back, then check each plugin's install line
 and Eden's `console.log`.
 
+### Plugins that run during online play
+
+Follow "Rules for plugins" in `ssbu-desync-detector`'s
+`docs/WHAT-IS-CHECKED.md`: draw no checked random number, don't skip or
+reorder native code that draws one, and change no simulated state. Then test
+both ways:
+
+- **In the match:** the detector's replay test (the same replay with and
+  without the plugin, `cargo run --example compare`).
+- **Online-only paths** (results, pop-ups, rematch, matchmaking), which a
+  replay can't reach: a same-PC pair (`tools/eden-pair/local_pair.ps1`, TLS
+  on, the rating runtime). One console runs the plugin and the other
+  doesn't, and both run the detector. Play the changed path to its end, so
+  the session after it is checked too. For elite-rematch that meant playing
+  the rematch, then answering No on both consoles.
+- **Server state:** where the path depends on it, seed it
+  (`-SeedS`/`-SeedY slot:rating`) so the game takes the path by itself,
+  instead of forcing it in a diag build.
+- **Pass:** every session on both consoles ends with
+  `sync_end … desync_seen=0`, at the same `frame=` on both.
+
 ## 6. README and evidence
 
 - **README:** one paragraph on what the plugin does, a GIF, the install path,
@@ -124,7 +156,8 @@ and Eden's `console.log`.
   that the other READMEs carry.
 - **Evidence:** `docs/EDEN-RESULTS.md`, `VALIDATION.md` or `docs/SAFETY.md`,
   dated, with the run label, the build (commit or NRO sha256), what was done
-  and what the log showed.
+  and what the log showed. For an online plugin, include the detector's
+  result on both consoles.
 - **Wording:** short, no promises beyond the tests, no operator quotes.
 
 ## 7. Release and install (operator order only)

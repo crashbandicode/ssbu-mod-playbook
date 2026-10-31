@@ -51,8 +51,11 @@ record.ps1 -Label e19 -Name hover -DurationMs 8000 -Width 1280 -Fps 10 -Moves 'b
 
 Other recorders:
 
-- `tools/eden-pair/chain.ps1 -GifName x.gif` records 15 s, 640 wide at
-  12 fps, on the Surface instance from the first pop-up after a match.
+- `tools/eden-pair/chain.ps1 -GifName x.gif` records on instance `s` after
+  the first match. The defaults are 15 s, 640 wide and 12 fps (`-GifSeconds`,
+  `-GifWidth`, `-GifFps`). Recording starts at the plugin's diag pop-up line
+  or, with `-Watch @()`, after `-PopupWait` seconds. `-GifLead <n>` starts it
+  n seconds earlier, so the clip leads in to the pop-up.
 - The `record-ui-demo` skill (`~/.claude/skills/record-ui-demo`) records
   from frames and has a review procedure for previews of CPU input.
 
@@ -61,7 +64,11 @@ Other recorders:
 Eden's 1280-wide GIFs are large (8 s clips: 15–20 MB). `tools/eden-solo/encode.py`
 re-encodes them:
 
-- It builds one shared palette from the first, middle and last frames.
+- It builds one shared palette from the first, middle and last frames. On
+  elite-rematch's e13 and e14 clips (2026-10-31), palettes from 9 frames
+  spread over the clip, or from every frame at quarter size, made no visible
+  difference: with all three, every frame's mean colour error stayed under
+  1.1 out of 255.
 - It doesn't dither, so pixels that don't change stay identical, and Pillow
   stores only the changed part of each frame.
 
@@ -72,9 +79,10 @@ encode.py e08-in-elite-real.gif in-elite.gif 0,0,1280,720 10 128    # 20.4 MB ->
 ```
 
 The arguments are the input GIF or a folder of PNGs, the output,
-`x,y,w,h`, fps and the number of colours. `encode.py` gives every frame the
-same time (1/fps). That clip's frames were 110 ms each in Eden, so at 10 fps
-it plays about 10% faster. To cut a clip, use
+`x,y,w,h`, fps and the number of colours. Use fps `0` with a GIF from Eden:
+each frame keeps the time Eden gave it, so the clip plays at game speed. A
+fixed fps gives every frame 1/fps instead. That clip's frames were 110 ms
+each in Eden, so at 10 fps it plays about 10% faster. To cut a clip, use
 `tools/eden-pair/trim_gif.py <in> <out> <start fraction> <end fraction>
 <frame step> <width>`.
 

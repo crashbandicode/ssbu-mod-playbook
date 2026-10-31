@@ -25,12 +25,15 @@ hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
    host, and hooks in `runtime.rs`. Build it as a cdylib only, so LTO applies.
 2. Before you hook anything, guard the game version and the bytes at the site,
    and check whether another plugin on the card already hooks it.
-3. Log an install line and one line per event to
-   `sd:/ultimate/<plugin>/events.log`. Tests read that log.
+3. Log one install line to `sd:/ultimate/<plugin>/events.log`. Lines per
+   event belong in the `diag` build, which Eden tests read. The shipped NRO
+   writes only its install line.
 4. Run the gates: `cargo test`, then clippy with zero warnings, then the
    no-default-features build, then `cargo skyline build --release`.
 5. In Eden, use a profile copy that has only your NRO and the tile cursor.
    Script the route to the screen, check the log, and take screenshots.
+   If the plugin runs during online play, also run two consoles with the
+   desync detector on both ([WORKFLOW](docs/WORKFLOW.md) §5).
 6. Write a short README with a full-screen GIF, plus a dated evidence doc.
 7. Tag, release and install on the Switch only when the operator orders it.
    Installs go over DBI MTP, with readbacks and a rollback copy kept on the
@@ -42,7 +45,8 @@ hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
   - Claim and release in `/tmp/deluxe-surface-1007/OWNER-COORDINATION.md`;
     `solo.ps1` does both.
   - Wait while anyone else holds a claim, run one Eden per host, and start
-    only with at least 10 GiB of MemAvailable.
+    only with at least 10 GiB of MemAvailable. Queue the run so it starts
+    itself when the host is free ([EDEN](docs/EDEN.md), "Queue runs").
   - Never use profile `a`, display `:61`, or another agent's runs.
 - **Git:** publish on Forgejo (`git.syntaxbyexample.com/intpa`), not GitHub.
   Never push, tag a release or write to the Switch without the operator's

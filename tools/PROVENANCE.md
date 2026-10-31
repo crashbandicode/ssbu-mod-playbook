@@ -41,3 +41,11 @@ workspace's. None of these files was in a git repository before.
 | `release/examples/publish-releases.ps1` | `<session scratchpad>/publish-releases.ps1` | `bcbb511788bcaaa4` |
 
 `eden-solo/step.ps1` is new: `<session scratchpad>/e18-step.ps1` with the run label as a parameter and `+` for button combinations.
+
+Changed later on 2026-10-31:
+
+| Copy | Change | SHA-256 (first 16) |
+| --- | --- | --- |
+| `eden-solo/encode.py` | fps `0` keeps the source GIF's frame times | `4fdfec3d1e60f546` |
+| `eden-pair/chain.ps1` | copied again: `-GifWidth`, `-GifFps`, `-GifLead` | `fb12cddc7379d9bf` |
+| `eden-pair/examples/queued-run.ps1` | new: `<session scratchpad>/online-release.ps1` (elite-rematch e26), plus a header comment and the MemAvailable check | `f1fa430873fb7d97` |
