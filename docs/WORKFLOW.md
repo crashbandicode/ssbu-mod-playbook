@@ -164,6 +164,11 @@ freed about 106 GB.
   keep old times, so cargo can judge stale output fresh. Unpack with
   `tar -m`, or run `cargo clean -p <crate>` for the workspace's own crates
   before the next build.
+- **Seeding a target from another copy's** saves rebuilding dependencies.
+  Copy it while holding the compiler lock, so you don't copy a half-written
+  build, then run `cargo clean -p` for the workspace's own crates straight
+  away. `cp -a` keeps the seed's file times, and anything the seed built
+  after you unpacked your sources looks fresh.
 - **One copy of the source per task.** Keep either an unpacked stage or its
   archive, not both.
 - **Check before you build:** run `df -h /` before a build or an Eden
