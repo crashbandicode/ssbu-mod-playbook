@@ -34,6 +34,12 @@ evidence doc.
   the install line.
 - **M** Fixed buffers, a writer thread on a static stack, files opened from
   stack-built paths. **E** gsp-visualizer, ssbu-gnw-judge-log.
+- **M** Every fix solves the root cause. Otherwise the workaround (guard,
+  skip, restriction, tolerance, lint `allow`, feature gate, setting off) went
+  to the operator with its root cause, cost and a recommendation, and was
+  approved before it shipped. The report lists each approved workaround with
+  its date ([WORKFLOW](WORKFLOW.md), "Root cause, or the operator's
+  approval").
 
 ## Hook safety
 

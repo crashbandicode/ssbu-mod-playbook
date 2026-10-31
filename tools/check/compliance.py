@@ -19,6 +19,7 @@ RELEASE_PROFILE = {'opt-level': '"s"', 'lto': 'true', 'codegen-units': '1', 'pan
 DIAG_MARKERS = (b'diag.txt', b'standin')
 AGENT_ROWS = [
     ('Gates run: test, clippy -D warnings, no-default-features, skyline release, diag build', 'M'),
+    ('Fixes: root cause fixed, or each workaround approved by the operator before it shipped and listed with its date', 'M'),
     ('Card scan for the site (and vtable slot) over a dated card copy', 'M'),
     ('Hook sharing or chaining; both stand-in modes and load orders in Eden', 'C'),
     ('Hook after the prologue or the function called instead', 'M'),

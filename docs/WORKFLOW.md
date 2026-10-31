@@ -118,6 +118,31 @@ cargo skyline build --release --features diag   # the Eden diagnostic build, kep
 (`.text`+`.rodata`+`.data`+`.bss`). That is what the plugin costs the game's
 memory.
 
+### Root cause, or the operator's approval
+
+Fix the root cause. A fix that leaves the root in place is a workaround.
+Examples:
+- a guard or skip around the failing path;
+- a restriction on what the player can pick, or in which order;
+- a relaxed check or a tolerance;
+- a lint `allow`, or code gated behind a feature to quiet a warning;
+- a setting turned off.
+
+Some workarounds are fine and some are not, and the operator decides which.
+Before one ships, give the operator:
+- the root cause, or what is still unknown about it;
+- why the root isn't fixed now;
+- what the workaround costs the player: latency, a restriction, wrong
+  colours, a feature off;
+- your recommendation.
+
+List the approved ones, with the approval date, in the evidence doc.
+
+2026-10-31 example: "Kirby only in the first slot of a window" avoided a hang
+in the game's copy registry. The root was that the plugin built a state the
+game never builds (Kirby as the second body of an entry). The fix builds
+valid states instead, and the player's rotation order stays free.
+
 ### Build caches and disk
 
 A cargo `target/` directory reaches 5–20 GB for a large plugin. On

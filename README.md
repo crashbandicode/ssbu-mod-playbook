@@ -78,6 +78,10 @@ machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
   - Matches use a short ruleset (1 stock, 1:00, items and hazards off)
     unless the test needs a long one ([EDEN](docs/EDEN.md), "Keep matches
     short").
+- **Fixes:** fix the root cause. A workaround (guard, skip, restriction,
+  tolerance, lint `allow`, feature gate) ships only after the operator
+  approves it ([WORKFLOW](docs/WORKFLOW.md), "Root cause, or the operator's
+  approval").
 - **Build:** `crate-type = ["cdylib"]` only. An `rlib` alongside turns LTO
   off and leaves code in the resident image the game pays for.
 - **Disk:**
