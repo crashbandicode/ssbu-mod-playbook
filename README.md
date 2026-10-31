@@ -1,0 +1,54 @@
+# ssbu-mod-playbook
+
+How the Smash Ultimate 13.0.5 Skyline plugins in this workspace get built,
+tested in Eden and installed, written down for the next agent. Dated
+2026-10-31. Paths, hosts and displays are this workspace's: the Yoga
+(`/home/intpa`) runs Eden, and the Switch is plugged into the Surface
+(`dreamland-surface.lan`) over USB.
+
+| Doc | Read it to |
+| --- | --- |
+| [WORKFLOW](docs/WORKFLOW.md) | take a plugin from its first commit to the Switch card |
+| [EDEN](docs/EDEN.md) | bring up one isolated Eden instance and drive it |
+| [MACROS](docs/MACROS.md) | script input routes, or record and replay Eden input macros |
+| [TILE-CURSOR](docs/TILE-CURSOR.md) | land on an exact fighter or stage |
+| [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
+| [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |
+
+HOOK-SHARING is a 2026-10-31 copy of `/home/intpa/SKYLINE-HOOK-SHARING.md`.
+`tools/` has the scripts these docs use, copied as they ran (sources and
+hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
+
+## The short version
+
+1. Copy a small plugin's layout: pure logic in `model.rs`, tested on the
+   host, and hooks in `runtime.rs`. Build it as a cdylib only, so LTO applies.
+2. Before you hook anything, guard the game version and the bytes at the site,
+   and check whether another plugin on the card already hooks it.
+3. Log an install line and one line per event to
+   `sd:/ultimate/<plugin>/events.log`. Tests read that log.
+4. Run the gates: `cargo test`, then clippy with zero warnings, then the
+   no-default-features build, then `cargo skyline build --release`.
+5. In Eden, use a profile copy that has only your NRO and the tile cursor.
+   Script the route to the screen, check the log, and take screenshots.
+6. Write a short README with a full-screen GIF, plus a dated evidence doc.
+7. Tag, release and install on the Switch only when the operator orders it.
+   Installs go over DBI MTP, with readbacks and a rollback copy kept on the
+   card.
+
+## Rules that bite
+
+- **Eden:**
+  - Claim and release in `/tmp/deluxe-surface-1007/OWNER-COORDINATION.md`;
+    `solo.ps1` does both.
+  - Wait while anyone else holds a claim, run one Eden per host, and start
+    only with at least 10 GiB of MemAvailable.
+  - Never use profile `a`, display `:61`, or another agent's runs.
+- **Git:** publish on Forgejo (`git.syntaxbyexample.com/intpa`), not GitHub.
+  Never push, tag a release or write to the Switch without the operator's
+  order.
+- **Commands:** wrap every local command in a memory and time limit
+  (`systemd-run --user --scope -p MemoryMax=… /usr/bin/timeout …`).
+  `systemd-run` expands `${var}` on its command line, so put anything that
+  uses it in a script file.
+- **Docs:** short, dated and evidence only. Don't quote the operator.
