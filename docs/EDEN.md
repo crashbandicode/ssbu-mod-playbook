@@ -23,6 +23,19 @@ a label `eNN`, and every file a run writes is named after it.
   the small parts that change: config, saves, the plugin folders. Check a
   copy with `du -sh` against `du -sh --apparent-size`; the first number
   should stay small.
+- **Link what is identical, copy what is not.** This applies to any copied
+  tree, not only game content:
+  - Hard-link a file when it is byte-identical to its source and the run
+    will not write it in place: game content, NROs, archives, unchanged
+    sources.
+  - Give a file its own copy when its content differs, or when the run
+    writes it in place: saves, an INI or config the plugin or Eden rewrites,
+    shader caches, logs. A write through a hard link changes every copy that
+    shares it.
+  - After `cp -al`, replace each file the run will write with a real copy
+    before the first boot.
+  - On 2026-10-31 a dedup pass hard-linked about 105 GiB of byte-identical
+    files across this workspace's profile copies, with nothing lost.
 
 ## Up
 

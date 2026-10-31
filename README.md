@@ -80,6 +80,12 @@ machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
     short").
 - **Build:** `crate-type = ["cdylib"]` only. An `rlib` alongside turns LTO
   off and leaves code in the resident image the game pays for.
+- **Disk:**
+  - Share one cargo build cache per host and toolchain, and check
+    `df -h /` before builds and Eden runs (stop below 40 GB).
+  - In copies, link what is byte-identical and copy what differs or what
+    the run writes in place ([WORKFLOW](docs/WORKFLOW.md), "Build caches and
+    disk").
 - **Git:** publish on Forgejo (`git.syntaxbyexample.com/intpa`), not GitHub.
   Never push, tag a release or write to the Switch without the operator's
   order.

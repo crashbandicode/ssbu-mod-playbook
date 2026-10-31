@@ -80,8 +80,16 @@ evidence doc.
   display `:61` or another agent's runs.
 - **M** The profile is a copy with the game content hard-linked (`gv.py
   prep`, or `cp -al`); a full copy per profile fills the filesystem. Only
-  the copy is changed. Evidence: `du -sh` against `du -sh --apparent-size`
+  the copy is changed. Byte-identical files are links, and files that differ
+  or that the run writes in place (saves, rewritten INI/config, shader
+  caches, logs) are real copies ([EDEN](EDEN.md), "Link what is identical,
+  copy what is not"). Evidence: `du -sh` against `du -sh --apparent-size`
   on the copy.
+- **M** Build caches shared per host and toolchain (one `CARGO_TARGET_DIR`,
+  not one per worker or copy); `df -h /` checked before every build or Eden
+  launch, stopping below 40 GB free; finished work's build products deleted,
+  with a manifest, while NROs, receipts and logs are kept ([WORKFLOW](WORKFLOW.md),
+  "Build caches and disk").
 - **M** Every wait gated on a log line or a screenshot check, between macro
   segments too ([MACROS](MACROS.md), "Hybrid"); a fixed sleep only where
   neither exists, and then rounded up.

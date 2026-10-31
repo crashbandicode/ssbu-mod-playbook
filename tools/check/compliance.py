@@ -29,6 +29,8 @@ AGENT_ROWS = [
     ('Eden: claim written and released, also after a failed run', 'M'),
     ('Eden: one instance per host, MemAvailable >= 10 GiB, not profile a or :61', 'M'),
     ('Eden: profile copy with hard-linked game content; only the copy changed', 'M'),
+    ('Copies: byte-identical files linked, differing or written-in-place files copied', 'M'),
+    ('Disk: one build cache per host and toolchain, df checked (>= 40 GB), finished build products deleted with a manifest', 'M'),
     ('Eden: waits gated on a log line or screenshot check', 'M'),
     ('Eden: failed precondition aborted and retried under the next label', 'M'),
     ('Eden: profile restored, temp files removed, host released', 'M'),

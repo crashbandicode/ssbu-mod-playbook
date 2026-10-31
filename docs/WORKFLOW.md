@@ -118,6 +118,27 @@ cargo skyline build --release --features diag   # the Eden diagnostic build, kep
 (`.text`+`.rodata`+`.data`+`.bss`). That is what the plugin costs the game's
 memory.
 
+### Build caches and disk
+
+A cargo `target/` directory reaches 5–20 GB for a large plugin. On
+2026-10-31 the Surface filled to 100% (2.8 GB free) from build caches that
+finished work had left behind, one per experiment, worker and build copy,
+plus unpacked source copies kept next to identical archives. Deleting them
+freed about 106 GB.
+
+- **Share a cache:** use one `CARGO_TARGET_DIR` per host and toolchain,
+  shared by every worker and copy, with a separate set per toolchain. A
+  per-worker or per-copy `target/` is not needed; cargo's lock serializes
+  access.
+- **One copy of the source per task.** Keep either an unpacked stage or its
+  archive, not both.
+- **Check before you build:** run `df -h /` before a build or an Eden
+  launch, and stop below 40 GB free.
+- **When the work is done:** delete its build products and keep the NROs,
+  receipts, logs and reports. Write a manifest of what you deleted.
+- **Copies:** link what is identical and copy what is not ([EDEN](EDEN.md),
+  "Link what is identical, copy what is not").
+
 ## 5. Eden
 
 Follow [EDEN](EDEN.md):
