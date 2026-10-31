@@ -39,7 +39,8 @@ evidence doc.
   to the operator with its root cause, cost and a recommendation, and was
   approved before it shipped. The report lists each approved workaround with
   its date ([WORKFLOW](WORKFLOW.md), "Root cause, or the operator's
-  approval").
+  approval"). Defects that share one cause were checked for a single
+  abstraction, and the report says which approach was chosen and why.
 
 ## Hook safety
 

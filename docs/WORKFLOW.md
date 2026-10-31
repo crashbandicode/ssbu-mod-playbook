@@ -138,6 +138,13 @@ Before one ships, give the operator:
 
 List the approved ones, with the approval date, in the evidence doc.
 
+When several defects come back to the same cause (the same native field,
+the same assumption the game makes, the same lifecycle step), look for one
+abstraction that owns that cause before you fix each site on its own.
+Examples are a module that owns every write to a native structure, or one
+contract that every reader goes through. Then say whether the abstraction or
+the separate fixes are the better choice, and why.
+
 2026-10-31 example: "Kirby only in the first slot of a window" avoided a hang
 in the game's copy registry. The root was that the plugin built a state the
 game never builds (Kirby as the second body of an entry). The fix builds
