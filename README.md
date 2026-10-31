@@ -75,6 +75,9 @@ machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
   - Never use profile `a`, display `:61`, or another agent's runs.
   - Profiles are hard-linked copies (`gv.py prep`); a full copy fills the
     filesystem.
+  - Matches use a short ruleset (1 stock, 1:00, items and hazards off)
+    unless the test needs a long one ([EDEN](docs/EDEN.md), "Keep matches
+    short").
 - **Build:** `crate-type = ["cdylib"]` only. An `rlib` alongside turns LTO
   off and leaves code in the resident image the game pays for.
 - **Git:** publish on Forgejo (`git.syntaxbyexample.com/intpa`), not GitHub.

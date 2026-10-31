@@ -86,6 +86,11 @@ evidence doc.
   only where neither exists, and then rounded up.
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
+- **M** The ruleset is the shortest that covers the path under test: 1
+  stock, a 1:00 limit, items, hazards and FS meter off ([EDEN](EDEN.md),
+  "Keep matches short"). A longer match only when the test needs it, with
+  the reason in the handoff. Evidence: the ruleset screenshot or the match
+  length in the log.
 - **M** Profile restored after the run: set-aside NROs back, saves and
   replays back, temp files removed, the host released.
 - **M** `console.log` searched for `panic`, `abort` and `crash`; `run.json`

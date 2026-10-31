@@ -67,6 +67,29 @@ input on the wrong screen. `step.ps1 -Label e19 -Steps 'b:a:4000,s:0:-1:250'`
 sends a short burst of input and then takes one screenshot. That is the
 basic loop. [MACROS](MACROS.md) has whole routes.
 
+## Keep matches short
+
+A test match should last as long as the path under test needs and no
+longer. The default Smash rules (3 stock, 7:00) make every run that has to
+reach the results screen, a pop-up or a rematch wait for three KOs or the
+clock, and a batch of ten pays that ten times.
+
+- **Make one short ruleset in the test profile** and pick it by name every
+  time: 1 stock, a 1:00 time limit, items off, stage hazards off (under the
+  editor's collapsed "Advanced" row), FS meter off, Final Destination or
+  Battlefield. Rulesets are save data, so a copy keeps it across runs; add it
+  to the copy, never to profile `a`. In the ruleset list, X opens an
+  Edit/Delete pop-up and A then opens the editor (Eden, 2026-10-30).
+- **End it on purpose.** With one stock, `match.ps1`'s walk-off ends the
+  match in one self-destruct instead of three, and the 1:00 limit ends a
+  match nobody finishes.
+- **Go long only when the test needs it,** and say why in the handoff: a
+  dataset run that wants many events per match (ssbu-gnw-judge-log's
+  free-play matches needed more Judges, and a level 9 CPU ended its 3-stock
+  matches in 44 to 80 s anyway), or a check of behaviour late in a match.
+- **Evidence:** the ruleset screenshot or the match length in the plugin's
+  log (`session_end` frame count, or the detector's `frame=`).
+
 ## Read the results
 
 - **Plugin logs:** under
