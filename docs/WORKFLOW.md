@@ -126,10 +126,19 @@ finished work had left behind, one per experiment, worker and build copy,
 plus unpacked source copies kept next to identical archives. Deleting them
 freed about 106 GB.
 
-- **Share a cache:** use one `CARGO_TARGET_DIR` per host and toolchain,
-  shared by every worker and copy, with a separate set per toolchain. A
-  per-worker or per-copy `target/` is not needed; cargo's lock serializes
-  access.
+- **One target per source copy:** give each source copy (worktree, stage,
+  worker copy) its own `CARGO_TARGET_DIR` and reuse it for every build of
+  that copy. Share only the cargo home (registry and git checkouts) per host
+  and toolchain. Never point two copies of the same workspace at one target:
+  cargo names a workspace's own crates by their path relative to the
+  workspace root, so every copy's crate gets the same artifact name, and it
+  judges freshness by file times. A build then links another copy's crate,
+  and tests pass or fail on code the copy does not contain (2026-10-31: E0432
+  on a module the copy had, 70 s after the same tests had passed in it).
+- **Refresh sources with new file times:** `tar -x`, `cp -p` and `rsync -a`
+  keep old times, so cargo can judge stale output fresh. Unpack with
+  `tar -m`, or run `cargo clean -p <crate>` for the workspace's own crates
+  before the next build.
 - **One copy of the source per task.** Keep either an unpacked stage or its
   archive, not both.
 - **Check before you build:** run `df -h /` before a build or an Eden

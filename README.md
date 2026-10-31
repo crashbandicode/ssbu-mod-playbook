@@ -81,8 +81,11 @@ machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
 - **Build:** `crate-type = ["cdylib"]` only. An `rlib` alongside turns LTO
   off and leaves code in the resident image the game pays for.
 - **Disk:**
-  - Share one cargo build cache per host and toolchain, and check
-    `df -h /` before builds and Eden runs (stop below 40 GB).
+  - Give each source copy its own cargo target dir and never share one
+    between copies of the same workspace (cargo would link one copy's crate
+    into another's build). Share the cargo home per host and toolchain,
+    delete targets when the work is done, and check `df -h /` before builds
+    and Eden runs (stop below 40 GB).
   - In copies, link what is byte-identical and copy what differs or what
     the run writes in place ([WORKFLOW](docs/WORKFLOW.md), "Build caches and
     disk").

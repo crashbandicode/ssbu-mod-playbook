@@ -85,8 +85,9 @@ evidence doc.
   caches, logs) are real copies ([EDEN](EDEN.md), "Link what is identical,
   copy what is not"). Evidence: `du -sh` against `du -sh --apparent-size`
   on the copy.
-- **M** Build caches shared per host and toolchain (one `CARGO_TARGET_DIR`,
-  not one per worker or copy); `df -h /` checked before every build or Eden
+- **M** One `CARGO_TARGET_DIR` per source copy, never shared between copies
+  of the same workspace, and the cargo home shared per host and toolchain;
+  sources refreshed with new file times; `df -h /` checked before every build or Eden
   launch, stopping below 40 GB free; finished work's build products deleted,
   with a manifest, while NROs, receipts and logs are kept ([WORKFLOW](WORKFLOW.md),
   "Build caches and disk").
