@@ -3,9 +3,12 @@
 2026-10-31. Two ways to drive the game to a screen. The plugin tests here
 used **scripted routes**: `gv.py`/`drive.py` calls with sleeps in a short
 PowerShell script. Eden also records and replays **input macros**
-(`.edenmacro.json`). Use scripted routes for routes you build yourself, and a
-recorded macro when someone hands you one or a sequence needs exact human
-timing.
+(`.edenmacro.json`). The best of the two is the hybrid described under
+"Eden input macros": a recorded macro for each segment of the route,
+replayed at game pace, with a log line or screenshot check between segments.
+Use a plain scripted route while you are still building a route or when a
+segment is one or two presses, and one long macro only for a sequence that
+needs exact human timing.
 
 ## Scripted routes
 
@@ -111,3 +114,62 @@ Eden's own guide is `docs/InputMacros.md` in the Eden build, with a tutorial,
 - **Receipts:** the training-lobby drivers (for example
   `/home/intpa/training-lobby-preload169/drive.py`) save each played file's
   sha256 with the run. Do the same.
+
+### Why they are fast, and where they break
+
+A macro replays at game pace: the route to the character select that
+`to-css.ps1` walks with about 70 s of sleeps takes a macro only as long as
+the game itself needs. But a macro cannot wait. Its frames count on, so when
+a load takes longer than it did while recording, the next press lands on the
+wrong screen; Eden's own doc lists loading times and performance among the
+things that change a replay's outcome. One macro for a whole route is fast
+until the day it is not, and then everything after the missed press is
+wrong.
+
+### Hybrid: one macro per segment, a check between
+
+1. **Split the route at the loads.** Title to main menu; main menu through
+   Online, Smash and Quickplay to Solo; the fighter pick; the stage pick.
+   Record each segment from its settled start screen up to the last press,
+   not through the wait after it, so the file holds inputs and no slack.
+   Keep the files in the repo's `eden/` folder with their sha256.
+2. **Play a segment:** `macro.play` with the file's path, poll
+   `macro.status` until it is finished and its `error` is empty, then
+   `input.reset`.
+3. **Check before the next one.** Poll a cheap screenshot marker
+   (`tools/eden-solo/examples/css_check.py` is one) or a log line every
+   second or two until the expected screen is there, with a cap. When the
+   cap passes: screenshot, stop, report. Never play the next segment onto a
+   screen you have not seen.
+4. **Keep segments independent.** A segment that starts from a settled
+   screen can be reused in any route; a branch made with "Record from
+   marker" shares its prefix with the original and cannot. Picks on the
+   character and stage select stay tile-cursor steps with their `hovered=`
+   check ([TILE-CURSOR](TILE-CURSOR.md)), inside a segment or as their own
+   step.
+
+### Editing a recording
+
+The file is plain JSON. `events` is a sparse list of changed samples, each
+with `frame`, `buttons` (a bit mask), `sticks` (`lx, ly, rx, ry` in −1..1),
+`triggers` and `motion`; only changes are stored, so a held button is one
+sample with its bit set and a later one with it cleared. `duration_frames`
+is the total length and playback runs to it.
+
+- **Safe edits:** cut idle time by subtracting the same number from every
+  later `frame` (the example file under `/home/intpa/automation01/peer10/`
+  waits 2,068 frames, 34 s, before its first input); drop a wrong press by
+  removing both its press and its release sample; shorten a hold by moving
+  its release sample earlier; trim the tail by setting `duration_frames` a
+  few frames past the last event.
+- **Keep:** frames ascending and distinct, every press paired with its
+  release, `game_id` and `player` as recorded, and at least one displayed
+  frame between samples. Eden keeps no sub-frame timing and may drop an
+  input shorter than one displayed frame.
+- **Then:** save it as a new file with a new `name` (the library remembers
+  paths), replay it from the same scene with a screenshot at the end before
+  trusting it, and record its sha256 like any played file.
+- **Limits from Eden's doc:** recording auto-saves at 60,000 changed samples
+  or 216,000 frames; macros do not restore savestates; playback owns the
+  controller until it finishes or `macro.stop`; keyboard and gamepad
+  shortcuts need Eden focused, so drive playback through the control API.

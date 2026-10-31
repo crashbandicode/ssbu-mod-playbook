@@ -10,7 +10,7 @@ tested in Eden and installed, written down for the next agent. Dated
 | --- | --- |
 | [WORKFLOW](docs/WORKFLOW.md) | take a plugin from its first commit to the Switch card |
 | [EDEN](docs/EDEN.md) | bring up one isolated Eden instance and drive it |
-| [MACROS](docs/MACROS.md) | script input routes, or record and replay Eden input macros |
+| [MACROS](docs/MACROS.md) | drive routes: macro segments with checks between, scripted routes, recording and editing Eden macros |
 | [TILE-CURSOR](docs/TILE-CURSOR.md) | land on an exact fighter or stage |
 | [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
 | [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |

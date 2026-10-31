@@ -82,8 +82,9 @@ evidence doc.
   prep`, or `cp -al`); a full copy per profile fills the filesystem. Only
   the copy is changed. Evidence: `du -sh` against `du -sh --apparent-size`
   on the copy.
-- **M** Every wait gated on a log line or a screenshot check; a fixed sleep
-  only where neither exists, and then rounded up.
+- **M** Every wait gated on a log line or a screenshot check, between macro
+  segments too ([MACROS](MACROS.md), "Hybrid"); a fixed sleep only where
+  neither exists, and then rounded up.
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
 - **M** The ruleset is the shortest that covers the path under test: 1
