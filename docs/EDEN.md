@@ -17,6 +17,12 @@ a label `eNN`, and every file a run writes is named after it.
   `/home/intpa/gsp-visualizer-work/profiles/y`. Game content is hard-linked
   and everything else is copied. Only the copy is ever changed. Profile `s`
   is a copy of `y`, for the second instance of a pair.
+- **Never copy a profile in full.** The game content alone is tens of
+  gigabytes, and one plain copy per profile or per run fills the filesystem.
+  Hard-link it (`gv.py prep`, or `cp -al` for a copy by hand) and copy only
+  the small parts that change: config, saves, the plugin folders. Check a
+  copy with `du -sh` against `du -sh --apparent-size`; the first number
+  should stay small.
 
 ## Up
 

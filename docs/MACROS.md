@@ -25,7 +25,9 @@ P 'lstick,up' 150; Start-Sleep 2                                           # til
 
 `P` is `gv.py press` and `S` is `gv.py stick`. `-BootSeconds` waits for boot
 first. `tools/eden-pair/nav.ps1` is the same route on both instances of a
-pair.
+pair. The fixed sleeps in these two are the old form, kept for the route's
+shape; the rule under "Rules learned" is to gate each wait on a log line or
+a screenshot check and sleep a fixed time only where neither exists.
 
 ### Building a new route
 

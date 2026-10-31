@@ -28,9 +28,12 @@ Whatever doesn't touch the game belongs in `model.rs`. `cargo test` checks it
 in seconds, and Eden is then needed only for what needs the game.
 
 **cdylib only.** If the crate types include `rlib`, Cargo skips LTO for that
-crate without saying so. Eleven repos were changed on 2026-10-31. Shaderdb-probe
-went from 1,081,344 to 618,496 bytes resident, with the same exports. A test
-or example that needs a module includes it by path:
+crate without saying so, and the code LTO would have dropped stays in the
+resident image, which the game's heap pays for on every boot. Eleven repos
+were changed on 2026-10-31. Shaderdb-probe went from 1,081,344 to 618,496
+bytes resident, with the same exports. Add `rlib` only when something must
+link the crate, which no plugin here does. A test or example that needs a
+module includes it by path:
 
 ```rust
 #[path = "../src/model.rs"]

@@ -51,3 +51,8 @@ Changed later on 2026-10-31:
 | `eden-pair/examples/queued-run.ps1` | new: `<session scratchpad>/online-release.ps1` (elite-rematch e26), plus a header comment and the MemAvailable check | `f1fa430873fb7d97` |
 | `eden-solo/examples/retry-batch.ps1` | new: `/home/intpa/ssbu-gnw-judge-log/eden/run_free_batch.ps1` (runs g39–g49), plus a header comment | `0289c04e1564ec0b` |
 | `eden-solo/examples/css_check.py` | new: `/home/intpa/ssbu-gnw-judge-log/eden/css_check.py`, plus a paragraph in the docstring | `35a5938b7f5051cc` |
+
+Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
+the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
+into the four agent tools and writes the pointer blocks) and
+`../skills/ssbu-mod-playbook/SKILL.md`.

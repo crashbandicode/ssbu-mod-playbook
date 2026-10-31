@@ -15,9 +15,30 @@ tested in Eden and installed, written down for the next agent. Dated
 | [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
 | [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |
 
+| [CHECKLIST](docs/CHECKLIST.md) | prove the work is done: mandatory, conditional and example items, and the report |
+
 HOOK-SHARING is a 2026-10-31 copy of `/home/intpa/SKYLINE-HOOK-SHARING.md`.
 `tools/` has the scripts these docs use, copied as they ran (sources and
 hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
+
+## Skill and checklist
+
+`skills/ssbu-mod-playbook/SKILL.md` is a thin skill that orders a full read
+of this playbook, a checklist built from [CHECKLIST](docs/CHECKLIST.md) and
+`tools/check/compliance.py` before completion. One copy serves the four
+agent tools through symlinks:
+
+```text
+python3 -I tools/skill/install.py           # ~/.claude, ~/.agents, ~/.cursor, ~/.config/opencode
+python3 -I tools/skill/install.py --check   # report only
+```
+
+It also writes a pointer block into `~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md` and a Cursor rule, so
+the read is required and not left to skill discovery. Run it on every
+machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
+(`/home/intpa/ssbu-mod-playbook` on the Ubuntu machines,
+`%USERPROFILE%\ssbu-mod-playbook` on Windows, where it makes junctions).
 
 ## The short version
 
@@ -52,6 +73,10 @@ hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
     only with at least 10 GiB of MemAvailable. Queue the run so it starts
     itself when the host is free ([EDEN](docs/EDEN.md), "Queue runs").
   - Never use profile `a`, display `:61`, or another agent's runs.
+  - Profiles are hard-linked copies (`gv.py prep`); a full copy fills the
+    filesystem.
+- **Build:** `crate-type = ["cdylib"]` only. An `rlib` alongside turns LTO
+  off and leaves code in the resident image the game pays for.
 - **Git:** publish on Forgejo (`git.syntaxbyexample.com/intpa`), not GitHub.
   Never push, tag a release or write to the Switch without the operator's
   order.
