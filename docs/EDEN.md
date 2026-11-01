@@ -109,7 +109,15 @@ clock, and a batch of ten pays that ten times.
   `gsp-visualizer-work/profiles/y/user/sdmc/ultimate/<plugin>/`, on the
   host, while the game runs.
 - **Eden's console:** `gsp-visualizer-work/runs/e19/console.log`. Search it
-  for `panic`, `abort` and `crash`.
+  for `panic`, `abort` and `crash`, and for `Unmapped Read` / `Unmapped
+  Write`. Eden returns 0 for a read through an unmapped guest address and
+  keeps running where the console faults: on 2026-11-01 a group swap that had
+  passed 878 Eden lanes with `HW.Memory … Unmapped Read32 @ 0x00000000000008`
+  in the log crashed the Switch at that read. Any `Unmapped` line at an
+  address below `0x1000`, or at any address inside the plugin's activity
+  window, fails the lane. Attribute the others by timestamp against the
+  plugin's own log lines before dismissing them; stock-game and emulator
+  noise exists (repeated `Read64 @ 0x0` + `Read8 @ 0x38` pairs, for one).
 - **The run's end state:** `run.json` and `memory.peak` in the same folder.
 - **Timestamps:** compare them as UTC (`[DateTimeOffset]::Parse(…)`). In
   PowerShell, `[DateTime]'…Z'` converts to local time.
