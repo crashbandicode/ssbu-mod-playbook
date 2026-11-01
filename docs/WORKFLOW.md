@@ -254,7 +254,20 @@ both ways:
 - **Provenance:** to find out what is on the card, rebuild the suspected
   commit. The build is reproducible, so a byte-identical NRO identifies it.
 - **Switch:** the Switch is plugged into the Surface, with DBI's MTP
-  responder running. `tools/switch/` holds the scripts:
+  responder running (or the card mounted through hekate UMS or a card
+  reader).
+  - **The user connects and disconnects it.** Only the user starts or stops
+    DBI or hekate UMS, unmounts the card or ejects it. The agent works on what
+    the user exposed and reads and writes the SD directly: `gio list`, `info`
+    and `copy` on DBI's SD Card over MTP, or the files under the mount point
+    (reads with O_DIRECT). It never runs a mount, unmount, eject or power-off
+    command (`udisksctl`, `gio mount`, `umount`, `eject`), and never remounts
+    the card to check a readback: it reads the card in place. If the card is
+    not visible, it stops and asks the user. When the last phase is done, the
+    report says the writes are complete and that the user can disconnect the
+    Switch. `tools/check/compliance.py` fails a repo whose scripts carry such
+    a command.
+  `tools/switch/` holds the scripts:
   - `upgrade2-mtp.py` replaces an NRO.
   - `remove-mtp.py` removes one, archiving it first.
   - `deploy-mtp.py` adds a new one. Its name, data folder and expected
@@ -264,8 +277,7 @@ both ways:
     with `mount` in the approval file, an atomic rename into place and a
     `verify <dir>` phase that re-reads every file the install touched. Every
     read of the card skips the page cache (O_DIRECT), so readbacks show what
-    the card holds. Never unmount or remount the card to check it (operator
-    rule, 2026-11-01): read it in place.
+    the card holds, and the card stays mounted throughout.
   Each runs `preflight <dir>` and then `install <dir>` (`remove` for
   removal) from a folder holding the NRO and an `operator-approval.json`
   (`operator_order`, `operator_install_authorized`, `name`, `data`, `old`,

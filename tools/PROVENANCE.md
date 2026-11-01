@@ -59,6 +59,17 @@ Changed on 2026-11-01:
 | --- | --- | --- |
 | `switch/upgrade2-ums.py` | verify remounts through the user's systemd manager when polkit refuses `udisksctl mount` over ssh, and checks with `pkcheck` that a way is authorized before it unmounts (the first version left the card unmounted over ssh). Tested on the Surface over ssh with a vfat loop image: the first version failed `NotAuthorizedCanObtain`, this one reached `verified_after_remount` | `0fc2930e1fd9849a` |
 | `switch/upgrade2-ums.py` | the card is never unmounted (operator rule): every card read is O_DIRECT (page-cache drop where refused), and verify re-reads in place, checking the mount id is unchanged. Tested on the Surface over ssh with a vfat loop image: every read `o_direct`, `verified_in_place` with the same mount id; after three bytes of the installed NRO were changed in the image behind the page cache, a normal read still showed the old bytes and a second verify failed on that file | `8fba8d5e74772bb6` |
+| `switch/upgrade2-ums.py` | after a successful install or verify, prints that the card is still mounted and that the user unmounts or ejects it (the user connects and disconnects the Switch) | `9c4b67412863c078` |
+| `switch/upgrade2-mtp.py` | after a successful install, prints that the Switch is still connected and that the user closes DBI | `041b9fa731a9784e` |
+| `switch/deploy-mtp.py` | the same closing line after a successful install | `ff82b5ac2b123df1` |
+| `switch/remove-mtp.py` | the same closing line after a successful remove | `560194b44417cdde` |
+
+`check/compliance.py` gained a machine row on 2026-11-01: it fails when a
+tracked script in the plugin repo, or a script under the playbook's
+`tools/switch`, mounts, unmounts, ejects or powers off a disk (`udisksctl
+mount|unmount|power-off`, `gio mount`, `umount`, `eject`, `mount`), as a
+shell line or an argv list. It flagged the `48b1471` `upgrade2-ums.py`, which
+unmounted the card; the current tools and the 24 local plugin repos pass.
 
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill

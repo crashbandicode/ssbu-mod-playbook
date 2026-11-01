@@ -17,6 +17,16 @@ from pathlib import Path
 
 RELEASE_PROFILE = {'opt-level': '"s"', 'lto': 'true', 'codegen-units': '1', 'panic': '"abort"'}
 DIAG_MARKERS = (b'diag.txt', b'standin')
+SCRIPT_SUFFIXES = {'.py', '.ps1', '.psm1', '.sh', '.bash', '.cmd', '.bat'}
+# A command that mounts, unmounts, ejects or powers off a disk, written as a
+# shell line or as an argv list ('/usr/bin/udisksctl', 'unmount'). The user
+# connects and disconnects the Switch; a script never does.
+CARD_COMMANDS = re.compile(
+    r"udisksctl['\"]?\s*,?\s*['\"]?(?:mount|unmount|power-off)\b"
+    r"|\bgio['\"]?\s*,?\s*['\"]?mount\b"
+    r"|\bumount\b"
+    r"|\beject['\"]?\s*,?\s*['\"]?(?:-|/dev/)"
+    r"|(?:^|[;&|(]\s*|\bsudo\s+)mount\s+(?:-|/dev/)")
 AGENT_ROWS = [
     ('Gates run: test, clippy -D warnings, no-default-features, skyline release, diag build', 'M'),
     ('Fixes: root cause fixed, or each workaround approved by the operator before it shipped and listed with its date', 'M'),
@@ -44,6 +54,7 @@ AGENT_ROWS = [
     ('Release: version bump, annotated tag, assets verified by anonymous download', 'C'),
     ('Release: rebuild of the tag byte-identical to the released NRO', 'C'),
     ('Card: MTP preflight, rollback copy, readbacks, receipts not re-run', 'C'),
+    ('Card: the user connected and disconnected it; the agent never mounted, unmounted, ejected or remounted it, nor started or stopped DBI', 'M'),
     ('Nothing pushed, tagged or written to the card without the operator\'s order', 'M'),
     ('Model/effort gate and watcher per the routing authority', 'M'),
 ]
@@ -65,6 +76,22 @@ def section(text, name):
 def toml_value(body, key):
     match = re.search(rf'^\s*{re.escape(key)}\s*=\s*(.+?)\s*(#.*)?$', body, re.M)
     return match.group(1).strip() if match else None
+
+
+def card_commands(paths, base):
+    """`file:line` of every script line (comment lines skipped) that would
+    mount, unmount, eject or power off a disk."""
+    hits = []
+    for path in paths:
+        if path.suffix.lower() not in SCRIPT_SUFFIXES or not path.is_file():
+            continue
+        for number, line in enumerate(read(path).splitlines(), 1):
+            code = line.strip()
+            if code.startswith(('#', '//', '::')) or code.upper().startswith('REM '):
+                continue
+            if CARD_COMMANDS.search(code):
+                hits.append(f'{path.relative_to(base)}:{number}')
+    return hits
 
 
 def git(repo, *args):
@@ -194,6 +221,13 @@ def rows_for(repo, nro_path):
         remote or 'no origin')
     status = git(repo, 'status', '--porcelain')
     row('working tree clean', 'M', status == '', 'git status' + (': dirty' if status else ''))
+    tracked = [repo / name for name in (git(repo, 'ls-files') or '').splitlines()]
+    tools = Path(__file__).resolve().parents[1]
+    hits = card_commands(tracked, repo) + [
+        f'playbook tools/{hit}' for hit in card_commands(sorted((tools / 'switch').rglob('*')), tools)]
+    row('no script mounts, unmounts or ejects the card (the user connects and disconnects it)', 'M', not hits,
+        ', '.join(hits[:8]) + (f' (+{len(hits) - 8} more)' if len(hits) > 8 else '')
+        or 'none in the tracked scripts or the playbook\'s tools/switch')
     head = git(repo, 'rev-parse', '--short', 'HEAD') or '?'
     tag = git(repo, 'describe', '--tags', '--exact-match') or 'no tag on HEAD'
     rows.append(('build identity', 'M', 'info', f'HEAD {head}; {tag}'))

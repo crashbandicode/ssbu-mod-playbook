@@ -141,6 +141,12 @@ evidence doc.
   sha256 matches), a rollback copy on the card, readback of the new NRO,
   every other plugin and the protected files; receipts kept; a phase with an
   existing receipt is not re-run.
+- **M** The user connects and disconnects the Switch. The agent never
+  mounted, unmounted, ejected or remounted the card and never started or
+  stopped DBI or hekate UMS; it read and wrote the SD only through what the
+  user exposed (MTP, or the mount point), and its report told the user when
+  the card could be disconnected. `compliance.py` fails scripts that carry a
+  mount, unmount, eject or power-off command.
 - **M** Without the order: nothing pushed, tagged or written to the card,
   and the report says so.
 

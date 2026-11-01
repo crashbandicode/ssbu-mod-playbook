@@ -51,5 +51,7 @@ READY.
 2. List the failed, skipped and unverified rows in the final message.
 3. Never push, tag, release or write to the Switch card without the
    operator's explicit order for that action, and say so in the report when
-   the order was not given.
+   the order was not given. The user connects and disconnects the Switch:
+   never mount, unmount, eject or remount the card, or start or stop DBI;
+   read and write the SD only through what the user exposed.
 4. Do not claim success for anything without the evidence that shows it.

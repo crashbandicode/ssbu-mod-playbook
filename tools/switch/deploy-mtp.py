@@ -199,3 +199,6 @@ finally:
     save()
     lock.close()
 print(json.dumps({k: receipt.get(k) for k in ('state', 'target', 'device_operations_closed')}, indent=2))
+if mode == 'install':
+    # The user connects and disconnects the Switch (playbook WORKFLOW, Switch); this tool never does.
+    print('Done. The Switch is still connected: disconnect it (close DBI) when you are ready.')
