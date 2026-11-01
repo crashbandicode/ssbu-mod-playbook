@@ -259,6 +259,10 @@ both ways:
   - `remove-mtp.py` removes one, archiving it first.
   - `deploy-mtp.py` adds a new one. Its name, data folder and expected
     sha256 are set in the script (gsp-visualizer's).
+  - `upgrade2-ums.py` replaces an NRO when the card is mounted as a USB disk
+    instead (hekate Nyx UMS, or a card reader): the same phases and receipts,
+    with `mount` in the approval file, an atomic rename into place and a
+    `verify <dir>` phase that remounts the card and re-reads every file.
   Each runs `preflight <dir>` and then `install <dir>` (`remove` for
   removal) from a folder holding the NRO and an `operator-approval.json`
   (`operator_order`, `operator_install_authorized`, `name`, `data`, `old`,

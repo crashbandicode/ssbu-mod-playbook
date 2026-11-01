@@ -31,6 +31,7 @@ workspace's. None of these files was in a git repository before.
 | `switch/deploy-mtp.py` | `/home/intpa/gsp-visualizer/eden/deploy-mtp.py` | `08e1119abd593b80` |
 | `switch/upgrade2-mtp.py` | `/home/intpa/gsp-visualizer/eden/upgrade2-mtp.py` | `7d6c49570eefa73a` |
 | `switch/remove-mtp.py` | `/home/intpa/gsp-visualizer/eden/remove-mtp.py` | `227616979ccf2604` |
+| `switch/upgrade2-ums.py` | written here 2026-11-01 (upgrade2-mtp.py's phases over a mounted card: hekate Nyx UMS or a card reader; adds a remount readback phase) | `0ac7a2ce3a044cf7` |
 | `switch/examples/prep-install.ps1` | `<session scratchpad>/prep-install.ps1` | `9f95ef3a514e5061` |
 | `switch/examples/mtp-run.ps1` | `<session scratchpad>/mtp-run.ps1` | `3dbbfd6933fbaddd` |
 | `switch/examples/prep-remove.ps1` | `<session scratchpad>/prep-remove.ps1` | `82b4a9475663ed55` |
