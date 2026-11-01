@@ -36,7 +36,7 @@ fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 approval = json.loads((OUT / 'operator-approval.json').read_text())
 assert approval['operator_removal_authorized']
 NAME, DATA, OLD = approval['name'], approval['data'], approval['old']
-assert re.fullmatch(r'lib[a-z0-9_]+\.nro', NAME) and re.fullmatch(r'ultimate/[a-z0-9_-]+', DATA)
+assert re.fullmatch(r'lib[a-z0-9_]+\.nro', NAME) and re.fullmatch(r'ultimate/[A-Za-z0-9_-]+', DATA)
 assert re.fullmatch(r'[0-9a-f]{64}', OLD)
 TARGET = PLUGINS + '/' + NAME
 ARCHIVE = DATA + f'/backups/removed-{OLD[:16]}.nro'

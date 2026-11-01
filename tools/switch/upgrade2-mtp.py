@@ -38,7 +38,7 @@ fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 approval = json.loads((OUT / 'operator-approval.json').read_text())
 assert approval['operator_install_authorized']
 NAME, DATA, OLD, NEW = approval['name'], approval['data'], approval['old'], approval['new']
-assert re.fullmatch(r'lib[a-z0-9_]+\.nro', NAME) and re.fullmatch(r'ultimate/[a-z0-9_-]+', DATA)
+assert re.fullmatch(r'lib[a-z0-9_]+\.nro', NAME) and re.fullmatch(r'ultimate/[A-Za-z0-9_-]+', DATA)
 assert all(re.fullmatch(r'[0-9a-f]{64}', h) for h in (OLD, NEW)) and OLD != NEW
 TARGET = PLUGINS + '/' + NAME
 BACKUP = DATA + f'/backups/pre-{NEW[:16]}.nro'

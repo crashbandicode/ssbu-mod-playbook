@@ -63,6 +63,8 @@ Changed on 2026-11-01:
 | `switch/upgrade2-mtp.py` | after a successful install, prints that the Switch is still connected and that the user closes DBI | `041b9fa731a9784e` |
 | `switch/deploy-mtp.py` | the same closing line after a successful install | `ff82b5ac2b123df1` |
 | `switch/remove-mtp.py` | the same closing line after a successful remove | `560194b44417cdde` |
+| `switch/upgrade2-mtp.py` | the approval's `data` folder may hold upper-case letters (`ultimate/[A-Za-z0-9_-]+`, as `upgrade2-ums.py` already allowed): the Training Modpack's folder is `ultimate/TrainingModpack`, which the lower-case check refused before any device access | `909b531078fa11cd` |
+| `switch/remove-mtp.py` | the same `data` check | `f9b175ac8a7232bf` |
 
 `check/compliance.py` gained a machine row on 2026-11-01: it fails when a
 tracked script in the plugin repo, or a script under the playbook's
