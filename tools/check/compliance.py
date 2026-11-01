@@ -109,7 +109,8 @@ def nro_facts(path):
         return None
     text, ro, rw = (struct.unpack_from('<II', data, 0x20 + 8 * i)[1] for i in range(3))
     bss = struct.unpack_from('<I', data, 0x38)[0]
-    markers = [m.decode() for m in DIAG_MARKERS if m in data]
+    # Whole-word matches only: `standin` inside `outstanding` (a common log word) is not a marker.
+    markers = [m.decode() for m in DIAG_MARKERS if re.search(rb'(?<![A-Za-z])' + re.escape(m) + rb'(?![A-Za-z])', data)]
     return hashlib.sha256(data).hexdigest(), text + ro + rw + bss, markers
 
 
