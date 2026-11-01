@@ -32,6 +32,9 @@ workspace's. None of these files was in a git repository before.
 | `switch/upgrade2-mtp.py` | `/home/intpa/gsp-visualizer/eden/upgrade2-mtp.py` | `7d6c49570eefa73a` |
 | `switch/remove-mtp.py` | `/home/intpa/gsp-visualizer/eden/remove-mtp.py` | `227616979ccf2604` |
 | `switch/upgrade2-ums.py` | written here 2026-11-01 (upgrade2-mtp.py's phases over a mounted card: hekate Nyx UMS or a card reader; adds a remount readback phase) | `0ac7a2ce3a044cf7` |
+| `switch/replace-exefs.py` | written here 2026-11-01 (upgrade2-mtp.py's and upgrade2-ums.py's phases for Skyline's `exefs/subsdk9` / `exefs/main.npdm`, one shared transaction over an MTP or mounted-card transport; adds `verify`, `extra_protected` and a readback of the whole `exefs/` folder). Tested only against a fake card; one read-only `preflight` ran on the real card 2026-11-01 16:02 ET (`preflight_verified`: `subsdk9` 9959ecb13eab6db8, `main.npdm` 0953885117632821) | `60cd5805592de2a6` |
+| `switch/tests/fake_gio.py` | written here 2026-11-01: runs the real `gio` and injects faults from a JSON plan (test double for `replace-exefs.py`) | `eae91c5ce8f06d86` |
+| `switch/tests/test_replace_exefs.py` | written here 2026-11-01: 38 tests of `replace-exefs.py` on a fake card (success, readback mismatch → rollback, failed rollback, re-run refusal, refusals before card access, both transports); 10 mutations of the script's safety steps each make it fail | `1e0fe2daa2f3eeb5` |
 | `switch/examples/prep-install.ps1` | `<session scratchpad>/prep-install.ps1` | `9f95ef3a514e5061` |
 | `switch/examples/mtp-run.ps1` | `<session scratchpad>/mtp-run.ps1` | `3dbbfd6933fbaddd` |
 | `switch/examples/prep-remove.ps1` | `<session scratchpad>/prep-remove.ps1` | `82b4a9475663ed55` |

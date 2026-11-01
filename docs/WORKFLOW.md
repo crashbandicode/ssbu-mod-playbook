@@ -278,6 +278,18 @@ both ways:
     `verify <dir>` phase that re-reads every file the install touched. Every
     read of the card skips the page cache (O_DIRECT), so readbacks show what
     the card holds, and the card stays mounted throughout.
+  - `replace-exefs.py` replaces Skyline's loader file (`exefs/subsdk9` or
+    `exefs/main.npdm`, the only two targets) over DBI MTP, or over a mounted
+    card with `"transport": "ums"`. It is `upgrade2-*.py`'s transaction for a
+    file that is not a plugin: `preflight`, `install` and `verify`; local
+    copies of the whole `exefs/` folder, the plugins, the protected configs and
+    any `extra_protected` data files (for example the Training Modpack's
+    `save_states.json`); the rollback copy at
+    `<data>/backups/pre-<new16>.<name>` (put `data` outside `exefs/`, for
+    example `ultimate/skyline_exefs`); the target and every copied file read
+    back, and the old file put back and read back when one differs. Its tests
+    run against a fake card tree (the real `gio` on a `file://` directory, plus
+    a fault-injecting wrapper): `python3 -I tools/switch/tests/test_replace_exefs.py`.
   Each runs `preflight <dir>` and then `install <dir>` (`remove` for
   removal) from a folder holding the NRO and an `operator-approval.json`
   (`operator_order`, `operator_install_authorized`, `name`, `data`, `old`,
@@ -292,3 +304,11 @@ both ways:
     exists, the phase refuses to run again: inspect it first.
   - **Steps:** `tools/switch/examples/` copies the folder to the Surface and
     runs each phase over ssh. One writer at a time.
+  - **Several files in one install** (an NRO and Skyline's loader): one
+    transaction per file, each with its own folder, and a fresh preflight right
+    before each install, because a later preflight must copy the earlier file's
+    new bytes. Write the loader file last: a bad loader stops every plugin from
+    loading, so it is the file whose failure you want to roll back with
+    everything else already verified. Each tool prints its disconnect line
+    after its own install; the user is told to disconnect only after the last
+    verify.

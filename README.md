@@ -75,7 +75,7 @@ working from the brief alone.
    whose numbers a host-tested script regenerates from the logs.
 7. Tag, release and install on the Switch only when the operator orders it.
    Installs go over DBI MTP, with readbacks and a rollback copy kept on the
-   card.
+   card (`replace-exefs.py` does the same for Skyline's `exefs/subsdk9`).
 
 ## Rules that bite
 
