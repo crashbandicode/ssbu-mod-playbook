@@ -151,6 +151,10 @@ evidence doc.
 - **M** The model and effort gate and the per-thread watcher follow the
   routing authority (`/home/intpa/.codex/DELEGATION_ROUTING.md`); they are
   not restated here.
+- **M** Every spawned worker read this playbook itself (`README.md`, all of
+  `docs/`, `tools/PROVENANCE.md`) before changing code, built its own
+  checklist and ran `tools/check/compliance.py` before READY; the brief that
+  spawned it said so and recorded the playbook commit it followed.
 
 ## The report
 

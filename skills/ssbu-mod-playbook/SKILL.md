@@ -11,6 +11,12 @@ machines, `%USERPROFILE%\ssbu-mod-playbook` on Windows; origin
 `https://git.syntaxbyexample.com/intpa/ssbu-mod-playbook`). This skill does
 not restate them. It makes sure they are read and proven.
 
+This applies to every agent that touches the plugin, including every
+subagent, teammate or worker you spawn: a parent's read does not cover its
+workers. Put the read order (steps 1–4 below, with the clone path) in every
+delegated brief, and require the worker's own compliance run before its
+READY.
+
 ## Before changing anything
 
 1. Bring the clone up to date (`git -C ~/ssbu-mod-playbook pull --ff-only`),

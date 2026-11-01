@@ -40,6 +40,19 @@ machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
 (`/home/intpa/ssbu-mod-playbook` on the Ubuntu machines,
 `%USERPROFILE%\ssbu-mod-playbook` on Windows, where it makes junctions).
 
+## Delegated workers read it too
+
+The read is per agent, not per project: a primary that has read this
+playbook does not cover the workers it spawns. Every subagent, teammate or
+worker that creates, changes, tests, validates, releases or installs a
+plugin, or drives Eden to test one, reads this playbook completely first
+(`README.md`, every file in `docs/`, `tools/PROVENANCE.md`), builds its own
+checklist from [CHECKLIST](docs/CHECKLIST.md) and runs
+`tools/check/compliance.py` before it reports READY. The brief that spawns
+it says so explicitly, names the clone path and records the commit the worker
+followed. A worker that cannot read the playbook stops and says so instead of
+working from the brief alone.
+
 ## The short version
 
 1. Copy a small plugin's layout: pure logic in `model.rs`, tested on the
