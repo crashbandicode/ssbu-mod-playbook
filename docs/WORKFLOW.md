@@ -263,6 +263,10 @@ both ways:
     instead (hekate Nyx UMS, or a card reader): the same phases and receipts,
     with `mount` in the approval file, an atomic rename into place and a
     `verify <dir>` phase that remounts the card and re-reads every file.
+    polkit refuses a udisks mount from an ssh session, so before it unmounts,
+    verify checks with `pkcheck` which way may mount: this session, or the
+    user's systemd manager (`systemd-run --user`, a local session since
+    systemd 256). With neither it stops and leaves the card mounted.
   Each runs `preflight <dir>` and then `install <dir>` (`remove` for
   removal) from a folder holding the NRO and an `operator-approval.json`
   (`operator_order`, `operator_install_authorized`, `name`, `data`, `old`,

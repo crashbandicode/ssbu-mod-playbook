@@ -13,7 +13,9 @@ Runs on the host the card is mounted on, as the user who owns the mount.
 and local copies (before/, just-before/, backup-readback/, stage-readback/,
 after/, verify/) go there too. "mount" is the card's mount point. The verify
 phase defeats the page cache: it remounts the card with udisksctl and reads
-every file again from the device."""
+every file again from the device. Over ssh it remounts through the user's
+systemd manager (polkit refuses a udisks mount from a remote session), and it
+checks with pkcheck that one way is authorized before it unmounts."""
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -161,6 +163,33 @@ def mount_source():
     return run('/usr/bin/findmnt', '-n', '-o', 'SOURCE', '--target', str(ROOT)).strip()
 
 
+# polkit lets udisks mount a removable filesystem only for a process in an
+# active local session. Over ssh `udisksctl unmount` of your own mount works but
+# `udisksctl mount` is refused (NotAuthorizedCanObtain), which once left the card
+# unmounted after verify. A process the user's systemd manager starts sits in a
+# local `manager` session (systemd 256+) and is allowed, so verify picks a way
+# that pkcheck confirms before it unmounts anything.
+MOUNT_ACTION = 'org.freedesktop.udisks2.filesystem-mount'
+VIA_MANAGER = ('/usr/bin/systemd-run', '--user', '--wait', '--pipe', '--quiet')
+PROBE = ('import os, subprocess, sys; sys.exit(subprocess.run(["/usr/bin/pkcheck", "--action-id", '
+         f'"{MOUNT_ACTION}", "--process", str(os.getpid())], capture_output=True).returncode)')
+
+
+def remount_prefix():
+    """The command prefix under which `udisksctl mount` is authorized here:
+    none (this session), or the user's systemd manager. Raises before any
+    unmount when neither is."""
+    for prefix in ((), VIA_MANAGER):
+        entry = op('mount-authorized', *prefix)
+        process = subprocess.run([*prefix, sys.executable, '-I', '-c', PROBE], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=60)
+        done(entry, exit_code=process.returncode, stderr=process.stderr)
+        if process.returncode == 0:
+            return prefix
+    raise AssertionError(f'no authorized way to remount {ROOT} ({MOUNT_ACTION}); the card is left mounted. '
+                         'Run verify from the desktop session, or remount by hand and re-read the files.')
+
+
 source = info(OUT / NAME)
 assert source['sha256'] == NEW and (OUT / NAME).read_bytes()[0x10:0x14] == b'NRO0'
 receipt = {'state': 'started', 'started': now(), 'mode': mode, 'transport': 'mounted card (USB disk)',
@@ -232,9 +261,11 @@ try:
         assert deployment['state'] == 'installed_verified'
         device = receipt['mount_source']
         assert re.fullmatch(r'/dev/[a-z0-9/]+', device), device
+        prefix = remount_prefix()
+        receipt['remount_via'] = ' '.join(prefix) or 'this session'
         state('remounting')
         run('/usr/bin/udisksctl', 'unmount', '-b', device)
-        mounted = run('/usr/bin/udisksctl', 'mount', '-b', device)
+        mounted = run(*prefix, '/usr/bin/udisksctl', 'mount', '-b', device)
         match = re.search(r' at (/\S.*?)\.?\s*$', mounted)
         assert match and Path(match.group(1)) == ROOT, f'remounted elsewhere: {mounted!r}'
         assert ROOT.is_mount()

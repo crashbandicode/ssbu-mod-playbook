@@ -53,6 +53,12 @@ Changed later on 2026-10-31:
 | `eden-solo/examples/retry-batch.ps1` | new: `/home/intpa/ssbu-gnw-judge-log/eden/run_free_batch.ps1` (runs g39–g49), plus a header comment | `0289c04e1564ec0b` |
 | `eden-solo/examples/css_check.py` | new: `/home/intpa/ssbu-gnw-judge-log/eden/css_check.py`, plus a paragraph in the docstring | `35a5938b7f5051cc` |
 
+Changed on 2026-11-01:
+
+| Copy | Change | SHA-256 (first 16) |
+| --- | --- | --- |
+| `switch/upgrade2-ums.py` | verify remounts through the user's systemd manager when polkit refuses `udisksctl mount` over ssh, and checks with `pkcheck` that a way is authorized before it unmounts (the first version left the card unmounted over ssh). Tested on the Surface over ssh with a vfat loop image: the first version failed `NotAuthorizedCanObtain`, this one reached `verified_after_remount` | `0fc2930e1fd9849a` |
+
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and
