@@ -6,20 +6,24 @@ Runs on the host the card is mounted on, as the user who owns the mount.
 
   python3 upgrade2-ums.py preflight <dir>
   python3 upgrade2-ums.py install   <dir>
-  python3 upgrade2-ums.py verify    <dir>   # unmount, remount, re-hash what install touched
+  python3 upgrade2-ums.py verify    <dir>   # re-read what install touched, from the card
 
 <dir> holds the NEW NRO and operator-approval.json ({"operator_order",
 "operator_install_authorized", "name", "data", "old", "new", "mount"}); receipts
 and local copies (before/, just-before/, backup-readback/, stage-readback/,
-after/, verify/) go there too. "mount" is the card's mount point. The verify
-phase defeats the page cache: it remounts the card with udisksctl and reads
-every file again from the device. Over ssh it remounts through the user's
-systemd manager (polkit refuses a udisks mount from a remote session), and it
-checks with pkcheck that one way is authorized before it unmounts."""
+after/, verify/) go there too. "mount" is the card's mount point.
+
+Every read of a card file bypasses the page cache (O_DIRECT; where a
+filesystem refuses it, the file's clean cached pages are dropped first), so a
+readback shows what the card holds, not what this process just wrote. The card
+is never unmounted or remounted (operator rule, 2026-11-01): verify reads every
+file in place."""
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -117,14 +121,52 @@ def exists(relative):
     return result
 
 
+ALIGN = 4096  # O_DIRECT buffer, offset and length alignment (covers 512 B and 4 KiB sectors)
+
+
+def read_from_card(relative):
+    """`(bytes, method)` of a card file as the card holds it. O_DIRECT reads
+    into a page-aligned buffer, skipping the page cache; if the open refuses
+    O_DIRECT, the file's clean cached pages are dropped (every write here was
+    fsynced) and it is read normally."""
+    path = card(relative)
+    size = path.stat().st_size
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        with open(path, 'rb') as handle:
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            return handle.read(), 'fadvise-dontneed'
+    try:
+        buffer = mmap.mmap(-1, max(ALIGN, -(-size // ALIGN) * ALIGN))
+        view = memoryview(buffer)
+        got = 0
+        while got < size:
+            assert got % ALIGN == 0, f'{relative}: short O_DIRECT read at {got}'
+            count = os.preadv(fd, [view[got:]], got)
+            if count == 0:
+                break
+            got += count
+        data = bytes(view[:got])
+        view.release()
+        buffer.close()
+    finally:
+        os.close(fd)
+    assert len(data) == size, f'{relative}: read {len(data)} of {size} bytes'
+    return data, 'o_direct'
+
+
 def download(relative, group, expected_size=None):
     destination = OUT / group / relative
     assert not destination.exists(), f'Preserve local evidence: {destination}'
     destination.parent.mkdir(parents=True, exist_ok=True)
     entry = op('copy-from-card', relative, destination)
-    shutil.copyfile(card(relative), destination)
+    data, method = read_from_card(relative)
+    destination.write_bytes(data)
     result = info(destination)
-    done(entry, **{k: result[k] for k in ('sha256', 'bytes')})
+    done(entry, method=method, **{k: result[k] for k in ('sha256', 'bytes')})
     assert result['bytes'] <= 30_000_000, relative
     if expected_size is not None:
         assert result['bytes'] == expected_size, relative
@@ -163,31 +205,14 @@ def mount_source():
     return run('/usr/bin/findmnt', '-n', '-o', 'SOURCE', '--target', str(ROOT)).strip()
 
 
-# polkit lets udisks mount a removable filesystem only for a process in an
-# active local session. Over ssh `udisksctl unmount` of your own mount works but
-# `udisksctl mount` is refused (NotAuthorizedCanObtain), which once left the card
-# unmounted after verify. A process the user's systemd manager starts sits in a
-# local `manager` session (systemd 256+) and is allowed, so verify picks a way
-# that pkcheck confirms before it unmounts anything.
-MOUNT_ACTION = 'org.freedesktop.udisks2.filesystem-mount'
-VIA_MANAGER = ('/usr/bin/systemd-run', '--user', '--wait', '--pipe', '--quiet')
-PROBE = ('import os, subprocess, sys; sys.exit(subprocess.run(["/usr/bin/pkcheck", "--action-id", '
-         f'"{MOUNT_ACTION}", "--process", str(os.getpid())], capture_output=True).returncode)')
-
-
-def remount_prefix():
-    """The command prefix under which `udisksctl mount` is authorized here:
-    none (this session), or the user's systemd manager. Raises before any
-    unmount when neither is."""
-    for prefix in ((), VIA_MANAGER):
-        entry = op('mount-authorized', *prefix)
-        process = subprocess.run([*prefix, sys.executable, '-I', '-c', PROBE], stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=60)
-        done(entry, exit_code=process.returncode, stderr=process.stderr)
-        if process.returncode == 0:
-            return prefix
-    raise AssertionError(f'no authorized way to remount {ROOT} ({MOUNT_ACTION}); the card is left mounted. '
-                         'Run verify from the desktop session, or remount by hand and re-read the files.')
+def mount_id():
+    """The kernel's id of the mount at ROOT: unchanged across verify shows the
+    card stayed mounted the whole time."""
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        fields = line.split()
+        if fields[4].replace('\\040', ' ') == str(ROOT):
+            return int(fields[0])
+    raise AssertionError(f'{ROOT} is not in mountinfo')
 
 
 source = info(OUT / NAME)
@@ -259,17 +284,8 @@ try:
     else:
         deployment = json.loads((OUT / 'deployment.json').read_text())
         assert deployment['state'] == 'installed_verified'
-        device = receipt['mount_source']
-        assert re.fullmatch(r'/dev/[a-z0-9/]+', device), device
-        prefix = remount_prefix()
-        receipt['remount_via'] = ' '.join(prefix) or 'this session'
-        state('remounting')
-        run('/usr/bin/udisksctl', 'unmount', '-b', device)
-        mounted = run(*prefix, '/usr/bin/udisksctl', 'mount', '-b', device)
-        match = re.search(r' at (/\S.*?)\.?\s*$', mounted)
-        assert match and Path(match.group(1)) == ROOT, f'remounted elsewhere: {mounted!r}'
-        assert ROOT.is_mount()
-        receipt['remount'] = mounted.strip()
+        receipt['mount_id_before'] = mount_id()
+        state('reading_in_place')
         receipt['verify'] = {}
         for relative, expected in deployment['after'].items():
             result = download(relative, 'verify', expected['bytes'])
@@ -278,8 +294,10 @@ try:
             assert result['sha256'] == expected['sha256'], relative
         receipt['plugin_names_verify'] = sorted(listing(PLUGINS))
         assert receipt['plugin_names_verify'] == deployment['plugin_names_after']
+        receipt['mount_id_after'] = mount_id()
+        assert receipt['mount_id_after'] == receipt['mount_id_before'], 'the card was remounted during verify'
         receipt['finished'] = now()
-        state('verified_after_remount')
+        state('verified_in_place')
 except Exception as error:
     receipt.update(error=repr(error), finished=now())
     state('failed')

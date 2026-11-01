@@ -262,11 +262,10 @@ both ways:
   - `upgrade2-ums.py` replaces an NRO when the card is mounted as a USB disk
     instead (hekate Nyx UMS, or a card reader): the same phases and receipts,
     with `mount` in the approval file, an atomic rename into place and a
-    `verify <dir>` phase that remounts the card and re-reads every file.
-    polkit refuses a udisks mount from an ssh session, so before it unmounts,
-    verify checks with `pkcheck` which way may mount: this session, or the
-    user's systemd manager (`systemd-run --user`, a local session since
-    systemd 256). With neither it stops and leaves the card mounted.
+    `verify <dir>` phase that re-reads every file the install touched. Every
+    read of the card skips the page cache (O_DIRECT), so readbacks show what
+    the card holds. Never unmount or remount the card to check it (operator
+    rule, 2026-11-01): read it in place.
   Each runs `preflight <dir>` and then `install <dir>` (`remove` for
   removal) from a folder holding the NRO and an `operator-approval.json`
   (`operator_order`, `operator_install_authorized`, `name`, `data`, `old`,

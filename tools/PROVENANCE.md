@@ -58,6 +58,7 @@ Changed on 2026-11-01:
 | Copy | Change | SHA-256 (first 16) |
 | --- | --- | --- |
 | `switch/upgrade2-ums.py` | verify remounts through the user's systemd manager when polkit refuses `udisksctl mount` over ssh, and checks with `pkcheck` that a way is authorized before it unmounts (the first version left the card unmounted over ssh). Tested on the Surface over ssh with a vfat loop image: the first version failed `NotAuthorizedCanObtain`, this one reached `verified_after_remount` | `0fc2930e1fd9849a` |
+| `switch/upgrade2-ums.py` | the card is never unmounted (operator rule): every card read is O_DIRECT (page-cache drop where refused), and verify re-reads in place, checking the mount id is unchanged. Tested on the Surface over ssh with a vfat loop image: every read `o_direct`, `verified_in_place` with the same mount id; after three bytes of the installed NRO were changed in the image behind the page cache, a normal read still showed the old bytes and a second verify failed on that file | `8fba8d5e74772bb6` |
 
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
