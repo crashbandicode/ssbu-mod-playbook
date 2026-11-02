@@ -169,19 +169,25 @@ def rows_for(repo, nro_path):
     lib = read(repo / 'src' / 'lib.rs')
     row('runtime only under cfg(target_os = "switch")', 'M', 'target_os = "switch"' in lib,
         'src/lib.rs')
-    sources = {p: read(p) for p in sorted((repo / 'src').glob('*.rs'))}
+    # Recursive: plugins that split model/runtime into folders (src/model/, src/runtime/) keep these items below src/.
+    sources = {p: read(p) for p in sorted((repo / 'src').rglob('*.rs'))}
     all_src = '\n'.join(sources.values())
-    row('supported version 13.0.5 in model', 'M', '13.0.5' in read(repo / 'src' / 'model.rs'),
-        'src/model.rs')
+    model_dir = repo / 'src' / 'model'
+    model_files = [p for p in [repo / 'src' / 'model.rs'] if p.is_file()] + \
+        (sorted(model_dir.rglob('*.rs')) if model_dir.is_dir() else [])
+    version_files = [p for p in model_files if '13.0.5' in read(p)]
+    row('supported version 13.0.5 in model', 'M', bool(version_files),
+        ', '.join(str(p.relative_to(repo)) for p in version_files[:3])
+        or ('13.0.5 not found in ' + (', '.join(str(p.relative_to(repo)) for p in model_files[:3]) or 'src/model.rs / src/model/')))
     guards = [g for g in re.findall(r'guard:\s*\[([^\]]*)\]', all_src, re.S)
               if 'u8' not in g]  # skip the field's type, `[u8; 64]`
     sizes = [len(re.findall(r'0x[0-9a-fA-F]{2}', g)) for g in guards]
     row('every site guard is 64 bytes', 'M', bool(sizes) and all(s == 64 for s in sizes),
         f'{len(sizes)} guard(s) in src/, sizes {sorted(set(sizes)) or "none"}')
     allocator = 'GlobalAlloc' in all_src and 'heap_allocations' in all_src
-    row('counting allocator reports heap_allocations', 'M', allocator, 'src/*.rs')
+    row('counting allocator reports heap_allocations', 'M', allocator, 'src/**/*.rs')
     tests = len(re.findall(r'#\[test\]', all_src))
-    row('host tests in model (cargo test)', 'M', tests > 0, f'{tests} #[test] in src/')
+    row('host tests in model (cargo test)', 'M', tests > 0, f'{tests} #[test] in src/**')
 
     readme = read(repo / 'README.md')
     row('README carries the AI-assistance disclaimer', 'M',

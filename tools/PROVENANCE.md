@@ -76,6 +76,10 @@ mount|unmount|power-off`, `gio mount`, `umount`, `eject`, `mount`), as a
 shell line or an argv list. It flagged the `48b1471` `upgrade2-ums.py`, which
 unmounted the card; the current tools and the 24 local plugin repos pass.
 
+On 2026-11-02 `check/compliance.py` reads `src/` recursively for the version, guard, allocator and test rows, and finds the
+version in `src/model.rs` or any file under `src/model/`: plugins that split model and runtime into folders
+(TrainingRoomsForUltimate: `src/model/`, `src/runtime/`) were reported as failing rows they meet.
+
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and
