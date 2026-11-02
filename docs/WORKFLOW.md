@@ -290,7 +290,21 @@ both ways:
     back, and the old file put back and read back when one differs. Its tests
     run against a fake card tree (the real `gio` on a `file://` directory, plus
     a fault-injecting wrapper): `python3 -I tools/switch/tests/test_replace_exefs.py`.
-  Each runs `preflight <dir>` and then `install <dir>` (`remove` for
+  - `swap-ums.py` swaps one installed plugin NRO for another on a mounted card
+    (remove + add as one transaction, for two plugins that must not be installed
+    together): `preflight`, `install` and `verify`. It archives the old NRO on
+    the card first (`<data>/backups/removed-<old16>.nro`, read back), stages the
+    new one, removes the old, renames the stage into the plugin folder and adds
+    the new plugin's data files (`ultimate/<folder>/<file>`, never overwriting,
+    never an import marker `migration.json`). Local copies and readbacks cover
+    the plugins, `exefs/`, the protected configs, `extra_protected` files and any
+    `watch` tree (every file up to 30 MB hashed, the rest listed), and free space
+    is checked. A mismatch or an interrupt after the first removal undoes the
+    swap in reverse (data files made by this run, the new NRO, the old NRO put
+    back and read back); the card ends fully swapped or as it was. The same tool
+    with `remove` and `add` exchanged undoes a completed swap. Tests on a fake
+    card tree: `python3 -I tools/switch/tests/test_swap_ums.py`.
+  Each of the others runs `preflight <dir>` and then `install <dir>` (`remove` for
   removal) from a folder holding the NRO and an `operator-approval.json`
   (`operator_order`, `operator_install_authorized`, `name`, `data`, `old`,
   `new`):

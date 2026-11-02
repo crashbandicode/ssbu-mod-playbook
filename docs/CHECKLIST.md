@@ -140,7 +140,7 @@ evidence doc.
   download.
 - **C** A rebuild of the tagged commit is byte-identical to the released
   NRO.
-- **C** Install over DBI MTP (or the mounted card with `upgrade2-ums.py`; Skyline's `exefs/subsdk9` with `replace-exefs.py`): preflight (card listing, local copies, `old`
+- **C** Install over DBI MTP (or the mounted card with `upgrade2-ums.py`; a swap of one plugin for another with `swap-ums.py`; Skyline's `exefs/subsdk9` with `replace-exefs.py`): preflight (card listing, local copies, `old`
   sha256 matches), a rollback copy on the card, readback of the new NRO,
   every other plugin and the protected files; receipts kept; a phase with an
   existing receipt is not re-run.
