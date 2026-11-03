@@ -202,17 +202,35 @@ The rules:
    below). The next run starts from them and records only what is still
    missing.
 
-#### The shared runner: write a row list, not a runner
+#### The shared runner: a helper, extended per project
 
-`tools/eden-runner/runner.py` is the runner. A test run writes only
-`rows.json` (segments, gates, rows) and, at `Up`, `instances.json` (each
-instance's control socket and the logs or files its gates read). Don't write
-another runner. If a step type is missing, add it to this tool with a test in
-`test_runner.py`.
+`tools/eden-runner/runner.py` runs the rows; `tools/eden-lifecycle` does
+`Up` and `Down` and writes `instances.json` (each instance's control socket
+and the files its gates read). A run writes `rows.json` and, for anything
+its plugin needs that the runner doesn't have, **project step hooks**: plain
+Python in the plugin's repo, `eden/steps.py`.
+
+- **Hooks are the flexible part.** A step `{"run": "eden/steps.py:open_defaults",
+  "args": {...}}` gets the runner's tools: `call`, `press`, `stick`, `play`,
+  `gate`, `ui`, `shot`, `wait_log` and `log`. Write the plugin's own menu
+  navigation and checks there, freely. They still run inside the row, so
+  stop files, the pace cap and `actions.jsonl` apply. Add `"check": true`
+  when the hook verifies the screen it leaves.
+- **Bring only generic needs to the shared tool**: something any plugin's
+  test would want (a new gate kind, a frontend operation). Add it with a
+  test in `test_runner.py`. Don't copy or fork `runner.py`.
+- **What stays fixed:** a test run doesn't drive one input at a time with a
+  model looking after each. Scripted inputs in a hook are fine. Lifecycle
+  hygiene and the pace check also stay.
+- **Record while exploring:** `runner.py record-start rows.json --instances
+  … --segment <name>`, then drive by hand (`step.ps1`, the GUI), then
+  `record-stop … --segment <name> [--start-gate <gate>]`. The segment lands
+  in `rows.json` with its sha256, ready for `play` steps and harvest.
+  Exploration stays interactive; what it finds becomes reusable.
 
 ```text
 python3 -I tools/eden-runner/runner.py dry-run eden/rows.json
-python3 -I tools/eden-runner/runner.py run eden/rows.json --instances runs/eNN/instances.json
+python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir>/instances.json
 ```
 
 - **Steps:** `play` a segment (`macro.play`, wait for it to finish, then

@@ -477,6 +477,60 @@ class RunnerTests(unittest.TestCase):
         self.manifest.write_text(json.dumps(self.plan))
         self.assertIn("call 'input.button'", ' | '.join(runner.dry_run(self.manifest)['errors']))
 
+    def test_project_step_hook_drives_and_checks_a_plugin_menu(self):
+        (self.dir / 'steps.py').write_text(
+            'def open_defaults(ctx, page="defaults"):\n'
+            '    ctx.press("zr")\n'
+            '    ctx.stick(0, -1, 50)\n'
+            '    line = ctx.wait_log("console_log", r"screen=" + page, cap=2)\n'
+            '    ctx.log({"opened": page})\n'
+            '    return line\n')
+        eden = FakeEden({})
+        original = eden.request
+
+        def request(method, params):
+            if method == 'input.stick' and params['y'] == -1:  # the plugin logs its new screen
+                with open(self.log, 'a') as f:
+                    f.write('[TR] screen=defaults\n')
+            return original(method, params)
+
+        eden.request = request
+        self.plan['rows'] = [{'id': 'menu', 'start': 'blue', 'end': 'defaults', 'steps': [
+            {'run': 'steps.py:open_defaults', 'args': {'page': 'defaults'}, 'check': True},
+            {'play': 'to-red'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])  # the checking hook is the play's start check
+        self.make(eden).run()
+        receipt = json.loads((self.dir / 'out' / 'menu.json').read_text())
+        self.assertEqual((receipt['status'], receipt['results'][0]['value']), ('PASS', 'screen=defaults'))
+        self.assertIn('input.button', eden.calls)
+        actions = (self.dir / 'out' / 'actions.jsonl').read_text()
+        self.assertIn('"opened": "defaults"', actions)
+        # A hook that won't load, or a moving hook before a play, is caught offline.
+        self.plan['rows'][0]['steps'][0] = {'run': 'steps.py:no_such_function'}
+        self.manifest.write_text(json.dumps(self.plan))
+        errors = ' | '.join(runner.dry_run(self.manifest)['errors'])
+        self.assertIn('no_such_function', errors)
+        self.assertIn('has no start check', errors)
+
+    def test_record_while_exploring_lands_the_segment_in_rows_json(self):
+        eden = FakeEden({})
+        new_rows = self.dir / 'explore' / 'rows.json'
+        new_rows.parent.mkdir()
+        started = runner.record_command('record-start', new_rows, self.instances, 'open-defaults', None,
+                                        client_factory=lambda s: eden)
+        self.assertEqual(started['recording'], 'open-defaults')
+        eden.request('input.button', {'button': 'zr', 'state': 'tap'})  # the agent explores by hand
+        stopped = runner.record_command('record-stop', new_rows, self.instances, 'open-defaults', None,
+                                        start_gate='training', client_factory=lambda s: eden)
+        plan = json.loads(new_rows.read_text())
+        seg = plan['segments']['open-defaults']
+        self.assertEqual((seg['sha256'], seg['start_gate']), (stopped['sha256'], 'training'))
+        self.assertEqual(seg['sha256'], sha(new_rows.parent / seg['file']))
+        with self.assertRaises(SystemExit):  # recorded segments are immutable: a second take needs a new name
+            runner.record_command('record-start', new_rows, self.instances, 'open-defaults', None,
+                                  client_factory=lambda s: eden)
+
     def test_named_pipe_client_round_trip(self):
         import io
 

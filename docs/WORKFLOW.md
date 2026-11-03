@@ -92,6 +92,12 @@ describes. Test that path in Eden with the diag stand-ins (`foreign=`).
   counting global allocator. Hooks shouldn't allocate.
 - **Events:** one line per event, in the diag build. The hook puts the line
   in a static buffer, and a writer thread appends it to the file.
+- **Screen and state lines for tests:** a plugin with its own menus or
+  modes logs one line whenever its screen or state changes, e.g.
+  `screen=defaults page=2` or `mode=waiting slot=3`. Test gates key on those
+  lines (`tools/eden-runner` log gates, or `wait_log` in a step hook)
+  instead of screenshots, so they survive a menu redesign, another
+  resolution or another host. Design these lines with the menu.
   gsp-visualizer and elite-rematch keep the buffer and the thread out of the
   shipped NRO, which writes only its install line; ssbu-tile-cursor, an Eden
   tool, writes every 100 ms.

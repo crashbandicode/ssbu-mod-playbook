@@ -102,7 +102,8 @@ evidence doc.
   segments too ([MACROS](MACROS.md), "Hybrid"); a fixed sleep only where
   neither exists, and then rounded up.
 - **M** A test run plays `tools/eden-runner/runner.py` with the run's own
-  `rows.json`; no project-specific runner. It was written and had an offline
+  `rows.json`, extended by project step hooks (`eden/steps.py`) where the
+  plugin needs them; no copied or forked runner. It was written and had an offline
   dry run before `Up`: recorded segments with sha256, automated gates, a receipt per
   row, rows chained on their end state, and the full restore once at `Down`
   ([MACROS](MACROS.md), "Test runs: the runner is ready before Up"). Manual

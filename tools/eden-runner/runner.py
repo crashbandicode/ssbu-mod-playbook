@@ -5,6 +5,8 @@ A test run writes only a row list (rows.json) and, at Up, an instances file. Thi
 
   runner.py dry-run <rows.json>                      offline: files, hashes, gates, row chain; lists missing segments
   runner.py run <rows.json> --instances <inst.json>  play the rows on the live instances
+  runner.py record-start|record-stop <rows.json> --instances <inst.json> --segment <name> [--start-gate <gate>]
+                                                     record while exploring by hand; the segment lands in rows.json
 
 rows.json (paths are relative to its folder):
   {
@@ -49,6 +51,11 @@ of the recording instead of wall time; use it for any stick hold whose length ma
 Reference images not taken yet: an image gate with "acquire": true and no reference file captures one the first time
 the run reaches it (once the region stops changing), writes its sha256 into rows.json, and the runner stops after that
 row with status REVIEW (exit 4). A model looks at the new references once, then runs again.
+
+Project step hooks (the plugin's own menus and checks, kept in the plugin's repo): {"run": "eden/steps.py:open_defaults",
+"args": {...}, "check": true|false}. The function gets a StepContext (call, press, stick, play, gate, ui, shot,
+wait_log, log, instance, row_dir) and runs inside the row: STOP files, the pace cap and actions.jsonl still apply.
+"check": true means the hook verifies the screen it leaves, so it counts as the start check for the next play.
 
 Eden's own frontend (menus, dialogs, the multiplayer room window): step {"ui": "trigger"|"click"|"set"|"key"|"select"|
 "items"|"context"|"close", "target": "<unique objectName>" or {"class": "QPushButton", "text": "^Host Room$"}, ...extra
@@ -240,6 +247,15 @@ def dry_run(manifest_path):
                     errors.append(f'row {row["id"]}: unknown gate {step["gate"]}')
                 elif gate.get('kind') == 'change' and (on, gate.get('mark')) not in marks:
                     errors.append(f'row {row["id"]}: change gate {step["gate"]} before its mark {gate.get("mark")!r}')
+            if 'run' in step:
+                try:
+                    load_step(base, step['run'])
+                except Exception as error:  # noqa: BLE001 - report any hook that won't load
+                    errors.append(f'row {row["id"]}: step hook {step["run"]!r}: {error!r}')
+                if step.get('check'):
+                    checked.add(on)  # the hook verifies the screen it leaves
+                else:
+                    checked.discard(on)  # a hook may move the game; check again before the next play
             if 'call' in step and step['call'] not in CALL_METHODS:
                 errors.append(f'row {row["id"]}: call {step["call"]!r} is not one of {", ".join(CALL_METHODS)}')
             if 'ui' in step and step['ui'] not in Runner.UI_OPS:
@@ -260,6 +276,69 @@ def dry_run(manifest_path):
 
 class StopRun(Exception):
     pass
+
+
+class StepContext:
+    """What a project step hook gets: the runner's own tools, bound to one instance and the current row.
+
+    A hook is plain Python in the plugin's repo (rows.json: {"run": "eden/steps.py:open_defaults", "args": {...}}).
+    It can call control methods (input included), take screenshots, play segments, check gates and operate the
+    frontend. Everything goes through the runner, so STOP/STOP-INPUT, the pace cap and actions.jsonl still apply.
+    """
+
+    def __init__(self, runner, on):
+        self.runner, self.on = runner, on
+        self.instance = runner.instances[on]
+        self.row_dir = runner.row_dir
+
+    def call(self, method, params=None, job_cap=15):
+        return self.runner.call(self.on, method, params, job_cap=job_cap)
+
+    def shot(self, name):
+        return self.runner.shot(self.on, name)
+
+    def play(self, segment):
+        return self.runner.play(self.on, segment)
+
+    def gate(self, name):
+        return self.runner.gate(self.on, name)
+
+    def ui(self, op, target=None, **params):
+        return self.runner.ui(self.on, {'ui': op, **({'target': target} if target is not None else {}), **params})
+
+    def press(self, button, ms=120):
+        """A scripted press (a route step in code, not a model looking after each input)."""
+        self.call('input.button', {'button': button, 'state': 'tap', 'duration_ms': ms, 'lease_ms': ms + 500})
+        time.sleep(ms / 1000 + .05)
+
+    def stick(self, x, y, ms=250):
+        self.call('input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': ms})
+        time.sleep(ms / 1000)
+        self.call('input.stick', {'stick': 'left', 'x': 0, 'y': 0, 'lease_ms': 100})
+
+    def wait_log(self, source, pattern, cap=10):
+        """Wait for a regex in an instance file (lines written during this row), like a log gate."""
+        lines = self.runner.check_gate_spec(self.on, {'kind': 'log', 'source': source, 'pattern': pattern, 'cap': cap},
+                                            'hook-log')
+        return lines[self.on]  # the matched text
+
+    def log(self, record):
+        self.runner.log({'hook': True, 'on': self.on, **record})
+
+    def check_stop(self):
+        self.runner.check_stop()
+
+
+def load_step(base, spec):
+    """'eden/steps.py:open_defaults' -> the function (path relative to the rows.json folder, or absolute)."""
+    path, _, function = spec.partition(':')
+    if not function:
+        raise ValueError(f'step hook {spec!r} needs "<file>.py:<function>"')
+    module_path = Path(path) if Path(path).is_absolute() else base / path
+    module_spec = importlib.util.spec_from_file_location('step_hook_' + module_path.stem, module_path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return getattr(module, function)
 
 
 class PipeClient:
@@ -517,7 +596,9 @@ class Runner:
                 self.wait_macro(on, seg.get('cap', 60))
 
     def check_gate(self, on, name):
-        gate = self.plan['gates'][name]
+        return self.check_gate_spec(on, self.plan['gates'][name], name)
+
+    def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
         if kind == 'log':
             # Lines from this row only: the line usually appears while the segment before the gate is playing.
@@ -776,6 +857,12 @@ class Runner:
                     elif 'ui' in step:
                         self.ui(on, step)
                         receipt['results'].append({'ui': step['ui'], 'on': on, 'target': step.get('target')})
+                    elif 'run' in step:
+                        hook = load_step(self.base, step['run'])
+                        value = hook(StepContext(self, on), **step.get('args', {}))
+                        receipt['results'].append({'run': step['run'], 'on': on,
+                                                   'value': value if isinstance(value, (str, int, float, bool, list,
+                                                                                        dict, type(None))) else repr(value)})
                     elif 'call' in step:
                         # "@key" values come from instances.json, e.g. {"call": "game.load", "params": {"path": "@game"}}
                         params = {k: (self.instances[on][v[1:]] if isinstance(v, str) and v.startswith('@') else v)
@@ -820,15 +907,59 @@ class Runner:
         return 'DONE'
 
 
+def record_command(mode, manifest, instances, name, on, start_gate=None, client_factory=None):
+    """Record while exploring: record-start opens an Eden recording into segments/<name>.edenmacro.json; drive the
+    game any way you like (step.ps1, gv.py press, the GUI); record-stop closes it and writes the segment with its
+    sha256 (and optional start gate) into rows.json, ready for play steps and harvest."""
+    manifest = manifest.resolve()
+    plan = json.loads(manifest.read_text()) if manifest.is_file() else {'start': 'unknown', 'segments': {}, 'gates': {},
+                                                                         'rows': []}
+    on = on or next(iter(instances))
+    client = (client_factory or default_client_factory())(instances[on]['socket'])
+    path = manifest.parent / 'segments' / f'{name}.edenmacro.json'
+    state_file = manifest.parent / 'segments' / f'.{name}.recording.json'
+    if mode == 'record-start':
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raise SystemExit(f'{path} exists; pick a new segment name (segments are immutable once recorded)')
+        reply = client.request('macro.record', {'name': name, 'path': str(path), 'player': 0, 'countdown_ms': 0})
+        if not reply.get('ok'):
+            raise SystemExit(f'macro.record failed: {reply}')
+        state_file.write_text(json.dumps({'segment': name, 'on': on, 'started': time.time()}) + '\n')
+        return {'recording': name, 'on': on, 'path': str(path), 'next': f'drive the game, then record-stop {name}'}
+    client.request('input.reset', {})
+    time.sleep(.12)  # one neutral frame before the recording closes
+    reply = client.request('macro.stop', {})
+    if not reply.get('ok') or not path.is_file():
+        raise SystemExit(f'macro.stop failed or no file was saved: {reply}')
+    seg = plan.setdefault('segments', {}).setdefault(name, {})
+    seg.update(file=f'segments/{name}.edenmacro.json', sha256=digest(path),
+               recorded=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    if start_gate:
+        seg['start_gate'] = start_gate
+    manifest.write_text(json.dumps(plan, indent=2) + '\n')
+    state_file.unlink(missing_ok=True)
+    return {'recorded': name, 'sha256': seg['sha256'], 'rows_json': str(manifest)}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('dry-run', 'run'))
+    parser.add_argument('mode', choices=('dry-run', 'run', 'record-start', 'record-stop'))
     parser.add_argument('manifest', type=Path)
     parser.add_argument('--instances', type=Path, help='instances.json written at Up (run mode)')
     parser.add_argument('--out', type=Path, help='output folder (default: <manifest folder>/out)')
     parser.add_argument('--rows', help='comma-separated row ids to run (default: all remaining)')
     parser.add_argument('--pace-minutes', type=float, default=15)
+    parser.add_argument('--segment', help='record-start/record-stop: the segment name')
+    parser.add_argument('--on', help='record-start/record-stop: the instance key (default: the first)')
+    parser.add_argument('--start-gate', help='record-stop: the gate that checks the segment\'s start screen')
     args = parser.parse_args(argv)
+    if args.mode in ('record-start', 'record-stop'):
+        if not (args.instances and args.segment):
+            parser.error(f'{args.mode} needs --instances and --segment')
+        print(json.dumps(record_command(args.mode, args.manifest, json.loads(args.instances.read_text()),
+                                        args.segment, args.on, args.start_gate)))
+        return 0
     manifest = args.manifest.resolve()
     report = dry_run(manifest)
     out = (args.out or manifest.parent / 'out').resolve()
