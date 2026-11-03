@@ -7,11 +7,13 @@ a label `eNN`, and every file a run writes is named after it.
 
 - **Eden:** the Eden-GIF build at
   `/home/intpa/Applications/Eden-GIF/current/Eden.AppImage`.
-  - `current` points at `20261030-a1796fe59ffe-elite-ratings-v8`.
+  - `current` points at `20261031-b3e672c43f03-nv01-timer` (2026-11-03; it
+    was `20261030-a1796fe59ffe-elite-ratings-v8` on 2026-10-31).
   - Its `tools/` has `edenctl.py`, the control client, and `eden-run.py`, the
     bounded launcher.
-  - Its `docs/` has `CLIControl.md` (the whole control API), `InputMacros.md`
-    and `ELITE_RATING_TESTS.md`.
+  - Its `docs/` has `CLIControl.md` (the whole control API), `InputMacros.md`,
+    `ELITE_RATING_TESTS.md` and `GUEST_TRACEPOINT.md` (see "Instrument the
+    running game without rebuilding" below).
 - **Profile:** `gv.py` copies source profile `b` of the Yoga
   (`/home/intpa/ssbu-desync-1029/profiles/b`) to
   `/home/intpa/gsp-visualizer-work/profiles/y`. Game content is hard-linked
@@ -79,6 +81,47 @@ input: menus load at different speeds, and one missed press puts every later
 input on the wrong screen. `step.ps1 -Label e19 -Steps 'b:a:4000,s:0:-1:250'`
 sends a short burst of input and then takes one screenshot. That is the
 basic loop. [MACROS](MACROS.md) has whole routes.
+
+## Instrument the running game without rebuilding
+
+2026-11-03. To learn a game-side fact (what a register or field holds at an
+instruction, whether a branch runs, when a lifetime ends), arm a guest
+tracepoint on the game that is already running. There's no plugin rebuild
+and no extra boot. Adding prints to a diag build and booting it again for
+each question cost one fork whole days of boots.
+
+```text
+edenctl --socket <run>/control.sock tracepoint arm 0x<addr> --register x0 --register x1 --register pc \
+        --memory-register x1 --memory-offset 16 --memory-size 64 --timeout-ms 600000
+edenctl --socket <run>/control.sock tracepoint status      # idle, armed, captured, expired or cancelled
+edenctl --socket <run>/control.sock tracepoint cancel
+```
+
+- **What it captures:** the chosen registers (`x0`–`x30`, `sp`, `pc`,
+  `pstate`) just before that instruction, plus up to 4,096 bytes of guest
+  memory from `--memory-address 0x…` or `--memory-register xN
+  [--memory-offset n]`. Then the game continues by itself. Guest code isn't
+  patched.
+- **Limits:**
+  - one armed request at a time, and one hit per request;
+  - a deadline of up to 10 minutes of wall time, cancelled when the game unloads;
+  - an AArch64 guest on an x86-64 host, with the GDB stub off;
+  - the address must be 4-byte aligned and mapped;
+  - the buffer is what that CPU sees, not an atomic snapshot.
+- **Where:** `edenctl.py` in the Eden build's `tools/`, documented in its
+  `docs/GUEST_TRACEPOINT.md`. On Windows (the Ally) use the same JSON
+  methods: `edenctl.ps1 -PipeName eden-control -Method tracepoint.arm
+  -ParamsJson '{"address":"0x…","registers":["x0","pc"],"memory_register":"x1","memory_size":64,"timeout_ms":600000}'`.
+- **How to plan it:**
+  - Before the run, write the list: address, registers, memory, the in-game
+    moment that reaches it, and what each answer decides.
+  - The run's single driver arms them in order during a run you're doing
+    anyway (one driver per instance).
+  - Addresses come from the game image (`main + offset` in the current
+    process), so read the module base from the run first.
+- **Keep a diag build** only for the plugin's own internal state, which a
+  native tracepoint can't see. A separate trace boot is for what neither can
+  capture, and the handoff says why.
 
 ## Keep matches short
 

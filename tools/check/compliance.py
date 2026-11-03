@@ -44,6 +44,7 @@ AGENT_ROWS = [
     ('Disk: one target dir per source copy (never shared between copies), cargo home shared per host and toolchain, df checked (>= 40 GB), finished build products deleted with a manifest', 'M'),
     ('Eden: waits gated on a log line or screenshot check', 'M'),
     ('Eden: failed precondition aborted and retried under the next label', 'M'),
+    ('Eden: game-side facts from guest tracepoints on a run already happening; diag rebuild or extra trace boot only with a stated reason', 'M'),
     ('Eden: profile restored, temp files removed, host released', 'M'),
     ('Eden: console.log searched for panic/abort/crash; run.json and memory.peak kept', 'M'),
     ('Every local command under the memory and time guard', 'M'),

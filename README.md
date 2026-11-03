@@ -91,6 +91,10 @@ working from the brief alone.
   - Matches use a short ruleset (1 stock, 1:00, items and hazards off)
     unless the test needs a long one ([EDEN](docs/EDEN.md), "Keep matches
     short").
+  - For a game-side fact, arm a guest tracepoint (`edenctl tracepoint arm`)
+    on the run that's already going instead of rebuilding a diag NRO and
+    booting again ([EDEN](docs/EDEN.md), "Instrument the running game
+    without rebuilding").
 - **Fixes:** fix the root cause. A workaround (guard, skip, restriction,
   tolerance, lint `allow`, feature gate) ships only after the operator
   approves it ([WORKFLOW](docs/WORKFLOW.md), "Root cause, or the operator's

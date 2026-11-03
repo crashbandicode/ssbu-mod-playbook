@@ -103,6 +103,10 @@ evidence doc.
   neither exists, and then rounded up.
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
+- **M** Game-side facts are captured with guest tracepoints on a run already
+  happening ([EDEN](EDEN.md), "Instrument the running game without
+  rebuilding"). A diag rebuild or an extra trace boot only for what a
+  tracepoint can't see, with the reason in the handoff.
 - **M** The ruleset is the shortest that covers the path under test: 1
   stock, a 1:00 limit, items, hazards and FS meter off ([EDEN](EDEN.md),
   "Keep matches short"). A longer match only when the test needs it, with
