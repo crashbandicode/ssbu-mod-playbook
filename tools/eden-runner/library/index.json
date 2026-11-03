@@ -369,6 +369,15 @@
       "end_gate": "result-card-a",
       "from_run": "p4s-shared",
       "row": "10-result-cards"
+    },
+    "waiting-menu-open": {
+      "file": "segments/waiting-menu-open.edenmacro.json",
+      "sha256": "c6ae5e685b84e64bea3de320aec18f8c140c1c3b061ab7851699bc7586c410c7",
+      "cap": 30,
+      "start_gate": "waiting",
+      "end_gate": "native-waiting-menu",
+      "from_run": "p4w-surface-01",
+      "row": "11-host-native-waiting-menu"
     }
   },
   "gates": {
@@ -2077,6 +2086,34 @@
       "cap": 25,
       "pattern": "\\[MiiAutoInit\\] catalog ready; capture_armed=\\[true, true\\] generations=\\[5, 5\\] opening=8\\b",
       "from_run": "lr09"
+    },
+    "native-guest-leave": {
+      "kind": "image",
+      "reference": "refs/native-guest-leave.png",
+      "sha256": "d8273dda91d361e2d4dfb94b24b04b9fa877bf101ca31029e0f89697dea3a946",
+      "roi": [
+        415,
+        260,
+        875,
+        300
+      ],
+      "cap": 12,
+      "reference_is_roi": true,
+      "from_run": "p4w-surface-01"
+    },
+    "native-waiting-menu": {
+      "kind": "image",
+      "reference": "refs/native-waiting-menu.png",
+      "sha256": "cc0586dcf4ed4ae7e9845874ceb50d711f09136626eeb55b2d07c44dbef2cd00",
+      "roi": [
+        80,
+        90,
+        440,
+        140
+      ],
+      "cap": 12,
+      "reference_is_roi": true,
+      "from_run": "p4w-surface-01"
     }
   }
 }
