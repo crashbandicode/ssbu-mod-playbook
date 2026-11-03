@@ -494,6 +494,9 @@ class RunnerTests(unittest.TestCase):
         self.make(eden).run()
         self.assertEqual(calls, [{'path': '/games/ssbu.xci'}])
         self.assertEqual(json.loads((self.dir / 'out' / 'load.json').read_text())['status'], 'PASS')
+        self.plan['rows'][0]['steps'][0]['call'] = 'trace.arm'  # tracing is allowed in rows
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
         self.plan['rows'][0]['steps'][0]['call'] = 'input.button'  # input stays in recorded segments
         self.manifest.write_text(json.dumps(self.plan))
         self.assertIn("call 'input.button'", ' | '.join(runner.dry_run(self.manifest)['errors']))

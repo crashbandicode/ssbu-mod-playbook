@@ -7,8 +7,15 @@ a label `eNN`, and every file a run writes is named after it.
 
 - **Eden:** the Eden-GIF build at
   `/home/intpa/Applications/Eden-GIF/current/Eden.AppImage`.
-  - `current` points at `20261031-b3e672c43f03-nv01-timer` (2026-11-03; it
-    was `20261030-a1796fe59ffe-elite-ratings-v8` on 2026-10-31).
+  - On the Surface, `current` points at
+    `20261103-063f1b80bb2c-persistent-tracing-6a0c80d2b858` (2026-11-03
+    21:05Z): the build with persistent guest tracing (`trace.*`, below). It
+    was `20261031-b3e672c43f03-nv01-timer` before that, and the Yoga keeps
+    that one until eden-tracing installs the new build there. Check the
+    host's own `current`.
+  - A run pins the resolved release path and the AppImage's sha256, never
+    `current`, and names that build in its results. Runs on two builds
+    aren't pooled without saying so.
   - Its `tools/` has `edenctl.py`, the control client, and `eden-run.py`, the
     bounded launcher.
   - Its `docs/` has `CLIControl.md` (the whole control API), `InputMacros.md`,
@@ -88,10 +95,57 @@ runner is ready before Up").
 ## Instrument the running game without rebuilding
 
 2026-11-03. To learn a game-side fact (what a register or field holds at an
-instruction, whether a branch runs, when a lifetime ends), arm a guest
-tracepoint on the game that is already running. There's no plugin rebuild
-and no extra boot. Adding prints to a diag build and booting it again for
-each question cost one fork whole days of boots.
+instruction, whether a branch runs, when a lifetime ends), trace the game
+that is already running. There's no plugin rebuild and no extra boot. Adding
+prints to a diag build and booting it again for each question cost one fork
+whole days of boots.
+
+### Persistent tracing (`trace.*`): the default
+
+Builds from `20261103-063f1b80bb2c-persistent-tracing-…` onwards (the Surface
+first) keep up to 256 trace points armed at once and stream every hit to a
+JSONL file. The release's `docs/GUEST_TRACEPOINT.md` is the reference;
+`edenctl.py` in its `tools/` is the client.
+
+- **From boot, to see plugin start-up:** launch with
+  `--trace-config <run>/trace.json`. `tools/eden-lifecycle` does this when
+  an instance in its config has `"trace": {"points": [...], "symbols":
+  [...]}`. It writes `trace.json` into the run folder and adds `trace_jsonl`
+  to `instances.json`. Points on a module that isn't loaded yet wait and
+  resolve when it loads.
+- **During a run:** `edenctl … trace arm '{"target": "…"}'`, then `trace
+  read '{"after": "<last next>"}'`, `trace counters`, `trace list` and
+  `trace disarm '{"id": "…"}'`. A row can do the same with a runner `call`
+  step, and a hook with `ctx.call`.
+- **Addresses:** `"target": "main+0x15d9a70"` or
+  `"libtraining_rooms.nro!hook_entry"`. For symbol names, load the plugin's
+  unstripped ELF (`symbols load <module> <elf>`, or `symbols` in
+  `trace.json`); its build ID must match the loaded NRO. `modules list` shows
+  what is loaded. An NRO loaded through the RO service has no file name, so
+  it shows as `nro:<build-id>` until a matching ELF names it.
+- **What a point records:** registers; `captures` with up to four nested
+  pointer reads and a type (`[[x0+0x10]+8]` as `u32`, `c-string(32)`,
+  `bytes`); a `condition` (`x1 == 3`, `[x0+0x30] != 0`, `thread == main`);
+  `on_return` (pairs the return with its entry, and x0 is recorded); a
+  `backtrace`; or `"mode": "counters"` for hit counts only. Each record has
+  `frame` (vsync count), `thread_id`, `core_id` and module/symbol locations.
+- **Use the stream as a gate:** a runner `log` gate on `trace_jsonl` (for
+  example `"pattern": "\"point_id\":\"3\".*\"event\":\"return\""`) waits for
+  the game to reach a function, with no screenshot and no plugin print.
+- **Limits:** 1,024 records in memory; a hot point is rate-limited
+  (default 1,000 records/s) and losses are counted (`loss` lines, `trace
+  counters`), not hidden. Its overhead on FPS isn't measured yet, so keep
+  heavy points out of timing and performance rows.
+- **Not there yet:** data watchpoints, allocation accounting, hitch
+  sampling and `unmapped_access: "fault"`. Unmapped-access log lines now
+  carry a module/symbol and backtrace, but they are sampled, not the
+  faulting instruction, so they don't replace the console crash check (see
+  "Read the results").
+
+### One-shot tracepoint (`tracepoint.*`)
+
+Every build since `20261031-…` has the single-shot form; on older builds it
+is the only one.
 
 ```text
 edenctl --socket <run>/control.sock tracepoint arm 0x<addr> --register x0 --register x1 --register pc \
@@ -122,8 +176,9 @@ edenctl --socket <run>/control.sock tracepoint cancel
     anyway (one driver per instance).
   - Addresses come from the game image (`main + offset` in the current
     process), so read the module base from the run first.
-- **Keep a diag build** only for the plugin's own internal state, which a
-  native tracepoint can't see. A separate trace boot is for what neither can
+- **Keep a diag build** only for what tracing can't see: allocation
+  accounting, data watchpoints, or plugin state no pointer chain reaches
+  from a hooked function. A separate trace boot is for what neither can
   capture, and the handoff says why.
 
 ## Keep matches short

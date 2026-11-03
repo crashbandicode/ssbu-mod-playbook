@@ -386,6 +386,16 @@ def validate(config):
         names = [pin.get('name', Path(pin['path']).name) for pin in item['plugins']]
         require(len(names) == len(set(names)) and all(Path(name).name == name and name.endswith('.nro') for name in names),
                 'Unique basename .nro plugin names required')
+        if 'trace' in item:
+            # Persistent guest tracing from boot (Eden's --trace-config; docs/GUEST_TRACEPOINT.md).
+            trace = item['trace']
+            require(not windows, 'trace: launch-time tracing is wired for Linux hosts only')
+            require(isinstance(trace, dict) and isinstance(trace.get('points'), list) and 0 < len(trace['points']) <= 256,
+                    'trace needs 1..256 points')
+            for symbols in trace.get('symbols', []):
+                require(isinstance(symbols.get('module'), str) and symbols['module'], 'trace symbols need a module')
+                safe_absolute(symbols['elf'])
+            require(trace.get('unmapped_access', 'log') in ('log', 'off'), 'trace unmapped_access must be log or off')
         for name in item.get('sources', {}).values():
             relative(name)
         require(not set(item.get('sources', {})) & {'socket', 'profile', 'console_log', 'control_log'},
@@ -518,6 +528,14 @@ class Host:
         command += [key + '=' + value for key, value in env.items()]
         command += [item['app']['path'], '--control-socket', item['socket'],
                     '--control-log', str(run / 'control.jsonl'), '--control-verbose', '--control-background']
+        if item.get('trace'):
+            # Points armed before boot resolve when their module loads, so plugin start-up is observed.
+            trace = item['trace']
+            trace_config = {'run_directory': str(run), 'label': item['key'],
+                            'unmapped_access': trace.get('unmapped_access', 'log'),
+                            'symbols': trace.get('symbols', []), 'points': trace['points']}
+            save(run / 'trace.json', trace_config)
+            command += ['--trace-config', str(run / 'trace.json')]
         self.run(['systemd-run', '--user', '--quiet', '--service-type=exec', '--unit=' + item['unit'],
                   '--property=MemoryMax=8G', '--property=MemorySwapMax=0', '--property=TasksMax=256',
                   '--property=RuntimeMaxSec=' + str(config.get('runtime', 5400)), '--property=KillMode=control-group',
@@ -1130,6 +1148,8 @@ class Lifecycle:
                     instances[item['key']] = {'socket': item['socket'], 'console_log': item['console_log'],
                         'profile': item['profile'], 'control_log': str(Path(item['run']) / 'control.jsonl'),
                         'game': item['game'],
+                        **({'trace_jsonl': str(Path(item['run']) / (item['key'] + '.trace.jsonl'))}
+                           if item.get('trace') else {}),
                         **({'screenshot_target': 'screen'} if self.c['host'] == 'ally' else {}),
                         **{name: str(Path(item['profile']) / rel) for name, rel in sources.items()}}
                 save(self.directory / 'instances.json', instances)

@@ -116,10 +116,14 @@ evidence doc.
   the `macro.play` calls in `control.jsonl`.
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
-- **M** Game-side facts are captured with guest tracepoints on a run already
-  happening ([EDEN](EDEN.md), "Instrument the running game without
-  rebuilding"). A diag rebuild or an extra trace boot only for what a
-  tracepoint can't see, with the reason in the handoff.
+- **M** Game-side facts are captured with guest tracing on a run already
+  happening: persistent `trace.*` points (from boot via the lifecycle's
+  `trace`, or armed during the run) on builds that have them, the one-shot
+  tracepoint otherwise ([EDEN](EDEN.md), "Instrument the running game
+  without rebuilding"). A diag rebuild or an extra trace boot only for what
+  tracing can't see (allocation accounting, watchpoints), with the reason in
+  the handoff. Evidence: the trace JSONL or captured result, and the build
+  it ran on.
 - **M** The ruleset is the shortest that covers the path under test: 1
   stock, a 1:00 limit, items, hazards and FS meter off ([EDEN](EDEN.md),
   "Keep matches short"). A longer match only when the test needs it, with

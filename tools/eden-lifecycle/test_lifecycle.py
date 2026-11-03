@@ -590,6 +590,34 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.host.calls)
         self.assertTrue(self.ledger.released)
 
+    def test_trace_config_is_written_and_passed_at_launch(self):
+        points = [{'target': 'libtraining_rooms.nro!hook_entry', 'registers': ['x0'], 'on_return': True},
+                  {'target': 'main+0x15d9a70', 'mode': 'counters'}]
+        self.config['instances'][0]['trace'] = {'points': points, 'symbols': [
+            {'module': 'libtraining_rooms.nro', 'elf': str(Path(self.config['state_dir']).parent / 'plugin.elf')}]}
+        c = self.controller()
+        c.up()
+        instances = json.loads((Path(self.config['state_dir']) / 'instances.json').read_text())
+        self.assertTrue(instances['a']['trace_jsonl'].endswith('/run-a/a.trace.jsonl'))
+        item = c.state['instances'][0]
+        host, commands = life.Host(), []
+        host.run = lambda argv, cap=30: commands.append(argv) or ''
+        host.unit = lambda _: {'ActiveState': 'active', 'MemoryMax': str(8 * life.GIB), 'MemorySwapMax': '0', 'TasksMax': '256'}
+        host.owned = lambda _: [{'pid': 999, 'start': 'fake', 'boot': 'fake'}]
+        exists = Path.exists
+        with patch.object(Path, 'exists', lambda path: True if str(path).startswith('/tmp/.X11-unix/X') else exists(path)):
+            with patch.object(Path, 'is_symlink', return_value=False):
+                host.launch(item, self.config)
+        command = commands[0]
+        trace_json = Path(item['run']) / 'trace.json'
+        self.assertEqual(command[command.index('--trace-config') + 1], str(trace_json))
+        written = json.loads(trace_json.read_text())
+        self.assertEqual((written['run_directory'], written['label'], written['points']), (item['run'], 'a', points))
+        # Bad trace configs are refused before anything happens.
+        self.config['instances'][0]['trace'] = {'points': []}
+        with self.assertRaises(life.Refused):
+            life.validate(self.config)
+
     def test_native_backend_launch_command_is_bounded_and_sanitized_without_executing(self):
         c = self.controller()
         c.up()

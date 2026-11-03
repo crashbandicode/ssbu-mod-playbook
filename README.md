@@ -95,10 +95,11 @@ working from the brief alone.
     `Up`. Single presses with a screenshot after each are only for building a
     missing segment ([MACROS](docs/MACROS.md), "Test runs: the runner is
     ready before Up").
-  - For a game-side fact, arm a guest tracepoint (`edenctl tracepoint arm`)
-    on the run that's already going instead of rebuilding a diag NRO and
-    booting again ([EDEN](docs/EDEN.md), "Instrument the running game
-    without rebuilding").
+  - For a game-side fact, trace the run that's already going instead of
+    rebuilding a diag NRO and booting again: persistent `trace.*` points
+    (from boot, by symbol from the plugin's ELF, streamed to JSONL) on the
+    tracing builds, or a one-shot `edenctl tracepoint arm` ([EDEN](docs/EDEN.md),
+    "Instrument the running game without rebuilding").
 - **Fixes:** fix the root cause. A workaround (guard, skip, restriction,
   tolerance, lint `allow`, feature gate) ships only after the operator
   approves it ([WORKFLOW](docs/WORKFLOW.md), "Root cause, or the operator's

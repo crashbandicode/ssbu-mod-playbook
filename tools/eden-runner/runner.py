@@ -64,7 +64,10 @@ Gate {"kind": "ui", "match": {...}, "cap": 30} waits for a matching widget. Onli
 BEFORE the game loads (Eden refuses room setup while a game runs): eden-lifecycle "defer_load": true leaves the
 frontend ready, then a row does {"call": "game.load", "params": {"path": "@game"}, "job_cap": 180} and a gate
 {"kind": "status", "expect": {"running": true, "loading_complete": true}, "max_frame_age_ms": 1500, "cap": 180}.
-"call" takes only game.load/pause/resume, status and settings.get/set/save; "@key" reads instances.json.
+"call" takes only game.load/pause/resume, status, settings.get/set/save and the tracing methods (trace.arm/read/
+counters/list/disarm, modules.list, symbols.load, tracepoint.*); "@key" reads instances.json. With eden-lifecycle's
+per-instance "trace", instances.json has "trace_jsonl": a log gate on it waits for a traced function, e.g.
+{"kind": "log", "source": "trace_jsonl", "pattern": "\"point_id\":\"2\".*\"event\":\"return\"", "cap": 30}.
 
 More gates:
   {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
@@ -90,7 +93,10 @@ from pathlib import Path
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
 GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status')
 # Control methods a row may call directly with a {"call": ...} step. Input stays in recorded segments.
-CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.get', 'settings.set', 'settings.save')
+CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.get', 'settings.set', 'settings.save',
+                # Guest tracing (Eden persistent-tracing builds, docs/GUEST_TRACEPOINT.md); never input.
+                'trace.arm', 'trace.read', 'trace.counters', 'trace.list', 'trace.disarm', 'modules.list',
+                'symbols.load', 'tracepoint.arm', 'tracepoint.status', 'tracepoint.cancel')
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
