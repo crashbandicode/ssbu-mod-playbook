@@ -559,7 +559,12 @@ class Runner:
         source = self.source(on, gate['source'])
         if not source.is_file():
             return None
-        offset = 0 if gate.get('whole_file') else self.row_offsets.get(str(source), 0)
+        offset, inode = (0, None) if gate.get('whole_file') else self.row_offsets.get(str(source), (0, None))
+        stat = source.stat()
+        if stat.st_ino != inode and inode is not None or stat.st_size < offset:
+            # The file was rotated (new inode) or truncated since the row started: everything in it now was
+            # written during this row (lr-04's practice-diagnostics.log rotated mid-row, 2026-11-03).
+            offset = 0
         with source.open('rb') as f:
             f.seek(offset)
             text = f.read().decode('utf-8', 'replace')
@@ -805,15 +810,22 @@ class Runner:
 
     # --- rows ----------------------------------------------------------------------------------------------------
     def log_offsets(self):
-        """Current size of every log a gate reads, so log gates see only lines written during the row."""
+        """Size and inode of every file a log gate or a hook's wait_log may read (every instance file and every
+        log gate source), so they see only lines written during the row, also across rotation or truncation."""
+        paths = set()
+        for on, inst in self.instances.items():
+            paths.update(str(v) for v in inst.values() if isinstance(v, str) and v.startswith('/'))
+            for gate in self.plan.get('gates', {}).values():
+                if gate.get('kind') == 'log':
+                    paths.add(str(self.source(on, gate['source'])))
         offsets = {}
-        for gate in self.plan.get('gates', {}).values():
-            if gate.get('kind') != 'log':
+        for path in paths:
+            try:
+                stat = Path(path).stat()
+            except OSError:
                 continue
-            for on in self.instances:
-                source = self.source(on, gate['source'])
-                if source.is_file():
-                    offsets[str(source)] = source.stat().st_size
+            if Path(path).is_file():
+                offsets[path] = (stat.st_size, stat.st_ino)
         return offsets
 
     def run(self, only=None):

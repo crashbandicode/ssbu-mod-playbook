@@ -151,6 +151,23 @@ class RunnerTests(unittest.TestCase):
         self.make(eden).run()
         self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
 
+    def test_log_gate_sees_a_rotated_or_truncated_log(self):
+        # The plugin rotates its log mid-row: the new file is shorter than the row-start offset (lr-04, row 13).
+        self.log.write_text('x' * 5000 + '\n')
+        eden = FakeEden({'to-red': RED, 'to-blue': BLUE})
+        original = eden.request
+
+        def request(method, params):
+            if method == 'macro.play' and 'pause' in params['path']:
+                rotated = self.dir / 'console.log.new'
+                rotated.write_text('[TR] paused=1\n')
+                rotated.replace(self.log)  # new inode, smaller file
+            return original(method, params)
+
+        eden.request = request
+        self.make(eden).run()
+        self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
+
     def test_log_gate_ignores_lines_written_before_the_step(self):
         eden = FakeEden({'to-red': RED})  # never appends paused=1
         with self.assertRaises(RuntimeError):
