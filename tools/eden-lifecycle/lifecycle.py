@@ -214,15 +214,67 @@ def active_claims(text, host):
             if scope in (host.lower(), 'unknown')]
 
 
+def validate_stale_claim_hours(value):
+    require(type(value) in (int, float) and 0 < value < math.inf,
+            'stale_claim_hours must be a finite positive number')
+
+
+def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, now=None):
+    """Opt-in admission policy only; never reconcile or release foreign claims.
+
+    Keep active_claims' release pairing authoritative. Ambiguous ownership,
+    scope or time stays blocking, even when the opt-in policy is enabled.
+    """
+    opened = active_claims(text, host)
+    if stale_claim_hours is None:
+        return {'blocking': opened, 'stale_claim_skipped': []}
+    validate_stale_claim_hours(stale_claim_hours)
+    clean = isinstance(admission, dict) and admission.get('foreign_processes') == []
+    now = now if now is not None else datetime.now(timezone.utc)
+    current_owner = re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s*(\S+)', owner, re.I)
+    current_owner = (current_owner[1].lower(), current_owner[2]) if current_owner else None
+    blocking, skipped = [], []
+    for line in opened:
+        # Require an entire, timezone-aware timestamp before the CLAIMED event.
+        event = re.fullmatch(r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?'
+                             r'(?:Z|[+-]\d{2}:\d{2}))\s+CLAIMED:\s*(.*)', line)
+        if not clean or not event:
+            blocking.append(line)
+            continue
+        body = event[2]
+        claimed_owner = re.match(r'(OpenCode|Codex|Claude|Cursor)\s*'
+                                 r'([A-Za-z0-9][A-Za-z0-9_./:-]*)(?=\s|$)', body, re.I)
+        scopes = {a.lower() or b.lower() for a, b in re.findall(
+            r'\bhost=([A-Za-z0-9_.-]+)\b|\bon\s+(surface|yoga|ally)\b', body, re.I)}
+        if (current_owner is None or not claimed_owner
+                or claimed_owner[2].lower() in ('on', 'host', 'lifecycle', 'run', 'display', 'profile')
+                or (claimed_owner[1].lower(), claimed_owner[2]) == current_owner
+                or scopes != {host.lower()}):
+            blocking.append(line)
+            continue
+        try:
+            claimed_at = datetime.fromisoformat(event[1].replace('Z', '+00:00'))
+            age_hours = (now - claimed_at).total_seconds() / 3600
+        except (ValueError, OverflowError):
+            blocking.append(line)
+            continue
+        if age_hours > stale_claim_hours:
+            skipped.append({'line': line, 'age_hours': age_hours, 'checked_at': now.isoformat()})
+        else:
+            blocking.append(line)
+    return {'blocking': blocking, 'stale_claim_skipped': skipped}
+
+
 class Ledger:
     def __init__(self, path, host, owner, token, remote=None):
         self.path, self.host, self.owner, self.token = str(path), host, owner, token
         self.remote = remote
 
-    def operate(self, operation):
+    def operate(self, operation, stale_claim_hours=None, admission=None):
         if self.remote:
             return forward(self.remote, 'ledger-' + operation,
-                           {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token}, True)
+                           {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
+                            'stale_claim_hours': stale_claim_hours, 'admission': admission}, True)
         path = safe_absolute(self.path)
         require(path.is_file(), 'Authoritative ledger must already exist')
         # Never replace/truncate the shared ledger or normalize it on disk.
@@ -237,8 +289,11 @@ class Ledger:
                         'owned_claim': any(exact(line) for line in opened),
                         'owned_release': any('RELEASED:' in line and exact(line) for line in text.splitlines())}
             require(operation in ('claim', 'release'), 'Unknown ledger operation')
+            skipped = []
             if operation == 'claim':
-                require(not active_claims(text, self.host), 'Open host claim; no profile changes permitted')
+                policy = claim_admission(text, self.host, self.owner, stale_claim_hours, admission)
+                require(not policy['blocking'], 'Open host claim; no profile changes permitted')
+                skipped = policy['stale_claim_skipped']
             else:
                 own = [line for line in active_claims(text, self.host)
                        if f'lifecycle={self.token} ' in line and f'{self.owner} ' in line]
@@ -250,10 +305,10 @@ class Ledger:
             stream.write('\n' + line + '\n')
             stream.flush()
             os.fsync(stream.fileno())
-            return {'line': line}
+            return {'line': line, 'stale_claim_skipped': skipped}
 
-    def claim(self):
-        return self.operate('claim')
+    def claim(self, stale_claim_hours=None, admission=None):
+        return self.operate('claim', stale_claim_hours, admission)
 
     def release(self):
         return self.operate('release')
@@ -264,6 +319,8 @@ class Ledger:
 
 def validate(config):
     require(config.get('host') in ('surface', 'yoga'), 'host must be surface or yoga')
+    if 'stale_claim_hours' in config:
+        validate_stale_claim_hours(config['stale_claim_hours'])
     require(isinstance(config.get('hostname'), str) and re.fullmatch(r'[A-Za-z0-9_.-]+', config['hostname']),
             'Explicit executor kernel hostname required; SSH aliases are not host identity')
     require(isinstance(config.get('owner'), str) and re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', config['owner']),
@@ -531,6 +588,7 @@ class Lifecycle:
         require(value['mem_available'] >= MIN_MEMORY, 'MemAvailable below 10 GiB')
         require(value['disk_free'] >= MIN_DISK, 'Free disk below 40 GB')
         require(not value['foreign_processes'], 'Eden/compiler already active on host')
+        return value
 
     def poll(self, predicate, cap, what):
         end = self.host.clock() + cap
@@ -641,9 +699,12 @@ class Lifecycle:
                           'config': self.c, 'instances': [], 'started': stamp()}
             self.write()
             try:
-                self.admission()
-                claim = self.ledger().claim()
+                admission = self.admission()
+                claim = self.ledger().claim(stale_claim_hours=self.c.get('stale_claim_hours'), admission=admission)
                 self.state['claimed'] = True
+                self.state['stale_claim_skipped'] = claim.get('stale_claim_skipped', [])
+                for skipped in self.state['stale_claim_skipped']:
+                    self.record('stale_claim_skipped', skipped)
                 self.record('claim', claim)
                 self.write()
                 root.mkdir(parents=True)
@@ -697,7 +758,8 @@ class Lifecycle:
                 save(self.directory / 'instances.json', instances)
                 self.state['phase'] = 'up'
                 self.write()
-                return {'phase': 'up', 'instances': instances, 'instances_file': str(self.directory / 'instances.json')}
+                return {'phase': 'up', 'instances': instances, 'instances_file': str(self.directory / 'instances.json'),
+                        'stale_claim_skipped': self.state['stale_claim_skipped']}
             except BaseException as error:
                 self.state['up_error'] = repr(error)
                 self.write()
@@ -854,7 +916,8 @@ def forward(host, mode, config, execute, run=subprocess.run):
 def dispatch(mode, config, execute=False):
     require(mode == 'status' or execute, 'Runtime mutation needs explicit --execute; tests inject fakes')
     if mode.startswith('ledger-'):
-        return Ledger(config['ledger'], config['host'], config['owner'], config['token']).operate(mode[7:])
+        return Ledger(config['ledger'], config['host'], config['owner'], config['token']).operate(
+            mode[7:], config.get('stale_claim_hours'), config.get('admission'))
     return getattr(Lifecycle(config), mode)()
 
 

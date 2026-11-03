@@ -2,6 +2,7 @@
 """Offline only: fake host/RPC/claims; all filesystem fixtures are temporary."""
 import base64
 from copy import deepcopy
+from datetime import datetime, timezone
 import importlib.util
 import io
 import json
@@ -10,7 +11,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 spec = importlib.util.spec_from_file_location('lifecycle', Path(__file__).with_name('lifecycle.py'))
 life = importlib.util.module_from_spec(spec)
@@ -22,13 +23,18 @@ class FakeLedger:
         self.order = order
         self.claimed = self.released = False
         self.refuse = False
+        self.open_text = ''
 
-    def claim(self):
+    def claim(self, stale_claim_hours=None, admission=None):
         self.order.append('claim')
         if self.refuse:
             raise life.Refused('foreign claim')
+        policy = life.claim_admission(self.open_text, 'surface', 'OpenCode test-session/test-stream',
+                                      stale_claim_hours, admission)
+        life.require(not policy['blocking'], 'Open host claim; no profile changes permitted')
         self.claimed = True
-        return {'line': 'FAKE claim; no coordination file touched'}
+        return {'line': 'FAKE claim; no coordination file touched',
+                'stale_claim_skipped': policy['stale_claim_skipped']}
 
     def release(self):
         self.order.append('release')
@@ -271,6 +277,67 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(Path(self.config['work_root']).exists())
         self.assertFalse(self.host.calls)
 
+    def test_old_claim_no_foreign_process_is_skipped_and_reported(self):
+        self.config['stale_claim_hours'] = 24
+        lines = ['2026-10-31T12:00:00.000+00:00 CLAIMED: Codex01abc/project on Surface old',
+                 '2026-10-30 12:00Z CLAIMED: Claude old/stream host=surface old']
+        self.ledger.open_text = '\n'.join(lines)
+        c = self.controller()
+        with patch.object(life, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
+            value = c.up()
+        receipts = value['stale_claim_skipped']
+        self.assertEqual([r['line'] for r in receipts], lines)
+        self.assertEqual([r['age_hours'] for r in receipts], [72, 96])
+        actions = [json.loads(line) for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+        self.assertEqual([a['value'] for a in actions if a['kind'] == 'stale_claim_skipped'], receipts)
+        self.assertEqual(self.state()['stale_claim_skipped'], receipts)
+        self.assertEqual(self.ledger.open_text, '\n'.join(lines))
+        self.assertEqual(c.down()['phase'], 'down')
+        self.assertEqual(self.ledger.open_text, '\n'.join(lines))
+        self.assertEqual(self.ledger_path.read_text(), '# TEMPORARY test data; not OWNER-COORDINATION\n')
+
+    def test_old_claim_with_foreign_process_still_blocks_before_claim(self):
+        self.config['stale_claim_hours'] = 24
+        self.ledger.open_text = '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream on Surface old'
+        self.host.foreign = [{'pid': 999, 'name': 'rustc'}]
+        with self.assertRaisesRegex(life.Refused, 'Eden/compiler already active'):
+            self.controller().up()
+        self.assertNotIn('claim', self.order)
+        self.assertFalse(self.ledger.claimed or self.ledger.released)
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertFalse(self.host.calls)
+
+    def test_young_claim_still_blocks_with_stale_option(self):
+        self.config['stale_claim_hours'] = 24
+        self.ledger.open_text = '2026-11-03 11:00Z CLAIMED: OpenCode foreign/stream on Surface young'
+        with patch.object(life, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
+            with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+                self.controller().up()
+        self.assertFalse(self.ledger.claimed or self.ledger.released)
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertFalse(self.host.calls)
+
+    def test_no_stale_field_preserves_strict_old_claim_blocking(self):
+        self.ledger.open_text = '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream on Surface old'
+        c = self.controller()
+        self.assertNotIn('stale_claim_hours', c.c)
+        with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+            c.up()
+        self.assertFalse(self.ledger.claimed or self.ledger.released)
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertFalse(self.host.calls)
+
+    def test_stale_option_rejects_invalid_values_without_any_action(self):
+        for value in (None, True, False, 0, -1, '24', float('nan'), float('inf')):
+            with self.subTest(value=value):
+                self.config['stale_claim_hours'] = value
+                with self.assertRaisesRegex(life.Refused, 'stale_claim_hours'):
+                    self.controller()
+        self.assertFalse(self.order)
+        self.assertFalse(Path(self.config['state_dir']).exists())
+
     def test_pins_checked_before_claim(self):
         self.plugin.write_bytes(b'changed')
         with self.assertRaisesRegex(life.Refused, 'Pinned input mismatch'):
@@ -469,7 +536,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.ledger_path.read_text(), '# TEMPORARY test data; not OWNER-COORDINATION\n')
 
     def test_claim_append_ack_loss_is_read_back_and_released_without_boot(self):
-        def lost_ack():
+        def lost_ack(**kwargs):
             self.ledger.claimed = True
             raise RuntimeError('synthetic claim ACK lost')
         self.ledger.claim = lost_ack
@@ -535,6 +602,74 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_stale_policy_fails_closed_on_missing_process_evidence_or_ambiguous_claims(self):
+        now = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
+        owner = 'OpenCode test/owner'
+        old = '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream host=surface old'
+        for admission in (None, {}, {'foreign_processes': None},
+                          {'foreign_processes': [{'pid': 123, 'name': 'eden'}]}):
+            with self.subTest(admission=admission):
+                self.assertEqual(life.claim_admission(old, 'surface', owner, 24, admission, now)['blocking'], [old])
+        for line in (
+            '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream unknown host',
+            '2026-10-01 12:00Z CLAIMED: host=surface owner-less',
+            '2026-10-01 12:00Z CLAIMED: OpenCode on Surface owner-less',
+            '2026-10-01 12:00Z CLAIMED: OpenCode host=surface owner-less',
+            '2026-10-01 12:00Z CLAIMED: Claude run e04 on Surface owner-less',
+            '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream host=surface on Yoga conflict',
+            '2026-10-01 12:00Z CLAIMED: OpenCode test/owner host=surface same owner',
+            'invalid-time CLAIMED: OpenCode foreign/stream host=surface old',
+            '2026-02-30 12:00Z CLAIMED: OpenCode foreign/stream host=surface invalid date',
+            '2026-10-01T12:00:00 CLAIMED: OpenCode foreign/stream host=surface naive time',
+            '2026-11-04 12:00Z CLAIMED: OpenCode foreign/stream host=surface future',
+            '2026-11-02 12:00Z CLAIMED: OpenCode foreign/stream host=surface exactly threshold',
+        ):
+            with self.subTest(line=line):
+                policy = life.claim_admission(line, 'surface', owner, 24, {'foreign_processes': []}, now)
+                self.assertEqual(policy, {'blocking': [line], 'stale_claim_skipped': []})
+
+    def test_remote_ledger_policy_round_trip_uses_in_memory_stream_only(self):
+        old = '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream host=surface old\n'
+        file = mock_open(read_data=old)
+        path = Path('/tmp/opencode/in-memory-ledger-not-created')
+        remote = life.Ledger(path, 'surface', 'OpenCode test/owner', 'own-token', remote='yoga')
+        packets = []
+        def forward(host, mode, config, execute):
+            packets.append((host, mode, json.loads(json.dumps(config)), execute))
+            # Exercise the same dispatch boundary as SSH, without a subprocess/file write.
+            return life.dispatch(mode, packets[-1][2], execute)
+        with patch.object(life, 'forward', side_effect=forward), patch.object(Path, 'is_file', return_value=True), \
+                patch.object(Path, 'open', file), patch.object(life.fcntl, 'flock'), patch.object(life.os, 'fsync'), \
+                patch.object(life, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
+            result = remote.claim(stale_claim_hours=24, admission={'foreign_processes': []})
+            self.assertEqual(result['stale_claim_skipped'][0]['line'], old.rstrip('\n'))
+            self.assertGreater(result['stale_claim_skipped'][0]['age_hours'], 24)
+            self.assertEqual(packets[0][1], 'ledger-claim')
+            self.assertEqual(packets[0][2]['stale_claim_hours'], 24)
+            self.assertEqual(packets[0][2]['admission'], {'foreign_processes': []})
+            appended = ''.join(call.args[0] for call in file().write.call_args_list)
+            self.assertIn('CLAIMED: OpenCode test/owner host=surface lifecycle=own-token ', appended)
+            self.assertNotIn('RELEASED:', appended)
+            self.assertNotIn('foreign/stream', appended)
+            file().write.reset_mock()
+            with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+                remote.claim(stale_claim_hours=24, admission={'foreign_processes': [{'pid': 1, 'name': 'cargo'}]})
+            file().write.assert_not_called()
+            # A successful own Down never closes or suppresses the skipped foreign record.
+            text = old + result['line'] + '\n'
+            file().read.return_value = text
+            released = remote.release()
+            appended = ''.join(call.args[0] for call in file().write.call_args_list)
+            self.assertIn('RELEASED: OpenCode test/owner host=surface lifecycle=own-token ', appended)
+            self.assertNotIn('foreign/stream', appended)
+            file().read.return_value = text + released['line'] + '\n'
+            self.assertEqual(remote.inspect()['open'], [old.rstrip('\n')])
+            file().write.reset_mock()
+            with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+                remote.claim()  # same foreign history still blocks the strict policy
+            file().write.assert_not_called()
+
     def test_real_ledger_shapes_from_2026_11_03(self):
         # Shapes from the live ledger that the first parser misread as six open Surface claims (lr-04 refusal).
         text = (

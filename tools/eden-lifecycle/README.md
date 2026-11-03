@@ -72,8 +72,33 @@ For an explicitly assigned same-host pair, set `pair_authorized:true` and add
 key `b` with a distinct display/source/inputs. One lifecycle claim covers the
 pair; memory/disk and foreign-process checks repeat before EACH launch. The
 second guest is the sole deliberate exception to one Eden per host. Different
-owners' existing Eden/compiler processes or open claims always refuse Up.
+owners' existing Eden/compiler processes always refuse Up; open claims are
+strictly blocking unless the optional policy below applies.
 The caller is responsible for obtaining its normal scheduling/queue turn.
+
+### Optional stale-claim admission (2026-11-03)
+
+`stale_claim_hours` has **no default**. Omit it to keep strict open-claim
+blocking. To opt in, add a finite positive number, e.g. `"stale_claim_hours": 24`;
+zero, negative, null, boolean and nonnumeric values are refused.
+
+After the existing parser pairs releases with claims, Up may skip an open
+**foreign-owner** claim only when its scope explicitly identifies this host,
+its timezone-aware timestamp is parseable and its age is **greater than** the
+configured hours, and executor admission found no foreign Eden/compiler
+processes. Memory/disk gates still apply. Unknown/conflicting scopes, missing
+owners, malformed/naive timestamps, future/young claims and this owner's own
+claims keep blocking. Missing process-check evidence also keeps blocking.
+The policy and admission result cross the authoritative-ledger SSH boundary;
+the ledger host's own process state does not substitute for the executor's.
+
+Each skipped claim gets a separate `actions.jsonl` entry with
+`kind: "stale_claim_skipped"`; its value contains the original `line`,
+`age_hours` and `checked_at` UTC timestamp. The same receipts appear in Up's
+`stale_claim_skipped` list and the lifecycle journal. This is admission policy,
+not ledger reconciliation: **no release is written for any foreign owner**,
+and the original claim remains in history and in strict ledger readback.
+Down still releases only the exact owned lifecycle claim after cleanup.
 
 Optional `display_helper: PIN` points to the existing reviewed
 `display-rootful.ps1`. It starts unique journalled weston/Xwayland units and
@@ -83,8 +108,9 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
 
 ## Safety and receipts
 
-- Local/remote ledger claim uses append+fsync under flock, no timestamp expiry,
-  normalization on disk or foreign-event exclusion. Historical fractional ISO
+- Local/remote ledger claim uses append+fsync under flock, no automatic release,
+  normalization on disk or default expiry. Optional stale-claim admission is
+  described above. Historical fractional ISO
   timestamps and `CodexID`/`Codex ID` spellings are read consistently.
   Exact-token readback handles claim/release ACK loss without inventing an
   unclaimed state; ledger outage still attempts owned stop/restore but retains
@@ -125,6 +151,14 @@ Journal unit/profile paths are checked against the owned token/config before
 cleanup, including a planted foreign-unit tamper test.
 Earlier `offline-1/2/3.log` drafts are retained. This is not native runtime
 acceptance. No runtime up/down invocation is authorized by this development task.
+
+Stale-policy follow-up base: `40fbe1d` (50 tests, including the real-ledger-shape
+release-pairing regression). The parser itself is unchanged. Added offline
+regressions cover old+clean, old+foreign-process, young and omitted-field
+behavior, invalid configuration, fail-closed boundaries, and an in-memory
+local/remote ledger dispatch round trip: **57 tests total**. No real ledger or
+live profile is used. Native/SSH qualification of the new option remains UNRUN;
+Primary review and commit are pending.
 
 Open draft gaps: native Surface/Yoga systemd/Qt/AppImage/SSH integration is
 UNRUN; no automatic remote file/socket forwarding or LDN frontend room setup;
