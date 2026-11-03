@@ -360,6 +360,15 @@
       "end_gate": "return-lucas-fresh",
       "from_run": "lr-04",
       "row": "12-return-lucas"
+    },
+    "continue-results": {
+      "file": "segments/continue-results.edenmacro.json",
+      "sha256": "2e85a52f13a703adddac34c99c797dc034743677d7d4af462e46abcfcef512f6",
+      "cap": 30,
+      "start_gate": "victory-current",
+      "end_gate": "result-card-a",
+      "from_run": "p4s-shared",
+      "row": "10-result-cards"
     }
   },
   "gates": {
@@ -1770,6 +1779,290 @@
       "pattern": "\\[Destroy\\] plan owner=1 reason=finalize steps=1 routes_cleared=1 attached=NativeRetiring routes_stale=0",
       "cap": 20,
       "from_run": "lr-04"
+    },
+    "frontend-ready": {
+      "kind": "status",
+      "expect": {
+        "running": false
+      },
+      "cap": 10,
+      "from_run": "p4s-shared"
+    },
+    "frontend-leave": {
+      "kind": "ui",
+      "match": {
+        "class": "QPushButton",
+        "name": "disconnect",
+        "text": "^Leave Room$"
+      },
+      "cap": 15,
+      "from_run": "p4s-shared"
+    },
+    "peer-action": {
+      "kind": "ui",
+      "match": {
+        "class": "QAction",
+        "name": "action_Connect_To_Room"
+      },
+      "cap": 15,
+      "from_run": "p4s-shared"
+    },
+    "peer-dialog": {
+      "kind": "ui",
+      "match": {
+        "class": "QLineEdit",
+        "name": "nickname"
+      },
+      "cap": 15,
+      "from_run": "p4s-shared"
+    },
+    "frontend-two": {
+      "kind": "ui",
+      "match": {
+        "class": "ClientRoomWindow",
+        "title": "\\(2/8 members\\).*connected"
+      },
+      "cap": 30,
+      "from_run": "p4s-shared"
+    },
+    "loaded": {
+      "kind": "status",
+      "expect": {
+        "running": true,
+        "loading_complete": true
+      },
+      "max_frame_age_ms": 1500,
+      "cap": 180,
+      "from_run": "p4s-shared"
+    },
+    "join-refused": {
+      "kind": "image",
+      "reference": "refs/join-refused.png",
+      "sha256": "763360589e01c7e6219b8ed34319375ea238efefdea24bd815d038db3b28be64",
+      "roi": [
+        510,
+        254,
+        780,
+        304
+      ],
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "native-join-prompt": {
+      "kind": "image",
+      "reference": "refs/native-join-prompt.png",
+      "sha256": "8d2dbaf622a8ee0beeda63379d3ced78ed7f8cd0721823243366024004d184e6",
+      "roi": [
+        400,
+        200,
+        900,
+        350
+      ],
+      "cap": 12,
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "victory-current": {
+      "kind": "image",
+      "reference": "refs/victory-current.png",
+      "sha256": "26cc2e1e62982a06a68866f0f0a123d9fb18100bcefcffd1cb4464bf907c6bd7",
+      "roi": [
+        300,
+        40,
+        370,
+        130
+      ],
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "result-card-a": {
+      "kind": "image",
+      "reference": "refs/result-card-a.png",
+      "roi": [
+        211,
+        510,
+        375,
+        545
+      ],
+      "cap": 20,
+      "sha256": "de049ed83e1f90a61b941fb3c65fa664a788f76b25cf06187f6e2a8e3a71c79d",
+      "acquired": "2026-11-03T20:25:25Z",
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "result-card-b": {
+      "kind": "image",
+      "reference": "refs/result-card-b.png",
+      "roi": [
+        211,
+        510,
+        375,
+        545
+      ],
+      "cap": 20,
+      "sha256": "de049ed83e1f90a61b941fb3c65fa664a788f76b25cf06187f6e2a8e3a71c79d",
+      "acquired": "2026-11-03T20:25:28Z",
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "result-summary": {
+      "kind": "image",
+      "reference": "refs/result-summary.png",
+      "roi": [
+        220,
+        468,
+        280,
+        491
+      ],
+      "cap": 30,
+      "sha256": "51d7376dfe6652171c64835a0bbdaba5f22d12f7ce713b2e7d0478cb7e194efe",
+      "acquired": "2026-11-03T20:25:54Z",
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "result-statistics": {
+      "kind": "image",
+      "reference": "refs/result-statistics.png",
+      "roi": [
+        228,
+        476,
+        353,
+        491
+      ],
+      "cap": 30,
+      "sha256": "020ba3f9b383eb6ec8f365cba2ae5089a0e83bb10e5415ac64e39af2bdea5e6b",
+      "acquired": "2026-11-03T20:26:29Z",
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "native-host-close": {
+      "kind": "image",
+      "reference": "refs/native-host-close.png",
+      "sha256": "d1557cd50ccd25bfc1967afaa9869d56739058e8388652eb34f7c6894bde2c36",
+      "roi": [
+        480,
+        235,
+        795,
+        320
+      ],
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "p4s-shared"
+    },
+    "practice-CaptainFalcon": {
+      "kind": "json",
+      "source": "settings",
+      "expect": {
+        "menu.player_character": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "cap": 20,
+      "from_run": "p4t-yoga-02"
+    },
+    "lr08-cpu-synchronous": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryCpu\\] staged ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*bank_build=false[\\s\\S]*?\\[MiiOrdinaryCpu\\] ready ticket=(?P=t) target=0x4a [^\\n]*released=true saved_files_written=false",
+      "cap": 25,
+      "from_run": "lr-08"
+    },
+    "lr06-catalog-cycle1": {
+      "kind": "log",
+      "source": "diag",
+      "cap": 25,
+      "pattern": "\\[MiiAutoInit\\] catalog ready; capture_armed=\\[true, true\\] generations=\\[3, 3\\] opening=4\\b",
+      "from_run": "lr-08"
     }
   }
 }
