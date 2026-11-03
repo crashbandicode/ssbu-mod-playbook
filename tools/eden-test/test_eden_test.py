@@ -117,7 +117,7 @@ class EdenTestTests(unittest.TestCase):
             eden_test.main(['new', *self.args()])
 
     def test_all_runs_down_even_after_a_failed_row_and_writes_results(self):
-        (self.rows / 'rows.json').write_text('{"rows": [], "note": "fail-once"}')
+        (self.rows / 'rows.json').write_text('{"rows": [{"id": "r1"}, {"id": "r2"}], "note": "fail-once"}')
         eden_test.main(['all', *self.args()])
         run = self.dir / 'runs/lr-14'
         journal = json.loads((run / 'state/lifecycle.json').read_text())
@@ -137,6 +137,27 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(eden_test.main(['run', str(run)]), 3)
         self.assertEqual(eden_test.main(['run', str(run), '--retry']), 0)
         self.assertEqual(json.loads((run / 'out/r2.json').read_text())['status'], 'PASS')
+
+    def test_results_count_only_rows_and_add_up_retries(self):
+        (self.rows / 'rows.json').write_text('{"rows": [{"id": "r1"}, {"id": "r2"}, {"id": "r3"}], "note": "fail-once"}')
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        eden_test.main(['up', str(run)])
+        eden_test.main(['run', str(run)])
+        (run / 'out/r2.json').rename(run / 'out/r2.FAILED.first-try.json')  # an agent keeps the failed attempt
+        (run / 'out/project-state.json').write_text('{"phase": "whatever"}')  # not a row receipt
+        (run / 'rows/rows.json').write_text('{"rows": [{"id": "r1"}, {"id": "r2"}, {"id": "r3"}], "note": "fixed"}')
+        eden_test.main(['run', str(run), '--retry'])
+        eden_test.HARVEST.write_text('print(\'{\\n  "segments": [1, 2],\\n  "gates": []\\n}\')\n')  # multi-line JSON
+        eden_test.main(['down', str(run)])
+        results = (run / 'RESULTS.md').read_text()
+        self.assertIn('2 PASS, 0 FAILED, 1 unrun; 1 earlier failed attempts retained', results)
+        self.assertIn('unrun: r3', results)
+        self.assertIn('changed during the boot', results)
+        self.assertIn('Harvest: segments 2, gates 0', results)
+        self.assertIn('over 2 run call(s)', results)
+        self.assertLessEqual(len(results.splitlines()), 20)
+        self.assertEqual(len(json.loads((run / 'timing.json').read_text())['runs']), 2)
 
 
 if __name__ == '__main__':

@@ -42,9 +42,15 @@ def sha256(path):
 
 
 def stamp(run, key):
+    """Record a time in timing.json. run_start/run_end also append to `runs`, so retries add up instead of overwriting."""
     timing_path = run / 'timing.json'
     timing = json.loads(timing_path.read_text()) if timing_path.exists() else {}
-    timing[key] = time.time()
+    now = time.time()
+    timing[key] = now
+    if key == 'run_start':
+        timing.setdefault('runs', []).append([now, None])
+    elif key == 'run_end' and timing.get('runs') and timing['runs'][-1][1] is None:
+        timing['runs'][-1][1] = now
     timing_path.write_text(json.dumps(timing, indent=2) + '\n')
 
 
@@ -165,27 +171,69 @@ def unit_results(run):
     return results
 
 
-def results_md(run, config):
+def one_line(text, limit=140):
+    return ' '.join(str(text).split())[:limit]
+
+
+def row_accounting(run):
+    """Row receipts are out/<id>.json for the ids in the final rows.json; other JSON in out/ is not a row.
+    Renamed attempts (out/<id>.FAILED.<why>.json) are retained failures, counted apart from the final status."""
     out = run / 'out'
-    receipts = sorted(p for p in out.glob('*.json') if p.name not in ('dry-run.json', 'pace.json'))
-    rows = [(p.stem, json.loads(p.read_text())) for p in receipts]
-    passed = [r for r, j in rows if j.get('status') == 'PASS']
-    failed = [(r, j.get('error', '')) for r, j in rows if j.get('status') != 'PASS']
+    spec = json.loads((run / 'rows' / 'rows.json').read_text())
+    ids = [row['id'] for row in (spec['rows'] if isinstance(spec, dict) else spec)]
+    passed, failed, unrun = [], [], []
+    for row_id in ids:
+        receipt = out / f'{row_id}.json'
+        if not receipt.exists():
+            unrun.append(row_id)
+            continue
+        status = json.loads(receipt.read_text())
+        if status.get('status') == 'PASS':
+            passed.append(row_id)
+        else:
+            failed.append((row_id, status.get('error', '')))
+    retained = len(list(out.glob('*.FAILED.*.json')))  # includes attempts of rows renamed or dropped since
+    return passed, failed, unrun, retained
+
+
+def harvest_summary(run):
+    path = run / 'harvest.json'
+    if not path.exists():
+        return 'not run'
+    try:
+        data = json.loads(path.read_text())
+    except ValueError:
+        return one_line(path.read_text(), 160)
+    if not isinstance(data, dict):
+        return one_line(json.dumps(data), 160)
+    return ', '.join(f'{key} {len(value) if isinstance(value, list) else value}' for key, value in data.items())
+
+
+def results_md(run, config):
+    passed, failed, unrun, retained = row_accounting(run)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
-    harvest = (run / 'harvest.json').read_text().strip() if (run / 'harvest.json').exists() else 'not run'
     timing = json.loads((run / 'timing.json').read_text())
+    runs = [(start, end) for start, end in timing.get('runs', []) if end]
+    rows_seconds = sum(end - start for start, end in runs) if runs else timing.get('run_end', 0) - timing.get('run_start', 0)
+    rows_now = sha256(run / 'rows' / 'rows.json')
+    rows_note = rows_now[:12] + '…' + ('' if rows_now == config['rows']['sha256'] else
+                                       f' (changed during the boot; Up had {config["rows"]["sha256"][:12]}…)')
+    manifests = sorted((run / 'out' / 'manifests').glob('*.json')) if (run / 'out' / 'manifests').is_dir() else []
     apps = sorted({f'{i["app"]["path"]} ({i["app"]["sha256"][:12]}…)' for i in config['instances']})
     lines = [f'# {config["label"]} — {time.strftime("%Y-%m-%d", time.gmtime())}',
              f'- Eden: {"; ".join(apps)}',
              f'- Plugins: ' + ', '.join(f'{Path(p["path"]).name} {p["sha256"][:8]}' for p in config['instances'][0].get('plugins', [])),
-             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED (receipts in `out/`); rows.json sha256 {config["rows"]["sha256"][:12]}…']
-    for row, error in failed[:8]:
-        lines.append(f'  - FAILED {row}: {str(error)[:140]}')
-    lines += [f'- Down: cleanup_failures={journal.get("cleanup_failures")}, released={journal.get("released")}; '
-              + '; '.join(unit_results(run)),
-              f'- Harvest: {harvest[:160]}',
-              f'- Timing: up {timing.get("up_done", 0) - timing.get("up_start", 0):.0f} s, rows '
-              f'{timing.get("run_end", 0) - timing.get("run_start", 0):.0f} s, down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s',
+             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun; {retained} earlier failed attempts retained '
+             f'(receipts in `out/`); final rows.json {rows_note}; {len(manifests)} runner manifests in `out/manifests/`']
+    for row, error in failed[:6]:
+        lines.append(f'  - FAILED {row}: {one_line(error)}')
+    if unrun:
+        lines.append(f'  - unrun: {one_line(", ".join(unrun), 160)}')
+    lines += [one_line(f'- Down: cleanup_failures={journal.get("cleanup_failures")}, released={journal.get("released")}; '
+                       + '; '.join(unit_results(run)), 240),
+              f'- Harvest: {harvest_summary(run)}',
+              f'- Timing: up {timing.get("up_done", 0) - timing.get("up_start", 0):.0f} s, rows {rows_seconds:.0f} s over '
+              f'{max(len(runs), 1)} run call(s), down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s',
               '- Next: ']
     (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
     print('\n'.join(lines[:20]))
