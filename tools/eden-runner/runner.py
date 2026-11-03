@@ -41,7 +41,8 @@ Known detours: a gate with "recover": "<segment>" plays that segment and checks 
 "recover_times", default 1). Use it for the attract-mode intro the game falls into when left idle, or a stray pop-up.
 
 Recipe actions: {"buttons": "a", "hold": 150, "gap": 0.6}, {"buttons": "b", "with_stick": [0, -1]} (stick held
-through the press, e.g. Down+B), {"stick": [x, y, ms]}.
+through the press, e.g. Down+B), {"stick": [x, y, ms]}. Add "frames": N (and "gap_frames": N) to hold for N game frames
+of the recording instead of wall time; use it for any stick hold whose length matters (cursor acceleration on the CSS).
 
 Reference images not taken yet: an image gate with "acquire": true and no reference file captures one the first time
 the run reaches it (once the region stops changing), writes its sha256 into rows.json, and the runner stops after that
@@ -313,6 +314,21 @@ class Runner:
             time.sleep(.2)
         raise RuntimeError(f'macro on {on} not finished within {cap} s')
 
+    FRAME_LEASE_MS = 10000  # input lease while holding for a frame count; released explicitly when the count is reached
+
+    def hold(self, on, frames, ms):
+        """Wait for `frames` game frames of the recording (macro.status frame) if given, else for `ms` wall time."""
+        if not frames:
+            time.sleep(ms / 1000)
+            return
+        start = (self.call(on, 'macro.status') or {}).get('frame', 0)
+        until = time.monotonic() + max(5.0, frames / 10)  # even a 10 fps game gets there in time
+        while time.monotonic() < until:
+            if (self.call(on, 'macro.status') or {}).get('frame', 0) - start >= frames:
+                return
+            time.sleep(.01)  # under a frame at 60 fps; the recording keeps whole display frames anyway
+        raise RuntimeError(f'recording on {on} did not advance {frames} frames in time (game paused or stalled?)')
+
     def record(self, on, name, seg):
         path = self.base / seg['file']
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,26 +336,32 @@ class Runner:
                                        'countdown_ms': 0})
         try:
             for action in seg['recipe']:
+                # "frames": hold for that many game frames (macro.status frame), not wall time: the game's speed
+                # varies, so a 400 ms hold recorded 11 frames once and 35 another time (lr-03, 2026-11-03).
+                frames = action.get('frames')
                 if 'buttons' in action:
                     hold = action.get('hold', 150)
+                    lease = self.FRAME_LEASE_MS if frames else hold + 500
                     buttons = action['buttons'].split(',')
                     if 'with_stick' in action:  # stick held through the press, e.g. Down+B
                         x, y = action['with_stick']
-                        self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': hold + 700})
+                        self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': lease + 200})
                         time.sleep(action.get('stick_lead_ms', 50) / 1000)
                     for b in buttons:
-                        self.call(on, 'input.button', {'button': b, 'state': 'press', 'lease_ms': hold + 500})
-                    time.sleep(hold / 1000)
+                        self.call(on, 'input.button', {'button': b, 'state': 'press', 'lease_ms': lease})
+                    self.hold(on, frames, hold)
                     for b in buttons:
                         self.call(on, 'input.button', {'button': b, 'state': 'release'})
                     if 'with_stick' in action:
                         self.call(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0, 'lease_ms': 100})
                 elif 'stick' in action:
-                    x, y, ms = action['stick']
-                    self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': ms})
-                    time.sleep(ms / 1000)
+                    x, y = action['stick'][:2]
+                    ms = action['stick'][2] if len(action['stick']) > 2 else 250
+                    lease = self.FRAME_LEASE_MS if frames else ms
+                    self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': lease})
+                    self.hold(on, frames, ms)
                     self.call(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0, 'lease_ms': 100})
-                time.sleep(action.get('gap', .6))
+                self.hold(on, action.get('gap_frames'), action.get('gap', .6) * 1000)
         finally:
             self.call(on, 'input.reset')
             time.sleep(.12)  # one neutral frame before the recording closes

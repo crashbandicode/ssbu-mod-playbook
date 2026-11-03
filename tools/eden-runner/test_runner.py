@@ -45,7 +45,8 @@ class FakeEden:
             return {'ok': True, 'result': {'state': 'playing'}}
         if method == 'macro.status':
             if self.recording:
-                return {'ok': True, 'result': {'state': 'recording'}}
+                self.frame = getattr(self, 'frame', 0) + 1  # the game advances one frame per status call here
+                return {'ok': True, 'result': {'state': 'recording', 'frame': self.frame}}
             return {'ok': True, 'result': {'state': 'finished', 'error': None}}
         if method == 'macro.record':
             self.recording = params
@@ -291,6 +292,24 @@ class RunnerTests(unittest.TestCase):
         self.make(eden).run()
         self.assertEqual(seen, [('input.stick', -1), ('input.button', 'press'), ('input.button', 'release'),
                                 ('input.stick', 0)])
+
+    def test_recipe_holds_for_game_frames(self):
+        self.plan['segments']['to-blue']['recipe'] = [{'stick': [1, 0], 'frames': 12, 'gap_frames': 3}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        frames_at = []
+        original = eden.request
+
+        def request(method, params):
+            if method == 'input.stick':
+                frames_at.append((params['x'], getattr(eden, 'frame', 0)))
+            return original(method, params)
+
+        eden.request = request
+        self.make(eden).run()
+        (x1, pressed), (x0, released) = frames_at
+        self.assertEqual((x1, x0), (1, 0))
+        self.assertGreaterEqual(released - pressed, 12)  # held for at least 12 game frames, however long that took
 
     def test_gate_recover_plays_detour_segment_once(self):
         # The game sits on the wrong screen (blue, like the attract-mode intro); the gate's recover segment fixes it.
