@@ -255,6 +255,43 @@ class RunnerTests(unittest.TestCase):
         first_play = eden.calls.index('macro.play')
         self.assertIn('ui.screenshot', eden.calls[:first_play])  # the start gate looked before the first input
 
+    def test_acquire_reference_then_review_stop_then_compare(self):
+        self.plan['gates']['red-new'] = {'kind': 'image', 'reference': 'refs/new/red-new.png', 'roi': [0, 0, 64, 36],
+                                         'acquire': True, 'cap': 3, 'interval': .05}
+        self.plan['rows'][0]['steps'][1] = {'gate': 'red-new'}
+        self.manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual((report['errors'], report['references_to_acquire']), ([], ['red-new']))
+        result = self.make(FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)).run()
+        self.assertEqual(result, 'REVIEW')  # stops after the row that captured a reference
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual((receipt['status'], len(receipt['acquired_references'])), ('PASS', 1))
+        saved = json.loads(self.manifest.read_text())['gates']['red-new']
+        self.assertEqual(saved['sha256'], sha(self.dir / 'refs' / 'new' / 'red-new.png'))
+        self.assertFalse((self.dir / 'out' / 'r2.json').exists())
+        self.assertEqual(runner.dry_run(self.manifest)['result'], 'READY_TO_RECORD')  # to-blue still to record
+        # The rerun skips r1 and continues from the screen r1 left (red); the acquired reference now compares normally.
+        resumed = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        resumed.colour = RED
+        self.assertEqual(self.make(resumed).run(), 'DONE')
+
+    def test_recipe_holds_stick_through_button(self):
+        self.plan['segments']['to-blue']['recipe'] = [{'buttons': 'b', 'with_stick': [0, -1], 'hold': 10, 'gap': 0}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        seen = []
+        original = eden.request
+
+        def request(method, params):
+            if method in ('input.stick', 'input.button'):
+                seen.append((method, params.get('y', params.get('state'))))
+            return original(method, params)
+
+        eden.request = request
+        self.make(eden).run()
+        self.assertEqual(seen, [('input.stick', -1), ('input.button', 'press'), ('input.button', 'release'),
+                                ('input.stick', 0)])
+
     def test_stop_file_and_pace_cap(self):
         (self.dir / 'out').mkdir()
         (self.dir / 'out' / 'STOP').write_text('primary')

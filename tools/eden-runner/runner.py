@@ -34,6 +34,13 @@ gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screensh
 copy <instance key> [as <name>] (copy that instance file into the row folder), json_diff {source, before, allowed,
 must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists).
 
+Recipe actions: {"buttons": "a", "hold": 150, "gap": 0.6}, {"buttons": "b", "with_stick": [0, -1]} (stick held
+through the press, e.g. Down+B), {"stick": [x, y, ms]}.
+
+Reference images not taken yet: an image gate with "acquire": true and no reference file captures one the first time
+the run reaches it (once the region stops changing), writes its sha256 into rows.json, and the runner stops after that
+row with status REVIEW (exit 4). A model looks at the new references once, then runs again.
+
 More gates:
   {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
       the region differs from the row's mark and has stopped moving (HUD portrait swapped, menu value changed)
@@ -88,7 +95,7 @@ def dry_run(manifest_path):
     """Offline only. Raises on a broken manifest; returns the report (missing segments are not an error)."""
     base = manifest_path.parent
     plan = json.loads(manifest_path.read_text())
-    errors, missing, available = [], [], []
+    errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
         if path.is_file():
@@ -115,7 +122,9 @@ def dry_run(manifest_path):
         try:
             if kind == 'image':
                 ref = base / gate['reference']
-                if digest(ref) != gate['sha256']:
+                if not ref.is_file() and gate.get('acquire'):
+                    to_acquire.append(name)  # captured the first time the run reaches the screen
+                elif digest(ref) != gate.get('sha256'):
                     errors.append(f'gate {name}: reference sha256 mismatch')
                 if len(gate['roi']) != 4:
                     errors.append(f'gate {name}: roi needs 4 numbers')
@@ -179,9 +188,9 @@ def dry_run(manifest_path):
                 errors.append(f'row {row["id"]}: json_diff before {step["json_diff"].get("before")!r} has no earlier copy')
         state = row['end']
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
-              'available_segments': available, 'missing_segments': missing, 'gates': len(plan.get('gates', {})),
-              'errors': errors,
-              'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing else 'READY')}
+              'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
+              'gates': len(plan.get('gates', {})), 'errors': errors,
+              'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing or to_acquire else 'READY')}
     return report
 
 
@@ -275,11 +284,17 @@ class Runner:
                 if 'buttons' in action:
                     hold = action.get('hold', 150)
                     buttons = action['buttons'].split(',')
+                    if 'with_stick' in action:  # stick held through the press, e.g. Down+B
+                        x, y = action['with_stick']
+                        self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': hold + 700})
+                        time.sleep(action.get('stick_lead_ms', 50) / 1000)
                     for b in buttons:
                         self.call(on, 'input.button', {'button': b, 'state': 'press', 'lease_ms': hold + 500})
                     time.sleep(hold / 1000)
                     for b in buttons:
                         self.call(on, 'input.button', {'button': b, 'state': 'release'})
+                    if 'with_stick' in action:
+                        self.call(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0, 'lease_ms': 100})
                 elif 'stick' in action:
                     x, y, ms = action['stick']
                     self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': ms})
@@ -395,6 +410,8 @@ class Runner:
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
                 time.sleep(.25)
+        elif kind == 'image' and gate.get('acquire') and not (self.base / gate['reference']).is_file():
+            return self.acquire(on, name, gate, until)
         else:
             hook = load_hook(self.base, gate) if kind == 'hook' else None
             while time.monotonic() < until:
@@ -411,6 +428,28 @@ class Runner:
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
         raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+
+    def acquire(self, on, name, gate, until):
+        """First visit of a screen with no reference yet: wait until the region stops changing, save that shot as the
+        reference, write its sha256 into rows.json, and flag the row so the runner stops for a review after it."""
+        previous = None
+        while time.monotonic() < until:
+            path = self.shot(on, 'acquire-' + name)
+            if previous is not None and self.roi_diff(path, previous, gate['roi']) <= gate.get('settle', 2):
+                reference = self.base / gate['reference']
+                reference.parent.mkdir(parents=True, exist_ok=True)
+                reference.write_bytes(path.read_bytes())
+                gate['sha256'] = digest(reference)
+                gate['acquired'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                self.manifest_path.write_text(json.dumps(self.plan, indent=2) + '\n')
+                self.acquired.append({'gate': name, 'reference': str(reference), 'shot': str(path)})
+                self.log({'gate': name, 'on': on, 'acquired': str(reference), 'sha256': gate['sha256']})
+                return str(reference)
+            if previous is not None:
+                previous.unlink(missing_ok=True)
+            previous = path
+            time.sleep(gate.get('interval', .5))
+        raise RuntimeError(f'gate {name} on {on}: screen never settled within {gate["cap"]} s to acquire a reference')
 
     def json_diff(self, on, spec):
         """Compare a JSON file now with a copy taken earlier in the row ({"copy": key, "as": before}).
@@ -474,7 +513,7 @@ class Runner:
             self.row_dir = self.out / row['id']
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()
-            self.marks, self.copies = {}, {}
+            self.marks, self.copies, self.acquired = {}, {}, []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': digest(self.manifest_path), 'started': time.time(), 'results': []}
             try:
@@ -514,6 +553,8 @@ class Runner:
                 raise
             finally:
                 receipt['ended'] = time.time()
+                if self.acquired:
+                    receipt['acquired_references'] = self.acquired
                 receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
                 for key in self.clients:
                     try:
@@ -524,7 +565,14 @@ class Runner:
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
                                   'receipt': str(receipt_path)}), flush=True)
             previous_end = row['end']
+            if self.acquired:
+                # A new reference is a claim about what the screen should look like: a model looks once, then reruns.
+                print(json.dumps({'status': 'REVIEW', 'row': row['id'], 'acquired': self.acquired,
+                                  'next': 'look at each new reference; if one is wrong, delete it and this row\'s '
+                                          'receipt and fix the route; then run again'}), flush=True)
+                return 'REVIEW'
         print(json.dumps({'status': 'DONE', 'out': str(self.out)}), flush=True)
+        return 'DONE'
 
 
 def main(argv=None):
@@ -548,7 +596,9 @@ def main(argv=None):
         parser.error('run needs --instances')
     instances = json.loads(args.instances.read_text())
     try:
-        Runner(manifest, instances, out, args.pace_minutes).run(set(args.rows.split(',')) if args.rows else None)
+        result = Runner(manifest, instances, out, args.pace_minutes).run(set(args.rows.split(',')) if args.rows else None)
+        if result == 'REVIEW':
+            return 4
     except StopRun as stop:
         print(json.dumps({'status': 'STOPPED', 'reason': str(stop)}), flush=True)
         return 2
