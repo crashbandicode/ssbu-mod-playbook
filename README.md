@@ -99,6 +99,9 @@ working from the brief alone.
     A failed row is fixed or deferred, and the same boot carries on. Each
     run writes a `RESULTS.md` of 20 lines at most; the full compliance report
     is once per phase (MACROS "Test runs", rules 8–9).
+  - One command per run: `tools/eden-test/eden_test.py new|up|run|down|all`.
+    Rows read the game's state instead of assuming fixture indexes, and
+    evidence is shot after the HUD settles (MACROS "Test runs", rules 10–12).
   - For a game-side fact, trace the run that's already going instead of
     rebuilding a diag NRO and booting again: persistent `trace.*` points
     (from boot, by symbol from the plugin's ELF, streamed to JSONL) on the

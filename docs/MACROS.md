@@ -228,6 +228,38 @@ The rules:
      lifecycle's own verify, archive essays.
    - **Once per phase or release candidate:** the full `compliance.py`
      report with every manual row disposed, over all of the phase's runs.
+   - **Coordination posts:** an inbox or status post is 5 lines at most. It
+     names the run, the rows that changed state, and the next action; paths
+     point to the rest.
+10. **One command per run: `tools/eden-test/eden_test.py`.** Don't hand-build
+    configs, state paths or caller scripts. Run it on the host that runs Eden
+    (on the Yoga: `git -C ~/ssbu-mod-playbook pull --ff-only`, copy the rows
+    folder over, then call it through `ssh`).
+    - `new --from <last config.json> --label <new> --rows <folder>` makes a
+      fresh run folder (`/home/intpa/eden-runs/<label>/`) with new state and
+      work paths. It keeps the previous run's pins and checks each one's
+      sha256; `--app` switches the Eden build.
+    - `up <run>` does the dry run, then the lifecycle `up`. `run <run>` runs
+      the rows; after a fix, `run <run> --retry`, on the same boot. `down
+      <run>` does the lifecycle `down`, the harvest, a `RESULTS.md` skeleton
+      of 20 lines or fewer (build, rows, the unit's exit result, harvest,
+      timing) and `timing.json`.
+    - `all` does new, up, run and down in one go, for a batch you don't
+      expect to fix mid-boot.
+11. **Read the game's state; don't assume it.** A row doesn't hard-code a
+    fixture's roster index, fighter kind or prefetch target. It reads them
+    first, from the settings or roster JSON (`json` gate, `copy`), the
+    plugin's state lines (`log` gate), or a trace point. Evidence shots are
+    taken after the screen settles: a `change` gate with `"stable": true` on
+    the HUD, or the plugin's ready line. A first-ready frame can show the new
+    body with the old HUD. (2026-11-03: lr-11 lost three rows to a hard-coded
+    prefetch, a wrong roster index and a route that skipped a step. lr-12's
+    Kirby/R.O.B. frames showed body and HUD disagreeing at first-ready.)
+12. **Brief workers with a standing goal.** For example: "keep batching the
+    open rows until each one is closed or deferred with a reason". A worker
+    keeps working through its batches. It waits for a busy host with polls of
+    60 s or less instead of ending its turn, and posts only at row checkpoints.
+    Restarting an agent that ended its turn costs minutes of re-reading.
 
 #### The shared runner: a helper, extended per project
 
