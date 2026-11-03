@@ -14,6 +14,10 @@ completes the rest with evidence: a file, a log line, a command's output. A
 row without evidence is not a pass. Keep the finished report with the
 evidence doc.
 
+Run it once per phase or release candidate, over all of that phase's Eden
+runs, not after every run. A single run only writes its short `RESULTS.md`
+([MACROS](MACROS.md), "Test runs", rule 9).
+
 ## Implementation
 
 - **M** `crate-type = ["cdylib"]` only. An `rlib` alongside makes Cargo skip
@@ -146,7 +150,13 @@ evidence doc.
   caption with date and build), the install path, the build commands, a
   license line and the AI-assistance disclaimer.
 - **M** A dated evidence doc: run labels, the build (commit or NRO sha256),
-  what was done, what the log showed.
+  what was done, what the log showed. For Eden test runs, each run's short
+  `RESULTS.md` plus the runner receipts are that doc; the phase's
+  compliance report collects them.
+- **M** Eden rows are grouped into as few boots as the hosts and builds allow:
+  one `rows.json` per boot covering every reachable open row. A failed row
+  is fixed or deferred and the same boot carries on ([MACROS](MACROS.md),
+  "Test runs", rule 8). Evidence: the run labels against the row list.
 - **C** (the evidence cites numbers computed from logs) every such number
   comes from a committed script over the logged files, with host tests, and
   the command is named next to the numbers.

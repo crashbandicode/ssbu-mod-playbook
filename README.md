@@ -95,6 +95,10 @@ working from the brief alone.
     `Up`. Single presses with a screenshot after each are only for building a
     missing segment ([MACROS](docs/MACROS.md), "Test runs: the runner is
     ready before Up").
+  - Group rows: one boot runs every open row that host and build can reach.
+    A failed row is fixed or deferred, and the same boot carries on. Each
+    run writes a `RESULTS.md` of 20 lines at most; the full compliance report
+    is once per phase (MACROS "Test runs", rules 8–9).
   - For a game-side fact, trace the run that's already going instead of
     rebuilding a diag NRO and booting again: persistent `trace.*` points
     (from boot, by symbol from the plugin's ELF, streamed to JSONL) on the

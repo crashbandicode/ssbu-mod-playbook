@@ -201,6 +201,33 @@ The rules:
    harvest the proven segments into the shared library (`harvest.py`,
    below). The next run starts from them and records only what is still
    missing.
+8. **Group rows into one boot.** A run's `rows.json` covers every open row
+   that host and build can reach, chained on their end states. Don't run one
+   row family per boot. Split into another boot only when the next rows need
+   a different build, plugin set, host or profile, or when a fresh boot is
+   itself the thing under test (boot-time install, first load).
+   - **When a row fails**, fix it (its data, a gate, a hook), delete
+     `STOP-INPUT` and run the same `rows.json` again on the same boot.
+     Passed rows are skipped. If a row can't be fixed within a few minutes,
+     take it out (list it as deferred, with the reason). Add a step that
+     brings the game to the next row's start (a library segment or a
+     `recover`), and carry on. Don't shut down to retry one row.
+   - **Order the batch:** cheap, independent rows first. Rows that may wedge
+     the game (crash checks, teardown, long matches) go last.
+   - 2026-11-03: Phase 1 ran 10 boots of 2–5 minutes each over four hours,
+     each followed by 10–15 minutes of write-up. Rows passed but almost none
+     closed.
+9. **Keep the write-up per run light; do compliance once per phase.**
+   - **Per run:** `RESULTS.md` of 20 lines at most: the build (resolved
+     path + sha256); each row's PASS, FAILED or deferred with its receipt path
+     and a one-line cause; and the `down` result (`cleanup_failures`, verify
+     equal, released). Add the harvest line and the next action. The
+     runner's receipts and the lifecycle journal are the evidence; don't
+     restate them.
+   - **Not per run:** checklist dispositions, extra inventories beyond the
+     lifecycle's own verify, archive essays.
+   - **Once per phase or release candidate:** the full `compliance.py`
+     report with every manual row disposed, over all of the phase's runs.
 
 #### The shared runner: a helper, extended per project
 
