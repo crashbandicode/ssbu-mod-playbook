@@ -236,6 +236,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(receipt['status'], 'PASS')
         self.assertEqual(receipt['results'][-1]['json_diff']['changes'], {'menu.sdi_state': [0, 2]})
 
+    def test_ui_click_job_left_running_by_a_modal_is_not_a_failure(self):
+        eden = FakeEden({})
+        original = eden.request
+        tree = [{'id': 'o91', 'class': 'QPushButton', 'name': 'host', 'text': 'Host Room', 'visible': True}]
+
+        def request(method, params):
+            if method == 'ui.tree':
+                return {'ok': True, 'result': list(tree)}
+            if method == 'ui.click':
+                tree.append({'id': 'o95', 'class': 'QLabel', 'name': 'members', 'text': '1 / 8', 'visible': True})
+                return {'ok': True, 'result': {'accepted': True, 'job': 'j1'}}
+            if method == 'jobs.get':  # the click's job waits inside the room window it opened
+                return {'ok': True, 'result': {'state': 'running'}}
+            return original(method, params)
+
+        eden.request = request
+        self.plan['gates']['room-open'] = {'kind': 'ui', 'match': {'class': 'QLabel', 'text': '/ 8$'}, 'cap': 2}
+        self.plan['rows'] = [{'id': 'host', 'start': 'blue', 'end': 'blue', 'steps': [
+            {'ui': 'click', 'target': {'name': 'host'}, 'job_cap': .3}, {'gate': 'room-open'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.make(eden).run()
+        self.assertEqual(json.loads((self.dir / 'out' / 'host.json').read_text())['status'], 'PASS')
+
     def test_dry_run_catches_change_gate_before_mark_and_diff_without_copy(self):
         self.plan['gates']['hud-changed'] = {'kind': 'change', 'mark': 'hud', 'roi': [0, 0, 64, 36], 'cap': 3}
         self.plan['rows'] = [{'id': 'c1', 'start': 'blue', 'end': 'red', 'steps': [

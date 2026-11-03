@@ -334,7 +334,10 @@ class Runner:
         if not self.pace['first_row_done'] and time.time() - self.pace['started'] > self.pace_seconds:
             raise StopRun(f'pace: no row finished {self.pace_seconds // 60} minutes after the run started')
 
-    def call(self, on, method, params=None):
+    def call(self, on, method, params=None, job_cap=15, running_ok=False):
+        """One control call. An accepted job is followed to completion within job_cap seconds. With running_ok, a
+        job still running at the cap is fine: a ui click that opens a modal dialog (Host Room, a confirm box) stays
+        running until that dialog is handled, by design (CLIControl.md); the next gate checks the outcome."""
         if method not in ('macro.stop', 'input.reset'):
             self.check_stop()
         reply = self.clients[on].request(method, params or {})
@@ -343,7 +346,7 @@ class Runner:
             raise RuntimeError(f'{method} on {on}: {reply}')
         value = reply.get('result')
         if isinstance(value, dict) and value.get('accepted') and value.get('job'):
-            until = time.monotonic() + 15
+            until = time.monotonic() + job_cap
             while True:
                 job = self.clients[on].request('jobs.get', {'job': value['job']})
                 state = (job.get('result') or {}).get('state')
@@ -352,7 +355,10 @@ class Runner:
                 if state in ('failed', 'error') or not job.get('ok'):
                     raise RuntimeError(f'{method} job on {on}: {job}')
                 if time.monotonic() > until:
-                    raise RuntimeError(f'{method} job on {on} still {state} after 15 s')
+                    if running_ok and state == 'running':
+                        self.log({'on': on, 'method': method, 'job': value['job'], 'left_running': True})
+                        break
+                    raise RuntimeError(f'{method} job on {on} still {state} after {job_cap} s')
                 time.sleep(.1)
         return value
 
@@ -648,13 +654,15 @@ class Runner:
 
     def ui(self, on, step):
         """Operate Eden's Qt frontend (menus, dialogs, the multiplayer room window) through the control socket."""
-        params = {k: v for k, v in step.items() if k not in ('ui', 'target', 'on', 'cap')}
+        params = {k: v for k, v in step.items() if k not in ('ui', 'target', 'on', 'cap', 'job_cap')}
         target = step.get('target')
         if isinstance(target, dict):
             params['target'] = self.find_ui(on, target, step.get('cap', 10))
         elif target is not None:
             params['target'] = target  # an objectName the server resolves (must be unique) or a session id
-        result = self.call(on, 'ui.' + step['ui'], params)
+        # A ui job may stay running while a modal it opened is up (pkg4's Host Room click, 2026-11-03): give it a
+        # short look ("job_cap", default 2 s) and let the next gate judge the result.
+        result = self.call(on, 'ui.' + step['ui'], params, job_cap=step.get('job_cap', 2), running_ok=True)
         self.log({'ui': step['ui'], 'on': on, 'params': params})
         return result
 
