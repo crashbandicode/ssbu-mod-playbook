@@ -194,9 +194,13 @@ The rules:
    after the run. (2026-11-03: the first runs under these rules spent 30
    minutes before any boot. Each agent wrote its own runner from scratch,
    one with 14 offline tests and 86 pinned input hashes.)
-7. **Keep what the run built.** At `Down`, commit the recorded segments
-   (with sha256), the runner and its row list to the repo's `eden/` folder.
-   The next run starts from them and records only what is still missing.
+7. **Keep what the run built.** At `Down`, commit the run's `rows.json`,
+   recorded segments and reference shots (with sha256) to the repo's
+   `eden/` folder, with the playbook commit of `tools/eden-runner` it ran
+   on. Don't copy `runner.py` into the repo; a copy forks the tool. Then
+   harvest the proven segments into the shared library (`harvest.py`,
+   below). The next run starts from them and records only what is still
+   missing.
 
 #### The shared runner: write a row list, not a runner
 
