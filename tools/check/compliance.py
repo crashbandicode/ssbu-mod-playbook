@@ -141,6 +141,23 @@ def nro_facts(path):
     return hashlib.sha256(data).hexdigest(), text + ro + rw + bss, markers
 
 
+def guard_size(initializer, all_src):
+    """Count explicit bytes or a Rust repeat initializer; unresolved lengths fail closed."""
+    repeated = re.fullmatch(r"[^;]+;\s*([A-Za-z_]\w*|[0-9][0-9_]*)\s*", initializer.strip())
+    if repeated:
+        length = repeated.group(1)
+        if re.fullmatch(r"[0-9][0-9_]*", length):
+            return int(length.replace("_", ""))
+        definitions = re.findall(
+            rf"\bconst\s+{re.escape(length)}\s*:\s*usize\s*=\s*([^;]+);", all_src)
+        if not definitions or any(not re.fullmatch(r"[0-9][0-9_]*", d.strip())
+                                  for d in definitions):
+            return 0
+        values = {int(d.strip().replace("_", "")) for d in definitions}
+        return values.pop() if len(values) == 1 else 0
+    return len(re.findall(r"0x[0-9a-fA-F]{2}", initializer))
+
+
 def rows_for(repo, nro_path):
     rows = []
 
@@ -181,7 +198,7 @@ def rows_for(repo, nro_path):
         or ('13.0.5 not found in ' + (', '.join(str(p.relative_to(repo)) for p in model_files[:3]) or 'src/model.rs / src/model/')))
     guards = [g for g in re.findall(r'guard:\s*\[([^\]]*)\]', all_src, re.S)
               if 'u8' not in g]  # skip the field's type, `[u8; 64]`
-    sizes = [len(re.findall(r'0x[0-9a-fA-F]{2}', g)) for g in guards]
+    sizes = [guard_size(g, all_src) for g in guards]
     row('every site guard is 64 bytes', 'M', bool(sizes) and all(s == 64 for s in sizes),
         f'{len(sizes)} guard(s) in src/, sizes {sorted(set(sizes)) or "none"}')
     allocator = 'GlobalAlloc' in all_src and 'heap_allocations' in all_src
