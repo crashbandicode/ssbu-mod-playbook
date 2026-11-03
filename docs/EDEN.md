@@ -80,7 +80,10 @@ gv.py call  e19 status         # running/loading, fps; any control method by nam
 input: menus load at different speeds, and one missed press puts every later
 input on the wrong screen. `step.ps1 -Label e19 -Steps 'b:a:4000,s:0:-1:250'`
 sends a short burst of input and then takes one screenshot. That is the
-basic loop. [MACROS](MACROS.md) has whole routes.
+basic loop for exploring a screen or building one route segment. A test run
+doesn't use it: it plays a runner, ready before `Up`, that replays recorded
+segments and checks each screen itself ([MACROS](MACROS.md), "Test runs: the
+runner is ready before Up").
 
 ## Instrument the running game without rebuilding
 

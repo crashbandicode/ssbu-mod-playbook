@@ -91,6 +91,10 @@ working from the brief alone.
   - Matches use a short ruleset (1 stock, 1:00, items and hazards off)
     unless the test needs a long one ([EDEN](docs/EDEN.md), "Keep matches
     short").
+  - A test run plays a runner of recorded segments that had a dry run before
+    `Up`. Single presses with a screenshot after each are only for building a
+    missing segment ([MACROS](docs/MACROS.md), "Test runs: the runner is
+    ready before Up").
   - For a game-side fact, arm a guest tracepoint (`edenctl tracepoint arm`)
     on the run that's already going instead of rebuilding a diag NRO and
     booting again ([EDEN](docs/EDEN.md), "Instrument the running game

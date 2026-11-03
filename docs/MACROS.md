@@ -8,7 +8,9 @@ PowerShell script. Eden also records and replays **input macros**
 replayed at game pace, with a log line or screenshot check between segments.
 Use a plain scripted route while you are still building a route or when a
 segment is one or two presses, and one long macro only for a sequence that
-needs exact human timing.
+needs exact human timing. A test run never drives by hand: it plays a runner
+that was ready before `Up` ("Test runs: the runner is ready before Up",
+below).
 
 ## Scripted routes
 
@@ -33,6 +35,9 @@ shape; the rule under "Rules learned" is to gate each wait on a log line or
 a screenshot check and sleep a fixed time only where neither exists.
 
 ### Building a new route
+
+This is for a segment nothing reaches yet. Build it once, record it and add
+it to the runner. A test run does not proceed this way ("Test runs", below).
 
 1. Send one segment at a time with `step.ps1`, then look at the screenshot it
    takes:
@@ -147,6 +152,38 @@ wrong.
    character and stage select stay tile-cursor steps with their `hovered=`
    check ([TILE-CURSOR](TILE-CURSOR.md)), inside a segment or as their own
    step.
+
+### Test runs: the runner is ready before Up
+
+2026-11-03. On the clean-room RC8 runs (lr-01, lr-02 and a Yoga pair), the
+agents spent most of each hour sending one press at a time, with a model
+reading a screenshot after each, and restored the whole menu state after
+every row. They had applied "Building a new route" and EDEN's `step.ps1`
+loop to the whole run. lr-02's batch sent 884 single presses and no macro.
+The rules:
+
+1. **Before `Up`, the runner exists and has had a dry run.** One script
+   covers the whole row list. Each row names its segment files (with
+   sha256), its gates (a marker or log line, with a cap) and the evidence it
+   saves (screenshots, log lines, a receipt per row). The dry run happens
+   offline and checks that every file exists and matches its hash, that every
+   gate loads, and that each row starts on the screen the row before it ends
+   on.
+2. **Chain rows on their end state.** Order the rows so each one starts
+   where the last one ended. Restore state between rows only where the next
+   row needs it. The full restore happens once, at `Down`.
+3. **Manual input only for a missing segment.** When a row needs a screen no
+   segment reaches, build that one segment ("Building a new route"), record
+   it, add it to the runner with its hash, and go back to the runner. Don't
+   drive the rest of the row by hand.
+4. **A model reviews at row checkpoints, not after each input.** The runner
+   plays segments and checks gates by itself. The agent reads the row's
+   receipt and screenshots when the row ends or a gate's cap passes.
+5. **Pace check.** If no row has finished 15 minutes after the game reached
+   its first settled screen, stop sending input and fix the runner. More
+   presses won't fix it. A coordinator can see it in the run's
+   `control.jsonl`: a run that follows these rules shows `macro.play` calls,
+   not hundreds of single presses.
 
 ### Editing a recording
 

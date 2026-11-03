@@ -43,6 +43,7 @@ AGENT_ROWS = [
     ('Copies: byte-identical files linked, differing or written-in-place files copied', 'M'),
     ('Disk: one target dir per source copy (never shared between copies), cargo home shared per host and toolchain, df checked (>= 40 GB), finished build products deleted with a manifest', 'M'),
     ('Eden: waits gated on a log line or screenshot check', 'M'),
+    ('Eden: test run plays a runner dry-run before Up (recorded segments + sha256, automated gates, per-row receipts, rows chained on end state); manual input only to build a missing segment', 'M'),
     ('Eden: failed precondition aborted and retried under the next label', 'M'),
     ('Eden: game-side facts from guest tracepoints on a run already happening; diag rebuild or extra trace boot only with a stated reason', 'M'),
     ('Eden: profile restored, temp files removed, host released', 'M'),
