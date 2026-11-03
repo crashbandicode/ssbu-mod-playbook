@@ -17,6 +17,7 @@ different Eden AppImage (resolved path; its sha256 is read). Same-boot fixing (M
 fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 """
 import argparse
+import copy
 import hashlib
 import json
 import shutil
@@ -63,7 +64,7 @@ def cmd_new(args):
     run = RUNS / args.label
     if run.exists():
         raise SystemExit(f'{run} exists; pick a new label')
-    config = dict(previous)
+    config = copy.deepcopy(previous)
     config['label'] = args.label
     config['state_dir'] = str(run / 'state')
     config['work_root'] = str(run / 'work')
@@ -78,6 +79,34 @@ def cmd_new(args):
                 raise SystemExit(f'pin changed: {pin["path"]} is {actual[:12]}…, config says {pin["sha256"][:12]}…')
     rows_src = Path(args.rows)
     run.mkdir(parents=True)
+    # A pinned Qt fixture is applied after lifecycle's source-config rewrite.
+    # Derive a new pinned fixture; never change the inherited input in place.
+    for item in config['instances']:
+        for pin in item.get('files', []):
+            if pin.get('to') != 'user/config/qt-config.ini':
+                continue
+            source = Path(pin['path'])
+            text = source.read_text()
+            lines, counts = [], {'nand_directory': 0, 'sdmc_directory': 0}
+            profile = Path(config['work_root']) / 'profiles' / ('profile-' + item['key'])
+            for line in text.splitlines(keepends=True):
+                key, equal, value = line.partition('=')
+                if equal and key.strip() in counts:
+                    name = key.strip()
+                    counts[name] += 1
+                    folder = 'nand' if name == 'nand_directory' else 'sdmc'
+                    ending = '\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
+                    line = key + '=' + (profile / 'user' / folder).as_posix() + ending
+                lines.append(line)
+            if any(count != 1 for count in counts.values()):
+                raise SystemExit(f'Qt fixture needs exactly one NAND and SDMC directory: {source}')
+            derived = run / 'inputs' / ('qt-' + item['key'] + '.ini')
+            derived.parent.mkdir(exist_ok=True)
+            derived.write_text(''.join(lines))
+            pin.update(path=str(derived), sha256=sha256(derived))
+            (derived.with_suffix('.provenance.json')).write_text(json.dumps({
+                'source': str(source), 'source_sha256': sha256(source),
+                'derived_sha256': pin['sha256'], 'changed_keys': list(counts)}, indent=2) + '\n')
     shutil.copytree(rows_src, run / 'rows', symlinks=True)
     config['rows'] = {'path': str(run / 'rows' / 'rows.json'), 'sha256': sha256(run / 'rows' / 'rows.json')}
     # The lifecycle dry-runs the rows with the runner it pins: always this playbook's runner, never a staged copy.

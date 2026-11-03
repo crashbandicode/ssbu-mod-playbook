@@ -89,6 +89,33 @@ class EdenTestTests(unittest.TestCase):
             eden_test.main(['new', *self.args()])
         self.assertIn('pin changed', str(caught.exception))
 
+    def test_new_rebases_pinned_qt_without_changing_original_or_other_pins(self):
+        qt = self.dir / 'old-qt.ini'
+        original = '[Data Storage]\nnand_directory=/old/private/nand\nsdmc_directory=/old/private/sdmc\n[Network]\nport=24872\n'
+        qt.write_text(original)
+        previous = json.loads(self.previous.read_text())
+        previous['instances'][0]['files'] = [{'path':str(qt), 'sha256':sha(qt), 'to':'user/config/qt-config.ini'}]
+        self.previous.write_text(json.dumps(previous))
+        eden_test.main(['new', *self.args()])
+        config = json.loads((self.dir / 'runs/lr-14/config.json').read_text())
+        pin = config['instances'][0]['files'][0]
+        derived = Path(pin['path'])
+        self.assertEqual(qt.read_text(), original)
+        self.assertEqual(sha(derived), pin['sha256'])
+        self.assertIn('port=24872', derived.read_text())
+        self.assertIn('nand_directory=' + str(self.dir / 'runs/lr-14/work/profiles/profile-a/user/nand'), derived.read_text())
+        self.assertIn('sdmc_directory=' + str(self.dir / 'runs/lr-14/work/profiles/profile-a/user/sdmc'), derived.read_text())
+        self.assertEqual(config['instances'][0]['plugins'], previous['instances'][0]['plugins'])
+
+    def test_qt_rebase_still_refuses_changed_pin_before_derivation(self):
+        qt = self.dir / 'old-qt.ini'
+        qt.write_text('nand_directory=/x\nsdmc_directory=/y\n')
+        previous = json.loads(self.previous.read_text())
+        previous['instances'][0]['files'] = [{'path':str(qt),'sha256':'0'*64,'to':'user/config/qt-config.ini'}]
+        self.previous.write_text(json.dumps(previous))
+        with self.assertRaises(SystemExit):
+            eden_test.main(['new', *self.args()])
+
     def test_all_runs_down_even_after_a_failed_row_and_writes_results(self):
         (self.rows / 'rows.json').write_text('{"rows": [], "note": "fail-once"}')
         eden_test.main(['all', *self.args()])
