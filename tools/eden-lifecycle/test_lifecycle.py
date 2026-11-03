@@ -535,6 +535,26 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_real_ledger_shapes_from_2026_11_03(self):
+        # Shapes from the live ledger that the first parser misread as six open Surface claims (lr-04 refusal).
+        text = (
+            # Release that doesn't repeat "on Surface".
+            '2026-10-31 23:17Z CLAIMED: Claude f9d4e7a2-902a/eden-merged ssbu-cpu-pilot run g04 on Surface, display :78\n'
+            '2026-10-31 23:22Z RELEASED: Claude f9d4e7a2-902a/eden-merged ssbu-cpu-pilot run g04 stopped Eden and Surface display :78\n'
+            # One claim carried across runs, released once naming only the last run.
+            '2026-10-31 22:37Z CLAIMED: Claude 63392ddd/slot-park-probe Training diag run e03 on Yoga, display :68\n'
+            '2026-10-31 22:43Z NOTE: Claude 63392ddd/slot-park-probe run e03 stopped; the same claim continues with run e04 on Yoga.\n'
+            '2026-10-31 22:43Z CLAIMED: Claude 63392ddd/slot-park-probe Training diag run e04 on Yoga, display :68\n'
+            '2026-10-31 22:55Z RELEASED: Claude 63392ddd/slot-park-probe run e04 stopped Eden, Yoga display :68\n'
+            # A release naming another host leaves this host's claim open.
+            '2026-11-01 10:00Z CLAIMED: Claude aaaa/two-hosts run x on Surface\n'
+            '2026-11-01 10:01Z CLAIMED: Claude aaaa/two-hosts run y on Yoga\n'
+            '2026-11-01 10:30Z RELEASED: Claude aaaa/two-hosts run y on Yoga done\n'
+            # A live claim with no release stays open.
+            '2026-11-03 18:21Z CLAIMED: OpenCode ses_e5e69459/pkg4-pair-runner3 on Yoga Eden Phase1\n')
+        self.assertEqual([l[:17] for l in life.active_claims(text, 'surface')], ['2026-11-01 10:00Z'])
+        self.assertEqual([l[:17] for l in life.active_claims(text, 'yoga')], ['2026-11-03 18:21Z'])
+
     def test_legacy_and_fractional_claim_release_formats_and_host_isolation(self):
         text = ('2026-11-03T15:00:00.123+00:00 CLAIMED: Codex01abc/project on Yoga busy\n'
                 '2026-11-03 15:01Z RELEASED: Codex 01abc/project on Yoga done\n'

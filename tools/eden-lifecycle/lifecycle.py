@@ -172,7 +172,10 @@ def active_claims(text, host):
     Accept historical fractional ISO timestamps and owner spacing. Unknown host
     or unparseable claim records block admission rather than disappearing.
     """
-    active = {}
+    # Releases pair with their owner's open claims: same lifecycle token, else the claims on the host the release
+    # names, else (no host named) all of the owner's legacy claims. Release lines often don't repeat "on <host>" ("stopped Eden and
+    # Surface display :78"); requiring the same scope left six released 2026-10-30..11-02 claims looking open.
+    open_claims = {}  # owner key -> [(scope, token, run, line)] in claim order
     for number, line in enumerate(text.splitlines()):
         event = re.search(r'\b(CLAIMED|RELEASED):\s*(.*)', line)
         if not event:
@@ -186,12 +189,29 @@ def active_claims(text, host):
         scope = scope[1].lower() if scope else 'unknown'
         token = re.search(r'\blifecycle=([a-zA-Z0-9_-]+)\b', body)
         token = token[1] if token else 'legacy'
-        key = (owner_key, scope, token)
+        run = re.search(r'\brun\s+([A-Za-z0-9][\w.-]*)', body)
+        run = run[1] if run else None
+        claims = open_claims.setdefault(owner_key, [])
         if event[1] == 'CLAIMED':
-            active[key] = line
+            claims.append((scope, token, run, line))
+            continue
+        # No run-label matching: one claim is often carried across runs (NOTE "continues with run e04") and
+        # released once naming only the last run. A live run is still caught by admission's foreign-process check.
+        tests = []
+        if token != 'legacy':
+            tests.append(lambda c: c[1] == token)
         else:
-            active.pop(key, None)
-    return [line for (_, scope, _), line in active.items() if scope in (host.lower(), 'unknown')]
+            if scope != 'unknown':
+                tests.append(lambda c: c[0] in (scope, 'unknown') and c[1] == 'legacy')
+            tests.append(lambda c: c[1] == 'legacy')
+        # A release closes every open claim of that owner matching the first criterion that matches any: agents
+        # re-post CLAIMED to extend or amend a claim and release once.
+        for test in tests:
+            if any(test(c) for c in claims):
+                claims[:] = [c for c in claims if not test(c)]
+                break
+    return [line for claims in open_claims.values() for scope, _, _, line in claims
+            if scope in (host.lower(), 'unknown')]
 
 
 class Ledger:
