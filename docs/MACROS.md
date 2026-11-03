@@ -219,6 +219,9 @@ Python in the plugin's repo, `eden/steps.py`.
 - **Bring only generic needs to the shared tool**: something any plugin's
   test would want (a new gate kind, a frontend operation). Add it with a
   test in `test_runner.py`. Don't copy or fork `runner.py`.
+- **Change the shared tools in a worktree** (`git worktree add`), never in
+  the playbook clone itself: live runs execute the tools from that clone,
+  so a half-edited file there breaks someone's `up` or `down`.
 - **What stays fixed:** a test run doesn't drive one input at a time with a
   model looking after each. Scripted inputs in a hook are fine. Lifecycle
   hygiene and the pace check also stay.
