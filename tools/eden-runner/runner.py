@@ -335,6 +335,20 @@ class StepContext:
         self.runner.check_stop()
 
 
+def node_text(node, key):
+    """A ui.tree widget's text/title/tooltip: top level for buttons and labels, but only under
+    properties.<name>.value for some widgets (QMessageBox text, window titles), as pkg4 found on 2026-11-03."""
+    value = node.get(key)
+    if value in (None, ''):
+        props = node.get('properties') or {}
+        for name in {'title': ('windowTitle', 'title'), 'text': ('text',), 'tooltip': ('toolTip', 'tooltip')}[key]:
+            entry = props.get(name)
+            value = entry.get('value') if isinstance(entry, dict) else entry
+            if value not in (None, ''):
+                break
+    return '' if value is None else str(value)
+
+
 def load_step(base, spec):
     """'eden/steps.py:open_defaults' -> the function (path relative to the rows.json folder, or absolute)."""
     path, _, function = spec.partition(':')
@@ -721,7 +735,8 @@ class Runner:
         try:
             tree = self.clients[on].request('ui.tree', {})
             (self.row_dir / f'{on}-GATE-FAILED-{name}-tree.json').write_text(json.dumps(tree.get('result'), indent=1))
-            dialogs = [{k: n.get(k) for k in ('class', 'name', 'title', 'text')} for n in tree.get('result') or []
+            dialogs = [{'class': n.get('class'), 'name': n.get('name'), 'title': node_text(n, 'title'),
+                        'text': node_text(n, 'text')} for n in tree.get('result') or []
                        if n.get('visible') and (n.get('class') in ('QMessageBox', 'QDialog', 'QLabel')
                                                  or 'Dialog' in str(n.get('class')))]
             self.log({'gate': name, 'on': on, 'pass': False, 'visible_dialog_widgets': dialogs[:20]})
@@ -765,7 +780,7 @@ class Runner:
                 if node.get(key) != want:
                     return False
             elif key in ('text', 'title', 'tooltip'):
-                if not re.search(want, str(node.get(key, '')).replace('&', '')):
+                if not re.search(want, node_text(node, key).replace('&', '')):
                     return False
             elif key in ('visible', 'enabled'):
                 if bool(node.get(key)) != bool(want):

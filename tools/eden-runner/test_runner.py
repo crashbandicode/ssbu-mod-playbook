@@ -558,8 +558,9 @@ class RunnerTests(unittest.TestCase):
     def test_failed_ui_gate_saves_the_tree_and_the_visible_dialog(self):
         eden = FakeEden({})
         original = eden.request
-        tree = [{'id': 'o7', 'class': 'QMessageBox', 'name': '', 'title': 'Error', 'text': 'Unable to connect to the room',
-                 'visible': True}]
+        # The real API's QMessageBox carries its text only under properties.text.value (pkg4, 2026-11-03).
+        tree = [{'id': 'o7', 'class': 'QMessageBox', 'name': '', 'title': '', 'text': None, 'visible': True,
+                 'properties': {'text': {'value': 'Unable to connect to the room'}, 'windowTitle': {'value': 'Error'}}}]
 
         def request(method, params):
             if method == 'ui.tree':
@@ -573,9 +574,13 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.make(eden).run()
         saved = json.loads((self.dir / 'out' / 'join' / 'a-GATE-FAILED-two-tree.json').read_text())
-        self.assertEqual(saved[0]['text'], 'Unable to connect to the room')
+        self.assertEqual(saved[0]['properties']['text']['value'], 'Unable to connect to the room')
         self.assertTrue(list((self.dir / 'out' / 'join').glob('*GATE-FAILED-two.png')))
-        self.assertIn('Unable to connect to the room', (self.dir / 'out' / 'actions.jsonl').read_text())
+        actions = (self.dir / 'out' / 'actions.jsonl').read_text()
+        self.assertIn('"text": "Unable to connect to the room"', actions)  # summarised, not null
+        self.assertIn('"title": "Error"', actions)
+        # A gate can match a message box by its text too.
+        self.assertTrue(runner.Runner.ui_matches(tree[0], {'class': 'QMessageBox', 'text': 'Unable to connect'}))
 
     def test_named_pipe_client_round_trip(self):
         import io
