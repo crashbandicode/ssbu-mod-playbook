@@ -177,6 +177,15 @@ pwsh -File tools/eden-solo/solo.ps1 -Action Down -Label e19
 Stops Eden, the display and the GPU lock, then writes `RELEASED:`. Always run
 it, even after a failed run. The profile is kept.
 
+With `tools/eden-lifecycle`, `lifecycle.py down config.json --execute` does
+the same for its own runs. It also restores the profile, verifies it
+separately, and releases only when both pass. Eden's `game.stop` rarely
+finishes within its 30 s cap: on 2026-11-03 it timed out on every run (lr-02
+to lr-05 and pkg4's pair), and the forced stop ended each one cleanly. The
+journal lists that under `stop_errors`. It isn't a failure. A failure is a
+non-empty `cleanup_failures`, a verify that isn't equal, or a claim that's
+still held.
+
 ## Queue runs
 
 `Up` stops when the host is busy. Don't keep checking by hand: start a
