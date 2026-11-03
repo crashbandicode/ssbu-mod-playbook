@@ -50,6 +50,11 @@ Reference images not taken yet: an image gate with "acquire": true and no refere
 the run reaches it (once the region stops changing), writes its sha256 into rows.json, and the runner stops after that
 row with status REVIEW (exit 4). A model looks at the new references once, then runs again.
 
+Eden's own frontend (menus, dialogs, the multiplayer room window): step {"ui": "trigger"|"click"|"set"|"key"|"select"|
+"items"|"context"|"close", "target": "<unique objectName>" or {"class": "QPushButton", "text": "^Host Room$"}, ...extra
+params such as "property"/"value"}. A dict target is polled in ui.tree until exactly one widget matches (or "index").
+Gate {"kind": "ui", "match": {...}, "cap": 30} waits for a matching widget. Online pairs set up their room this way.
+
 More gates:
   {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
       the region differs from the row's mark and has stopped moving (HUD portrait swapped, menu value changed)
@@ -72,7 +77,7 @@ import time
 from pathlib import Path
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
-GATE_KINDS = ('image', 'log', 'json', 'hook', 'change')
+GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui')
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
@@ -182,6 +187,13 @@ def dry_run(manifest_path):
             elif kind == 'change':
                 if len(gate['roi']) != 4 or not gate.get('mark'):
                     errors.append(f'gate {name}: change needs "mark" and a 4-number roi')
+            elif kind == 'ui':
+                if not isinstance(gate.get('match'), dict) or not gate['match']:
+                    errors.append(f'gate {name}: ui needs a "match" object')
+                else:
+                    for key in ('text', 'title', 'tooltip'):
+                        if key in gate['match']:
+                            re.compile(gate['match'][key])
             elif kind == 'json':
                 if not gate.get('expect'):
                     errors.append(f'gate {name}: empty expect')
@@ -222,6 +234,8 @@ def dry_run(manifest_path):
                     errors.append(f'row {row["id"]}: unknown gate {step["gate"]}')
                 elif gate.get('kind') == 'change' and (on, gate.get('mark')) not in marks:
                     errors.append(f'row {row["id"]}: change gate {step["gate"]} before its mark {gate.get("mark")!r}')
+            if 'ui' in step and step['ui'] not in Runner.UI_OPS:
+                errors.append(f'row {row["id"]}: ui op {step["ui"]!r} is not one of {", ".join(Runner.UI_OPS)}')
             if 'mark' in step:
                 marks.add((on, step['mark']))
             if 'copy' in step:
@@ -534,6 +548,18 @@ class Runner:
                 previous = path
                 time.sleep(gate.get('interval', .5))
             self.shot(on, 'GATE-FAILED-' + name)
+        elif kind == 'ui':
+            # A frontend widget state, e.g. the room window's member count: {"match": {"class": "QLabel",
+            # "text": "2 / 8"}}. Passes when at least one visible widget matches.
+            while time.monotonic() < until:
+                self.check_stop()
+                tree = self.call(on, 'ui.tree', {}) or []
+                hits = [n for n in tree if self.ui_matches(n, gate['match'])]
+                if hits:
+                    self.log({'gate': name, 'on': on, 'pass': True, 'widget': {k: hits[0].get(k) for k in
+                                                                                 ('id', 'class', 'name', 'text')}})
+                    return {k: hits[0].get(k) for k in ('id', 'class', 'name', 'text')}
+                time.sleep(.5)
         elif kind == 'json':
             source = self.source(on, gate['source'])
             while time.monotonic() < until:
@@ -588,6 +614,49 @@ class Runner:
             previous = path
             time.sleep(gate.get('interval', .5))
         raise RuntimeError(f'gate {name} on {on}: screen never settled within {gate["cap"]} s to acquire a reference')
+
+    UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
+
+    @staticmethod
+    def ui_matches(node, match):
+        """match: exact "class"/"name"/"id", regex "text"/"title"/"tooltip" (& accelerators ignored), "visible"
+        (default true), "enabled"."""
+        for key, want in match.items():
+            if key in ('class', 'name', 'id'):
+                if node.get(key) != want:
+                    return False
+            elif key in ('text', 'title', 'tooltip'):
+                if not re.search(want, str(node.get(key, '')).replace('&', '')):
+                    return False
+            elif key in ('visible', 'enabled'):
+                if bool(node.get(key)) != bool(want):
+                    return False
+        return match.get('visible', True) is False or node.get('visible', True)
+
+    def find_ui(self, on, match, cap):
+        """Poll ui.tree until exactly one widget matches (dialogs open asynchronously); returns its session id."""
+        until = time.monotonic() + cap
+        found = []
+        while time.monotonic() < until:
+            self.check_stop()
+            tree = self.call(on, 'ui.tree', {}) or []
+            found = [n for n in tree if self.ui_matches(n, match)]
+            if len(found) == 1 or (found and 'index' in match):
+                return found[match.get('index', 0)]['id']
+            time.sleep(.3)
+        raise RuntimeError(f'ui target {match} on {on}: {len(found)} matches after {cap} s (need exactly one)')
+
+    def ui(self, on, step):
+        """Operate Eden's Qt frontend (menus, dialogs, the multiplayer room window) through the control socket."""
+        params = {k: v for k, v in step.items() if k not in ('ui', 'target', 'on', 'cap')}
+        target = step.get('target')
+        if isinstance(target, dict):
+            params['target'] = self.find_ui(on, target, step.get('cap', 10))
+        elif target is not None:
+            params['target'] = target  # an objectName the server resolves (must be unique) or a session id
+        result = self.call(on, 'ui.' + step['ui'], params)
+        self.log({'ui': step['ui'], 'on': on, 'params': params})
+        return result
 
     def json_diff(self, on, spec):
         """Compare a JSON file now with a copy taken earlier in the row ({"copy": key, "as": before}).
@@ -675,6 +744,9 @@ class Runner:
                         receipt['results'].append({'copy': str(target)})
                     elif 'json_diff' in step:
                         receipt['results'].append({'json_diff': self.json_diff(on, step['json_diff'])})
+                    elif 'ui' in step:
+                        self.ui(on, step)
+                        receipt['results'].append({'ui': step['ui'], 'on': on, 'target': step.get('target')})
                     elif 'wait_ms' in step:
                         self.check_stop()
                         time.sleep(step['wait_ms'] / 1000)

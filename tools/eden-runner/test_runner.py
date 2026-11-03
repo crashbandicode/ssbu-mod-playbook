@@ -382,6 +382,47 @@ class RunnerTests(unittest.TestCase):
         # A second harvest leaves existing entries alone.
         self.assertEqual(harvest.harvest(self.manifest, self.dir / 'out', 'test-02', library)['segments'], [])
 
+    def test_ui_steps_set_up_a_room_through_the_frontend(self):
+        tree = [{'id': 'o4', 'class': 'QAction', 'name': 'action_Multiplayer_Create_Room', 'text': '&Create Room',
+                 'visible': True}]
+        sent = []
+        eden = FakeEden({})
+        original = eden.request
+
+        def request(method, params):
+            if method == 'ui.tree':
+                return {'ok': True, 'result': list(tree)}
+            if method.startswith('ui.') and method != 'ui.screenshot':
+                sent.append((method, params))
+                if method == 'ui.trigger':  # the room dialog opens
+                    tree.extend([{'id': 'o90', 'class': 'QLineEdit', 'name': 'port', 'text': '24872', 'visible': True},
+                                 {'id': 'o91', 'class': 'QPushButton', 'name': 'host', 'text': '&Host Room',
+                                  'visible': True}])
+                if method == 'ui.click':  # the room window shows its member count
+                    tree.append({'id': 'o95', 'class': 'QLabel', 'name': 'members', 'text': '1 / 8', 'visible': True})
+                return {'ok': True, 'result': {}}
+            return original(method, params)
+
+        eden.request = request
+        self.plan['gates']['room-open'] = {'kind': 'ui', 'match': {'class': 'QLabel', 'text': r'^\d+ / 8$'}, 'cap': 2}
+        self.plan['rows'] = [{'id': 'room', 'start': 'blue', 'end': 'blue', 'steps': [
+            {'ui': 'trigger', 'target': 'action_Multiplayer_Create_Room'},
+            {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': 'port'}, 'property': 'text', 'value': '24873'},
+            {'ui': 'click', 'target': {'class': 'QPushButton', 'text': '^Host Room$'}},
+            {'gate': 'room-open'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+        self.make(eden).run()
+        self.assertEqual(sent, [('ui.trigger', {'target': 'action_Multiplayer_Create_Room'}),
+                                ('ui.set', {'property': 'text', 'value': '24873', 'target': 'o90'}),
+                                ('ui.click', {'target': 'o91'})])
+        receipt = json.loads((self.dir / 'out' / 'room.json').read_text())
+        self.assertEqual((receipt['status'], receipt['results'][-1]['evidence']['text']), ('PASS', '1 / 8'))
+        # A typo'd op is caught offline.
+        self.plan['rows'][0]['steps'][0]['ui'] = 'press'
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn("ui op 'press'", ' | '.join(runner.dry_run(self.manifest)['errors']))
+
     def test_named_pipe_client_round_trip(self):
         import io
 
