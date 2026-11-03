@@ -186,8 +186,10 @@ The rules:
    not hundreds of single presses.
 6. **Runner prep is time-boxed.** Up comes at most 15 minutes after the
    order when the segments exist, and 30 minutes when some must be recorded.
-   Boot with the rows whose dry run passes. Add the others between rows in
-   the same boot, each one dry-run first. The dry run is the checks in rule 1
+   Boot with the rows whose dry run passes. A dry run that fails on some
+   rows is not a reason to wait: take those rows out of `rows.json`, list
+   them in the handoff as deferred with the reason, and boot. Add them back
+   between rows in the same boot once each one passes its own dry run. The dry run is the checks in rule 1
    and no more: extra test suites, input-pin sets and code review wait until
    after the run. (2026-11-03: the first runs under these rules spent 30
    minutes before any boot. Each agent wrote its own runner from scratch,
@@ -195,6 +197,45 @@ The rules:
 7. **Keep what the run built.** At `Down`, commit the recorded segments
    (with sha256), the runner and its row list to the repo's `eden/` folder.
    The next run starts from them and records only what is still missing.
+
+#### The shared runner: write a row list, not a runner
+
+`tools/eden-runner/runner.py` is the runner. A test run writes only
+`rows.json` (segments, gates, rows) and, at `Up`, `instances.json` (each
+instance's control socket and the logs or files its gates read). Don't write
+another runner. If a step type is missing, add it to this tool with a test in
+`test_runner.py`.
+
+```text
+python3 -I tools/eden-runner/runner.py dry-run eden/rows.json
+python3 -I tools/eden-runner/runner.py run eden/rows.json --instances runs/eNN/instances.json
+```
+
+- **Steps:** `play` a segment (`macro.play`, wait for it to finish, then
+  `input.reset`), `gate`, `shot`, `copy` (save an instance file into the row
+  folder), and `wait_ms` (only where no gate exists).
+- **Recording:** a segment whose file is missing but which has a `recipe` is
+  recorded on its first `play` (`macro.record`, then the recipe's inputs,
+  then `macro.stop`). Its sha256 is written back into `rows.json`, and
+  every later use plays the file. Recipe inputs are the only single inputs
+  the runner ever sends.
+- **Gates:** `log` (a regex over lines the row wrote), `json` (expected
+  values in a file such as the settings), `image` (a region compared with a
+  reference shot) and `hook` (a Python check such as `css_check.py`).
+  - Prefer a log line.
+  - For an image gate, pick a region that doesn't animate. The default
+    tolerance is a mean difference of 8 per colour byte; an exact match is
+    only allowed with `"static": true`. The title screen's attract mode
+    failed two exact-match attempts on 2026-11-03.
+  - Capture reference shots from the run itself, at the same resolution.
+- **Stopping:** the first failure writes `STOP-INPUT` and the runner exits.
+  Fix the row list or the tool, delete `STOP-INPUT`, and run again. Rows
+  with a PASS receipt are skipped. A `STOP` file in the output folder stops
+  the runner before its next input; a coordinator can use it. The 15-minute
+  pace cap is built in (`--pace-minutes`).
+- **Evidence:** every control call goes to `out/actions.jsonl`. Each row
+  writes `out/<row>.json`, and its screenshots and copies go to
+  `out/<row>/`.
 
 ### Editing a recording
 
