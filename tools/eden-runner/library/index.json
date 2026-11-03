@@ -1,0 +1,5 @@
+{
+  "about": "Proven Super Smash Bros. Ultimate 13.0.5 segments and gate references for tools/eden-runner. Rows name them with {\"library\": \"<name>\"}. Add an entry only from a run that passed it, with start/end screens, sha256 and the run label.",
+  "segments": {},
+  "gates": {}
+}

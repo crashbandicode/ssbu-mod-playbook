@@ -228,6 +228,24 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances runs/eNN/i
     only allowed with `"static": true`. The title screen's attract mode
     failed two exact-match attempts on 2026-11-03.
   - Capture reference shots from the run itself, at the same resolution.
+- **Start checks:** every `play` needs one. That's a gate on the same
+  instance since the last play, a `start_gate` on the segment, or an
+  explicit `"unchecked": true`. On 2026-11-03 lr-03 recorded title→main
+  while the game sat in the attract-mode intro movie.
+- **Idle game:** left idle on the title (or during a long hold), the game
+  plays its attract-mode intro movie. Both runs on 2026-11-03 hit it. Give
+  the first gate of a run, and the first gate after any pause in driving, a
+  `"recover": "<intro-cancel segment>"`. A failed gate then plays that
+  segment once and checks again.
+- **References not taken yet:** an image gate with `"acquire": true` and no
+  reference file saves the settled screen as its reference on first visit.
+  The runner then stops after that row with `REVIEW` (exit 4). Look at the
+  new references once, then run again.
+- **Shared library:** `tools/eden-runner/library/index.json` holds proven
+  segments and gate references for the game, with sha256 and start/end
+  screens. Rows use them with `{"library": "<name>"}` instead of recording
+  them again. At `Down`, add the segments a run proved (rule 7), with the
+  run label.
 - **Stopping:** the first failure writes `STOP-INPUT` and the runner exits.
   Fix the row list or the tool, delete `STOP-INPUT`, and run again. Rows
   with a PASS receipt are skipped. A `STOP` file in the output folder stops

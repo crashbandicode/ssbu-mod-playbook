@@ -292,6 +292,44 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(seen, [('input.stick', -1), ('input.button', 'press'), ('input.button', 'release'),
                                 ('input.stick', 0)])
 
+    def test_gate_recover_plays_detour_segment_once(self):
+        # The game sits on the wrong screen (blue, like the attract-mode intro); the gate's recover segment fixes it.
+        self.plan['gates']['red']['recover'] = 'to-red'
+        self.plan['gates']['red']['cap'] = .5
+        self.plan['rows'] = [{'id': 'w1', 'start': 'blue', 'end': 'red', 'steps': [{'gate': 'red'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+        eden = FakeEden({'to-red': RED})
+        self.make(eden).run()
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertEqual(json.loads((self.dir / 'out' / 'w1.json').read_text())['status'], 'PASS')
+        # Without a way back the gate still fails after the one recovery.
+        (self.dir / 'out' / 'w1.json').unlink()
+        with self.assertRaises(RuntimeError):
+            self.make(FakeEden({'to-red': BLUE})).run()
+
+    def test_library_entries_resolve_from_the_shared_folder(self):
+        library = self.dir / 'library'
+        (library / 'segments').mkdir(parents=True)
+        shutil.copy(self.dir / 'segments' / 'to-red.edenmacro.json', library / 'segments' / 'to-red.edenmacro.json')
+        (library / 'index.json').write_text(json.dumps({'segments': {'to-red': {
+            'file': 'segments/to-red.edenmacro.json', 'sha256': self.plan['segments']['to-red']['sha256'],
+            'start': 'blue', 'end': 'red'}}, 'gates': {}}))
+        (self.dir / 'segments' / 'to-red.edenmacro.json').unlink()
+        self.plan['segments']['to-red'] = {'library': 'to-red', 'cap': 30}
+        self.manifest.write_text(json.dumps(self.plan))
+        original = runner.LIBRARY
+        runner.LIBRARY = library
+        try:
+            report = runner.dry_run(self.manifest)
+            self.assertEqual(report['errors'], [])
+            self.assertIn('to-red', report['available_segments'])
+            self.plan['segments']['to-red'] = {'library': 'no-such-entry'}
+            self.manifest.write_text(json.dumps(self.plan))
+            self.assertIn('no library entry', runner.dry_run(self.manifest)['errors'][0])
+        finally:
+            runner.LIBRARY = original
+
     def test_stop_file_and_pace_cap(self):
         (self.dir / 'out').mkdir()
         (self.dir / 'out' / 'STOP').write_text('primary')

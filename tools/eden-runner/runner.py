@@ -34,6 +34,12 @@ gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screensh
 copy <instance key> [as <name>] (copy that instance file into the row folder), json_diff {source, before, allowed,
 must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists).
 
+Shared library: a segment or gate written as {"library": "<name>"} comes from library/index.json next to this file
+(proven segments and references, with sha256 and start/end screens), so common routes aren't recorded again per run.
+
+Known detours: a gate with "recover": "<segment>" plays that segment and checks again when it fails (at most
+"recover_times", default 1). Use it for the attract-mode intro the game falls into when left idle, or a stray pop-up.
+
 Recipe actions: {"buttons": "a", "hold": 150, "gap": 0.6}, {"buttons": "b", "with_stick": [0, -1]} (stick held
 through the press, e.g. Down+B), {"stick": [x, y, ms]}.
 
@@ -91,10 +97,41 @@ def load_hook(base, gate):
     return getattr(module, gate['function'])
 
 
+LIBRARY = Path(__file__).resolve().parent / 'library'
+
+
+def expand_library(plan):
+    """Fill in segments and gates that name a shared library entry ({"library": "title-main"}).
+
+    The library (library/index.json) holds proven segments and gate references for the game, each with its sha256 and
+    start/end screens. Paths become absolute, so they resolve from any rows.json folder. Fields set in rows.json win.
+    """
+    index_path = LIBRARY / 'index.json'
+    index = json.loads(index_path.read_text()) if index_path.is_file() else {'segments': {}, 'gates': {}}
+    for kind in ('segments', 'gates'):
+        for name, item in plan.get(kind, {}).items():
+            if 'library' not in item:
+                continue
+            entry = index.get(kind, {}).get(item['library'])
+            if entry is None:
+                raise KeyError(f'{kind[:-1]} {name}: no library entry {item["library"]!r} in {index_path}')
+            merged = dict(entry)
+            for field in ('file', 'reference', 'module'):
+                if field in merged:
+                    merged[field] = str(LIBRARY / merged[field])
+            merged.update({k: v for k, v in item.items() if k not in ('file', 'reference', 'module', 'sha256')})
+            plan[kind][name] = merged
+    return plan
+
+
 def dry_run(manifest_path):
     """Offline only. Raises on a broken manifest; returns the report (missing segments are not an error)."""
     base = manifest_path.parent
-    plan = json.loads(manifest_path.read_text())
+    try:
+        plan = expand_library(json.loads(manifest_path.read_text()))
+    except KeyError as error:
+        return {'manifest': str(manifest_path), 'errors': [str(error)], 'result': 'BROKEN', 'rows': 0,
+                'missing_segments': [], 'references_to_acquire': [], 'available_segments': []}
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
@@ -119,6 +156,8 @@ def dry_run(manifest_path):
             continue
         if not gate.get('cap', 0) > 0:
             errors.append(f'gate {name}: needs a cap > 0')
+        if gate.get('recover') and gate['recover'] not in plan.get('segments', {}):
+            errors.append(f'gate {name}: recover segment {gate["recover"]!r} is not in segments')
         try:
             if kind == 'image':
                 ref = base / gate['reference']
@@ -202,7 +241,7 @@ class Runner:
     def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None):
         self.manifest_path = manifest_path
         self.base = manifest_path.parent
-        self.plan = json.loads(manifest_path.read_text())
+        self.plan = expand_library(json.loads(manifest_path.read_text()))
         self.instances = instances
         self.default = next(iter(instances))
         self.out = out
@@ -351,6 +390,23 @@ class Runner:
         return sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
 
     def gate(self, on, name):
+        """Check a gate. With "recover": "<segment>" a failed gate plays that segment and checks again, at most
+        "recover_times" (default 1) times: for known detours such as the attract-mode intro or a stray pop-up."""
+        gate = self.plan['gates'][name]
+        for attempt in range(gate.get('recover_times', 1) + 1 if gate.get('recover') else 1):
+            try:
+                return self.check_gate(on, name)
+            except StopRun:
+                raise
+            except RuntimeError as error:
+                if not gate.get('recover') or attempt == gate.get('recover_times', 1):
+                    raise
+                self.log({'gate': name, 'on': on, 'recover': gate['recover'], 'after': repr(error)[:200]})
+                seg = self.plan['segments'][gate['recover']]
+                self.call(on, 'macro.play', {'path': str(self.base / seg['file'])})
+                self.wait_macro(on, seg.get('cap', 60))
+
+    def check_gate(self, on, name):
         gate = self.plan['gates'][name]
         kind, until = gate['kind'], time.monotonic() + gate['cap']
         if kind == 'log':
