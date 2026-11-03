@@ -107,8 +107,11 @@ evidence doc.
   ([MACROS](MACROS.md), "Test runs: the runner is ready before Up"). Manual
   input only to build a missing segment, which is then recorded into the
   runner. If no row is done 15 minutes after the first settled screen, stop
-  and fix the runner. Evidence: the runner's path and dry-run log, and the
-  `macro.play` calls in `control.jsonl`.
+  and fix the runner. Up within 15 minutes of the order (30 when segments
+  must be recorded), with the rows that pass; no extra offline suites before
+  boot. At `Down`, segments, runner and row list committed to `eden/`.
+  Evidence: the runner's path and dry-run log, the order and `Up` times, and
+  the `macro.play` calls in `control.jsonl`.
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
 - **M** Game-side facts are captured with guest tracepoints on a run already

@@ -184,6 +184,17 @@ The rules:
    presses won't fix it. A coordinator can see it in the run's
    `control.jsonl`: a run that follows these rules shows `macro.play` calls,
    not hundreds of single presses.
+6. **Runner prep is time-boxed.** Up comes at most 15 minutes after the
+   order when the segments exist, and 30 minutes when some must be recorded.
+   Boot with the rows whose dry run passes. Add the others between rows in
+   the same boot, each one dry-run first. The dry run is the checks in rule 1
+   and no more: extra test suites, input-pin sets and code review wait until
+   after the run. (2026-11-03: the first runs under these rules spent 30
+   minutes before any boot. Each agent wrote its own runner from scratch,
+   one with 14 offline tests and 86 pinned input hashes.)
+7. **Keep what the run built.** At `Down`, commit the recorded segments
+   (with sha256), the runner and its row list to the repo's `eden/` folder.
+   The next run starts from them and records only what is still missing.
 
 ### Editing a recording
 
