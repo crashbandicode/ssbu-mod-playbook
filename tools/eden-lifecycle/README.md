@@ -199,7 +199,7 @@ No process-name kill is used. Recorded creation-time/image/session identities
 and Job membership protect against PID reuse. Only the token-derived task is
 ended/deleted, then all owned PIDs must be absent before restore/release.
 
-Offline suite at the follow-up checkpoint: **70 tests**, including twelve Windows
+Offline suite at the follow-up checkpoint: **71 tests**, including thirteen Windows
 fake/command/bridge tests and Primary's concurrent deferred-load regression.
 Native single-boot qualification is tracked separately in the Primary inbox;
 pair mode and transport-loss recovery remain unqualified. SSH always uses a
@@ -208,6 +208,18 @@ non-login exec, no PTY and explicit `-NoProfile -NonInteractive` MSI PowerShell;
 operation, never by replaying an admitted Up. That retry contract is fault-tested
 offline, not natively triggered. Tasks use the current user's SID rather than
 SSH's unreliable USERDOMAIN string. No alternate shell is substituted.
+
+The follow-up branch starts at `ceae08f`; `lifecycle.py`, `defer_load`, its
+frontend-ready behavior, the `game` field in instances.json and the original
+deferred-load regression are unchanged. One added offline regression exercises
+the actual Windows task-creation failure path through Up's cleanup, verifying
+restore/source equality and own release without spawning a launcher or Eden.
+The earlier 20:08–20:10 native attempt proved **pre-launch rollback only**:
+Task Scheduler rejected UserId, no launcher receipt existed, and the full
+1,344-entry private snapshot plus 1,297-entry source inventory verified before
+release. It did not prove a game-loaded or Job-kill path. Exact observations,
+remaining artifacts and the later-proof checklist are in
+[ALLY-OFFLINE-2026-11-03.md](ALLY-OFFLINE-2026-11-03.md).
 
 ### Later Ally qualification (not currently authorized)
 

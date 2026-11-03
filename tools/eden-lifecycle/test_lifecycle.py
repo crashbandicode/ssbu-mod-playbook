@@ -922,6 +922,37 @@ class WindowsTests(unittest.TestCase):
             host.call(item, 'input.button', {}, 1)
         self.assertEqual(len(scripts), 1)
 
+    def test_windows_task_creation_failure_rolls_back_and_releases_without_spawning(self):
+        # Original 20:08 attempt: scheduler rejected UserId before any task/launcher/Eden existed.
+        class NoJob:
+            def open_job(self, name, access):
+                return None
+        native = life.WindowsHost(self.config, job_api=NoJob())
+        native.ps = lambda script, **kwargs: 'S-1-5-21-1-2-3-1001' if 'WindowsIdentity' in script else '{}'
+        commands = []
+        def rejected(command, cap=30):
+            commands.append(command)
+            raise life.Refused('No mapping between account names and security IDs was done; UserId')
+        native.run = rejected
+        self.host.launch = native.launch
+        self.host.force_stop = native.force_stop
+        self.host.metrics = native.metrics
+        c = self.controller()
+        with patch.object(life.subprocess, 'Popen') as spawn, \
+                patch.object(life.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as tasks:
+            with self.assertRaisesRegex(life.Refused, 'No mapping between account names'):
+                c.up()
+        spawn.assert_not_called()
+        self.assertEqual([cmd[1] for cmd in commands], ['/create'])
+        self.assertEqual([call.args[0][1] for call in tasks.call_args_list], ['/end', '/delete'])
+        self.assertEqual(c.state['phase'], 'down')
+        self.assertTrue(self.ledger.claimed and self.ledger.released)
+        self.assertTrue(c.state['instances'][0]['restored'] and c.state['instances'][0]['verified'])
+        self.assertFalse(c.state['cleanup_failures'])
+        self.assertTrue(json.loads((c.directory / 'a-source-verify.json').read_text())['unchanged'])
+        self.assertNotIn('game.load', [method for _, method, _, _ in self.host.calls])
+        self.assertFalse((Path(c.state['instances'][0]['run']) / 'launcher.json').exists())
+
     def test_windows_job_kill_is_session_scoped_and_never_targets_a_reused_pid(self):
         class Job:
             def __init__(self):
