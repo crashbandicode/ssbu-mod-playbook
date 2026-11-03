@@ -710,7 +710,27 @@ class Runner:
                 path.unlink(missing_ok=True)  # keep only the passing shot and the final failing one
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
+            raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+        # Non-image gates (log, json, ui, status, change) save what the game showed when they gave up, so a
+        # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
+        self.failure_evidence(on, name)
         raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+
+    def failure_evidence(self, on, name):
+        """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""
+        try:
+            tree = self.clients[on].request('ui.tree', {})
+            (self.row_dir / f'{on}-GATE-FAILED-{name}-tree.json').write_text(json.dumps(tree.get('result'), indent=1))
+            dialogs = [{k: n.get(k) for k in ('class', 'name', 'title', 'text')} for n in tree.get('result') or []
+                       if n.get('visible') and (n.get('class') in ('QMessageBox', 'QDialog', 'QLabel')
+                                                 or 'Dialog' in str(n.get('class')))]
+            self.log({'gate': name, 'on': on, 'pass': False, 'visible_dialog_widgets': dialogs[:20]})
+        except Exception as error:  # noqa: BLE001 - evidence is best effort; the gate failure is the result
+            self.log({'gate': name, 'on': on, 'failure_evidence_error': repr(error)})
+        try:
+            self.shot(on, 'GATE-FAILED-' + name)
+        except Exception as error:  # noqa: BLE001
+            self.log({'gate': name, 'on': on, 'failure_shot_error': repr(error)})
 
     def acquire(self, on, name, gate, until):
         """First visit of a screen with no reference yet: wait until the region stops changing, save that shot as the

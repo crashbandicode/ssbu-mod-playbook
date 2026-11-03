@@ -555,6 +555,28 @@ class RunnerTests(unittest.TestCase):
             runner.record_command('record-start', new_rows, self.instances, 'open-defaults', None,
                                   client_factory=lambda s: eden)
 
+    def test_failed_ui_gate_saves_the_tree_and_the_visible_dialog(self):
+        eden = FakeEden({})
+        original = eden.request
+        tree = [{'id': 'o7', 'class': 'QMessageBox', 'name': '', 'title': 'Error', 'text': 'Unable to connect to the room',
+                 'visible': True}]
+
+        def request(method, params):
+            if method == 'ui.tree':
+                return {'ok': True, 'result': list(tree)}
+            return original(method, params)
+
+        eden.request = request
+        self.plan['gates']['two'] = {'kind': 'ui', 'match': {'class': 'QLabel', 'text': '^2 / 8$'}, 'cap': .6}
+        self.plan['rows'] = [{'id': 'join', 'start': 'blue', 'end': 'blue', 'steps': [{'gate': 'two'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        with self.assertRaises(RuntimeError):
+            self.make(eden).run()
+        saved = json.loads((self.dir / 'out' / 'join' / 'a-GATE-FAILED-two-tree.json').read_text())
+        self.assertEqual(saved[0]['text'], 'Unable to connect to the room')
+        self.assertTrue(list((self.dir / 'out' / 'join').glob('*GATE-FAILED-two.png')))
+        self.assertIn('Unable to connect to the room', (self.dir / 'out' / 'actions.jsonl').read_text())
+
     def test_named_pipe_client_round_trip(self):
         import io
 
