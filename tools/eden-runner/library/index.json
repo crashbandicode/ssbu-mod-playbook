@@ -2063,6 +2063,20 @@
       "cap": 25,
       "pattern": "\\[MiiAutoInit\\] catalog ready; capture_armed=\\[true, true\\] generations=\\[3, 3\\] opening=4\\b",
       "from_run": "lr-08"
+    },
+    "lr06-catalog-cycle2": {
+      "kind": "log",
+      "source": "diag",
+      "cap": 25,
+      "pattern": "\\[MiiAutoInit\\] catalog ready; capture_armed=\\[true, true\\] generations=\\[4, 4\\] opening=6\\b",
+      "from_run": "lr09"
+    },
+    "lr06-catalog-cycle3": {
+      "kind": "log",
+      "source": "diag",
+      "cap": 25,
+      "pattern": "\\[MiiAutoInit\\] catalog ready; capture_armed=\\[true, true\\] generations=\\[5, 5\\] opening=8\\b",
+      "from_run": "lr09"
     }
   }
 }
