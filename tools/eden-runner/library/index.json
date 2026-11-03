@@ -306,6 +306,60 @@
       "end_gate": "room-list",
       "from_run": "p4r-shared",
       "row": "07-native-departure"
+    },
+    "steve-hover": {
+      "file": "segments/steve-hover.edenmacro.json",
+      "sha256": "edf2fb3e2db4b65571420dbc839219a005687f7b8685bf7201f940d06d2dd414",
+      "cap": 20,
+      "start_gate": "css",
+      "end_gate": "steve78",
+      "from_run": "lr-04",
+      "row": "04-steve"
+    },
+    "steve-place": {
+      "file": "segments/steve-place.edenmacro.json",
+      "sha256": "c02d3b0a91229c573ee848b686afc575649b4697734c3041351525e98dbe2fdc",
+      "cap": 20,
+      "start_gate": "steve78",
+      "end_gate": "steve-selected",
+      "from_run": "lr-04",
+      "row": "04-steve"
+    },
+    "lr04-cpu-approach": {
+      "file": "segments/lr04-cpu-approach.edenmacro.json",
+      "sha256": "27b8846bc5f9aa21d7c3746d1cef7894369f7479f29f937c248ca5f23d580396",
+      "cap": 20,
+      "start_gate": "steve-selected",
+      "end_gate": "steve-selected",
+      "from_run": "lr-04",
+      "row": "05a-cpu-approach"
+    },
+    "lr04-cpu-pick": {
+      "file": "segments/lr04-cpu-pick.edenmacro.json",
+      "sha256": "fc6319148f476318cbd86fb5a2d3d63e4b135808aa34a21cada687b6dbddc1f9",
+      "cap": 25,
+      "start_gate": "steve-selected",
+      "end_gate": "cpu-token-fresh",
+      "from_run": "lr-04",
+      "row": "05b-cpu-pick"
+    },
+    "lr04-cpu85-to74": {
+      "file": "segments/lr04-cpu85-to74.edenmacro.json",
+      "sha256": "96f97989b34e29973e53d7ad4174cdececb754e1727bb22c5ca7d7abde102cdb",
+      "cap": 15,
+      "start_gate": "cpu85-held",
+      "end_gate": "cpu74-fresh",
+      "from_run": "lr-04",
+      "row": "05c-cpu74"
+    },
+    "lr04-roy-lucas": {
+      "file": "segments/lr04-roy-lucas.edenmacro.json",
+      "sha256": "dc74d27fceb1d3387e2d0679424f2f9de484762dc634da7d532115e9b20c0702",
+      "cap": 15,
+      "start_gate": "return-roy-held",
+      "end_gate": "return-lucas-fresh",
+      "from_run": "lr-04",
+      "row": "12-return-lucas"
     }
   },
   "gates": {
@@ -1565,6 +1619,157 @@
       "purpose": "Static SIMON label on actual native result card, not fading Gold Earned animation",
       "reference_is_roi": true,
       "from_run": "p4r-shared"
+    },
+    "host-action": {
+      "kind": "ui",
+      "match": {
+        "class": "QAction",
+        "name": "action_Start_Room"
+      },
+      "cap": 15,
+      "from_run": "p4s-shared"
+    },
+    "host-dialog": {
+      "kind": "ui",
+      "match": {
+        "class": "QLineEdit",
+        "name": "username"
+      },
+      "cap": 15,
+      "from_run": "p4s-shared"
+    },
+    "steve78": {
+      "kind": "log",
+      "source": "tile",
+      "pattern": "settled screen=css at=78 hovered=78",
+      "cap": 15,
+      "from_run": "lr-04"
+    },
+    "steve-selected": {
+      "kind": "image",
+      "reference": "refs/steve-selected.png",
+      "sha256": "e643e8ff4b88a51db98a47956725384342f8e3a2288aa43afcea4f41746ea37f",
+      "roi": [
+        315,
+        545,
+        415,
+        580
+      ],
+      "tolerance": 8,
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "lr-04"
+    },
+    "cpu-token-fresh": {
+      "kind": "log",
+      "source": "tile",
+      "pattern": "step screen=css [^\\n]*token=p2",
+      "cap": 5,
+      "from_run": "lr-04"
+    },
+    "cpu85-held": {
+      "kind": "image",
+      "reference": "refs/cpu85-held.png",
+      "sha256": "552ed5825f743b85e469d8104d6d8bf5ac099c8e46346a70b86f7e4a267c8ed5",
+      "roi": [
+        930,
+        545,
+        1125,
+        579
+      ],
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "lr-04"
+    },
+    "cpu74-fresh": {
+      "kind": "log",
+      "source": "tile",
+      "pattern": "step screen=css dir=up from=85 to=74 token=p2",
+      "cap": 10,
+      "from_run": "lr-04"
+    },
+    "delay2-settings": {
+      "kind": "json",
+      "source": "settings",
+      "expect": {
+        "menu.input_delay": [
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "cap": 5,
+      "from_run": "lr-04"
+    },
+    "no-leak2": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "pause_owner resume_checked delay=2 leaked=0",
+      "cap": 15,
+      "from_run": "lr-04"
+    },
+    "return-roy-held": {
+      "kind": "image",
+      "reference": "refs/return-roy-held.png",
+      "sha256": "08f86998536a62d02ccb8709b1cd5aa33696b24bed948f1bee2fa164ded1aaf3",
+      "roi": [
+        1052,
+        548,
+        1127,
+        581
+      ],
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "lr-04"
+    },
+    "return-lucas-fresh": {
+      "kind": "log",
+      "source": "tile",
+      "pattern": "step screen=css dir=left from=40 to=39 token=p2",
+      "cap": 8,
+      "from_run": "lr-04"
+    },
+    "native-finalize-p1": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[Destroy\\] plan owner=0 reason=finalize steps=1 routes_cleared=1 attached=NativeRetiring routes_stale=0",
+      "cap": 20,
+      "from_run": "lr-04"
+    },
+    "native-finalize-cpu": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[Destroy\\] plan owner=1 reason=finalize steps=1 routes_cleared=1 attached=NativeRetiring routes_stale=0",
+      "cap": 20,
+      "from_run": "lr-04"
     }
   }
 }
