@@ -1,10 +1,17 @@
-# Eden lifecycle draft — 2026-11-03
+# Eden lifecycle — 2026-11-03
 
-**Initial Linux draft was offline-tested. The current Ally follow-up is offline
-only by operator decision; no successful Ally Eden boot is claimed.** Earlier
-authorized pre-launch attempts and exact rollback receipts are in the Primary
-inbox. Companion to `../eden-runner/runner.py`;
-the lifecycle never sends input, plays macros or implements project rows.
+**Live status (2026-11-03):**
+- **Linux:** proven on real runs. The Yoga over `--ssh` ran lr-04 to lr-09 (single
+  instance); the Surface ran locally, and the Yoga over `--ssh`, ran pkg4's pairs
+  (`pair_authorized` + `defer_load`). Each did up, rows, down, full restore,
+  separate verify and release.
+- **Ally (Windows):** one no-input proof passed at 21:27–21:29Z: up, game loaded,
+  down through the Job fallback, restore, separate verify and release (below).
+  Graceful `game.stop`, pairs, native error 1312 and transport loss aren't
+  qualified there yet.
+
+Companion to `../eden-runner/runner.py`; the lifecycle never sends input, plays
+macros or implements project rows.
 
 Playbook read: `c95d1f40255df6eca041eced2596d647c74dff5e` (README, all docs,
 PROVENANCE); source references read: pkg4 runner3 lifecycle, lead lr03/runtime
@@ -221,10 +228,36 @@ release. It did not prove a game-loaded or Job-kill path. Exact observations,
 remaining artifacts and the later-proof checklist are in
 [ALLY-OFFLINE-2026-11-03.md](ALLY-OFFLINE-2026-11-03.md).
 
-### Later Ally qualification (not currently authorized)
+### Ally live proof: PASS (2026-11-03 21:27:09–21:29:34Z, pkg6)
 
-**HOLD: wait for Primary's explicit GO after the new Yoga build is installed.**
-No host query, claim or launch is part of offline preparation. The checked-in
+One no-input proof after the primary's GO; source `bd13a46` (runtime
+`lifecycle.py` identical to main's apart from Linux-only tracing), fresh
+`C:\Eden\life-p6-go01\{work,state}`, lifecycle token
+`9b042b5a61da406d98dfc83dc9659ecc`.
+- **Up:** strict claim and admission (no foreign native/WSL processes, memory
+  and disk gates). The current-SID InteractiveToken task started in session 1.
+  Eden `a3a27006…` (build `063f1b80bb2c`, SSBU 13.0.5). Mute was persisted and
+  read back through the CLI before the only `game.load`. Game loaded at
+  21:28:38Z, running, `loading_complete`, no modal, fresh frame.
+- **Down:** the graceful `game.stop` hit its cap (`Deadline: terminal
+  game.stop`, the same as on Linux). The exact session-scoped Job was
+  terminated at 21:29:02Z, and the task and its process identities were gone
+  before restore. Job limits read back as 8 GiB commit, 256 processes and
+  kill-on-close (peak commit 5.56 GB).
+- **Restore and release:** full private restore, then separate verify (1,347
+  private entries; the installed source's 1,297 entries unchanged), then
+  release. The authoritative readback has `owned_release=true` and `open=[]`.
+- **Not yet qualified on the Ally:** graceful shutdown, pairs, native error
+  1312 handling, transport-loss recovery, cap exhaustion and runtime expiry.
+
+The text below is the checklist that the proof followed; reuse it for the next
+Ally qualification.
+
+### Ally qualification checklist
+
+**Each live Ally run needs the operator's grant and the Ally's normal
+queue/ledger turn.** No host query, claim or launch is part of offline
+preparation. The checked-in
 `ally-proof-HOLD.template.json` reserves `C:\Eden\life-p6-go01\{work,state}` but
 does not assert those paths are currently unused. Its pins and session are
 deliberately invalid, so its draft cannot execute as delivered. It is a plan,
