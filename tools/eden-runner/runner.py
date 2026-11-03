@@ -53,7 +53,11 @@ row with status REVIEW (exit 4). A model looks at the new references once, then 
 Eden's own frontend (menus, dialogs, the multiplayer room window): step {"ui": "trigger"|"click"|"set"|"key"|"select"|
 "items"|"context"|"close", "target": "<unique objectName>" or {"class": "QPushButton", "text": "^Host Room$"}, ...extra
 params such as "property"/"value"}. A dict target is polled in ui.tree until exactly one widget matches (or "index").
-Gate {"kind": "ui", "match": {...}, "cap": 30} waits for a matching widget. Online pairs set up their room this way.
+Gate {"kind": "ui", "match": {...}, "cap": 30} waits for a matching widget. Online pairs set up their room this way,
+BEFORE the game loads (Eden refuses room setup while a game runs): eden-lifecycle "defer_load": true leaves the
+frontend ready, then a row does {"call": "game.load", "params": {"path": "@game"}, "job_cap": 180} and a gate
+{"kind": "status", "expect": {"running": true, "loading_complete": true}, "max_frame_age_ms": 1500, "cap": 180}.
+"call" takes only game.load/pause/resume, status and settings.get/set/save; "@key" reads instances.json.
 
 More gates:
   {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
@@ -77,7 +81,9 @@ import time
 from pathlib import Path
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
-GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui')
+GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status')
+# Control methods a row may call directly with a {"call": ...} step. Input stays in recorded segments.
+CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.get', 'settings.set', 'settings.save')
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
@@ -234,6 +240,8 @@ def dry_run(manifest_path):
                     errors.append(f'row {row["id"]}: unknown gate {step["gate"]}')
                 elif gate.get('kind') == 'change' and (on, gate.get('mark')) not in marks:
                     errors.append(f'row {row["id"]}: change gate {step["gate"]} before its mark {gate.get("mark")!r}')
+            if 'call' in step and step['call'] not in CALL_METHODS:
+                errors.append(f'row {row["id"]}: call {step["call"]!r} is not one of {", ".join(CALL_METHODS)}')
             if 'ui' in step and step['ui'] not in Runner.UI_OPS:
                 errors.append(f'row {row["id"]}: ui op {step["ui"]!r} is not one of {", ".join(Runner.UI_OPS)}')
             if 'mark' in step:
@@ -566,6 +574,19 @@ class Runner:
                                                                                  ('id', 'class', 'name', 'text')}})
                     return {k: hits[0].get(k) for k in ('id', 'class', 'name', 'text')}
                 time.sleep(.5)
+        elif kind == 'status':
+            # Eden's own status, e.g. a game that finished loading: {"expect": {"running": true,
+            # "loading_complete": true}, "max_frame_age_ms": 1500} (the same test eden-lifecycle's up uses).
+            while time.monotonic() < until:
+                self.check_stop()
+                status = self.call(on, 'status') or {}
+                fresh = ('max_frame_age_ms' not in gate or
+                         (isinstance(status.get('last_frame_age_ms'), (int, float))
+                          and status['last_frame_age_ms'] < gate['max_frame_age_ms']))
+                if fresh and not status.get('modal') and all(status.get(k) == v for k, v in gate['expect'].items()):
+                    self.log({'gate': name, 'on': on, 'pass': True})
+                    return {k: status.get(k) for k in gate['expect']}
+                time.sleep(.5)
         elif kind == 'json':
             source = self.source(on, gate['source'])
             while time.monotonic() < until:
@@ -755,6 +776,12 @@ class Runner:
                     elif 'ui' in step:
                         self.ui(on, step)
                         receipt['results'].append({'ui': step['ui'], 'on': on, 'target': step.get('target')})
+                    elif 'call' in step:
+                        # "@key" values come from instances.json, e.g. {"call": "game.load", "params": {"path": "@game"}}
+                        params = {k: (self.instances[on][v[1:]] if isinstance(v, str) and v.startswith('@') else v)
+                                  for k, v in step.get('params', {}).items()}
+                        self.call(on, step['call'], params, job_cap=step.get('job_cap', 15))
+                        receipt['results'].append({'call': step['call'], 'on': on, 'params': params})
                     elif 'wait_ms' in step:
                         self.check_stop()
                         time.sleep(step['wait_ms'] / 1000)

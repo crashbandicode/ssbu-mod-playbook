@@ -446,6 +446,37 @@ class RunnerTests(unittest.TestCase):
         self.manifest.write_text(json.dumps(self.plan))
         self.assertIn("ui op 'press'", ' | '.join(runner.dry_run(self.manifest)['errors']))
 
+    def test_call_game_load_from_instances_then_status_gate(self):
+        eden = FakeEden({})
+        original = eden.request
+        state = {'loaded': False}
+        calls = []
+
+        def request(method, params):
+            if method == 'game.load':
+                calls.append(params)
+                state['loaded'] = True
+                return {'ok': True, 'result': {}}
+            if method == 'status':
+                return {'ok': True, 'result': {'running': state['loaded'], 'loading_complete': state['loaded'],
+                                               'last_frame_age_ms': 16}}
+            return original(method, params)
+
+        eden.request = request
+        self.instances['a']['game'] = '/games/ssbu.xci'
+        self.plan['gates']['loaded'] = {'kind': 'status', 'expect': {'running': True, 'loading_complete': True},
+                                        'max_frame_age_ms': 1500, 'cap': 2}
+        self.plan['rows'] = [{'id': 'load', 'start': 'blue', 'end': 'blue', 'steps': [
+            {'call': 'game.load', 'params': {'path': '@game'}}, {'gate': 'loaded'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+        self.make(eden).run()
+        self.assertEqual(calls, [{'path': '/games/ssbu.xci'}])
+        self.assertEqual(json.loads((self.dir / 'out' / 'load.json').read_text())['status'], 'PASS')
+        self.plan['rows'][0]['steps'][0]['call'] = 'input.button'  # input stays in recorded segments
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn("call 'input.button'", ' | '.join(runner.dry_run(self.manifest)['errors']))
+
     def test_named_pipe_client_round_trip(self):
         import io
 
