@@ -56,8 +56,9 @@ verified unchanged. `C:\Eden\tracing-1103` was not modified.
 mute/save/readback, terminal game load plus fresh frames, capped game.stop and
 actual session-scoped Job termination. Pair mode, native 1312 recovery and
 transport-loss continuation are also unqualified. No gameplay, rows, input,
-media, performance or production-READY claim is made. Independent Primary
-review/merge remains pending.
+media, performance or production-READY claim is made. The initial offline
+follow-up was reviewed/cherry-picked by Primary as `128dce8`; native
+qualification remains open.
 
 After a new operator grant and the normal queue/claim turn, use entirely fresh
 work/state paths (do not recycle the three failed journals). Revalidate the
@@ -73,3 +74,17 @@ Only then can that narrow native lifecycle path be accepted.
 No NRO/build, push, tag, release, Switch/card/DBI operation or new agent occurred.
 There is no retained proof queue/job; only the model watcher is reaped as part
 of the final local handoff. Phase2 product work remains paused at `4814381`.
+
+## Proof preparation while on HOLD
+
+No new Ally observation or re-pin has occurred. `ally-proof-HOLD.template.json`
+is a deliberately non-executable plan for one later no-input proof; it has
+unresolved pins, session zero, no GO reference or observation timestamp, and
+reserves new `life-p6-go01` work/state names without asserting remote absence.
+All identities, paths and policy must be freshly verified only after Primary's
+explicit GO. No queue, auto-start or availability watcher is armed.
+
+The current suite has **74 offline tests**: the original 71 plus fail-closed SID
+rejection, parsed task XML with spaced/Unicode/XML-sensitive Python paths, and
+the HOLD template's invalid-pin/session and single-boot constraints. Runtime
+`lifecycle.py`, `defer_load` and `runner.py` remain unchanged from `ceae08f`.

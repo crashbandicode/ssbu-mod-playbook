@@ -950,6 +950,75 @@ class WindowsTests(unittest.TestCase):
             host.call(item, 'input.button', {}, 1)
         self.assertEqual(len(scripts), 1)
 
+    def test_windows_invalid_sid_never_creates_or_starts_a_task(self):
+        c = self.controller()
+        c.up()
+        host = life.WindowsHost(self.config, job_api=object())
+        commands = []
+        host.run = lambda argv, cap=30: commands.append(argv) or ''
+        host.ps = lambda script, **kwargs: 'WORKGROUP\\tester' if 'WindowsIdentity' in script else '{}'
+        with self.assertRaisesRegex(life.Refused, 'current Windows user SID'):
+            host.launch(c.state['instances'][0], self.config)
+        self.assertEqual(commands, [])
+
+    def test_windows_task_xml_preserves_python_path_with_spaces_and_xml_characters(self):
+        import xml.etree.ElementTree as ET
+        python = self.base / 'Program Files & Pýthon' / 'pythonw.exe'
+        python.parent.mkdir()
+        python.write_bytes(b'fake Python, never executed')
+        self.config['windows_python'] = {'path': str(python), 'sha256': life.digest(python)}
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        run = Path(item['run'])
+        life.save(run / 'launcher.json', {'session': 1, 'limits': {'JobMemoryLimit': 8 * life.GIB,
+            'KillOnJobClose': True, 'ActiveProcessLimit': 256}, 'owned_pids': [{'pid': 123, 'start': 'fake'}]})
+        host = life.WindowsHost(self.config, job_api=object())
+        commands = []
+        host.run = lambda argv, cap=30: commands.append(argv) or ''
+        host.ps = lambda script, **kwargs: 'S-1-5-21-1-2-3-1001' if 'WindowsIdentity' in script else '{}'
+        host.launch(item, self.config)
+        xml = ET.fromstring((run / 'task.xml').read_text(encoding='utf-16'))
+        ns = {'t': 'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+        self.assertEqual(xml.findtext('t:Actions/t:Exec/t:Command', namespaces=ns), str(python))
+        self.assertEqual(xml.findtext('t:Actions/t:Exec/t:WorkingDirectory', namespaces=ns), str(run))
+        self.assertEqual(xml.findtext('t:Principals/t:Principal/t:UserId', namespaces=ns), 'S-1-5-21-1-2-3-1001')
+        self.assertIn('_windows-launch', xml.findtext('t:Actions/t:Exec/t:Arguments', namespaces=ns))
+        self.assertEqual([cmd[1] for cmd in commands], ['/create', '/run'])
+
+    def test_ally_hold_template_is_unpinned_single_boot_and_not_executable_as_delivered(self):
+        packet = json.loads(Path(__file__).with_name('ally-proof-HOLD.template.json').read_text())
+        draft = packet['draft_config']
+        self.assertEqual(packet['status'], 'HOLD_WAITING_FOR_PRIMARY_GO')
+        self.assertIsNone(packet['go_reference'])
+        self.assertIsNone(packet['observed_after_go_utc'])
+        self.assertTrue(packet['not_for_execution'])
+        self.assertTrue(draft['lifecycle_only'])
+        self.assertFalse(draft['defer_load'])
+        self.assertFalse(draft['allow_inbound_block'])
+        self.assertEqual(len(draft['instances']), 1)
+        self.assertEqual(draft['instances'][0]['plugins'], [])
+        self.assertNotIn('stale_claim_hours', draft)
+        work, state = (PureWindowsPath(draft[key]) for key in ('work_root', 'state_dir'))
+        self.assertTrue(work.is_absolute() and state.is_absolute())
+        self.assertNotEqual(work, state)
+        self.assertNotIn(work, state.parents)
+        self.assertNotIn(state, work.parents)
+        self.assertEqual(work.parent.name, 'life-p6-go01')
+        for key in ('windows_job', 'windows_control', 'windows_python'):
+            invalid = deepcopy(self.config)
+            invalid[key]['sha256'] = draft[key]['sha256']
+            with self.assertRaisesRegex(life.Refused, 'Windows helper pins'):
+                life.validate(invalid)
+        invalid = deepcopy(self.config)
+        invalid['instances'][0]['app']['sha256'] = draft['instances'][0]['app']['sha256']
+        with self.assertRaisesRegex(life.Refused, 'Input SHA256 required'):
+            life.validate(invalid)
+        invalid = deepcopy(self.config)
+        invalid['interactive_session'] = draft['interactive_session']
+        with self.assertRaisesRegex(life.Refused, 'interactive_session required'):
+            life.validate(invalid)
+
     def test_windows_task_creation_failure_rolls_back_and_releases_without_spawning(self):
         # Original 20:08 attempt: scheduler rejected UserId before any task/launcher/Eden existed.
         class NoJob:

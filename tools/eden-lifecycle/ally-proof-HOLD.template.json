@@ -1,0 +1,44 @@
+{
+  "status": "HOLD_WAITING_FOR_PRIMARY_GO",
+  "go_reference": null,
+  "observed_after_go_utc": null,
+  "not_for_execution": true,
+  "notes": [
+    "Offline preparation only: do not contact or claim the Ally until Primary posts GO.",
+    "Paths are historical candidates or fresh reservations, not current host observations.",
+    "After GO, verify hostname, interactive session/current user SID, game/source paths and absence of both work/state directories.",
+    "After GO, freshly hash Eden, pythonw.exe, winjob.py and Invoke-EdenControl.ps1; bind observations and tested lifecycle source in the proof receipt.",
+    "Confirm authorized inbound Block policy; never answer a firewall prompt or modify an Allow rule.",
+    "Use normal queue, authoritative ledger and native/WSL/resource admission; no stale_claim_hours for this proof.",
+    "One no-input up/game-loaded/down only, unconditional cleanup, separate private/source verification, exact own release. No wait, retry-boot or queue worker is armed."
+  ],
+  "draft_config": {
+    "host": "ally",
+    "hostname": "REVERIFY-AFTER-GO",
+    "owner": "OpenCode ses_e5f1861efffeRud9AsitO7MgWW/pkg6-ally-lifecycle",
+    "label": "p6-ally-go01",
+    "work_root": "C:\\Eden\\life-p6-go01\\work",
+    "state_dir": "C:\\Eden\\life-p6-go01\\state",
+    "ledger": "/tmp/deluxe-surface-1007/OWNER-COORDINATION.md",
+    "ledger_ssh": "memento-claw-yoga-ubuntu",
+    "interactive_session": 0,
+    "runtime": 600,
+    "socket_cap": 90,
+    "load_cap": 240,
+    "stop_cap": 15,
+    "force_cap": 30,
+    "lifecycle_only": true,
+    "defer_load": false,
+    "allow_inbound_block": false,
+    "windows_job": {"path": "C:\\Eden\\win\\winjob.py", "sha256": "REPIN_AFTER_PRIMARY_GO"},
+    "windows_control": {"path": "C:\\Eden\\scripts\\Invoke-EdenControl.ps1", "sha256": "REPIN_AFTER_PRIMARY_GO"},
+    "windows_python": {"path": "C:\\Program Files\\Python312\\pythonw.exe", "sha256": "REPIN_AFTER_PRIMARY_GO"},
+    "instances": [{
+      "key": "a",
+      "source": "C:\\Users\\intpa\\AppData\\Roaming\\eden",
+      "app": {"path": "C:\\Eden\\app\\eden.exe", "sha256": "REPIN_AFTER_PRIMARY_GO"},
+      "game": "C:\\Eden\\Games\\Switch\\Super Smash Bros. Ultimate [01006A800016E000]+[v13.0.3+ 9DLC][US](nsw2u.com).xci",
+      "plugins": []
+    }]
+  }
+}

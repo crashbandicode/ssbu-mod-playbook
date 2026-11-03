@@ -199,7 +199,7 @@ No process-name kill is used. Recorded creation-time/image/session identities
 and Job membership protect against PID reuse. Only the token-derived task is
 ended/deleted, then all owned PIDs must be absent before restore/release.
 
-Offline suite at the follow-up checkpoint: **71 tests**, including thirteen Windows
+Offline suite at the follow-up checkpoint: **74 tests**, including sixteen Windows
 fake/command/bridge tests and Primary's concurrent deferred-load regression.
 Native single-boot qualification is tracked separately in the Primary inbox;
 pair mode and transport-loss recovery remain unqualified. SSH always uses a
@@ -222,6 +222,22 @@ remaining artifacts and the later-proof checklist are in
 [ALLY-OFFLINE-2026-11-03.md](ALLY-OFFLINE-2026-11-03.md).
 
 ### Later Ally qualification (not currently authorized)
+
+**HOLD: wait for Primary's explicit GO after the new Yoga build is installed.**
+No host query, claim or launch is part of offline preparation. The checked-in
+`ally-proof-HOLD.template.json` reserves `C:\Eden\life-p6-go01\{work,state}` but
+does not assert those paths are currently unused. Its pins and session are
+deliberately invalid, so its draft cannot execute as delivered. It is a plan,
+not a launcher or an authorization token; no queue worker is armed.
+
+After GO, freshly observe and bind all executable/helper hashes, active session
+and current user SID, hostname, game/source paths, root absence and firewall
+policy before making an executable config from `draft_config`. Old hashes are
+historical, **not re-pinned current identities**. Preserve the GO reference and
+observation timestamp with that proof's source/config receipt. The source
+already uses the SID-based task principal; offline tests also reject an invalid
+SID before any task command and parse XML containing spaced/Unicode Python
+paths. Native startup remains unqualified.
 
 Obtain a new operator grant and the Ally's normal queue/ledger turn; it currently
 belongs to eden-tracing. Do not reuse the failed `life-p6`, `life-p6b` or
