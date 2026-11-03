@@ -25,6 +25,9 @@ rows.json (paths are relative to its folder):
 instances.json (written by whoever ran Up): {"a": {"socket": ".../control.sock", "console_log": ".../console.log",
   "settings": ".../TrainingRooms/settings.json"}}. Steps run on "on": "<key>", default the first key.
 
+Every play needs a start check: a gate step on the same instance since its last play, a "start_gate" on the segment
+(checked before each play), or "unchecked": true on the step. The dry run refuses a play without one.
+
 Steps: play <segment> (macro.play, wait for finished, input.reset; a segment whose file is missing but has a recipe is
 recorded instead: macro.record, the recipe's inputs, input.reset, macro.stop, then its sha256 is written back to rows.json),
 gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screenshot a "before" for a change gate),
@@ -145,11 +148,23 @@ def dry_run(manifest_path):
             errors.append(f'row {row["id"]}: starts on {row["start"]} but the row before ends on {state}')
         if not row.get('steps'):
             errors.append(f'row {row["id"]}: no steps')
-        marks, copies = set(), set()
+        marks, copies, checked = set(), set(), set()
         for step in row.get('steps', []):
             on = step.get('on', '*')
             if 'play' in step and step['play'] not in plan.get('segments', {}):
                 errors.append(f'row {row["id"]}: unknown segment {step["play"]}')
+            elif 'play' in step:
+                # Never play or record onto a screen nobody checked (MACROS "Hybrid", rule 3). 2026-11-03 lr-03
+                # recorded title->main while the game sat in the attract-mode intro movie.
+                seg = plan['segments'][step['play']]
+                if not (seg.get('start_gate') or on in checked or step.get('unchecked')):
+                    errors.append(f'row {row["id"]}: play {step["play"]} on {on} has no start check '
+                                  '(a gate step before it, a "start_gate" on the segment, or "unchecked": true)')
+                if seg.get('start_gate') and seg['start_gate'] not in plan.get('gates', {}):
+                    errors.append(f'segment {step["play"]}: unknown start_gate {seg["start_gate"]}')
+                checked.discard(on)
+            if 'gate' in step:
+                checked.add(on)
             if 'gate' in step:
                 gate = plan.get('gates', {}).get(step['gate'])
                 if gate is None:
@@ -233,7 +248,7 @@ class Runner:
     def shot(self, on, name):
         tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
         target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
-        path = self.row_dir / f'{on}-{time.strftime("%H%M%S")}-{time.time_ns() % 10**6:06d}-{name}.png'
+        path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
         self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
         return path
 
@@ -284,6 +299,8 @@ class Runner:
 
     def play(self, on, name):
         seg = self.plan['segments'][name]
+        if seg.get('start_gate'):
+            self.gate(on, seg['start_gate'])  # the segment's start screen, checked before any input
         path = self.base / seg['file']
         if not path.is_file():
             self.record(on, name, seg)  # the recording itself reaches the segment's end screen

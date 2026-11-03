@@ -94,9 +94,9 @@ class RunnerTests(unittest.TestCase):
                 'paused': {'kind': 'log', 'source': 'console_log', 'pattern': r'paused=1', 'cap': 2},
             },
             'rows': [
-                {'id': 'r1', 'start': 'blue', 'end': 'red', 'steps': [{'play': 'to-red'}, {'gate': 'red'}]},
-                {'id': 'r2', 'start': 'red', 'end': 'red-paused', 'steps': [{'play': 'pause'}, {'gate': 'paused'}]},
-                {'id': 'r3', 'start': 'red-paused', 'end': 'blue', 'steps': [{'play': 'to-blue'}, {'shot': 'end'}]},
+                {'id': 'r1', 'start': 'blue', 'end': 'red', 'steps': [{'play': 'to-red', 'unchecked': True}, {'gate': 'red'}]},
+                {'id': 'r2', 'start': 'red', 'end': 'red-paused', 'steps': [{'gate': 'red'}, {'play': 'pause'}, {'gate': 'paused'}]},
+                {'id': 'r3', 'start': 'red-paused', 'end': 'blue', 'steps': [{'play': 'to-blue', 'unchecked': True}, {'shot': 'end'}]},
             ],
         }
         self.manifest = self.dir / 'rows.json'
@@ -208,7 +208,7 @@ class RunnerTests(unittest.TestCase):
         self.plan['rows'] = [{'id': 'c1', 'start': 'blue', 'end': 'red', 'on': 'b', 'steps': [
             {'copy': 'settings', 'as': 'before', 'on': 'b'},
             {'mark': 'hud', 'on': 'b'},
-            {'play': 'to-red', 'on': 'b'},
+            {'play': 'to-red', 'on': 'b', 'unchecked': True},
             {'gate': 'hud-changed', 'on': 'b'},
             {'json_diff': {'source': 'settings', 'before': 'before', 'must_change': ['menu.sdi_state'],
                            'must_keep': ['menu.sdi_strength']}, 'on': 'b'},
@@ -237,6 +237,23 @@ class RunnerTests(unittest.TestCase):
         errors = ' | '.join(runner.dry_run(self.manifest)['errors'])
         self.assertIn('before its mark', errors)
         self.assertIn('has no earlier copy', errors)
+
+    def test_play_needs_a_start_check_and_start_gate_runs_first(self):
+        self.plan['rows'][0]['steps'][0].pop('unchecked')
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('play to-red on * has no start check', ' | '.join(runner.dry_run(self.manifest)['errors']))
+        # A start_gate on the segment satisfies the dry run and is checked before the macro plays.
+        self.plan['gates']['blue'] = {'kind': 'hook', 'module': 'is_blue.py', 'function': 'check', 'cap': 1, 'interval': .05}
+        (self.dir / 'is_blue.py').write_text('from PIL import Image\n'
+                                            'def check(path, gate):\n'
+                                            '    return Image.open(path).getpixel((0, 0)) == (30, 30, 200)\n')
+        self.plan['segments']['to-red']['start_gate'] = 'blue'
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+        eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        self.make(eden).run()
+        first_play = eden.calls.index('macro.play')
+        self.assertIn('ui.screenshot', eden.calls[:first_play])  # the start gate looked before the first input
 
     def test_stop_file_and_pace_cap(self):
         (self.dir / 'out').mkdir()
