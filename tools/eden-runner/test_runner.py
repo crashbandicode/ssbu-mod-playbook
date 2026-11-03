@@ -163,6 +163,81 @@ class RunnerTests(unittest.TestCase):
         self.make(FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)).run()
         self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
 
+    def two_instances(self):
+        logs = {}
+        for side in ('a', 'b'):
+            logs[side] = self.dir / f'detector-{side}.log'
+            logs[side].write_text('sync_end frame=1 desync_seen=0 (an earlier match)\n')
+        self.instances = {side: {'socket': side, 'detector_log': str(logs[side]), 'settings': str(self.dir / 'settings.json')}
+                          for side in ('a', 'b')}
+        return logs
+
+    def test_log_gate_across_instances_needs_equal_values(self):
+        logs = self.two_instances()
+        self.plan['gates']['synced'] = {'kind': 'log', 'source': 'detector_log', 'on_all': ['a', 'b'], 'equal': True,
+                                        'pattern': r'sync_end frame=(\d+) desync_seen=(\d+)', 'expect_groups': {'2': '0'},
+                                        'cap': 1.5}
+        self.plan['rows'] = [{'id': 's1', 'start': 'blue', 'end': 'blue', 'steps': [{'gate': 'synced', 'on': 'a'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = FakeEden({})
+
+        def write_later(lines):
+            time.sleep(.3)
+            for side, line in lines.items():
+                with open(logs[side], 'a') as f:
+                    f.write(line + '\n')
+
+        threading.Thread(target=write_later, args=({'a': 'sync_end frame=3353 desync_seen=0',
+                                                    'b': 'sync_end frame=3353 desync_seen=0'},)).start()
+        self.make(eden).run()
+        self.assertEqual(json.loads((self.dir / 'out' / 's1.json').read_text())['status'], 'PASS')
+        # Different frames on the two sides fail the gate.
+        (self.dir / 'out' / 's1.json').unlink()
+        threading.Thread(target=write_later, args=({'a': 'sync_end frame=4000 desync_seen=0',
+                                                    'b': 'sync_end frame=4001 desync_seen=0'},)).start()
+        with self.assertRaises(RuntimeError) as caught:
+            self.make(FakeEden({})).run()
+        self.assertIn('differ', str(caught.exception))
+
+    def test_change_gate_and_json_diff(self):
+        self.two_instances()
+        settings = self.dir / 'settings.json'
+        settings.write_text(json.dumps({'menu': {'sdi_state': 0, 'sdi_strength': 1, 'hud': 'x'}}))
+        self.plan['gates']['hud-changed'] = {'kind': 'change', 'mark': 'hud', 'roi': [0, 0, 64, 36], 'cap': 3,
+                                             'interval': .05}
+        self.plan['rows'] = [{'id': 'c1', 'start': 'blue', 'end': 'red', 'on': 'b', 'steps': [
+            {'copy': 'settings', 'as': 'before', 'on': 'b'},
+            {'mark': 'hud', 'on': 'b'},
+            {'play': 'to-red', 'on': 'b'},
+            {'gate': 'hud-changed', 'on': 'b'},
+            {'json_diff': {'source': 'settings', 'before': 'before', 'must_change': ['menu.sdi_state'],
+                           'must_keep': ['menu.sdi_strength']}, 'on': 'b'},
+        ]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+        eden = FakeEden({'to-red': RED})
+        original = eden.request
+
+        def request(method, params):
+            if method == 'macro.play':  # the game saves the new SDI choice while the segment plays
+                settings.write_text(json.dumps({'menu': {'sdi_state': 2, 'sdi_strength': 1, 'hud': 'x'}}))
+            return original(method, params)
+
+        eden.request = request
+        self.make(eden).run()
+        receipt = json.loads((self.dir / 'out' / 'c1.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertEqual(receipt['results'][-1]['json_diff']['changes'], {'menu.sdi_state': [0, 2]})
+
+    def test_dry_run_catches_change_gate_before_mark_and_diff_without_copy(self):
+        self.plan['gates']['hud-changed'] = {'kind': 'change', 'mark': 'hud', 'roi': [0, 0, 64, 36], 'cap': 3}
+        self.plan['rows'] = [{'id': 'c1', 'start': 'blue', 'end': 'red', 'steps': [
+            {'gate': 'hud-changed'}, {'json_diff': {'source': 'settings', 'before': 'before'}}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        errors = ' | '.join(runner.dry_run(self.manifest)['errors'])
+        self.assertIn('before its mark', errors)
+        self.assertIn('has no earlier copy', errors)
+
     def test_stop_file_and_pace_cap(self):
         (self.dir / 'out').mkdir()
         (self.dir / 'out' / 'STOP').write_text('primary')

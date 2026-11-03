@@ -27,8 +27,16 @@ instances.json (written by whoever ran Up): {"a": {"socket": ".../control.sock",
 
 Steps: play <segment> (macro.play, wait for finished, input.reset; a segment whose file is missing but has a recipe is
 recorded instead: macro.record, the recipe's inputs, input.reset, macro.stop, then its sha256 is written back to rows.json),
-gate <gate>, shot <name> (screenshot into the row folder), copy <instance key> (copy that instance file into the row
-folder), wait_ms <ms> (only where no gate exists).
+gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screenshot a "before" for a change gate),
+copy <instance key> [as <name>] (copy that instance file into the row folder), json_diff {source, before, allowed,
+must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists).
+
+More gates:
+  {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
+      the region differs from the row's mark and has stopped moving (HUD portrait swapped, menu value changed)
+  {"kind": "log", "source": "detector_log", "pattern": "sync_end .*frame=(\\d+) .*desync_seen=(\\d+)",
+   "on_all": ["a", "b"], "equal": true, "expect_groups": {"2": "0"}, "cap": 120}
+      every listed instance logged a match this row, with the same captured values and desync_seen=0
 
 Run rules (playbook docs/MACROS.md, "Test runs"): rows run back to back while their gates pass; the first failure writes
 STOP-INPUT and the runner exits. A STOP file in the output folder stops it before its next input. If no row has finished
@@ -45,7 +53,7 @@ import time
 from pathlib import Path
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
-GATE_KINDS = ('image', 'log', 'json', 'hook')
+GATE_KINDS = ('image', 'log', 'json', 'hook', 'change')
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
@@ -111,7 +119,15 @@ def dry_run(manifest_path):
                 if gate.get('tolerance', DEFAULT_TOLERANCE) == 0 and not gate.get('static'):
                     errors.append(f'gate {name}: tolerance 0 needs "static": true (exact matches fail on animated screens)')
             elif kind == 'log':
-                re.compile(gate['pattern'])
+                pattern = re.compile(gate['pattern'])
+                for number in gate.get('expect_groups', {}):
+                    if int(number) > pattern.groups:
+                        errors.append(f'gate {name}: expect_groups {number} but the pattern has {pattern.groups} groups')
+                if gate.get('equal') and pattern.groups == 0:
+                    errors.append(f'gate {name}: "equal" needs capture groups in the pattern')
+            elif kind == 'change':
+                if len(gate['roi']) != 4 or not gate.get('mark'):
+                    errors.append(f'gate {name}: change needs "mark" and a 4-number roi')
             elif kind == 'json':
                 if not gate.get('expect'):
                     errors.append(f'gate {name}: empty expect')
@@ -129,11 +145,23 @@ def dry_run(manifest_path):
             errors.append(f'row {row["id"]}: starts on {row["start"]} but the row before ends on {state}')
         if not row.get('steps'):
             errors.append(f'row {row["id"]}: no steps')
+        marks, copies = set(), set()
         for step in row.get('steps', []):
+            on = step.get('on', '*')
             if 'play' in step and step['play'] not in plan.get('segments', {}):
                 errors.append(f'row {row["id"]}: unknown segment {step["play"]}')
-            if 'gate' in step and step['gate'] not in plan.get('gates', {}):
-                errors.append(f'row {row["id"]}: unknown gate {step["gate"]}')
+            if 'gate' in step:
+                gate = plan.get('gates', {}).get(step['gate'])
+                if gate is None:
+                    errors.append(f'row {row["id"]}: unknown gate {step["gate"]}')
+                elif gate.get('kind') == 'change' and (on, gate.get('mark')) not in marks:
+                    errors.append(f'row {row["id"]}: change gate {step["gate"]} before its mark {gate.get("mark")!r}')
+            if 'mark' in step:
+                marks.add((on, step['mark']))
+            if 'copy' in step:
+                copies.add((on, step.get('as', step['copy'])))
+            if 'json_diff' in step and (on, step['json_diff'].get('before')) not in copies:
+                errors.append(f'row {row["id"]}: json_diff before {step["json_diff"].get("before")!r} has no earlier copy')
         state = row['end']
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'gates': len(plan.get('gates', {})),
@@ -265,26 +293,79 @@ class Runner:
         self.call(on, 'macro.play', {'path': str(path)})
         self.wait_macro(on, seg.get('cap', 60))
 
+    def source(self, on, key):
+        return Path(self.instances[on][key]) if key in self.instances[on] else Path(key)
+
+    def last_match(self, on, gate):
+        """Last match of the gate's pattern in lines written during this row (or the whole file), or None."""
+        source = self.source(on, gate['source'])
+        if not source.is_file():
+            return None
+        offset = 0 if gate.get('whole_file') else self.row_offsets.get(str(source), 0)
+        with source.open('rb') as f:
+            f.seek(offset)
+            text = f.read().decode('utf-8', 'replace')
+        matches = list(re.finditer(gate['pattern'], text))
+        return matches[-1] if matches else None
+
+    @staticmethod
+    def roi_diff(path_a, path_b, roi):
+        from PIL import Image
+        with Image.open(path_a) as im_a, Image.open(path_b) as im_b:
+            a = im_a.convert('RGB').crop(tuple(roi)).tobytes()
+            b = im_b.convert('RGB').crop(tuple(roi)).tobytes()
+        if len(a) != len(b):
+            return float('inf')
+        return sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
+
     def gate(self, on, name):
         gate = self.plan['gates'][name]
         kind, until = gate['kind'], time.monotonic() + gate['cap']
         if kind == 'log':
-            source = Path(self.instances[on][gate['source']]) if gate['source'] in self.instances[on] else Path(gate['source'])
             # Lines from this row only: the line usually appears while the segment before the gate is playing.
-            offset = 0 if gate.get('whole_file') else self.row_offsets.get(str(source), 0)
-            pattern = re.compile(gate['pattern'])
+            # "on_all": every listed instance must match; "equal": their captured groups must be the same;
+            # "expect_groups": {"2": "0"} pins captured values (group number -> text).
+            sides = gate.get('on_all') or [on]
             while time.monotonic() < until:
                 self.check_stop()
-                if source.is_file():
-                    with source.open('rb') as f:
-                        f.seek(offset)
-                        match = pattern.search(f.read().decode('utf-8', 'replace'))
-                    if match:
-                        self.log({'gate': name, 'on': on, 'pass': True, 'line': match.group(0)[:300]})
-                        return match.group(0)
+                found = {side: self.last_match(side, gate) for side in sides}
+                if all(found.values()):
+                    groups = {side: m.groups() for side, m in found.items()}
+                    for side, m in found.items():
+                        for number, want in gate.get('expect_groups', {}).items():
+                            if m.group(int(number)) != want:
+                                raise RuntimeError(f'gate {name} on {side}: group {number} is {m.group(int(number))!r}, '
+                                                   f'expected {want!r}: {m.group(0)[:200]}')
+                    if gate.get('equal') and len(set(groups.values())) > 1:
+                        time.sleep(.5)  # the other side may not have written its line yet
+                        if time.monotonic() >= until:
+                            raise RuntimeError(f'gate {name}: captured values differ across instances: {groups}')
+                        continue
+                    lines = {side: m.group(0)[:300] for side, m in found.items()}
+                    self.log({'gate': name, 'on': sides, 'pass': True, 'lines': lines})
+                    return lines
                 time.sleep(.3)
+        elif kind == 'change':
+            # Passes when the region differs from the row's earlier "mark" shot and, with "stable", has stopped moving.
+            before = self.marks.get((on, gate['mark']))
+            if before is None:
+                raise RuntimeError(f'gate {name}: no mark {gate["mark"]!r} taken on {on} earlier in this row')
+            previous = None
+            while time.monotonic() < until:
+                path = self.shot(on, 'gate-' + name)
+                changed = self.roi_diff(path, before, gate['roi']) > gate.get('min_diff', DEFAULT_TOLERANCE)
+                settled = not gate.get('stable', True) or (
+                    previous is not None and self.roi_diff(path, previous, gate['roi']) <= gate.get('tolerance', 2))
+                if changed and settled:
+                    self.log({'gate': name, 'on': on, 'pass': True, 'shot': str(path), 'mark': str(before)})
+                    return str(path)
+                if previous is not None and previous != before:
+                    Path(previous).unlink(missing_ok=True)
+                previous = path
+                time.sleep(gate.get('interval', .5))
+            self.shot(on, 'GATE-FAILED-' + name)
         elif kind == 'json':
-            source = Path(self.instances[on][gate['source']]) if gate['source'] in self.instances[on] else Path(gate['source'])
+            source = self.source(on, gate['source'])
             while time.monotonic() < until:
                 self.check_stop()
                 try:
@@ -298,18 +379,14 @@ class Runner:
                     pass
                 time.sleep(.25)
         else:
-            from PIL import Image
             hook = load_hook(self.base, gate) if kind == 'hook' else None
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
                 if hook is not None:
                     passed = bool(hook(str(path), gate))
                 else:
-                    with Image.open(path) as im, Image.open(self.base / gate['reference']) as ref:
-                        a = im.convert('RGB').crop(tuple(gate['roi'])).tobytes()
-                        b = ref.convert('RGB').crop(tuple(gate['roi'])).tobytes()
-                    diff = sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
-                    passed = len(a) == len(b) and diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
+                    diff = self.roi_diff(path, self.base / gate['reference'], gate['roi'])
+                    passed = diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
                 if passed:
                     self.log({'gate': name, 'on': on, 'pass': True, 'shot': str(path)})
                     return str(path)
@@ -317,6 +394,41 @@ class Runner:
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
         raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+
+    def json_diff(self, on, spec):
+        """Compare a JSON file now with a copy taken earlier in the row ({"copy": key, "as": before}).
+
+        spec: {"source": "settings", "before": "before", "allowed": [dotted keys that may change],
+               "must_change": [...], "must_keep": [...]}. Writes the diff into the row folder.
+        """
+        before_path = self.copies.get((on, spec['before']))
+        if before_path is None:
+            raise RuntimeError(f'json_diff: no copy {spec["before"]!r} taken on {on} earlier in this row')
+
+        def leaves(value, prefix=''):
+            if isinstance(value, dict):
+                out = {}
+                for k, v in value.items():
+                    out.update(leaves(v, f'{prefix}.{k}' if prefix else k))
+                return out
+            return {prefix: value}
+
+        old = leaves(json.loads(before_path.read_text()))
+        new = leaves(json.loads(self.source(on, spec['source']).read_text()))
+        changes = {k: [old.get(k), new.get(k)] for k in old.keys() | new.keys() if old.get(k) != new.get(k)}
+        report = {'before': str(before_path), 'changes': changes}
+        (self.row_dir / f'json-diff-{on}-{spec["before"]}.json').write_text(json.dumps(report, indent=2) + '\n')
+        allowed = set(spec.get('allowed', [])) | set(spec.get('must_change', []))
+        unexpected = sorted(set(changes) - allowed)
+        if unexpected:
+            raise RuntimeError(f'json_diff on {on}: unexpected changes {unexpected[:10]}')
+        missing = [k for k in spec.get('must_change', []) if k not in changes]
+        if missing:
+            raise RuntimeError(f'json_diff on {on}: expected changes missing {missing}')
+        kept = [k for k in spec.get('must_keep', []) if k in changes]
+        if kept:
+            raise RuntimeError(f'json_diff on {on}: must_keep keys changed {kept}')
+        return report
 
     # --- rows ----------------------------------------------------------------------------------------------------
     def log_offsets(self):
@@ -345,6 +457,7 @@ class Runner:
             self.row_dir = self.out / row['id']
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()
+            self.marks, self.copies = {}, {}
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': digest(self.manifest_path), 'started': time.time(), 'results': []}
             try:
@@ -357,11 +470,17 @@ class Runner:
                         receipt['results'].append({'gate': step['gate'], 'on': on, 'evidence': self.gate(on, step['gate'])})
                     elif 'shot' in step:
                         receipt['results'].append({'shot': str(self.shot(on, step['shot']))})
+                    elif 'mark' in step:
+                        self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
+                        receipt['results'].append({'mark': step['mark'], 'on': on})
                     elif 'copy' in step:
-                        source = Path(self.instances[on][step['copy']])
-                        target = self.row_dir / f'{step["copy"]}-{source.name}'
+                        source = self.source(on, step['copy'])
+                        target = self.row_dir / f'{step.get("as", step["copy"])}-{on}-{source.name}'
                         target.write_bytes(source.read_bytes())
+                        self.copies[(on, step.get('as', step['copy']))] = target
                         receipt['results'].append({'copy': str(target)})
+                    elif 'json_diff' in step:
+                        receipt['results'].append({'json_diff': self.json_diff(on, step['json_diff'])})
                     elif 'wait_ms' in step:
                         self.check_stop()
                         time.sleep(step['wait_ms'] / 1000)
