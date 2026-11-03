@@ -244,8 +244,11 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances runs/eNN/i
 - **Shared library:** `tools/eden-runner/library/index.json` holds proven
   segments and gate references for the game, with sha256 and start/end
   screens. Rows use them with `{"library": "<name>"}` instead of recording
-  them again. At `Down`, add the segments a run proved (rule 7), with the
-  run label.
+  them again. At `Down`, add the segments a run proved (rule 7):
+  `python3 -I tools/eden-runner/harvest.py eden/rows.json --label eNN`
+  copies every segment and gate used in a PASS row, with sha256, the gates
+  before and after each segment, and the run label. It leaves existing
+  entries alone unless you pass `--replace`.
 - **Stopping:** the first failure writes `STOP-INPUT` and the runner exits.
   Fix the row list or the tool, delete `STOP-INPUT`, and run again. Rows
   with a PASS receipt are skipped. A `STOP` file in the output folder stops

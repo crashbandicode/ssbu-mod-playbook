@@ -349,6 +349,23 @@ class RunnerTests(unittest.TestCase):
         finally:
             runner.LIBRARY = original
 
+    def test_harvest_copies_only_what_passing_rows_used(self):
+        import harvest
+        eden = FakeEden({'to-red': RED}, log_path=None)  # r2's log gate never passes: r1 PASS, r2 FAILED
+        with self.assertRaises(RuntimeError):
+            self.make(eden).run()
+        library = self.dir / 'library'
+        added = harvest.harvest(self.manifest, self.dir / 'out', 'test-01', library)
+        self.assertEqual(added['segments'], ['to-red'])  # r2's pause segment isn't proven
+        self.assertEqual(added['gates'], ['red'])
+        index = json.loads((library / 'index.json').read_text())
+        seg = index['segments']['to-red']
+        self.assertEqual((seg['end_gate'], seg['from_run'], seg['row']), ('red', 'test-01', 'r1'))
+        self.assertEqual(seg['sha256'], sha(library / seg['file']))
+        self.assertEqual(index['gates']['red']['sha256'], sha(library / index['gates']['red']['reference']))
+        # A second harvest leaves existing entries alone.
+        self.assertEqual(harvest.harvest(self.manifest, self.dir / 'out', 'test-02', library)['segments'], [])
+
     def test_stop_file_and_pace_cap(self):
         (self.dir / 'out').mkdir()
         (self.dir / 'out' / 'STOP').write_text('primary')
