@@ -598,6 +598,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('--property=RuntimeMaxSec=5400', command)
         self.assertIn('-i', command)
         self.assertIn('--control-background', command)
+        # A launch without a log filter runs Eden at Debug (lr-04: 1 GB of console in 6 minutes).
+        self.assertIn('EDEN_LOG_FILTER=' + life.DEFAULT_LOG_FILTER, command)
         self.assertNotIn('pkill', ' '.join(command))
 
 

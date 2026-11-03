@@ -33,6 +33,8 @@ import uuid
 
 sys.dont_write_bytecode = True
 GIB = 1024 ** 3
+# Same filter as tools/eden-solo/gv.py launch. "log_filter" in the config overrides it.
+DEFAULT_LOG_FILTER = '*:Warning Frontend:Info Service.Sockets:Info Network:Info'
 MIN_MEMORY = 10 * GIB
 MIN_DISK = 40 * 10 ** 9
 READ_ONLY = ('user/nand/user/Contents', 'user/nand/system/Contents', 'user/firmware')
@@ -457,7 +459,9 @@ class Host:
         run.mkdir(parents=True, exist_ok=True)
         env = {'DISPLAY': item['display'], 'WAYLAND_DISPLAY': '', 'XAUTHORITY': '', 'QT_QPA_PLATFORM': 'xcb',
                'XDG_DATA_HOME': str(profile / 'xdg-data'), 'XDG_CONFIG_HOME': str(profile / 'xdg-config'),
-               'XDG_CACHE_HOME': str(profile / 'xdg-cache')}
+               'XDG_CACHE_HOME': str(profile / 'xdg-cache'),
+               # Without a filter Eden logs at Debug: lr-04 wrote 1 GB of console in 6 minutes (2026-11-03).
+               'EDEN_LOG_FILTER': config.get('log_filter', DEFAULT_LOG_FILTER)}
         # Eden needs a sanitized environment: no inherited LAN/runtime/seed overrides.
         command = ['/usr/bin/env', '-i', 'PATH=/usr/local/bin:/usr/bin:/bin',
                    'HOME=' + str(Path.home()), 'XDG_RUNTIME_DIR=' + os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')]
