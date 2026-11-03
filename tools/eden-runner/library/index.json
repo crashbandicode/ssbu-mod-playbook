@@ -378,6 +378,222 @@
       "end_gate": "native-waiting-menu",
       "from_run": "p4w-surface-01",
       "row": "11-host-native-waiting-menu"
+    },
+    "p4x-cpu75-to74": {
+      "file": "segments/p4x-cpu75-to74.edenmacro.json",
+      "sha256": "e737608106d11048e3abb61277078176ca4a214e9e76acec308c1464512f1252",
+      "cap": 15,
+      "start_gate": "p4x-cpu75",
+      "end_gate": "p4x-cpu74-fresh",
+      "from_run": "p4x-ui-01",
+      "row": "03-native-fighters"
+    },
+    "ui-di": {
+      "file": "segments/ui-di.edenmacro.json",
+      "sha256": "0becee5b9efed5f0dd19a6f8c23113024a456b711e3175310e5150f00c58b34e",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "ui-di",
+      "from_run": "p4x-ui-01",
+      "row": "ui-di"
+    },
+    "ui-sdi": {
+      "file": "segments/ui-sdi.edenmacro.json",
+      "sha256": "5c3fb979fb9b32ba46dd61b64cb1a95b058bb717a1b1acb2efddd7d0e8eaaa5e",
+      "cap": 120,
+      "start_gate": "ui-di",
+      "end_gate": "ui-sdi",
+      "from_run": "p4x-ui-01",
+      "row": "ui-sdi"
+    },
+    "ui-items": {
+      "file": "segments/ui-items.edenmacro.json",
+      "sha256": "250b1e7812f115dc643164ab4ba7fc97835d4807f53ecb30d500f1529b41951f",
+      "cap": 120,
+      "start_gate": "ui-sdi",
+      "end_gate": "ui-items",
+      "from_run": "p4x-ui-01",
+      "row": "ui-items"
+    },
+    "p4x-stage-open-correction": {
+      "file": "segments/p4x-stage-open-correction.edenmacro.json",
+      "sha256": "24034019dbd3b4309908c39a24e7b4c06f9d672eca868b1bb683fff627cb2473",
+      "cap": 15,
+      "start_gate": "p4x-lobby-practice-off-focus",
+      "end_gate": "ui-stages-open",
+      "from_run": "p4x-ui-01",
+      "row": "ui-stages"
+    },
+    "ui-stage-ranks": {
+      "file": "segments/ui-stage-ranks.edenmacro.json",
+      "sha256": "a27cee2c5d26d552d8471d3dd7c6904f234a1945f06c9f3b6070e23900fa5f40",
+      "cap": 120,
+      "start_gate": "ui-stages-open",
+      "end_gate": "ui-stages-ranked",
+      "from_run": "p4x-ui-01",
+      "row": "ui-stage-ranks"
+    },
+    "ui-stage-direct": {
+      "file": "segments/ui-stage-direct.edenmacro.json",
+      "sha256": "863049f5d6ac241c81ab95e633e45139d86fc06f46b0e016b0104d824cef5bd6",
+      "cap": 120,
+      "start_gate": "ui-stages-ranked",
+      "end_gate": "ui-stages-direct",
+      "from_run": "p4x-ui-01",
+      "row": "ui-stage-direct"
+    },
+    "ui-stage-commit": {
+      "file": "segments/ui-stage-commit.edenmacro.json",
+      "sha256": "b009fbe9c52bf2e03346a88d1fa463a43ace1b64a7014867883509b58a317654",
+      "cap": 120,
+      "start_gate": "ui-stages-direct",
+      "end_gate": "log-ui-stage-commit",
+      "from_run": "p4x-ui-01",
+      "row": "ui-stage-commit"
+    },
+    "ui-stage-reopen": {
+      "file": "segments/ui-stage-reopen.edenmacro.json",
+      "sha256": "c658b5cbe48a72b9995fec037b0671643fbcbce85015853345cc0716188c48e3",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "ui-stages-reopen",
+      "from_run": "p4x-ui-01",
+      "row": "ui-stage-reopen"
+    },
+    "ui-roster": {
+      "file": "segments/ui-roster.edenmacro.json",
+      "sha256": "4b8043783e26a00b82e6dcaf1522d1a492141c88e4c155556d6d809bf384420c",
+      "cap": 120,
+      "start_gate": "ui-stages-reopen",
+      "end_gate": "ui-roster-player",
+      "from_run": "p4x-ui-01",
+      "row": "ui-roster"
+    },
+    "ui-player-ranks": {
+      "file": "segments/ui-player-ranks.edenmacro.json",
+      "sha256": "648c49dd0ec8560129c779738ba72fdd61e1f527a669e9893b449d4205df244d",
+      "cap": 120,
+      "start_gate": "ui-roster-player",
+      "end_gate": "ui-roster-player",
+      "from_run": "p4x-ui-01",
+      "row": "ui-player-ranks"
+    },
+    "ui-cpu-ranks": {
+      "file": "segments/ui-cpu-ranks.edenmacro.json",
+      "sha256": "21034f9b90ebb0186db1d3b3e312a25c1f1a694601fcb9a8573eaf6f855cb175",
+      "cap": 120,
+      "start_gate": "ui-roster-player",
+      "end_gate": "ui-roster-cpu",
+      "from_run": "p4x-ui-01",
+      "row": "ui-cpu-ranks"
+    },
+    "ui-ranks-commit": {
+      "file": "segments/ui-ranks-commit.edenmacro.json",
+      "sha256": "f0846d61dfef2b2b6094c6b4c85ad0c5f65f0dc33a18f9279df94ddd9b95635e",
+      "cap": 120,
+      "start_gate": "ui-roster-cpu",
+      "end_gate": "log-ui-ranks-commit",
+      "from_run": "p4x-ui-01",
+      "row": "ui-ranks-commit"
+    },
+    "ui-defaults-prepare": {
+      "file": "segments/ui-defaults-prepare.edenmacro.json",
+      "sha256": "cf467a67e0709cc74c51e8dda8a9eef794f0ff093dfe696f6d50fc60b90952e1",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "log-ui-defaults-prepare",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-prepare"
+    },
+    "ui-defaults-focused": {
+      "file": "segments/ui-defaults-focused.edenmacro.json",
+      "sha256": "24d8681d1e9e889b1290841538c1edefa8c927a1b958e4a533b94bbf26a9a466",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "ui-defaults-focused",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-focused"
+    },
+    "ui-defaults-focused-commit": {
+      "file": "segments/ui-defaults-focused-commit.edenmacro.json",
+      "sha256": "5c6ee9ed9e4e0206eb5ea15955b2b88878fa414aa925252b3644c39fa8d15c98",
+      "cap": 120,
+      "start_gate": "ui-defaults-focused",
+      "end_gate": "log-ui-defaults-focused-commit",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-focused-commit"
+    },
+    "ui-defaults-page": {
+      "file": "segments/ui-defaults-page.edenmacro.json",
+      "sha256": "f8eb1a6bc56f3efc40dd5dbf7256188d36589beb6c55232f64f6f9519361642c",
+      "cap": 120,
+      "start_gate": "training-closed",
+      "end_gate": "ui-defaults-page",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-page"
+    },
+    "ui-defaults-page-commit": {
+      "file": "segments/ui-defaults-page-commit.edenmacro.json",
+      "sha256": "363a759844724fcd6260f935ac17ab896f81a80c5021616b39d2a443ea2db77b",
+      "cap": 120,
+      "start_gate": "ui-defaults-page",
+      "end_gate": "log-ui-defaults-page-commit",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-page-commit"
+    },
+    "ui-defaults-reopen": {
+      "file": "segments/ui-defaults-reopen.edenmacro.json",
+      "sha256": "acf996a074699ea7f5c6c071ba998f7144d55a3451aaa2d2c70709c2da07adc0",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "ui-defaults-reopen",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-reopen"
+    },
+    "ui-defaults-close": {
+      "file": "segments/ui-defaults-close.edenmacro.json",
+      "sha256": "aab0213b9c488f51044d3ec55d37fc5ad62ad6e437b0f787fceb91764b688b5e",
+      "cap": 120,
+      "start_gate": "ui-defaults-reopen",
+      "end_gate": "log-ui-defaults-close",
+      "from_run": "p4x-ui-01",
+      "row": "ui-defaults-close"
+    },
+    "ui-dev-off-probe": {
+      "file": "segments/ui-dev-off-probe.edenmacro.json",
+      "sha256": "9ec17677d2764dc4417fa207f124fce27a3ce53a56446b8f0f42a59f77f3da30",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": null,
+      "from_run": "p4x-ui-01",
+      "row": "ui-dev-off-probe"
+    },
+    "ui-dev-enable": {
+      "file": "segments/ui-dev-enable.edenmacro.json",
+      "sha256": "b92dfa010a3171850cf457418c10ec8a4b3224b013db646b14ac8e86322fa862",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "log-ui-dev-enable",
+      "from_run": "p4x-ui-01",
+      "row": "ui-dev-enable"
+    },
+    "ui-dev-on-probe": {
+      "file": "segments/ui-dev-on-probe.edenmacro.json",
+      "sha256": "7ff973011f3f2d4ed31261910080250a7b768e5b108ddc374c4618da633be012",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": null,
+      "from_run": "p4x-ui-01",
+      "row": "ui-dev-on-probe"
+    },
+    "ui-dev-disable": {
+      "file": "segments/ui-dev-disable.edenmacro.json",
+      "sha256": "2fe1e3d49d98cc19dad29f7711451c12abfce4c746ddbd3c3d738acc2e2c0aba",
+      "cap": 120,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "log-ui-dev-disable",
+      "from_run": "p4x-ui-01",
+      "row": "ui-dev-disable"
     }
   },
   "gates": {
@@ -2114,6 +2330,315 @@
       "cap": 12,
       "reference_is_roi": true,
       "from_run": "p4w-surface-01"
+    },
+    "p4x-cpu75": {
+      "kind": "log",
+      "source": "tile_log",
+      "whole_file": true,
+      "pattern": "settled screen=css at=75 hovered=75",
+      "cap": 3,
+      "from_run": "p4x-ui-01"
+    },
+    "p4x-cpu74-fresh": {
+      "kind": "log",
+      "source": "tile_log",
+      "pattern": "step screen=css dir=left from=75 to=74 token=p2",
+      "cap": 5,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-di": {
+      "kind": "image",
+      "reference": "refs/ui-di.png",
+      "sha256": "fb11630b6bad45126e690f1673dabdc216c7f7f80518f017e4e1b2394e7ef675",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-di": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Chips\\] visual=Di bound=10 texture=\\d+x\\d+",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-sdi": {
+      "kind": "image",
+      "reference": "refs/ui-sdi.png",
+      "sha256": "2b1a68c2a9c28c893e672667058fdd5761a47067e778c59286604ff384e70906",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-sdi": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Chips\\] visual=Sdi bound=10 texture=\\d+x\\d+",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-items": {
+      "kind": "image",
+      "reference": "refs/ui-items.png",
+      "sha256": "a6c53cb01201aa5c90220b88e7dfb734db908eb8c54d2650633a407216dd21d1",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "p4x-lobby-practice-off-focus": {
+      "kind": "image",
+      "reference": "refs/p4x-lobby-practice-off-focus.png",
+      "sha256": "d7a00e0fce5d1551f7cbec619e4935b1523c1e5922888db61a20252edcba4530",
+      "roi": [
+        356,
+        126,
+        1198,
+        160
+      ],
+      "cap": 5,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-stages-open": {
+      "kind": "image",
+      "reference": "refs/ui-stages-open.png",
+      "sha256": "765a39f4a822a60a7d68366f78bc025bd684626931047df53735eda983635147",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-stages-ranked": {
+      "kind": "image",
+      "reference": "refs/ui-stages-ranked.png",
+      "sha256": "f0e9a0970aa0595085627a05bdeab9d3f07255e60eace5d4f23686e615cd4969",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-stages-direct": {
+      "kind": "image",
+      "reference": "refs/ui-stages-direct.png",
+      "sha256": "36cf3cbbfbb9030132cac213a4f7af4f5620f20c20ae3135d8ca889c648a220b",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-stage-commit": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-stages-reopen": {
+      "kind": "image",
+      "reference": "refs/ui-stages-reopen.png",
+      "sha256": "4e2d68916aecd001966d090a64df6d2fed8acda76fc46eb01a81c089e51966a7",
+      "roi": [
+        67,
+        26,
+        1212,
+        610
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-roster-player": {
+      "kind": "image",
+      "reference": "refs/ui-roster-player.png",
+      "sha256": "7df514740d7eb74b52d95a5ad5a9f313f2f31b341b59872534298f4aedb636ac",
+      "roi": [
+        90,
+        589,
+        330,
+        608
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-roster": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Thumbs\\] bound=86 loading=0",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-roster-cpu": {
+      "kind": "image",
+      "reference": "refs/ui-roster-cpu.png",
+      "sha256": "e4e98f3569468567e8a52ec94cbf1568423a64d584366e83843c2c159c709483",
+      "roi": [
+        90,
+        589,
+        330,
+        608
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-cpu-ranks": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Thumbs\\] bound=86 loading=0",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-ranks-commit": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-defaults-prepare": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-defaults-focused": {
+      "kind": "image",
+      "reference": "refs/ui-defaults-focused.png",
+      "sha256": "7e25065e4e2159a9be839680771701f9dfe703eb06946e86dfb9324ef38fe051",
+      "roi": [
+        526,
+        42,
+        687,
+        83
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-defaults-focused-commit": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-defaults-page": {
+      "kind": "image",
+      "reference": "refs/ui-defaults-page.png",
+      "sha256": "7e25065e4e2159a9be839680771701f9dfe703eb06946e86dfb9324ef38fe051",
+      "roi": [
+        526,
+        42,
+        687,
+        83
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-defaults-page-commit": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "ui-defaults-reopen": {
+      "kind": "image",
+      "reference": "refs/ui-defaults-reopen.png",
+      "sha256": "7e25065e4e2159a9be839680771701f9dfe703eb06946e86dfb9324ef38fe051",
+      "roi": [
+        526,
+        42,
+        687,
+        83
+      ],
+      "cap": 15,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-defaults-close": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "p4x-kirby-visible": {
+      "kind": "image",
+      "reference": "refs/p4x-kirby-visible.png",
+      "sha256": "eb889d68e3bc0594639699b2bb738091949bc6dd1f49f881d7ce3504eab41a29",
+      "roi": [
+        170,
+        570,
+        256,
+        650
+      ],
+      "cap": 5,
+      "tolerance": 8,
+      "reference_is_roi": true,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-dev-enable": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
+    },
+    "log-ui-dev-disable": {
+      "kind": "log",
+      "source": "diag_log",
+      "pattern": "\\[Ui\\] menu closed changed=true",
+      "cap": 20,
+      "from_run": "p4x-ui-01"
     }
   }
 }
