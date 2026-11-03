@@ -252,6 +252,64 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.order.count('release'), 1)
         self.assertTrue(all(x['verified'] for x in c.state['instances']))
 
+    def test_main_stop_failure_retains_claim_and_never_restores_or_releases(self):
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        main = item['owned_pids'][0]
+        native, now = life.Host(), [0.0]
+        native.unit = lambda _: {'MainPID': str(main['pid']), 'ActiveState': 'active'}
+        native.owned = lambda _: [main]
+        native.identity = lambda _: main
+        native.clock = lambda: now[0]
+        native.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+        self.host.force_stop = native.force_stop
+        with patch.object(native, 'run') as run, patch.object(os, 'pidfd_open', return_value=99), \
+                patch.object(os, 'close'), patch.object(life.signal, 'pidfd_send_signal') as send:
+            with self.assertRaisesRegex(life.Refused, 'Cleanup incomplete'):
+                c.down()
+            run.assert_not_called()  # No group stop while main survives even SIGKILL.
+            self.assertEqual([call.args[1] for call in send.call_args_list], [life.signal.SIGTERM, life.signal.SIGKILL])
+        self.assertFalse(self.ledger.released)
+        self.assertEqual(self.state()['phase'], 'cleanup-failed')
+        self.assertFalse((c.directory / 'a-restore.json').exists())
+        self.assertFalse((c.directory / 'a-verify.json').exists())
+
+    def test_ordered_native_stop_precedes_full_restore_separate_verify_and_release(self):
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        main = item['owned_pids'][0]
+        mount = {'pid': 1, 'start': 'synthetic-fuse', 'boot': 'fake'}
+        self.host.live[item['unit']].insert(0, mount)
+        native = life.Host()
+        native.owned = self.host.owned
+        native.identity = lambda pid: next((p for p in self.host.live.get(item['unit'], []) if p['pid'] == pid), None)
+        native.unit = lambda _: {'MainPID': str(main['pid']), 'ActiveState': 'active', 'KillMode': 'control-group'}
+        def send(fd, sig):
+            self.assertEqual((fd, sig), (main['pid'] + 1000, life.signal.SIGTERM))
+            self.assertIn(mount, self.host.live[item['unit']])
+            self.order.append('main-gone')
+            self.host.live[item['unit']].remove(main)
+        def group_stop(argv, cap=30):
+            self.assertEqual(argv, ['systemctl', '--user', 'stop', item['unit']])
+            self.assertNotIn(main, self.host.live[item['unit']])
+            self.order.append('backing-group-gone')
+            self.host.live.pop(item['unit'])
+            return ''
+        native.run = group_stop
+        self.host.force_stop = native.force_stop
+        restore, verify = c.restore, c.verify
+        c.restore = lambda i: (self.order.append('restore'), restore(i))[-1]
+        c.verify = lambda i: (self.order.append('verify'), verify(i))[-1]
+        with patch.object(os, 'pidfd_open', side_effect=lambda pid: pid + 1000), \
+                patch.object(os, 'close'), patch.object(life.signal, 'pidfd_send_signal', side_effect=send):
+            self.assertEqual(c.down()['phase'], 'down')
+        phases = [self.order.index(name) for name in ('main-gone', 'backing-group-gone', 'restore', 'verify', 'release')]
+        self.assertEqual(phases, sorted(phases))
+        self.assertTrue(c.state['instances'][0]['verified'] and self.ledger.released)
+        self.assertEqual(life.inventory(self.source), self.before_source)
+
     def test_pair_requires_explicit_exception(self):
         self.pair()
         self.config['pair_authorized'] = False
@@ -602,7 +660,8 @@ class LifecycleTests(unittest.TestCase):
         item = c.state['instances'][0]
         host, commands = life.Host(), []
         host.run = lambda argv, cap=30: commands.append(argv) or ''
-        host.unit = lambda _: {'ActiveState': 'active', 'MemoryMax': str(8 * life.GIB), 'MemorySwapMax': '0', 'TasksMax': '256'}
+        host.unit = lambda _: {'ActiveState': 'active', 'MemoryMax': str(8 * life.GIB), 'MemorySwapMax': '0', 'TasksMax': '256',
+                               'KillMode': 'mixed', 'KillSignal': '15', 'FinalKillSignal': '9'}
         host.owned = lambda _: [{'pid': 999, 'start': 'fake', 'boot': 'fake'}]
         exists = Path.exists
         with patch.object(Path, 'exists', lambda path: True if str(path).startswith('/tmp/.X11-unix/X') else exists(path)):
@@ -624,7 +683,8 @@ class LifecycleTests(unittest.TestCase):
         item = c.state['instances'][0]
         host, commands = life.Host(), []
         host.run = lambda argv, cap=30: commands.append(argv) or ''
-        host.unit = lambda _: {'ActiveState': 'active', 'MemoryMax': str(8 * life.GIB), 'MemorySwapMax': '0', 'TasksMax': '256'}
+        host.unit = lambda _: {'ActiveState': 'active', 'MemoryMax': str(8 * life.GIB), 'MemorySwapMax': '0', 'TasksMax': '256',
+                               'KillMode': 'mixed', 'KillSignal': '15', 'FinalKillSignal': '9'}
         host.owned = lambda _: [{'pid': 999, 'start': 'fake', 'boot': 'fake'}]
         exists = Path.exists
         with patch.object(Path, 'exists', lambda path: True if str(path).startswith('/tmp/.X11-unix/X') else exists(path)):
@@ -635,11 +695,168 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('--property=MemorySwapMax=0', command)
         self.assertIn('--property=TasksMax=256', command)
         self.assertIn('--property=RuntimeMaxSec=5400', command)
+        self.assertIn('--property=KillMode=mixed', command)
+        self.assertIn('--property=KillSignal=SIGTERM', command)
+        self.assertIn('--property=FinalKillSignal=SIGKILL', command)
+        self.assertNotIn('--property=KillMode=control-group', command)
         self.assertIn('-i', command)
         self.assertIn('--control-background', command)
         # A launch without a log filter runs Eden at Debug (lr-04: 1 GB of console in 6 minutes).
         self.assertIn('EDEN_LOG_FILTER=' + life.DEFAULT_LOG_FILTER, command)
         self.assertNotIn('pkill', ' '.join(command))
+
+    def test_native_launch_refuses_unsafe_stop_policy_readback(self):
+        c = self.controller()
+        c.up()
+        host = life.Host()
+        host.run = lambda *_args, **_kwargs: ''
+        safe = {'ActiveState': 'active', 'MemoryMax': str(8 * life.GIB), 'MemorySwapMax': '0',
+                'TasksMax': '256', 'KillMode': 'mixed', 'KillSignal': '15', 'FinalKillSignal': '9'}
+        exists = Path.exists
+        with patch.object(Path, 'exists', lambda path: True if str(path).startswith('/tmp/.X11-unix/X') else exists(path)), \
+                patch.object(Path, 'is_symlink', return_value=False):
+            for wrong in ({'KillMode': 'control-group'}, {'KillMode': None}, {'KillSignal': '9'}, {'FinalKillSignal': '6'}):
+                with self.subTest(wrong=wrong):
+                    host.unit = lambda _, values={**safe, **wrong}: values
+                    with self.assertRaisesRegex(life.Refused, 'stop policy'):
+                        host.launch(c.state['instances'][0], self.config)
+
+
+class LinuxStopTests(unittest.TestCase):
+    """Synthetic process graph: main, its AppImage mount and LAN helper; no processes run."""
+    def setUp(self):
+        self.main = {'pid': 30, 'start': 'main-birth', 'boot': 'fake'}
+        self.mount = {'pid': 10, 'start': 'fuse-birth', 'boot': 'fake'}
+        self.helper = {'pid': 20, 'start': 'helper-birth', 'boot': 'fake'}
+        self.live = {p['pid']: p for p in (self.mount, self.helper, self.main)}
+        self.item = {'unit': 'eden-life-offline-a.service', 'app': {'path': '/not/executed/Eden.AppImage'},
+                     'owned_pids': [self.main, self.mount]}
+        self.host, self.now, self.events = life.Host(), 0.0, []
+        self.term_exits, self.kill_exits, self.group_exits = True, True, True
+        self.host.clock = lambda: self.now
+        self.host.sleep = self.wait
+        # Deliberately put FUSE/helper BEFORE the main PID. Numeric/snapshot order is not a safe stop order.
+        self.host.owned = lambda _: list(self.live.values())
+        # The exact same ordering also protects old control-group journals such as lr09.
+        self.host.unit = lambda _: {'MainPID': '30' if 30 in self.live else '0', 'ActiveState': 'active',
+                                    'KillMode': 'control-group'}
+        self.host.identity = lambda pid: self.live.get(pid)
+        self.host.run = self.group_stop
+        for target in (patch.object(os, 'pidfd_open', side_effect=lambda pid: pid + 1000),
+                       patch.object(os, 'close'),
+                       patch.object(life.signal, 'pidfd_send_signal', side_effect=self.signal)):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def wait(self, seconds):
+        self.events.append(('wait', seconds))
+        self.now += seconds
+
+    def signal(self, fd, sig):
+        pid = fd - 1000
+        self.events.append(('signal', pid, sig))
+        if pid == 30:
+            self.assertIn(10, self.live, 'FUSE must still exist while signalling main')
+            self.assertIn(20, self.live, 'Helper must not be group-terminated before main')
+            exits = self.term_exits if sig == life.signal.SIGTERM else self.kill_exits
+            if exits:
+                self.live.pop(pid, None)
+        else:
+            self.assertNotIn(30, self.live, 'Never tear down backing processes before main exits')
+            self.live.pop(pid, None)
+
+    def group_stop(self, argv, cap=30):
+        self.events.append(('group-stop', list(argv), cap))
+        self.assertNotIn(30, self.live, 'lr09 regression: group SIGTERM can remove FUSE while main still runs')
+        self.assertEqual(argv, ['systemctl', '--user', 'stop', self.item['unit']])
+        self.assertGreater(cap, 0)
+        if self.group_exits:
+            self.live.clear()
+        else:
+            raise subprocess.TimeoutExpired(argv, cap)
+        return ''
+
+    def signals(self):
+        return [(event[1], event[2]) for event in self.events if event[0] == 'signal']
+
+    def test_main_term_exit_precedes_group_even_with_lower_numbered_fuse(self):
+        result = self.host.force_stop(self.item, 1)
+        self.assertEqual(self.signals(), [(30, life.signal.SIGTERM)])
+        self.assertEqual(result['main_pid_stopped'], self.main)
+        self.assertEqual(result['main_stop_signals'], ['SIGTERM'])
+        self.assertEqual(result['owned_pids_stopped'], [self.main, self.mount, self.helper])
+        self.assertFalse(self.live)
+
+    def test_main_ignores_term_kill_main_then_wait_before_any_group_stop(self):
+        self.term_exits = False
+        result = self.host.force_stop(self.item, 1)
+        self.assertEqual(self.signals(), [(30, life.signal.SIGTERM), (30, life.signal.SIGKILL)])
+        self.assertEqual(result['main_stop_signals'], ['SIGTERM', 'SIGKILL'])
+        self.assertGreater(self.now, 0)
+        self.assertLessEqual(self.now, 1)
+        self.assertFalse(self.live)
+
+    def test_surviving_main_blocks_group_stop(self):
+        self.term_exits = self.kill_exits = False
+        with self.assertRaisesRegex(life.Refused, 'main PID remains'):
+            self.host.force_stop(self.item, 1)
+        self.assertFalse(any(event[0] == 'group-stop' for event in self.events))
+        self.assertEqual(set(self.live), {10, 20, 30})
+        self.assertLessEqual(self.now, 1)
+
+    def test_group_stop_timeout_only_kills_helpers_after_main_is_gone(self):
+        self.group_exits = False
+        self.host.force_stop(self.item, 1)
+        self.assertEqual(self.signals(), [(30, life.signal.SIGTERM), (10, life.signal.SIGKILL), (20, life.signal.SIGKILL)])
+        self.assertFalse(self.live)
+
+    def test_already_gone_main_still_cleans_owned_mount_and_helper(self):
+        self.live.pop(30)
+        result = self.host.force_stop(self.item, 1)
+        self.assertIsNone(result['main_pid_stopped'])
+        self.assertEqual(self.signals(), [])
+        self.assertFalse(self.live)
+
+    def test_main_pid_not_in_owned_cgroup_refuses_every_signal_and_group_stop(self):
+        self.host.owned = lambda _: [self.mount, self.helper]
+        with self.assertRaisesRegex(life.Refused, 'Main PID not in owned cgroup'):
+            self.host.force_stop(self.item, 1)
+        self.assertEqual(self.events, [])
+
+    def test_main_pid_changed_from_journal_refuses_before_signalling(self):
+        self.live[30] = {**self.main, 'start': 'new-birth'}
+        with self.assertRaisesRegex(life.Refused, 'Main PID differs from journal'):
+            self.host.force_stop(self.item, 1)
+        self.assertEqual(self.events, [])
+
+    def test_main_pid_reuse_after_pidfd_open_refuses_without_group_stop(self):
+        def changed(pid):
+            self.live[pid] = {**self.main, 'start': 'reused-after-open'}
+            return pid + 1000
+        with patch.object(os, 'pidfd_open', side_effect=changed):
+            with self.assertRaisesRegex(life.Refused, 'PID changed'):
+                self.host.force_stop(self.item, 1)
+        self.assertEqual(self.events, [])
+
+    def test_partial_launch_without_pid_receipt_uses_current_owned_main(self):
+        self.item.pop('owned_pids')
+        self.host.force_stop(self.item, 1)
+        self.assertEqual(self.signals(), [(30, life.signal.SIGTERM)])
+        self.assertFalse(self.live)
+
+    def test_unsettled_main_pid_refuses_group_stop(self):
+        self.host.unit = lambda _: {'MainPID': '0', 'ActiveState': 'activating'}
+        with self.assertRaisesRegex(life.Refused, 'Main PID not settled'):
+            self.host.force_stop(self.item, 1)
+        self.assertEqual(self.events, [])
+
+    def test_display_unit_keeps_its_existing_group_cleanup_path(self):
+        item = {'unit': self.item['unit'], 'owned_pids': [self.main, self.mount]}
+        self.host.run = lambda *_args, **_kwargs: self.live.clear()
+        with patch.object(self.host, 'stop_main', side_effect=AssertionError('Display has no AppImage main')):
+            self.host.force_stop(item, 1)
+        self.assertEqual(self.signals(), [])
+        self.assertFalse(self.live)
 
 
 class ProtocolTests(unittest.TestCase):

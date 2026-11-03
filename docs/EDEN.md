@@ -235,11 +235,26 @@ it, even after a failed run. The profile is kept.
 With `tools/eden-lifecycle`, `lifecycle.py down config.json --execute` does
 the same for its own runs. It also restores the profile, verifies it
 separately, and releases only when both pass. Eden's `game.stop` rarely
-finishes within its 30 s cap: on 2026-11-03 it timed out on every run (lr-02
-to lr-05 and pkg4's pair), and the forced stop ended each one cleanly. The
-journal lists that under `stop_errors`. It isn't a failure. A failure is a
-non-empty `cleanup_failures`, a verify that isn't equal, or a claim that's
-still held.
+finishes within its 30 s cap: on 2026-11-03 it timed out on lr-02 to lr-05
+and pkg4's pair. The journal retains that under `stop_errors`; successful
+bounded cleanup can still restore/verify/release, but does not establish
+graceful shutdown or waive a fatal console tail. Non-empty `cleanup_failures`,
+unequal verification or an unreleased claim always mean cleanup failure.
+
+**AppImage backing processes must outlive Eden's main process.** lr-09's
+group-wide SIGTERM removed its FUSE mount while Eden still ran, producing
+main-process SIGBUS and a LAN helper Go fault. Shared lifecycle guest units
+now use/read back `KillMode=mixed` (initial SIGTERM to main only). Down also
+orders the fallback explicitly: identity-checked pidfd SIGTERM to the unit's
+owned MainPID, bounded wait, main-only SIGKILL if needed, then confirmation
+that this main identity is gone **before** stopping/killing remaining cgroup
+members, including FUSE. This works with older journals too; never stop a
+backing process first just because its PID sorts earlier. An ambiguous or
+surviving main identity retains the claim and blocks group stop/restore.
+Full owned-PID absence still precedes restore, separate verify and release.
+Keep the native unit/mount timeline and console: no SIGBUS/panic/fatal failure
+is dismissed as the expected CLI timeout. The ordering fix is offline-tested;
+the next lead batch's post-merge Down is its live check, not an extra boot.
 
 ## Queue runs
 

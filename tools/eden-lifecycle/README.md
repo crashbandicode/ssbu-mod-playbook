@@ -4,7 +4,9 @@
 - **Linux:** proven on real runs. The Yoga over `--ssh` ran lr-04 to lr-09 (single
   instance); the Surface ran locally, and the Yoga over `--ssh`, ran pkg4's pairs
   (`pair_authorized` + `defer_load`). Each did up, rows, down, full restore,
-  separate verify and release.
+  separate verify and release. lr-09 also exposed a teardown SIGBUS in Eden and
+  its LAN helper; cleanup success was not clean shutdown health. The main-first
+  correction below is offline-tested; its live check belongs to the next lead run.
 - **Ally (Windows):** one no-input proof passed at 21:27–21:29Z: up, game loaded,
   down through the Job fallback, restore, separate verify and release (below).
   Graceful `game.stop`, pairs, native error 1312 and transport loss aren't
@@ -146,6 +148,40 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
 - State: lifecycle.json; actions.jsonl; dry-run.json; per-instance
   snapshot/restore/verify JSON; run-* full console/control logs; post-run-*
   profile evidence. The original snapshot never becomes the output directory.
+
+### Linux AppImage Down: main before FUSE (2026-11-03)
+
+lr-09's old `KillMode=control-group` sent SIGTERM to Eden **and** its AppImage
+FUSE daemon together. The package mount disappeared while Eden still executed
+mapped files: its main PID exited with SIGBUS and helper stderr contained a Go
+fault. This is lifecycle teardown failure, not an accepted plugin-log exception.
+
+New guest units use and read back `KillMode=mixed`, `KillSignal=SIGTERM` and
+`FinalKillSignal=SIGKILL`: systemd initially signals only the main process.
+Down additionally enforces ordering itself, including for older journals/units:
+after the capped CLI `game.stop`, read the exact unit's current MainPID, require
+its birth identity in the owned cgroup and (when available) original launch
+receipt, signal it through an identity-rechecked pidfd, and wait. Half of
+`force_cap` is reserved for this main-only phase: SIGTERM gets its first half,
+then SIGKILL targets **only that same main process** if necessary. Only after
+the original main identity is gone may Down stop the unit and kill any remaining
+owned members. Lower-numbered FUSE/helper PIDs never determine stop order.
+Display units and the Windows Job backend keep their existing cleanup paths.
+
+If main identity/ownership is ambiguous or the main process survives, no cgroup
+stop or profile restore/release is permitted; retain the claim for recovery.
+The forced-stop receipt records `main_pid_stopped` and `main_stop_signals`.
+Full owned-process absence, post-run preservation, restore, **separate** verify
+and exact release remain in that order. A stop timeout alone is not a clean-log
+waiver: inspect SIGBUS/fatal/panic tails and unit exit status separately. No
+AppImage extraction, binary-pin or profile-layout change is needed. Native
+mount lifetime/clean-log confirmation is pending the lead's post-merge Down;
+offline tests do not establish it.
+
+The suite at this fix is **89 offline tests** (75 on base `705cc21`, plus 14
+regressions), including main-only escalation, old control-group units,
+lower-numbered FUSE/helper members, PID reuse, partial launch, unsafe policy
+readback, retained-claim failure and stop → restore → separate verify → release.
 
 ## Ally / Windows backend (2026-11-03)
 

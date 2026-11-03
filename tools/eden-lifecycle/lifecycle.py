@@ -472,7 +472,7 @@ class Host:
 
     def unit(self, name):
         done = subprocess.run(['systemctl', '--user', 'show', name,
-            '--property=LoadState,MainPID,ControlGroup,ActiveState,MemoryMax,MemorySwapMax,TasksMax,RuntimeMaxUSec,MemoryPeak'],
+            '--property=LoadState,MainPID,ControlGroup,ActiveState,MemoryMax,MemorySwapMax,TasksMax,RuntimeMaxUSec,MemoryPeak,KillMode,KillSignal,FinalKillSignal'],
             capture_output=True, text=True, timeout=15)
         info = dict(line.split('=', 1) for line in done.stdout.splitlines() if '=' in line)
         require(done.returncode == 0 or info.get('LoadState') == 'not-found', 'Cannot inspect exact owned unit')
@@ -509,7 +509,8 @@ class Host:
         info = self.unit(item['unit'])
         value = info.get('MemoryPeak', '')
         return {'memory_peak': int(value) if value.isdecimal() else None,
-                'limits': {k: info.get(k) for k in ('MemoryMax', 'MemorySwapMax', 'TasksMax', 'RuntimeMaxUSec')}}
+                'limits': {k: info.get(k) for k in ('MemoryMax', 'MemorySwapMax', 'TasksMax', 'RuntimeMaxUSec',
+                                                  'KillMode', 'KillSignal', 'FinalKillSignal')}}
 
     def launch(self, item, config):
         require(not Path('/tmp/.X11-unix/X' + item['display'][1:]).is_symlink(), 'Display socket alias refused')
@@ -538,13 +539,16 @@ class Host:
             command += ['--trace-config', str(run / 'trace.json')]
         self.run(['systemd-run', '--user', '--quiet', '--service-type=exec', '--unit=' + item['unit'],
                   '--property=MemoryMax=8G', '--property=MemorySwapMax=0', '--property=TasksMax=256',
-                  '--property=RuntimeMaxSec=' + str(config.get('runtime', 5400)), '--property=KillMode=control-group',
+                  '--property=RuntimeMaxSec=' + str(config.get('runtime', 5400)), '--property=KillMode=mixed',
+                  '--property=KillSignal=SIGTERM', '--property=FinalKillSignal=SIGKILL',
                   '--property=TimeoutStopSec=10', '--property=StandardOutput=append:' + item['console_log'],
                   '--property=StandardError=append:' + item['console_log'], '--working-directory=' + str(profile),
                   '--', *command])
         info = self.unit(item['unit'])
         require(info.get('ActiveState') == 'active' and info.get('MemoryMax') == str(8 * GIB)
-                and info.get('MemorySwapMax') == '0' and info.get('TasksMax') == '256', 'Actual cgroup limits differ')
+                and info.get('MemorySwapMax') == '0' and info.get('TasksMax') == '256'
+                and info.get('KillMode') == 'mixed' and info.get('KillSignal') == '15'
+                and info.get('FinalKillSignal') == '9', 'Actual cgroup limits/stop policy differ')
         identities = self.owned(item)
         require(identities, 'No owned Eden PID recorded')
         return identities
@@ -565,28 +569,63 @@ class Host:
         spec.loader.exec_module(module)
         return module.Client(item['socket'], timeout=timeout).request(method, params)
 
+    def signal_identity(self, identity, sig):
+        fd = os.pidfd_open(identity['pid'])
+        try:
+            # Recheck after pidfd_open, which pins the process against reuse.
+            require(self.identity(identity['pid']) == identity, 'Owned PID changed before force stop')
+            signal.pidfd_send_signal(fd, sig)
+        finally:
+            os.close(fd)
+
+    def stop_main(self, item, cap):
+        """Keep AppImage FUSE/helper processes alive until the actual main PID is gone."""
+        info = self.unit(item['unit'])
+        pid = int(info.get('MainPID') or 0)
+        if not pid:
+            require(info.get('ActiveState') not in ('activating', 'reloading'),
+                    'Main PID not settled; no cgroup stop')
+            return {'main_pid_stopped': None, 'main_stop_signals': []}
+        identity = self.identity(pid)
+        if identity is None:
+            return {'main_pid_stopped': None, 'main_stop_signals': []}
+        require(identity in self.owned(item), 'Main PID not in owned cgroup; no cgroup stop')
+        require(not item.get('owned_pids') or identity in item['owned_pids'],
+                'Main PID differs from journal; no cgroup stop')
+        deadline = self.clock() + cap
+        sent = []
+        for sig, end in ((signal.SIGTERM, self.clock() + cap / 2), (signal.SIGKILL, deadline)):
+            if self.identity(pid) != identity:
+                break
+            self.signal_identity(identity, sig)
+            sent.append(sig.name)
+            while self.clock() < end and self.identity(pid) == identity:
+                self.sleep(max(0, min(.1, end - self.clock())))
+        require(self.identity(pid) != identity, 'Owned main PID remains; no cgroup stop/restore/release')
+        return {'main_pid_stopped': identity, 'main_stop_signals': sent}
+
     def force_stop(self, item, cap):
         # Unique journalled unit/cgroup only. Never process-name matching or pkill.
+        deadline = self.clock() + cap
         before = list({(x['pid'], x['start'], x['boot']): x
-                       for x in [*item.get('owned_pids', []), *self.owned(item)]}.values())
+                        for x in [*item.get('owned_pids', []), *self.owned(item)]}.values())
+        # A group-wide SIGTERM kills the AppImage FUSE daemon while Eden still maps
+        # its files (lr-09: main SIGBUS plus Go companion fault). Even on timeout,
+        # escalate ONLY the main PID and confirm its death before touching the group.
+        main_stop = self.stop_main(item, cap / 2) if item.get('app') else {}
         try:
-            self.run(['systemctl', '--user', 'stop', item['unit']], cap=cap)
+            self.run(['systemctl', '--user', 'stop', item['unit']], cap=max(.001, deadline - self.clock()))
         except (Refused, subprocess.TimeoutExpired):
             pass
         for identity in self.owned(item):
             if self.identity(identity['pid']) == identity:
-                fd = os.pidfd_open(identity['pid'])
-                try:
-                    # Recheck after pidfd_open, which pins the process against reuse.
-                    require(self.identity(identity['pid']) == identity, 'Owned PID changed before force stop')
-                    signal.pidfd_send_signal(fd, signal.SIGKILL)
-                finally:
-                    os.close(fd)
-        deadline = self.clock() + cap
-        while self.clock() < deadline:
+                self.signal_identity(identity, signal.SIGKILL)
+        while True:
             if not self.owned(item) and all(self.identity(x['pid']) != x for x in before):
-                return {'owned_pids_stopped': before}
-            self.sleep(.1)
+                return {'owned_pids_stopped': before, **main_stop}
+            if self.clock() >= deadline:
+                break
+            self.sleep(max(0, min(.1, deadline - self.clock())))
         raise Refused('Owned Eden processes remain; do not restore/release')
 
 
