@@ -22,8 +22,10 @@ rows.json (paths are relative to its folder):
               "evidence": ["training screenshot"]}]
   }
 
-instances.json (written by whoever ran Up): {"a": {"socket": ".../control.sock", "console_log": ".../console.log",
-  "settings": ".../TrainingRooms/settings.json"}}. Steps run on "on": "<key>", default the first key.
+instances.json (written by tools/eden-lifecycle at Up): {"a": {"socket": ".../control.sock", "console_log": ".../console.log",
+  "settings": ".../TrainingRooms/settings.json"}}. Steps run on "on": "<key>", default the first key. Standard file keys:
+  console_log, control_log, diag_log, events_log, tile_log, detector_log, settings; a gate's "source" may drop the
+  "_log" suffix ("diag" finds diag_log), so library gates work with any run's instances file.
 
 Every play needs a start check: a gate step on the same instance since its last play, a "start_gate" on the segment
 (checked before each play), or "unchecked": true on the step. The dry run refuses a play without one.
@@ -387,7 +389,13 @@ class Runner:
         self.wait_macro(on, seg.get('cap', 60))
 
     def source(self, on, key):
-        return Path(self.instances[on][key]) if key in self.instances[on] else Path(key)
+        """An instance file by key. "diag" and "diag_log" name the same file, so library gates work with any
+        instances.json (eden-lifecycle writes console_log, control_log, diag_log, detector_log, settings)."""
+        inst = self.instances[on]
+        for name in (key, key + '_log', key[:-4] if key.endswith('_log') else None):
+            if name and name in inst:
+                return Path(inst[name])
+        return Path(key)
 
     def last_match(self, on, gate):
         """Last match of the gate's pattern in lines written during this row (or the whole file), or None."""
@@ -402,11 +410,13 @@ class Runner:
         return matches[-1] if matches else None
 
     @staticmethod
-    def roi_diff(path_a, path_b, roi):
+    def roi_diff(path_a, path_b, roi, b_is_roi=False):
+        """Mean absolute difference per colour byte of the region in both images. With b_is_roi, image b already
+        is just that region (library references keep only the compared region)."""
         from PIL import Image
         with Image.open(path_a) as im_a, Image.open(path_b) as im_b:
             a = im_a.convert('RGB').crop(tuple(roi)).tobytes()
-            b = im_b.convert('RGB').crop(tuple(roi)).tobytes()
+            b = (im_b.convert('RGB') if b_is_roi else im_b.convert('RGB').crop(tuple(roi))).tobytes()
         if len(a) != len(b):
             return float('inf')
         return sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
@@ -497,7 +507,7 @@ class Runner:
                 if hook is not None:
                     passed = bool(hook(str(path), gate))
                 else:
-                    diff = self.roi_diff(path, self.base / gate['reference'], gate['roi'])
+                    diff = self.roi_diff(path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'))
                     passed = diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
                 if passed:
                     self.log({'gate': name, 'on': on, 'pass': True, 'shot': str(path)})
@@ -571,8 +581,8 @@ class Runner:
         for gate in self.plan.get('gates', {}).values():
             if gate.get('kind') != 'log':
                 continue
-            for inst in self.instances.values():
-                source = Path(inst.get(gate['source'], gate['source']))
+            for on in self.instances:
+                source = self.source(on, gate['source'])
                 if source.is_file():
                     offsets[str(source)] = source.stat().st_size
         return offsets

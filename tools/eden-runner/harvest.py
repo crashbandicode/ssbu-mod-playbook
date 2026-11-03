@@ -42,7 +42,8 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                 last_gate[on] = step['gate']
                 names = [step['gate']]
             elif 'play' in step:
-                names = []
+                # A segment's own start gate is a dependency even when no row step names it (lr-03 harvest gap).
+                names = [g for g in (plan['segments'][step['play']].get('start_gate'),) if g]
             else:
                 continue
             for gate_name in names:
@@ -53,12 +54,21 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                     if field in gate:
                         src = Path(gate[field]) if Path(gate[field]).is_absolute() else base / gate[field]
                         dest = Path(folder) / f'{gate_name}{src.suffix}'
-                        if not dry:
-                            (library / folder).mkdir(parents=True, exist_ok=True)
-                            shutil.copyfile(src, library / dest)
                         gate[field] = str(dest)
-                        if field == 'reference':
-                            gate['sha256'] = digest(src)
+                        if dry:
+                            continue
+                        (library / folder).mkdir(parents=True, exist_ok=True)
+                        if field == 'reference' and gate.get('kind') in ('image', 'change') and 'roi' in gate:
+                            # Keep only the compared region: a full screenshot is ~600 KB, the region a few KB.
+                            from PIL import Image
+                            with Image.open(src) as im:
+                                im.convert('RGB').crop(tuple(gate['roi'])).save(library / dest)
+                            gate['reference_is_roi'] = True
+                            gate['sha256'] = digest(library / dest)
+                        else:
+                            shutil.copyfile(src, library / dest)
+                            if field == 'reference':
+                                gate['sha256'] = digest(src)
                 gate.pop('acquire', None)
                 gate['from_run'] = label
                 index['gates'][gate_name] = gate
@@ -70,7 +80,8 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
             if seg.get('library'):
                 continue
             if name in index['segments'] and not replace:
-                added['skipped'].append(name)
+                if name not in added['skipped'] and name not in added['segments']:
+                    added['skipped'].append(name)
                 continue
             src = Path(seg['file']) if Path(seg['file']).is_absolute() else base / seg['file']
             if digest(src) != seg.get('sha256'):

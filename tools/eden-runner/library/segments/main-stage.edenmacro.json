@@ -1,0 +1,590 @@
+{
+  "bindings": {
+    "keyboard": "",
+    "gamepad": ""
+  },
+  "duration_frames": 575,
+  "events": [
+    {
+      "buttons": 0,
+      "frame": 0,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 16384,
+      "frame": 19,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 0,
+      "frame": 29,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 8192,
+      "frame": 73,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 0,
+      "frame": 83,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 1,
+      "frame": 173,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 0,
+      "frame": 185,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 32768,
+      "frame": 287,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 0,
+      "frame": 298,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 4096,
+      "frame": 341,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 0,
+      "frame": 352,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 1,
+      "frame": 442,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    },
+    {
+      "buttons": 0,
+      "frame": 454,
+      "motion": [
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "accel": [
+            0,
+            0,
+            0
+          ],
+          "delta_us": 10000,
+          "gyro": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "sticks": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "triggers": [
+        0,
+        0
+      ]
+    }
+  ],
+  "format": "eden-input-macro",
+  "game_id": "01006A800016E000",
+  "markers": [
+    {
+      "frame": 18,
+      "name": "main-ready"
+    },
+    {
+      "frame": 145,
+      "name": "games-more-highlighted"
+    },
+    {
+      "frame": 173,
+      "name": "open-games-more"
+    },
+    {
+      "frame": 413,
+      "name": "training-highlighted"
+    },
+    {
+      "frame": 442,
+      "name": "open-stage-select"
+    },
+    {
+      "frame": 571,
+      "name": "stage-select-ready"
+    }
+  ],
+  "name": "tr-main-to-stage-select",
+  "parent": {
+    "name": "",
+    "marker": ""
+  },
+  "player": 0,
+  "version": 1
+}

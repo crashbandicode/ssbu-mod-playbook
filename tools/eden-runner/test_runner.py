@@ -145,6 +145,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(inside, 2)
         self.assertEqual(runner.dry_run(self.manifest)['result'], 'READY')
 
+    def test_log_source_names_with_or_without_log_suffix(self):
+        self.instances = {'a': {'socket': 'fake', 'console': str(self.log)}}  # gate says console_log
+        eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        self.make(eden).run()
+        self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
+
     def test_log_gate_ignores_lines_written_before_the_step(self):
         eden = FakeEden({'to-red': RED})  # never appends paused=1
         with self.assertRaises(RuntimeError):
@@ -363,6 +369,16 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((seg['end_gate'], seg['from_run'], seg['row']), ('red', 'test-01', 'r1'))
         self.assertEqual(seg['sha256'], sha(library / seg['file']))
         self.assertEqual(index['gates']['red']['sha256'], sha(library / index['gates']['red']['reference']))
+        self.assertTrue(index['gates']['red']['reference_is_roi'])
+        # The region-only reference still passes a live screenshot of the same screen.
+        shot = self.dir / 'shot.png'
+        Image.new('RGB', (64, 36), RED).save(shot)
+        self.assertEqual(runner.Runner.roi_diff(shot, library / index['gates']['red']['reference'], [0, 0, 64, 36], True), 0)
+        # A segment's start_gate comes along even when no row step names it.
+        self.plan['segments']['to-red']['start_gate'] = 'paused'
+        self.manifest.write_text(json.dumps(self.plan))
+        (library / 'index.json').unlink()
+        self.assertIn('paused', harvest.harvest(self.manifest, self.dir / 'out', 'test-01', library)['gates'])
         # A second harvest leaves existing entries alone.
         self.assertEqual(harvest.harvest(self.manifest, self.dir / 'out', 'test-02', library)['segments'], [])
 

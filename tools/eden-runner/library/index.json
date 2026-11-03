@@ -1,5 +1,435 @@
 {
-  "about": "Proven Super Smash Bros. Ultimate 13.0.5 segments and gate references for tools/eden-runner. Rows name them with {\"library\": \"<name>\"}. Add an entry only from a run that passed it, with start/end screens, sha256 and the run label.",
-  "segments": {},
-  "gates": {}
+  "about": "Proven Super Smash Bros. Ultimate 13.0.5 segments and gate references for tools/eden-runner. Rows name them with {\"library\": \"<name>\"}. Add an entry only from a run that passed it, with start/end screens, sha256 and the run label (harvest.py).",
+  "segments": {
+    "smash-main": {
+      "file": "segments/smash-main.edenmacro.json",
+      "sha256": "240feba90e10d7133254a27968c683252e0636fd5083104aa1fcfc421f368bf7",
+      "cap": 20,
+      "start_gate": "smash-submenu",
+      "end_gate": "main",
+      "from_run": "lr-03",
+      "row": "01-main"
+    },
+    "main-stage": {
+      "file": "segments/main-stage.edenmacro.json",
+      "sha256": "ce6714b44f34f04cacd0d17454e4773c8906d289e5a37e34c606c604e6e4acfb",
+      "cap": 60,
+      "start_gate": "main",
+      "end_gate": "stage",
+      "from_run": "lr-03",
+      "row": "02-stage"
+    },
+    "stage-css": {
+      "file": "segments/stage-css.edenmacro.json",
+      "sha256": "240249606f15207106e4cc654cc3ee173efa97d51ea276586c82e6c7c438db74",
+      "cap": 30,
+      "start_gate": "stage",
+      "end_gate": "css",
+      "from_run": "lr-03",
+      "row": "03-css"
+    },
+    "cpu74-lucas": {
+      "file": "segments/cpu74-lucas.edenmacro.json",
+      "sha256": "0c1b4ceca55fbd4c41f0be6040c072b0d21b2804d814b0bc541a0d91761c3298",
+      "cap": 30,
+      "start_gate": "cpu-held74",
+      "end_gate": "lucas",
+      "from_run": "lr-03",
+      "row": "05-lucas"
+    },
+    "lucas-pick": {
+      "file": "segments/lucas-pick.edenmacro.json",
+      "sha256": "7d74e4e47ffa0a99604767a08e0188a647281926508c614ac7f42c0590991f66",
+      "cap": 20,
+      "start_gate": "lucas",
+      "end_gate": "ready",
+      "from_run": "lr-03",
+      "row": "05-lucas"
+    },
+    "enter-training": {
+      "file": "segments/enter-training.edenmacro.json",
+      "sha256": "7cdd035473160fec1a0e8c601c05f599f5b21556ac1cb4479b358c629e05b5c1",
+      "cap": 30,
+      "start_gate": "ready",
+      "end_gate": "p1-original",
+      "from_run": "lr-03",
+      "row": "06-training"
+    },
+    "pause-open": {
+      "file": "segments/pause-open.edenmacro.json",
+      "sha256": "64dd73ecc545a194de80411cddb3b8cbd5e37be8e7a4e077a39a5dedee23fe24",
+      "cap": 20,
+      "start_gate": "training-closed",
+      "end_gate": "pause",
+      "from_run": "lr-03",
+      "row": "07-pause"
+    },
+    "pause-close": {
+      "file": "segments/pause-close.edenmacro.json",
+      "sha256": "5e8ab5d918a72f8825aa47489cf0895edf975642cb915e74e6cfceed61982969",
+      "cap": 20,
+      "start_gate": "native-pause",
+      "end_gate": "resume",
+      "from_run": "lr-03",
+      "row": "09-pause-roundtrip"
+    },
+    "p1-next-frames": {
+      "file": "segments/p1-next-frames.edenmacro.json",
+      "sha256": "d56e381eebfc979cfc4380a80f24af11c057990f306c4ad66b23c6e6641d6df4",
+      "cap": 30,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "p1-b",
+      "from_run": "lr-03",
+      "row": "10-p1-falcon"
+    },
+    "cpu-next-frames": {
+      "file": "segments/cpu-next-frames.edenmacro.json",
+      "sha256": "771d9c618735334c245cbe3ea86f6753f73744aaff6841945ab9b570506f17f5",
+      "cap": 30,
+      "start_gate": "training-hud-unpaused",
+      "end_gate": "cpu-4a",
+      "from_run": "lr-03",
+      "row": "22-cpu-gunner"
+    },
+    "focus-native-quit-frames": {
+      "file": "segments/focus-native-quit-frames.edenmacro.json",
+      "sha256": "281999e46939ca06c960cef0108b28672c611435d33260ddeddfc6c9dd475b46",
+      "cap": 20,
+      "start_gate": "native-pause",
+      "end_gate": "quit-focus",
+      "from_run": "lr-03",
+      "row": "25-warm-scene-exit"
+    },
+    "confirm-native-quit-frames": {
+      "file": "segments/confirm-native-quit-frames.edenmacro.json",
+      "sha256": "6fc21293dea72efe1bfb888735d8a62d8a6754d8a1855e8bbcde9af08e24080b",
+      "cap": 20,
+      "start_gate": "quit-focus",
+      "end_gate": "finalize-p1",
+      "from_run": "lr-03",
+      "row": "25-warm-scene-exit"
+    }
+  },
+  "gates": {
+    "installed": {
+      "kind": "log",
+      "source": "events",
+      "pattern": "cpu_common=installed",
+      "whole_file": true,
+      "cap": 120,
+      "from_run": "lr-03"
+    },
+    "smash-submenu": {
+      "kind": "image",
+      "reference": "refs/smash-submenu.png",
+      "sha256": "ab968c4f7e3b2562cca4bd363ce9979847edf311c834873af24c45e4df3e0fd7",
+      "roi": [
+        552,
+        360,
+        710,
+        405
+      ],
+      "tolerance": 8,
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "main": {
+      "kind": "image",
+      "reference": "refs/main.png",
+      "sha256": "902628cebd8620847be44e41a826046740f495ca0dfa7e78d8482c43c0da1bdc",
+      "roi": [
+        150,
+        265,
+        450,
+        335
+      ],
+      "tolerance": 8,
+      "cap": 30,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "stage": {
+      "kind": "image",
+      "reference": "refs/stage.png",
+      "sha256": "99e7013e2be97b8173498e36a9b0e3b849c4e403bd239f1febda185470617033",
+      "roi": [
+        110,
+        445,
+        290,
+        495
+      ],
+      "tolerance": 8,
+      "cap": 45,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "css": {
+      "kind": "image",
+      "reference": "refs/css.png",
+      "sha256": "a7a15642548952e4e263e42d467542b2877576cac4785061c21988e6cd7c0b76",
+      "roi": [
+        55,
+        55,
+        675,
+        155
+      ],
+      "tolerance": 8,
+      "cap": 60,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "cpu-held74": {
+      "kind": "image",
+      "reference": "refs/cpu-held74.png",
+      "sha256": "b0e89ddafe4979de6deb208412f869745f8e0692f6a07694d87e2f05fbec8ab7",
+      "roi": [
+        865,
+        545,
+        1130,
+        580
+      ],
+      "tolerance": 8,
+      "cap": 10,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "lucas": {
+      "kind": "log",
+      "source": "tile",
+      "pattern": "settled screen=css at=39 hovered=39",
+      "cap": 15,
+      "from_run": "lr-03"
+    },
+    "ready": {
+      "kind": "image",
+      "reference": "refs/ready.png",
+      "sha256": "760e864b6bfdfd06d46fd0ce8ceed91f456f09f2caef75401d4e9a49a952522f",
+      "roi": [
+        410,
+        195,
+        600,
+        245
+      ],
+      "tolerance": 8,
+      "cap": 30,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "p1-original": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[CharacterRoster\\] observed owner=0 [^\\n]*kind=0x58\\b",
+      "cap": 60,
+      "from_run": "lr-03"
+    },
+    "cpu-original": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[CharacterRoster\\] observed owner=1 [^\\n]*kind=0x28\\b",
+      "cap": 30,
+      "from_run": "lr-03"
+    },
+    "catalog": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiAutoInit\\] catalog ready;[^\\n]*",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "player-owner": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] catalog owner qualified; immutable origin retained",
+      "cap": 30,
+      "from_run": "lr-03"
+    },
+    "cpu-owner": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryCpu\\] catalog owner qualified; immutable origin retained",
+      "cap": 30,
+      "from_run": "lr-03"
+    },
+    "training-closed": {
+      "kind": "image",
+      "reference": "refs/training-closed.png",
+      "sha256": "bf8371948c69d7ab8871254389ed81e85fc316eaeaf547f128b3d770154e238d",
+      "roi": [
+        75,
+        120,
+        300,
+        190
+      ],
+      "tolerance": 8,
+      "cap": 15,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "pause": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "pause_owner begin [^\\n]*owners=0x10",
+      "cap": 15,
+      "from_run": "lr-03"
+    },
+    "native-pause": {
+      "kind": "image",
+      "reference": "refs/native-pause.png",
+      "sha256": "3f03f8a24e7685cf86c5c00f4d06d2d48a3d15d23259c64872d0a5ff4ba717e5",
+      "roi": [
+        105,
+        142,
+        260,
+        174
+      ],
+      "tolerance": 8,
+      "cap": 15,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "resume": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "pause_owner end [^\\n]*owned_non_neutral=0 owners=0x00",
+      "cap": 15,
+      "from_run": "lr-03"
+    },
+    "training-hud-unpaused": {
+      "kind": "image",
+      "reference": "refs/training-hud-unpaused.png",
+      "sha256": "7ecf9a4258ace218ad179e2fe14dcaf9d3dd906c594dec2ec8216cb5e02a8d2c",
+      "roi": [
+        280,
+        580,
+        302,
+        615
+      ],
+      "tolerance": 8,
+      "cap": 10,
+      "scope": "Undimmed native zero digit, excluding changing faction emblem; applies only to this no-damage cycle lane.",
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "p1-b": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0xb\\b[\\s\\S]*?\\[MiiOrdinaryPlayer\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0xb\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "p1-1f": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x1f\\b[\\s\\S]*?\\[MiiOrdinaryPlayer\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x1f\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "p1-hud-changed": {
+      "kind": "change",
+      "mark": "hud-before",
+      "roi": [
+        140,
+        554,
+        250,
+        655
+      ],
+      "min_diff": 8,
+      "stable": true,
+      "cap": 20,
+      "from_run": "lr-03"
+    },
+    "p1-2e": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x2e\\b[\\s\\S]*?\\[MiiOrdinaryPlayer\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x2e\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "p1-2d": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x2d\\b[\\s\\S]*?\\[MiiOrdinaryPlayer\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x2d\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "p1-2c": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x2c\\b[\\s\\S]*?\\[MiiOrdinaryPlayer\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x2c\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "p1-58": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryPlayer\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x58\\b[\\s\\S]*?\\[MiiOrdinaryPlayer\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x58\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "cpu-4a": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryCpu\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x4a\\b[\\s\\S]*?\\[MiiOrdinaryCpu\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x4a\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "cpu-hud-changed": {
+      "kind": "change",
+      "mark": "hud-before",
+      "roi": [
+        403,
+        554,
+        505,
+        655
+      ],
+      "min_diff": 8,
+      "stable": true,
+      "cap": 20,
+      "from_run": "lr-03"
+    },
+    "cpu-1": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryCpu\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x1\\b[\\s\\S]*?\\[MiiOrdinaryCpu\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x1\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "cpu-28": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[MiiOrdinaryCpu\\] (?:(?P<bank>bank switch)|submit) ticket=(?P<t>Ticket \\{[^}]+\\}) [^\\n]*?target=0x28\\b[\\s\\S]*?\\[MiiOrdinaryCpu\\] (?(bank)bank ready|ready) ticket=(?P=t) [^\\n]*target=0x28\\b[^\\n]*released=true",
+      "cap": 45,
+      "from_run": "lr-03"
+    },
+    "quit-focus": {
+      "kind": "image",
+      "reference": "refs/quit-focus.png",
+      "sha256": "8101e26010b70dc07f24bac30c077c2152059f87f27f4b6c0d30a0b197b69c67",
+      "roi": [
+        65,
+        16,
+        275,
+        47
+      ],
+      "tolerance": 8,
+      "cap": 15,
+      "reference_is_roi": true,
+      "from_run": "lr-03"
+    },
+    "finalize-p1": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[GroupSwap\\] teardown owner=0 [^\\n]*reason=finalize",
+      "cap": 30,
+      "from_run": "lr-03"
+    },
+    "finalize-cpu": {
+      "kind": "log",
+      "source": "diag",
+      "pattern": "\\[GroupSwap\\] teardown owner=1 [^\\n]*reason=finalize",
+      "cap": 30,
+      "from_run": "lr-03"
+    }
+  }
 }
