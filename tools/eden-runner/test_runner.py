@@ -135,6 +135,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(saved['sha256'], sha(self.dir / 'segments' / 'to-blue.edenmacro.json'))
         self.assertIn('macro.record', eden.calls)
         self.assertEqual(eden.calls.count('macro.play'), 2)
+        # Every receipt's manifest_sha256 names a retained copy, also the version from before the recording.
+        for row in ('r1', 'r2', 'r3'):
+            sha_ = json.loads((self.dir / 'out' / f'{row}.json').read_text())['manifest_sha256']
+            self.assertEqual(sha(self.dir / 'out' / 'manifests' / f'{sha_}.json'), sha_)
         # Single inputs happen only inside the recording window.
         inside, recording = 0, False
         for m in eden.calls:

@@ -809,6 +809,17 @@ class Runner:
         return report
 
     # --- rows ----------------------------------------------------------------------------------------------------
+    def snapshot_manifest(self):
+        """Keep the exact rows.json bytes a receipt names: recording rewrites rows.json in place (new sha256s), so
+        out/manifests/<sha256>.json holds every version a row started from (the lead's lr-04 gap)."""
+        data = self.manifest_path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        target = self.out / 'manifests' / f'{sha}.json'
+        if not target.exists():
+            target.parent.mkdir(exist_ok=True)
+            target.write_bytes(data)
+        return sha
+
     def log_offsets(self):
         """Size and inode of every file a log gate or a hook's wait_log may read (every instance file and every
         log gate source), so they see only lines written during the row, also across rotation or truncation."""
@@ -844,7 +855,7 @@ class Runner:
             self.row_offsets = self.log_offsets()
             self.marks, self.copies, self.acquired = {}, {}, []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
-                       'manifest_sha256': digest(self.manifest_path), 'started': time.time(), 'results': []}
+                       'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
             try:
                 for step in row['steps']:
                     on = step.get('on', self.default)
