@@ -382,6 +382,41 @@ class RunnerTests(unittest.TestCase):
         # A second harvest leaves existing entries alone.
         self.assertEqual(harvest.harvest(self.manifest, self.dir / 'out', 'test-02', library)['segments'], [])
 
+    def test_named_pipe_client_round_trip(self):
+        import io
+
+        class FakePipe(io.RawIOBase):
+            def __init__(self):
+                self.written = b''
+                self.reply = None
+
+            def readable(self):
+                return True
+
+            def writable(self):
+                return True
+
+            def write(self, b):
+                self.written += bytes(b)
+                request = json.loads(self.written.decode())
+                self.reply = io.BytesIO(json.dumps({'id': request['id'], 'ok': True,
+                                                    'result': {'echo': request['method']}}).encode() + b'\n')
+                return len(b)
+
+            def read(self, n=-1):
+                return self.reply.read(n)
+
+        opened = []
+
+        def opener(path, mode, buffering=0):
+            opened.append(path)
+            return FakePipe()
+
+        client = runner.PipeClient('\\\\.\\pipe\\eden-ally-control', opener=opener)
+        self.assertEqual(client.request('status')['result'], {'echo': 'status'})
+        self.assertEqual(opened, ['\\\\.\\pipe\\eden-ally-control'])
+        self.assertIsInstance(runner.default_client_factory()('\\\\.\\pipe\\x'), runner.PipeClient)
+
     def test_stop_file_and_pace_cap(self):
         (self.dir / 'out').mkdir()
         (self.dir / 'out' / 'STOP').write_text('primary')

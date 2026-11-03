@@ -240,6 +240,54 @@ class StopRun(Exception):
     pass
 
 
+class PipeClient:
+    """Eden control over a Windows named pipe (the Ally: \\\\.\\pipe\\<name>), same JSON-lines protocol as edenctl's
+    Unix-socket Client: one {"id", "method", "params"} line per connection, one reply line with the same id."""
+
+    def __init__(self, path, timeout=10.0, opener=open):
+        self.path, self.timeout, self.opener = path, timeout, opener
+
+    def request(self, method, params=None):
+        import uuid
+        request_id = uuid.uuid4().hex
+        payload = json.dumps({'id': request_id, 'method': method, 'params': params or {}},
+                             allow_nan=False, separators=(',', ':')).encode() + b'\n'
+        deadline = time.monotonic() + self.timeout
+        while True:  # the pipe server may be between connections: retry the open until the deadline
+            try:
+                pipe = self.opener(self.path, 'r+b', buffering=0)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(.05)
+        with pipe:
+            pipe.write(payload)
+            data = bytearray()
+            while b'\n' not in data:
+                if time.monotonic() > deadline:
+                    raise TimeoutError('control request deadline exceeded')
+                chunk = pipe.read(65536)
+                if not chunk:
+                    raise RuntimeError('Eden closed the pipe before replying')
+                data.extend(chunk)
+        response = json.loads(data.split(b'\n', 1)[0])
+        if not isinstance(response, dict) or response.get('id') != request_id:
+            raise RuntimeError('invalid response or mismatched request id')
+        return response
+
+
+def default_client_factory():
+    """Unix socket path -> edenctl Client; \\\\.\\pipe\\name -> PipeClient (Windows hosts such as the Ally)."""
+    def make(socket_path):
+        if str(socket_path).startswith('\\\\.\\pipe\\'):
+            return PipeClient(socket_path)
+        sys.path.insert(0, EDENCTL_DIR)
+        from edenctl import Client
+        return Client(socket_path, 10)
+    return make
+
+
 class Runner:
     def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None):
         self.manifest_path = manifest_path
@@ -251,9 +299,7 @@ class Runner:
         self.out.mkdir(parents=True, exist_ok=True)
         self.row_dir = self.out
         if client_factory is None:
-            sys.path.insert(0, EDENCTL_DIR)
-            from edenctl import Client
-            client_factory = lambda socket: Client(socket, 10)  # noqa: E731
+            client_factory = default_client_factory()
         self.clients = {key: client_factory(inst['socket']) for key, inst in instances.items()}
         pace = self.out / 'pace.json'
         if not pace.exists():
@@ -297,8 +343,12 @@ class Runner:
         return value
 
     def shot(self, on, name):
-        tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
-        target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
+        # "screenshot_target" in instances.json overrides the window lookup: the Ally needs "screen" (a per-window
+        # grab is black under Vulkan there). Image gates are per host resolution; log gates are portable.
+        target = self.instances[on].get('screenshot_target')
+        if not target:
+            tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
+            target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
         path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
         self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
         return path
