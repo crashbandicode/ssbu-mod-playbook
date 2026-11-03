@@ -1,7 +1,9 @@
 # Eden lifecycle draft — 2026-11-03
 
-**Offline-tested draft; no live launch, claim, profile mutation or SSH invocation
-was performed during development.** Companion to `../eden-runner/runner.py`;
+**Initial Linux draft was offline-tested. The current Ally follow-up is offline
+only by operator decision; no successful Ally Eden boot is claimed.** Earlier
+authorized pre-launch attempts and exact rollback receipts are in the Primary
+inbox. Companion to `../eden-runner/runner.py`;
 the lifecycle never sends input, plays macros or implements project rows.
 
 Playbook read: `c95d1f40255df6eca041eced2596d647c74dff5e` (README, all docs,
@@ -137,6 +139,93 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
 - State: lifecycle.json; actions.jsonl; dry-run.json; per-instance
   snapshot/restore/verify JSON; run-* full console/control logs; post-run-*
   profile evidence. The original snapshot never becomes the output directory.
+
+## Ally / Windows backend (2026-11-03)
+
+Use `lifecycle.py {up,down,status} config.json --ssh intpa@dreamland-ally`
+(`--execute` for up/down). The cmd-default SSH host receives the explicit MSI
+PowerShell7 executable with a UTF-16LE EncodedCommand, then Python312. The
+Linux controller services only token-bound read/claim/release requests against
+the configured authoritative ledger; no ledger copy or Windows SSH credential
+is needed. Keep that controller running until Up/Down returns. If transport is
+lost, use Down with the same config: its Windows journal and scheduled Job
+remain recoverable, with a separate hard lifetime bound.
+
+Windows config differences:
+
+- `host: "ally"`, exact kernel `hostname`, and `interactive_session: 1` (verify
+  the actual active session before each campaign).
+- Disjoint native `work_root` / `state_dir`, e.g. `C:\Eden\life-p6\work` and
+  `C:\Eden\life-p6\state`. Never use an installed or another worker's root.
+- `source` is the read-only **user data** directory (e.g. the installed
+  `%APPDATA%\eden`); `app` pins `eden.exe` in its separate runtime directory.
+  The backend wraps the source in a fresh portable `<profile>\user`, links
+  immutable game content/runtime dependencies, copies mutable data, and
+  snapshots the entire private profile before staging. The executable runs
+  from that copy, with isolated APPDATA/LOCALAPPDATA fallbacks. Down separately
+  verifies both restored private profile and unchanged source inventory.
+- `windows_job`, `windows_control`, `windows_python` are SHA256 pin objects
+  for the reviewed `winjob.py` API, asynchronous `Invoke-EdenControl.ps1`, and
+  console-less `pythonw.exe`. Known Ally paths are `C:\Eden\win\winjob.py`,
+  `C:\Eden\scripts\Invoke-EdenControl.ps1`, and
+  `C:\Program Files\Python312\pythonw.exe`; verify hashes, do not use old notes
+  as binary identity. Helpers are read/imported, never changed. HANDLE argument
+  prototypes are pinned at full pointer width when loading the older Job API.
+- No Linux display/helper. A uniquely named interactive-token scheduled task
+  owns the launcher; it survives SSH. Its disabled future trigger prevents an
+  automatic second start, its action has an exclusive launch-once marker, and
+  Task Scheduler adds an execution-time cap. The launcher joins a kill-on-close
+  Job **before** creating Eden (the child inherits membership): 8GiB total Job
+  **commit**, 256 processes, finite wall lifetime. Windows commit is not Linux
+  RSS and there is no claim of disabling Windows paging.
+- An enabled inbound Block rule for the private executable is required.
+  `allow_inbound_block: true` explicitly permits creating only that token-named
+  Block rule where operator policy authorizes it. The rule name/program/time
+  receipt is retained as `run-*/firewall.json`; existing Allow rules are never
+  modified. The Block remains associated with the retained private executable.
+  No firewall prompt is answered or dismissed. Hosting peers needs separate
+  authorization/policy because inbound Block prevents it.
+- `lifecycle_only: true` is the explicit Windows no-row proof mode. It records
+  `LIFECYCLE_ONLY` / **zero rows**, does not import or execute a runner, and
+  authorizes no input. Otherwise the ordinary pinned shared-runner dry run is
+  required. This field is not a bypass for product row acceptance.
+
+Instances use `socket: "\\\\.\\pipe\\eden-life-<token>-<key>"` (unique per run),
+plus `screenshot_target: "screen"`; paths are Windows-host paths. The shared
+runner must use its named-pipe implementation on Windows; this change never
+edits runner.py. A capped game.stop is still attempted first; the expected
+Windows power-off hang then takes the exact `Session\<id>\<owned-job>` fallback.
+No process-name kill is used. Recorded creation-time/image/session identities
+and Job membership protect against PID reuse. Only the token-derived task is
+ended/deleted, then all owned PIDs must be absent before restore/release.
+
+Offline suite at the follow-up checkpoint: **70 tests**, including twelve Windows
+fake/command/bridge tests and Primary's concurrent deferred-load regression.
+Native single-boot qualification is tracked separately in the Primary inbox;
+pair mode and transport-loss recovery remain unqualified. SSH always uses a
+non-login exec, no PTY and explicit `-NoProfile -NonInteractive` MSI PowerShell;
+`CreateProcessAsUserW failed: 1312` is retried once only before any ledger
+operation, never by replaying an admitted Up. That retry contract is fault-tested
+offline, not natively triggered. Tasks use the current user's SID rather than
+SSH's unreliable USERDOMAIN string. No alternate shell is substituted.
+
+### Later Ally qualification (not currently authorized)
+
+Obtain a new operator grant and the Ally's normal queue/ledger turn; it currently
+belongs to eden-tracing. Do not reuse the failed `life-p6`, `life-p6b` or
+`life-p6c` journals, change tracing-1103, or touch the installed profile in place.
+Use fresh work/state paths, current binary/helper pins and the actual interactive
+session/SID. Confirm no foreign native/WSL Eden/compiler, >=10GiB available and
+>=40GB free, and the private executable's inbound Block policy. Then perform one
+no-row up/game-loaded/down proof: record the named pipe, terminal load plus fresh
+frame status, 8GiB/256-process/kill-on-close Job limits, and capped game.stop →
+exact session Job fallback. A fresh Down process must leave no owned PID/task,
+preserve the post-run profile, restore and separately verify the full private
+snapshot and unchanged source inventory, and append only its own release.
+Retain console/control logs, Job/task/firewall receipts and authoritative ledger
+readback; compare the actually deployed source/binary hashes with the tested
+candidate. Pair mode, native 1312 handling and transport-loss recovery need their
+own later qualification; offline tests are not permission to run these now.
 
 ## Tests and open gaps
 

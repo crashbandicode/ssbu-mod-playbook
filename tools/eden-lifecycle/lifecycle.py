@@ -14,7 +14,10 @@ import argparse
 import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows uses an exclusive byte-range run lock; ledger lives on Linux.
+    fcntl = None
 import hashlib
 import importlib.util
 import json
@@ -30,6 +33,8 @@ import subprocess
 import sys
 import time
 import uuid
+import queue
+import threading
 
 sys.dont_write_bytecode = True
 GIB = 1024 ** 3
@@ -88,11 +93,17 @@ def private_config(profile, require_mute=True):
             if key in ('nand_directory', 'sdmc_directory') or section == '[Audio]' and key == 'volume':
                 require(key not in values, 'Duplicate private config key: ' + key)
                 values[key] = value.strip()
-    require(values.get('nand_directory') == str(Path(profile) / 'user/nand')
-            and values.get('sdmc_directory') == str(Path(profile) / 'user/sdmc'), 'Config escapes private NAND/SDMC')
+    require(Path(values.get('nand_directory', '.')) == Path(profile) / 'user/nand'
+            and Path(values.get('sdmc_directory', '.')) == Path(profile) / 'user/sdmc', 'Config escapes private NAND/SDMC')
     if require_mute:
         require(values.get('volume') in ('0', '0.0'), 'Persisted [Audio] volume not zero')
     return values
+
+
+def profile_directories(profile):
+    """Qt persists forward slashes on Windows too; do not compare native str()."""
+    return {'nand_directory': (profile / 'user/nand').as_posix(),
+            'sdmc_directory': (profile / 'user/sdmc').as_posix()}
 
 
 def stamp():
@@ -109,6 +120,8 @@ def save(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+    if os.name == 'nt':
+        return  # Windows has no directory fsync; file bytes were flushed before atomic replace.
     fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
@@ -121,7 +134,8 @@ def safe_absolute(value):
     require(path.is_absolute() and '..' not in path.parts, 'Absolute, non-traversing path required: ' + str(path))
     # Reject aliases before any recursive copy/removal, including dangling links.
     for part in (path, *path.parents):
-        require(not part.is_symlink(), 'Symlink ancestor refused: ' + str(part))
+        require(not part.is_symlink() and not getattr(part, 'is_junction', lambda: False)(),
+                'Symlink ancestor refused: ' + str(part))
     return path
 
 
@@ -129,6 +143,7 @@ def relative(value):
     path = Path(value)
     require(bool(value) and not path.is_absolute() and '..' not in path.parts and str(path) != '.',
             'Non-traversing relative path required: ' + str(path))
+    require(':' not in str(path) and not path.drive, 'Drive/alternate stream refused')
     return path
 
 
@@ -140,7 +155,8 @@ def inventory(root):
     for path in [root, *sorted(root.rglob('*'))]:
         info = path.lstat()
         name = str(path.relative_to(root))
-        require(not stat.S_ISLNK(info.st_mode), 'Profile symlinks need an explicit policy: ' + str(path))
+        require(not stat.S_ISLNK(info.st_mode) and not getattr(path, 'is_junction', lambda: False)(),
+                'Profile symlinks need an explicit policy: ' + str(path))
         if stat.S_ISDIR(info.st_mode):
             result[name] = {'type': 'directory', 'mode': stat.S_IMODE(info.st_mode)}
         else:
@@ -150,7 +166,7 @@ def inventory(root):
     return result
 
 
-def clone_profile(source, target):
+def clone_profile(source, target, read_only=READ_ONLY):
     """Link only immutable game content; private-copy EVERY other file."""
     source, target = safe_absolute(source), safe_absolute(target)
     require(source.is_dir() and source.name != 'a' and target.name != 'a', 'Profile a/missing source refused')
@@ -160,7 +176,7 @@ def clone_profile(source, target):
 
     def copy(src, dst):
         rel = Path(src).relative_to(source)
-        immutable = any(rel == Path(prefix) or Path(prefix) in rel.parents for prefix in READ_ONLY)
+        immutable = any(rel == Path(prefix) or Path(prefix) in rel.parents for prefix in read_only)
         return os.link(src, dst) if immutable else shutil.copy2(src, dst)
 
     shutil.copytree(source, target, copy_function=copy)
@@ -273,6 +289,8 @@ class Ledger:
         self.remote = remote
 
     def operate(self, operation, stale_claim_hours=None, admission=None):
+        if globals().get('_LEDGER_BRIDGE'):
+            return _LEDGER_BRIDGE(operation, self.token, stale_claim_hours, admission)
         if self.remote:
             return forward(self.remote, 'ledger-' + operation,
                            {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
@@ -320,7 +338,8 @@ class Ledger:
 
 
 def validate(config):
-    require(config.get('host') in ('surface', 'yoga'), 'host must be surface or yoga')
+    require(config.get('host') in ('surface', 'yoga', 'ally'), 'host must be surface, yoga or ally')
+    windows = config['host'] == 'ally'
     if 'stale_claim_hours' in config:
         validate_stale_claim_hours(config['stale_claim_hours'])
     require(isinstance(config.get('hostname'), str) and re.fullmatch(r'[A-Za-z0-9_.-]+', config['hostname']),
@@ -331,11 +350,15 @@ def validate(config):
     root, state_dir = safe_absolute(config['work_root']), safe_absolute(config['state_dir'])
     require(len(root.parts) >= 4 and len(state_dir.parts) >= 4 and root != state_dir, 'Dedicated work_root and state_dir required')
     require(root not in state_dir.parents and state_dir not in root.parents, 'State and profile roots must be disjoint')
-    safe_absolute(config['ledger'])
-    for pinned in (config['runner'], config['rows']):
+    if not (windows and config.get('ledger_ssh')):
+        safe_absolute(config['ledger'])
+    require(not config.get('lifecycle_only') or windows and config['lifecycle_only'] is True,
+            'lifecycle_only is the explicit Windows no-row proof mode')
+    for pinned in (() if config.get('lifecycle_only') else (config['runner'], config['rows'])):
         safe_absolute(pinned['path'])
         require(re.fullmatch(r'[0-9a-f]{64}', pinned.get('sha256', '')), 'Runner/rows SHA256 required')
     if config.get('display_helper'):
+        require(not windows, 'Windows has no Linux display helper')
         safe_absolute(config['display_helper']['path'])
         require(re.fullmatch(r'[0-9a-f]{64}', config['display_helper'].get('sha256', '')), 'Display helper SHA256 required')
     require(1 <= len(config['instances']) <= 2, 'One or an explicitly authorized pair only')
@@ -345,9 +368,10 @@ def validate(config):
         require(re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,20}', item['key']) and item['key'] != 'a-profile', 'Invalid instance key')
         require(item['key'] not in keys, 'Duplicate instance key')
         keys.add(item['key'])
-        require(re.fullmatch(r':\d{1,3}', item['display']) and item['display'] != ':61', 'Forbidden display')
-        require(item['display'] not in displays, 'Duplicate display')
-        displays.add(item['display'])
+        if not windows:
+            require(re.fullmatch(r':\d{1,3}', item['display']) and item['display'] != ':61', 'Forbidden display')
+            require(item['display'] not in displays, 'Duplicate display')
+            displays.add(item['display'])
         source = safe_absolute(item['source'])
         require(source.name != 'a' and root != source and root not in source.parents and source not in root.parents,
                 'Source profile is protected/overlaps work root')
@@ -370,7 +394,33 @@ def validate(config):
         value = config.get(key, default)
         require(isinstance(value, (int, float)) and math.isfinite(value) and 0 < value <= (10800 if key == 'runtime' else 300),
                 'Invalid bounded ' + key)
+    if windows:
+        require(type(config.get('interactive_session')) is int and config['interactive_session'] > 0,
+                'Windows interactive_session required')
+        for pin in (config['windows_job'], config['windows_control'], config['windows_python']):
+            safe_absolute(pin['path'])
+            require(re.fullmatch(r'[0-9a-f]{64}', pin.get('sha256', '')), 'Windows helper pins required')
     return config
+
+
+@contextmanager
+def run_lock(stream):
+    if fcntl is not None:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    else:
+        import msvcrt
+        stream.seek(0)
+        if not stream.read(1):
+            stream.write('0')
+            stream.flush()
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 class Host:
@@ -522,10 +572,302 @@ class Host:
         raise Refused('Owned Eden processes remain; do not restore/release')
 
 
+class WindowsHost(Host):
+    """Native Ally executor: interactive task + session-scoped, kill-on-close Job.
+
+    Reuses the pinned, reviewed winjob API, not its installed-profile controllers.
+    All RPCs use the pinned asynchronous PowerShell named-pipe client.
+    """
+    def __init__(self, config, job_api=None):
+        self.config, self._job, self.peaks = config, job_api, {}
+
+    def ps(self, script, cap=30):
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode()
+        return self.run([r'C:\Program Files\PowerShell\7\pwsh.exe', '-NoLogo', '-NoProfile',
+                         '-NonInteractive', '-EncodedCommand', encoded], cap)
+
+    @staticmethod
+    def quote(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @property
+    def job(self):
+        if self._job is None:
+            pin = self.config['windows_job']
+            require(digest(pin['path']) == pin['sha256'], 'Windows Job helper changed')
+            spec = importlib.util.spec_from_file_location('_eden_lifecycle_winjob', pin['path'])
+            api = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(api)
+            # The old helper omitted HANDLE prototypes. Pin full-width handles on x64.
+            import ctypes
+            from ctypes import wintypes as w
+            original = api._k32
+            def typed():
+                k = original()
+                definitions = {
+                    'CreateJobObjectW': (w.HANDLE, [ctypes.c_void_p, w.LPCWSTR]),
+                    'OpenJobObjectW': (w.HANDLE, [w.DWORD, w.BOOL, w.LPCWSTR]),
+                    'OpenProcess': (w.HANDLE, [w.DWORD, w.BOOL, w.DWORD]),
+                    'CloseHandle': (w.BOOL, [w.HANDLE]),
+                    'SetInformationJobObject': (w.BOOL, [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]),
+                    'QueryInformationJobObject': (w.BOOL, [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.c_void_p]),
+                    'AssignProcessToJobObject': (w.BOOL, [w.HANDLE, w.HANDLE]),
+                    'TerminateJobObject': (w.BOOL, [w.HANDLE, w.UINT]),
+                    'GetExitCodeProcess': (w.BOOL, [w.HANDLE, ctypes.c_void_p]),
+                }
+                for name, (result, args) in definitions.items():
+                    fn = getattr(k, name)
+                    fn.restype, fn.argtypes = result, args
+                return k
+            api._k32 = typed
+            original_limits = api.limits
+            def limits(handle):
+                import ctypes
+                record = original_limits(handle)
+                info = api.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                returned = ctypes.c_ulong()
+                api._check(api._k32().QueryInformationJobObject(handle, 9, ctypes.byref(info),
+                           ctypes.sizeof(info), ctypes.byref(returned)), 'Query Job process cap')
+                record['ActiveProcessLimit'] = int(info.BasicLimitInformation.ActiveProcessLimit)
+                return record
+            api.limits = limits
+            self._job = api
+        return self._job
+
+    def identity(self, pid):
+        import ctypes
+        from ctypes import wintypes as w
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.OpenProcess.argtypes, k.OpenProcess.restype = [w.DWORD, w.BOOL, w.DWORD], w.HANDLE
+        k.GetProcessTimes.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        k.GetExitCodeProcess.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD)]
+        k.QueryFullProcessImageNameW.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
+        k.CloseHandle.argtypes = [w.HANDLE]
+        handle = k.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            require(ctypes.get_last_error() in (87, 1168), 'Cannot inspect owned Windows PID')
+            return None
+        try:
+            code = w.DWORD()
+            require(k.GetExitCodeProcess(handle, ctypes.byref(code)), 'Cannot inspect Windows exit state')
+            if code.value != 259:
+                return None
+            times = [ctypes.c_ulonglong() for _ in range(4)]
+            require(k.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)), 'Cannot inspect PID creation time')
+            path, size = ctypes.create_unicode_buffer(32768), w.DWORD(32768)
+            require(k.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)), 'Cannot inspect PID image')
+            return {'pid': int(pid), 'start': str(times[0].value), 'image': path.value,
+                    'session': self.job.session_of(pid)}
+        finally:
+            k.CloseHandle(handle)
+
+    def open_job(self, unit, access=4):
+        require(re.fullmatch(r'eden-life-[0-9a-f]{32}-[A-Za-z][A-Za-z0-9_-]{0,20}\.service', unit),
+                'Foreign Windows Job name refused')
+        return self.job.open_job(f'Session\\{self.config["interactive_session"]}\\{unit}', access)
+
+    def owned(self, item):
+        handle = self.open_job(item['unit'])
+        if handle is None:
+            return []
+        try:
+            return [identity for pid in self.job.pids(handle) if (identity := self.identity(pid)) is not None]
+        finally:
+            self.job.close(handle)
+
+    def resources(self, disk_path, owned_units=()):
+        owned = {p['pid'] for unit in owned_units for p in self.owned({'unit': unit})}
+        raw = self.ps("$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | "
+                      "Select-Object ProcessId,Name) | ConvertTo-Json -Compress", cap=20)
+        processes = json.loads(raw)
+        if isinstance(processes, dict):
+            processes = [processes]
+        names = {'eden.exe', 'eden-cli.exe', 'cargo.exe', 'rustc.exe', 'cl.exe', 'link.exe',
+                 'ninja.exe', 'cmake.exe', 'msbuild.exe', 'clang.exe', 'clang++.exe',
+                 'gcc.exe', 'g++.exe', 'wsl.exe', 'wslhost.exe', 'vmmemwsl'}
+        conflicts = [{'pid': p['ProcessId'], 'name': p['Name']} for p in processes
+                     if p['Name'].lower() in names and p['ProcessId'] not in owned]
+        return {'mem_available': self.job.system_memory()['available_bytes'],
+                'disk_free': shutil.disk_usage(disk_path).free, 'foreign_processes': conflicts}
+
+    def start_display(self, item, config):
+        return {}  # Task principal explicitly binds the interactive desktop; no display adoption.
+
+    def clone_source(self, original, profile):
+        source = safe_absolute(original['source'])
+        profile.mkdir()
+        clone_profile(source, profile / 'user', tuple(p.removeprefix('user/') for p in READ_ONLY))
+        app = safe_absolute(original['app']['path']).parent
+        inventory(app)  # Reject reparse points/special files before linking read-only runtime files.
+        shutil.copytree(app, profile, dirs_exist_ok=True, copy_function=os.link,
+                        ignore=lambda directory, names: ['user'] if Path(directory) == app and 'user' in names else [])
+        require(digest(profile / 'eden.exe') == original['app']['sha256'], 'Private Eden binary differs')
+        save(profile.parent.parent / ('source-' + original['key'] + '.json'), inventory(source))
+
+    def metrics(self, item):
+        handle = self.open_job(item['unit'])
+        try:
+            limits = self.job.limits(handle) if handle else {}
+            peak = limits.get('PeakJobMemoryUsed', self.peaks.get(item['unit']))
+            self.peaks[item['unit']] = peak
+            return {'memory_peak': peak, 'memory_limit_kind': 'job_commit', 'limits': limits}
+        finally:
+            if handle:
+                self.job.close(handle)
+
+    def task_name(self, item):
+        self.open_job_name_check(item['unit'])
+        return 'EdenLife-' + item['unit'].removeprefix('eden-life-').removesuffix('.service')
+
+    @staticmethod
+    def open_job_name_check(unit):
+        require(re.fullmatch(r'eden-life-[0-9a-f]{32}-[A-Za-z][A-Za-z0-9_-]{0,20}\.service', unit),
+                'Foreign Windows task refused')
+
+    def launch(self, item, config):
+        run = Path(item['run'])
+        run.mkdir(parents=True, exist_ok=True)
+        for pin in (config['windows_control'], config['windows_python']):
+            require(digest(pin['path']) == pin['sha256'], 'Windows helper changed')
+        exe = Path(item['profile']) / 'eden.exe'
+        # No prompt interaction. Only an explicitly authorized inbound Block may be added.
+        rule = self.task_name(item)
+        script = ("$ErrorActionPreference='Stop'; $exe=" + self.quote(exe) + '; '
+                  "$rules=@(Get-NetFirewallApplicationFilter | Where-Object {$_.Program -ieq $exe} | "
+                  "Get-NetFirewallRule | Where-Object {$_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block'}); "
+                  "$created=$false; "
+                  "if($rules.Count -eq 0){" +
+                  ("New-NetFirewallRule -Name " + self.quote(rule) + ' -DisplayName ' + self.quote(rule) +
+                   " -Direction Inbound -Action Block -Program $exe | Out-Null; $created=$true; "
+                   "$rules=@(Get-NetFirewallRule -Name " + self.quote(rule) + '); '
+                   if config.get('allow_inbound_block') is True else "throw 'Explicit inbound Block policy required'; ") +
+                  "}; @{program=$exe;rules=@($rules.Name);created=$created;utc=[DateTimeOffset]::UtcNow.ToString('o')}|ConvertTo-Json -Compress")
+        save(run / 'firewall.json', json.loads(self.ps(script)))
+        backend = run / 'lifecycle-backend.py'
+        backend.write_text(globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(), encoding='utf-8')
+        save(run / 'launch.json', {'config': config, 'item': item})
+        from xml.sax.saxutils import escape
+        sid = self.ps('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value').strip()
+        require(re.fullmatch(r'S-\d-(?:\d+-)*\d+', sid), 'Cannot bind task to current Windows user SID')
+        action = subprocess.list2cmdline([str(backend), '_windows-launch', str(run / 'launch.json')])
+        xml = ('<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+               '<Triggers><TimeTrigger><StartBoundary>2099-01-01T00:00:00</StartBoundary><Enabled>false</Enabled></TimeTrigger></Triggers>'
+               '<Principals><Principal id="Author"><UserId>' + escape(sid) +
+               '</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>'
+               '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+               '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT' + str(int(config.get('runtime', 5400)) + 30) +
+               'S</ExecutionTimeLimit></Settings><Actions Context="Author"><Exec><Command>' + escape(config['windows_python']['path']) +
+               '</Command><Arguments>' + escape(action) + '</Arguments><WorkingDirectory>' + escape(str(run)) + '</WorkingDirectory></Exec></Actions></Task>')
+        task_xml = run / 'task.xml'
+        task_xml.write_text(xml, encoding='utf-16')
+        task = self.task_name(item)
+        self.run(['schtasks.exe', '/create', '/f', '/tn', task, '/xml', task_xml])
+        self.run(['schtasks.exe', '/run', '/tn', task])
+        end = self.clock() + config.get('socket_cap', 90)
+        while self.clock() < end:
+            if (run / 'launcher.json').is_file():
+                launch = json.loads((run / 'launcher.json').read_text())
+                require(not launch.get('error'), 'Windows launcher failed: ' + str(launch))
+                if launch.get('owned_pids'):
+                    require(launch['session'] == config['interactive_session'], 'Wrong interactive session')
+                    limits = launch['limits']
+                    require(limits['JobMemoryLimit'] == 8 * GIB and limits['KillOnJobClose']
+                            and limits['ActiveProcessLimit'] == 256, 'Job limits differ')
+                    return launch['owned_pids']
+            self.sleep(.2)
+        raise Refused('Windows task did not publish a bounded launcher receipt')
+
+    def socket_ready(self, item):
+        try:
+            return self.call(item, 'status', {}, 2).get('ok') is True
+        except (Refused, subprocess.TimeoutExpired):
+            return False
+
+    def call(self, item, method, params, timeout):
+        require(method in RPC_METHODS, 'Lifecycle cannot send input/navigation/trace calls')
+        pin = self.config['windows_control']
+        require(digest(pin['path']) == pin['sha256'], 'Windows control client changed')
+        script = ('$ErrorActionPreference=\'Stop\'; & ' + self.quote(pin['path']) +
+                  ' -PipeName ' + self.quote(item['socket'].removeprefix('\\\\.\\pipe\\')) +
+                  ' -Method ' + self.quote(method) + ' -ParamsJson ' + self.quote(json.dumps(params)) +
+                  ' -TimeoutMs ' + str(max(1, int(timeout * 1000))))
+        return json.loads(self.ps(script, cap=timeout + 8))
+
+    def force_stop(self, item, cap):
+        before = [*item.get('owned_pids', []), *self.owned(item)]
+        handle = self.open_job(item['unit'], 4 | 8)
+        try:
+            if handle:
+                self.job.terminate(handle, 137)  # Exact named Job only, including its owning launcher.
+            task = self.task_name(item)
+            # End/delete only our token-derived task; prevents late-start races after a partial launch.
+            subprocess.run(['schtasks.exe', '/end', '/tn', task], capture_output=True, timeout=10)
+            subprocess.run(['schtasks.exe', '/delete', '/f', '/tn', task], capture_output=True, timeout=10)
+            end = self.clock() + cap
+            while self.clock() < end:
+                if not self.owned(item) and all(self.identity(p['pid']) != p for p in before):
+                    return {'owned_pids_stopped': before, 'job_terminated': bool(handle), 'task': task}
+                self.sleep(.2)
+            raise Refused('Owned Windows Job/PIDs remain; no restore/release')
+        finally:
+            if handle:
+                self.job.close(handle)
+
+
+def windows_launch(packet_path):
+    """Task-only entry: join the Job BEFORE creating Eden, so children inherit it."""
+    packet = json.loads(Path(packet_path).read_text())
+    config, item = validate(packet['config']), packet['item']
+    host = WindowsHost(config)
+    require(os.name == 'nt' and host.name().casefold() == config['hostname'].casefold(), 'Wrong Windows launch host')
+    host.open_job_name_check(item['unit'])
+    run, profile = safe_absolute(item['run']), safe_absolute(item['profile'])
+    require(run.parent == Path(config['state_dir']) and profile.parent == Path(config['work_root']) / 'profiles',
+            'Foreign task profile/run')
+    with (run / 'launch-once').open('x'):
+        pass
+    job = host.job.create(item['unit'], 8 * GIB)
+    try:
+        import ctypes
+        info = host.job.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x200 | 0x2000 | 0x400 | 0x8
+        info.BasicLimitInformation.ActiveProcessLimit = 256
+        info.JobMemoryLimit = 8 * GIB
+        host.job._check(host.job._k32().SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)),
+                        'Set Job memory/process caps')
+        host.job.assign(job, os.getpid())  # Descendants cannot run outside this Job, even before their first instruction.
+        session = host.job.session_of(os.getpid())
+        require(session == config['interactive_session'], 'Task not in the authorized interactive session')
+        limits = host.job.limits(job)
+        require(limits['JobMemoryLimit'] == 8 * GIB and limits['KillOnJobClose']
+                and limits['ActiveProcessLimit'] == 256, 'Unbounded Windows Job')
+        exe = profile / 'eden.exe'
+        require(digest(exe) == item['app']['sha256'], 'Windows executable changed')
+        private_config(profile)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('EDEN_', 'YUZU_'))}
+        env.update(APPDATA=str(profile / 'isolated-appdata'), LOCALAPPDATA=str(profile / 'isolated-localappdata'))
+        env['EDEN_LOG_FILTER'] = config.get('log_filter', '*:Warning Frontend:Info Debug.Emulated:Info Service.FS:Info')
+        with Path(item['console_log']).open('ab', buffering=0) as console:
+            child = subprocess.Popen([str(exe), '--control-socket', item['socket'], '--control-log',
+                str(run / 'control.jsonl'), '--control-verbose', '--control-background'], cwd=profile,
+                env=env, stdin=subprocess.DEVNULL, stdout=console, stderr=subprocess.STDOUT)
+            save(run / 'launcher.json', {'session': session, 'limits': limits,
+                 'owned_pids': host.owned(item), 'started': stamp(), 'runtime': config.get('runtime', 5400)})
+            try:
+                child.wait(timeout=config.get('runtime', 5400))
+            except subprocess.TimeoutExpired:
+                save(run / 'runtime-expired.json', {'utc': stamp(), 'limits': host.job.limits(job)})
+    except BaseException as error:
+        save(run / 'launcher.json', {'error': repr(error), 'utc': stamp()})
+        raise
+    finally:
+        host.job.close(job)  # KILL_ON_JOB_CLOSE includes this launcher and every descendant.
+
+
 class Lifecycle:
     def __init__(self, config, host=None, ledger=None, plan_check=None):
         self.c = validate(config)
-        self.host = host if host is not None else Host()
+        self.host = host if host is not None else WindowsHost(config) if config['host'] == 'ally' else Host()
         self.directory = Path(config['state_dir'])
         self.journal = self.directory / 'lifecycle.json'
         self.injected_ledger = ledger
@@ -533,6 +875,8 @@ class Lifecycle:
         self.state = None
 
     def check_rows(self):
+        if self.c.get('lifecycle_only'):
+            return {'result': 'LIFECYCLE_ONLY', 'rows': 0, 'errors': [], 'scope': 'no runner/input authorized'}
         runner = self.c['runner']
         require(digest(runner['path']) == runner['sha256'], 'Shared runner changed')
         require(digest(self.c['rows']['path']) == self.c['rows']['sha256'], 'Row list changed')
@@ -568,7 +912,8 @@ class Lifecycle:
             require(item['profile'] == str(Path(self.c['work_root']) / 'profiles' / ('profile-' + key))
                     and item['snapshot'] == str(self.directory / ('snapshot-' + key))
                     and item['run'] == str(self.directory / ('run-' + key))
-                    and item['socket'] == str(self.directory / ('run-' + key) / 'control.sock'),
+                    and item['socket'] == (f'\\\\.\\pipe\\eden-life-{token}-{key}' if self.c['host'] == 'ally'
+                                           else str(self.directory / ('run-' + key) / 'control.sock')),
                     'Foreign journal profile/run path refused')
 
     def ledger(self):
@@ -579,9 +924,9 @@ class Lifecycle:
     def lock(self):
         self.directory.mkdir(parents=True, exist_ok=True)
         require(not self.directory.is_symlink(), 'State directory alias refused')
-        with (self.directory / '.lock').open('a') as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            yield
+        with (self.directory / '.lock').open('a+') as stream:
+            with run_lock(stream):
+                yield
 
     def admission(self, owned=()):
         path = Path(self.c['work_root'])
@@ -640,23 +985,27 @@ class Lifecycle:
         self.write()
         config = profile / CONFIG
         text = config.read_text()
-        text = text.replace(item['source'], str(profile))
+        replacement = profile / 'user' if self.c['host'] == 'ally' else profile
+        text = text.replace(item['source'], str(replacement))
+        if self.c['host'] == 'ally':
+            text = text.replace(Path(item['source']).as_posix(), replacement.as_posix())
         section = None
         output = []
         volume = 0
+        directories = profile_directories(profile)
         for line in text.splitlines():
             if line.startswith('['):
                 section = line.strip()
             key = line.split('=', 1)[0].strip()
             if key in ('nand_directory', 'sdmc_directory'):
-                line = key + '=' + str(profile / ('user/nand' if key == 'nand_directory' else 'user/sdmc'))
+                line = key + '=' + directories[key]
             if section == '[Audio]' and key == 'volume':
                 line, volume = 'volume=0', volume + 1
             if section == '[Audio]' and key == 'volume\\default':
                 line = 'volume\\default=false'
             output.append(line)
         require(volume == 1, 'Expected exactly one persisted [Audio] volume')
-        require(str(profile / 'user/nand') in '\n'.join(output) and str(profile / 'user/sdmc') in '\n'.join(output),
+        require(all(value in '\n'.join(output) for value in directories.values()),
                 'Private NAND/SDMC config paths missing')
         config.write_text('\n'.join(output) + '\n')
         plugins = profile / PLUGINS
@@ -683,16 +1032,23 @@ class Lifecycle:
         self.record('prepared', {'key': item['key'], 'snapshot_entries': len(expected), 'persisted_volume': 0})
 
     def up(self):
-        require(self.host.name() == self.c['hostname'], 'Wrong executor hostname; no claim/profile action')
+        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname; no claim/profile action')
         with self.lock():
             require(not self.journal.exists(), 'Run already journalled; use down/status, never blind up retry')
             root = Path(self.c['work_root'])
             require(not root.exists(), 'Fresh isolated work_root required')
             report = self.plan_check()
-            require(not report.get('errors') and report.get('rows', 0) > 0
-                    and report.get('result') in ('READY', 'READY_TO_RECORD'), 'Shared runner dry-run failed')
+            if self.c.get('lifecycle_only'):
+                require(report.get('result') == 'LIFECYCLE_ONLY' and report.get('rows') == 0,
+                        'Explicit lifecycle-only proof required')
+            else:
+                require(not report.get('errors') and report.get('rows', 0) > 0
+                        and report.get('result') in ('READY', 'READY_TO_RECORD'), 'Shared runner dry-run failed')
             save(self.directory / 'dry-run.json', report)
             # Validate pinned inputs before claim/staging. Never choose a newest binary.
+            if self.c['host'] == 'ally':
+                for pin in (self.c['windows_job'], self.c['windows_control'], self.c['windows_python']):
+                    require(digest(pin['path']) == pin['sha256'], 'Windows helper mismatch before claim')
             for item in self.c['instances']:
                 require(Path(item['source']).is_dir() and Path(item['game']).is_file(), 'Source/game missing')
                 for pin in [item['app'], *item['plugins'], *item.get('files', [])]:
@@ -721,10 +1077,16 @@ class Lifecycle:
                             'unit': f'eden-life-{token}-{key}.service', 'snapshot_ready': False, 'launch_intent': False,
                             'display_units': [f'eden-life-{token}-{key}-display.service', f'eden-life-{token}-{key}-display-x.service'],
                             'display_intent': False}
-                    require(len(os.fsencode(item['socket'])) < 108, 'Control socket path too long; choose shorter state_dir')
+                    if self.c['host'] == 'ally':
+                        item['socket'] = f'\\\\.\\pipe\\eden-life-{token}-{key}'
+                    else:
+                        require(len(os.fsencode(item['socket'])) < 108, 'Control socket path too long; choose shorter state_dir')
                     self.state['instances'].append(item)
                     self.write()
-                    clone_profile(original['source'], profile)
+                    if self.c['host'] == 'ally':
+                        self.host.clone_source(original, profile)
+                    else:
+                        clone_profile(original['source'], profile)
                     self.prepare(item)
                     self.admission([x['unit'] for x in self.state['instances'] if x['launch_intent']])
                     item['display_intent'] = bool(self.c.get('display_helper'))
@@ -746,10 +1108,19 @@ class Lifecycle:
                     require(mute_is_zero(muted), 'CLI mute readback failed')
                     # The CLI save must really persist mute, before any game.load.
                     private_config(profile)
-                    self.rpc(item, 'game.load', {'path': item['game']}, self.c.get('load_cap', 180))
-                    self.poll(lambda: self.ready(item), self.c.get('load_cap', 180), 'game loading complete')
                     run_state = json.loads((Path(item['run']) / 'run.json').read_text())
-                    run_state.update(state='running', game_loaded=stamp())
+                    if self.c.get('defer_load'):
+                        # Online pairs: Eden refuses to create or join a multiplayer room while a game runs
+                        # ("Game already running", pkg4 2026-11-03). The rows set up the room through the frontend,
+                        # then load the game with a runner {"call": "game.load"} step.
+                        run_state.update(state='frontend-ready', game_load='deferred to the rows')
+                    else:
+                        self.rpc(item, 'game.load', {'path': item['game']}, self.c.get('load_cap', 180))
+                        self.poll(lambda: self.ready(item), self.c.get('load_cap', 180), 'game loading complete')
+                        run_state.update(state='running', game_loaded=stamp())
+                    if self.c['host'] == 'ally':
+                        run_state['loaded_status'] = self.rpc(item, 'status')
+                        run_state['screenshot_target'] = 'screen'
                     save(Path(item['run']) / 'run.json', run_state)
                 instances = {}
                 for item in self.state['instances']:
@@ -758,6 +1129,8 @@ class Lifecycle:
                                'detector_log': 'user/sdmc/ultimate/ssbu-desync-detector/events.log', **item.get('sources', {})}
                     instances[item['key']] = {'socket': item['socket'], 'console_log': item['console_log'],
                         'profile': item['profile'], 'control_log': str(Path(item['run']) / 'control.jsonl'),
+                        'game': item['game'],
+                        **({'screenshot_target': 'screen'} if self.c['host'] == 'ally' else {}),
                         **{name: str(Path(item['profile']) / rel) for name, rel in sources.items()}}
                 save(self.directory / 'instances.json', instances)
                 self.state['phase'] = 'up'
@@ -796,6 +1169,10 @@ class Lifecycle:
         expected = json.loads((self.directory / (item['key'] + '-snapshot.json')).read_text())
         require(inventory(item['snapshot']) == expected and inventory(item['profile']) == expected,
                 'Separate full-profile verification failed; retain claim')
+        if self.c['host'] == 'ally':
+            original = json.loads((Path(self.c['work_root']) / ('source-' + item['key'] + '.json')).read_text())
+            require(inventory(item['source']) == original, 'Installed source profile changed; retain claim')
+            save(self.directory / (item['key'] + '-source-verify.json'), {'unchanged': True, 'entries': len(original)})
         save(self.directory / (item['key'] + '-verify.json'), {'equal': True, 'snapshot_equal': True, 'entries': len(expected)})
 
     def _down(self):
@@ -880,7 +1257,7 @@ class Lifecycle:
         return {'phase': 'down', 'released': self.state['released'], 'game_stop_errors': stop_errors}
 
     def down(self):
-        require(self.host.name() == self.c['hostname'], 'Wrong executor hostname; no cleanup action')
+        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname; no cleanup action')
         with self.lock():
             require(self.journal.is_file(), 'No owned lifecycle journal')
             self.state = json.loads(self.journal.read_text())
@@ -890,7 +1267,7 @@ class Lifecycle:
             return self._down()
 
     def status(self):
-        require(self.host.name() == self.c['hostname'], 'Wrong executor hostname')
+        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname')
         if not self.journal.is_file():
             return {'phase': 'absent'}
         value = json.loads(self.journal.read_text())
@@ -904,6 +1281,8 @@ class Lifecycle:
 def forward(host, mode, config, execute, run=subprocess.run):
     """One bounded SSH request; remote account login shell must be pwsh."""
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
+    if config.get('host') == 'ally' and not mode.startswith('ledger-'):
+        return forward_windows(host, mode, config, execute)
     bootstrap = 'import json,sys; p=json.load(sys.stdin); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
     script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 900 "
               "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
@@ -928,10 +1307,128 @@ def dispatch(mode, config, execute=False):
 def remote_main(packet):
     # Allows a Surface executor to reach the authoritative Yoga ledger too.
     globals()['_FORWARDED_SOURCE'] = packet['source']
-    print(json.dumps(dispatch(packet['mode'], packet['config'], packet['execute'])))
+    if packet.get('ledger_bridge'):
+        def bridge(operation, token, stale_claim_hours, admission):
+            print(json.dumps({'ledger_request': {'operation': operation, 'token': token,
+                              'stale_claim_hours': stale_claim_hours, 'admission': admission}}), flush=True)
+            reply = json.loads(sys.stdin.readline())
+            require('error' not in reply, reply.get('error'))
+            return reply['result']
+        globals()['_LEDGER_BRIDGE'] = bridge
+        try:
+            value = dispatch(packet['mode'], packet['config'], packet['execute'])
+            print(json.dumps({'lifecycle_result': value}), flush=True)
+        except BaseException as error:
+            print(json.dumps({'lifecycle_error': str(error)}), flush=True)
+    else:
+        print(json.dumps(dispatch(packet['mode'], packet['config'], packet['execute'])))
+
+
+def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger):
+    # SSH exec is always non-login/noninteractive (-T, explicit MSI pwsh -NoProfile).
+    # 1312 is a pre-launch Windows logon failure: retry ONCE, never replay a claim/Up.
+    for attempt in range(2):
+        try:
+            return _forward_windows_once(host, mode, config, execute, popen, ledger_factory)
+        except Refused as error:
+            if not (attempt == 0 and getattr(error, 'transport_not_started', False)
+                    and 'CreateProcessAsUserW failed: 1312' in str(error)):
+                raise
+
+
+def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger):
+    """Windows cmd-default SSH transport, with Linux-authoritative ledger RPC.
+
+    No Windows SSH keys or copied ledger. Both sides retain the same durable token.
+    The controller only honors its configured owner/host/path and bounded operations.
+    """
+    require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
+    require(mode == 'status' or execute, 'Windows up/down require --execute')
+    bootstrap = 'import json,sys; p=json.loads(sys.stdin.readline()); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
+    script = ('& "C:\\Program Files\\Python312\\python.exe" -I -B -X utf8 -c ' +
+              "'" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
+    encoded = base64.b64encode(script.encode('utf-16-le')).decode()
+    command = ['ssh', '-T', '-x', '-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes',
+               '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', host,
+               '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand ' + encoded]
+    source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
+    process = popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding='utf-8')
+    messages, errors = queue.Queue(), []
+    def drain():
+        try:
+            for line in process.stdout:
+                messages.put(line)
+        finally:
+            messages.put(None)
+    def stderr():
+        for line in process.stderr:
+            errors.append(line)
+            if len(errors) > 100:
+                del errors[0]
+    threading.Thread(target=drain, daemon=True).start()
+    error_thread = threading.Thread(target=stderr, daemon=True)
+    error_thread.start()
+    end = time.monotonic() + 900
+    token_seen = None
+    try:
+        process.stdin.write(json.dumps({'mode': mode, 'config': config, 'execute': execute,
+                                       'source': source, 'ledger_bridge': True}) + '\n')
+        process.stdin.flush()
+        while True:
+            remaining = end - time.monotonic()
+            require(remaining > 0, 'Windows SSH lifecycle deadline; use down with the same journal')
+            try:
+                line = messages.get(timeout=remaining)
+            except queue.Empty:
+                raise Refused('Windows SSH lifecycle deadline; use down with the same journal')
+            if line is None:
+                process.wait(timeout=3)
+                error_thread.join(timeout=2)
+                error = Refused('Windows SSH disconnected: ' + ''.join(errors)[-2000:])
+                error.transport_not_started = token_seen is None
+                raise error
+            message = json.loads(line)
+            if 'ledger_request' in message:
+                request = message['ledger_request']
+                token = request['token']
+                require(re.fullmatch(r'[0-9a-f]{32}', token) and token_seen in (None, token), 'Foreign bridge token')
+                token_seen = token
+                require(request['operation'] in ('read', 'claim', 'release'), 'Unknown bridge operation')
+                require(mode != 'status' or request['operation'] == 'read', 'Status cannot mutate a ledger')
+                ledger = ledger_factory(config['ledger'], 'ally', config['owner'], token, config.get('ledger_ssh'))
+                try:
+                    result = ledger.operate(request['operation'], request.get('stale_claim_hours'), request.get('admission'))
+                    reply = {'result': result}
+                except Exception as error:
+                    reply = {'error': str(error)}
+                process.stdin.write(json.dumps(reply) + '\n')
+                process.stdin.flush()
+            elif 'lifecycle_result' in message:
+                require(process.wait(timeout=15) == 0, 'Windows SSH failed after reply')
+                return message['lifecycle_result']
+            else:
+                raise Refused(message.get('lifecycle_error', 'Unknown Windows protocol response'))
+    except BrokenPipeError as cause:
+        error_thread.join(timeout=2)
+        error = Refused('Windows SSH disconnected: ' + ''.join(errors)[-2000:] + str(cause))
+        error.transport_not_started = token_seen is None
+        raise error from cause
+    finally:
+        if process.poll() is None:
+            process.kill()  # Only this SSH transport; the task Job survives for explicit down/hard cap.
+            process.wait(timeout=10)
+        try:
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass  # Do not mask the classified pre-launch failure (or a completed reply).
 
 
 def main(argv=None):
+    actual = list(sys.argv[1:] if argv is None else argv)
+    if actual and actual[0] == '_windows-launch':
+        windows_launch(actual[1])
+        return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('mode', choices=('up', 'down', 'status'))
     parser.add_argument('config', type=Path)

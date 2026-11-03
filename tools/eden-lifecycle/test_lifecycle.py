@@ -7,7 +7,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import tempfile
 import unittest
@@ -204,6 +204,17 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(life.private_config(instances['a']['profile'])['volume'], '0')
         self.assertFalse(self.ledger.released)
         self.assertEqual(life.inventory(self.source), self.before_source)
+
+    def test_defer_load_leaves_the_frontend_ready_for_room_setup(self):
+        # Online pairs: Eden refuses to create a room while a game runs, so the rows load the game themselves.
+        self.config['defer_load'] = True
+        value = self.controller().up()
+        self.assertEqual(value['phase'], 'up')
+        methods = [method for _, method, _, _ in self.host.calls]
+        self.assertNotIn('game.load', methods)
+        self.assertIn('settings.save', methods)  # still muted before anything can load
+        instances = json.loads((Path(self.config['state_dir']) / 'instances.json').read_text())
+        self.assertEqual(instances['a']['game'], self.config['instances'][0]['game'])
 
     def test_down_restores_full_profile_then_separately_verifies_then_releases(self):
         controller = self.controller()
@@ -790,6 +801,237 @@ class ProtocolTests(unittest.TestCase):
         with patch.object(os, 'pidfd_open') as open_pid:
             self.assertEqual(host.force_stop({'unit': 'eden-life-own.service'}, .1)['owned_pids_stopped'], [])
             open_pid.assert_not_called()
+
+
+class FakeWindowsHost(FakeHost):
+    clone_source = life.WindowsHost.clone_source
+
+    def name(self):
+        return 'OFFLINE-TEST-HOST'
+
+
+class WindowsTests(unittest.TestCase):
+    controller = LifecycleTests.controller
+    state = LifecycleTests.state
+
+    def test_windows_ini_paths_use_qt_forward_slashes_not_native_backslashes(self):
+        self.assertEqual(life.profile_directories(PureWindowsPath(r'C:\Eden\owned\profile')),
+                         {'nand_directory': 'C:/Eden/owned/profile/user/nand',
+                          'sdmc_directory': 'C:/Eden/owned/profile/user/sdmc'})
+
+    def setUp(self):
+        LifecycleTests.setUp(self)
+        appdir = self.base / 'app'
+        appdir.mkdir()
+        app = appdir / 'eden.exe'
+        app.write_bytes(b'fake Windows runtime')
+        (appdir / 'dependency.dll').write_bytes(b'fake dependency')
+        self.config.update(host='ally', interactive_session=1, lifecycle_only=True,
+            windows_job={'path': str(self.runner), 'sha256': life.digest(self.runner)},
+            windows_control={'path': str(self.settings), 'sha256': life.digest(self.settings)},
+            windows_python={'path': str(app), 'sha256': life.digest(app)})
+        item = self.config['instances'][0]
+        item['source'] = str(self.source / 'user')
+        item['app'] = {'path': str(app), 'sha256': life.digest(app)}
+        item.pop('display')
+        self.host = FakeWindowsHost(self.order)
+
+    def test_windows_full_fake_up_down_pipe_private_clone_and_source_verification(self):
+        original = life.inventory(self.source)
+        c = self.controller()
+        result = c.up()
+        item = c.state['instances'][0]
+        self.assertEqual(result['instances']['a']['socket'], '\\\\.\\pipe\\eden-life-' + c.state['token'] + '-a')
+        self.assertEqual(result['instances']['a']['screenshot_target'], 'screen')
+        self.assertTrue((Path(item['profile']) / 'eden.exe').is_file())
+        self.assertNotEqual((Path(item['profile']) / life.CONFIG).stat().st_ino,
+                            (self.source / life.CONFIG).stat().st_ino)
+        self.assertEqual(c.down()['phase'], 'down')
+        self.assertEqual(life.inventory(self.source), original)
+        self.assertTrue(json.loads((c.directory / 'a-source-verify.json').read_text())['unchanged'])
+
+    def test_windows_fresh_controller_can_down_nondefault_named_pipe_state(self):
+        self.controller().up()
+        self.assertEqual(self.controller().status()['phase'], 'up')
+        self.assertEqual(self.controller().down()['phase'], 'down')
+        self.assertTrue(self.ledger.released)
+
+    def test_windows_source_drift_retains_claim_after_owned_stop(self):
+        c = self.controller()
+        c.up()
+        (self.source / 'user/config/qt-config.ini').write_text('foreign change')
+        with self.assertRaisesRegex(life.Refused, 'Cleanup incomplete'):
+            c.down()
+        self.assertFalse(self.ledger.released)
+        self.assertFalse(self.host.live)
+
+    def test_windows_pipe_tampering_refuses_before_cleanup(self):
+        c = self.controller()
+        c.up()
+        value = self.state()
+        value['instances'][0]['socket'] = '\\\\.\\pipe\\foreign-owner'
+        life.save(c.journal, value)
+        previous = list(self.order)
+        with self.assertRaisesRegex(life.Refused, 'Foreign journal profile/run'):
+            self.controller().down()
+        self.assertEqual(self.order, previous)
+
+    def test_windows_helper_drift_refuses_before_claim(self):
+        self.config['windows_job']['sha256'] = '0' * 64
+        with self.assertRaisesRegex(life.Refused, 'Windows helper mismatch'):
+            self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+
+    def test_windows_native_task_command_is_interactive_bounded_and_one_shot(self):
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        run = Path(item['run'])
+        life.save(run / 'launcher.json', {'session': 1, 'limits': {'JobMemoryLimit': 8 * life.GIB,
+            'KillOnJobClose': True, 'ActiveProcessLimit': 256}, 'owned_pids': [{'pid': 123, 'start': 'fake'}]})
+        host = life.WindowsHost(self.config, job_api=object())
+        commands = []
+        host.run = lambda argv, cap=30: commands.append(argv) or ''
+        scripts = []
+        host.ps = lambda script, **kwargs: scripts.append(script) or (
+            'S-1-5-21-1-2-3-1001' if 'WindowsIdentity' in script else '{}')
+        with patch.dict(os.environ, {'USERDOMAIN': 'TEST', 'USERNAME': 'tester'}):
+            self.assertEqual(host.launch(item, self.config)[0]['pid'], 123)
+        xml = (run / 'task.xml').read_text(encoding='utf-16')
+        self.assertIn('<LogonType>InteractiveToken</LogonType>', xml)
+        self.assertIn('<UserId>S-1-5-21-1-2-3-1001</UserId>', xml)
+        self.assertNotIn('TEST\\tester', xml)  # SSH USERDOMAIN can be a workgroup, not an account domain.
+        self.assertIn('<ExecutionTimeLimit>PT5430S</ExecutionTimeLimit>', xml)
+        self.assertIn('<Enabled>false</Enabled>', xml)
+        self.assertIn('_windows-launch', xml)
+        self.assertEqual([cmd[1] for cmd in commands], ['/create', '/run'])
+        self.assertTrue((run / 'lifecycle-backend.py').is_file())
+        self.assertIn('rules=@($rules.Name)', scripts[0])
+        self.assertIn('created=$created', scripts[0])
+        self.assertNotIn('New-NetFirewallRule', scripts[0])  # no silent permission to create a rule
+
+    def test_windows_control_uses_pinned_async_client_and_forbids_input(self):
+        host = life.WindowsHost(self.config, job_api=object())
+        scripts = []
+        host.ps = lambda script, cap=30: scripts.append((script, cap)) or '{"ok":true,"result":{}}'
+        item = {'socket': '\\\\.\\pipe\\own-pipe'}
+        self.assertTrue(host.call(item, 'game.stop', {}, .3)['ok'])
+        self.assertIn("-PipeName 'own-pipe'", scripts[0][0])
+        self.assertIn('-TimeoutMs 300', scripts[0][0])
+        with self.assertRaisesRegex(life.Refused, 'cannot send input'):
+            host.call(item, 'input.button', {}, 1)
+        self.assertEqual(len(scripts), 1)
+
+    def test_windows_job_kill_is_session_scoped_and_never_targets_a_reused_pid(self):
+        class Job:
+            def __init__(self):
+                self.names, self.killed = [], []
+            def open_job(self, name, access):
+                self.names.append(name)
+                return 42
+            def pids(self, handle):
+                return []
+            def terminate(self, handle, code):
+                self.killed.append((handle, code))
+            def close(self, handle):
+                pass
+        job = Job()
+        host = life.WindowsHost(self.config, job)
+        host.identity = lambda pid: {'pid': pid, 'start': 'new'}
+        unit = 'eden-life-' + 'a' * 32 + '-a.service'
+        with patch.object(life.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            result = host.force_stop({'unit': unit, 'owned_pids': [{'pid': 55, 'start': 'old'}]}, .1)
+        self.assertTrue(result['job_terminated'])
+        self.assertEqual(job.killed, [(42, 137)])
+        self.assertEqual(set(job.names), {'Session\\1\\' + unit})
+        self.assertEqual([call.args[0][1] for call in run.call_args_list], ['/end', '/delete'])
+        with self.assertRaisesRegex(life.Refused, 'Foreign Windows'):
+            host.force_stop({'unit': 'foreign-task'}, .1)
+
+    def test_windows_transport_keeps_authoritative_ledger_on_controller(self):
+        token = 'b' * 32
+        request = {'ledger_request': {'operation': 'claim', 'token': token,
+                   'admission': {'foreign_processes': []}, 'stale_claim_hours': None}}
+        class Input(io.StringIO):
+            def close(self):
+                self.saved = self.getvalue()
+                super().close()
+        class Process:
+            stdin = Input()
+            stdout = io.StringIO(json.dumps(request) + '\n' + json.dumps({'lifecycle_result': {'phase': 'up'}}) + '\n')
+            stderr = io.StringIO()
+            def poll(self):
+                return 0
+            def wait(self, timeout):
+                return 0
+        process = Process()
+        commands, ledgers = [], []
+        def popen(command, **kwargs):
+            commands.append(command)
+            return process
+        class Ledger:
+            def __init__(self, *args):
+                ledgers.append(args)
+            def operate(self, operation, stale, admission):
+                self.test = operation
+                return {'line': 'FAKE claim'}
+        self.config['ledger_ssh'] = 'yoga'
+        value = life.forward_windows('intpa@dreamland-ally', 'up', self.config, True, popen, Ledger)
+        self.assertEqual(value['phase'], 'up')
+        self.assertEqual(ledgers, [(self.config['ledger'], 'ally', self.config['owner'], token, 'yoga')])
+        self.assertTrue(commands[0][-1].startswith('"C:\\Program Files\\PowerShell\\7\\pwsh.exe"'))
+        packet = json.loads(process.stdin.saved.splitlines()[0])
+        self.assertTrue(packet['ledger_bridge'])
+        self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]), {'result': {'line': 'FAKE claim'}})
+
+    def test_windows_1312_retries_once_only_before_any_ledger_action(self):
+        error = life.Refused('CreateProcessAsUserW failed: 1312')
+        error.transport_not_started = True
+        with patch.object(life, '_forward_windows_once', side_effect=[error, {'phase': 'absent'}]) as once:
+            self.assertEqual(life.forward_windows('intpa@dreamland-ally', 'status', self.config, False), {'phase': 'absent'})
+            self.assertEqual(once.call_count, 2)
+        with patch.object(life, '_forward_windows_once', side_effect=error) as once:
+            with self.assertRaises(life.Refused):
+                life.forward_windows('intpa@dreamland-ally', 'status', self.config, False)
+            self.assertEqual(once.call_count, 2)
+        error.transport_not_started = False
+        with patch.object(life, '_forward_windows_once', side_effect=error) as once:
+            with self.assertRaises(life.Refused):
+                life.forward_windows('intpa@dreamland-ally', 'up', self.config, True)
+            self.assertEqual(once.call_count, 1)
+
+    def test_windows_real_transport_classifies_broken_pipe_1312_without_replaying_a_claim(self):
+        class BrokenInput:
+            def write(self, text):
+                raise BrokenPipeError('server did not start a remote process')
+            def close(self):
+                raise BrokenPipeError('flush during close')
+        class Input(io.StringIO):
+            def close(self):
+                self.saved = self.getvalue()
+                super().close()
+        class Process:
+            def __init__(self, failed):
+                self.stdin = BrokenInput() if failed else Input()
+                self.stdout = io.StringIO('' if failed else '{"lifecycle_result":{"phase":"absent"}}\n')
+                self.stderr = io.StringIO('CreateProcessAsUserW failed: 1312\n' if failed else '')
+            def poll(self):
+                return 0
+            def wait(self, timeout):
+                return 0
+        processes = [Process(True), Process(False)]
+        commands = []
+        def popen(command, **kwargs):
+            commands.append(command)
+            return processes[len(commands) - 1]
+        with patch.object(life, 'Ledger') as ledger:
+            result = life.forward_windows('intpa@dreamland-ally', 'status', self.config, False, popen, ledger)
+        self.assertEqual(result, {'phase': 'absent'})
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0], commands[1])
+        self.assertIn('-NoProfile -NonInteractive -EncodedCommand', commands[0][-1])
+        self.assertEqual(commands[0][1:3], ['-T', '-x'])
+        ledger.assert_not_called()
 
 
 if __name__ == '__main__':
