@@ -231,6 +231,8 @@ the work itself.
    fresh worker for them. Coding follow-ups go back to the worker that wrote
    the code.
 2. **Never replace a worker for context.**
+   - **The tool compacts by itself when it needs to,** so the same workers
+     run for the whole campaign.
    - **Worker context belongs to the operator.** The coordinator doesn't
      monitor or compact a worker's context, and doesn't act on the clawo
      broker's `contextPercent`. That meter reads "100%" at about 256K tokens,
