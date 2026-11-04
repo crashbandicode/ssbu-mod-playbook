@@ -65,7 +65,7 @@ class EdenTestTests(unittest.TestCase):
                            'plugins': [{'path': str(nro), 'sha256': sha(nro)}], 'game': '/games/x.xci'}]}))
         self.rows = self.dir / 'rows-src'
         self.rows.mkdir()
-        (self.rows / 'rows.json').write_text('{"rows": []}')
+        (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[]}')
 
     def tearDown(self):
         eden_test.LIFECYCLE, eden_test.RUNNER, eden_test.HARVEST, eden_test.RUNS = self.saved
@@ -147,7 +147,7 @@ class EdenTestTests(unittest.TestCase):
             eden_test.main(['new', *self.args()])
 
     def test_all_runs_down_even_after_a_failed_row_and_writes_results(self):
-        (self.rows / 'rows.json').write_text('{"rows": [{"id": "r1"}, {"id": "r2"}], "note": "fail-once"}')
+        (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[{"id": "r1"}, {"id": "r2"}], "note": "fail-once"}')
         eden_test.main(['all', *self.args()])
         run = self.dir / 'runs/lr-14'
         journal = json.loads((run / 'state/lifecycle.json').read_text())
@@ -160,7 +160,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertTrue({'new', 'up_start', 'up_done', 'run_start', 'run_end', 'down_start', 'down_done'} <= set(timing))
 
     def test_retry_clears_stop_input_and_reruns_on_the_same_boot(self):
-        (self.rows / 'rows.json').write_text('{"rows": [], "note": "fail-once"}')
+        (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[], "note": "fail-once"}')
         eden_test.main(['new', *self.args()])
         run = self.dir / 'runs/lr-14'
         eden_test.main(['up', str(run)])
@@ -169,14 +169,14 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(json.loads((run / 'out/r2.json').read_text())['status'], 'PASS')
 
     def test_results_count_only_rows_and_add_up_retries(self):
-        (self.rows / 'rows.json').write_text('{"rows": [{"id": "r1"}, {"id": "r2"}, {"id": "r3"}], "note": "fail-once"}')
+        (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[{"id": "r1"}, {"id": "r2"}, {"id": "r3"}], "note": "fail-once"}')
         eden_test.main(['new', *self.args()])
         run = self.dir / 'runs/lr-14'
         eden_test.main(['up', str(run)])
         eden_test.main(['run', str(run)])
         (run / 'out/r2.json').rename(run / 'out/r2.FAILED.first-try.json')  # an agent keeps the failed attempt
         (run / 'out/project-state.json').write_text('{"phase": "whatever"}')  # not a row receipt
-        (run / 'rows/rows.json').write_text('{"rows": [{"id": "r1"}, {"id": "r2"}, {"id": "r3"}], "note": "fixed"}')
+        (run / 'rows/rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[{"id": "r1"}, {"id": "r2"}, {"id": "r3"}], "note": "fixed"}')
         eden_test.main(['run', str(run), '--retry'])
         eden_test.HARVEST.write_text('print(\'{\\n  "segments": [1, 2],\\n  "gates": []\\n}\')\n')  # multi-line JSON
         eden_test.main(['down', str(run)])
@@ -188,6 +188,42 @@ class EdenTestTests(unittest.TestCase):
         self.assertIn('over 2 run call(s)', results)
         self.assertLessEqual(len(results.splitlines()), 20)
         self.assertEqual(len(json.loads((run / 'timing.json').read_text())['runs']), 2)
+
+    def test_up_refuses_a_missing_or_vague_setup_plan(self):
+        (self.rows / 'rows.json').write_text('{"rows": [{"id": "r1"}]}')
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        with self.assertRaises(SystemExit) as caught:
+            eden_test.main(['up', str(run)])
+        self.assertIn('no "setup" list', str(caught.exception))
+        self.assertEqual(eden_test.setup_plan_problems({'setup': [{'state': 'CPU Kirby', 'via': 'by hand'}]}),
+                         ['setup[0] needs "state", "via" (fixture/segment/record/hook) and "ref"'])
+        eden_test.main(['up', str(run), '--skip-setup-plan'])  # re-running recorded rows stays possible
+        self.assertTrue((run / 'state/instances.json').exists())
+
+    def test_pace_counts_hand_driven_inputs_not_runner_or_recorded_ones(self):
+        (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], '
+                                             '"rows": [{"id": "r1"}, {"id": "r2"}]}')
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        eden_test.main(['up', str(run)])
+        control = run / 'state/run-a/control.jsonl'
+        control.parent.mkdir(parents=True, exist_ok=True)
+        req = lambda m: json.dumps({'event': 'request', 'method': m, 'time': '2026-11-04T02:00:00Z'})
+        lines = [req('macro.record_start')] + [req('input.button')] * 30 + [req('macro.stop')]  # recording: fine
+        lines += [req('input.button')] * 50  # outside recordings: 5 of them are the runner's hook presses
+        control.write_text('\n'.join(lines) + '\n')
+        (run / 'out').mkdir(exist_ok=True)
+        (run / 'out/actions.jsonl').write_text('\n'.join(json.dumps({'method': 'input.button'}) for _ in range(5)) + '\n')
+        report = eden_test.pace_report(run)
+        self.assertEqual((report['manual_inputs'], report['runner_inputs']), (45, 5))
+        self.assertIn('45 hand-driven inputs (budget 40)', report['over'][0])
+        self.assertEqual(eden_test.main(['pace', str(run)]), 2)
+        up = json.loads((run / 'timing.json').read_text())['up_done']
+        control.write_text(req('macro.play') + '\n')
+        late = eden_test.pace_report(run, now=up + 16 * 60)  # no row passed 16 minutes after Up
+        self.assertEqual(len(late['over']), 1)
+        self.assertIn('without a newly passed row', late['over'][0])
 
 
 if __name__ == '__main__':

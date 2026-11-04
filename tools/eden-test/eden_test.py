@@ -147,8 +147,29 @@ def lifecycle(run, mode):
     return sh(argv, run / f'lifecycle-{mode}.log')
 
 
-def cmd_up(run):
+SETUP_VIA = ('fixture', 'segment', 'record', 'hook')
+
+
+def setup_plan_problems(spec):
+    """MACROS rule 13: rows.json names how each starting state is reached, before Up.
+    "setup": [{"state": "Training, P1 Kirby, CPU Kirby", "via": "fixture", "ref": "files: settings.json"}, ...]"""
+    plan = spec.get('setup') if isinstance(spec, dict) else None
+    if not isinstance(plan, list) or not plan:
+        return ['rows.json has no "setup" list: name each starting state and how it is reached '
+                f'(via one of {", ".join(SETUP_VIA)}) before Up']
+    problems = []
+    for i, item in enumerate(plan):
+        if not isinstance(item, dict) or not item.get('state') or item.get('via') not in SETUP_VIA or not item.get('ref'):
+            problems.append(f'setup[{i}] needs "state", "via" ({"/".join(SETUP_VIA)}) and "ref"')
+    return problems
+
+
+def cmd_up(run, skip_setup_plan=False):
     rows = run / 'rows' / 'rows.json'
+    problems = setup_plan_problems(json.loads(rows.read_text()))
+    if problems and not skip_setup_plan:
+        raise SystemExit('setup plan: ' + '; '.join(problems) + ' (MACROS rule 13; --skip-setup-plan only to re-run '
+                         'rows that already have their segments)')
     if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
@@ -167,7 +188,83 @@ def cmd_run(run, retry=False):
     code = sh([sys.executable, '-B', '-I', str(RUNNER), 'run', str(run / 'rows' / 'rows.json'),
                '--instances', str(run / 'state' / 'instances.json'), '--out', str(run / 'out')], run / 'runner.log')
     stamp(run, 'run_end')
+    cmd_pace(run)  # informational after every run call; `pace` alone exits 2 when over budget
     return code
+
+
+# MACROS rule 13: a boot reaches its starting state through a fixture or a recorded segment, not by an agent steering
+# menus one input at a time. These budgets make that visible while the boot is still up.
+MANUAL_INPUT_BUDGET = 40
+NO_ROW_MINUTES = 15
+
+
+def control_inputs(run):
+    """(inputs outside macro recordings, their timestamps) summed over the run's instances' control.jsonl."""
+    count, times = 0, []
+    for path in sorted((run / 'state').glob('run-*/control.jsonl')):
+        recording = False
+        for line in path.read_text(errors='replace').splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get('event') != 'request':
+                continue
+            method = event.get('method', '')
+            if method.startswith('macro.record'):
+                recording = True
+            elif method == 'macro.stop':
+                recording = False
+            elif method in ('input.button', 'input.stick') and not recording:
+                count += 1
+                times.append(event.get('time'))
+    return count, times
+
+
+def runner_inputs(run):
+    """Inputs the runner itself sent (its own call log): scripted hook presses and sticks, not hand-driving."""
+    path = run / 'out' / 'actions.jsonl'
+    if not path.exists():
+        return 0
+    count = 0
+    for line in path.read_text(errors='replace').splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if str(record.get('method', '')).startswith('input.'):
+            count += 1
+    return count
+
+
+def pace_report(run, now=None):
+    """Hand-driven inputs and row progress since Up; 'over' says which budget is spent."""
+    now = time.time() if now is None else now
+    timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
+    up = timing.get('up_done')
+    outside, _ = control_inputs(run)
+    manual = max(0, outside - runner_inputs(run))
+    passed, _failed, unrun, _retained = row_accounting(run) if (run / 'rows' / 'rows.json').exists() else ([], [], [], 0)
+    receipts = [run / 'out' / f'{row}.json' for row in passed]
+    last_pass = max((p.stat().st_mtime for p in receipts if p.exists()), default=None)
+    since = (now - (last_pass or up)) / 60 if up else 0.0
+    over = []
+    if manual > MANUAL_INPUT_BUDGET:
+        over.append(f'{manual} hand-driven inputs (budget {MANUAL_INPUT_BUDGET})')
+    if up and unrun and since > NO_ROW_MINUTES:
+        over.append(f'{since:.0f} min without a newly passed row (budget {NO_ROW_MINUTES})')
+    return {'manual_inputs': manual, 'runner_inputs': runner_inputs(run), 'rows_passed': len(passed),
+            'rows_left': len(unrun), 'minutes_since_progress': round(since, 1), 'over': over}
+
+
+def cmd_pace(run):
+    report = pace_report(run)
+    print('pace: ' + json.dumps(report))
+    if report['over']:
+        print('STOP: ' + '; '.join(report['over']) + '. Reach the starting state with a fixture or record the route once as a '
+              'segment (MACROS rule 13), or Down and fix the rows; don\'t keep steering by hand.')
+        return 2
+    return 0
 
 
 def unit_results(run):
@@ -299,8 +396,12 @@ def main(argv=None):
                        help='swap the pinned plugin with this file name for this build (repeatable; sha256 is read)')
         p.add_argument('--defer-load', action='store_true',
                        help='leave the frontend ready so rows can configure boot tracing before game.load')
-    for name in ('up', 'down'):
+    for name in ('down', 'pace'):
         sub.add_parser(name).add_argument('run', type=Path)
+    p = sub.add_parser('up')
+    p.add_argument('run', type=Path)
+    p.add_argument('--skip-setup-plan', action='store_true',
+                   help='re-running rows whose starting states are already recorded (no "setup" list yet)')
     p = sub.add_parser('run')
     p.add_argument('run', type=Path)
     p.add_argument('--retry', action='store_true')
@@ -308,11 +409,13 @@ def main(argv=None):
     if args.mode == 'new':
         cmd_new(args)
     elif args.mode == 'up':
-        cmd_up(args.run.resolve())
+        cmd_up(args.run.resolve(), args.skip_setup_plan)
     elif args.mode == 'run':
         return cmd_run(args.run.resolve(), args.retry)
     elif args.mode == 'down':
         cmd_down(args.run.resolve())
+    elif args.mode == 'pace':
+        return cmd_pace(args.run.resolve())
     elif args.mode == 'all':
         run = cmd_new(args)
         cmd_up(run)

@@ -118,6 +118,12 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   boot. At `Down`, segments, runner and row list committed to `eden/`.
   Evidence: the runner's path and dry-run log, the order and `Up` times, and
   the `macro.play` calls in `control.jsonl`.
+- **M** Starting states come from a fixture, a segment, a hook or one bounded
+  recording, named in `rows.json` `"setup"` before `Up` (`eden_test.py up`
+  refuses without it); `eden_test.py pace` stayed under budget (40
+  hand-driven inputs, 15 minutes without a newly passed row) or the boot was
+  stopped and the rows fixed ([MACROS](MACROS.md), rule 13). Evidence: the
+  `setup` list and the `pace:` lines in the run's output.
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
 - **M** Game-side facts are captured with guest tracing on a run already

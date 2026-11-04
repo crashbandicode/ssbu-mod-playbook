@@ -246,6 +246,14 @@ The rules:
       timing) and `timing.json`.
     - `all` does new, up, run and down in one go, for a batch you don't
       expect to fix mid-boot.
+    - `--plugin <new build>` on `new` swaps the pinned plugin with that file
+      name; `--defer-load` leaves the frontend ready for boot tracing.
+    - `pace <run>` reports hand-driven inputs (control requests outside
+      macro recordings, minus the runner's own hook inputs) and the minutes
+      since the last newly passed row; it exits 2 and prints `STOP` past 40
+      inputs or 15 minutes. `run` prints it after every call. When it says
+      STOP, stop steering: use a fixture, record the route once, or Down and
+      fix the rows (rule 13).
 11. **Read the game's state; don't assume it.** A row doesn't hard-code a
     fixture's roster index, fighter kind or prefetch target. It reads them
     first, from the settings or roster JSON (`json` gate, `copy`), the
@@ -260,6 +268,23 @@ The rules:
     keeps working through its batches. It waits for a busy host with polls of
     60 s or less instead of ending its turn, and posts only at row checkpoints.
     Restarting an agent that ended its turn costs minutes of re-reading.
+13. **Reach the starting state with a fixture, and plan it before Up.** A
+    row's starting state (which fighters, which stage, which settings, which
+    screen) comes from, in this order: a **fixture** (a pinned file in the
+    run config, `instances[].files` with `to`, such as the plugin's settings
+    JSON, or the plugin's own settings-reload fixture), an existing recorded
+    **segment** or library recipe, a project **hook** that reads state and
+    steps to it, or one bounded **record**ing (`record-start`, the inputs,
+    `record-stop`) that then becomes a segment. Steering native menus one input
+    at a time is for the case where the menu itself is under test. `rows.json`
+    carries the plan, and `eden_test.py up` refuses without it:
+    `"setup": [{"state": "Training, P1 Kirby, CPU Kirby", "via": "fixture",
+    "ref": "files: TrainingRooms/settings.json"}]` (`via` is `fixture`,
+    `segment`, `record` or `hook`; `--skip-setup-plan` only to re-run rows
+    whose segments already exist). (2026-11-04: a worker spent a 20-minute
+    boot steering the character select to make the CPU Kirby, 139 single
+    inputs and no finished row, until the runtime cap stopped Eden; the
+    plugin's settings fixture reached the same state in one step.)
 
 #### The shared runner: a helper, extended per project
 
