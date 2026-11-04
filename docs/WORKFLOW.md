@@ -217,6 +217,58 @@ For a sanity check before shipping, use the card's full plugin set, play one
 match to the results screen and back, then check each plugin's install line
 and Eden's `console.log`.
 
+### Running agent workers without churn
+
+These rules come from the TrainingRooms Phase 2/3 day (2026-11-04). It
+started 14 worker sessions in 8 hours. Most of the lost time was restarts,
+re-reading, workers stopping early, and Eden routes rebuilt from scratch, not
+the work itself.
+
+1. **One persistent worker per Eden host.** Give each host (Surface, Yoga,
+   Ally) one worker with a standing goal: "keep closing the rows I send you
+   until each one is PASS, FAIL or BLOCKED with a reason" (MACROS rule 12).
+   New rows and follow-ups go to **that session** as messages; don't start a
+   fresh worker for them. Coding follow-ups go back to the worker that wrote
+   the code.
+2. **Replace a worker only when its context runs out,** and then from a
+   handoff file it writes. The file holds what is done, the routes and
+   segments it built, its open rows, and the live run state (claims, run
+   folder, build hashes). The replacement reads the file, not the whole
+   ramp-up.
+3. **Every brief ends in a done-checklist.** Each item is PASS, FAIL or
+   BLOCKED with the exact reason. A worker ends its turn only when every item
+   has one of those, or when the time-box is actually spent. "Time-box" is not
+   a reason to stop 50 minutes into 2.5 hours. A worker never ends its turn
+   while a build or a run is in progress; it polls in ≤60 s steps instead.
+   Nothing wakes a worker whose turn has ended.
+4. **A shared route library, committed as soon as something works.** A chord
+   macro, a menu route, a fixture or a hook that works goes into the project's
+   library (for example `eden/<phase>/lib/` with a one-line index) and is
+   committed right away. Workers read the index and reuse before they build.
+   On 11-04 three workers each re-learned same-frame chords (MACROS rule 14),
+   the fighter fixtures and the menu routes.
+5. **The coordinator enforces the Up deadline.** It is 15 minutes, or 30 when
+   segments must be recorded (MACROS "Test runs" rule 6). Past it, interrupt
+   the worker and redirect it: Up now with the rows that need no new route,
+   record the missing routes inside that boot (MACROS rule 13), and mark
+   unstaged rows BLOCKED.
+6. **Watch for stalls, not blips.** The coordinator's watcher alerts on:
+   - direct input outside the runner;
+   - a provider or turn error **with no worker activity in the 2 minutes
+     after it** (OpenCode retries most blips by itself);
+   - a worker **quiet for 12 minutes without updating its report**.
+
+   Anything else needs no action.
+7. **Hosts take turns.** One Eden boot per host. The lifecycle refuses `Up`
+   while any compiler runs, so builders wait while an Eden worker holds a
+   lock file around Up and Down. Gate runs for a new head write to a **new
+   folder**, so NRO paths and hashes that running Eden workers pinned stay
+   valid.
+8. **The coordinator accepts on evidence it has seen.** It looks at the
+   frames and log lines itself, and decodes the source for any asset claim
+   ([GIFS](GIFS.md)), before closing a row. A worker's PASS on a visual
+   criterion is a request for review.
+
 ### Plugins that run during online play
 
 Follow "Rules for plugins" in `ssbu-desync-detector`'s

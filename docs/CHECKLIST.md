@@ -219,6 +219,13 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   `docs/`, `tools/PROVENANCE.md`) before changing code, built its own
   checklist and ran `tools/check/compliance.py` before READY; the brief that
   spawned it said so and recorded the playbook commit it followed.
+- **C** (several workers or Eden hosts) one persistent worker per host
+  carries follow-ups in its own session. Every brief ends in a done-checklist:
+  PASS, FAIL or BLOCKED with a reason. Working routes, chords and fixtures go
+  into the shared route library when they first work. The coordinator enforces
+  the Up deadline and watches for stalls ([WORKFLOW](WORKFLOW.md), "Running
+  agent workers without churn"). Evidence: the session list against the
+  hosts, and the library's commits.
 
 ## The report
 
