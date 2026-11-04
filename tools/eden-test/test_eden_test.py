@@ -225,6 +225,35 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(len(late['over']), 1)
         self.assertIn('without a newly passed row', late['over'][0])
 
+    def test_pace_stops_near_the_runtime_cap(self):
+        (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], '
+                                             '"rows": [{"id": "r1"}]}')
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        config = json.loads((run / 'config.json').read_text())
+        config['runtime'] = 1200
+        (run / 'config.json').write_text(json.dumps(config))
+        eden_test.main(['up', str(run)])
+        up = json.loads((run / 'timing.json').read_text())['up_done']
+        early = eden_test.pace_report(run, now=up + 10 * 60)
+        self.assertEqual((early['minutes_to_cap'], early['over']), (10.0, []))
+        late = eden_test.pace_report(run, now=up + 16 * 60)  # 4 minutes left
+        self.assertTrue(any('to the runtime cap' in reason for reason in late['over']))
+
+    def test_down_uses_the_up_time_config_and_keeps_an_edited_one_aside(self):
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        eden_test.main(['up', str(run), '--skip-setup-plan'])
+        up_config = json.loads((run / 'config.json').read_text())
+        journal = json.loads((run / 'state/lifecycle.json').read_text())
+        journal['config'] = up_config
+        (run / 'state/lifecycle.json').write_text(json.dumps(journal))
+        (run / 'config.json').write_text(json.dumps(dict(up_config, owner='edited after Up')))
+        aside = eden_test.restore_up_config(run)
+        self.assertEqual(json.loads((run / 'config.json').read_text()), up_config)
+        self.assertEqual(json.loads(aside.read_text())['owner'], 'edited after Up')
+        self.assertIsNone(eden_test.restore_up_config(run))  # nothing to do the second time
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

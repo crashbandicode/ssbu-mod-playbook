@@ -196,6 +196,7 @@ def cmd_run(run, retry=False):
 # menus one input at a time. These budgets make that visible while the boot is still up.
 MANUAL_INPUT_BUDGET = 40
 NO_ROW_MINUTES = 15
+CAP_MARGIN_MINUTES = 5
 
 
 def control_inputs(run):
@@ -248,21 +249,29 @@ def pace_report(run, now=None):
     receipts = [run / 'out' / f'{row}.json' for row in passed]
     last_pass = max((p.stat().st_mtime for p in receipts if p.exists()), default=None)
     since = (now - (last_pass or up)) / 60 if up else 0.0
+    # The lifecycle's runtime cap (config "runtime", seconds) stops Eden with SIGTERM, and Eden has crashed on that
+    # signal (SEGV, 2026-11-03/04). Down well before it, whatever the rows' progress.
+    config = json.loads((run / 'config.json').read_text()) if (run / 'config.json').exists() else {}
+    cap_left = (up + config.get('runtime', 5400) - now) / 60 if up else None
     over = []
     if manual > MANUAL_INPUT_BUDGET:
         over.append(f'{manual} hand-driven inputs (budget {MANUAL_INPUT_BUDGET})')
     if up and unrun and since > NO_ROW_MINUTES:
         over.append(f'{since:.0f} min without a newly passed row (budget {NO_ROW_MINUTES})')
+    if cap_left is not None and cap_left <= CAP_MARGIN_MINUTES:
+        over.append(f'{max(cap_left, 0):.0f} min to the runtime cap (Down at {CAP_MARGIN_MINUTES} min left)')
     return {'manual_inputs': manual, 'runner_inputs': runner_inputs(run), 'rows_passed': len(passed),
-            'rows_left': len(unrun), 'minutes_since_progress': round(since, 1), 'over': over}
+            'rows_left': len(unrun), 'minutes_since_progress': round(since, 1),
+            'minutes_to_cap': None if cap_left is None else round(cap_left, 1), 'over': over}
 
 
 def cmd_pace(run):
     report = pace_report(run)
     print('pace: ' + json.dumps(report))
     if report['over']:
-        print('STOP: ' + '; '.join(report['over']) + '. Reach the starting state with a fixture or record the route once as a '
-              'segment (MACROS rule 13), or Down and fix the rows; don\'t keep steering by hand.')
+        print('STOP: ' + '; '.join(report['over']) + '. Down now if the cap is near. Otherwise reach the starting state with a '
+              'fixture or record the route once as a segment (MACROS rule 13), or Down and fix the rows; don\'t keep '
+              'steering by hand.')
         return 2
     return 0
 
@@ -369,7 +378,26 @@ def results_md(run, config):
     print('\n'.join(lines[:20]))
 
 
+def restore_up_config(run):
+    """Down cleans up what Up created, so it uses the Up-time config the lifecycle journal recorded. A config.json
+    edited after Up (it shouldn't be: rows.json and hooks are what change mid-boot) is kept aside, never merged into
+    the journal; the lifecycle refuses a journal/config mismatch by design."""
+    journal_path = run / 'state' / 'lifecycle.json'
+    config_path = run / 'config.json'
+    if not journal_path.exists() or not config_path.exists():
+        return None
+    up_config = json.loads(journal_path.read_text()).get('config')
+    if not up_config or json.loads(config_path.read_text()) == up_config:
+        return None
+    aside = run / f'config.after-up.{int(time.time())}.json'
+    config_path.rename(aside)
+    config_path.write_text(json.dumps(up_config, indent=2) + '\n')
+    print(f'config.json changed after Up; Down uses the Up-time config (edited copy kept as {aside.name})')
+    return aside
+
+
 def cmd_down(run):
+    restore_up_config(run)
     config = json.loads((run / 'config.json').read_text())
     stamp(run, 'down_start')
     code = lifecycle(run, 'down')
