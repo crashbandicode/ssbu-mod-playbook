@@ -103,6 +103,14 @@ class EdenTestTests(unittest.TestCase):
                             '--plugin', str(self.dir / 'Eden.AppImage')])
         self.assertIn('no pinned plugin', str(caught.exception))
 
+    def test_classify_exit_flags_core_dumps_and_the_cap(self):
+        self.assertTrue(eden_test.classify_exit({'Result': 'timeout', 'ExecMainCode': '3', 'ExecMainStatus': '11'})
+                        .startswith('CRASH (core dumped, signal 11); the runtime cap fired'))  # p4za
+        self.assertTrue(eden_test.classify_exit({'Result': 'signal', 'ExecMainCode': '2', 'ExecMainStatus': '9'})
+                        .startswith('forced stop (SIGKILL), not a crash'))
+        self.assertTrue(eden_test.classify_exit({'Result': 'core-dump', 'ExecMainCode': '3', 'ExecMainStatus': '7'})
+                        .startswith('CRASH (core dumped, signal 7)'))  # lr-12 SIGBUS
+
     def test_explicit_defer_load_leaves_boot_setup_to_rows(self):  # pkg4
         previous = json.loads(self.previous.read_text())
         previous['defer_load'] = False

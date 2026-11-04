@@ -180,11 +180,28 @@ def unit_results(run):
         unit = item.get('unit')
         if not unit:
             continue
-        done = subprocess.run(['systemctl', '--user', 'show', unit, '--property=Result,ExecMainStatus'],
+        done = subprocess.run(['systemctl', '--user', 'show', unit, '--property=Result,ExecMainCode,ExecMainStatus'],
                               capture_output=True, text=True)
         props = dict(line.split('=', 1) for line in done.stdout.splitlines() if '=' in line)
-        results.append(f'{item.get("key")}: Result={props.get("Result", "?")} status={props.get("ExecMainStatus", "?")}')
+        results.append(f'{item.get("key")}: {classify_exit(props)}')
     return results
+
+
+def classify_exit(props):
+    """systemd ExecMainCode: 1 exited, 2 killed, 3 dumped (core). Our Down ends a live Eden with SIGKILL after SIGTERM,
+    so killed/9 is the expected forced stop; a core dump (SEGV, BUS, ABRT…) is a CRASH whatever else passed."""
+    result, code, status = props.get('Result', '?'), props.get('ExecMainCode', '?'), props.get('ExecMainStatus', '?')
+    if code == '3':
+        verdict = f'CRASH (core dumped, signal {status})'
+    elif code == '2' and status == '9':
+        verdict = 'forced stop (SIGKILL), not a crash'
+    elif code == '2':
+        verdict = f'killed by signal {status}'
+    else:
+        verdict = f'exited {status}'
+    if result == 'timeout':
+        verdict += '; the runtime cap fired'
+    return f'{verdict} [Result={result} code={code} status={status}]'
 
 
 def one_line(text, limit=140):
