@@ -248,30 +248,37 @@ the work itself.
    a reason to stop 50 minutes into 2.5 hours. A worker never ends its turn
    while a build or a run is in progress; it polls in ≤60 s steps instead.
    Nothing wakes a worker whose turn has ended.
-4. **A shared route library, committed as soon as something works.** A chord
+4. **Name the existing navigation kit in every Eden brief.** Pointing at
+   the playbook in general isn't enough. Name the tile cursor plugin
+   ([TILE-CURSOR](TILE-CURSOR.md)), the runner's segment library, the
+   project's own hook sets (for TrainingRooms, `eden/lr*-shared`, which
+   includes pilot arming), and settings fixtures. (2026-11-04: Phase 2/3
+   workers stick-steered the character select and hand-built tile-step
+   macros, with the tile cursor plugin already in their plugin set.)
+5. **A shared route library, committed as soon as something works.** A chord
    macro, a menu route, a fixture or a hook that works goes into the project's
    library (for example `eden/<phase>/lib/` with a one-line index) and is
    committed right away. Workers read the index and reuse before they build.
    On 11-04 three workers each re-learned same-frame chords (MACROS rule 14),
    the fighter fixtures and the menu routes.
-5. **The coordinator enforces the Up deadline.** It is 15 minutes, or 30 when
+6. **The coordinator enforces the Up deadline.** It is 15 minutes, or 30 when
    segments must be recorded (MACROS "Test runs" rule 6). Past it, interrupt
    the worker and redirect it: Up now with the rows that need no new route,
    record the missing routes inside that boot (MACROS rule 13), and mark
    unstaged rows BLOCKED.
-6. **Watch for stalls, not blips.** The coordinator's watcher alerts on:
+7. **Watch for stalls, not blips.** The coordinator's watcher alerts on:
    - direct input outside the runner;
    - a provider or turn error **with no worker activity in the 2 minutes
      after it** (OpenCode retries most blips by itself);
    - a worker **quiet for 12 minutes without updating its report**.
 
    Anything else needs no action.
-7. **Hosts take turns.** One Eden boot per host. The lifecycle refuses `Up`
+8. **Hosts take turns.** At most two Eden boots on a Linux host (Surface, Yoga) and one on the Ally (the lifecycle enforces it). The lifecycle refuses `Up`
    while any compiler runs, so builders wait while an Eden worker holds a
    lock file around Up and Down. Gate runs for a new head write to a **new
    folder**, so NRO paths and hashes that running Eden workers pinned stay
    valid.
-8. **The coordinator accepts on evidence it has seen.** It looks at the
+9. **The coordinator accepts on evidence it has seen.** It looks at the
    frames and log lines itself, and decodes the source for any asset claim
    ([GIFS](GIFS.md)), before closing a row. A worker's PASS on a visual
    criterion is a request for review.
