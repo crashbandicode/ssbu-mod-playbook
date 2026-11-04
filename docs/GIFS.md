@@ -14,6 +14,17 @@ elite-rematch and ssbu-tile-cursor were all made this way.
   Record the same route twice, once without the plugin and once with it
   (ssbu-quiet-elite-switch's `before.gif`/`after.gif`).
 
+## Evidence clips are not README GIFs
+
+Clips recorded as **test evidence** (a hit, a respawn, a menu step inside an Eden row) stay small:
+- `width` 640, `fps` ≤15;
+- a `duration_ms` that covers only the action, a few seconds;
+- ≤10 MB each.
+
+A raw take that has to stay bigger is compressed after review (`gifsicle -O3 --lossy=80`). On 2026-11-04 full-size 30 fps
+evidence takes of up to 60 s came out at 24–217 MB each, and the operator called that way too big. The full 1280 width
+below is for README clips only.
+
 ## Record
 
 `recording.start` takes:
