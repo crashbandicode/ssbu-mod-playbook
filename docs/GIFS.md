@@ -101,6 +101,20 @@ frame count, duration). View the PNGs. Then check:
 - The start, the action and the result are all in the clip.
 - The plugin's text is readable.
 - No loading screen or menu in between makes the caption untrue.
+- A claim about which picture is shown ("this tile is the mod's art", "these
+  are the stock icons") is checked against the source, not by eye. Decode the
+  expected image and the stock one, and put the frame between them:
+
+  ```text
+  python3 -I tools/assets/arc_get.py <out-dir> ui/replace/stage/stage_1/stage_1_end.bntx
+  python3 -I tools/assets/bntx_view.py <out-dir>/stock-stage_1_end.bntx stock.png
+  python3 -I tools/assets/bntx_view.py "<mod>/ui/replace/stage/stage_1/stage_1_end.bntx" mod.png
+  ```
+
+  On 2026-11-04 a worker reported a Cosmic Destination tile that was the stock
+  Final Destination picture: the runs had no ARCropolis, so no mod loaded
+  ([EDEN](EDEN.md), "Mods need ARCropolis"). Game-derived images stay out of
+  every git repo.
 
 ## Put it in the README
 

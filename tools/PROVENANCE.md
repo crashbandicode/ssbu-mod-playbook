@@ -87,3 +87,10 @@ Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and
 `../skills/ssbu-mod-playbook/SKILL.md`.
+
+Written here 2026-11-04 (TrainingRooms primary), not copies: `assets/bntx_view.py` (decodes the first texture of a BNTX:
+Tegra block-linear deswizzle + Pillow's BCn decoder; BC1–BC5, BC7 and RGBA8) `53bdd2c078f1da4e`; `assets/arc_get.py`
+(extracts named files from the local stock 13.0.5 `data.arc` with `/home/intpa/ssbu-recomp/tools/nro/arc_extract.py`)
+`6d2a2e46f0c3b37f`; `assets/zshim/zstandard.py` (the two calls `arc_extract.py` needs, over Python 3.14's stdlib
+`compression.zstd`) `1fb083fa75a184aa`. Checked by decoding stock and Cosmic Destination `stage_1_end` / `stage_2_end`
+(BC7, 108x90 and 512x256) and matching them to Eden frames; no host tests yet.

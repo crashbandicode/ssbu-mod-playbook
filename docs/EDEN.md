@@ -46,6 +46,18 @@ a label `eNN`, and every file a run writes is named after it.
   - On 2026-10-31 a dedup pass hard-linked about 105 GiB of byte-identical
     files across this workspace's profile copies, with nothing lost.
 
+## Mods need ARCropolis
+
+Every launcher here (`gv.py prep`, the lifecycle behind `eden_test.py`) moves
+each NRO already in the profile's `plugins/` aside and installs only the
+pinned list. A mod in `ultimate/mods/` (stage, fighter, UI, sound) loads only
+through ARCropolis, so a run that tests anything a mod changes pins the card's
+`libarcropolis.nro` (`92171b2f…`, the same in every card snapshot under
+`/home/intpa/ssbu-cpu-pilot-install/`). Prove the mod loaded on the game's own
+screen in the same boot (for a stage: the native stage select) before judging
+the plugin's view of it. Without the pin the run shows stock assets and the
+check proves nothing (2026-11-04, TrainingRooms RC10).
+
 ## Up
 
 ```text

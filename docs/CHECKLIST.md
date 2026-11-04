@@ -124,6 +124,12 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   hand-driven inputs, 15 minutes without a newly passed row) or the boot was
   stopped and the rows fixed ([MACROS](MACROS.md), rule 13). Evidence: the
   `setup` list and the `pace:` lines in the run's output.
+- **C** (a row depends on a mod in `ultimate/mods`: stage, fighter, UI or
+  sound replacement) the card's `libarcropolis.nro` is in the run's pinned
+  plugins. The lifecycle moves every unpinned NRO aside, so without it no mod
+  loads and the row shows stock assets ([EDEN](EDEN.md), "Mods need
+  ARCropolis"). Evidence: the pin in `config.json`, and the game's own screen
+  showing the mod in the same boot (for a stage, the native stage select).
 - **M** A run whose precondition line never comes is aborted and retried
   under the next label ([EDEN](EDEN.md), "Queue runs").
 - **M** Game-side facts are captured with guest tracing on a run already
@@ -169,6 +175,11 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   comes from a committed script over the logged files, with host tests, and
   the command is named next to the numbers.
 - **M** No operator quotes, no claims beyond the tests.
+- **C** (the evidence says a particular picture, icon or mod asset is shown)
+  the frame is put next to the expected image decoded from its source file
+  (the mod's file, or the stock file from `data.arc`), and the stock case is
+  ruled out the same way ([GIFS](GIFS.md), "Check before you use it").
+  Evidence: the side-by-side image and the decoded files' paths.
 - **C** (the change alters something a recorded decision covers) the commit
   and report cite the decision (document, item, date) and, when a newer
   order reverses it, say so plainly; the new decision is recorded where the
