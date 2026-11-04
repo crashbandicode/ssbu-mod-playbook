@@ -370,11 +370,33 @@ class LifecycleTests(unittest.TestCase):
         self.config['stale_claim_hours'] = 24
         self.ledger.open_text = '2026-10-01 12:00Z CLAIMED: OpenCode foreign/stream on Surface old'
         self.host.foreign = [{'pid': 999, 'name': 'rustc'}]
-        with self.assertRaisesRegex(life.Refused, 'Eden/compiler already active'):
+        with self.assertRaisesRegex(life.Refused, 'Compiler already active'):
             self.controller().up()
         self.assertNotIn('claim', self.order)
         self.assertFalse(self.ledger.claimed or self.ledger.released)
         self.assertFalse(Path(self.config['work_root']).exists())
+
+    def test_a_second_eden_is_admitted_on_a_two_instance_host(self):
+        # Operator 2026-11-04: the Surface and the Yoga run two emulators. Launcher/helper processes are not instances.
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.max_eden = 2
+        self.host.foreign = [{'pid': 501, 'name': 'eden'}, {'pid': 502, 'name': 'eden.appimage'},
+                             {'pid': 503, 'name': 'eden-lan-runtim'}]
+        self.controller().admission()
+
+    def test_a_third_eden_is_refused_on_a_two_instance_host(self):
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.max_eden = 2
+        self.host.foreign = [{'pid': 501, 'name': 'eden'}, {'pid': 601, 'name': 'eden'}]
+        with self.assertRaisesRegex(life.Refused, r'2 Eden instance\(s\) already active on host \(limit 2\)'):
+            self.controller().admission()
+
+    def test_a_one_instance_host_refuses_a_second_eden(self):
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.max_eden = 1
+        self.host.foreign = [{'pid': 501, 'name': 'eden.exe'}]
+        with self.assertRaisesRegex(life.Refused, r'1 Eden instance\(s\) already active on host \(limit 1\)'):
+            self.controller().admission()
         self.assertFalse(self.host.calls)
 
     def test_young_claim_still_blocks_with_stale_option(self):

@@ -41,6 +41,8 @@ GIB = 1024 ** 3
 # Same filter as tools/eden-solo/gv.py launch. "log_filter" in the config overrides it.
 DEFAULT_LOG_FILTER = '*:Warning Frontend:Info Service.Sockets:Info Network:Info'
 MIN_MEMORY = 10 * GIB
+# Process names that are one running emulator instance (Linux comm, Windows image name).
+EDEN_INSTANCE_NAMES = {'eden', 'yuzu', 'eden.exe'}
 MIN_DISK = 40 * 10 ** 9
 READ_ONLY = ('user/nand/user/Contents', 'user/nand/system/Contents', 'user/firmware')
 PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'
@@ -434,6 +436,8 @@ def run_lock(stream):
 
 
 class Host:
+    # Linux rigs (Surface, Yoga: 32 GB): two Eden instances at once, each under its own 8 GiB unit (operator 2026-11-04).
+    max_eden = 2
     """Real Linux executor. Tests replace this class; no shell-string commands."""
     clock = staticmethod(time.monotonic)
     sleep = staticmethod(time.sleep)
@@ -635,6 +639,8 @@ class WindowsHost(Host):
     Reuses the pinned, reviewed winjob API, not its installed-profile controllers.
     All RPCs use the pinned asynchronous PowerShell named-pipe client.
     """
+    max_eden = 1  # the Ally (18.7 GB, 23 GB commit limit) runs one Eden at a time
+
     def __init__(self, config, job_api=None):
         self.config, self._job, self.peaks = config, job_api, {}
 
@@ -993,7 +999,15 @@ class Lifecycle:
         self.record('admission', value)
         require(value['mem_available'] >= MIN_MEMORY, 'MemAvailable below 10 GiB')
         require(value['disk_free'] >= MIN_DISK, 'Free disk below 40 GB')
-        require(not value['foreign_processes'], 'Eden/compiler already active on host')
+        # Compilers always block an Up. Other Eden instances are allowed up to the host's limit (operator 2026-11-04:
+        # the Surface and the Yoga can each run two emulators; the Ally stays at one). Only the emulator binary counts
+        # as an instance; its AppImage launcher and LAN helper processes belong to the same instance.
+        foreign = value['foreign_processes']
+        edens = [p for p in foreign if p['name'].lower() in EDEN_INSTANCE_NAMES]
+        others = [p for p in foreign if not p['name'].lower().startswith(('eden', 'yuzu'))]
+        require(not others, 'Compiler already active on host')
+        limit = getattr(self.host, 'max_eden', 1)
+        require(len(edens) < limit, f'{len(edens)} Eden instance(s) already active on host (limit {limit})')
         return value
 
     def poll(self, predicate, cap, what):

@@ -38,7 +38,7 @@ AGENT_ROWS = [
     ('Online: replay A/B with the desync detector identical', 'C'),
     ('Online: two consoles past the changed path, desync_seen=0 at the same frame', 'C'),
     ('Eden: claim written and released, also after a failed run', 'M'),
-    ('Eden: one instance per host, MemAvailable >= 10 GiB, not profile a or :61', 'M'),
+    ('Eden: at most two instances per Linux host, one on the Ally; MemAvailable >= 10 GiB; not profile a or :61', 'M'),
     ('Eden: profile copy with hard-linked game content; only the copy changed', 'M'),
     ('Copies: byte-identical files linked, differing or written-in-place files copied', 'M'),
     ('Disk: one target dir per source copy (never shared between copies), cargo home shared per host and toolchain, df checked (>= 40 GB), finished build products deleted with a manifest', 'M'),
