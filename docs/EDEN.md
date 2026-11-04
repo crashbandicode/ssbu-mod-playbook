@@ -219,6 +219,17 @@ clock, and a batch of ten pays that ten times.
   window, fails the lane. Attribute the others by timestamp against the
   plugin's own log lines before dismissing them; stock-game and emulator
   noise exists (repeated `Read64 @ 0x0` + `Read8 @ 0x38` pairs, for one).
+- **A clean scan is not proof of no null read.** Eden doesn't log every
+  unmapped read. On 2026-11-04 (lr-14t, build `6a0c80d2`; `d483c082` has the
+  same logging code) a TrainingRooms RC8 load `ldr x8,[x0,#0x20]` ran
+  with `x0=0x1`, read address `0x21`, got 0, and the full console had no
+  `HW.Memory`/`Unmapped` line; the Switch would fault there. A `0 Unmapped`
+  scan means only that nothing was logged. For any pointer the plugin gets
+  from a native call or reads out of game memory, check the type the game
+  returns (its bytes; a `cset w0` ends a bool, not a pointer) and, on a run
+  already happening, put a `tracepoint` on the load to see the address it
+  uses. Until Eden has an `unmapped_access: "fault"` mode, null-dereference
+  safety needs that review plus hardware, not the log.
 - **The run's end state:** `run.json` and `memory.peak` in the same folder.
 - **Timestamps:** compare them as UTC (`[DateTimeOffset]::Parse(…)`). In
   PowerShell, `[DateTime]'…Z'` converts to local time.

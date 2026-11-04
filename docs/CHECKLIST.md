@@ -138,8 +138,10 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 - **M** `console.log` searched for `panic`, `abort`, `crash` and `Unmapped`;
   an `Unmapped Read`/`Unmapped Write` below `0x1000` or inside the plugin's
   activity window fails the lane, because Eden tolerates the null read the
-  console faults on ([EDEN](EDEN.md), "Read the results"). `run.json` and
-  `memory.peak` kept with the run.
+  console faults on ([EDEN](EDEN.md), "Read the results"). A clean scan
+  doesn't prove there was no null read (Eden misses some; lr-14t): every
+  native return or game-memory value used as a pointer has its type checked
+  against the game's bytes. `run.json` and `memory.peak` kept with the run.
 - **M** Every local command under the memory and time guard; anything with
   `${var}` in a script file.
 - **M** Each run's outputs kept under its label.
