@@ -275,7 +275,7 @@ the work itself.
    - a worker **quiet for 12 minutes without updating its report**.
 
    Anything else needs no action.
-8. **Hosts take turns.** At most two Eden boots on a Linux host (Surface, Yoga) and one on the Ally (the lifecycle enforces it). The lifecycle refuses `Up`
+8. **Hosts take turns.** At most two Eden boots on a Linux host (Surface, Yoga) and one on the Ally (the lifecycle enforces it). The ledger admits a second claim only when the open one is the lifecycle's own (`host=<h> lifecycle=<token> Eden lifecycle admitted`, each run with its own profile copy); a manual or foreign claim still blocks (operator 2026-11-04). The lifecycle refuses `Up`
    while any compiler runs, so builders wait while an Eden worker holds a
    lock file around Up and Down. Gate runs for a new head write to a **new
    folder**, so NRO paths and hashes that running Eden workers pinned stay

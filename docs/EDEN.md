@@ -240,8 +240,17 @@ clock, and a batch of ten pays that ten times.
   from a native call or reads out of game memory, check the type the game
   returns (its bytes; a `cset w0` ends a bool, not a pointer) and, on a run
   already happening, put a `tracepoint` on the load to see the address it
-  uses. Until Eden has an `unmapped_access: "fault"` mode, null-dereference
-  safety needs that review plus hardware, not the log.
+  uses. On builds before `20261104-f916cf4b8c68`, null-dereference safety
+  needs that review plus hardware, not the log.
+- **From `20261104-f916cf4b8c68` (unmapped-stop) on,** with a trace config
+  (`unmapped_access: "log"`), every guest unmapped data access prints a line
+  with its exact PC and module (the first 16, then power-of-two totals), and
+  `edenctl call trace.unmapped_access '{}'` returns `total`/`emitted`/
+  `suppressed`. A `total` of 0 is proof for the paths the run exercised; save
+  the receipt. `"fault"` stops the guest at the first access anywhere (no
+  module filter, the stock game's own reads included), so use it only to get
+  full registers for an access the log already found. The lifecycle accepts
+  `log` and `off`.
 - **The run's end state:** `run.json` and `memory.peak` in the same folder.
 - **Timestamps:** compare them as UTC (`[DateTimeOffset]::Parse(…)`). In
   PowerShell, `[DateTime]'…Z'` converts to local time.

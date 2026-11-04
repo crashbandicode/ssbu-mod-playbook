@@ -247,8 +247,21 @@ def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, n
     scope or time stays blocking, even when the opt-in policy is enabled.
     """
     opened = active_claims(text, host)
+    # Operator 2026-11-04: the Surface and the Yoga run two emulators. A claim this tool wrote for another run on the
+    # same host (`host=<host> lifecycle=<token> Eden lifecycle admitted`; each run has its own profile copy) is a
+    # concurrent instance, not a block, while fewer than the host's `max_eden` are open. Admission's process, memory
+    # and compiler checks still run first. Manual and foreign claims block as before; the Ally's limit stays 1.
+    limit = admission.get('max_eden', 1) if isinstance(admission, dict) else 1
+    lifecycle_claim = re.compile(r'CLAIMED:\s*\S+(?:\s+\S+)*?\s+host=' + re.escape(host) +
+                                 r'\s+lifecycle=[A-Za-z0-9_-]+\s+Eden lifecycle admitted\s*$', re.I)
+    concurrent = [line for line in opened if lifecycle_claim.search(line)]
+    if 0 < len(concurrent) < limit:
+        opened = [line for line in opened if line not in concurrent]
+    else:
+        concurrent = []
+    extra = {'concurrent_claims': concurrent} if concurrent else {}
     if stale_claim_hours is None:
-        return {'blocking': opened, 'stale_claim_skipped': []}
+        return {'blocking': opened, 'stale_claim_skipped': [], **extra}
     validate_stale_claim_hours(stale_claim_hours)
     clean = isinstance(admission, dict) and admission.get('foreign_processes') == []
     now = now if now is not None else datetime.now(timezone.utc)
@@ -283,7 +296,7 @@ def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, n
             skipped.append({'line': line, 'age_hours': age_hours, 'checked_at': now.isoformat()})
         else:
             blocking.append(line)
-    return {'blocking': blocking, 'stale_claim_skipped': skipped}
+    return {'blocking': blocking, 'stale_claim_skipped': skipped, **extra}
 
 
 class Ledger:
@@ -997,6 +1010,8 @@ class Lifecycle:
         while not path.exists():
             path = path.parent
         value = self.host.resources(path, owned)
+        # The ledger admits up to this many of this tool's own claims on the host (claim_admission).
+        value['max_eden'] = getattr(self.host, 'max_eden', 1)
         self.record('admission', value)
         require(value['disk_free'] >= MIN_DISK, 'Free disk below 40 GB')
         # Compilers always block an Up. Other Eden instances are allowed up to the host's limit (operator 2026-11-04:

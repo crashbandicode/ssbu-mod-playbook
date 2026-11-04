@@ -413,6 +413,43 @@ class LifecycleTests(unittest.TestCase):
             self.controller().admission()
         self.assertFalse(self.host.calls)
 
+    LIFECYCLE_CLAIM = ('2026-11-04T16:45:00.000000+00:00 CLAIMED: OpenCode lane/yoga host=surface '
+                       'lifecycle=run-a Eden lifecycle admitted')
+
+    def test_a_second_lifecycle_claim_is_admitted_on_a_two_instance_host(self):
+        # Operator 2026-11-04: two Edens per Linux host; the ledger must not undo the process limit.
+        policy = life.claim_admission(self.LIFECYCLE_CLAIM, 'surface', 'OpenCode lane/yoga',
+                                      admission={'max_eden': 2, 'foreign_processes': [{'pid': 501, 'name': 'eden'}]})
+        self.assertEqual(policy['blocking'], [])
+        self.assertEqual(policy['concurrent_claims'], [self.LIFECYCLE_CLAIM])
+
+    def test_a_third_lifecycle_claim_is_refused_on_a_two_instance_host(self):
+        second = self.LIFECYCLE_CLAIM.replace('lifecycle=run-a', 'lifecycle=run-b')
+        text = self.LIFECYCLE_CLAIM + '\n' + second
+        policy = life.claim_admission(text, 'surface', 'OpenCode lane/yoga', admission={'max_eden': 2})
+        self.assertEqual(policy['blocking'], [self.LIFECYCLE_CLAIM, second])
+        self.assertNotIn('concurrent_claims', policy)
+
+    def test_a_second_lifecycle_claim_is_refused_on_a_one_instance_host(self):
+        for admission in ({'max_eden': 1}, None):
+            policy = life.claim_admission(self.LIFECYCLE_CLAIM, 'surface', 'OpenCode lane/yoga', admission=admission)
+            self.assertEqual(policy['blocking'], [self.LIFECYCLE_CLAIM])
+
+    def test_a_manual_claim_still_blocks_on_a_two_instance_host(self):
+        manual = '2026-11-04 16:00Z CLAIMED: OpenCode foreign/stream on Surface display :78'
+        other_host = self.LIFECYCLE_CLAIM.replace('host=surface', 'host=yoga')
+        policy = life.claim_admission(manual + '\n' + self.LIFECYCLE_CLAIM, 'surface', 'OpenCode lane/yoga',
+                                      admission={'max_eden': 2})
+        self.assertEqual(policy['blocking'], [manual])
+        policy = life.claim_admission(other_host, 'yoga', 'OpenCode lane/yoga', admission={'max_eden': 2})
+        self.assertEqual(policy['blocking'], [])
+
+    def test_admission_reports_the_host_instance_limit(self):
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.max_eden = 2
+        self.host.foreign = []
+        self.assertEqual(self.controller().admission()['max_eden'], 2)
+
     def test_young_claim_still_blocks_with_stale_option(self):
         self.config['stale_claim_hours'] = 24
         self.ledger.open_text = '2026-11-03 11:00Z CLAIMED: OpenCode foreign/stream on Surface young'
