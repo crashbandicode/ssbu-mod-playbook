@@ -214,6 +214,13 @@ The rules:
      `recover`), and carry on. Don't shut down to retry one row.
    - **Order the batch:** cheap, independent rows first. Rows that may wedge
      the game (crash checks, teardown, long matches) go last.
+   - **Budget the boot against the runtime cap before Up.** Give each row a
+     minute estimate in `rows.json` (`"budget_min"`). Keep the sum, plus
+     about 10 minutes for boot and navigation, under the cap minus `pace`'s
+     5-minute margin. Rows over budget go to a planned second boot, not a
+     forced one. Route-building inside a boot counts against the budget too.
+     (2026-11-04: a Yoga boot spent its time building routes and hit the cap
+     before its redo rows ran.)
    - 2026-11-03: Phase 1 ran 10 boots of 2–5 minutes each over four hours,
      each followed by 10–15 minutes of write-up. Rows passed but almost none
      closed.
