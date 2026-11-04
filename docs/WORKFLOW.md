@@ -230,11 +230,20 @@ the work itself.
    New rows and follow-ups go to **that session** as messages; don't start a
    fresh worker for them. Coding follow-ups go back to the worker that wrote
    the code.
-2. **Replace a worker only when its context runs out,** and then from a
-   handoff file it writes. The file holds what is done, the routes and
-   segments it built, its open rows, and the live run state (claims, run
-   folder, build hashes). The replacement reads the file, not the whole
-   ramp-up.
+2. **Don't replace a worker for context: compact it in place.**
+   - **Measure real usage.** Read each request's prompt size from OpenCode's
+     own token counts (input + cache read; `oc_ctx.py`). The clawo broker's
+     `contextPercent` is measured against about 256K tokens and reads "100%"
+     at a quarter of GLM 5.3 Flash's 1M window.
+   - **Compact near the window.** When a worker's real prompt nears about
+     800K tokens, compact the same session between rows
+     (`POST /api/session/<id>/compact` on the OpenCode server).
+   - **Keep a handoff file current anyway.** It holds what is done, the routes
+     and segments built, the open rows, and the live run state (claims, run
+     folder, build hashes), so a compaction loses nothing.
+   - (2026-11-04: two workers were replaced as "out of context" on the
+     broker's meter at 265K and 428K real tokens. Each replacement re-read
+     everything.)
 3. **Every brief ends in a done-checklist.** Each item is PASS, FAIL or
    BLOCKED with the exact reason. A worker ends its turn only when every item
    has one of those, or when the time-box is actually spent. "Time-box" is not

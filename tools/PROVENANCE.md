@@ -94,3 +94,4 @@ Tegra block-linear deswizzle + Pillow's BCn decoder; BC1–BC5, BC7 and RGBA8) `
 `6d2a2e46f0c3b37f`; `assets/zshim/zstandard.py` (the two calls `arc_extract.py` needs, over Python 3.14's stdlib
 `compression.zstd`) `1fb083fa75a184aa`. Checked by decoding stock and Cosmic Destination `stage_1_end` / `stage_2_end`
 (BC7, 108x90 and 512x256) and matching them to Eden frames; no host tests yet.
+Written here 2026-11-04 (TrainingRooms primary): `oc_ctx.py` (read-only: each OpenCode session's real prompt size per request from the local OpenCode DB, to decide when to compact instead of reading the broker's `contextPercent`) `3bd8478af84bdbf8`.
