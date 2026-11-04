@@ -214,6 +214,11 @@ The rules:
      `recover`), and carry on. Don't shut down to retry one row.
    - **Order the batch:** cheap, independent rows first. Rows that may wedge
      the game (crash checks, teardown, long matches) go last.
+   - **Set the runtime cap for a batch.** It is `config.json` `"runtime"`, in
+     seconds: the lifecycle defaults to 5400 and allows up to 10800. A config
+     cloned with `eden_test.py new --from` keeps its source's cap, and a GIF
+     run's 1200 s cut 11-04's batch boots short. A batch boot sets 5400 or
+     more.
    - **Budget the boot against the runtime cap before Up.** Give each row a
      minute estimate in `rows.json` (`"budget_min"`). Keep the sum, plus
      about 10 minutes for boot and navigation, under the cap minus `pace`'s
