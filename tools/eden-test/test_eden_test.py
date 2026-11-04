@@ -89,6 +89,28 @@ class EdenTestTests(unittest.TestCase):
             eden_test.main(['new', *self.args()])
         self.assertIn('pin changed', str(caught.exception))
 
+    def test_plugin_swaps_the_same_named_pin_and_records_it(self):
+        rc9 = self.dir / 'rc9'
+        rc9.mkdir()
+        (rc9 / 'plugin.nro').write_bytes(b'rc9 build')
+        eden_test.main(['new', *self.args('--plugin', str(rc9 / 'plugin.nro'))])
+        config = json.loads((self.dir / 'runs/lr-14/config.json').read_text())
+        pin = config['instances'][0]['plugins'][0]
+        self.assertEqual((pin['path'], pin['sha256']), (str(rc9 / 'plugin.nro'), sha(rc9 / 'plugin.nro')))
+        self.assertEqual(config['plugin_swaps'][0]['from'], str(self.dir / 'plugin.nro'))
+        with self.assertRaises(SystemExit) as caught:  # an unknown file name is refused, not added
+            eden_test.main(['new', '--from', str(self.previous), '--label', 'lr-15', '--rows', str(self.rows),
+                            '--plugin', str(self.dir / 'Eden.AppImage')])
+        self.assertIn('no pinned plugin', str(caught.exception))
+
+    def test_explicit_defer_load_leaves_boot_setup_to_rows(self):  # pkg4
+        previous = json.loads(self.previous.read_text())
+        previous['defer_load'] = False
+        self.previous.write_text(json.dumps(previous))
+        eden_test.main(['new', *self.args('--defer-load')])
+        config = json.loads((self.dir / 'runs/lr-14/config.json').read_text())
+        self.assertTrue(config['defer_load'])
+
     def test_new_rebases_pinned_qt_without_changing_original_or_other_pins(self):
         qt = self.dir / 'old-qt.ini'
         original = '[Data Storage]\nnand_directory=/old/private/nand\nsdmc_directory=/old/private/sdmc\n[Network]\nport=24872\n'

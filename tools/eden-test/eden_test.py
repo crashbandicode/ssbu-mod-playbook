@@ -12,8 +12,10 @@ after `git -C ~/ssbu-mod-playbook pull --ff-only` there and copying the rows fol
 
 A run folder is /home/intpa/eden-runs/<label>/ with config.json, rows/ (a copy of the rows folder), state/ and
 work/ (fresh every run), out/ (runner output) and RESULTS.md. Pins (Eden AppImage, plugins, files, game) carry over
-from the previous config unchanged; `new` checks each pinned file still has its sha256, and `--app` swaps in a
-different Eden AppImage (resolved path; its sha256 is read). Same-boot fixing (MACROS rule 8): after a failed row,
+from the previous config unchanged; `new` checks each pinned file still has its sha256, `--app` swaps in a
+different Eden AppImage and `--plugin <new build>` swaps the pinned plugin with the same file name (resolved path;
+sha256 read; the swap is recorded in config.json `plugin_swaps`). `--defer-load` leaves the frontend ready so rows
+can configure boot tracing before game.load. Same-boot fixing (MACROS rule 8): after a failed row,
 fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 """
 import argparse
@@ -76,6 +78,20 @@ def cmd_new(args):
     config['work_root'] = str(run / 'work')
     if args.owner:
         config['owner'] = args.owner
+    if args.defer_load:  # pkg4: leave the frontend ready so rows can configure boot tracing before game.load
+        config['defer_load'] = True
+    swapped = []
+    for new in args.plugin:  # swap a pinned plugin for a new build with the same file name, in every instance
+        new_path = Path(new).resolve()
+        hits = [pin for item in config['instances'] for pin in item.get('plugins', [])
+                if Path(pin['path']).name == new_path.name]
+        if not hits:
+            raise SystemExit(f'--plugin {new_path.name}: no pinned plugin with that file name')
+        for pin in hits:
+            swapped.append({'from': pin['path'], 'from_sha256': pin['sha256'], 'to': str(new_path)})
+            pin.update(path=str(new_path), sha256=sha256(new_path))
+    if swapped:
+        config['plugin_swaps'] = swapped
     for item in config['instances']:
         if args.app:
             item['app'] = {'path': str(Path(args.app).resolve()), 'sha256': sha256(Path(args.app).resolve())}
@@ -262,6 +278,10 @@ def main(argv=None):
         p.add_argument('--rows', required=True, help='folder with rows.json, segments, refs and hooks')
         p.add_argument('--app', help='use this Eden AppImage instead of the previous config\'s')
         p.add_argument('--owner')
+        p.add_argument('--plugin', action='append', default=[],
+                       help='swap the pinned plugin with this file name for this build (repeatable; sha256 is read)')
+        p.add_argument('--defer-load', action='store_true',
+                       help='leave the frontend ready so rows can configure boot tracing before game.load')
     for name in ('up', 'down'):
         sub.add_parser(name).add_argument('run', type=Path)
     p = sub.add_parser('run')
