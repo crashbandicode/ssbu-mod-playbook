@@ -305,6 +305,15 @@ The rules:
     it once as a segment, and reuse it. (2026-11-04: the Ally batch lost its
     first 15 minutes to menu chords that never registered, until the worker
     built same-frame chord macros.)
+15. **A row passes on the behaviour, not on its setup.** A row's gate checks
+    that the behaviour under test happened. Use a machine-readable value where
+    one exists: a guest tracepoint on the plugin's function (its return or
+    argument per event), a log line, a HUD number. Otherwise use a frame that
+    shows the event itself: the hit, the death, the respawn. "Fixture applied"
+    and "clip recorded" are setup checks only. (2026-11-04: five TrainingRooms
+    rows passed on their setup gates while their clips showed no respawn, no
+    hit during playback, and no difference between SDI on and off. The
+    coordinator's frame review caught it.)
 
 #### The shared runner: a helper, extended per project
 
