@@ -156,6 +156,19 @@ in the game's copy registry. The root was that the plugin built a state the
 game never builds (Kirby as the second body of an entry). The fix builds
 valid states instead, and the player's rotation order stays free.
 
+### Design changes and recorded decisions
+
+Plugin repos keep decisions in their specs and decision logs (a spec's open
+questions, `MENU-DRAFT.md`, a `DECISIONS.md`). Before a change alters
+something a decision covers (where assets come from, what a menu shows,
+which fighters or stages a feature allows), find that decision and cite it
+in the commit and the report: the document, the item and its date. A newer
+order from the operator wins, but name the conflict plainly ("this reverses
+SPEC-core-07 Q16, 2026-11-01: portraits read at run time, nothing baked")
+so the operator decides knowing both, and record the new decision where the
+old one lives. A citation names where the decision was made: the document
+and item, or the order's message and time.
+
 ### Build caches and disk
 
 A cargo `target/` directory reaches 5–20 GB for a large plugin. On

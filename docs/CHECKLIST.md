@@ -169,6 +169,11 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   comes from a committed script over the logged files, with host tests, and
   the command is named next to the numbers.
 - **M** No operator quotes, no claims beyond the tests.
+- **C** (the change alters something a recorded decision covers) the commit
+  and report cite the decision (document, item, date) and, when a newer
+  order reverses it, say so plainly; the new decision is recorded where the
+  old one lives ([WORKFLOW](WORKFLOW.md), "Design changes and recorded
+  decisions").
 - **M** The handoff file current at each checkpoint: branch, commit,
   evidence, live state, next commands; no secrets.
 
