@@ -41,6 +41,7 @@ GIB = 1024 ** 3
 # Same filter as tools/eden-solo/gv.py launch. "log_filter" in the config overrides it.
 DEFAULT_LOG_FILTER = '*:Warning Frontend:Info Service.Sockets:Info Network:Info'
 MIN_MEMORY = 10 * GIB
+MIN_MEMORY_SECOND = 9 * GIB  # for a second Eden on the host (each instance is capped at 8 GiB)
 # Process names that are one running emulator instance (Linux comm, Windows image name).
 EDEN_INSTANCE_NAMES = {'eden', 'yuzu', 'eden.exe'}
 MIN_DISK = 40 * 10 ** 9
@@ -997,7 +998,6 @@ class Lifecycle:
             path = path.parent
         value = self.host.resources(path, owned)
         self.record('admission', value)
-        require(value['mem_available'] >= MIN_MEMORY, 'MemAvailable below 10 GiB')
         require(value['disk_free'] >= MIN_DISK, 'Free disk below 40 GB')
         # Compilers always block an Up. Other Eden instances are allowed up to the host's limit (operator 2026-11-04:
         # the Surface and the Yoga can each run two emulators; the Ally stays at one). Only the emulator binary counts
@@ -1008,6 +1008,10 @@ class Lifecycle:
         require(not others, 'Compiler already active on host')
         limit = getattr(self.host, 'max_eden', 1)
         require(len(edens) < limit, f'{len(edens)} Eden instance(s) already active on host (limit {limit})')
+        # The first instance needs 10 GiB available. A second one needs 9 GiB (operator 2026-11-04): its own unit
+        # caps it at 8 GiB, plus 1 GiB of headroom.
+        need = MIN_MEMORY_SECOND if edens else MIN_MEMORY
+        require(value['mem_available'] >= need, f'MemAvailable below {need // GIB} GiB')
         return value
 
     def poll(self, predicate, cap, what):

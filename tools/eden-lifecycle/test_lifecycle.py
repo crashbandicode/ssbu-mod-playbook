@@ -384,6 +384,20 @@ class LifecycleTests(unittest.TestCase):
                              {'pid': 503, 'name': 'eden-lan-runtim'}]
         self.controller().admission()
 
+    def test_a_second_eden_needs_9_gib_and_the_first_10(self):
+        # Operator 2026-11-04: lower the free-memory check to 9 GiB for a second instance (each is capped at 8 GiB).
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.max_eden = 2
+        self.host.available = int(9.5 * life.GIB)
+        self.host.foreign = []
+        with self.assertRaisesRegex(life.Refused, 'MemAvailable below 10 GiB'):
+            self.controller().admission()
+        self.host.foreign = [{'pid': 501, 'name': 'eden'}]
+        self.controller().admission()
+        self.host.available = int(8.5 * life.GIB)
+        with self.assertRaisesRegex(life.Refused, 'MemAvailable below 9 GiB'):
+            self.controller().admission()
+
     def test_a_third_eden_is_refused_on_a_two_instance_host(self):
         Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
         self.host.max_eden = 2
