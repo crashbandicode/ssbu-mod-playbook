@@ -252,9 +252,11 @@ the work itself.
    the playbook in general isn't enough. Name the tile cursor plugin
    ([TILE-CURSOR](TILE-CURSOR.md)), the runner's segment library, the
    project's own hook sets (for TrainingRooms, `eden/lr*-shared`, which
-   includes pilot arming), and settings fixtures. (2026-11-04: Phase 2/3
-   workers stick-steered the character select and hand-built tile-step
-   macros, with the tile cursor plugin already in their plugin set.)
+   includes pilot arming), and settings fixtures. (2026-11-04: the primary's own Ally brief said "set fighters at the character
+   select" without naming the tile cursor, and the repo's tile-step hook sent
+   L3 and the D-pad as two calls in different frames, MACROS rule 14. In
+   these tools `lstick` in a button list is the L3 click, the tile cursor's
+   modifier, not stick steering.)
 5. **A shared route library, committed as soon as something works.** A chord
    macro, a menu route, a fixture or a hook that works goes into the project's
    library (for example `eden/<phase>/lib/` with a one-line index) and is
