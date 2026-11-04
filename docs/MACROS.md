@@ -249,11 +249,19 @@ The rules:
     - `--plugin <new build>` on `new` swaps the pinned plugin with that file
       name; `--defer-load` leaves the frontend ready for boot tracing.
     - `pace <run>` reports hand-driven inputs (control requests outside
-      macro recordings, minus the runner's own hook inputs) and the minutes
-      since the last newly passed row; it exits 2 and prints `STOP` past 40
-      inputs or 15 minutes. `run` prints it after every call. When it says
-      STOP, stop steering: use a fixture, record the route once, or Down and
-      fix the rows (rule 13).
+      macro recordings, minus the runner's own hook inputs), the minutes
+      since the last newly passed row and the minutes left before the run's
+      runtime cap (`runtime` in the config). It exits 2 and prints `STOP`
+      past 40 inputs, 15 minutes without progress, or 5 minutes before the
+      cap. `run` prints it after every call. When it says STOP: Down if the
+      cap is near (Eden has crashed on the cap's SIGTERM, 2026-11-03/04);
+      otherwise stop steering, use a fixture, record the route once, or Down
+      and fix the rows (rule 13). Retakes of clips go on a fresh boot.
+    - Mid-boot fixes change `rows.json` and hooks only, never `config.json`
+      or the lifecycle's `state/lifecycle.json`. If `config.json` was edited
+      after Up anyway, `down` restores the Up-time config (the lifecycle
+      refuses a mismatch) and keeps the edited copy as
+      `config.after-up.<time>.json`.
 11. **Read the game's state; don't assume it.** A row doesn't hard-code a
     fixture's roster index, fighter kind or prefetch target. It reads them
     first, from the settings or roster JSON (`json` gate, `copy`), the
