@@ -276,6 +276,10 @@ The rules:
     keeps working through its batches. It waits for a busy host with polls of
     60 s or less instead of ending its turn, and posts only at row checkpoints.
     Restarting an agent that ended its turn costs minutes of re-reading.
+    This includes a run in progress: poll `eden_test.py pace` and the runner
+    log until it finishes. (2026-11-04: an OpenCode worker ended its turn
+    "until the retry completes"; the retry failed a minute later, and the
+    worker sat idle for 11 minutes until the primary re-sent it.)
 13. **Reach the starting state with a fixture, and plan it before Up.** A
     row's starting state (which fighters, which stage, which settings, which
     screen) comes from, in this order: a **fixture** (a pinned file in the
@@ -293,6 +297,14 @@ The rules:
     boot steering the character select to make the CPU Kirby, 139 single
     inputs and no finished row, until the runtime cap stopped Eden; the
     plugin's settings fixture reached the same state in one step.)
+14. **Press a chord in one frame.** A plugin that reads a button combination
+    (a menu chord such as `B`+`Up`, a shortcut such as `ZL`+`Left`, the
+    `L`+`R`+`A` start) sees it only when every button goes down in the same
+    poll frame. Sequential `input.button` calls straddle frames and the chord
+    never fires. Put chords in a macro whose events share one frame, record
+    it once as a segment, and reuse it. (2026-11-04: the Ally batch lost its
+    first 15 minutes to menu chords that never registered, until the worker
+    built same-frame chord macros.)
 
 #### The shared runner: a helper, extended per project
 
