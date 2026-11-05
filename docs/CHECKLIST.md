@@ -6,8 +6,11 @@ condition is stated, and when it does not apply the report says N/A and
 why) or **E** (an example of how it was done, not a rule).
 
 ```text
-python3 -I tools/check/compliance.py <plugin repo> [--nro <file>] [--out report.md]
+python3 -I tools/check/compliance.py <plugin repo> [--nro <file>] [--base <ref>] [--trace <design.md>]... [--out report.md]
 ```
+
+Pass `--base` (the commit the branch started from) and `--trace` (the design report) for every branch: without them
+the two rows below stay `agent` rows, and a brief can require them.
 
 fills the rows a machine can verify and prints the report. The agent
 completes the rest with evidence: a file, a log line, a command's output. A
@@ -45,6 +48,19 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   its date ([WORKFLOW](WORKFLOW.md), "Root cause, or the operator's
   approval"). Defects that share one cause were checked for a single
   abstraction, and the report says which approach was chosen and why.
+- **M** Every user-facing refusal the branch adds cites an approved restriction (operator 2026-11-05, after a worker
+  shipped "Turn Player Swapping on to switch Player 1" without asking). A refusal is a string literal that refuses or
+  restricts what the user asked for ("Turn X on to …", "unavailable", "not available", "only when", "requires",
+  "cannot", …). The line, or one of the 3 above it, carries `// restriction: <ID>`, and `docs/RESTRICTIONS.md` has a
+  table row `| <ID> | message | why | approved |` whose last cell records the operator's approval (a date or decision
+  ID; `pending` does not count). An ordinary refusal ("busy", "a save state is loading") is listed once like any other.
+  Evidence: `compliance.py --base <branch start>`.
+- **M** The design report, written before the code, has a requirement-trace table: one row per clause of the
+  operator's request, quoted verbatim, the design element that implements it, and the test(s) that prove it, as
+  backticked function names (`| Operator clause | Design | Test |`). A requirement "the same as X" is proven by a
+  parity test that runs X and the new path through one table of cases. Every row names a test and every named test
+  exists. The design report is a working file beside the handoff; the README and shipped docs still carry no operator
+  quotes. Evidence: `compliance.py --trace <design report>`.
 
 ## Hook safety
 

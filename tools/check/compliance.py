@@ -1,12 +1,19 @@
 """Fill in the machine-checkable rows of docs/CHECKLIST.md for a plugin repo.
 
 Usage:
-  compliance.py <plugin repo> [--nro <file>] [--out report.md]
+  compliance.py <plugin repo> [--nro <file>] [--base <ref>] [--trace <design.md>]... [--out report.md]
 
 Prints one Markdown table, `Requirement | Tag | Result | Evidence`. Rows a
 machine can verify get `pass` or `fail` with what was read; the others are
 printed as `agent` for the agent to complete with evidence or `N/A: reason`.
-Exit status 1 when a mandatory machine row fails. Read-only."""
+Exit status 1 when a mandatory machine row fails. Read-only.
+
+--base <ref>: the commit the branch started from. Every user-facing refusal
+the branch adds (a string literal that refuses or restricts, e.g. "Turn X on
+to ...", "unavailable", "only when") must carry `// restriction: <ID>` on its
+line or the 3 lines above, and <ID> must be approved in docs/RESTRICTIONS.md.
+--trace <file>: a design report whose requirement-trace table maps each of the
+operator's clauses to a test; every row needs a test and every test must exist."""
 import argparse
 import hashlib
 import re
@@ -27,6 +34,15 @@ CARD_COMMANDS = re.compile(
     r"|\bumount\b"
     r"|\beject['\"]?\s*,?\s*['\"]?(?:-|/dev/)"
     r"|(?:^|[;&|(]\s*|\bsudo\s+)mount\s+(?:-|/dev/)")
+# A string literal that refuses or restricts what the user asked for. Restrictions
+# need the operator's approval (WORKFLOW: workarounds and restrictions), so a branch
+# that adds one must cite an approved entry of docs/RESTRICTIONS.md.
+REFUSAL = re.compile(
+    r'"[^"\n]*(?:\bturn\b[^"\n]{0,40}\bon\b|\bunavailable\b|\bnot available\b|\brefus\w*'
+    r"|\bcan't\b|\bcannot\b|\bcan not\b|\bonly (?:when|while|in|with|after|before)\b"
+    r'|\brequires?\b|\bnot allowed\b|\bblocked\b|\bdisabled\b)[^"\n]*"', re.I)
+RESTRICTION_TAG = re.compile(r'restriction:\s*([A-Za-z0-9_.\-]+)')
+APPROVED_EMPTY = {'', '-', 'pending', 'no', 'not yet', 'tbd'}
 AGENT_ROWS = [
     ('Gates run: test, clippy -D warnings, no-default-features, skyline release, diag build', 'M'),
     ('Fixes: root cause fixed, or each workaround approved by the operator before it shipped and listed with its date', 'M'),
@@ -106,6 +122,98 @@ def git(repo, *args):
     return done.stdout.strip() if done.returncode == 0 else None
 
 
+def added_lines(repo, base, suffix='.rs'):
+    """(path, line number, text) of every line `base...HEAD` adds to a file ending in
+    `suffix`; None when git can't produce the diff (unknown base)."""
+    diff = git(repo, 'diff', '--unified=0', '--no-color', '--no-ext-diff', f'{base}...HEAD', '--',
+               f'*{suffix}')
+    if diff is None:
+        return None
+    added, path, number = [], None, 0
+    for line in diff.splitlines():
+        if line.startswith('+++ '):
+            path = line[6:] if line.startswith('+++ b/') else None
+        elif line.startswith('@@'):
+            match = re.search(r'\+(\d+)', line)
+            number = int(match.group(1)) if match else 0
+        elif line.startswith('+') and path:
+            added.append((path, number, line[1:]))
+            number += 1
+    return added
+
+
+def is_test_path(path):
+    parts = Path(path).parts
+    name = Path(path).name
+    return 'tests' in parts or name in ('tests.rs', 'test.rs') or name.endswith(('_tests.rs', '_test.rs'))
+
+
+def approved_restrictions(repo):
+    """IDs of docs/RESTRICTIONS.md table rows whose last column records an approval."""
+    approved = set()
+    for line in read(repo / 'docs' / 'RESTRICTIONS.md').splitlines():
+        cells = [c.strip() for c in line.strip().strip('|').split('|')]
+        if not line.lstrip().startswith('|') or len(cells) < 2 or set(cells[0]) <= set('-: '):
+            continue
+        ident = cells[0].strip('`* ')
+        if ident.lower() in ('id', '') or cells[-1].strip('`* ').lower() in APPROVED_EMPTY:
+            continue
+        approved.add(ident)
+    return approved
+
+
+def new_refusals(repo, base):
+    """Each refusal string the branch adds, with the restriction ID it cites (or None).
+    Comment lines and test files are skipped. None when the diff can't be read."""
+    added = added_lines(repo, base)
+    if added is None:
+        return None
+    hits, files = [], {}
+    for path, number, text in added:
+        code = text.strip()
+        if code.startswith(('//', '/*', '*')) or is_test_path(path) or not REFUSAL.search(code):
+            continue
+        if path not in files:
+            files[path] = read(repo / path).splitlines()
+        lines = files[path]
+        window = lines[max(0, number - 4):number] if lines else [text]
+        tags = [m.group(1) for line in window for m in [RESTRICTION_TAG.search(line)] if m]
+        hits.append((f'{path}:{number}', code[:90], tags[-1] if tags else None))
+    return hits
+
+
+def trace_tables(text):
+    """Rows of every Markdown table whose header names an operator clause and a test:
+    [(clause, tests)], tests being the backticked names in the test column."""
+    rows, lines, i = [], text.splitlines(), 0
+    while i < len(lines):
+        header = lines[i].strip()
+        cells = [c.strip().lower() for c in header.strip('|').split('|')] if header.startswith('|') else []
+        test_col = next((k for k, c in enumerate(cells) if 'test' in c), None)
+        clause_col = next((k for k, c in enumerate(cells) if 'clause' in c or 'operator' in c), None)
+        if test_col is None or clause_col is None or i + 1 >= len(lines) \
+                or not re.fullmatch(r'\|?[\s:\-|]+\|?', lines[i + 1].strip()):
+            i += 1
+            continue
+        i += 2
+        while i < len(lines) and lines[i].strip().startswith('|'):
+            row = [c.strip() for c in lines[i].strip().strip('|').split('|')]
+            if len(row) > max(test_col, clause_col):
+                names = re.findall(r'`([^`]+)`', row[test_col])
+                rows.append((row[clause_col], [n.split('::')[-1].split('(')[0].strip() for n in names]))
+            i += 1
+    return rows
+
+
+def defined_tests(repo):
+    """Every `fn name` in the repo's Rust sources and `def name` in its Python tools."""
+    names = set()
+    for path in list(repo.glob('src/**/*.rs')) + list(repo.glob('tests/**/*.rs')) \
+            + list(repo.glob('crates/**/*.rs')) + list(repo.glob('tools/**/*.py')):
+        names.update(re.findall(r'\b(?:fn|def)\s+([A-Za-z_]\w*)', read(path)))
+    return names
+
+
 def gif_info(path):
     try:
         from PIL import Image
@@ -161,7 +269,7 @@ def guard_size(initializer, all_src):
     return len(re.findall(r"0x[0-9a-fA-F]{2}", initializer))
 
 
-def rows_for(repo, nro_path):
+def rows_for(repo, nro_path, base=None, traces=()):
     rows = []
 
     def row(name, tag, ok, evidence):
@@ -275,6 +383,38 @@ def rows_for(repo, nro_path):
     else:
         rows.append(('shipped NRO identity and diag strings', 'M', 'agent',
                      'no NRO found (pass --nro)'))
+    refusal_row = 'New user-facing refusals cite an approved restriction (// restriction: ID, docs/RESTRICTIONS.md)'
+    if base:
+        hits = new_refusals(repo, base)
+        if hits is None:
+            row(refusal_row, 'M', False, f'git diff {base}...HEAD failed (unknown base?)')
+        else:
+            approved = approved_restrictions(repo)
+            bad = [f'{where} {text}' + (f' (cites {tag}: not approved)' if tag else ' (no restriction: tag)')
+                   for where, text, tag in hits if tag not in approved]
+            row(refusal_row, 'M', not bad,
+                '; '.join(bad[:6]) + (f' (+{len(bad) - 6} more)' if len(bad) > 6 else '')
+                if bad else f'{len(hits)} added refusal(s) since {base}, all cite approved IDs')
+    else:
+        rows.append((refusal_row, 'M', 'agent', 'pass --base <the commit the branch started from>'))
+    trace_row = 'Design report traces every operator clause to a test that exists'
+    if traces:
+        defined = defined_tests(repo)
+        problems, total = [], 0
+        for trace in traces:
+            table = trace_tables(read(Path(trace)))
+            if not table:
+                problems.append(f'{Path(trace).name}: no table with an operator-clause and a test column')
+            for clause, names in table:
+                total += 1
+                if not names:
+                    problems.append(f'"{clause[:50]}": no test named')
+                problems += [f'"{clause[:40]}": `{n}` not found' for n in names if n not in defined]
+        row(trace_row, 'M', not problems,
+            '; '.join(problems[:6]) + (f' (+{len(problems) - 6} more)' if len(problems) > 6 else '')
+            if problems else f'{total} clause(s), every test found')
+    else:
+        rows.append((trace_row, 'M', 'agent', 'pass --trace <design report with the requirement-trace table>'))
     for name, tag in AGENT_ROWS:
         rows.append((name, tag, 'agent', ''))
     return rows
@@ -284,10 +424,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('repo', help='plugin repository')
     parser.add_argument('--nro', help='shipped NRO (default: dist/ or target/ release build)')
+    parser.add_argument('--base', help='the commit the branch started from (checks added refusals)')
+    parser.add_argument('--trace', action='append', default=[],
+                        help='design report with the requirement-trace table (repeatable)')
     parser.add_argument('--out', help='also write the report here')
     args = parser.parse_args(argv)
     repo = Path(args.repo).resolve()
-    rows = rows_for(repo, args.nro)
+    rows = rows_for(repo, args.nro, args.base, args.trace)
     lines = [f'# Compliance report: {repo.name}', '',
              '| Requirement | Tag | Result | Evidence |', '| --- | --- | --- | --- |']
     lines += [f'| {name} | {tag} | {result} | {evidence} |' for name, tag, result, evidence in rows]
