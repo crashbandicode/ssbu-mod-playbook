@@ -230,13 +230,15 @@ the work itself.
    New rows and follow-ups go to **that session** as messages; don't start a
    fresh worker for them. Coding follow-ups go back to the worker that wrote
    the code.
-2. **Never replace a worker for context.**
-   - **The tool compacts by itself when it needs to,** so the same workers
-     run for the whole campaign.
-   - **Worker context belongs to the operator.** The coordinator doesn't
-     monitor or compact a worker's context, and doesn't act on the clawo
-     broker's `contextPercent`. That meter reads "100%" at about 256K tokens,
-     a quarter of GLM 5.3 Flash's 1M window.
+2. **Ignore context entirely; never replace an agent for it** (operator
+   2026-11-05).
+   - **The tool compacts by itself when it needs to,** so the same primary
+     and the same workers run for the whole campaign.
+   - **Context belongs to the operator.** No agent watches, reports, measures
+     or acts on its own or another session's context, and none compacts,
+     recycles or hands off because of it. Ignore the clawo broker's
+     `contextPercent` (that meter reads "100%" at about 256K tokens, a
+     quarter of GLM 5.3 Flash's 1M window).
    - **Workers keep a handoff file current at row checkpoints:** what is done,
      the routes and segments built, the open rows, and the live run state
      (claims, run folder, build hashes).
