@@ -58,6 +58,15 @@ class Refusals(unittest.TestCase):
             'src/b_tests.rs': 'fn t() { let _ = "cannot"; }\n'})
         self.assertEqual(new_refusals(repo, base), [])
 
+    def test_positively_phrased_scope_limits_and_waits_are_reported(self):
+        """2026-11-05: "Combos work in Training" limited combos to Training and slipped past the first pattern."""
+        repo, base = repo_with({'src/a.rs': ''}, {'src/a.rs': (
+            'fn a() { return Err("Combos work in Training".into()); }\n'
+            'fn b() { return Err("Wait for the practice fighters to finish loading".into()); }\n'
+            'fn c() { notify("Recording works only in native Training"); }\n'
+            'fn d() { notify("Stage ready"); }\n')})
+        self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:1', 'src/a.rs:2', 'src/a.rs:3'])
+
     def test_in_file_test_modules_and_assertions_are_not_reported(self):
         """2026-11-05 rc.5: `assert!(… " - unavailable")` in a `#[cfg(test)] mod tests` was reported."""
         repo, base = repo_with({'src/a.rs': 'fn a() {}\n'}, {'src/a.rs': (

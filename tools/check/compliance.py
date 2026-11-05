@@ -40,7 +40,10 @@ CARD_COMMANDS = re.compile(
 REFUSAL = re.compile(
     r'"[^"\n]*(?:\bturn\b[^"\n]{0,40}\bon\b|\bunavailable\b|\bnot available\b|\brefus\w*'
     r"|\bcan't\b|\bcannot\b|\bcan not\b|\bonly (?:when|while|in|with|after|before)\b"
-    r'|\brequires?\b|\bnot allowed\b|\bblocked\b|\bdisabled\b)[^"\n]*"', re.I)
+    r'|\brequires?\b|\bnot allowed\b|\bblocked\b|\bdisabled\b'
+    # Scope limits phrased positively ("Combos work in Training", 2026-11-05) and waits imposed on the user.
+    r'|\b(?:works?|available|allowed)\s+(?:only\s+)?(?:in|on|with|while|after|during)\b|\bwait\s+for\b'
+    r')[^"\n]*"', re.I)
 RESTRICTION_TAG = re.compile(r'restriction:\s*([A-Za-z0-9_.\-]+)')
 APPROVED_EMPTY = {'', '-', 'pending', 'no', 'not yet', 'tbd'}
 AGENT_ROWS = [
