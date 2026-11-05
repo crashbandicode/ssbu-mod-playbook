@@ -162,19 +162,41 @@ def approved_restrictions(repo):
     return approved
 
 
+def test_lines(lines):
+    """1-based line numbers inside `#[cfg(test)]` items (an in-file `mod tests { … }` or a test fn), by brace depth."""
+    inside, i = set(), 0
+    while i < len(lines):
+        if '#[cfg(test)]' not in lines[i]:
+            i += 1
+            continue
+        start, depth, opened = i, 0, False
+        while i < len(lines):
+            depth += lines[i].count('{') - lines[i].count('}')
+            opened = opened or '{' in lines[i]
+            i += 1
+            if opened and depth <= 0:
+                break
+        inside.update(range(start + 1, i + 1))
+    return inside
+
+
 def new_refusals(repo, base):
     """Each refusal string the branch adds, with the restriction ID it cites (or None).
-    Comment lines and test files are skipped. None when the diff can't be read."""
+    Comment lines, assertions, test files and `#[cfg(test)]` items are skipped. None when the diff can't be read."""
     added = added_lines(repo, base)
     if added is None:
         return None
-    hits, files = [], {}
+    hits, files, tests = [], {}, {}
     for path, number, text in added:
         code = text.strip()
-        if code.startswith(('//', '/*', '*')) or is_test_path(path) or not REFUSAL.search(code):
+        if code.startswith(('//', '/*', '*')) or is_test_path(path) or not REFUSAL.search(code) \
+                or re.match(r'(?:debug_)?assert(?:_eq|_ne)?!', code):
             continue
         if path not in files:
             files[path] = read(repo / path).splitlines()
+            tests[path] = test_lines(files[path])
+        if number in tests[path]:
+            continue
         lines = files[path]
         window = lines[max(0, number - 4):number] if lines else [text]
         tags = [m.group(1) for line in window for m in [RESTRICTION_TAG.search(line)] if m]

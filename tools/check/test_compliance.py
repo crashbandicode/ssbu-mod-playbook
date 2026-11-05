@@ -58,6 +58,15 @@ class Refusals(unittest.TestCase):
             'src/b_tests.rs': 'fn t() { let _ = "cannot"; }\n'})
         self.assertEqual(new_refusals(repo, base), [])
 
+    def test_in_file_test_modules_and_assertions_are_not_reported(self):
+        """2026-11-05 rc.5: `assert!(… " - unavailable")` in a `#[cfg(test)] mod tests` was reported."""
+        repo, base = repo_with({'src/a.rs': 'fn a() {}\n'}, {'src/a.rs': (
+            'fn a() {}\n'
+            '#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n'
+            '        let s = "x - unavailable";\n        assert!(s.ends_with(" - unavailable"));\n    }\n}\n'
+            'fn after() { notify("Swap unavailable"); }\n')})
+        self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:10'])
+
     def test_rows_fail_without_approval_and_ask_for_base_when_none_is_given(self):
         repo, base = repo_with({'src/a.rs': ''}, {'src/a.rs': 'fn b() { notify("Only when Player Swapping is On"); }\n'})
         row = {name: (result, ev) for name, _, result, ev in rows_for(repo, None, base)}
