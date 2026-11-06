@@ -354,7 +354,8 @@ class Ledger:
 
 
 # The XPS (ubuntu-xps, 2026-11-06) is a Linux executor like the Surface and Yoga, using the Yoga ledger
-# through ledger_ssh. It runs two Eden instances, like them (dual-Eden proof run xps-dual-01, 2026-11-06).
+# through ledger_ssh. It runs two Eden instances, like them (operator 2026-11-06). Run xps-dual-02 showed an
+# online pair finishing cleanly at about 53 simulated frames/s (power-limited), so timed rows belong elsewhere.
 HOSTS = ('surface', 'yoga', 'xps', 'ally')
 LINUX_MAX_EDEN = {'surface': 2, 'yoga': 2, 'xps': 2}
 

@@ -16,10 +16,23 @@ a label `eNN`, and every file a run writes is named after it.
   - The XPS (`ubuntu-xps`, Ubuntu 26.04, Iris Xe, added 2026-11-06) has
     `current` at `20261104-1961a200485e-unmapped-stop-0c7f89f711d6`. It is a
     Linux executor like the Surface: config `"host": "xps"`, `"hostname":
-    "ubuntu-xps"`, `"ledger_ssh": "memento-claw-yoga-ubuntu"`; two Eden
-    instances at a time, like the Surface and Yoga (proved 2026-11-06 by run
-    `xps-dual-01`, an online pair). Its profile, game and display helper sit
-    at the same paths as on the Yoga.
+    "ubuntu-xps"`, `"ledger_ssh": "memento-claw-yoga-ubuntu"`. It runs two Eden
+    instances at a time, like the Surface and Yoga (operator 2026-11-06: "the
+    default should just be what yoga can do. I'm not using it to game it's for
+    development").
+    - Run `xps-dual-02` (2026-11-06, an online pair, match and rematch) ended
+      cleanly on both instances: `desync_seen=0`, the rematch connected,
+      MemAvailable stayed at or above 12.8 GiB.
+    - But the package's 29.5 W long-term power limit (MMIO PL1) held each
+      instance to about 53 simulated frames/s, where the Yoga runs 60, so a
+      2:00 match takes about 2:18.
+    - Use the Surface or the Yoga for any row that measures time, FPS or
+      latency.
+    - The 13.0.5 update NSP was added to `~/Games/Roms/Switch Rom Updates and
+      DLC` on 2026-11-06. Before that the XPS booted 13.0.3, and every
+      13.0.5-guarded plugin refused.
+
+    Its profile, game and display helper sit at the same paths as on the Yoga.
   - A run pins the resolved release path and the AppImage's sha256, never
     `current`, and names that build in its results. Runs on two builds
     aren't pooled without saying so.
