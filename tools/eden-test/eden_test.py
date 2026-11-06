@@ -141,8 +141,8 @@ def cmd_new(args):
 
 def lifecycle(run, mode):
     config = json.loads((run / 'config.json').read_text())
-    if config.get('host') not in ('surface', 'yoga', 'ally'):
-        raise SystemExit('config host must be surface, yoga or ally')
+    if config.get('host') not in ('surface', 'yoga', 'xps', 'ally'):
+        raise SystemExit('config host must be surface, yoga, xps or ally')
     argv = [sys.executable, '-B', '-I', str(LIFECYCLE), mode, str(run / 'config.json'), '--execute']
     return sh(argv, run / f'lifecycle-{mode}.log')
 

@@ -103,7 +103,7 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 
 - **M** Claim written before `Up` and released after `Down`, also after a
   failed run. Evidence: the coordination file's lines.
-- **M** At most two Eden instances on a Linux host (Surface, Yoga) and one on the Ally (operator 2026-11-04;
+- **M** At most two Eden instances on the Surface or Yoga, and one on the XPS or the Ally (operator 2026-11-04, XPS 2026-11-06;
   the lifecycle enforces it), MemAvailable at least 10 GiB for the first instance and 9 GiB for a second one (operator 2026-11-04), never profile `a`,
   display `:61` or another agent's runs.
 - **M** The profile is a copy with the game content hard-linked (`gv.py

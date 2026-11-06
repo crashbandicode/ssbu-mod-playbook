@@ -204,8 +204,8 @@ def active_claims(text, host):
         body = event[2]
         owner = re.match(r'(OpenCode|Codex|Claude|Cursor)\s*([^\s]+)', body, re.I)
         owner_key = (owner[1].lower(), owner[2]) if owner else ('unknown', str(number))
-        explicit = re.search(r'\bhost=(surface|yoga|ally)\b', body, re.I)
-        named = re.search(r'\bon\s+(surface|yoga|ally)\b', body, re.I)
+        explicit = re.search(r'\bhost=(surface|yoga|ally|xps)\b', body, re.I)
+        named = re.search(r'\bon\s+(surface|yoga|ally|xps)\b', body, re.I)
         scope = (explicit or named)
         scope = scope[1].lower() if scope else 'unknown'
         token = re.search(r'\blifecycle=([a-zA-Z0-9_-]+)\b', body)
@@ -279,7 +279,7 @@ def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, n
         claimed_owner = re.match(r'(OpenCode|Codex|Claude|Cursor)\s*'
                                  r'([A-Za-z0-9][A-Za-z0-9_./:-]*)(?=\s|$)', body, re.I)
         scopes = {a.lower() or b.lower() for a, b in re.findall(
-            r'\bhost=([A-Za-z0-9_.-]+)\b|\bon\s+(surface|yoga|ally)\b', body, re.I)}
+            r'\bhost=([A-Za-z0-9_.-]+)\b|\bon\s+(surface|yoga|ally|xps)\b', body, re.I)}
         if (current_owner is None or not claimed_owner
                 or claimed_owner[2].lower() in ('on', 'host', 'lifecycle', 'run', 'display', 'profile')
                 or (claimed_owner[1].lower(), claimed_owner[2]) == current_owner
@@ -353,8 +353,14 @@ class Ledger:
         return self.operate('read')
 
 
+# The XPS (ubuntu-xps, 2026-11-06) is a Linux executor like the Surface and Yoga, using the Yoga ledger
+# through ledger_ssh. It runs one Eden until two have been tested on its 8-thread Iris Xe.
+HOSTS = ('surface', 'yoga', 'xps', 'ally')
+LINUX_MAX_EDEN = {'surface': 2, 'yoga': 2, 'xps': 1}
+
+
 def validate(config):
-    require(config.get('host') in ('surface', 'yoga', 'ally'), 'host must be surface, yoga or ally')
+    require(config.get('host') in HOSTS, 'host must be surface, yoga, xps or ally')
     windows = config['host'] == 'ally'
     if 'stale_claim_hours' in config:
         validate_stale_claim_hours(config['stale_claim_hours'])
@@ -945,6 +951,8 @@ class Lifecycle:
     def __init__(self, config, host=None, ledger=None, plan_check=None):
         self.c = validate(config)
         self.host = host if host is not None else WindowsHost(config) if config['host'] == 'ally' else Host()
+        if host is None and config['host'] != 'ally':
+            self.host.max_eden = LINUX_MAX_EDEN[config['host']]
         self.directory = Path(config['state_dir'])
         self.journal = self.directory / 'lifecycle.json'
         self.injected_ledger = ledger

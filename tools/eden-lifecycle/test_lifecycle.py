@@ -1028,6 +1028,22 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(life.active_claims(text, 'yoga'), [])
         self.assertEqual(len(life.active_claims(text, 'surface')), 1)
 
+    def test_xps_claims_are_scoped_to_the_xps(self):
+        text = ('2026-11-06 08:00:00Z CLAIMED: OpenCode a/b host=xps lifecycle=t1 Eden lifecycle admitted\n'
+                '2026-11-06 08:01Z CLAIMED: OpenCode c/d on XPS manual check\n')
+        self.assertEqual(life.active_claims(text, 'surface'), [])
+        self.assertEqual(life.active_claims(text, 'yoga'), [])
+        self.assertEqual(len(life.active_claims(text, 'xps')), 2)
+        released = text + '2026-11-06 09:00Z RELEASED: OpenCode a/b host=xps lifecycle=t1 Eden stopped\n'
+        self.assertEqual(len(life.active_claims(released, 'xps')), 1)
+        # An XPS claim must still block the XPS itself, and a hostless claim blocks it too.
+        self.assertEqual(len(life.active_claims(text + 'CLAIMED: OpenCode g/h busy\n', 'xps')), 3)
+
+    def test_xps_is_a_one_instance_linux_host(self):
+        self.assertIn('xps', life.HOSTS)
+        self.assertEqual(life.LINUX_MAX_EDEN, {'surface': 2, 'yoga': 2, 'xps': 1})
+        self.assertEqual(life.Host.max_eden, 2)  # class default unchanged for the Surface and Yoga
+
     def test_unknown_host_and_unparseable_claim_fail_closed(self):
         for text in ('CLAIMED: OpenCode unknown/stream busy\n', 'CLAIMED: malformed record\n'):
             self.assertTrue(life.active_claims(text, 'surface'))

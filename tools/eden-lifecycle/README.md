@@ -40,8 +40,9 @@ Append `--ssh memento-claw-yoga-ubuntu` to run the SAME lifecycle code on Yoga
 through its PowerShell7 login shell, with source/config on stdin, no script
 staging. **All config paths and generated instances paths are executor-host
 paths.** Run the shared runner on that host too; no implicit socket forwarding.
-For local Surface with the authoritative ledger on Yoga, set `ledger_ssh` to
-that SSH host. Claims/releases run under a remote file lock, preserving raw
+For local Surface or XPS with the authoritative ledger on Yoga, set `ledger_ssh` to
+that SSH host. Hosts are `surface`, `yoga`, `xps` (hostname `ubuntu-xps`) and
+`ally`; the XPS runs one Eden at a time. Claims/releases run under a remote file lock, preserving raw
 ledger bytes; unknown host/owner records block rather than disappear. No SSH
 credential/config edits or foreign claim reconciliation are performed.
 
