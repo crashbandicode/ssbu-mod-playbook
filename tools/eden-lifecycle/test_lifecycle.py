@@ -57,6 +57,8 @@ class FakeHost:
         self.socket = True
         self.loading = True
         self.mute = {'value': 0, 'effective': 0}
+        self.boot = {}
+        self.resolution_reply = None
         self.stop_mode = 'done'
         self.fail_launch = None
         self.leftover = False
@@ -104,8 +106,16 @@ class FakeHost:
     def call(self, item, method, params, timeout):
         self.calls.append((item['key'], method, params, timeout))
         self.order.append(method + '-' + item['key'])
-        if method == 'settings.get':
-            result = self.mute
+        if method == 'settings.set':
+            self.boot[params['key']] = params['value']
+            result = {}
+        elif method == 'settings.get':
+            if params.get('key') == 'core.volume':
+                result = self.mute
+            elif params.get('key') == 'core.resolution_setup' and self.resolution_reply is not None:
+                result = self.resolution_reply
+            else:
+                result = {'value': self.boot[params['key']]}
         elif method == 'status':
             result = {'running': True, 'loading_complete': self.loading, 'last_frame_age_ms': 0}
         elif method == 'game.stop':
@@ -204,6 +214,62 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(life.private_config(instances['a']['profile'])['volume'], '0')
         self.assertFalse(self.ledger.released)
         self.assertEqual(life.inventory(self.source), self.before_source)
+        self.assertNotIn('core.resolution_setup', [params.get('key') for _, _, params, _ in self.host.calls])
+
+    def resolution_sets_before_load(self, calls):
+        load = next(i for i, (_, method, _, _) in enumerate(calls) if method == 'game.load')
+        before = calls[:load]
+        return [params for _, method, params, _ in before
+                if method == 'settings.set' and params.get('key') == 'core.resolution_setup']
+
+    def test_xps_sets_half_resolution_and_reads_it_back_before_game_load(self):
+        self.config['host'] = 'xps'
+        self.pair()
+        self.controller().up()
+        for key in ('a', 'b'):
+            calls = [call for call in self.host.calls if call[0] == key]
+            sets = self.resolution_sets_before_load(calls)
+            self.assertEqual(sets, [{'key': 'core.resolution_setup', 'value': 1}])
+            load = next(i for i, (_, method, _, _) in enumerate(calls) if method == 'game.load')
+            set_at = next(i for i, (_, method, params, _) in enumerate(calls)
+                          if method == 'settings.set' and params.get('key') == 'core.resolution_setup')
+            get_at = next(i for i, (_, method, params, _) in enumerate(calls)
+                          if method == 'settings.get' and params.get('key') == 'core.resolution_setup')
+            self.assertLess(set_at, get_at)
+            self.assertLess(get_at, load)
+            self.assertTrue(any(method == 'settings.save' for _, method, _, _ in calls[set_at + 1:get_at]))
+
+    def test_surface_and_yoga_do_not_set_resolution(self):
+        for host in ('surface', 'yoga'):
+            self.config['host'] = host
+            self.config['work_root'] = str(self.base / ('owned-' + host))
+            self.config['state_dir'] = str(self.base / ('state-' + host))
+            fake = FakeHost(self.order)
+            life.Lifecycle(self.config, fake, FakeLedger(self.order)).up()
+            self.assertIn('game.load', [method for _, method, _, _ in fake.calls])
+            self.assertNotIn('core.resolution_setup', [params.get('key') for _, _, params, _ in fake.calls])
+
+    def test_explicit_instance_setting_overrides_the_xps_default(self):
+        self.config['host'] = 'xps'
+        self.config['eden_settings'] = {'core.resolution_setup': 0}
+        self.config['instances'][0]['eden_settings'] = {'core.resolution_setup': 3}
+        self.controller().up()
+        self.assertEqual(self.resolution_sets_before_load(self.host.calls),
+                         [{'key': 'core.resolution_setup', 'value': 3}])
+        self.assertEqual(life.eden_boot_settings({'host': 'xps'}, {}), {'core.resolution_setup': 1})
+        self.assertEqual(life.eden_boot_settings({'host': 'surface'}, {}), {})
+        self.assertEqual(life.eden_boot_settings({'host': 'yoga'}, {}), {})
+        self.assertEqual(life.eden_boot_settings(
+            {'host': 'xps', 'eden_settings': {'core.resolution_setup': 0}}, {}),
+            {'core.resolution_setup': 0})
+
+    def test_xps_resolution_readback_mismatch_refuses_game_load(self):
+        self.config['host'] = 'xps'
+        self.host.resolution_reply = {'value': 3}
+        with self.assertRaisesRegex(life.Refused, 'readback'):
+            self.controller().up()
+        self.assertNotIn('game.load', [method for _, method, _, _ in self.host.calls])
+        self.assertTrue(self.ledger.released)
 
     def test_defer_load_leaves_the_frontend_ready_for_room_setup(self):
         # Online pairs: Eden refuses to create a room while a game runs, so the rows load the game themselves.

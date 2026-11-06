@@ -42,7 +42,16 @@ staging. **All config paths and generated instances paths are executor-host
 paths.** Run the shared runner on that host too; no implicit socket forwarding.
 For local Surface or XPS with the authoritative ledger on Yoga, set `ledger_ssh` to
 that SSH host. Hosts are `surface`, `yoga`, `xps` (hostname `ubuntu-xps`) and
-`ally`; the XPS runs two Eden instances, like the Surface and Yoga. Claims/releases run under a remote file lock, preserving raw
+`ally`; the XPS runs two Eden instances, like the Surface and Yoga. Every XPS
+Eden boots at 0.5x (`core.resolution_setup` = 1, `Res1_2X`) before `game.load`.
+Operator 2026-11-06: "yes, make half res the XPS default". Thermald stays on.
+Timed rows stay on the Surface and Yoga. At load, thermald `--adaptive` cuts
+MMIO PL1 to 15 W; 29.5 W is the idle value. `xps-dual-03` (thermald on) ran a
+median of 59.3 simulated frames/s; `xps-dual-04` (thermald off) ran about 60,
+at 100 °C. A run or instance `eden_settings` object may set
+`core.resolution_setup` to another non-negative integer; the instance value
+wins over the run, and either wins over the XPS default. Surface, Yoga and
+Ally do not receive that default. Claims/releases run under a remote file lock, preserving raw
 ledger bytes; unknown host/owner records block rather than disappear. No SSH
 credential/config edits or foreign claim reconciliation are performed.
 
@@ -133,7 +142,10 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
   including empty directories, unknown files, bytes and modes.
 - Pristine snapshot precedes all staging/config changes. NAND/SDMC paths are
   rebased and checked; persisted Audio volume is zero, then CLI
-  settings.set(core.volume,0)/settings.save/readback precede game.load.
+  settings.set(core.volume,0)/settings.save/readback precede game.load. On
+  `host: xps` the same moment also sets `core.resolution_setup` to 1, saves,
+  and reads it back, unless `eden_settings` on the run or that instance
+  supplies the key. The instance value wins.
 - Guests run in unique 8GiB/swap0/Tasks256 systemd units with hard runtime caps,
   full console/control logs and no inherited LAN/runtime/seed environment.
 - Accepted load/stop jobs require successful terminal responses, not mere ACK.

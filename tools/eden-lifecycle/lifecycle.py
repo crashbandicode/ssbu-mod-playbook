@@ -65,7 +65,7 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def mute_is_zero(value):
+def setting_is(value, expected):
     """Use actual CLI value/current/effective fields, never truthiness."""
     found = []
 
@@ -82,7 +82,14 @@ def mute_is_zero(value):
     if isinstance(value, (int, float, str)) and not isinstance(value, bool):
         found.append(value)
     walk(value)
-    return bool(found) and all(not isinstance(x, bool) and str(x) in ('0', '0.0') for x in found)
+    acceptable = {str(expected)}
+    if type(expected) is int:
+        acceptable.add(str(expected) + '.0')
+    return bool(found) and all(not isinstance(x, bool) and str(x) in acceptable for x in found)
+
+
+def mute_is_zero(value):
+    return setting_is(value, 0)
 
 
 def private_config(profile, require_mute=True):
@@ -354,10 +361,28 @@ class Ledger:
 
 
 # The XPS (ubuntu-xps, 2026-11-06) is a Linux executor like the Surface and Yoga, using the Yoga ledger
-# through ledger_ssh. It runs two Eden instances, like them (operator 2026-11-06). Run xps-dual-02 showed an
-# online pair finishing cleanly at about 53 simulated frames/s (power-limited), so timed rows belong elsewhere.
+# through ledger_ssh. It runs two Eden instances, like them (operator 2026-11-06). Timed rows stay on the
+# Surface and Yoga. Every XPS Eden boots at 0.5x unless eden_settings overrides core.resolution_setup.
 HOSTS = ('surface', 'yoga', 'xps', 'ally')
 LINUX_MAX_EDEN = {'surface': 2, 'yoga': 2, 'xps': 2}
+# Res1_2X (settings_enums.h ResolutionSetup). Applied before game.load.
+HOST_EDEN_SETTINGS = {'xps': {'core.resolution_setup': 1}}
+
+
+def validate_eden_settings(settings, where):
+    require(isinstance(settings, dict), where + ' eden_settings must be an object')
+    for key, value in settings.items():
+        require(key == 'core.resolution_setup', where + ' eden_settings only overrides core.resolution_setup')
+        require(type(value) is int and value >= 0, where + ' core.resolution_setup must be a non-negative integer')
+
+
+def eden_boot_settings(config, item):
+    """Host defaults, then the run, then the instance. An explicit key wins."""
+    values = dict(HOST_EDEN_SETTINGS.get(config.get('host'), {}))
+    for source in (config.get('eden_settings'), item.get('eden_settings')):
+        if source:
+            values.update(source)
+    return values
 
 
 def validate(config):
@@ -386,6 +411,8 @@ def validate(config):
         require(re.fullmatch(r'[0-9a-f]{64}', config['display_helper'].get('sha256', '')), 'Display helper SHA256 required')
     require(1 <= len(config['instances']) <= 2, 'One or an explicitly authorized pair only')
     require(len(config['instances']) == 1 or config.get('pair_authorized') is True, 'Pair exception needs pair_authorized=true')
+    if 'eden_settings' in config:
+        validate_eden_settings(config['eden_settings'], 'run')
     displays, keys = set(), set()
     for item in config['instances']:
         require(re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,20}', item['key']) and item['key'] != 'a-profile', 'Invalid instance key')
@@ -423,6 +450,8 @@ def validate(config):
             relative(name)
         require(not set(item.get('sources', {})) & {'socket', 'profile', 'console_log', 'control_log'},
                 'File source alias cannot override a transport/owned path')
+        if 'eden_settings' in item:
+            validate_eden_settings(item['eden_settings'], 'instance ' + item['key'])
     for key, default in (('socket_cap', 90), ('load_cap', 180), ('stop_cap', 30), ('force_cap', 30), ('runtime', 5400)):
         value = config.get(key, default)
         require(isinstance(value, (int, float)) and math.isfinite(value) and 0 < value <= (10800 if key == 'runtime' else 300),
@@ -1206,6 +1235,11 @@ class Lifecycle:
                     self.rpc(item, 'settings.save')
                     muted = self.rpc(item, 'settings.get', {'key': 'core.volume'})
                     require(mute_is_zero(muted), 'CLI mute readback failed')
+                    for key, value in eden_boot_settings(self.c, item).items():
+                        self.rpc(item, 'settings.set', {'key': key, 'value': value})
+                        self.rpc(item, 'settings.save')
+                        readback = self.rpc(item, 'settings.get', {'key': key})
+                        require(setting_is(readback, value), 'CLI setting readback failed: ' + key)
                     # The CLI save must really persist mute, before any game.load.
                     private_config(profile)
                     run_state = json.loads((Path(item['run']) / 'run.json').read_text())

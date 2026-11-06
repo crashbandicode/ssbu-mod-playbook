@@ -106,6 +106,11 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 - **M** At most two Eden instances on the Surface, Yoga or XPS, and one on the Ally (operator 2026-11-04, XPS 2026-11-06;
   the lifecycle enforces it), MemAvailable at least 10 GiB for the first instance and 9 GiB for a second one (operator 2026-11-04), never profile `a`,
   display `:61` or another agent's runs.
+- **M** The lifecycle boots every XPS Eden at 0.5x (`core.resolution_setup` = 1 before `game.load`; operator 2026-11-06:
+  "yes, make half res the XPS default"). Thermald stays on. Timed rows stay on the Surface and Yoga. At load, thermald
+  `--adaptive` cuts PL1 to 15 W; 29.5 W is the idle value. `xps-dual-03` ran a median of 59.3 simulated frames/s with
+  thermald on; `xps-dual-04` ran about 60 with thermald off, at 100 °C. An `eden_settings` value on the run or the
+  instance overrides the default, and the instance wins ([EDEN](EDEN.md)).
 - **M** The profile is a copy with the game content hard-linked (`gv.py
   prep`, or `cp -al`); a full copy per profile fills the filesystem. Only
   the copy is changed. Byte-identical files are links, and files that differ

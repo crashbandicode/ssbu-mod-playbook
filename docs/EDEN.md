@@ -20,14 +20,22 @@ a label `eNN`, and every file a run writes is named after it.
     instances at a time, like the Surface and Yoga (operator 2026-11-06: "the
     default should just be what yoga can do. I'm not using it to game it's for
     development").
-    - Run `xps-dual-02` (2026-11-06, an online pair, match and rematch) ended
-      cleanly on both instances: `desync_seen=0`, the rematch connected,
-      MemAvailable stayed at or above 12.8 GiB.
-    - But the package's 29.5 W long-term power limit (MMIO PL1) held each
-      instance to about 53 simulated frames/s, where the Yoga runs 60, so a
-      2:00 match takes about 2:18.
-    - Use the Surface or the Yoga for any row that measures time, FPS or
-      latency.
+    - Run `xps-dual-02` (2026-11-06, an online pair, match and rematch, at 1x)
+      ended cleanly on both instances: `desync_seen=0`, the rematch connected,
+      MemAvailable stayed at or above 12.8 GiB. The pair ran about 53
+      simulated frames/s.
+    - The lifecycle boots every XPS Eden at 0.5x (`core.resolution_setup` = 1,
+      `Res1_2X`) before `game.load`, with `settings.save` and a readback beside
+      the volume mute. Operator 2026-11-06: "yes, make half res the XPS
+      default". Thermald stays on. A run or an instance may set
+      `eden_settings` to `{"core.resolution_setup": <integer>}`; the instance
+      value wins over the run, and either value wins over this default.
+      Surface, Yoga and Ally keep their boot settings unless that instance
+      sets the key.
+    - At load, thermald `--adaptive` cuts MMIO PL1 to 15 W. 29.5 W is the idle
+      value. `xps-dual-03` (0.5x, thermald on) ran a median of 59.3 simulated
+      frames/s. `xps-dual-04` (0.5x, thermald off) ran about 60, at 100 °C.
+    - Timed rows stay on the Surface or the Yoga.
     - The 13.0.5 update NSP was added to `~/Games/Roms/Switch Rom Updates and
       DLC` on 2026-11-06. Before that the XPS booted 13.0.3, and every
       13.0.5-guarded plugin refused.
