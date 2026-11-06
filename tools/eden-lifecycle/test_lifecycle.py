@@ -1039,10 +1039,10 @@ class ProtocolTests(unittest.TestCase):
         # An XPS claim must still block the XPS itself, and a hostless claim blocks it too.
         self.assertEqual(len(life.active_claims(text + 'CLAIMED: OpenCode g/h busy\n', 'xps')), 3)
 
-    def test_xps_is_a_one_instance_linux_host(self):
+    def test_xps_is_a_two_instance_linux_host(self):
         self.assertIn('xps', life.HOSTS)
-        self.assertEqual(life.LINUX_MAX_EDEN, {'surface': 2, 'yoga': 2, 'xps': 1})
-        self.assertEqual(life.Host.max_eden, 2)  # class default unchanged for the Surface and Yoga
+        self.assertEqual(life.LINUX_MAX_EDEN, {'surface': 2, 'yoga': 2, 'xps': 2})
+        self.assertEqual(life.Host.max_eden, 2)  # the class default the Surface and Yoga use
 
     def test_unknown_host_and_unparseable_claim_fail_closed(self):
         for text in ('CLAIMED: OpenCode unknown/stream busy\n', 'CLAIMED: malformed record\n'):

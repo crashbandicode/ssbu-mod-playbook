@@ -354,9 +354,9 @@ class Ledger:
 
 
 # The XPS (ubuntu-xps, 2026-11-06) is a Linux executor like the Surface and Yoga, using the Yoga ledger
-# through ledger_ssh. It runs one Eden until two have been tested on its 8-thread Iris Xe.
+# through ledger_ssh. It runs two Eden instances, like them (dual-Eden proof run xps-dual-01, 2026-11-06).
 HOSTS = ('surface', 'yoga', 'xps', 'ally')
-LINUX_MAX_EDEN = {'surface': 2, 'yoga': 2, 'xps': 1}
+LINUX_MAX_EDEN = {'surface': 2, 'yoga': 2, 'xps': 2}
 
 
 def validate(config):
@@ -456,7 +456,8 @@ def run_lock(stream):
 
 
 class Host:
-    # Linux rigs (Surface, Yoga: 32 GB): two Eden instances at once, each under its own 8 GiB unit (operator 2026-11-04).
+    # Linux rigs (Surface, Yoga, XPS: 32 GB): two Eden instances at once, each under its own 8 GiB unit (operator
+    # 2026-11-04; the XPS 2026-11-06).
     max_eden = 2
     """Real Linux executor. Tests replace this class; no shell-string commands."""
     clock = staticmethod(time.monotonic)

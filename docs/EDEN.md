@@ -16,9 +16,10 @@ a label `eNN`, and every file a run writes is named after it.
   - The XPS (`ubuntu-xps`, Ubuntu 26.04, Iris Xe, added 2026-11-06) has
     `current` at `20261104-1961a200485e-unmapped-stop-0c7f89f711d6`. It is a
     Linux executor like the Surface: config `"host": "xps"`, `"hostname":
-    "ubuntu-xps"`, `"ledger_ssh": "memento-claw-yoga-ubuntu"`; one Eden at a
-    time. Its profile, game and display helper sit at the same paths as on the
-    Yoga.
+    "ubuntu-xps"`, `"ledger_ssh": "memento-claw-yoga-ubuntu"`; two Eden
+    instances at a time, like the Surface and Yoga (proved 2026-11-06 by run
+    `xps-dual-01`, an online pair). Its profile, game and display helper sit
+    at the same paths as on the Yoga.
   - A run pins the resolved release path and the AppImage's sha256, never
     `current`, and names that build in its results. Runs on two builds
     aren't pooled without saying so.
