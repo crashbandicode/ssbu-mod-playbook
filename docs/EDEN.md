@@ -120,7 +120,25 @@ base, optional update version, optional playbook commit, memory, disk,
 compilers, ledger claims and a declared display. It writes nothing. `up` runs
 the same pin and game checks before it creates state. `watchdog --execute`
 Downs an instance that sits idle outside a declared safe state (default five
-minutes) or that a declared detector calls a demo. A missing control log
+minutes) or that a declared detector calls a demo. A config that declares
+`watchdog` still Downs after `idle_s` while the instance waits in Training
+for a lane, unless a `state_probe` rule sets a state listed in `safe_states`. For TrainingRooms,
+the diag build's Training HUD line is on `diag_log`:
+
+```json
+"safe_states": ["training"],
+"state_probe": {
+  "source": "diag_log",
+  "rules": [{"pattern": "\\[FrameStrip\\] shown=true menu_open=false", "state": "training"}]
+}
+```
+
+That line is `[FrameStrip] shown=true menu_open=false` in
+`practice-diagnostics.log`. The probe sees the last 40 lines, so the state
+lasts only while the line is still in that window. A `new-files` detector
+keeps its baseline across sidecar polls. A `log-line` detector searches that
+same 40-line window, so one demo line keeps matching until the action ends
+the sidecar or the line scrolls out. A missing control log
 counts from Up, not from the epoch. Park is an optional declared button or
 stick sequence. The receipt is `state_dir/watchdog-receipt.json`. A config
 that declares `watchdog` starts that loop from `up` unless `watchdog.auto`

@@ -55,8 +55,34 @@ than `watchdog.idle_s` (default 300 seconds) outside a declared `safe_states`
 entry, or a detector hit, takes `action` (default `down`). A missing
 `control.jsonl` counts from the journal's Up time, not from the epoch.
 Detectors are `new-files` (directory + pattern), `log-line`, `screen-class`
-(`demo_states`), or `hook` (`module` + `function`). A safe state skips idle
-and does not skip a demo detector. `park` sends only the declared `buttons`
+(`demo_states`), or `hook` (`module` + `function`). The `new-files` baseline
+is kept on the lifecycle, including across sidecar polls: the first look
+records the names already there, and a later poll reports a name that
+appeared since. `log-line` reads the last 40 lines of the `state_probe`
+source, not a consumed delta, so one matching line keeps matching on every
+later poll until that line scrolls out of the window. The action ends the
+sidecar, so that repeated match runs the action once. A safe state skips idle
+and does not skip a demo detector. `safe_states` does nothing by itself.
+Idle still Downs the instance after `idle_s` while it waits in Training for
+a lane, unless a `state_probe` rule sets a state listed in `safe_states`. TrainingRooms names that state from a diagnostics line.
+The diag build writes `[FrameStrip] shown=true menu_open=false` to
+`practice-diagnostics.log` when the frame strip is shown and no menu is open
+(`diag_log`; that line is not copied into `practice-gates.log`). The probe
+is still only the last 40 lines, so the wait stays safe only while that line
+remains in the window:
+
+```json
+"watchdog": {
+  "idle_s": 300,
+  "safe_states": ["training"],
+  "state_probe": {
+    "source": "diag_log",
+    "rules": [{"pattern": "\\[FrameStrip\\] shown=true menu_open=false", "state": "training"}]
+  }
+}
+```
+
+`park` sends only the declared `buttons`
 or `stick` steps through edenctl, then `input.reset`. The receipt is
 `state_dir/watchdog-receipt.json`. `--rounds` and `--pause` override
 `rounds` and `poll_s`. When the config has `watchdog` and `watchdog.auto` is

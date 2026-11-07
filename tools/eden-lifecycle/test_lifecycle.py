@@ -1049,6 +1049,58 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.host.stopped_watchdogs, [])
         self.assertTrue(self.ledger.released)
 
+    def test_sidecar_keeps_the_new_file_baseline_across_rounds(self):
+        drift = self.base / 'drift'
+        drift.mkdir()
+        (drift / 'already-there-doubles-0').write_text('baseline')
+        self.config['watchdog'] = {
+            'idle_s': 300, 'auto': False, 'poll_s': 1, 'action': 'down',
+            'detectors': [{'kind': 'new-files', 'directory': str(drift), 'pattern': '*-doubles-*'}]}
+        controller = self.controller()
+        controller.up()
+        polls = {'n': 0}
+
+        def sleep(seconds):
+            if controller.state.get('phase') == 'up':
+                polls['n'] += 1
+                if polls['n'] == 1:
+                    (drift / 'match-doubles-2').write_text('new')
+                if polls['n'] > 2:
+                    raise AssertionError('new file was treated as a fresh baseline')
+            self.host.now += seconds
+
+        self.host.sleep = sleep
+        receipt = controller.watchdog_serve()
+        self.assertEqual(polls['n'], 1)
+        self.assertEqual(receipt['action'], 'down')
+        self.assertEqual(receipt['reason'], 'demo-drift')
+        self.assertEqual(receipt['detector'], 'new-files')
+        self.assertEqual(controller.state['phase'], 'down')
+        seen = controller._watchdog_seen['a']
+        self.assertIn('already-there-doubles-0', seen)
+        self.assertIn('match-doubles-2', seen)
+
+    def test_log_line_keeps_matching_the_recent_window(self):
+        self.config['watchdog'] = {
+            'idle_s': 300, 'auto': False, 'poll_s': 1,
+            'detectors': [{'kind': 'log-line', 'pattern': 'attract demo'}],
+            'state_probe': {'source': 'diag_log', 'rules': []}}
+        controller = self.controller()
+        controller.up()
+        instances = json.loads((Path(self.config['state_dir']) / 'instances.json').read_text())
+        diag = Path(instances['a']['diag_log'])
+        diag.parent.mkdir(parents=True, exist_ok=True)
+        diag.write_text('entered attract demo\n')
+        self.assertIn('attract demo', controller.observe_watchdog({})['a']['log_delta'])
+        self.assertIn('attract demo', controller.observe_watchdog({})['a']['log_delta'])
+        diag.write_text('entered attract demo\n' + ''.join('later %d\n' % i for i in range(40)))
+        self.assertNotIn('attract demo', controller.observe_watchdog({})['a']['log_delta'])
+        diag.write_text('tail\nattract demo\n')
+        receipt = controller.watchdog_serve()
+        self.assertEqual(receipt['detector'], 'log-line')
+        self.assertEqual(receipt['action'], 'down')
+        self.assertEqual(controller.state['phase'], 'down')
+
     def test_declared_sources_are_written_for_the_runner(self):
         self.config['sources'] = {'notes': {'sdmc': 'ultimate/TrainingRooms/notes.log'}}
         self.config['instances'][0]['sources'] = {

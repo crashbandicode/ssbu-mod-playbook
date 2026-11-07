@@ -1238,6 +1238,7 @@ class Lifecycle:
         self.injected_ledger = ledger
         self.plan_check = plan_check if plan_check is not None else self.check_rows
         self.state = None
+        self._watchdog_seen = {}
 
     def check_rows(self):
         if self.c.get('lifecycle_only'):
@@ -1545,6 +1546,7 @@ class Lifecycle:
                 'lines': lines, 'checks': checks, 'message': '; '.join(problems) if problems else 'preflight ok'}
 
     def _watchdog_text(self, item, source_name):
+        """The last 40 lines of a declared source. This is a window, not a consumed delta."""
         path = self.directory / 'instances.json'
         if not source_name or not path.is_file():
             return ''
@@ -1624,7 +1626,9 @@ class Lifecycle:
         dog = IdleWatchdog(spec)
         rounds = spec.get('rounds', 1) if rounds is None else rounds
         pause = spec.get('poll_s', 0) if pause is None else pause
-        seen, decision, current = {}, None, samples
+        # Sidecar mode calls this once per poll. A fresh dict each call would treat every
+        # new-files look as a baseline, so a file that appears between polls is never new.
+        seen, decision, current = self._watchdog_seen, None, samples
         for _ in range(max(1, int(rounds))):
             if samples is None:
                 current = self.observe_watchdog(seen)
