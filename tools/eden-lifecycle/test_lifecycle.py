@@ -64,6 +64,10 @@ class FakeHost:
         self.leftover = False
         self.job_mode = 'done'
         self.admissions = []
+        self.fail_watchdog = False
+        self.started_watchdogs = []
+        self.stopped_watchdogs = []
+        self.watchdog_commands = []
 
     def clock(self):
         return self.now
@@ -90,7 +94,7 @@ class FakeHost:
 
     def launch(self, item, config):
         self.order.append('launch-' + item['key'])
-        Path(item['run']).mkdir()
+        Path(item['run']).mkdir(parents=True, exist_ok=True)
         Path(item['console_log']).write_text('fake console\n')
         self.live[item['unit']] = [{'pid': 100 + len(self.live), 'start': '10', 'boot': 'fake'}]
         if self.fail_launch == item['key']:
@@ -140,6 +144,20 @@ class FakeHost:
             raise life.Refused('synthetic owned PID left alive')
         before = self.live.pop(item['unit'], [])
         return {'owned_pids_stopped': before}
+
+    def start_watchdog(self, unit, command, directory, runtime):
+        if self.fail_watchdog:
+            raise RuntimeError('synthetic watchdog start failure')
+        self.started_watchdogs.append(unit)
+        self.watchdog_commands.append(command)
+        self.live[unit] = [{'pid': 9, 'start': 'wd', 'boot': 'fake'}]
+
+    def stop_watchdog(self, unit):
+        self.stopped_watchdogs.append(unit)
+        self.live.pop(unit, None)
+
+    def watchdog_running(self, unit):
+        return unit in self.live
 
 
 class LifecycleTests(unittest.TestCase):
@@ -967,6 +985,160 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(seen, [receipt])
         self.assertFalse(self.ledger.claimed)
         self.assertIn('ACTION watchdog', receipt['lines'][0])
+
+    def test_up_starts_the_watchdog_sidecar_and_down_stops_it(self):
+        self.config['watchdog'] = {'idle_s': 300, 'poll_s': 2}
+        value = self.controller().up()
+        unit = value['watchdog_unit']
+        self.assertRegex(unit, r'^eden-life-[0-9a-f]{32}-watchdog\.service$')
+        self.assertEqual(self.host.started_watchdogs, [unit])
+        self.assertIn('watchdog-serve', self.host.watchdog_commands[0])
+        self.assertTrue((Path(self.config['state_dir']) / 'lifecycle-watchdog.py').is_file())
+        status = self.controller().status()
+        self.assertEqual(status['watchdog_unit'], unit)
+        self.assertTrue(status['watchdog_running'])
+        self.controller().down()
+        self.assertEqual(self.host.stopped_watchdogs, [unit])
+        self.assertFalse(self.controller().status()['watchdog_running'])
+        self.assertTrue(self.ledger.released)
+
+    def test_watchdog_auto_false_does_not_start_a_sidecar(self):
+        self.config['watchdog'] = {'idle_s': 300, 'auto': False}
+        value = self.controller().up()
+        self.assertIsNone(value['watchdog_unit'])
+        self.assertEqual(self.host.started_watchdogs, [])
+
+    def test_watchdog_serve_exits_without_a_journal_and_down_starts_nothing(self):
+        self.config['watchdog'] = {'idle_s': 30}
+        controller = self.controller()
+        receipt = controller.watchdog_serve()
+        self.assertEqual(receipt['lines'], ['OK watchdog: no journal'])
+        self.assertEqual(self.host.started_watchdogs, [])
+        with self.assertRaisesRegex(life.Refused, 'No owned lifecycle journal'):
+            controller.down()
+        self.assertEqual(self.host.stopped_watchdogs, [])
+        self.assertFalse(self.ledger.claimed)
+
+    def test_missing_control_log_is_not_idle(self):
+        self.config['watchdog'] = {'idle_s': 300, 'auto': False}
+        controller = self.controller()
+        controller.up()
+        samples = controller.observe_watchdog({})
+        started = datetime.fromisoformat(controller.state['started']).timestamp()
+        self.assertAlmostEqual(samples['a']['activity'], started, delta=1)
+        self.assertGreater(samples['a']['activity'], 1_000_000_000)
+        self.assertIsNone(life.IdleWatchdog({'idle_s': 300}).decide(samples['a']['activity'] + 30, samples))
+        control = Path(controller.state['instances'][0]['run']) / 'control.jsonl'
+        older = started - 100
+        control.write_text('')
+        os.utime(control, (older, older))
+        self.assertAlmostEqual(controller.observe_watchdog({})['a']['activity'], started, delta=1)
+        newer = started + 50
+        os.utime(control, (newer, newer))
+        self.assertAlmostEqual(controller.observe_watchdog({})['a']['activity'], newer, delta=1)
+
+    def test_watchdog_action_downs_without_stopping_its_own_unit(self):
+        self.config['watchdog'] = {'idle_s': 1, 'auto': False}
+        controller = self.controller()
+        controller.up()
+        controller.state['started'] = '2000-01-01T00:00:00+00:00'
+        controller.write()
+        receipt = controller.watchdog_serve()
+        self.assertEqual(receipt['action'], 'down')
+        self.assertEqual(controller.state['phase'], 'down')
+        self.assertEqual(self.host.stopped_watchdogs, [])
+        self.assertTrue(self.ledger.released)
+
+    def test_declared_sources_are_written_for_the_runner(self):
+        self.config['sources'] = {'notes': {'sdmc': 'ultimate/TrainingRooms/notes.log'}}
+        self.config['instances'][0]['sources'] = {
+            'gates': {'beside': 'diag_log', 'name': 'practice-gates.log'}}
+        self.controller().up()
+        instances = json.loads((Path(self.config['state_dir']) / 'instances.json').read_text())
+        diag = Path(instances['a']['diag_log'])
+        self.assertEqual(Path(instances['a']['gates']), diag.with_name('practice-gates.log'))
+        self.assertTrue(str(diag).endswith('user/sdmc/ultimate/TrainingRooms/practice-diagnostics.log'))
+        self.assertEqual(Path(instances['a']['notes']),
+                         Path(instances['a']['profile']) / 'user' / 'sdmc' / 'ultimate' / 'TrainingRooms' / 'notes.log')
+
+    def test_watchdog_start_failure_still_stops_and_releases(self):
+        self.config['watchdog'] = {'idle_s': 300}
+        self.host.fail_watchdog = True
+        with self.assertRaisesRegex(RuntimeError, 'watchdog start failure'):
+            self.controller().up()
+        self.assertEqual(len(self.host.stopped_watchdogs), 1)
+        self.assertTrue(self.ledger.released)
+        self.assertEqual(self.state()['phase'], 'down')
+
+    def test_linux_and_windows_watchdog_commands_are_named_for_the_run(self):
+        unit = 'eden-life-' + ('ab' * 16) + '-watchdog.service'
+        linux = life.Host()
+        linux_commands = []
+        linux.run = lambda argv, cap=30: linux_commands.append(list(argv)) or ''
+        linux.start_watchdog(unit, ['/usr/bin/python3', '-I', '-B', 'lifecycle-watchdog.py',
+                                    'watchdog-serve', 'config.json', '--execute'], self.base, 90)
+        self.assertEqual(linux_commands[0][0], 'systemd-run')
+        self.assertIn('--unit=' + unit, linux_commands[0])
+        self.assertIn('--setenv=EDEN_WATCHDOG_SIDECAR=1', linux_commands[0])
+        windows = life.WindowsHost({})
+        windows_commands = []
+        windows.ps = lambda script, cap=30: 'S-1-5-21-1'
+        windows.run = lambda argv, cap=30: windows_commands.append(list(argv)) or ''
+        directory = self.base / 'win-watchdog'
+        directory.mkdir()
+        windows.start_watchdog(unit, [r'C:\Python\python.exe', '-I', '-B', r'C:\state\lifecycle-watchdog.py',
+                                      'watchdog-serve', r'C:\state\lifecycle-config.json', '--execute'],
+                               directory, 90)
+        self.assertEqual(windows_commands[0][:2], ['schtasks.exe', '/create'])
+        self.assertIn('EdenLife-' + ('ab' * 16) + '-watchdog', windows_commands[0])
+        self.assertIn('watchdog-serve', (directory / 'watchdog-task.xml').read_text(encoding='utf-16'))
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0)) as stopped:
+            windows.stop_watchdog(unit)
+        self.assertIn('/end', stopped.call_args_list[0].args[0])
+        self.assertIn('/delete', stopped.call_args_list[1].args[0])
+
+    def test_preflight_reports_a_stale_socket_and_trace_without_removing_them(self):
+        run = Path(self.config['state_dir']) / 'run-a'
+        run.mkdir(parents=True)
+        socket_path = run / 'control.sock'
+        socket_path.write_bytes(b'not a live listener')
+        trace = run / 'a.trace.jsonl'
+        trace.write_text('old trace\n')
+        report = self.controller().preflight()
+        self.assertTrue(report['ok'], report['message'])
+        self.assertTrue(any(line.startswith('REPORT stale control socket:') for line in report['lines']))
+        self.assertTrue(any(line.startswith('REPORT stale trace log:') for line in report['lines']))
+        self.assertTrue(socket_path.exists())
+        self.assertEqual(trace.read_text(), 'old trace\n')
+
+    def test_up_removes_a_stale_socket_and_moves_a_trace_log(self):
+        run = Path(self.config['state_dir']) / 'run-a'
+        run.mkdir(parents=True)
+        import socket
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        listener.bind(str(run / 'control.sock'))
+        trace = run / 'a.trace.jsonl'
+        trace.write_text('old trace\n')
+        self.controller().up()
+        self.assertFalse((run / 'control.sock').exists())
+        asides = list(run.glob('a.trace-aside-*.jsonl'))
+        self.assertEqual([path.read_text() for path in asides], ['old trace\n'])
+        self.assertFalse(trace.exists())
+        text = (Path(self.config['state_dir']) / 'actions.jsonl').read_text()
+        self.assertIn('stale-runtime', text)
+        self.assertIn('removed', text)
+        self.assertIn('moved', text)
+
+    def test_socket_ready_is_a_status_reply_not_a_file(self):
+        host = life.Host()
+        item = {'socket': str(self.base / 'control.sock'), 'app': {'path': str(self.app)}}
+        (self.base / 'control.sock').write_bytes(b'stale')
+        host.call = lambda *args: (_ for _ in ()).throw(ConnectionRefusedError(111))
+        self.assertFalse(host.socket_ready(item))
+        host.call = lambda *args: {'ok': True, 'result': {'running': True}}
+        self.assertTrue(host.socket_ready(item))
+        self.assertTrue((self.base / 'control.sock').exists())
 
     def test_preflight_requires_a_declared_trace_elf(self):
         self.config['instances'][0]['trace'] = {

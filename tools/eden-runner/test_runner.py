@@ -110,6 +110,13 @@ class RunnerTests(unittest.TestCase):
     def make(self, eden, pace=15):
         return runner.Runner(self.manifest, self.instances, self.dir / 'out', pace, client_factory=lambda s: eden)
 
+    def test_gates_comes_from_instances_not_a_hardcoded_filename(self):
+        self.instances['a']['diag_log'] = str(self.dir / 'practice-diagnostics.log')
+        self.assertEqual(self.make(FakeEden({})).source('a', 'gates'), Path('gates'))
+        path = self.dir / 'practice-gates.log'
+        self.instances['a']['gates'] = str(path)
+        self.assertEqual(self.make(FakeEden({})).source('a', 'gates'), path)
+
     def test_dry_run_ready_to_record(self):
         report = runner.dry_run(self.manifest)
         self.assertEqual(report['errors'], [])

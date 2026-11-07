@@ -42,19 +42,33 @@ an optional `playbook` object (`root` and `commit`; a short hash matches a
 longer HEAD), free memory (`memory_floor_bytes`, or the 10 GiB / 9 GiB
 admission floors), free disk, compilers, open ledger claims, and a declared
 display when the host can probe one. A declared trace `symbols` ELF must
-exist. Human lines go to stderr. One JSON
+exist. A leftover `control.sock` or `<key>.trace.jsonl` in the state directory
+is reported and left untouched; `up` removes that socket and moves the trace
+log aside, with a `stale-runtime` receipt, before launch. Socket readiness is
+a `status` reply retried until the deadline, not the presence of a socket file.
+Human lines go to stderr. One JSON
 receipt goes to stdout. Exit 1 when `ok` is false. It does not claim, stage,
 or write the ledger.
 
 `watchdog` needs `--execute`. It watches control-log activity. Idle longer
 than `watchdog.idle_s` (default 300 seconds) outside a declared `safe_states`
-entry, or a detector hit, takes `action` (default `down`). Detectors are
-`new-files` (directory + pattern), `log-line`, `screen-class` (`demo_states`),
-or `hook` (`module` + `function`). A safe state skips idle and does not skip
-a demo detector. `park` sends only the declared `buttons` or `stick` steps
-through edenctl, then `input.reset`. The receipt is
+entry, or a detector hit, takes `action` (default `down`). A missing
+`control.jsonl` counts from the journal's Up time, not from the epoch.
+Detectors are `new-files` (directory + pattern), `log-line`, `screen-class`
+(`demo_states`), or `hook` (`module` + `function`). A safe state skips idle
+and does not skip a demo detector. `park` sends only the declared `buttons`
+or `stick` steps through edenctl, then `input.reset`. The receipt is
 `state_dir/watchdog-receipt.json`. `--rounds` and `--pause` override
-`rounds` and `poll_s`.
+`rounds` and `poll_s`. When the config has `watchdog` and `watchdog.auto` is
+not false, `up` starts this loop as a sidecar: a `systemd-run --user` unit
+`eden-life-<token>-watchdog.service` on Linux, or a scheduled task
+`EdenLife-<token>-watchdog` on the Ally. The unit name is in the journal and
+in `status`. `down` stops that unit. The sidecar also exits when it takes an
+action, when the phase is `down`, or when the journal is gone. Extra per-instance
+files are `sources` on the run or the instance: a relative profile path,
+`{"sdmc": "ultimate/TrainingRooms/practice-gates.log"}`, or
+`{"beside": "diag_log", "name": "practice-gates.log"}`. They are written into
+`instances.json` for the runner.
 
 Wrap local commands in the usual memory/time guard and PowerShell7. The caller
 must place `down` in its own cleanup/finally, even if runner execution fails.

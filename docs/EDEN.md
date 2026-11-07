@@ -120,9 +120,13 @@ base, optional update version, optional playbook commit, memory, disk,
 compilers, ledger claims and a declared display. It writes nothing. `up` runs
 the same pin and game checks before it creates state. `watchdog --execute`
 Downs an instance that sits idle outside a declared safe state (default five
-minutes) or that a declared detector calls a demo. Park is an optional
-declared button or stick sequence. The receipt is
-`state_dir/watchdog-receipt.json`.
+minutes) or that a declared detector calls a demo. A missing control log
+counts from Up, not from the epoch. Park is an optional declared button or
+stick sequence. The receipt is `state_dir/watchdog-receipt.json`. A config
+that declares `watchdog` starts that loop from `up` unless `watchdog.auto`
+is false. `status` shows the unit. `down` stops it, and so does the action
+the watchdog takes. A run may declare extra instance files, for example
+`"sources": {"gates": {"beside": "diag_log", "name": "practice-gates.log"}}`.
 
 ## Drive
 

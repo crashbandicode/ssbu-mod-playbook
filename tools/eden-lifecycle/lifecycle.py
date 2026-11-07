@@ -9,8 +9,11 @@
 
 preflight is read-only: pins, game base, declared update version, playbook commit,
 memory floor, disk, compilers, ledger claims and a declared display. It runs
-again, still without writing, before every up. watchdog watches control activity
-and either parks with the declared input sequence or (the default) Downs with a receipt.
+again, still without writing, before every up. When the config declares watchdog
+and does not set auto false, up starts that watchdog as a sidecar until down.
+watchdog watches control activity and either parks with the declared input
+sequence or (the default) Downs with a receipt. A missing control log counts
+from the journal's Up time. Extra instance files are declared sources.
 
 No runtime operations are performed by tests: inject a fake Host and Ledger.
 SSH executes the SAME source through the remote login shell's PowerShell 7,
@@ -163,6 +166,34 @@ def relative(value):
             'Non-traversing relative path required: ' + str(path))
     require(':' not in str(path) and not path.drive, 'Drive/alternate stream refused')
     return path
+
+
+SOURCE_BUILTIN = {
+    'settings': 'user/sdmc/ultimate/TrainingRooms/settings.json',
+    'diag_log': 'user/sdmc/ultimate/TrainingRooms/practice-diagnostics.log',
+    'detector_log': 'user/sdmc/ultimate/ssbu-desync-detector/events.log',
+}
+SOURCE_RESERVED = {'socket', 'profile', 'console_log', 'control_log', 'game', 'trace_jsonl', 'screenshot_target'}
+
+
+def validate_sources(mapping):
+    """A declared file the runner can read by key. Paths stay relative; no plugin name is implied."""
+    require(isinstance(mapping, dict), 'sources must be an object')
+    require(not set(mapping) & SOURCE_RESERVED, 'File source alias cannot override a transport/owned path')
+    for name, spec in mapping.items():
+        require(re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,40}', str(name)), 'Invalid source name')
+        if isinstance(spec, str):
+            relative(spec)
+        elif isinstance(spec, dict) and set(spec) == {'beside', 'name'}:
+            require(re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,40}', str(spec.get('beside') or '')),
+                    'beside source needs a source name')
+            filename = spec.get('name')
+            require(isinstance(filename, str) and Path(filename).name == filename and filename not in ('.', '..'),
+                    'beside source name must be a single file name')
+        elif isinstance(spec, dict) and set(spec) == {'sdmc'}:
+            relative(spec.get('sdmc'))
+        else:
+            raise Refused('source needs a relative path, beside+name, or sdmc')
 
 
 def inventory(root):
@@ -454,10 +485,8 @@ def validate(config):
                 require(isinstance(symbols.get('module'), str) and symbols['module'], 'trace symbols need a module')
                 safe_absolute(symbols['elf'])
             require(trace.get('unmapped_access', 'log') in ('log', 'off'), 'trace unmapped_access must be log or off')
-        for name in item.get('sources', {}).values():
-            relative(name)
-        require(not set(item.get('sources', {})) & {'socket', 'profile', 'console_log', 'control_log'},
-                'File source alias cannot override a transport/owned path')
+        if 'sources' in item:
+            validate_sources(item['sources'])
         if 'eden_settings' in item:
             validate_eden_settings(item['eden_settings'], 'instance ' + item['key'])
     for key, default in (('socket_cap', 90), ('load_cap', 180), ('stop_cap', 30), ('force_cap', 30), ('runtime', 5400)):
@@ -493,6 +522,14 @@ def validate(config):
             elif detector['kind'] == 'hook':
                 require(isinstance(detector.get('module'), str) and isinstance(detector.get('function'), str),
                         'hook detector needs module and function')
+        if 'auto' in spec:
+            require(type(spec['auto']) is bool, 'watchdog.auto must be true or false')
+        if 'poll_s' in spec:
+            pause = spec['poll_s']
+            require(isinstance(pause, (int, float)) and not isinstance(pause, bool) and 0 <= pause <= 300,
+                    'watchdog.poll_s must be a number from 0 to 300')
+    if 'sources' in config:
+        validate_sources(config['sources'])
     if windows:
         require(type(config.get('interactive_session')) is int and config['interactive_session'] > 0,
                 'Windows interactive_session required')
@@ -666,10 +703,12 @@ class Host:
         return identities
 
     def socket_ready(self, item):
+        """A leftover socket file is not readiness. The deadline retries until status answers."""
         try:
-            return stat.S_ISSOCK(Path(item['socket']).stat().st_mode)
-        except FileNotFoundError:
+            reply = self.call(item, 'status', {}, 2)
+        except (Refused, OSError, subprocess.TimeoutExpired):
             return False
+        return isinstance(reply, dict) and reply.get('ok') is True
 
     def call(self, item, method, params, timeout):
         require(method in RPC_METHODS, 'Lifecycle cannot send input/navigation/trace calls')
@@ -739,6 +778,23 @@ class Host:
                 break
             self.sleep(max(0, min(.1, deadline - self.clock())))
         raise Refused('Owned Eden processes remain; do not restore/release')
+
+    def start_watchdog(self, unit, command, directory, runtime):
+        require(re.fullmatch(r'eden-life-[0-9a-f]{32}-watchdog\.service', unit), 'Foreign watchdog unit refused')
+        self.run(['systemd-run', '--user', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
+                  '--property=MemoryMax=256M', '--property=MemorySwapMax=0',
+                  '--property=RuntimeMaxSec=' + str(int(runtime) + 60),
+                  '--setenv=EDEN_WATCHDOG_SIDECAR=1', '--working-directory=' + str(directory), '--', *command])
+
+    def stop_watchdog(self, unit):
+        require(re.fullmatch(r'eden-life-[0-9a-f]{32}-watchdog\.service', unit), 'Foreign watchdog unit refused')
+        done = subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, text=True, timeout=15)
+        detail = (done.stderr or '') + (done.stdout or '')
+        require(done.returncode == 0 or 'not loaded' in detail.lower() or 'not-found' in detail.lower(),
+                'Watchdog stop failed: ' + detail[-300:])
+
+    def watchdog_running(self, unit):
+        return self.unit(unit).get('ActiveState') == 'active'
 
 
 class WindowsHost(Host):
@@ -951,7 +1007,7 @@ class WindowsHost(Host):
     def socket_ready(self, item):
         try:
             return self.call(item, 'status', {}, 2).get('ok') is True
-        except (Refused, subprocess.TimeoutExpired):
+        except (Refused, OSError, subprocess.TimeoutExpired):
             return False
 
     def call(self, item, method, params, timeout):
@@ -983,6 +1039,42 @@ class WindowsHost(Host):
         finally:
             if handle:
                 self.job.close(handle)
+
+    def start_watchdog(self, unit, command, directory, runtime):
+        """The Ally equivalent of the Linux user unit: one scheduled task named for the run."""
+        self.open_job_name_check(unit)
+        directory = Path(directory)
+        sid = self.ps('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value').strip()
+        require(re.fullmatch(r'S-\d-(?:\d+-)*\d+', sid), 'Cannot bind task to current Windows user SID')
+        from xml.sax.saxutils import escape
+        task = 'EdenLife-' + unit.removeprefix('eden-life-').removesuffix('.service')
+        executable, *arguments = command
+        xml = ('<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+               '<Triggers><TimeTrigger><StartBoundary>2099-01-01T00:00:00</StartBoundary><Enabled>false</Enabled></TimeTrigger></Triggers>'
+               '<Principals><Principal id="Author"><UserId>' + escape(sid) +
+               '</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>'
+               '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+               '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT' + str(int(runtime) + 60) +
+               'S</ExecutionTimeLimit></Settings><Actions Context="Author"><Exec><Command>' + escape(str(executable)) +
+               '</Command><Arguments>' + escape(subprocess.list2cmdline(arguments)) + '</Arguments><WorkingDirectory>' +
+               escape(str(directory)) + '</WorkingDirectory></Exec></Actions></Task>')
+        task_xml = directory / 'watchdog-task.xml'
+        task_xml.write_text(xml, encoding='utf-16')
+        self.run(['schtasks.exe', '/create', '/f', '/tn', task, '/xml', str(task_xml)])
+        self.run(['schtasks.exe', '/run', '/tn', task])
+
+    def stop_watchdog(self, unit):
+        self.open_job_name_check(unit)
+        task = 'EdenLife-' + unit.removeprefix('eden-life-').removesuffix('.service')
+        subprocess.run(['schtasks.exe', '/end', '/tn', task], capture_output=True, timeout=10)
+        subprocess.run(['schtasks.exe', '/delete', '/f', '/tn', task], capture_output=True, timeout=10)
+
+    def watchdog_running(self, unit):
+        self.open_job_name_check(unit)
+        task = 'EdenLife-' + unit.removeprefix('eden-life-').removesuffix('.service')
+        done = subprocess.run(['schtasks.exe', '/query', '/tn', task, '/fo', 'LIST'],
+                              capture_output=True, text=True, timeout=10)
+        return done.returncode == 0 and 'Running' in done.stdout
 
 
 def windows_launch(packet_path):
@@ -1188,6 +1280,9 @@ class Lifecycle:
                     and item['socket'] == (f'\\\\.\\pipe\\eden-life-{token}-{key}' if self.c['host'] == 'ally'
                                            else str(self.directory / ('run-' + key) / 'control.sock')),
                     'Foreign journal profile/run path refused')
+        watched = self.state.get('watchdog_unit')
+        if watched:
+            require(watched == f'eden-life-{token}-watchdog.service', 'Foreign watchdog unit refused')
 
     def ledger(self):
         return self.injected_ledger if self.injected_ledger is not None else Ledger(
@@ -1395,6 +1490,18 @@ class Lifecycle:
                     problems.append(detail or f'Display not ready: {item.get("display")}')
                     lines.append(f'FAIL display {item.get("key")}: {detail}')
                     checks.append({'name': 'display', 'ok': False, 'instance': item.get('key'), **result})
+        state_root = Path(self.c['state_dir'])
+        if state_root.is_dir() and self.c['host'] != 'ally':
+            for item in self.c['instances']:
+                run = state_root / ('run-' + item['key'])
+                socket = run / 'control.sock'
+                if socket.exists():
+                    lines.append(f'REPORT stale control socket: {socket} (removed before launch)')
+                    checks.append({'name': 'stale-socket', 'ok': True, 'path': str(socket), 'action': 'remove-before-launch'})
+                trace = run / (item['key'] + '.trace.jsonl')
+                if trace.exists():
+                    lines.append(f'REPORT stale trace log: {trace} (moved aside before launch)')
+                    checks.append({'name': 'stale-trace', 'ok': True, 'path': str(trace), 'action': 'move-aside-before-launch'})
         return problems, lines, checks
 
     def runtime_checks(self, value):
@@ -1455,11 +1562,7 @@ class Lifecycle:
         spec = self.c.get('watchdog') or {}
         samples = {}
         for item in self.state['instances']:
-            control = Path(item['run']) / 'control.jsonl'
-            try:
-                activity = control.stat().st_mtime
-            except OSError:
-                activity = 0
+            activity = self.control_activity(item)
             text = self._watchdog_text(item, (spec.get('state_probe') or {}).get('source'))
             state = None
             for rule in (spec.get('state_probe') or {}).get('rules') or []:
@@ -1550,6 +1653,103 @@ class Lifecycle:
         if self.directory.exists():
             save(self.directory / 'watchdog-receipt.json', receipt)
         return receipt
+
+    def control_activity(self, item):
+        """Later of the control log and the journal Up time. A missing log is not decades of idle."""
+        started = datetime.fromisoformat(self.state['started']).timestamp()
+        control = Path(item['run']) / 'control.jsonl'
+        try:
+            observed = control.stat().st_mtime
+        except OSError:
+            return started
+        return max(observed, started)
+
+    def watchdog_serve(self):
+        """Sidecar loop. It leaves when the journal is gone, the instance is Down, or it takes an action."""
+        self._in_sidecar = True
+        pause = (self.c.get('watchdog') or {}).get('poll_s', 5)
+        while True:
+            if not self.journal.is_file():
+                return {'phase': 'watchdog', 'action': None, 'ok': True, 'mutation': False,
+                        'lines': ['OK watchdog: no journal']}
+            state = json.loads(self.journal.read_text())
+            if state.get('phase') == 'down':
+                return {'phase': 'watchdog', 'action': None, 'ok': True, 'mutation': False,
+                        'lines': ['OK watchdog: instance is down']}
+            receipt = self.watchdog(rounds=1, pause=0)
+            if receipt.get('action'):
+                return receipt
+            self.host.sleep(pause if pause else 5)
+
+    def resolved_sources(self, item):
+        """Builtin paths, then the run's sources, then the instance's. beside names a path already resolved."""
+        declared = dict(SOURCE_BUILTIN)
+        if isinstance(self.c.get('sources'), dict):
+            declared.update(self.c['sources'])
+        declared.update(item.get('sources') or {})
+        resolved, pending = {}, []
+        profile = Path(item['profile'])
+        for name, spec in declared.items():
+            if isinstance(spec, str):
+                resolved[name] = str(profile / spec)
+            elif 'sdmc' in spec:
+                resolved[name] = str(profile / 'user' / 'sdmc' / spec['sdmc'])
+            else:
+                pending.append((name, spec))
+        for name, spec in pending:
+            base = resolved.get(spec['beside'])
+            require(base, 'beside source unknown: ' + spec['beside'])
+            resolved[name] = str(Path(base).with_name(spec['name']))
+        return resolved
+
+    def start_owned_watchdog(self):
+        spec = self.c.get('watchdog')
+        if not isinstance(spec, dict) or spec.get('auto', True) is not True:
+            return None
+        source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(encoding='utf-8')
+        script = self.directory / 'lifecycle-watchdog.py'
+        script.write_text(source, encoding='utf-8')
+        config_path = self.directory / 'lifecycle-config.json'
+        save(config_path, self.c)
+        unit = f"eden-life-{self.state['token']}-watchdog.service"
+        self.state['watchdog_unit'] = unit
+        self.write()
+        program = self.c['windows_python']['path'] if self.c['host'] == 'ally' else '/usr/bin/python3'
+        command = [program, '-I', '-B', str(script), 'watchdog-serve', str(config_path), '--execute']
+        self.host.start_watchdog(unit, command, self.directory, self.c.get('runtime', 5400))
+        self.state['watchdog_started'] = True
+        self.write()
+        return unit
+
+    def retire_stale_runtime(self, item):
+        """Drop a dead control socket and set aside a leftover trace log before Eden creates them."""
+        run = Path(item['run'])
+        run.mkdir(parents=True, exist_ok=True)
+        retired = []
+        socket = Path(item['socket'])
+        if self.c['host'] != 'ally':
+            require(socket.parent == run, 'Control socket is outside the run directory')
+            if socket.exists() or socket.is_socket():
+                socket.unlink()
+                retired.append({'path': str(socket), 'action': 'removed'})
+        trace = run / (item['key'] + '.trace.jsonl')
+        if trace.exists() and not trace.is_symlink():
+            aside = run / (item['key'] + '.trace-aside-' + datetime.now(timezone.utc).strftime('%H%M%S%f') + '.jsonl')
+            trace.replace(aside)
+            retired.append({'path': str(trace), 'aside': str(aside), 'action': 'moved'})
+        if retired:
+            self.record('stale-runtime', {'key': item['key'], 'files': retired})
+        return retired
+
+    def _stop_watchdog_unit(self):
+        # The sidecar is this process. Stopping its unit here would kill the Down it is running.
+        if getattr(self, '_in_sidecar', False):
+            return
+        unit = (self.state or {}).get('watchdog_unit')
+        if not unit:
+            return
+        require(unit == f"eden-life-{self.state['token']}-watchdog.service", 'Foreign watchdog unit refused')
+        self.host.stop_watchdog(unit)
 
     def poll(self, predicate, cap, what):
         end = self.host.clock() + cap
@@ -1715,6 +1915,7 @@ class Lifecycle:
                     self.write()
                     item['launch_intent'] = True
                     self.write()  # recovery can stop this exact unit even if launch raises
+                    self.retire_stale_runtime(item)
                     item['owned_pids'] = self.host.launch(item, self.c)
                     self.write()
                     save(Path(item['run']) / 'run.json', {'unit': item['unit'], 'state': 'frontend',
@@ -1749,22 +1950,21 @@ class Lifecycle:
                     save(Path(item['run']) / 'run.json', run_state)
                 instances = {}
                 for item in self.state['instances']:
-                    sources = {'settings': 'user/sdmc/ultimate/TrainingRooms/settings.json',
-                               'diag_log': 'user/sdmc/ultimate/TrainingRooms/practice-diagnostics.log',
-                               'detector_log': 'user/sdmc/ultimate/ssbu-desync-detector/events.log', **item.get('sources', {})}
-                    instances[item['key']] = {'socket': item['socket'], 'console_log': item['console_log'],
+                    instances[item['key']] = {**self.resolved_sources(item),
+                        'socket': item['socket'], 'console_log': item['console_log'],
                         'profile': item['profile'], 'control_log': str(Path(item['run']) / 'control.jsonl'),
                         'game': item['game'],
                         **({'trace_jsonl': str(Path(item['run']) / (item['key'] + '.trace.jsonl'))}
                            if item.get('trace') else {}),
-                        **({'screenshot_target': 'screen'} if self.c['host'] == 'ally' else {}),
-                        **{name: str(Path(item['profile']) / rel) for name, rel in sources.items()}}
+                        **({'screenshot_target': 'screen'} if self.c['host'] == 'ally' else {})}
                 save(self.directory / 'instances.json', instances)
                 self.state['phase'] = 'up'
                 self.write()
+                self.start_owned_watchdog()
                 return {'phase': 'up', 'instances': instances, 'instances_file': str(self.directory / 'instances.json'),
                         'stale_claim_skipped': self.state['stale_claim_skipped'],
-                        'preflight': self.state.get('preflight')}
+                        'preflight': self.state.get('preflight'),
+                        'watchdog_unit': self.state.get('watchdog_unit')}
             except BaseException as error:
                 self.state['up_error'] = repr(error)
                 self.write()
@@ -1805,6 +2005,7 @@ class Lifecycle:
 
     def _down(self):
         failures, stop_errors = [], []
+        self._stop_watchdog_unit()
         self.state['phase'] = 'stopping'
         self.write()
         # Claim/release ACK loss must not become an imaginary unclaimed/down state.
@@ -1891,6 +2092,7 @@ class Lifecycle:
             self.state = json.loads(self.journal.read_text())
             self.check_state()
             if self.state['phase'] == 'down':
+                self._stop_watchdog_unit()
                 return {'phase': 'down', 'released': self.state['released'], 'already_down': True}
             return self._down()
 
@@ -1901,8 +2103,10 @@ class Lifecycle:
         value = json.loads(self.journal.read_text())
         self.state = value
         self.check_state()
+        unit = value.get('watchdog_unit')
         return {'phase': value['phase'], 'claimed': value['claimed'], 'released': value['released'],
                 'owned_pids': {x['key']: self.host.owned(x) for x in value['instances'] if x['launch_intent']},
+                'watchdog_unit': unit, 'watchdog_running': bool(unit) and self.host.watchdog_running(unit),
                 'cleanup_failures': value.get('cleanup_failures', [])}
 
 
@@ -1933,6 +2137,8 @@ def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=N
     tool = Lifecycle(config)
     if mode == 'watchdog':
         return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
+    if mode == 'watchdog-serve':
+        return tool.watchdog_serve()
     return getattr(tool, mode)()
 
 
@@ -2069,7 +2275,7 @@ def main(argv=None):
         windows_launch(actual[1])
         return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'watchdog'))
+    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'watchdog', 'watchdog-serve'))
     parser.add_argument('config', type=Path)
     parser.add_argument('--execute', action='store_true', help='explicit runtime authorization; NEVER used by offline tests')
     parser.add_argument('--ssh', help='executor host (remote login shell PowerShell 7)')
@@ -2081,7 +2287,7 @@ def main(argv=None):
         require(args.mode in ('status', 'preflight') or args.execute, 'up/down require explicit --execute')
         value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause)
                  if args.ssh else dispatch(args.mode, config, args.execute, args.rounds, args.pause))
-        if isinstance(value, dict) and args.mode in ('preflight', 'watchdog'):
+        if isinstance(value, dict) and args.mode in ('preflight', 'watchdog', 'watchdog-serve'):
             for line in value.get('lines') or []:
                 print(line, file=sys.stderr)
         print(json.dumps(value, indent=2))
