@@ -383,7 +383,16 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
   recorded on its first `play` (`macro.record`, then the recipe's inputs,
   then `macro.stop`). Its sha256 is written back into `rows.json`, and
   every later use plays the file. Recipe inputs are the only single inputs
-  the runner ever sends.
+  the runner ever sends. Eden takes `lease_ms` of 1..10000
+  (`CLIControl.md`, "Controller input"; `edenctl.py` passes that field on
+  `input.button` and `input.stick`). Sending the same input again replaces
+  the expiry, so a long hold — a `frames` hold, or a wall hold whose lease
+  would pass 10000 — is a run of leases, each at most 10000 ms, renewed
+  before the current one expires. A `with_stick` hold does not add its
+  margin on top of 10000. If recording fails, the partial macro is deleted
+  and the segment is left without a sha256, and the row fails with that
+  error. A later `play` of a file that still has no sha256 fails the row
+  the same way; it does not raise `KeyError`.
 - **Gates:** `log` (a regex over lines the row wrote), `json` (expected
   values in a file such as the settings), `image` (a region compared with a
   reference shot) and `hook` (a Python check such as `css_check.py`).
@@ -391,8 +400,18 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
   - For an image gate, pick a region that doesn't animate. The default
     tolerance is a mean difference of 8 per colour byte; an exact match is
     only allowed with `"static": true`. The title screen's attract mode
-    failed two exact-match attempts on 2026-11-03.
-  - Capture reference shots from the run itself, at the same resolution.
+    failed two exact-match attempts on 2026-11-03. `"scale": "fit"` on the
+    gate, or on the plan, scales the live frame to the reference's size when
+    the sizes differ and the aspect ratio matches, then compares. The ROI
+    stays in reference coordinates. It is off unless set. The receipt records
+    that scaling was used. Tolerances stay as written. A hook gate that
+    returns bare `True` checks the row without leaving screen or log
+    evidence; the receipt warns, and the row still passes. Return a line, a
+    count or a small dict from the hook when a later reader should see what
+    passed. Rows differ, so the warning is not a failure.
+  - Capture reference shots from the run itself, at the same resolution,
+    or set `"scale": "fit"` when one reference is compared with a 0.5x
+    frame or another 16:9 capture.
 - **Start checks:** every `play` needs one. That's a gate on the same
   instance since the last play, a `start_gate` on the segment, or an
   explicit `"unchecked": true`. On 2026-11-03 lr-03 recorded title→main

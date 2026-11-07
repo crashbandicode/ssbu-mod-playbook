@@ -885,6 +885,173 @@ class RunnerTests(unittest.TestCase):
         started = next(params for method, params in eden.params if method == 'recording.start')
         self.assertEqual(started['width'], 800)
 
+    def test_long_with_stick_hold_is_split_under_the_lease_cap(self):
+        self.assertEqual(runner.lease_parts(10200), [10000, 200])
+        self.plan['segments']['to-blue']['recipe'] = [
+            {'buttons': 'b', 'with_stick': [0, -1], 'frames': 12, 'gap': 0, 'stick_lead_ms': 0}]
+        self.plan['rows'] = [
+            {'id': 'hold', 'start': 'blue', 'end': 'blue',
+             'steps': [{'play': 'to-blue', 'unchecked': True}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        short = self._leases_during_record(FakeEden({'to-blue': BLUE}))
+        self.assertTrue(short)
+        self.assertTrue(all(1 <= lease <= 10000 for lease in short))
+        self.assertNotIn(10200, short)
+        self.assertEqual(sum(1 for lease in short if lease == 10000), 2)  # one stick, one button; hold is short
+
+        # A hold that outlasts one lease is renewed. The clock jumps with sleep so the test does not wait 10 s.
+        path = self.dir / 'segments' / 'to-blue.edenmacro.json'
+        path.unlink()
+        self.plan['segments']['to-blue'].pop('sha256', None)
+        self.plan['segments']['to-blue']['recipe'][0]['frames'] = 1500
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'hold.json').unlink()
+        clock = {'now': 0.0}
+        real_sleep, real_mono = runner.time.sleep, runner.time.monotonic
+
+        def sleep(seconds):
+            clock['now'] += seconds
+
+        def monotonic():
+            return clock['now']
+
+        runner.time.sleep, runner.time.monotonic = sleep, monotonic
+        try:
+            leases = self._leases_during_record(FakeEden({'to-blue': BLUE}))
+        finally:
+            runner.time.sleep, runner.time.monotonic = real_sleep, real_mono
+        self.assertTrue(all(1 <= lease <= 10000 for lease in leases))
+        downs = [lease for lease in leases if lease == 10000]
+        self.assertGreaterEqual(len(downs), 3)  # first stick, first button, and at least one renewal
+        saved = json.loads(self.manifest.read_text())['segments']['to-blue']
+        self.assertEqual(saved['sha256'], sha(path))
+        self.assertEqual(json.loads((self.dir / 'out' / 'hold.json').read_text())['status'], 'PASS')
+
+    def _leases_during_record(self, eden):
+        leases = []
+        original = eden.request
+
+        def request(method, params):
+            if method in ('input.stick', 'input.button') and 'lease_ms' in (params or {}):
+                leases.append(params['lease_ms'])
+            return original(method, params)
+
+        eden.request = request
+        self.make(eden).run()
+        return leases
+
+    def test_recording_failure_leaves_no_segment_and_fails_the_row(self):
+        self.plan['rows'] = [
+            {'id': 'rec', 'start': 'blue', 'end': 'blue', 'steps': [{'play': 'to-blue', 'unchecked': True}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = FakeEden({'to-blue': BLUE})
+        original = eden.request
+
+        def request(method, params):
+            if method == 'input.button':
+                return {'ok': False, 'error': {'message': 'injected recording failure'}}
+            return original(method, params)
+
+        eden.request = request
+        with self.assertRaises(RuntimeError) as caught:
+            self.make(eden).run()
+        self.assertNotIsInstance(caught.exception, KeyError)
+        self.assertIn('injected recording failure', str(caught.exception))
+        path = self.dir / 'segments' / 'to-blue.edenmacro.json'
+        self.assertFalse(path.exists())
+        saved = json.loads(self.manifest.read_text())['segments']['to-blue']
+        self.assertNotIn('sha256', saved)
+        receipt = json.loads((self.dir / 'out' / 'rec.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertNotIn('KeyError', receipt['error'])
+
+    def test_sha_less_play_fails_cleanly(self):
+        del self.plan['segments']['to-red']['sha256']
+        self.plan['rows'] = [
+            {'id': 'bare', 'start': 'blue', 'end': 'red', 'steps': [{'play': 'to-red', 'unchecked': True}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('to-red: no sha256', ' | '.join(runner.dry_run(self.manifest)['errors']))
+        with self.assertRaises(RuntimeError) as caught:
+            self.make(FakeEden({'to-red': RED})).run()
+        self.assertIn('no sha256', str(caught.exception))
+        self.assertNotIsInstance(caught.exception, KeyError)
+        receipt = json.loads((self.dir / 'out' / 'bare.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertIn('sha256', receipt['error'])
+        self.assertNotIn('KeyError', receipt['error'])
+
+    def _paint(self, eden, size):
+        original = eden.request
+
+        def request(method, params):
+            reply = original(method, params)
+            if method == 'ui.screenshot':
+                Image.new('RGB', size, eden.colour).save(params['path'])
+            return reply
+
+        eden.request = request
+        return eden
+
+    def test_scale_fit_matches_a_half_size_frame_and_is_off_by_default(self):
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'red',
+             'steps': [{'play': 'to-red', 'unchecked': True}, {'gate': 'red'}]}]
+        self.plan['gates']['red']['cap'] = 0.4
+        self.manifest.write_text(json.dumps(self.plan))
+        with self.assertRaises(RuntimeError):
+            self.make(self._paint(FakeEden({'to-red': RED}), (32, 18))).run()
+        failed = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual(failed['status'], 'FAILED')
+        self.assertNotIn('scale', failed)
+
+        self.plan['gates']['red']['scale'] = 'fit'
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'r1.json').unlink()
+        (self.dir / 'out' / 'STOP-INPUT').unlink()
+        self.assertEqual(self.make(self._paint(FakeEden({'to-red': RED}), (32, 18))).run(), 'DONE')
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertEqual(receipt['scale'][0]['scale'], 'fit')
+        self.assertEqual(receipt['scale'][0]['frame'], [32, 18])
+        self.assertEqual(receipt['scale'][0]['reference'], [64, 36])
+        self.assertEqual(receipt['results'][1]['scale']['scale'], 'fit')
+
+        # The plan can opt in, and a different aspect is still compared at its own size.
+        self.plan['gates']['red'].pop('scale')
+        self.plan['scale'] = 'fit'
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'r1.json').unlink()
+        self.assertEqual(self.make(self._paint(FakeEden({'to-red': RED}), (32, 18))).run(), 'DONE')
+        self.plan.pop('scale')
+        self.plan['gates']['red']['scale'] = 'fit'
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'r1.json').unlink()
+        with self.assertRaises(RuntimeError):
+            self.make(self._paint(FakeEden({'to-red': RED}), (40, 30))).run()
+        mismatched = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual(mismatched['status'], 'FAILED')
+        self.assertNotIn('scale', mismatched)
+
+    def test_receipt_warns_when_a_passing_hook_checked_nothing(self):
+        (self.dir / 'always.py').write_text('def check(path, gate):\n    return True\n')
+        self.plan['gates']['empty'] = {
+            'kind': 'hook', 'module': 'always.py', 'function': 'check', 'cap': 1, 'interval': 0.01}
+        self.plan['rows'] = [
+            {'id': 'bare', 'start': 'blue', 'end': 'blue', 'steps': [{'gate': 'empty'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(self.make(FakeEden({})).run(), 'DONE')
+        receipt = json.loads((self.dir / 'out' / 'bare.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertIn('no screen or log evidence', receipt['warnings'][0])
+
+        (self.dir / 'always.py').write_text('def check(path, gate):\n    return {"screen": "blue"}\n')
+        (self.dir / 'out' / 'bare.json').unlink()
+        self.assertEqual(self.make(FakeEden({})).run(), 'DONE')
+        receipt = json.loads((self.dir / 'out' / 'bare.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertNotIn('warnings', receipt)
+        self.assertEqual(receipt['results'][0]['hook_evidence'], {'screen': 'blue'})
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

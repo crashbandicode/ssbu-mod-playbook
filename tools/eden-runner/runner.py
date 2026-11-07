@@ -50,6 +50,11 @@ Known detours: a gate with "recover": "<segment>" plays that segment and checks 
 Recipe actions: {"buttons": "a", "hold": 150, "gap": 0.6}, {"buttons": "b", "with_stick": [0, -1]} (stick held
 through the press, e.g. Down+B), {"stick": [x, y, ms]}. Add "frames": N (and "gap_frames": N) to hold for N game frames
 of the recording instead of wall time; use it for any stick hold whose length matters (cursor acceleration on the CSS).
+Eden's control API accepts lease_ms of 1..10000 only (CLIControl.md "Controller input"; edenctl.py copies lease_ms
+onto input.button and input.stick). A new press replaces the previous expiry, so a hold longer than one lease —
+including a frame hold, whose wall time is the game's — is renewed with another lease of at most 10000 ms. The
+runner never asks for 10000 plus a margin. A recording that fails deletes the partial macro and writes no sha256.
+Playing a segment file that has no sha256 fails that row with a clear error.
 
 Reference images not taken yet: an image gate with "acquire": true and no reference file captures one the first time
 the run reaches it (once the region stops changing), writes its sha256 into rows.json, and the runner stops after that
@@ -75,6 +80,11 @@ per-instance "trace", instances.json has "trace_jsonl": a log gate on it waits f
 More gates:
   {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
       the region differs from the row's mark and has stopped moving (HUD portrait swapped, menu value changed)
+  {"kind": "image", "scale": "fit"}
+      opt-in, on the gate or the plan. Scale the live frame to the reference size when the aspect ratio matches,
+      then compare. The ROI stays in reference coordinates. Off unless set. The receipt records the scaling.
+      Tolerances are unchanged. A pass that came only from hook gates returning True gets a receipt warning and
+      still passes; return a line, a count or a small dict from the hook when that pass should count as evidence.
   {"kind": "log", "source": "detector_log", "pattern": "sync_end .*frame=(\\d+) .*desync_seen=(\\d+)",
    "on_all": ["a", "b"], "equal": true, "expect_groups": {"2": "0"}, "cap": 120}
       every listed instance logged a match this row, with the same captured values and desync_seen=0
@@ -127,6 +137,27 @@ DEFAULT_FAILURE_EVIDENCE = {'screenshot': True, 'log_tails': True, 'trace': 'aut
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
+# Eden control API (Eden-GIF docs/CLIControl.md, "Controller input"): a held input's lease_ms is 1..10000.
+# edenctl.py copies lease_ms onto input.button, input.stick and the other held-input commands. A new press
+# replaces the previous expiry, so a longer hold is renewed with another lease; it is not one request past the cap.
+# Renew this long before expiry. Eden checks expiry on a 20 ms GUI timer.
+LEASE_MAX_MS = 10000
+LEASE_MIN_MS = 1
+LEASE_RENEW_MARGIN_MS = 250
+
+
+def lease_parts(total_ms, cap=LEASE_MAX_MS):
+    """Split a hold into consecutive leases of 1..cap ms. Eden rejects a single lease outside that range."""
+    total = int(total_ms)
+    if total < LEASE_MIN_MS:
+        raise ValueError(f'lease_ms {total} is below {LEASE_MIN_MS}')
+    parts = []
+    left = total
+    while left > cap:
+        parts.append(cap)
+        left -= cap
+    parts.append(left)
+    return parts
 
 
 def digest(path):
@@ -578,7 +609,10 @@ def dry_run(manifest_path):
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
         if path.is_file():
-            if seg.get('sha256') != digest(path):
+            if not seg.get('sha256'):
+                errors.append(f'segment {name}: no sha256')
+                continue
+            if seg['sha256'] != digest(path):
                 errors.append(f'segment {name}: sha256 mismatch')
                 continue
             macro = json.loads(path.read_text())
@@ -591,6 +625,8 @@ def dry_run(manifest_path):
             missing.append(name)
         else:
             errors.append(f'segment {name}: file missing and no recipe')
+    if 'scale' in plan and plan.get('scale') not in (None, False, 'off', 'fit'):
+        errors.append(f'plan scale {plan.get("scale")!r} is not "fit" or "off"')
     for name, gate in plan.get('gates', {}).items():
         kind = gate.get('kind')
         if kind not in GATE_KINDS:
@@ -602,6 +638,9 @@ def dry_run(manifest_path):
             errors.append(f'gate {name}: recover segment {gate["recover"]!r} is not in segments')
         try:
             if kind == 'image':
+                scale = gate['scale'] if 'scale' in gate else None
+                if scale not in (None, False, 'off', 'fit'):
+                    errors.append(f'gate {name}: scale {scale!r} is not "fit" or "off"')
                 ref = base / gate['reference']
                 if not ref.is_file() and gate.get('acquire'):
                     to_acquire.append(name)  # captured the first time the run reaches the screen
@@ -989,20 +1028,107 @@ class Runner:
             time.sleep(.2)
         raise RuntimeError(f'macro on {on} not finished within {cap} s')
 
-    FRAME_LEASE_MS = 10000  # input lease while holding for a frame count; released explicitly when the count is reached
+    def send_lease(self, on, method, params, lease_ms):
+        """One held input whose lease is inside Eden's 1..10000 ms range. A value outside it is a runner bug."""
+        lease_ms = int(lease_ms)
+        if lease_ms < LEASE_MIN_MS or lease_ms > LEASE_MAX_MS:
+            raise RuntimeError(f'{method} lease_ms {lease_ms} is outside {LEASE_MIN_MS}..{LEASE_MAX_MS}')
+        body = dict(params)
+        body['lease_ms'] = lease_ms
+        self.call(on, method, body)
 
-    def hold(self, on, frames, ms):
-        """Wait for `frames` game frames of the recording (macro.status frame) if given, else for `ms` wall time."""
-        if not frames:
+    def issue_hold(self, on, method, params, lease_ms, renew):
+        """Send the first lease. A request past 10000 ms is split: the rest is renewed from hold()."""
+        parts = lease_parts(lease_ms)
+        self.send_lease(on, method, params, parts[0])
+        if len(parts) > 1:
+            renew.append((method, params))
+
+    def hold(self, on, frames, ms, renew=None):
+        """Wait for `frames` game frames of the recording (macro.status frame) if given, else for `ms` wall time.
+
+        `renew` is held inputs to send again before the current lease expires. Eden replaces the previous expiry
+        when the same input is pressed again (CLIControl.md), so this is how a hold outlasts 10000 ms."""
+        renew = list(renew or [])
+        if not frames and not renew:
             time.sleep(ms / 1000)
             return
-        start = (self.call(on, 'macro.status') or {}).get('frame', 0)
-        until = time.monotonic() + max(5.0, frames / 10)  # even a 10 fps game gets there in time
-        while time.monotonic() < until:
-            if (self.call(on, 'macro.status') or {}).get('frame', 0) - start >= frames:
+        start = (self.call(on, 'macro.status') or {}).get('frame', 0) if frames else None
+        deadline = None if frames else time.monotonic() + ms / 1000
+        frame_deadline = time.monotonic() + max(5.0, frames / 10) if frames else None
+        period = (LEASE_MAX_MS - LEASE_RENEW_MARGIN_MS) / 1000
+        next_renew = time.monotonic() + period if renew else None
+        while True:
+            now = time.monotonic()
+            if frames:
+                if (self.call(on, 'macro.status') or {}).get('frame', 0) - start >= frames:
+                    return
+                if now > frame_deadline:
+                    raise RuntimeError(
+                        f'recording on {on} did not advance {frames} frames in time (game paused or stalled?)')
+            elif now >= deadline:
                 return
-            time.sleep(.01)  # under a frame at 60 fps; the recording keeps whole display frames anyway
-        raise RuntimeError(f'recording on {on} did not advance {frames} frames in time (game paused or stalled?)')
+            if next_renew is not None and now >= next_renew:
+                for method, params in renew:
+                    self.send_lease(on, method, params, LEASE_MAX_MS)
+                next_renew = time.monotonic() + period
+            slice_s = 0.01 if frames else 0.05
+            if next_renew is not None:
+                slice_s = min(slice_s, max(0.0, next_renew - time.monotonic()))
+            if deadline is not None:
+                slice_s = min(slice_s, max(0.0, deadline - time.monotonic()))
+            if slice_s > 0:
+                time.sleep(slice_s)
+
+    def drop_recording(self, on, path):
+        """A failed recording leaves no macro file and no sha256. Eden may still have saved one on macro.stop."""
+        for method in ('input.reset', 'macro.stop'):
+            try:
+                self.call(on, method)
+            except Exception:
+                pass
+        path.unlink(missing_ok=True)
+
+    def recipe_action(self, on, action):
+        # "frames": hold for that many game frames (macro.status frame), not wall time: the game's speed
+        # varies, so a 400 ms hold recorded 11 frames once and 35 another time (lr-03, 2026-11-03).
+        # A frame hold's wall time can pass 10 s, so those inputs are renewed until the frame count arrives.
+        frames = action.get('frames')
+        renew = []
+        if 'buttons' in action:
+            hold_ms = action.get('hold', 150)
+            lease = LEASE_MAX_MS if frames else hold_ms + 500
+            buttons = [b for b in action['buttons'].split(',') if b]
+            if 'with_stick' in action:  # stick held through the press, e.g. Down+B
+                x, y = action['with_stick']
+                params = {'stick': 'left', 'x': x, 'y': y}
+                # The extra 200 ms used to be one lease of `lease + 200`. At the 10000 ms frame lease that is
+                # 10200, which Eden rejects. Cap the first lease and renew when the hold outlasts it.
+                self.issue_hold(on, 'input.stick', params, lease + 200, renew)
+                if frames and ('input.stick', params) not in renew:
+                    renew.append(('input.stick', params))
+                time.sleep(action.get('stick_lead_ms', 50) / 1000)
+            for button in buttons:
+                params = {'button': button, 'state': 'press'}
+                self.issue_hold(on, 'input.button', params, lease, renew)
+                if frames and ('input.button', params) not in renew:
+                    renew.append(('input.button', params))
+            self.hold(on, frames, hold_ms, renew)
+            for button in buttons:
+                self.call(on, 'input.button', {'button': button, 'state': 'release'})
+            if 'with_stick' in action:
+                self.send_lease(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0}, 100)
+        elif 'stick' in action:
+            x, y = action['stick'][:2]
+            ms = action['stick'][2] if len(action['stick']) > 2 else 250
+            lease = LEASE_MAX_MS if frames else ms
+            params = {'stick': 'left', 'x': x, 'y': y}
+            self.issue_hold(on, 'input.stick', params, lease, renew)
+            if frames and ('input.stick', params) not in renew:
+                renew.append(('input.stick', params))
+            self.hold(on, frames, ms, renew)
+            self.send_lease(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0}, 100)
+        self.hold(on, action.get('gap_frames'), action.get('gap', .6) * 1000)
 
     def record(self, on, name, seg):
         path = self.base / seg['file']
@@ -1011,36 +1137,13 @@ class Runner:
                                        'countdown_ms': 0})
         try:
             for action in seg['recipe']:
-                # "frames": hold for that many game frames (macro.status frame), not wall time: the game's speed
-                # varies, so a 400 ms hold recorded 11 frames once and 35 another time (lr-03, 2026-11-03).
-                frames = action.get('frames')
-                if 'buttons' in action:
-                    hold = action.get('hold', 150)
-                    lease = self.FRAME_LEASE_MS if frames else hold + 500
-                    buttons = action['buttons'].split(',')
-                    if 'with_stick' in action:  # stick held through the press, e.g. Down+B
-                        x, y = action['with_stick']
-                        self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': lease + 200})
-                        time.sleep(action.get('stick_lead_ms', 50) / 1000)
-                    for b in buttons:
-                        self.call(on, 'input.button', {'button': b, 'state': 'press', 'lease_ms': lease})
-                    self.hold(on, frames, hold)
-                    for b in buttons:
-                        self.call(on, 'input.button', {'button': b, 'state': 'release'})
-                    if 'with_stick' in action:
-                        self.call(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0, 'lease_ms': 100})
-                elif 'stick' in action:
-                    x, y = action['stick'][:2]
-                    ms = action['stick'][2] if len(action['stick']) > 2 else 250
-                    lease = self.FRAME_LEASE_MS if frames else ms
-                    self.call(on, 'input.stick', {'stick': 'left', 'x': x, 'y': y, 'lease_ms': lease})
-                    self.hold(on, frames, ms)
-                    self.call(on, 'input.stick', {'stick': 'left', 'x': 0, 'y': 0, 'lease_ms': 100})
-                self.hold(on, action.get('gap_frames'), action.get('gap', .6) * 1000)
-        finally:
+                self.recipe_action(on, action)
             self.call(on, 'input.reset')
             time.sleep(.12)  # one neutral frame before the recording closes
             self.call(on, 'macro.stop')
+        except Exception:
+            self.drop_recording(on, path)
+            raise
         if not path.is_file():
             raise RuntimeError(f'Eden saved no recording for {name}')
         seg['sha256'] = digest(path)
@@ -1054,8 +1157,13 @@ class Runner:
             self.gate(on, seg['start_gate'])  # the segment's start screen, checked before any input
         path = self.base / seg['file']
         if not path.is_file():
+            if not seg.get('recipe'):
+                raise RuntimeError(f'segment {name} is missing and has no recipe to record')
             self.record(on, name, seg)  # the recording itself reaches the segment's end screen
             return
+        if not seg.get('sha256'):
+            raise RuntimeError(
+                f'segment {name} has no sha256; refusing to play an unhashed recording ({path.name})')
         if digest(path) != seg['sha256']:
             raise RuntimeError(f'segment {name} changed since the dry run')
         self.call(on, 'macro.play', {'path': str(path)})
@@ -1088,16 +1196,51 @@ class Runner:
         return matches[-1] if matches else None
 
     @staticmethod
+    def same_aspect(size_a, size_b):
+        """True when two sizes are the same shape, with about a pixel of slack. A crop is not the frame's shape."""
+        aw, ah = size_a
+        bw, bh = size_b
+        if min(aw, ah, bw, bh) < 1:
+            return False
+        return abs(aw * bh - bw * ah) <= max(ah, bh)
+
+    @staticmethod
+    def compare_region(path_a, path_b, roi, b_is_roi=False, scale=None):
+        """Mean difference of the ROI, and a note when the live frame was scaled to the reference.
+
+        scale "fit" resizes the frame to the reference size when the aspect matches. The ROI is in reference
+        coordinates, applied after that. A reference that is already the ROI (b_is_roi) is left alone: its aspect
+        is the crop's, not the frame's. Returns (difference, note or None)."""
+        from PIL import Image
+        with Image.open(path_a) as im_a, Image.open(path_b) as im_b:
+            frame = im_a.convert('RGB')
+            reference = im_b.convert('RGB')
+            note = None
+            if (scale == 'fit' and not b_is_roi and frame.size != reference.size
+                    and Runner.same_aspect(frame.size, reference.size)):
+                note = {'scale': 'fit', 'frame': [frame.size[0], frame.size[1]],
+                        'reference': [reference.size[0], reference.size[1]]}
+                frame = frame.resize(reference.size, Image.Resampling.BOX)
+            region = frame.crop(tuple(roi)).tobytes()
+            other = (reference if b_is_roi else reference.crop(tuple(roi))).tobytes()
+        if len(region) != len(other):
+            return float('inf'), note
+        return sum(abs(x - y) for x, y in zip(region, other)) / max(len(region), 1), note
+
+    @staticmethod
     def roi_diff(path_a, path_b, roi, b_is_roi=False):
         """Mean absolute difference per colour byte of the region in both images. With b_is_roi, image b already
         is just that region (library references keep only the compared region)."""
-        from PIL import Image
-        with Image.open(path_a) as im_a, Image.open(path_b) as im_b:
-            a = im_a.convert('RGB').crop(tuple(roi)).tobytes()
-            b = (im_b.convert('RGB') if b_is_roi else im_b.convert('RGB').crop(tuple(roi))).tobytes()
-        if len(a) != len(b):
-            return float('inf')
-        return sum(abs(x - y) for x, y in zip(a, b)) / max(len(a), 1)
+        return Runner.compare_region(path_a, path_b, roi, b_is_roi)[0]
+
+    def image_scale(self, gate):
+        """"fit" on the gate, or on the plan when the gate doesn't say. Anything else is off, except a typo."""
+        value = gate['scale'] if 'scale' in gate else self.plan.get('scale')
+        if value in (None, False, 'off'):
+            return None
+        if value == 'fit':
+            return 'fit'
+        raise RuntimeError(f'scale {value!r} is not "fit" or "off"')
 
     def gate(self, on, name):
         """Check a gate. With "recover": "<segment>" a failed gate plays that segment and checks again, at most
@@ -1117,7 +1260,10 @@ class Runner:
                 self.wait_macro(on, seg.get('cap', 60))
 
     def check_gate(self, on, name):
-        return self.check_gate_spec(on, self.plan['gates'][name], name)
+        self._gate_evidence = True
+        result = self.check_gate_spec(on, self.plan['gates'][name], name)
+        self.gate_saw_evidence.append(self._gate_evidence)
+        return result
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
@@ -1207,15 +1353,36 @@ class Runner:
             return self.acquire(on, name, gate, until)
         else:
             hook = load_hook(self.base, gate) if kind == 'hook' else None
+            scale = None if hook is not None else self.image_scale(gate)
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
+                note = None
+                hook_evidence = None
                 if hook is not None:
-                    passed = bool(hook(str(path), gate))
+                    outcome = hook(str(path), gate)
+                    passed = bool(outcome)
+                    # Bare True checked the row and named nothing. Any other truthy result is the evidence.
+                    if passed and outcome is not True:
+                        try:
+                            json.dumps(outcome)
+                            hook_evidence = outcome
+                        except TypeError:
+                            hook_evidence = repr(outcome)[:300]
+                    self._gate_evidence = hook_evidence is not None
                 else:
-                    diff = self.roi_diff(path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'))
+                    diff, note = self.compare_region(
+                        path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'), scale)
                     passed = diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
                 if passed:
-                    self.log({'gate': name, 'on': on, 'pass': True, 'shot': str(path)})
+                    record = {'gate': name, 'on': on, 'pass': True, 'shot': str(path)}
+                    if note:
+                        record.update(note)
+                        self.last_image_scale = {'gate': name, **note}
+                        self.scales_used.append(self.last_image_scale)
+                    if hook is not None:
+                        record['hook_evidence'] = hook_evidence
+                        self.last_hook_evidence = hook_evidence
+                    self.log(record)
                     return str(path)
                 path.unlink(missing_ok=True)  # keep only the passing shot and the final failing one
                 time.sleep(gate.get('interval', 1))
@@ -1406,7 +1573,15 @@ class Runner:
         return {'play': step['play'], 'on': on}
 
     def _step_gate(self, on, step):
-        return {'gate': step['gate'], 'on': on, 'evidence': self.gate(on, step['gate'])}
+        self.last_image_scale = None
+        self.last_hook_evidence = None
+        evidence = self.gate(on, step['gate'])
+        result = {'gate': step['gate'], 'on': on, 'evidence': evidence}
+        if self.last_image_scale:
+            result['scale'] = self.last_image_scale
+        if self.last_hook_evidence is not None:
+            result['hook_evidence'] = self.last_hook_evidence
+        return result
 
     def _step_shot(self, on, step):
         return {'shot': str(self.shot(on, step['shot']))}
@@ -1676,6 +1851,9 @@ class Runner:
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()
             self.marks, self.copies, self.acquired = {}, {}, []
+            self.scales_used, self.gate_saw_evidence = [], []
+            self.last_image_scale = None
+            self.last_hook_evidence = None
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
             try:
@@ -1685,6 +1863,10 @@ class Runner:
                 for step in row['steps']:
                     self.execute_step(step, receipt['results'])
                 receipt['status'] = 'PASS'
+                if self.scales_used:
+                    receipt['scale'] = self.scales_used
+                if self.gate_saw_evidence and not any(self.gate_saw_evidence):
+                    receipt['warnings'] = ['passed with no screen or log evidence from its gates']
                 self.note(row['id'], 'pass')
                 if not self.pace['first_row_done']:
                     self.pace['first_row_done'] = time.time()
