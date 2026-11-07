@@ -1348,12 +1348,14 @@ class Lifecycle:
             detail = f'{running} Eden instance(s) already active on host (limit {limit})'
             problems.append(detail)
             lines.append('FAIL eden slots: ' + detail)
-            checks.append({'name': 'eden-slots', 'ok': False, 'running': running, 'limit': limit,
-                           'owned_running': owned_running})
+            slot = {'name': 'eden-slots', 'ok': False, 'running': running, 'limit': limit}
         else:
             lines.append(f'OK eden slots: {running} running, limit {limit}, requesting {len(self.c["instances"])}')
-            checks.append({'name': 'eden-slots', 'ok': True, 'running': running, 'limit': limit,
-                           'requesting': len(self.c['instances']), 'owned_running': owned_running})
+            slot = {'name': 'eden-slots', 'ok': True, 'running': running, 'limit': limit,
+                    'requesting': len(self.c['instances'])}
+        if 'owned_running' in value:
+            slot['owned_running'] = owned_running
+        checks.append(slot)
         need = MIN_MEMORY_SECOND if running else MIN_MEMORY
         floor = self.c.get('memory_floor_bytes', need)
         if value['mem_available'] < floor:

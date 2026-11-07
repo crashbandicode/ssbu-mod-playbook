@@ -932,6 +932,10 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(Path(self.config['work_root']).exists())
         self.assertFalse(self.ledger.claimed)
         self.assertTrue(any(line.startswith('OK pin:') for line in value['lines']))
+        slots = next(check for check in value['checks'] if check['name'] == 'eden-slots')
+        self.assertEqual(slots, {'name': 'eden-slots', 'ok': True, 'running': 0, 'limit': 1,
+                                 'requesting': 1})
+        self.assertTrue(any(line == 'OK eden slots: 0 running, limit 1, requesting 1' for line in value['lines']))
         self.assertEqual(self.ledger_path.read_text(), '# TEMPORARY test data; not OWNER-COORDINATION\n')
         self.plugin.write_bytes(b'changed')
         bad = self.controller().preflight()
