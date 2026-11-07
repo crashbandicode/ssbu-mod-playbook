@@ -1304,11 +1304,15 @@ class Lifecycle:
         value = self.host.resources(path, owned)
         # The ledger admits up to this many of this tool's own claims on the host (claim_admission).
         value['max_eden'] = getattr(self.host, 'max_eden', 1)
+        # resources() removes these units from foreign_processes. Count them here or a pair's
+        # second launch looks like the only Eden on the host.
+        value['owned_running'] = len(tuple(owned))
         self.record('admission', value)
         # Compilers always block an Up. Other Eden instances are allowed up to the host's limit (operator 2026-11-04:
         # the Surface and the Yoga can each run two emulators; the Ally stays at one). Only the emulator binary counts
         # as an instance; its AppImage launcher and LAN helper processes belong to the same instance.
-        # The first instance needs 10 GiB available. A second one needs 9 GiB: its unit caps it at 8 GiB, plus 1 GiB.
+        # The first instance needs 10 GiB available. A second one, foreign or already launched by this run,
+        # needs 9 GiB: its unit caps it at 8 GiB, plus 1 GiB.
         problems, _lines, _checks = self.resource_report(value)
         if problems:
             require(False, problems[0])
@@ -1335,16 +1339,22 @@ class Lifecycle:
             lines.append('OK compiler: none running')
             checks.append({'name': 'compiler', 'ok': True})
         limit = value.get('max_eden', getattr(self.host, 'max_eden', 1))
-        if len(edens) >= limit:
-            detail = f'{len(edens)} Eden instance(s) already active on host (limit {limit})'
+        # Preflight has no owned_running, so it still counts foreign Edens only.
+        owned_running = value.get('owned_running', 0)
+        if type(owned_running) is not int or owned_running < 0:
+            owned_running = 0
+        running = len(edens) + owned_running
+        if running >= limit:
+            detail = f'{running} Eden instance(s) already active on host (limit {limit})'
             problems.append(detail)
             lines.append('FAIL eden slots: ' + detail)
-            checks.append({'name': 'eden-slots', 'ok': False, 'running': len(edens), 'limit': limit})
+            checks.append({'name': 'eden-slots', 'ok': False, 'running': running, 'limit': limit,
+                           'owned_running': owned_running})
         else:
-            lines.append(f'OK eden slots: {len(edens)} running, limit {limit}, requesting {len(self.c["instances"])}')
-            checks.append({'name': 'eden-slots', 'ok': True, 'running': len(edens), 'limit': limit,
-                           'requesting': len(self.c['instances'])})
-        need = MIN_MEMORY_SECOND if edens else MIN_MEMORY
+            lines.append(f'OK eden slots: {running} running, limit {limit}, requesting {len(self.c["instances"])}')
+            checks.append({'name': 'eden-slots', 'ok': True, 'running': running, 'limit': limit,
+                           'requesting': len(self.c['instances']), 'owned_running': owned_running})
+        need = MIN_MEMORY_SECOND if running else MIN_MEMORY
         floor = self.c.get('memory_floor_bytes', need)
         if value['mem_available'] < floor:
             if 'memory_floor_bytes' in self.c:

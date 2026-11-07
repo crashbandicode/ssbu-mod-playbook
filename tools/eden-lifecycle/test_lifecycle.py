@@ -216,6 +216,7 @@ class LifecycleTests(unittest.TestCase):
 
     def pair(self):
         self.config['pair_authorized'] = True
+        self.host.max_eden = 2
         second = deepcopy(self.config['instances'][0])
         second.update(key='b', display=':102')
         self.config['instances'].append(second)
@@ -481,6 +482,49 @@ class LifecycleTests(unittest.TestCase):
         self.host.available = int(8.5 * life.GIB)
         with self.assertRaisesRegex(life.Refused, 'MemAvailable below 9 GiB'):
             self.controller().admission()
+
+    def test_pair_up_counts_its_first_instance_and_admits_the_second_at_9_5_gib(self):
+        self.pair()
+        self.host.available = 12 * life.GIB
+        real = self.host.resources
+
+        def resources(path, owned=()):
+            if owned:
+                self.host.available = int(9.5 * life.GIB)
+            return real(path, owned)
+
+        self.host.resources = resources
+        value = self.controller().up()
+        self.assertEqual(set(value['instances']), {'a', 'b'})
+        counts = [json.loads(line)['value'].get('owned_running')
+                  for line in (Path(self.config['state_dir']) / 'actions.jsonl').read_text().splitlines()
+                  if '"kind": "admission"' in line]
+        self.assertEqual(counts, [0, 0, 1])
+
+    def test_pair_up_refuses_its_second_instance_at_8_5_gib(self):
+        self.pair()
+        self.host.available = 12 * life.GIB
+        real = self.host.resources
+
+        def resources(path, owned=()):
+            if owned:
+                self.host.available = int(8.5 * life.GIB)
+            return real(path, owned)
+
+        self.host.resources = resources
+        with self.assertRaisesRegex(life.Refused, 'MemAvailable below 9 GiB'):
+            self.controller().up()
+        self.assertIn('launch-a', self.order)
+        self.assertNotIn('launch-b', self.order)
+
+    def test_pair_up_refuses_when_one_foreign_and_one_owned_fill_the_slots(self):
+        self.pair()
+        self.host.available = 16 * life.GIB
+        self.host.foreign = [{'pid': 501, 'name': 'eden'}]
+        with self.assertRaisesRegex(life.Refused, r'2 Eden instance\(s\) already active on host \(limit 2\)'):
+            self.controller().up()
+        self.assertIn('launch-a', self.order)
+        self.assertNotIn('launch-b', self.order)
 
     def test_a_third_eden_is_refused_on_a_two_instance_host(self):
         Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)

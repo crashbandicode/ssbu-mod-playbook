@@ -35,7 +35,11 @@ python3 -B -I lifecycle.py down config.json --execute
 `preflight` is read-only. On its own it checks resources, ledger claims and
 the display as well as the pins. `up` repeats the pin, game, update, commit
 and display checks before it creates a journal or a claim, then the existing
-admission checks memory, disk, compilers and claims once. It checks every
+admission checks memory, disk, compilers and claims, and again before each
+launch. The later check counts instances this run already launched, because
+`resources()` omits their units from the foreign list: the 9 GiB floor applies
+when any Eden is already running, and the slot limit is foreign plus owned.
+Preflight still counts foreign Edens only. It checks every
 `path`+`sha256` pin, each instance's game base and source profile, an optional
 `expected_game_version` against `game_updates` or an instance `updates` list,
 an optional `playbook` object (`root` and `commit`; a short hash matches a
