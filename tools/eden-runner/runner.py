@@ -36,7 +36,10 @@ Steps: play <segment> (macro.play, wait for finished, input.reset; a segment who
 recorded instead: macro.record, the recipe's inputs, input.reset, macro.stop, then its sha256 is written back to rows.json),
 gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screenshot a "before" for a change gate),
 copy <instance key> [as <name>] (copy that instance file into the row folder), json_diff {source, before, allowed,
-must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists).
+must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists),
+library <name> (play a shared-library segment by its index name), gif {name, preset, steps, out?} (record the nested
+steps; presets "docs" and "evidence", or a preset the plan defines). A step has one kind. New kinds register on
+Runner.step_handlers instead of another branch in the row loop.
 
 Shared library: a segment or gate written as {"library": "<name>"} comes from library/index.json next to this file
 (proven segments and references, with sha256 and start/end screens), so common routes aren't recorded again per run.
@@ -76,10 +79,21 @@ More gates:
    "on_all": ["a", "b"], "equal": true, "expect_groups": {"2": "0"}, "cap": 120}
       every listed instance logged a match this row, with the same captured values and desync_seen=0
 
-Run rules (playbook docs/MACROS.md, "Test runs"): rows run back to back while their gates pass; the first failure writes
-STOP-INPUT and the runner exits. A STOP file in the output folder stops it before its next input. If no row has finished
---pace-minutes after the first run started, it writes STOP-INPUT. Every control call goes to out/actions.jsonl; each row
-writes out/<row>.json and its media under out/<row>/. Rerunning skips rows whose receipt passed and resumes at the next.
+Run rules (playbook docs/MACROS.md, "Test runs"): rows run back to back while their gates pass. On a failure the runner
+writes the row's receipt as FAILED with evidence (a screenshot, the tails of the logs that row's gates read, and
+trace.counters plus trace.read when that instance is tracing). It then follows on_failure: "continue" or "stop".
+The default is continue when the next row has a start gate and a recover list, and stop otherwise, so a rows.json
+with no recover still stops at the first failure (STOP-INPUT) as before. continue plays that next row's recover
+(or the plan's recover list) and checks its start gate; the list may hold segments, a library route, a run hook,
+or a ui or call step. If the start gate passes, the run carries on. If recovery fails, or status says the game is
+not running (running false, or a crash), it writes STOP-INPUT and stops. The runner never reboots Eden.
+on_failure may be set on the plan, overridden per row, or passed as --on-failure. A plan or row may also set
+failure_evidence and on_failure_hook (a project hook that adds evidence). out/summary.json lists every row as
+pass, fail, skipped or not run, with each failure's reason and evidence paths. The exit code is nonzero if any
+row failed. --rows failed reruns only rows whose receipt is FAILED. A STOP file in the output folder stops the
+runner before its next input. If no row has finished --pace-minutes after the first run started, it writes
+STOP-INPUT. Every control call goes to out/actions.jsonl; each row writes out/<row>.json and its media under
+out/<row>/. Rerunning skips rows whose receipt passed and resumes at the next.
 """
 import argparse
 import hashlib
@@ -97,6 +111,19 @@ CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.ge
                 # Guest tracing (Eden persistent-tracing builds, docs/GUEST_TRACEPOINT.md); never input.
                 'trace.arm', 'trace.read', 'trace.counters', 'trace.list', 'trace.disarm', 'modules.list',
                 'symbols.load', 'tracepoint.arm', 'tracepoint.status', 'tracepoint.cancel')
+# One verb per step. Runner.step_handlers maps each of these to a method; add a kind there, not a new if-chain.
+STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 'call', 'wait_ms', 'gif', 'library')
+UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
+# Eden recording.start limits (tools/edenctl.py, docs/GIFRecording.md): fps 1-30, width 160-1280,
+# duration_ms 100-120000. Presets below are the playbook's defaults (docs/GIFS.md), not a ceiling:
+# a plan or row gif_presets entry, or fields on the gif step, override them. Leaving the operator's
+# envelope (docs: 1280 wide and under 10 s; evidence: 640 wide, fps at most 15, at most 10 MB) needs a reason.
+BUILTIN_GIF_PRESETS = {
+    'docs': {'width': 1280, 'fps': 10, 'max_duration_s': 10},
+    'evidence': {'width': 640, 'fps': 10, 'max_duration_s': 10, 'max_bytes': 10 * 1024 * 1024},
+}
+EVIDENCE_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_FAILURE_EVIDENCE = {'screenshot': True, 'log_tails': True, 'trace': 'auto', 'tail_lines': 80}
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
@@ -149,6 +176,394 @@ def expand_library(plan):
             merged.update({k: v for k, v in item.items() if k not in ('file', 'reference', 'module', 'sha256')})
             plan[kind][name] = merged
     return plan
+
+
+class GifRefused(RuntimeError):
+    """The captured GIF breaks its preset. detail is stored on the row receipt."""
+
+    def __init__(self, message, detail):
+        super().__init__(message)
+        self.detail = detail
+
+
+def step_kind(step):
+    """The one verb in a step. Unknown shapes raise; the dry run still ignores a step with no known verb,
+    and the run reports it, which is how an unrecognized future kind fails today."""
+    if not isinstance(step, dict):
+        raise RuntimeError(f'unknown step {step}')
+    known = list(STEP_KINDS)
+    extra = getattr(step_kind, 'extra', ())
+    for key in extra:
+        if key not in known:
+            known.append(key)
+    found = [key for key in known if key in step]
+    if len(found) != 1:
+        raise RuntimeError(f'unknown step {step}')
+    return found[0]
+
+
+def project_root(base):
+    """Repo root when rows.json lives in a checkout; otherwise the rows folder. A plan "root" wins."""
+    here = base.resolve()
+    for parent in (here, *here.parents):
+        if (parent / '.git').exists():
+            return parent
+    return here
+
+
+def inside_root(root, rel):
+    """A relative path that stays inside root. Absolute paths and escapes raise ValueError."""
+    if not isinstance(rel, str) or not rel.strip():
+        raise ValueError('empty path')
+    path = Path(rel)
+    if path.is_absolute() or '..' in path.parts:
+        # ".." is checked after resolve as well: "a/../../x" must not leave root.
+        raise ValueError(f'path {rel!r} must stay inside {root}')
+    resolved = (root / path).resolve()
+    root_resolved = root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ValueError(f'path {rel!r} leaves {root_resolved}')
+    return resolved
+
+
+def library_index():
+    index_path = LIBRARY / 'index.json'
+    if not index_path.is_file():
+        return {'segments': {}, 'gates': {}}
+    return json.loads(index_path.read_text())
+
+
+def merged_gif_presets(plan, row=None):
+    """Builtin presets, then the plan's gif_presets, then the row's. Later fields replace earlier ones."""
+    presets = {name: dict(spec) for name, spec in BUILTIN_GIF_PRESETS.items()}
+    for source in (plan.get('gif_presets') or {}, (row or {}).get('gif_presets') or {}):
+        if not isinstance(source, dict):
+            raise ValueError('gif_presets must be an object')
+        for name, spec in source.items():
+            if not isinstance(spec, dict):
+                raise ValueError(f'gif preset {name!r} must be an object')
+            base = dict(presets.get(name, {}))
+            base.update(spec)
+            presets[name] = base
+    return presets
+
+
+def _gif_number(spec, *keys):
+    for key in keys:
+        if key in spec and spec[key] is not None:
+            return spec[key]
+    return None
+
+
+def resolve_gif_spec(plan, row, gif):
+    """Preset plus the step's width/fps/length/size overrides. Does not decide whether a reason is required."""
+    if not isinstance(gif, dict):
+        raise ValueError('gif step needs an object')
+    if not gif.get('name') or not isinstance(gif['name'], str):
+        raise ValueError('gif step needs a name')
+    if not gif.get('preset'):
+        raise ValueError('gif step needs a preset')
+    presets = merged_gif_presets(plan, row)
+    if gif['preset'] not in presets:
+        raise ValueError(f'unknown gif preset {gif["preset"]!r}')
+    spec = dict(presets[gif['preset']])
+    if 'width' in gif:
+        spec['width'] = gif['width']
+    if 'fps' in gif:
+        spec['fps'] = gif['fps']
+    length = _gif_number(gif, 'length', 'max_duration_s', 'duration_s')
+    if length is not None:
+        spec['max_duration_s'] = length
+    if 'duration_ms' in gif:
+        spec['max_duration_s'] = gif['duration_ms'] / 1000
+    if 'max_bytes' in gif:
+        spec['max_bytes'] = gif['max_bytes']
+    elif 'size' in gif:
+        spec['max_bytes'] = gif['size']
+    elif 'max_mb' in gif:
+        spec['max_bytes'] = int(float(gif['max_mb']) * 1024 * 1024)
+    if 'width' not in spec or 'fps' not in spec or 'max_duration_s' not in spec:
+        raise ValueError(f'gif preset {gif["preset"]!r} needs width, fps and a duration')
+    spec['width'] = int(spec['width'])
+    spec['fps'] = int(spec['fps'])
+    spec['max_duration_s'] = float(spec['max_duration_s'])
+    if spec.get('max_bytes') is not None:
+        spec['max_bytes'] = int(spec['max_bytes'])
+    spec['preset'] = gif['preset']
+    spec['reason'] = gif.get('reason') or spec.get('reason')
+    return spec
+
+
+def gif_api_error(spec):
+    """None when recording.start would accept the numbers. A reason cannot widen Eden's own limits."""
+    if not 1 <= spec['fps'] <= 30:
+        return f'fps {spec["fps"]} is outside Eden\'s 1..30'
+    if not 160 <= spec['width'] <= 1280:
+        return f'width {spec["width"]} is outside Eden\'s 160..1280'
+    duration_ms = spec['max_duration_s'] * 1000
+    if not 100 <= duration_ms <= 120000:
+        return f'duration {duration_ms:g} ms is outside Eden\'s 100..120000'
+    return None
+
+
+def gif_outside_operator_rules(spec):
+    """True when the spec is outside both playbook envelopes and therefore needs a reason.
+
+    docs (GIFS.md): full frame, 1280 wide, under 10 s. fps stays inside Eden's 1..30.
+    evidence: 640 wide, fps at most 15, a size cap of at most 10 MB. Duration may run up to
+    Eden's 120 s so a longer action still counts as evidence when the file stays small.
+    """
+    width, fps, duration = spec['width'], spec['fps'], spec['max_duration_s']
+    size = spec.get('max_bytes')
+    docs = width == 1280 and duration <= 10 and 1 <= fps <= 30
+    evidence = (width == 640 and fps <= 15 and duration <= 120 and size is not None and size <= EVIDENCE_MAX_BYTES)
+    return not (docs or evidence)
+
+
+def gif_dest_path(root, row_dir, gif):
+    if gif.get('out'):
+        return inside_root(root, gif['out'])
+    name = gif['name']
+    if Path(name).is_absolute() or '..' in Path(name).parts:
+        raise ValueError(f'gif name {name!r} must stay inside the row folder')
+    if not name.endswith('.gif'):
+        name += '.gif'
+    return inside_root(row_dir, name)
+
+
+def recover_steps_of(plan, row):
+    """The row's recover list, else the plan's. None when neither is declared (old rows.json)."""
+    if isinstance(row, dict) and 'recover' in row:
+        return row['recover']
+    if isinstance(plan.get('recover'), list):
+        return plan['recover']
+    return None
+
+
+def start_gate_of(plan, row):
+    """The gate that proves the row's start screen: an explicit start_gate, or start when that name is a gate."""
+    if row.get('start_gate'):
+        return row['start_gate']
+    if row.get('start') in plan.get('gates', {}):
+        return row['start']
+    return None
+
+
+def failure_policy_of(plan, row, successor, cli=None):
+    """cli, then the row, then the plan, else continue only when the next row can be recovered."""
+    if cli:
+        return cli
+    if row.get('on_failure'):
+        return row['on_failure']
+    if plan.get('on_failure'):
+        return plan['on_failure']
+    if successor is not None and start_gate_of(plan, successor) and recover_steps_of(plan, successor) is not None:
+        return 'continue'
+    return 'stop'
+
+
+def evidence_config_of(plan, row):
+    raw = row.get('failure_evidence', plan.get('failure_evidence', DEFAULT_FAILURE_EVIDENCE))
+    cfg = dict(DEFAULT_FAILURE_EVIDENCE)
+    if isinstance(raw, list):
+        cfg['screenshot'] = 'screenshot' in raw
+        cfg['log_tails'] = 'log_tails' in raw or 'logs' in raw
+        cfg['trace'] = True if 'trace' in raw else False
+    elif isinstance(raw, dict):
+        cfg.update(raw)
+    else:
+        raise ValueError('failure_evidence must be a list or an object')
+    return cfg
+
+
+def tracing_enabled(plan, instances):
+    if plan.get('trace'):
+        return True
+    return any(isinstance(inst, dict) and (inst.get('trace_jsonl') or inst.get('trace')) for inst in instances.values())
+
+
+def _check_known_step(plan, base, step, where, errors):
+    """References a recover step or a gif's nested step points at. Play start-checks are the caller's job."""
+    try:
+        kind = step_kind(step)
+    except RuntimeError:
+        errors.append(f'{where}: unknown step {step!r}')
+        return
+    if kind == 'play' and step['play'] not in plan.get('segments', {}):
+        errors.append(f'{where}: unknown segment {step["play"]}')
+    elif kind == 'library':
+        name = step['library']
+        in_plan = any(seg_name == name or seg.get('library') == name for seg_name, seg in plan.get('segments', {}).items())
+        if not in_plan and name not in library_index().get('segments', {}):
+            errors.append(f'{where}: unknown library segment {name!r}')
+    elif kind == 'gate' and step['gate'] not in plan.get('gates', {}):
+        errors.append(f'{where}: unknown gate {step["gate"]}')
+    elif kind == 'run':
+        try:
+            load_step(base, step['run'])
+        except Exception as error:  # noqa: BLE001
+            errors.append(f'{where}: step hook {step["run"]!r}: {error!r}')
+    elif kind == 'call' and step['call'] not in CALL_METHODS:
+        errors.append(f'{where}: call {step["call"]!r} is not one of {", ".join(CALL_METHODS)}')
+    elif kind == 'ui' and step['ui'] not in UI_OPS:
+        errors.append(f'{where}: ui op {step["ui"]!r} is not one of {", ".join(UI_OPS)}')
+    elif kind == 'gif':
+        _check_gif(plan, base, None, step, where, errors)
+    elif kind == 'wait_ms' and not isinstance(step['wait_ms'], (int, float)):
+        errors.append(f'{where}: wait_ms needs a number')
+
+
+def _check_gif(plan, base, row, step, where, errors):
+    gif = step.get('gif')
+    try:
+        spec = resolve_gif_spec(plan, row or {}, gif)
+    except ValueError as error:
+        errors.append(f'{where}: {error}')
+        return
+    if 'crop' in gif:
+        errors.append(f'{where}: gif records the full frame and does not crop')
+    api = gif_api_error(spec)
+    if api:
+        errors.append(f'{where}: gif {gif.get("name")}: {api}')
+    elif gif_outside_operator_rules(spec) and not spec.get('reason'):
+        errors.append(f'{where}: gif {gif.get("name")} leaves the docs/evidence rules and needs a "reason"')
+    if gif.get('out'):
+        root = Path(plan['root']) if plan.get('root') else project_root(base)
+        try:
+            inside_root(root, gif['out'])
+        except ValueError as error:
+            errors.append(f'{where}: gif out: {error}')
+    try:
+        if Path(gif.get('name', '')).is_absolute() or '..' in Path(gif.get('name', '')).parts:
+            errors.append(f'{where}: gif name {gif.get("name")!r} must stay inside the row folder')
+    except TypeError:
+        errors.append(f'{where}: gif name must be a string')
+    for nested in gif.get('steps') or []:
+        _check_known_step(plan, base, nested, f'{where} gif {gif.get("name")}', errors)
+
+
+def check_plan_policies(plan, base, errors):
+    """Presets, recover lists and failure hooks. Old plans that omit them pass through."""
+    try:
+        presets = merged_gif_presets(plan)
+    except ValueError as error:
+        errors.append(str(error))
+        presets = {}
+    for name, spec in (plan.get('gif_presets') or {}).items() if isinstance(plan.get('gif_presets'), dict) else []:
+        merged = presets.get(name, spec)
+        try:
+            probe = resolve_gif_spec({'gif_presets': {name: merged}}, None, {'name': name, 'preset': name})
+        except ValueError as error:
+            errors.append(f'gif preset {name}: {error}')
+            continue
+        api = gif_api_error(probe)
+        if api:
+            errors.append(f'gif preset {name}: {api}')
+        elif gif_outside_operator_rules(probe) and not probe.get('reason'):
+            errors.append(f'gif preset {name} leaves the docs/evidence rules and needs a "reason"')
+    if 'recover' in plan and not isinstance(plan['recover'], list):
+        errors.append('plan recover must be a list of steps (a gate\'s recover stays a segment name)')
+    if isinstance(plan.get('recover'), list):
+        for step in plan['recover']:
+            _check_known_step(plan, base, step, 'plan recover', errors)
+    if plan.get('on_failure') not in (None, 'continue', 'stop'):
+        errors.append(f'plan on_failure {plan.get("on_failure")!r} must be "continue" or "stop"')
+    hook = plan.get('on_failure_hook')
+    if isinstance(hook, str):
+        try:
+            load_step(base, hook)
+        except Exception as error:  # noqa: BLE001
+            errors.append(f'on_failure_hook {hook!r}: {error!r}')
+    elif isinstance(hook, dict) and hook.get('run'):
+        try:
+            load_step(base, hook['run'])
+        except Exception as error:  # noqa: BLE001
+            errors.append(f'on_failure_hook {hook["run"]!r}: {error!r}')
+    try:
+        if 'failure_evidence' in plan:
+            evidence_config_of(plan, {})
+    except ValueError as error:
+        errors.append(str(error))
+
+
+def publish_gif(raw_path, dest, spec):
+    """Trim to the preset duration, scale the full frame to its width, and palette-encode.
+
+    No crop: docs GIFs are the whole frame (GIFS.md). Returns frames, duration, size, sha256 and path.
+    Raises GifRefused and deletes dest when the file still breaks the preset.
+    """
+    from PIL import Image, ImageSequence
+    resample = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS', Image.BICUBIC)
+    limit = int(spec['max_duration_s'] * 1000)
+    frames, durations, total = [], [], 0
+    with Image.open(raw_path) as im:
+        for frame in ImageSequence.Iterator(im):
+            dur = int(frame.info.get('duration') or round(1000 / max(spec['fps'], 1)))
+            if total >= limit:
+                break
+            # The first frame can already be longer than the cap (Eden, or Pillow merging identical
+            # frames into one held frame). Shorten it; don't keep a clip past the preset.
+            if total + dur > limit:
+                dur = max(1, limit - total)
+            frames.append(frame.convert('RGB'))
+            durations.append(max(1, dur))
+            total += durations[-1]
+            if total >= limit:
+                break
+    if not frames:
+        raise GifRefused(f'gif {spec.get("preset")} captured no frames', {'preset': spec.get('preset'), 'why': 'no frames'})
+    width = spec['width']
+
+    def scaled(source):
+        out = []
+        for frame in source:
+            height = max(1, round(width * frame.height / max(frame.width, 1)))
+            out.append(frame if frame.size == (width, height) else frame.resize((width, height), resample))
+        return out
+
+    def save(source, durs, colors):
+        pictures = scaled(source)
+        height = pictures[0].height
+        sample = [0, len(pictures) // 2, len(pictures) - 1]
+        mosaic = Image.new('RGB', (width, height * 3))
+        for index, which in enumerate(sample):
+            mosaic.paste(pictures[which], (0, index * height))
+        palette = mosaic.quantize(colors=max(2, colors), method=Image.Quantize.MEDIANCUT)
+        encoded = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in pictures]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        encoded[0].save(dest, save_all=True, append_images=encoded[1:], duration=durs[:len(encoded)],
+                        loop=0, disposal=1)
+        return dest.stat().st_size, len(encoded), pictures[0].size
+
+    colors, step = 128, 1
+    size, count, dimensions = save(frames, durations, colors)
+    max_bytes = spec.get('max_bytes')
+    kept, durs = frames, durations
+    while max_bytes and size > max_bytes and (colors > 16 or step * 2 < len(frames)):
+        if colors > 16:
+            colors //= 2
+        else:
+            step *= 2
+            kept = frames[::step] or frames[:1]
+            durs = []
+            for index in range(0, len(frames), step):
+                durs.append(max(1, sum(durations[index:index + step])))
+            durs = durs[:len(kept)]
+        size, count, dimensions = save(kept, durs, colors)
+    duration_s = round(sum(durs if step > 1 else durations[:count]) / 1000, 3)
+    why = None
+    if dimensions[0] != width:
+        why = f'width is {dimensions[0]}, preset wants {width}'
+    elif duration_s > spec['max_duration_s'] + 0.05:
+        why = f'duration is {duration_s} s, preset allows {spec["max_duration_s"]} s'
+    elif max_bytes and size > max_bytes:
+        why = f'size is {size} bytes, preset allows {max_bytes}'
+    if why:
+        dest.unlink(missing_ok=True)
+        raise GifRefused(f'gif breaks preset {spec.get("preset")}: {why}', {
+            'preset': spec.get('preset'), 'why': why, 'frames': count, 'duration': duration_s, 'size': size})
+    return {'frames': count, 'duration': duration_s, 'size': size, 'sha256': digest(dest), 'path': str(dest),
+            'width': dimensions[0], 'fps': spec['fps']}
 
 
 def dry_run(manifest_path):
@@ -220,9 +635,11 @@ def dry_run(manifest_path):
                 load_hook(base, gate)
         except Exception as error:  # report every broken gate, not just the first
             errors.append(f'gate {name}: {error!r}')
+    check_plan_policies(plan, base, errors)
     state = plan['start']
     ids = set()
-    for row in plan['rows']:
+    rows = plan['rows']
+    for index, row in enumerate(rows):
         if row['id'] in ids:
             errors.append(f'row {row["id"]}: duplicate id')
         ids.add(row['id'])
@@ -264,14 +681,80 @@ def dry_run(manifest_path):
                     checked.discard(on)  # a hook may move the game; check again before the next play
             if 'call' in step and step['call'] not in CALL_METHODS:
                 errors.append(f'row {row["id"]}: call {step["call"]!r} is not one of {", ".join(CALL_METHODS)}')
-            if 'ui' in step and step['ui'] not in Runner.UI_OPS:
-                errors.append(f'row {row["id"]}: ui op {step["ui"]!r} is not one of {", ".join(Runner.UI_OPS)}')
+            if 'ui' in step and step['ui'] not in UI_OPS:
+                errors.append(f'row {row["id"]}: ui op {step["ui"]!r} is not one of {", ".join(UI_OPS)}')
             if 'mark' in step:
                 marks.add((on, step['mark']))
             if 'copy' in step:
                 copies.add((on, step.get('as', step['copy'])))
             if 'json_diff' in step and (on, step['json_diff'].get('before')) not in copies:
                 errors.append(f'row {row["id"]}: json_diff before {step["json_diff"].get("before")!r} has no earlier copy')
+            if isinstance(step.get('gif'), dict):
+                _check_gif(plan, base, row, step, f'row {row["id"]}', errors)
+                for nested in step['gif'].get('steps') or []:
+                    if not isinstance(nested, dict):
+                        errors.append(f'row {row["id"]}: gif step must be an object')
+                        continue
+                    non = nested.get('on', on)
+                    if 'play' in nested and nested['play'] in plan.get('segments', {}):
+                        seg = plan['segments'][nested['play']]
+                        if not (seg.get('start_gate') or non in checked or nested.get('unchecked')):
+                            errors.append(f'row {row["id"]}: play {nested["play"]} on {non} has no start check '
+                                          '(a gate step before it, a "start_gate" on the segment, or "unchecked": true)')
+                        checked.discard(non)
+                    if 'gate' in nested:
+                        checked.add(non)
+                    if 'run' in nested:
+                        checked.add(non) if nested.get('check') else checked.discard(non)
+                    if 'library' in nested:
+                        checked.discard(non)
+            elif 'library' in step:
+                _check_known_step(plan, base, step, f'row {row["id"]}', errors)
+                checked.discard(on)
+        if row.get('on_failure') not in (None, 'continue', 'stop'):
+            errors.append(f'row {row["id"]}: on_failure {row.get("on_failure")!r} must be "continue" or "stop"')
+        if row.get('start_gate') and row['start_gate'] not in plan.get('gates', {}):
+            errors.append(f'row {row["id"]}: unknown start_gate {row["start_gate"]!r}')
+        if 'recover' in row:
+            if not isinstance(row['recover'], list):
+                errors.append(f'row {row["id"]}: recover must be a list of steps')
+            else:
+                for recover_step in row['recover']:
+                    _check_known_step(plan, base, recover_step, f'row {row["id"]} recover', errors)
+        if 'gif_presets' in row:
+            try:
+                for name in merged_gif_presets(plan, row):
+                    if name not in (row.get('gif_presets') or {}):
+                        continue
+                    probe = resolve_gif_spec(plan, row, {'name': name, 'preset': name,
+                                                        **({'reason': row['gif_presets'][name].get('reason')}
+                                                           if isinstance(row['gif_presets'][name], dict) else {})})
+                    api = gif_api_error(probe)
+                    if api:
+                        errors.append(f'row {row["id"]} gif preset {name}: {api}')
+                    elif gif_outside_operator_rules(probe) and not probe.get('reason'):
+                        errors.append(f'row {row["id"]} gif preset {name} leaves the docs/evidence rules and needs a "reason"')
+            except ValueError as error:
+                errors.append(f'row {row["id"]}: {error}')
+        hook = row.get('on_failure_hook')
+        hook_spec = hook.get('run') if isinstance(hook, dict) else hook
+        if isinstance(hook_spec, str):
+            try:
+                load_step(base, hook_spec)
+            except Exception as error:  # noqa: BLE001
+                errors.append(f'row {row["id"]}: on_failure_hook {hook_spec!r}: {error!r}')
+        if 'failure_evidence' in row:
+            try:
+                evidence_config_of(plan, row)
+            except ValueError as error:
+                errors.append(f'row {row["id"]}: {error}')
+        policy = row.get('on_failure') or plan.get('on_failure')
+        if policy == 'continue' and index + 1 < len(rows):
+            nxt = rows[index + 1]
+            if not start_gate_of(plan, nxt):
+                errors.append(f'row {row["id"]}: on_failure continue needs a start gate on {nxt["id"]}')
+            if recover_steps_of(plan, nxt) is None:
+                errors.append(f'row {row["id"]}: on_failure continue needs a recover list on {nxt["id"]} or the plan')
         state = row['end']
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
@@ -409,8 +892,16 @@ def default_client_factory():
     return make
 
 
+class RecoveryFailed(RuntimeError):
+    """Getting the next row back to its start gate failed. The run stops; Eden is not rebooted."""
+
+
 class Runner:
-    def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None):
+    # Filled after the class body. A plugin hook can add a kind: step_handlers['kind'] = fn(self, on, step)
+    # and step_kind.extra = tuple(step_handlers).
+    step_handlers = {}
+
+    def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None, on_failure=None):
         self.manifest_path = manifest_path
         self.base = manifest_path.parent
         self.plan = expand_library(json.loads(manifest_path.read_text()))
@@ -419,6 +910,11 @@ class Runner:
         self.out = out
         self.out.mkdir(parents=True, exist_ok=True)
         self.row_dir = self.out
+        self.on_failure_cli = on_failure
+        self.outcomes = {}
+        self.recovered_to = None
+        self.current_on = self.default
+        self.current_row = None
         if client_factory is None:
             client_factory = default_client_factory()
         self.clients = {key: client_factory(inst['socket']) for key, inst in instances.items()}
@@ -880,16 +1376,301 @@ class Runner:
                 offsets[path] = (stat.st_size, stat.st_ino)
         return offsets
 
-    def run(self, only=None):
-        previous_end = self.plan['start']
+    def note(self, row_id, status, **extra):
+        item = {'status': status}
+        for key, value in extra.items():
+            if value is not None and value != []:
+                item[key] = value
+        self.outcomes[row_id] = item
+
+    def stop_input(self, row, text):
+        (self.out / 'STOP-INPUT').write_text(text if str(text).endswith('\n') else f'{text}\n')
+
+    def execute_step(self, step, into=None):
+        try:
+            kind = step_kind(step)
+        except RuntimeError:
+            raise RuntimeError(f'unknown step {step}') from None
+        handler = self.step_handlers.get(kind)
+        if handler is None:
+            raise RuntimeError(f'unknown step {step}')
+        on = step.get('on', self.default) if isinstance(step, dict) else self.default
+        self.current_on = on
+        result = handler(self, on, step)
+        if into is not None and result is not None:
+            into.append(result)
+        return result
+
+    def _step_play(self, on, step):
+        self.play(on, step['play'])
+        return {'play': step['play'], 'on': on}
+
+    def _step_gate(self, on, step):
+        return {'gate': step['gate'], 'on': on, 'evidence': self.gate(on, step['gate'])}
+
+    def _step_shot(self, on, step):
+        return {'shot': str(self.shot(on, step['shot']))}
+
+    def _step_mark(self, on, step):
+        self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
+        return {'mark': step['mark'], 'on': on}
+
+    def _step_copy(self, on, step):
+        source = self.source(on, step['copy'])
+        target = self.row_dir / f'{step.get("as", step["copy"])}-{on}-{source.name}'
+        target.write_bytes(source.read_bytes())
+        self.copies[(on, step.get('as', step['copy']))] = target
+        return {'copy': str(target)}
+
+    def _step_json_diff(self, on, step):
+        return {'json_diff': self.json_diff(on, step['json_diff'])}
+
+    def _step_ui(self, on, step):
+        self.ui(on, step)
+        return {'ui': step['ui'], 'on': on, 'target': step.get('target')}
+
+    def _step_run(self, on, step):
+        hook = load_step(self.base, step['run'])
+        value = hook(StepContext(self, on), **step.get('args', {}))
+        if not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+            value = repr(value)
+        return {'run': step['run'], 'on': on, 'value': value}
+
+    def _step_call(self, on, step):
+        # "@key" values come from instances.json, e.g. {"call": "game.load", "params": {"path": "@game"}}
+        params = {k: (self.instances[on][v[1:]] if isinstance(v, str) and v.startswith('@') else v)
+                  for k, v in step.get('params', {}).items()}
+        self.call(on, step['call'], params, job_cap=step.get('job_cap', 15))
+        return {'call': step['call'], 'on': on, 'params': params}
+
+    def _step_wait(self, on, step):
+        self.check_stop()
+        time.sleep(step['wait_ms'] / 1000)
+        return None
+
+    def play_library(self, on, name):
+        """Play a shared-library segment by index name, or a plan segment that already imported it."""
+        for seg_name, seg in self.plan.get('segments', {}).items():
+            if seg_name == name or seg.get('library') == name:
+                self.play(on, seg_name)
+                return
+        entry = library_index().get('segments', {}).get(name)
+        if entry is None:
+            raise RuntimeError(f'library segment {name!r} is not in the plan or {LIBRARY / "index.json"}')
+        path = LIBRARY / entry['file']
+        if not path.is_file():
+            raise RuntimeError(f'library segment {name} file missing: {path}')
+        if entry.get('sha256') and digest(path) != entry['sha256']:
+            raise RuntimeError(f'library segment {name} sha256 mismatch')
+        if entry.get('start_gate') and entry['start_gate'] in self.plan.get('gates', {}):
+            self.gate(on, entry['start_gate'])
+        self.call(on, 'macro.play', {'path': str(path)})
+        self.wait_macro(on, entry.get('cap', 60))
+
+    def _step_library(self, on, step):
+        self.play_library(on, step['library'])
+        return {'library': step['library'], 'on': on}
+
+    def _step_gif(self, on, step):
+        gif = step['gif']
+        row = self.current_row or {}
+        spec = resolve_gif_spec(self.plan, row, gif)
+        api = gif_api_error(spec)
+        if api:
+            raise GifRefused(f'gif {gif.get("name")}: {api}', {'why': api, 'preset': spec.get('preset')})
+        if 'crop' in gif:
+            why = 'gif records the full frame and does not crop'
+            raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
+        if gif_outside_operator_rules(spec) and not spec.get('reason'):
+            why = 'override outside the GIF rules needs a reason'
+            raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
+        root = Path(self.plan['root']) if self.plan.get('root') else project_root(self.base)
+        try:
+            dest = gif_dest_path(root, self.row_dir, gif)
+        except ValueError as error:
+            raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': str(error), 'preset': spec.get('preset')}) from error
+        slug = re.sub(r'[^A-Za-z0-9._-]+', '-', gif['name']).strip('-') or 'clip'
+        raw = self.row_dir / f'{slug}.{time.time_ns()}.capture.gif'
+        self.call(on, 'recording.start', {'path': str(raw), 'fps': spec['fps'], 'width': spec['width'],
+                                          'duration_ms': int(spec['max_duration_s'] * 1000)})
+        nested = []
+        try:
+            for child in gif.get('steps') or []:
+                self.execute_step(child, nested)
+        finally:
+            try:
+                self.call(on, 'recording.stop', {})
+            except Exception as error:  # noqa: BLE001 - a failed moment still has to release the recorder
+                self.log({'gif': gif.get('name'), 'stop_error': repr(error)})
+        status = self.call(on, 'recording.status', {}) or {}
+        if isinstance(status, dict) and (status.get('state') == 'error' or status.get('error')):
+            why = f'recording status {status.get("state")}: {status.get("error")}'
+            raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
+        if not raw.is_file():
+            why = 'Eden wrote no gif'
+            raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
+        info = publish_gif(raw, dest, spec)
+        info['steps'] = nested
+        info['preset'] = spec['preset']
+        if spec.get('reason'):
+            info['reason'] = spec['reason']
+        if isinstance(status, dict):
+            if status.get('frames') is not None:
+                info['captured_frames'] = status['frames']
+            if status.get('dropped_frames') is not None:
+                info['dropped_frames'] = status['dropped_frames']
+        return {'gif': info}
+
+    def game_running(self, on):
+        """False when status says the game stopped or crashed, or the control call itself failed."""
+        try:
+            status = self.call(on, 'status') or {}
+        except Exception as error:  # noqa: BLE001
+            self.log({'on': on, 'status_error': repr(error)})
+            return False
+        if not isinstance(status, dict):
+            return True
+        if status.get('running') is False:
+            return False
+        if status.get('crashed') or status.get('crash') or status.get('state') in ('crashed', 'crash'):
+            return False
+        return True
+
+    def recover_to(self, row):
+        """Play the row or plan recover list, then require the row's start gate. Does not reboot Eden."""
+        gate_name = start_gate_of(self.plan, row)
+        if not gate_name:
+            raise RecoveryFailed(f'recovery to {row["id"]}: no start gate')
+        steps = recover_steps_of(self.plan, row)
+        if steps is None:
+            raise RecoveryFailed(f'recovery to {row["id"]}: no recover list')
+        saved = self.current_row
+        self.current_row = row
+        try:
+            for step in steps:
+                self.execute_step(step)
+            self.gate(row.get('on', self.default), gate_name)
+        except RecoveryFailed:
+            raise
+        except StopRun:
+            raise
+        except Exception as error:
+            raise RecoveryFailed(f'recovery to {row["id"]} failed: {error}') from error
+        finally:
+            self.current_row = saved
+
+    def _gate_names(self, row):
+        def walk(steps):
+            for step in steps or []:
+                if not isinstance(step, dict):
+                    continue
+                if 'gate' in step:
+                    yield step['gate']
+                gif = step.get('gif')
+                if isinstance(gif, dict):
+                    yield from walk(gif.get('steps'))
+        return list(walk(row.get('steps')))
+
+    def collect_failure_evidence(self, row, error):
+        """Screenshot, log tails for the gates this row read, trace counters and a trace read when tracing is on.
+        on_failure_hook may add paths. Best effort: a failure here does not hide the row's own error."""
+        cfg = evidence_config_of(self.plan, row)
+        paths = []
+        on = self.current_on or self.default
+        if cfg.get('screenshot', True):
+            try:
+                paths.append(str(self.shot(on, 'FAIL')))
+            except StopRun:
+                raise
+            except Exception as shot_error:  # noqa: BLE001
+                self.log({'on': on, 'failure_shot_error': repr(shot_error)})
+        if cfg.get('log_tails', True):
+            tail = int(cfg.get('tail_lines', 80) or 0)
+            seen = set()
+            for gate_name in self._gate_names(row):
+                gate = self.plan.get('gates', {}).get(gate_name) or {}
+                if gate.get('kind') != 'log' or not gate.get('source') or gate['source'] in seen:
+                    continue
+                seen.add(gate['source'])
+                for side in self.instances:
+                    source = self.source(side, gate['source'])
+                    if not source.is_file():
+                        continue
+                    lines = source.read_text(errors='replace').splitlines()[-tail:]
+                    dest = self.row_dir / f'log-tail-{side}-{gate["source"]}.txt'
+                    dest.write_text('\n'.join(lines) + ('\n' if lines else ''))
+                    paths.append(str(dest))
+        want_trace = cfg.get('trace', 'auto')
+        traced = [key for key, inst in self.instances.items() if isinstance(inst, dict) and (inst.get('trace_jsonl') or inst.get('trace'))]
+        if want_trace is True or (want_trace == 'auto' and (traced or self.plan.get('trace'))):
+            targets = traced or ([on] if self.plan.get('trace') or want_trace is True else [])
+            for side in targets:
+                for method in ('trace.counters', 'trace.read'):
+                    try:
+                        value = self.call(side, method, {})
+                    except Exception as trace_error:  # noqa: BLE001
+                        value = {'error': repr(trace_error)}
+                    dest = self.row_dir / f'{side}-{method.replace(".", "-")}.json'
+                    dest.write_text(json.dumps(value, indent=2, default=str) + '\n')
+                    paths.append(str(dest))
+        hook = row.get('on_failure_hook', self.plan.get('on_failure_hook'))
+        if hook:
+            spec = hook.get('run') if isinstance(hook, dict) else hook
+            args = hook.get('args', {}) if isinstance(hook, dict) else {}
+            try:
+                ctx = StepContext(self, on)
+                ctx.failure = error
+                value = load_step(self.base, spec)(ctx, **args)
+            except StopRun:
+                raise
+            except Exception as hook_error:  # noqa: BLE001
+                self.log({'on_failure_hook_error': repr(hook_error)})
+                value = None
+            extra = [value] if isinstance(value, (str, Path)) else value if isinstance(value, list) else []
+            for item in extra:
+                if item:
+                    paths.append(str(item))
+        return paths
+
+    def write_summary(self):
+        rows = []
+        failed = 0
         for row in self.plan['rows']:
+            info = {'id': row['id'], **self.outcomes.get(row['id'], {'status': 'not run'})}
+            if info['status'] == 'fail':
+                failed += 1
+            rows.append(info)
+        (self.out / 'summary.json').write_text(json.dumps({'rows': rows, 'failed': failed}, indent=2) + '\n')
+        return failed
+
+    def run(self, only=None):
+        self.outcomes = {}
+        self.recovered_to = None
+        try:
+            return self._run_rows(only)
+        finally:
+            self.write_summary()
+
+    def _run_rows(self, only):
+        previous_end = self.plan['start']
+        rows = self.plan['rows']
+        review = None
+        for index, row in enumerate(rows):
+            self.current_row = row
             receipt_path = self.out / f'{row["id"]}.json'
-            if receipt_path.exists() and json.loads(receipt_path.read_text()).get('status') == 'PASS':
+            prior_status = None
+            prior = {}
+            if receipt_path.exists():
+                prior = json.loads(receipt_path.read_text())
+                prior_status = prior.get('status')
+            if prior_status == 'PASS':
+                self.note(row['id'], 'pass')
                 previous_end = row['end']
                 continue
-            if only and row['id'] not in only:
+            if only is not None and row['id'] not in only:
+                self.note(row['id'], 'skipped', receipt=prior_status)
                 continue
-            if not only and row['start'] != previous_end:
+            if only is None and row['start'] != previous_end and self.recovered_to != row['id']:
                 raise StopRun(f'row {row["id"]} starts on {row["start"]}, but the game is on {previous_end}')
             self.row_dir = self.out / row['id']
             self.row_dir.mkdir(exist_ok=True)
@@ -898,54 +1679,58 @@ class Runner:
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
             try:
+                if (self.recovered_to != row['id'] and prior_status == 'FAILED'
+                        and start_gate_of(self.plan, row) and recover_steps_of(self.plan, row) is not None):
+                    self.recover_to(row)
                 for step in row['steps']:
-                    on = step.get('on', self.default)
-                    if 'play' in step:
-                        self.play(on, step['play'])
-                        receipt['results'].append({'play': step['play'], 'on': on})
-                    elif 'gate' in step:
-                        receipt['results'].append({'gate': step['gate'], 'on': on, 'evidence': self.gate(on, step['gate'])})
-                    elif 'shot' in step:
-                        receipt['results'].append({'shot': str(self.shot(on, step['shot']))})
-                    elif 'mark' in step:
-                        self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
-                        receipt['results'].append({'mark': step['mark'], 'on': on})
-                    elif 'copy' in step:
-                        source = self.source(on, step['copy'])
-                        target = self.row_dir / f'{step.get("as", step["copy"])}-{on}-{source.name}'
-                        target.write_bytes(source.read_bytes())
-                        self.copies[(on, step.get('as', step['copy']))] = target
-                        receipt['results'].append({'copy': str(target)})
-                    elif 'json_diff' in step:
-                        receipt['results'].append({'json_diff': self.json_diff(on, step['json_diff'])})
-                    elif 'ui' in step:
-                        self.ui(on, step)
-                        receipt['results'].append({'ui': step['ui'], 'on': on, 'target': step.get('target')})
-                    elif 'run' in step:
-                        hook = load_step(self.base, step['run'])
-                        value = hook(StepContext(self, on), **step.get('args', {}))
-                        receipt['results'].append({'run': step['run'], 'on': on,
-                                                   'value': value if isinstance(value, (str, int, float, bool, list,
-                                                                                        dict, type(None))) else repr(value)})
-                    elif 'call' in step:
-                        # "@key" values come from instances.json, e.g. {"call": "game.load", "params": {"path": "@game"}}
-                        params = {k: (self.instances[on][v[1:]] if isinstance(v, str) and v.startswith('@') else v)
-                                  for k, v in step.get('params', {}).items()}
-                        self.call(on, step['call'], params, job_cap=step.get('job_cap', 15))
-                        receipt['results'].append({'call': step['call'], 'on': on, 'params': params})
-                    elif 'wait_ms' in step:
-                        self.check_stop()
-                        time.sleep(step['wait_ms'] / 1000)
-                    else:
-                        raise RuntimeError(f'unknown step {step}')
+                    self.execute_step(step, receipt['results'])
                 receipt['status'] = 'PASS'
+                self.note(row['id'], 'pass')
                 if not self.pace['first_row_done']:
                     self.pace['first_row_done'] = time.time()
                     (self.out / 'pace.json').write_text(json.dumps(self.pace) + '\n')
+            except StopRun as error:
+                receipt.update(status='FAILED', error=repr(error))
+                self.note(row['id'], 'fail', reason=repr(error))
+                raise
+            except Exception as error:
+                receipt.update(status='FAILED', error=repr(error))
+                if isinstance(error, GifRefused):
+                    receipt['gif_refused'] = error.detail
+                evidence = []
+                try:
+                    evidence = self.collect_failure_evidence(row, error)
+                except StopRun:
+                    raise
+                except Exception as evidence_error:  # noqa: BLE001
+                    self.log({'failure_evidence_error': repr(evidence_error)})
+                receipt['evidence_paths'] = evidence
+                self.note(row['id'], 'fail', reason=repr(error), evidence=evidence)
+                successor = rows[index + 1] if index + 1 < len(rows) else None
+                policy = failure_policy_of(self.plan, row, successor, self.on_failure_cli)
+                if isinstance(error, RecoveryFailed) or policy != 'continue' or successor is None:
+                    self.stop_input(row, f'{row["id"]}: {error!r}')
+                    raise
+                if not self.game_running(self.current_on or self.default):
+                    receipt['recovery'] = {'ok': False, 'error': 'game is not running'}
+                    self.stop_input(row, f'{row["id"]}: {error!r}')
+                    raise
+                saved_dir = self.row_dir
+                self.row_dir = self.out / successor['id']
+                self.row_dir.mkdir(exist_ok=True)
+                try:
+                    self.recover_to(successor)
+                except Exception as recovered:
+                    receipt['recovery'] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
+                    self.stop_input(row, f'{row["id"]}: {error!r}; recovery to {successor["id"]} failed: {recovered!r}')
+                    raise recovered
+                finally:
+                    self.row_dir = saved_dir
+                receipt['recovery'] = {'to': successor['id'], 'ok': True}
+                self.recovered_to = successor['id']
             except BaseException as error:
                 receipt.update(status='FAILED', error=repr(error))
-                if not isinstance(error, StopRun):
-                    (self.out / 'STOP-INPUT').write_text(f'{row["id"]}: {error!r}\n')
+                self.stop_input(row, f'{row["id"]}: {error!r}')
                 raise
             finally:
                 receipt['ended'] = time.time()
@@ -960,15 +1745,39 @@ class Runner:
                 print(json.dumps({'row': row['id'], 'status': receipt['status'],
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
                                   'receipt': str(receipt_path)}), flush=True)
-            previous_end = row['end']
-            if self.acquired:
-                # A new reference is a claim about what the screen should look like: a model looks once, then reruns.
-                print(json.dumps({'status': 'REVIEW', 'row': row['id'], 'acquired': self.acquired,
-                                  'next': 'look at each new reference; if one is wrong, delete it and this row\'s '
-                                          'receipt and fix the route; then run again'}), flush=True)
-                return 'REVIEW'
-        print(json.dumps({'status': 'DONE', 'out': str(self.out)}), flush=True)
-        return 'DONE'
+            if receipt['status'] == 'PASS':
+                previous_end = row['end']
+                if self.acquired:
+                    # A new reference is a claim about what the screen should look like: a model looks once, then reruns.
+                    print(json.dumps({'status': 'REVIEW', 'row': row['id'], 'acquired': self.acquired,
+                                      'next': 'look at each new reference; if one is wrong, delete it and this row\'s '
+                                              'receipt and fix the route; then run again'}), flush=True)
+                    review = 'REVIEW'
+                    break
+        failed = any(item.get('status') == 'fail' for item in self.outcomes.values())
+        if review:
+            return review
+        status = 'FAILED' if failed else 'DONE'
+        print(json.dumps({'status': status, 'out': str(self.out),
+                          'failed': sum(1 for item in self.outcomes.values() if item.get('status') == 'fail')}), flush=True)
+        return status
+
+
+Runner.step_handlers = {
+    'play': Runner._step_play,
+    'gate': Runner._step_gate,
+    'shot': Runner._step_shot,
+    'mark': Runner._step_mark,
+    'copy': Runner._step_copy,
+    'json_diff': Runner._step_json_diff,
+    'ui': Runner._step_ui,
+    'run': Runner._step_run,
+    'call': Runner._step_call,
+    'wait_ms': Runner._step_wait,
+    'gif': Runner._step_gif,
+    'library': Runner._step_library,
+}
+step_kind.extra = tuple(Runner.step_handlers)
 
 
 def record_command(mode, manifest, instances, name, on, start_gate=None, client_factory=None):
@@ -1012,7 +1821,9 @@ def main(argv=None):
     parser.add_argument('manifest', type=Path)
     parser.add_argument('--instances', type=Path, help='instances.json written at Up (run mode)')
     parser.add_argument('--out', type=Path, help='output folder (default: <manifest folder>/out)')
-    parser.add_argument('--rows', help='comma-separated row ids to run (default: all remaining)')
+    parser.add_argument('--rows', help='comma-separated row ids, or "failed" to rerun rows whose receipt is FAILED')
+    parser.add_argument('--on-failure', choices=('continue', 'stop'),
+                        help='override the plan/row on_failure policy for this run')
     parser.add_argument('--pace-minutes', type=float, default=15)
     parser.add_argument('--segment', help='record-start/record-stop: the segment name')
     parser.add_argument('--on', help='record-start/record-stop: the instance key (default: the first)')
@@ -1035,10 +1846,21 @@ def main(argv=None):
     if not args.instances:
         parser.error('run needs --instances')
     instances = json.loads(args.instances.read_text())
+    only = None
+    if args.rows == 'failed':
+        only = set()
+        for row in json.loads(manifest.read_text()).get('rows', []):
+            receipt = out / f'{row["id"]}.json'
+            if receipt.is_file() and json.loads(receipt.read_text()).get('status') == 'FAILED':
+                only.add(row['id'])
+    elif args.rows:
+        only = set(args.rows.split(','))
     try:
-        result = Runner(manifest, instances, out, args.pace_minutes).run(set(args.rows.split(',')) if args.rows else None)
+        result = Runner(manifest, instances, out, args.pace_minutes, on_failure=args.on_failure).run(only)
         if result == 'REVIEW':
             return 4
+        if result == 'FAILED':
+            return 3
     except StopRun as stop:
         print(json.dumps({'status': 'STOPPED', 'reason': str(stop)}), flush=True)
         return 2

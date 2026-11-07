@@ -628,6 +628,263 @@ class RunnerTests(unittest.TestCase):
             self.make(FakeEden({'to-red': RED})).run()
         self.assertIn('pace', str(caught.exception))
 
+    def test_old_rows_json_still_stops_at_the_first_failure(self):
+        # No recover and no on_failure: the first failing row writes STOP-INPUT and later rows do not run.
+        eden = FakeEden({'to-red': BLUE}, log_path=self.log)
+        with self.assertRaises(RuntimeError):
+            self.make(eden).run()
+        self.assertTrue((self.dir / 'out' / 'STOP-INPUT').exists())
+        self.assertEqual(json.loads((self.dir / 'out' / 'r1.json').read_text())['status'], 'FAILED')
+        self.assertFalse((self.dir / 'out' / 'r2.json').exists())
+        summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual([row['status'] for row in summary['rows']], ['fail', 'not run', 'not run'])
+        self.assertTrue(summary['rows'][0]['evidence'])
+
+    def _continue_plan(self):
+        Image.new('RGB', (64, 36), BLUE).save(self.dir / 'refs' / 'blue.png')
+        self.plan['gates']['paused']['cap'] = 0.4
+        self.plan['gates']['red']['cap'] = 0.4
+        self.plan['gates']['red']['interval'] = 0.05
+        (self.dir / 'steps.py').write_text(
+            'def back(ctx):\n'
+            '    ctx.play("to-red")\n'
+            '    return "back"\n'
+            'def collect(ctx):\n'
+            '    path = ctx.row_dir / "hook.txt"\n'
+            '    path.write_text("saw\\n")\n'
+            '    return str(path)\n')
+        self.instances['a']['trace_jsonl'] = str(self.dir / 'trace.jsonl')
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'red', 'on_failure_hook': 'steps.py:collect',
+             'steps': [{'gate': 'paused'}]},
+            {'id': 'r2', 'start': 'red', 'end': 'red', 'start_gate': 'red',
+             'recover': [{'run': 'steps.py:back'}], 'steps': [{'gate': 'red'}, {'shot': 'ok'}]},
+            {'id': 'r3', 'start': 'red', 'end': 'blue', 'steps': [{'shot': 'after'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+
+    def test_failure_recovers_and_the_next_rows_run(self):
+        self._continue_plan()
+        eden = FakeEden({'to-red': RED}, log_path=self.log)
+        result = self.make(eden).run()
+        self.assertEqual(result, 'FAILED')  # r1 failed; the run still finished the later rows
+        self.assertFalse((self.dir / 'out' / 'STOP-INPUT').exists())
+        self.assertEqual(json.loads((self.dir / 'out' / 'r1.json').read_text())['status'], 'FAILED')
+        self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
+        self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual(receipt['recovery'], {'to': 'r2', 'ok': True})
+        evidence = ' '.join(receipt['evidence_paths'])
+        self.assertIn('hook.txt', evidence)
+        self.assertIn('log-tail-', evidence)
+        self.assertIn('trace-counters', evidence)
+        self.assertIn('trace-read', evidence)
+        self.assertIn('FAIL', evidence)
+        summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual([row['status'] for row in summary['rows']], ['fail', 'pass', 'pass'])
+        self.assertEqual(summary['failed'], 1)
+        self.assertIn('trace.counters', eden.calls)
+        self.assertIn('trace.read', eden.calls)
+
+    def test_failed_recovery_stops_the_run(self):
+        self._continue_plan()
+        eden = FakeEden({'to-red': BLUE}, log_path=self.log)  # recover never reaches the red start gate
+        with self.assertRaises(RuntimeError):
+            self.make(eden).run()
+        self.assertTrue((self.dir / 'out' / 'STOP-INPUT').exists())
+        self.assertFalse((self.dir / 'out' / 'r3.json').exists())
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertFalse(receipt['recovery']['ok'])
+        summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual(summary['rows'][2]['status'], 'not run')
+
+    def test_a_crashed_game_stops_without_recovery(self):
+        self._continue_plan()
+
+        class CrashEden(FakeEden):
+            def request(self, method, params):
+                if method == 'status':
+                    self.calls.append(method)
+                    return {'ok': True, 'result': {'running': False, 'crash': True}}
+                return super().request(method, params)
+
+        eden = CrashEden({'to-red': RED}, log_path=self.log)
+        with self.assertRaises(RuntimeError):
+            self.make(eden).run()
+        self.assertTrue((self.dir / 'out' / 'STOP-INPUT').exists())
+        self.assertNotIn('macro.play', eden.calls)  # r1 never played; recovery must not either
+        self.assertFalse((self.dir / 'out' / 'r2.json').exists())
+
+    def test_rows_failed_reruns_only_the_failed_rows(self):
+        eden = FakeEden({'to-red': BLUE}, log_path=self.log)
+        with self.assertRaises(RuntimeError):
+            self.make(eden).run()
+        (self.dir / 'out' / 'STOP-INPUT').unlink()
+        instances = self.dir / 'instances.json'
+        instances.write_text(json.dumps(self.instances))
+        fixed = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        original = runner.default_client_factory
+        runner.default_client_factory = lambda: (lambda socket: fixed)
+        try:
+            code = runner.main(['run', str(self.manifest), '--instances', str(instances),
+                                '--rows', 'failed', '--pace-minutes', '15'])
+        finally:
+            runner.default_client_factory = original
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads((self.dir / 'out' / 'r1.json').read_text())['status'], 'PASS')
+        summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual([row['status'] for row in summary['rows']], ['pass', 'skipped', 'skipped'])
+        # A later full run still resumes after the passed row. The new fake starts where the fixed row left it.
+        follow = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
+        follow.colour = RED
+        self.make(follow).run()
+        self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
+
+    def test_rows_failed_with_nothing_failed_runs_nothing(self):
+        result = self.make(FakeEden({'to-red': RED})).run(only=set())
+        self.assertEqual(result, 'DONE')
+        self.assertFalse((self.dir / 'out' / 'r1.json').exists())
+        summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual([row['status'] for row in summary['rows']], ['skipped', 'skipped', 'skipped'])
+
+    def test_gif_presets_record_and_a_breaking_file_is_refused(self):
+        class GifEden(FakeEden):
+            def __init__(self, screens, frames=4, frame_ms=100):
+                super().__init__(screens)
+                self.frames, self.frame_ms, self.gif, self.params = frames, frame_ms, None, []
+
+            def request(self, method, params):
+                self.params.append((method, dict(params or {})))
+                if method == 'recording.start':
+                    self.gif = dict(params)
+                    return {'ok': True, 'result': {'state': 'recording'}}
+                if method == 'recording.stop':
+                    spec = self.gif or {}
+                    width = spec.get('width', 640)
+                    height = max(1, round(width * 9 / 16))
+                    images = [Image.new('RGB', (width, height), RED) for _ in range(self.frames)]
+                    images[0].save(spec['path'], save_all=True, append_images=images[1:],
+                                   duration=self.frame_ms, loop=0)
+                    self.gif = None
+                    return {'ok': True, 'result': {'state': 'finished'}}
+                if method == 'recording.status':
+                    return {'ok': True, 'result': {'state': 'finished', 'frames': self.frames,
+                                                   'dropped_frames': 0, 'error': None}}
+                return super().request(method, params)
+
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
+            {'gif': {'name': 'hover', 'preset': 'docs', 'steps': [{'shot': 'mid'}]}}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+        eden = GifEden({})
+        self.assertEqual(self.make(eden).run(), 'DONE')
+        started = next(params for method, params in eden.params if method == 'recording.start')
+        self.assertEqual(started['width'], 1280)
+        self.assertEqual(started['fps'], 10)
+        self.assertEqual(started['duration_ms'], 10000)
+        info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
+        self.assertEqual(set(info) & {'frames', 'duration', 'size', 'sha256', 'path'},
+                         {'frames', 'duration', 'size', 'sha256', 'path'})
+        self.assertLessEqual(info['duration'], 10)
+        self.assertEqual(info['sha256'], sha(info['path']))
+        with Image.open(info['path']) as frame:
+            self.assertEqual(frame.size[0], 1280)
+
+        self.plan['rows'][0]['steps'] = [
+            {'gif': {'name': 'hit', 'preset': 'evidence', 'steps': [{'shot': 'mid'}]}}]
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'g1.json').unlink()
+        evidence = GifEden({})
+        self.make(evidence).run()
+        started = next(params for method, params in evidence.params if method == 'recording.start')
+        self.assertEqual(started['width'], 640)
+        self.assertLessEqual(started['fps'], 15)
+        info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
+        self.assertLessEqual(info['size'], 10 * 1024 * 1024)
+        with Image.open(info['path']) as frame:
+            self.assertEqual(frame.size[0], 640)
+
+        self.plan['rows'][0]['steps'] = [
+            {'gif': {'name': 'huge', 'preset': 'evidence', 'max_bytes': 1, 'steps': [{'shot': 'mid'}]}}]
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'g1.json').unlink()
+        with self.assertRaises(RuntimeError):
+            self.make(GifEden({})).run()
+        refused = json.loads((self.dir / 'out' / 'g1.json').read_text())
+        self.assertEqual(refused['status'], 'FAILED')
+        self.assertIn('size', refused['gif_refused']['why'])
+        self.assertFalse((self.dir / 'out' / 'g1' / 'huge.gif').exists())
+
+        long = GifEden({}, frames=12, frame_ms=1000)
+        self.plan['rows'][0]['steps'] = [
+            {'gif': {'name': 'long', 'preset': 'docs', 'steps': [{'shot': 'mid'}]}}]
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'out' / 'g1.json').unlink()
+        (self.dir / 'out' / 'STOP-INPUT').unlink()
+        self.make(long).run()
+        info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
+        self.assertLessEqual(info['duration'], 10)
+
+    def test_dry_run_catches_a_bad_gif_or_recover_and_keeps_a_reason(self):
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
+            {'gif': {'name': 'hover', 'preset': 'docs', 'width': 900, 'steps': [{'shot': 'mid'}]}}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        errors = ' | '.join(runner.dry_run(self.manifest)['errors'])
+        self.assertIn('reason', errors)
+
+        self.plan['rows'][0]['steps'][0]['gif']['reason'] = 'the plugin text is already readable narrower'
+        self.plan['rows'][0]['steps'][0]['gif']['out'] = '../outside.gif'
+        self.manifest.write_text(json.dumps(self.plan))
+        errors = ' | '.join(runner.dry_run(self.manifest)['errors'])
+        self.assertIn('out', errors)
+
+        self.plan['rows'][0]['steps'][0]['gif'].pop('out')
+        self.plan['gif_presets'] = {'lobby': {'width': 800, 'fps': 8, 'max_duration_s': 4, 'max_bytes': 2_000_000}}
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('reason', ' | '.join(runner.dry_run(self.manifest)['errors']))
+        self.plan['gif_presets']['lobby']['reason'] = 'lobby art is drawn for 800'
+        self.plan['rows'][0]['steps'] = [
+            {'gif': {'name': 'lobby', 'preset': 'lobby', 'steps': [{'shot': 'mid'}]}}]
+        self.plan['rows'].append({'id': 'g2', 'start': 'blue', 'end': 'blue', 'recover': [{'play': 'missing'}],
+                                  'steps': [{'shot': 'x'}]})
+        self.manifest.write_text(json.dumps(self.plan))
+        errors = ' | '.join(runner.dry_run(self.manifest)['errors'])
+        self.assertIn('missing', errors)
+        self.assertNotIn('lobby', errors)
+
+        self.plan['rows'][1]['recover'] = [{'play': 'to-red', 'unchecked': True}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+
+        class GifEden(FakeEden):
+            def __init__(self):
+                super().__init__({})
+                self.params = []
+
+            def request(self, method, params):
+                self.params.append((method, dict(params or {})))
+                if method == 'recording.start':
+                    self.gif = dict(params)
+                    return {'ok': True, 'result': {'state': 'recording'}}
+                if method == 'recording.stop':
+                    Image.new('RGB', (self.gif['width'], 32), BLUE).save(self.gif['path'])
+                    return {'ok': True, 'result': {}}
+                if method == 'recording.status':
+                    return {'ok': True, 'result': {'state': 'finished', 'frames': 1, 'error': None}}
+                return super().request(method, params)
+
+        # A one-frame PNG is not a multi-frame gif; ImageSequence still yields one frame. Width follows the preset.
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
+            {'gif': {'name': 'lobby', 'preset': 'lobby', 'steps': [{'shot': 'mid'}]}}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = GifEden()
+        self.make(eden).run()
+        info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
+        self.assertEqual(info['reason'], 'lobby art is drawn for 800')
+        self.assertEqual(info['width'], 800)
+        started = next(params for method, params in eden.params if method == 'recording.start')
+        self.assertEqual(started['width'], 800)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

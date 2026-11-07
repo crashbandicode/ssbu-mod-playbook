@@ -193,6 +193,10 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   one `rows.json` per boot covering every reachable open row. A failed row
   is fixed or deferred and the same boot carries on ([MACROS](MACROS.md),
   "Test runs", rule 8). Evidence: the run labels against the row list.
+- **M** Test runs continue past a failing row and the batch is fixed in one
+  go. The operator, 2026-11-06: "it should also not stop at the first bug if
+  possible but test everything it can and fix it all in one go to avoid one
+  bug fix, reboot, another, reboot etc". Evidence: `out/summary.json`.
 - **C** (the evidence cites numbers computed from logs) every such number
   comes from a committed script over the logged files, with host tests, and
   the command is named next to the numbers.

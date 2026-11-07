@@ -70,6 +70,40 @@ Other recorders:
 - The `record-ui-demo` skill (`~/.claude/skills/record-ui-demo`) records
   from frames and has a review procedure for previews of CPU input.
 
+## A `gif` step in a test run
+
+The operator, 2026-11-06: "during its boots grok should capture the gifs it
+needs for the documentation as well so another boot isn't necessary". A row
+records the moment while the other steps run:
+
+```json
+{"gif": {"name": "hover", "preset": "docs", "out": "docs/media/hover.gif",
+         "steps": [{"play": "hover"}]}}
+```
+
+`name` is the clip's name inside the row folder. `out`, when set, is a path
+inside the repo (the README's `docs/media/<name>.gif`). `preset` is `docs` or
+`evidence`, or a name in the plan's or the row's `gif_presets`. The runner
+calls Eden `recording.start`, runs the nested steps, then `recording.stop`,
+trims to the preset's length and encodes the full frame at the preset width.
+It does not crop.
+
+| Preset | What the file must be |
+| --- | --- |
+| `docs` | full frame, 1280 wide, at most 10 s |
+| `evidence` | 640 wide, at most 15 fps, at most 10 MB |
+
+A step may override `width`, `fps`, `length` (`duration_s` or `duration_ms`)
+and `size` (`max_bytes` or `max_mb`). Plugins differ, so those are defaults.
+An override outside the two envelopes needs a `"reason"`, and the receipt
+copies that reason. Eden's own limits still apply (fps 1–30, width 160–1280,
+duration 100–120,000 ms); a reason does not widen them. The dry run checks
+the preset, the reason, the `out` path and any `recover` list.
+
+The receipt for the step holds the frame count, duration, size, sha256 and
+the output path. A file that still breaks its preset is not written, and the
+receipt says why.
+
 ## Shrink
 
 Eden's 1280-wide GIFs are large (8 s clips: 15–20 MB). `tools/eden-solo/encode.py`

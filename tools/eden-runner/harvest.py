@@ -24,6 +24,18 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def flatten_steps(steps):
+    """A gif step's nested steps are the moment the row played. Harvest those segments and gates too."""
+    flat = []
+    for step in steps or []:
+        gif = step.get('gif') if isinstance(step, dict) else None
+        if isinstance(gif, dict):
+            flat.extend(flatten_steps(gif.get('steps')))
+        else:
+            flat.append(step)
+    return flat
+
+
 def harvest(manifest, out, label, library, replace=False, dry=False):
     plan = runner.expand_library(json.loads(manifest.read_text()))
     base = manifest.parent
@@ -35,7 +47,7 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
         if not receipt.is_file() or json.loads(receipt.read_text()).get('status') != 'PASS':
             continue
         last_gate = {}
-        steps = row['steps']
+        steps = flatten_steps(row['steps'])
         for i, step in enumerate(steps):
             on = step.get('on', '*')
             if 'gate' in step:

@@ -206,12 +206,25 @@ The rules:
    row family per boot. Split into another boot only when the next rows need
    a different build, plugin set, host or profile, or when a fresh boot is
    itself the thing under test (boot-time install, first load).
-   - **When a row fails**, fix it (its data, a gate, a hook), delete
-     `STOP-INPUT` and run the same `rows.json` again on the same boot.
-     Passed rows are skipped. If a row can't be fixed within a few minutes,
-     take it out (list it as deferred, with the reason). Add a step that
-     brings the game to the next row's start (a library segment or a
-     `recover`), and carry on. Don't shut down to retry one row.
+   - **When a row fails**, keep going if the next row can be reached. The
+     operator, 2026-11-06: "it should also not stop at the first bug if
+     possible but test everything it can and fix it all in one go to avoid
+     one bug fix, reboot, another, reboot etc". The runner saves that row's
+     evidence and, when the next row has a start gate and a `recover` list,
+     plays the list and checks the start gate. The list is whatever that
+     plugin needs: a segment, a `library` route, a `run` hook, or a `ui` or
+     `call` step. The plan may hold one `recover` list for every row; a row's
+     own list replaces it. The same boot then runs the rest.
+     `out/summary.json` lists every row as pass, fail, skipped or not run,
+     with each failure's reason and evidence paths. `--rows failed` reruns
+     only the rows whose receipt is FAILED, after a fix; passed rows are
+     skipped. The runner writes `STOP-INPUT` and stops when recovery fails
+     or the game is no longer running (`status` `running` false, or a crash).
+     It does not reboot Eden. A `rows.json` with no `recover` still stops at
+     the first failure. `on_failure` is `continue` or `stop`, set on the
+     plan, overridden on a row, or passed as `--on-failure`. If a row can't
+     be fixed within a few minutes, take it out (list it as deferred, with
+     the reason). Don't shut down to retry one row.
    - **Order the batch:** cheap, independent rows first. Rows that may wedge
      the game (crash checks, teardown, long matches) go last.
    - **Set the runtime cap for a batch.** It is `config.json` `"runtime"`, in
@@ -363,7 +376,9 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
 
 - **Steps:** `play` a segment (`macro.play`, wait for it to finish, then
   `input.reset`), `gate`, `shot`, `copy` (save an instance file into the row
-  folder), and `wait_ms` (only where no gate exists).
+  folder), `wait_ms` (only where no gate exists), `library` (a shared-library
+  segment by name) and `gif` (record the nested steps; [GIFS](GIFS.md)).
+  A step has one kind. Further kinds register on `Runner.step_handlers`.
 - **Recording:** a segment whose file is missing but which has a `recipe` is
   recorded on its first `play` (`macro.record`, then the recipe's inputs,
   then `macro.stop`). Its sha256 is written back into `rows.json`, and
@@ -399,14 +414,21 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
   copies every segment and gate used in a PASS row, with sha256, the gates
   before and after each segment, and the run label. It leaves existing
   entries alone unless you pass `--replace`.
-- **Stopping:** the first failure writes `STOP-INPUT` and the runner exits.
-  Fix the row list or the tool, delete `STOP-INPUT`, and run again. Rows
-  with a PASS receipt are skipped. A `STOP` file in the output folder stops
-  the runner before its next input; a coordinator can use it. The 15-minute
-  pace cap is built in (`--pace-minutes`).
+- **Stopping:** a failure writes the row `FAILED`, with a screenshot, the
+  tails of the logs that row's gates read, and `trace.counters` plus
+  `trace.read` when that instance is tracing. `failure_evidence` on the plan
+  or the row changes what is collected, and `on_failure_hook` (a project
+  hook) can add paths. The run continues when the next row has a start gate
+  and a `recover` list; otherwise it writes `STOP-INPUT` and exits. A
+  `rows.json` that does not declare `recover` behaves as before. Fix what
+  failed, delete `STOP-INPUT` if it was written, and run again, or pass
+  `--rows failed` to rerun only the failed rows. Rows with a PASS receipt
+  are skipped. A `STOP` file in the output folder stops the runner before
+  its next input; a coordinator can use it. The 15-minute pace cap is built
+  in (`--pace-minutes`). The exit code is nonzero if any row failed.
 - **Evidence:** every control call goes to `out/actions.jsonl`. Each row
-  writes `out/<row>.json`, and its screenshots and copies go to
-  `out/<row>/`.
+  writes `out/<row>.json`, and its screenshots, copies and clips go to
+  `out/<row>/`. `out/summary.json` lists every row.
 
 ### Editing a recording
 
