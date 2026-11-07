@@ -4,7 +4,13 @@
 A test run writes only a row list (rows.json) and, at Up, an instances file. This tool does the rest:
 
   runner.py dry-run <rows.json>                      offline: files, hashes, gates, row chain; lists missing segments
-  runner.py run <rows.json> --instances <inst.json>  play the rows on the live instances
+  runner.py run <rows.json> --instances <inst.json> [--capture-fixtures]
+                                                     play the rows on the live instances
+  runner.py replay <rows.json> --fixture <dir>       replay the row's gates and step hooks on a captured fixture
+  runner.py self-test <rows.json> --instances <inst.json>
+                                                     check declared start states and recovery from each screen class
+  runner.py capture-fixture <rows.json> --instances <inst.json> [--rows <id>]
+                                                     run the selected rows and save a fixture from each pass
   runner.py record-start|record-stop <rows.json> --instances <inst.json> --segment <name> [--start-gate <gate>]
                                                      record while exploring by hand; the segment lands in rows.json
 
@@ -97,6 +103,14 @@ with no recover still stops at the first failure (STOP-INPUT) as before. continu
 (or the plan's recover list) and checks its start gate; the list may hold segments, a library route, a run hook,
 or a ui or call step. If the start gate passes, the run carries on. If recovery fails, or status says the game is
 not running (running false, or a crash), it writes STOP-INPUT and stops. The runner never reboots Eden.
+Each failure is tagged harness-suspect (the screen never changed, recovery or the start
+state failed, or evidence is missing), product-suspect (a screen gate passed and a later
+effect, card file, or trace assertion failed), or unknown. out/summary.json groups them
+by kind and cause. After early_stop failures of one cause (default 3; false disables it)
+the run stops with "probable shared cause" instead of repeating that failure.
+A passing row can be saved with --capture-fixtures and replayed offline. self-test, before
+plugin rows, checks each declared start gate and the declared recovery from each
+screen class back to that gate. Screen classes and their routes are plan data.
 on_failure may be set on the plan, overridden per row, or passed as --on-failure. A plan or row may also set
 failure_evidence and on_failure_hook (a project hook that adds evidence). out/summary.json lists every row as
 pass, fail, skipped or not run, with each failure's reason and evidence paths. The exit code is nonzero if any
@@ -113,6 +127,11 @@ import re
 import sys
 import time
 from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import harness  # noqa: E402
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
 GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status')
@@ -515,6 +534,7 @@ def check_plan_policies(plan, base, errors):
             evidence_config_of(plan, {})
     except ValueError as error:
         errors.append(str(error))
+    harness.validate_declarations(plan, errors)
 
 
 def publish_gif(raw_path, dest, spec):
@@ -962,6 +982,16 @@ class Runner:
             pace.write_text(json.dumps({'started': time.time(), 'first_row_done': None}) + '\n')
         self.pace = json.loads(pace.read_text())
         self.pace_seconds = pace_minutes * 60
+        self.capture_fixtures = False
+        self.cause_counts = {}
+        self.early_stop = None
+        self.screen_reached = False
+        self.last_gate_outcome = None
+        self.gate_saw_evidence = []
+        self.scales_used = []
+        self._arm_frames = False
+        self._gate_baseline = None
+        self._gate_latest = None
 
     # --- control -------------------------------------------------------------------------------------------------
     def log(self, record):
@@ -1013,6 +1043,15 @@ class Runner:
             target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
         path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
         self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        if self._arm_frames:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                data = None
+            if data is not None:
+                if self._gate_baseline is None:
+                    self._gate_baseline = data
+                self._gate_latest = data
         return path
 
     # --- steps ---------------------------------------------------------------------------------------------------
@@ -1261,9 +1300,32 @@ class Runner:
 
     def check_gate(self, on, name):
         self._gate_evidence = True
-        result = self.check_gate_spec(on, self.plan['gates'][name], name)
-        self.gate_saw_evidence.append(self._gate_evidence)
-        return result
+        gate = self.plan['gates'][name]
+        self._arm_frames = True
+        self._gate_baseline = None
+        self._gate_latest = None
+        missing = harness.gate_inputs_missing(self, on, gate)
+        try:
+            result = self.check_gate_spec(on, gate, name)
+        except RuntimeError as error:
+            timed_out = 'did not pass within' in str(error) or 'never settled' in str(error)
+            if timed_out:
+                self.last_gate_outcome = harness.timeout_facts(
+                    self, on, name, gate, missing, gate.get('tolerance', DEFAULT_TOLERANCE))
+            else:
+                self.last_gate_outcome = {'gate': name, 'on': on, 'role': harness.assertion_role(gate),
+                                          'timed_out': False, 'screen_unchanged': None,
+                                          'missing_evidence': missing, 'screen_reached': self.screen_reached}
+            raise
+        else:
+            if harness.assertion_role(gate) == 'screen':
+                self.screen_reached = True
+            self.last_gate_outcome = {'gate': name, 'passed': True, 'role': harness.assertion_role(gate),
+                                      'screen_reached': self.screen_reached}
+            self.gate_saw_evidence.append(self._gate_evidence)
+            return result
+        finally:
+            self._arm_frames = False
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
@@ -1712,19 +1774,26 @@ class Runner:
         return True
 
     def recover_to(self, row):
-        """Play the row or plan recover list, then require the row's start gate. Does not reboot Eden."""
+        """Play the row or plan recover list on the row's instance, then require its start gate.
+
+        A shared recover list names no instance, so each step is bound to the row's own
+        instance before it runs. Does not reboot Eden.
+        """
         gate_name = start_gate_of(self.plan, row)
         if not gate_name:
             raise RecoveryFailed(f'recovery to {row["id"]}: no start gate')
         steps = recover_steps_of(self.plan, row)
         if steps is None:
             raise RecoveryFailed(f'recovery to {row["id"]}: no recover list')
-        saved = self.current_row
+        on = row.get('on', self.default)
+        saved_row = self.current_row
+        saved_on = self.current_on
         self.current_row = row
+        self.current_on = on
         try:
             for step in steps:
-                self.execute_step(step)
-            self.gate(row.get('on', self.default), gate_name)
+                self.execute_step(harness.bind_step(step, on))
+            self.gate(on, gate_name)
         except RecoveryFailed:
             raise
         except StopRun:
@@ -1732,7 +1801,8 @@ class Runner:
         except Exception as error:
             raise RecoveryFailed(f'recovery to {row["id"]} failed: {error}') from error
         finally:
-            self.current_row = saved
+            self.current_row = saved_row
+            self.current_on = saved_on
 
     def _gate_names(self, row):
         def walk(steps):
@@ -1807,20 +1877,92 @@ class Runner:
                     paths.append(str(item))
         return paths
 
+    def classify_failure(self, row, error):
+        """Tag one failure and count its cause. Early stop is a result, not another reboot."""
+        facts = dict(self.last_gate_outcome or {})
+        text = str(error)
+        if 'starts on' in text and 'but the game is on' in text:
+            facts['start_expected'] = row.get('start')
+            facts['start_actual'] = text.rsplit(' on ', 1)[-1]
+        if isinstance(error, RecoveryFailed):
+            facts['recovery'] = True
+            facts['recovery_target'] = row.get('id')
+        if isinstance(error, StopRun) and not facts.get('start_expected'):
+            kind, cause = 'harness-suspect', 'runner-stop'
+        else:
+            kind, cause = harness.classify_failure(error, facts)
+        self.cause_counts[cause] = self.cause_counts.get(cause, 0) + 1
+        count = self.cause_counts[cause]
+        limit = harness.early_stop_limit(self.plan)
+        early = None
+        if cause != 'runner-stop' and limit is not None and count >= limit:
+            early = {'result': f'probable shared cause: {cause}', 'cause': cause, 'kind': kind, 'count': count}
+            self.early_stop = early
+        return kind, cause, early
+
+    def apply_failure(self, row, receipt, error, evidence=None):
+        kind, cause, early = self.classify_failure(row, error)
+        if receipt is not None:
+            receipt['failure_kind'] = kind
+            receipt['failure_cause'] = cause
+            if early:
+                receipt['early_stop'] = early
+        self.note(row['id'], 'fail', reason=repr(error), evidence=evidence,
+                  failure_kind=kind, failure_cause=cause)
+        return early
+
+    def replay_checks(self, row_id):
+        """Run gate steps and project step hooks for one row. Plays are not repeated."""
+        row = next(item for item in self.plan['rows'] if item['id'] == row_id)
+        self.current_row = row
+        self.row_dir = self.out / str(row_id)
+        self.row_dir.mkdir(parents=True, exist_ok=True)
+        self.row_offsets = {}
+        self.screen_reached = False
+        checks = []
+        for step in row.get('steps') or []:
+            if not isinstance(step, dict):
+                continue
+            try:
+                kind = step_kind(step)
+            except RuntimeError:
+                checks.append({'step': 'unknown', 'name': None, 'ok': False, 'error': f'unknown step {step!r}'})
+                continue
+            if kind not in ('gate', 'run'):
+                continue
+            try:
+                self.execute_step(step)
+                checks.append({'step': kind, 'name': step.get(kind), 'ok': True})
+            except Exception as error:  # noqa: BLE001 - replay reports the check; it does not boot Eden
+                checks.append({'step': kind, 'name': step.get(kind), 'ok': False, 'error': str(error)})
+        return {'ok': bool(checks) and all(item['ok'] for item in checks), 'row': row_id, 'checks': checks}
+
+    def self_test(self):
+        return harness.self_test_boot(self)
+
     def write_summary(self):
         rows = []
         failed = 0
+        by_kind, by_cause = {}, {}
         for row in self.plan['rows']:
             info = {'id': row['id'], **self.outcomes.get(row['id'], {'status': 'not run'})}
             if info['status'] == 'fail':
                 failed += 1
+                by_kind.setdefault(info.get('failure_kind', 'unknown'), []).append(row['id'])
+                by_cause.setdefault(info.get('failure_cause', 'unclassified'), []).append(row['id'])
             rows.append(info)
-        (self.out / 'summary.json').write_text(json.dumps({'rows': rows, 'failed': failed}, indent=2) + '\n')
+        payload = {'rows': rows, 'failed': failed, 'by_kind': by_kind, 'by_cause': by_cause}
+        if self.early_stop:
+            payload['early_stop'] = self.early_stop
+            payload['result'] = self.early_stop['result']
+        (self.out / 'summary.json').write_text(json.dumps(payload, indent=2) + '\n')
         return failed
 
     def run(self, only=None):
         self.outcomes = {}
         self.recovered_to = None
+        self.cause_counts = {}
+        self.early_stop = None
         try:
             return self._run_rows(only)
         finally:
@@ -1846,7 +1988,11 @@ class Runner:
                 self.note(row['id'], 'skipped', receipt=prior_status)
                 continue
             if only is None and row['start'] != previous_end and self.recovered_to != row['id']:
-                raise StopRun(f'row {row["id"]} starts on {row["start"]}, but the game is on {previous_end}')
+                mismatch = StopRun(f'row {row["id"]} starts on {row["start"]}, but the game is on {previous_end}')
+                early = self.apply_failure(row, None, mismatch)
+                if early:
+                    raise harness.EarlyStop(early['result'])
+                raise mismatch
             self.row_dir = self.out / row['id']
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()
@@ -1854,6 +2000,8 @@ class Runner:
             self.scales_used, self.gate_saw_evidence = [], []
             self.last_image_scale = None
             self.last_hook_evidence = None
+            self.screen_reached = False
+            self.last_gate_outcome = None
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
             try:
@@ -1868,12 +2016,17 @@ class Runner:
                 if self.gate_saw_evidence and not any(self.gate_saw_evidence):
                     receipt['warnings'] = ['passed with no screen or log evidence from its gates']
                 self.note(row['id'], 'pass')
+                if self.capture_fixtures or self.plan.get('capture_fixtures'):
+                    receipt['fixture'] = str(harness.capture_passing_row(self, row, self.out / 'fixtures' / row['id']))
                 if not self.pace['first_row_done']:
                     self.pace['first_row_done'] = time.time()
                     (self.out / 'pace.json').write_text(json.dumps(self.pace) + '\n')
             except StopRun as error:
                 receipt.update(status='FAILED', error=repr(error))
-                self.note(row['id'], 'fail', reason=repr(error))
+                early = self.apply_failure(row, receipt, error)
+                if early:
+                    self.stop_input(row, early['result'])
+                    raise harness.EarlyStop(early['result'])
                 raise
             except Exception as error:
                 receipt.update(status='FAILED', error=repr(error))
@@ -1887,7 +2040,10 @@ class Runner:
                 except Exception as evidence_error:  # noqa: BLE001
                     self.log({'failure_evidence_error': repr(evidence_error)})
                 receipt['evidence_paths'] = evidence
-                self.note(row['id'], 'fail', reason=repr(error), evidence=evidence)
+                early = self.apply_failure(row, receipt, error, evidence=evidence)
+                if early:
+                    self.stop_input(row, early['result'])
+                    raise harness.EarlyStop(early['result'])
                 successor = rows[index + 1] if index + 1 < len(rows) else None
                 policy = failure_policy_of(self.plan, row, successor, self.on_failure_cli)
                 if isinstance(error, RecoveryFailed) or policy != 'continue' or successor is None:
@@ -1999,10 +2155,14 @@ def record_command(mode, manifest, instances, name, on, start_gate=None, client_
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('dry-run', 'run', 'record-start', 'record-stop'))
+    parser.add_argument('mode', choices=('dry-run', 'run', 'replay', 'self-test', 'capture-fixture',
+                                         'record-start', 'record-stop'))
     parser.add_argument('manifest', type=Path)
     parser.add_argument('--instances', type=Path, help='instances.json written at Up (run mode)')
     parser.add_argument('--out', type=Path, help='output folder (default: <manifest folder>/out)')
+    parser.add_argument('--fixture', type=Path, help='replay: directory containing fixture.json')
+    parser.add_argument('--capture-fixtures', action='store_true',
+                        help='save an offline fixture for each passing row')
     parser.add_argument('--rows', help='comma-separated row ids, or "failed" to rerun rows whose receipt is FAILED')
     parser.add_argument('--on-failure', choices=('continue', 'stop'),
                         help='override the plan/row on_failure policy for this run')
@@ -2022,12 +2182,30 @@ def main(argv=None):
     out = (args.out or manifest.parent / 'out').resolve()
     out.mkdir(parents=True, exist_ok=True)
     (out / 'dry-run.json').write_text(json.dumps(report, indent=2) + '\n')
+    if args.mode == 'replay':
+        if report['errors']:
+            print(json.dumps(report, indent=2))
+            return 1
+        if not args.fixture:
+            parser.error('replay needs --fixture')
+        result = harness.replay_fixture(manifest, args.fixture, out / 'replay', Runner)
+        for line in result.get('lines') or []:
+            print(line, file=sys.stderr)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get('ok') else 1
     if args.mode == 'dry-run' or report['errors']:
         print(json.dumps(report, indent=2))
         return 1 if report['errors'] else 0
     if not args.instances:
-        parser.error('run needs --instances')
+        parser.error(f'{args.mode} needs --instances')
     instances = json.loads(args.instances.read_text())
+    if args.mode == 'self-test':
+        result = Runner(manifest, instances, out, args.pace_minutes).self_test()
+        (out / 'self-test.json').write_text(json.dumps(result, indent=2) + '\n')
+        for line in result.get('lines') or []:
+            print(line, file=sys.stderr)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get('ok') else 1
     only = None
     if args.rows == 'failed':
         only = set()
@@ -2038,11 +2216,16 @@ def main(argv=None):
     elif args.rows:
         only = set(args.rows.split(','))
     try:
-        result = Runner(manifest, instances, out, args.pace_minutes, on_failure=args.on_failure).run(only)
+        tool = Runner(manifest, instances, out, args.pace_minutes, on_failure=args.on_failure)
+        tool.capture_fixtures = bool(args.capture_fixtures or args.mode == 'capture-fixture')
+        result = tool.run(only)
         if result == 'REVIEW':
             return 4
         if result == 'FAILED':
             return 3
+    except harness.EarlyStop as stop:
+        print(json.dumps({'status': 'EARLY-STOP', 'result': str(stop), 'probable_shared_cause': True}), flush=True)
+        return 5
     except StopRun as stop:
         print(json.dumps({'status': 'STOPPED', 'reason': str(stop)}), flush=True)
         return 2

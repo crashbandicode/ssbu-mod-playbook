@@ -113,6 +113,17 @@ pwsh -File tools/eden-solo/solo.ps1 -Action Up -Label e19 -Nro a.nro,b.nro [-Dia
 `-Seeds slot:rating` seeds the rating runtime, for example to put a fighter
 in Elite Smash. The details are in Eden's `ELITE_RATING_TESTS.md`.
 
+## Preflight and the idle watchdog (2026-11-07)
+
+`tools/eden-lifecycle/lifecycle.py preflight` checks the config's pins, game
+base, optional update version, optional playbook commit, memory, disk,
+compilers, ledger claims and a declared display. It writes nothing. `up` runs
+the same pin and game checks before it creates state. `watchdog --execute`
+Downs an instance that sits idle outside a declared safe state (default five
+minutes) or that a declared detector calls a demo. Park is an optional
+declared button or stick sequence. The receipt is
+`state_dir/watchdog-receipt.json`.
+
 ## Drive
 
 ```text

@@ -25,10 +25,36 @@ with no-default/review/native acceptance pending and no owned host claim/job.
 
 ```text
 python3 -B -I lifecycle.py status config.json
+python3 -B -I lifecycle.py preflight config.json
 python3 -B -I lifecycle.py up config.json --execute
 python3 -B -I ../eden-runner/runner.py run rows.json --instances <state_dir>/instances.json
+python3 -B -I lifecycle.py watchdog config.json --execute
 python3 -B -I lifecycle.py down config.json --execute
 ```
+
+`preflight` is read-only. On its own it checks resources, ledger claims and
+the display as well as the pins. `up` repeats the pin, game, update, commit
+and display checks before it creates a journal or a claim, then the existing
+admission checks memory, disk, compilers and claims once. It checks every
+`path`+`sha256` pin, each instance's game base and source profile, an optional
+`expected_game_version` against `game_updates` or an instance `updates` list,
+an optional `playbook` object (`root` and `commit`; a short hash matches a
+longer HEAD), free memory (`memory_floor_bytes`, or the 10 GiB / 9 GiB
+admission floors), free disk, compilers, open ledger claims, and a declared
+display when the host can probe one. A declared trace `symbols` ELF must
+exist. Human lines go to stderr. One JSON
+receipt goes to stdout. Exit 1 when `ok` is false. It does not claim, stage,
+or write the ledger.
+
+`watchdog` needs `--execute`. It watches control-log activity. Idle longer
+than `watchdog.idle_s` (default 300 seconds) outside a declared `safe_states`
+entry, or a detector hit, takes `action` (default `down`). Detectors are
+`new-files` (directory + pattern), `log-line`, `screen-class` (`demo_states`),
+or `hook` (`module` + `function`). A safe state skips idle and does not skip
+a demo detector. `park` sends only the declared `buttons` or `stick` steps
+through edenctl, then `input.reset`. The receipt is
+`state_dir/watchdog-receipt.json`. `--rounds` and `--pause` override
+`rounds` and `poll_s`.
 
 Wrap local commands in the usual memory/time guard and PowerShell7. The caller
 must place `down` in its own cleanup/finally, even if runner execution fails.

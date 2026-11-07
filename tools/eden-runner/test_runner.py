@@ -1052,6 +1052,140 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('warnings', receipt)
         self.assertEqual(receipt['results'][0]['hook_evidence'], {'screen': 'blue'})
 
+    def test_failure_kinds_early_stop_and_start_state(self):
+        settings = self.dir / 'settings.json'
+        settings.write_text('{"menu": {"x": 1}}\n')
+        self.instances['a']['settings'] = str(settings)
+        self.plan['gates']['saved'] = {'kind': 'json', 'source': 'settings', 'expect': {'menu.x': 2},
+                                       'cap': 0.25, 'asserts': 'card'}
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'red', 'steps': [
+            {'play': 'to-red', 'unchecked': True}, {'gate': 'red'}, {'gate': 'saved'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        with self.assertRaises(RuntimeError):
+            self.make(FakeEden({'to-red': RED}, log_path=self.log)).run()
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual(receipt['failure_kind'], 'product-suspect')
+        self.assertEqual(receipt['failure_cause'], 'card:saved')
+        summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual(summary['by_kind']['product-suspect'], ['r1'])
+
+        self.plan.pop('gates')
+        self.plan['gates'] = {'gone': {'kind': 'log', 'source': 'diag_log', 'pattern': 'missing', 'cap': 0.2}}
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'gate': 'gone'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        shutil.rmtree(self.dir / 'out')
+        with self.assertRaises(RuntimeError):
+            self.make(FakeEden({})).run()
+        missing = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual(missing['failure_kind'], 'harness-suspect')
+        self.assertEqual(missing['failure_cause'], 'missing-evidence:gone')
+
+        Image.new('RGB', (64, 36), RED).save(self.dir / 'refs' / 'red.png')
+        self.plan['gates'] = {
+            'red': {'kind': 'image', 'reference': 'refs/red.png', 'sha256': sha(self.dir / 'refs' / 'red.png'),
+                    'roi': [0, 0, 64, 36], 'cap': 0.3, 'interval': 0.05},
+            'saved': {'kind': 'json', 'source': 'settings', 'expect': {'menu.x': 2}, 'cap': 0.25, 'asserts': 'card'},
+        }
+        self.plan['start'] = 'red'
+        self.plan['early_stop'] = 2
+        self.plan['on_failure'] = 'continue'
+        self.plan['recover'] = []
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'red', 'end': 'red', 'steps': [{'gate': 'red'}, {'gate': 'saved'}]},
+            {'id': 'r2', 'start': 'red', 'end': 'red', 'start_gate': 'red', 'steps': [{'gate': 'red'}, {'gate': 'saved'}]},
+            {'id': 'r3', 'start': 'red', 'end': 'red', 'steps': [{'gate': 'red'}, {'gate': 'saved'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+        shutil.rmtree(self.dir / 'out')
+        eden = FakeEden({})
+        eden.colour = RED
+        with self.assertRaises(runner.harness.EarlyStop):
+            self.make(eden).run()
+        stopped = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertTrue(stopped['result'].startswith('probable shared cause:'))
+        self.assertEqual(stopped['early_stop']['count'], 2)
+        self.assertEqual([row['status'] for row in stopped['rows']], ['fail', 'fail', 'not run'])
+        self.assertEqual(stopped['by_cause']['card:saved'], ['r1', 'r2'])
+
+        self.plan['rows'][0]['start'] = 'elsewhere'
+        self.plan['early_stop'] = 3
+        self.manifest.write_text(json.dumps(self.plan))
+        shutil.rmtree(self.dir / 'out')
+        with self.assertRaises(runner.StopRun) as caught:
+            self.make(FakeEden({})).run()
+        self.assertIn('starts on elsewhere', str(caught.exception))
+        mismatched = json.loads((self.dir / 'out' / 'summary.json').read_text())
+        self.assertEqual(mismatched['rows'][0]['failure_kind'], 'harness-suspect')
+        self.assertIn('start-state:elsewhere', mismatched['rows'][0]['failure_cause'])
+
+    def test_fixture_replay_runs_gates_and_step_hooks_without_eden(self):
+        settings = self.dir / 'settings.json'
+        settings.write_text('{"menu": {"x": 1}}\n')
+        self.instances['a']['settings'] = str(settings)
+        (self.dir / 'steps.py').write_text(
+            'def check_card(ctx):\n'
+            '    with open(ctx.instance["settings"]) as handle:\n'
+            '        text = handle.read()\n'
+            '    if \'"x": 1\' not in text:\n'
+            '        raise RuntimeError("card")\n'
+            '    return "card"\n')
+        self.plan['capture_fixtures'] = True
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'red', 'steps': [
+            {'play': 'to-red', 'unchecked': True}, {'gate': 'red'}, {'run': 'steps.py:check_card'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(self.make(FakeEden({'to-red': RED})).run(), 'DONE')
+        fixture = self.dir / 'out' / 'fixtures' / 'r1'
+        self.assertTrue((fixture / 'fixture.json').is_file())
+        report = runner.harness.replay_fixture(self.manifest, fixture, self.dir / 'replay-out', runner.Runner)
+        self.assertTrue(report['ok'], report)
+        self.assertEqual([item['name'] for item in report['checks']], ['red', 'steps.py:check_card'])
+        card = fixture / 'a-settings.json'
+        card.write_text('{"menu": {"x": 0}}\n')
+        refused = runner.harness.replay_fixture(self.manifest, fixture, self.dir / 'replay-out-2', runner.Runner)
+        self.assertFalse(refused['ok'])
+        self.assertIn('card', refused['checks'][1]['error'])
+
+    def test_self_test_reports_each_declared_recovery(self):
+        menu, popup = (20, 180, 40), (180, 180, 20)
+        Image.new('RGB', (64, 36), BLUE).save(self.dir / 'refs' / 'blue.png')
+        Image.new('RGB', (64, 36), menu).save(self.dir / 'refs' / 'menu.png')
+        Image.new('RGB', (64, 36), popup).save(self.dir / 'refs' / 'popup.png')
+        for name in ('to-menu', 'to-popup', 'to-blue'):
+            source = self.dir / 'segments' / 'to-red.edenmacro.json'
+            target = self.dir / 'segments' / f'{name}.edenmacro.json'
+            target.write_bytes(source.read_bytes())
+            self.plan['segments'][name] = {'file': f'segments/{name}.edenmacro.json', 'sha256': sha(target)}
+        image = {'kind': 'image', 'roi': [0, 0, 64, 36], 'cap': 0.4, 'interval': 0.05}
+        self.plan['gates']['blue'] = {**image, 'reference': 'refs/blue.png', 'sha256': sha(self.dir / 'refs' / 'blue.png')}
+        self.plan['gates']['menu'] = {**image, 'reference': 'refs/menu.png', 'sha256': sha(self.dir / 'refs' / 'menu.png')}
+        self.plan['gates']['popup'] = {**image, 'reference': 'refs/popup.png', 'sha256': sha(self.dir / 'refs' / 'popup.png')}
+        self.plan['recover'] = [{'play': 'to-blue', 'unchecked': True}]
+        self.plan['screen_classes'] = [
+            {'class': 'menu', 'reach': [{'play': 'to-menu', 'unchecked': True}], 'gate': 'menu'},
+            {'class': 'pop-up', 'reach': [{'play': 'to-popup', 'unchecked': True}], 'gate': 'popup'},
+        ]
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue', 'start_gate': 'blue',
+                              'steps': [{'shot': 'stay'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = FakeEden({'to-menu': menu, 'to-popup': popup, 'to-blue': BLUE})
+        eden.colour = BLUE
+        report = self.make(eden).self_test()
+        self.assertTrue(report['ok'], report)
+        classes = [item.get('class') for item in report['recoveries'] if item['check'] == 'recovery']
+        self.assertEqual(classes, ['menu', 'pop-up'])
+        eden.screens['to-blue'] = menu
+        broken = self.make(eden).self_test()
+        self.assertFalse(broken['ok'])
+        self.assertTrue(any(not item['ok'] and item['check'] == 'recovery' for item in broken['recoveries']))
+
+    def test_dry_run_rejects_a_bad_early_stop_and_screen_class(self):
+        self.plan['early_stop'] = True
+        self.plan['screen_classes'] = [{'class': 'menu'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(self.manifest)
+        self.assertTrue(any('early_stop' in item for item in report['errors']))
+        self.assertTrue(any('screen class' in item for item in report['errors']))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

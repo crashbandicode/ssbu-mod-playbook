@@ -12,6 +12,19 @@ needs exact human timing. A test run never drives by hand: it plays a runner
 that was ready before `Up` ("Test runs: the runner is ready before Up",
 below).
 
+## Offline replay and a self-test boot (2026-11-07)
+
+`runner.py replay rows.json --fixture <dir>` runs one passing row's gate
+steps and `steps.py` hooks against a captured fixture. No Eden, and no play
+steps. `run` with `capture_fixtures` in the plan, or `capture-fixture`, writes
+`out/fixtures/<row>/fixture.json` plus the screen and the source files those
+checks read. `runner.py self-test rows.json --instances instances.json`
+checks each row's declared start gate, then each `screen_classes` entry: the
+`reach` steps, that class's gate, the row or plan `recover` list, and the
+start gate again. Class names and routes are plan data. The report is
+`out/self-test.json`. A plan may set `early_stop` (default 3, or false). After
+that many failures of one cause the run stops with `probable shared cause`.
+
 ## Scripted routes
 
 A route is presses and stick pushes, each followed by a wait long enough for

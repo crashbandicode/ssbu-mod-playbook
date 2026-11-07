@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Shared, journalled Eden lifecycle. Import is inert; see README.md for config.
 
-  lifecycle.py up     config.json --execute [--ssh memento-claw-yoga-ubuntu]
-  lifecycle.py down   config.json --execute [--ssh memento-claw-yoga-ubuntu]
-  lifecycle.py status config.json           [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py up        config.json --execute [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py down      config.json --execute [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py status    config.json           [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py preflight config.json           [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py watchdog  config.json --execute [--ssh memento-claw-yoga-ubuntu] [--rounds N] [--pause S]
+
+preflight is read-only: pins, game base, declared update version, playbook commit,
+memory floor, disk, compilers, ledger claims and a declared display. It runs
+again, still without writing, before every up. watchdog watches control activity
+and either parks with the declared input sequence or (the default) Downs with a receipt.
 
 No runtime operations are performed by tests: inject a fake Host and Ledger.
 SSH executes the SAME source through the remote login shell's PowerShell 7,
@@ -18,6 +25,7 @@ try:
     import fcntl
 except ImportError:  # Windows uses an exclusive byte-range run lock; ledger lives on Linux.
     fcntl = None
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -456,6 +464,35 @@ def validate(config):
         value = config.get(key, default)
         require(isinstance(value, (int, float)) and math.isfinite(value) and 0 < value <= (10800 if key == 'runtime' else 300),
                 'Invalid bounded ' + key)
+    if 'expected_game_version' in config:
+        require(isinstance(config['expected_game_version'], str) and config['expected_game_version'],
+                'expected_game_version must be a non-empty string')
+    if 'playbook' in config:
+        book = config['playbook']
+        require(isinstance(book, dict) and isinstance(book.get('root'), str) and isinstance(book.get('commit'), str)
+                and book['root'] and book['commit'], 'playbook needs root and commit strings')
+    if 'memory_floor_bytes' in config:
+        require(type(config['memory_floor_bytes']) is int and config['memory_floor_bytes'] > 0,
+                'memory_floor_bytes must be a positive integer')
+    if 'watchdog' in config:
+        spec = config['watchdog']
+        require(isinstance(spec, dict), 'watchdog must be an object')
+        IdleWatchdog(spec)
+        for detector in spec.get('detectors') or []:
+            require(isinstance(detector, dict) and detector.get('kind') in DEMO_DETECTORS,
+                    'unknown watchdog detector: ' + str(detector.get('kind') if isinstance(detector, dict) else detector))
+            if detector['kind'] == 'new-files':
+                require(isinstance(detector.get('directory'), str) and detector['directory'],
+                        'new-files detector needs a directory')
+            elif detector['kind'] == 'log-line':
+                require(isinstance(detector.get('pattern'), str) and detector['pattern'],
+                        'log-line detector needs a pattern')
+            elif detector['kind'] == 'screen-class':
+                require(isinstance(detector.get('demo_states'), list) and detector['demo_states'],
+                        'screen-class detector needs demo_states')
+            elif detector['kind'] == 'hook':
+                require(isinstance(detector.get('module'), str) and isinstance(detector.get('function'), str),
+                        'hook detector needs module and function')
     if windows:
         require(type(config.get('interactive_session')) is int and config['interactive_session'] > 0,
                 'Windows interactive_session required')
@@ -514,6 +551,26 @@ class Host:
             except (FileNotFoundError, ProcessLookupError):
                 pass
         return {'mem_available': memory, 'disk_free': shutil.disk_usage(disk_path).free, 'foreign_processes': processes}
+
+    def display_ready(self, item, config):
+        """A declared display is ready when its socket exists, or is free for a helper to create."""
+        display = item.get('display')
+        if not display:
+            return {'declared': False, 'ready': True, 'detail': 'no display declared'}
+        socket_path = Path('/tmp/.X11-unix/X' + display[1:])
+        helper = bool(config.get('display_helper'))
+        try:
+            exists = socket_path.exists() and not socket_path.is_symlink()
+        except OSError as error:
+            return {'declared': True, 'ready': False, 'helper': helper, 'socket': str(socket_path),
+                    'detail': f'display socket unreadable: {error}'}
+        if helper:
+            ready = not exists
+            detail = 'display socket free for the helper' if ready else 'display socket already in use: ' + str(socket_path)
+        else:
+            ready = exists
+            detail = 'display socket present: ' + str(socket_path) if ready else 'display socket missing: ' + str(socket_path)
+        return {'declared': True, 'ready': ready, 'helper': helper, 'socket': str(socket_path), 'detail': detail}
 
     def identity(self, pid):
         try:
@@ -978,6 +1035,106 @@ def windows_launch(packet_path):
         host.job.close(job)  # KILL_ON_JOB_CLOSE includes this launcher and every descendant.
 
 
+def iter_pin_nodes(node):
+    """Every object that pins a file with path and sha256. The walk is the config, not a plugin."""
+    if isinstance(node, dict):
+        path, digest_value = node.get('path'), node.get('sha256')
+        if isinstance(path, str) and isinstance(digest_value, str) and re.fullmatch(r'[0-9a-f]{64}', digest_value):
+            yield node
+        for key, child in node.items():
+            if key in ('path', 'sha256'):
+                continue
+            yield from iter_pin_nodes(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from iter_pin_nodes(child)
+
+
+def update_pins(config):
+    pins = [pin for pin in config.get('game_updates') or [] if isinstance(pin, dict)]
+    for item in config.get('instances') or []:
+        pins.extend(pin for pin in (item.get('updates') or []) if isinstance(pin, dict))
+    return pins
+
+
+def detect_new_files(spec, sample):
+    pattern = spec.get('pattern') or '*'
+    return any(fnmatch.fnmatch(str(name), pattern) for name in sample.get('new_files') or [])
+
+
+def detect_log_line(spec, sample):
+    return re.search(spec.get('pattern') or '', sample.get('log_delta') or '') is not None
+
+
+def detect_screen_class(spec, sample):
+    return sample.get('screen_class') in set(spec.get('demo_states') or [])
+
+
+def detect_hook(spec, sample):
+    module_path = Path(spec['module'])
+    loaded = importlib.util.spec_from_file_location('watchdog_detector_' + module_path.stem, module_path)
+    module = importlib.util.module_from_spec(loaded)
+    loaded.loader.exec_module(module)
+    return bool(getattr(module, spec['function'])(spec, sample))
+
+
+DEMO_DETECTORS = {'new-files': detect_new_files, 'log-line': detect_log_line,
+                  'screen-class': detect_screen_class, 'hook': detect_hook}
+
+
+class IdleWatchdog:
+    """Decide when an instance has been idle, or has drifted into a demo, and which action to take.
+
+    The sample is plain data. Screen names, file patterns and log lines come from the config.
+    The default action is Down. Park is only the declared button or stick sequence.
+    """
+
+    def __init__(self, spec):
+        spec = spec or {}
+        self.idle_s = spec.get('idle_s', 300)
+        require(isinstance(self.idle_s, (int, float)) and not isinstance(self.idle_s, bool) and self.idle_s > 0,
+                'watchdog.idle_s must be a positive number')
+        self.action = spec.get('action', 'down')
+        require(self.action in ('down', 'park'), 'watchdog.action must be down or park')
+        self.safe = set(spec.get('safe_states') or [])
+        self.park = spec.get('park')
+        self.detectors = spec.get('detectors') or []
+        if self.action == 'park':
+            require(isinstance(self.park, list) and self.park, 'watchdog park needs a declared input sequence')
+        require(isinstance(self.detectors, list), 'watchdog.detectors must be a list')
+        require(isinstance(spec.get('safe_states', []), list), 'watchdog.safe_states must be a list')
+
+    def decide(self, now, samples):
+        for key, sample in (samples or {}).items():
+            hit = self.demo(sample)
+            idle_for = now - sample.get('activity', now)
+            if hit is not None:
+                return self.decision(key, 'demo-drift', hit, idle_for)
+            if sample.get('state') in self.safe:
+                continue
+            if idle_for > self.idle_s:
+                return self.decision(key, 'idle', None, idle_for)
+        return None
+
+    def demo(self, sample):
+        for spec in self.detectors:
+            kind = spec.get('kind') if isinstance(spec, dict) else None
+            fn = DEMO_DETECTORS.get(kind)
+            if fn is None:
+                raise Refused('unknown watchdog detector: ' + str(kind))
+            if fn(spec, sample):
+                return spec
+        return None
+
+    def decision(self, key, reason, detector, idle_for):
+        value = {'action': self.action, 'reason': reason, 'instance': key, 'idle_s': idle_for}
+        if detector is not None:
+            value['detector'] = detector.get('kind')
+        if self.action == 'park':
+            value['park'] = self.park
+        return value
+
+
 class Lifecycle:
     def __init__(self, config, host=None, ledger=None, plan_check=None):
         self.c = validate(config)
@@ -1052,21 +1209,347 @@ class Lifecycle:
         # The ledger admits up to this many of this tool's own claims on the host (claim_admission).
         value['max_eden'] = getattr(self.host, 'max_eden', 1)
         self.record('admission', value)
-        require(value['disk_free'] >= MIN_DISK, 'Free disk below 40 GB')
         # Compilers always block an Up. Other Eden instances are allowed up to the host's limit (operator 2026-11-04:
         # the Surface and the Yoga can each run two emulators; the Ally stays at one). Only the emulator binary counts
         # as an instance; its AppImage launcher and LAN helper processes belong to the same instance.
-        foreign = value['foreign_processes']
-        edens = [p for p in foreign if p['name'].lower() in EDEN_INSTANCE_NAMES]
-        others = [p for p in foreign if not p['name'].lower().startswith(('eden', 'yuzu'))]
-        require(not others, 'Compiler already active on host')
-        limit = getattr(self.host, 'max_eden', 1)
-        require(len(edens) < limit, f'{len(edens)} Eden instance(s) already active on host (limit {limit})')
-        # The first instance needs 10 GiB available. A second one needs 9 GiB (operator 2026-11-04): its own unit
-        # caps it at 8 GiB, plus 1 GiB of headroom.
-        need = MIN_MEMORY_SECOND if edens else MIN_MEMORY
-        require(value['mem_available'] >= need, f'MemAvailable below {need // GIB} GiB')
+        # The first instance needs 10 GiB available. A second one needs 9 GiB: its unit caps it at 8 GiB, plus 1 GiB.
+        problems, _lines, _checks = self.resource_report(value)
+        if problems:
+            require(False, problems[0])
         return value
+
+    def resource_report(self, value):
+        """Memory, disk, compilers and Eden slots. Same refusals admission uses, without writing."""
+        problems, lines, checks = [], [], []
+        if value['disk_free'] < MIN_DISK:
+            problems.append('Free disk below 40 GB')
+            lines.append('FAIL disk: Free disk below 40 GB')
+            checks.append({'name': 'disk', 'ok': False, 'free': value['disk_free']})
+        else:
+            lines.append(f'OK disk: {value["disk_free"]} bytes free')
+            checks.append({'name': 'disk', 'ok': True, 'free': value['disk_free']})
+        foreign = value['foreign_processes']
+        edens = [p for p in foreign if str(p.get('name', '')).lower() in EDEN_INSTANCE_NAMES]
+        others = [p for p in foreign if not str(p.get('name', '')).lower().startswith(('eden', 'yuzu'))]
+        if others:
+            problems.append('Compiler already active on host')
+            lines.append('FAIL compiler: Compiler already active on host')
+            checks.append({'name': 'compiler', 'ok': False, 'processes': others})
+        else:
+            lines.append('OK compiler: none running')
+            checks.append({'name': 'compiler', 'ok': True})
+        limit = value.get('max_eden', getattr(self.host, 'max_eden', 1))
+        if len(edens) >= limit:
+            detail = f'{len(edens)} Eden instance(s) already active on host (limit {limit})'
+            problems.append(detail)
+            lines.append('FAIL eden slots: ' + detail)
+            checks.append({'name': 'eden-slots', 'ok': False, 'running': len(edens), 'limit': limit})
+        else:
+            lines.append(f'OK eden slots: {len(edens)} running, limit {limit}, requesting {len(self.c["instances"])}')
+            checks.append({'name': 'eden-slots', 'ok': True, 'running': len(edens), 'limit': limit,
+                           'requesting': len(self.c['instances'])})
+        need = MIN_MEMORY_SECOND if edens else MIN_MEMORY
+        floor = self.c.get('memory_floor_bytes', need)
+        if value['mem_available'] < floor:
+            if 'memory_floor_bytes' in self.c:
+                detail = f'MemAvailable {value["mem_available"]} is below the per-instance floor {floor}'
+            else:
+                detail = f'MemAvailable below {need // GIB} GiB'
+            problems.append(detail)
+            lines.append('FAIL memory: ' + detail)
+            checks.append({'name': 'memory', 'ok': False, 'available': value['mem_available'], 'floor': floor})
+        else:
+            lines.append(f'OK memory: {value["mem_available"]} bytes available, floor {floor}')
+            checks.append({'name': 'memory', 'ok': True, 'available': value['mem_available'], 'floor': floor})
+        return problems, lines, checks
+
+    def ledger_text(self):
+        """Read the ledger. Injected ledgers and a remote read do not append."""
+        if self.injected_ledger is not None:
+            return getattr(self.injected_ledger, 'open_text', '')
+        if self.c.get('ledger_ssh'):
+            info = Ledger(self.c['ledger'], self.c['host'], self.c['owner'], '0' * 32, self.c.get('ledger_ssh')).inspect()
+            return '\n'.join(info.get('open') or [])
+        path = safe_absolute(self.c['ledger'])
+        require(path.is_file(), 'Authoritative ledger must already exist')
+        with path.open('r', encoding='utf-8') as stream:
+            if fcntl is not None:
+                fcntl.flock(stream, fcntl.LOCK_SH)
+            return stream.read()
+
+    def playbook_head(self, root):
+        probe = getattr(self.host, 'playbook_head', None)
+        if probe is not None:
+            return probe(root)
+        safe_absolute(root)
+        done = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=15)
+        require(done.returncode == 0, 'Playbook commit unreadable: ' + (done.stderr or done.stdout)[-300:])
+        return done.stdout.strip()
+
+    def static_checks(self):
+        """Pins, game base, declared update version, playbook commit and display. No writes."""
+        problems, lines, checks = [], [], []
+        windows = set()
+        if self.c.get('host') == 'ally':
+            for key in ('windows_job', 'windows_control', 'windows_python'):
+                helper = self.c.get(key) or {}
+                if isinstance(helper, dict) and isinstance(helper.get('path'), str):
+                    windows.add(helper['path'])
+        seen = set()
+        for pin in iter_pin_nodes(self.c):
+            identity = (pin.get('path'), pin.get('sha256'))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            path = Path(pin['path'])
+            if not path.is_file():
+                detail = f'Pinned input missing: {path}'
+            else:
+                got = digest(path)
+                detail = None if got == pin['sha256'] else f'Pinned input mismatch: {path}'
+            if detail and str(path) in windows:
+                detail = 'Windows helper mismatch before claim'
+            if detail:
+                problems.append(detail)
+                lines.append('FAIL pin: ' + detail)
+                checks.append({'name': 'pin', 'ok': False, 'path': str(path), 'detail': detail})
+            else:
+                lines.append(f'OK pin: {path}')
+                checks.append({'name': 'pin', 'ok': True, 'path': str(path)})
+        for item in self.c['instances']:
+            game = Path(item['game'])
+            if game.is_file():
+                lines.append(f'OK game base: {game}')
+                checks.append({'name': 'game-base', 'ok': True, 'instance': item['key'], 'path': str(game)})
+            else:
+                detail = f'Game base missing: {game}'
+                problems.append(detail)
+                lines.append('FAIL game base: ' + detail)
+                checks.append({'name': 'game-base', 'ok': False, 'instance': item['key'], 'detail': detail})
+            source = Path(item['source'])
+            if source.is_dir():
+                lines.append(f'OK source profile: {source}')
+                checks.append({'name': 'source-profile', 'ok': True, 'instance': item['key'], 'path': str(source)})
+            else:
+                detail = f'Source profile missing: {source}'
+                problems.append(detail)
+                lines.append('FAIL source profile: ' + detail)
+                checks.append({'name': 'source-profile', 'ok': False, 'instance': item['key'], 'detail': detail})
+            for symbols in (item.get('trace') or {}).get('symbols') or []:
+                elf = Path(str(symbols.get('elf') or ''))
+                if elf.is_file():
+                    lines.append(f'OK trace elf: {elf}')
+                    checks.append({'name': 'trace-elf', 'ok': True, 'instance': item['key'], 'path': str(elf)})
+                else:
+                    detail = f'Trace ELF missing: {elf}'
+                    problems.append(detail)
+                    lines.append('FAIL trace elf: ' + detail)
+                    checks.append({'name': 'trace-elf', 'ok': False, 'instance': item['key'], 'detail': detail})
+        expected = self.c.get('expected_game_version')
+        if expected:
+            matched = [pin for pin in update_pins(self.c) if pin.get('version') == expected]
+            if matched:
+                lines.append(f'OK game update: version {expected} pinned {len(matched)} file(s)')
+                checks.append({'name': 'game-update', 'ok': True, 'version': expected, 'count': len(matched)})
+            else:
+                detail = f'No game update pin for version {expected}'
+                problems.append(detail)
+                lines.append('FAIL game update: ' + detail)
+                checks.append({'name': 'game-update', 'ok': False, 'detail': detail})
+        else:
+            lines.append('OK game update: no expected version declared')
+            checks.append({'name': 'game-update', 'ok': True, 'detail': 'not declared'})
+        book = self.c.get('playbook')
+        if isinstance(book, dict):
+            try:
+                head = self.playbook_head(book.get('root'))
+            except Exception as error:  # noqa: BLE001 - the receipt names the commit failure
+                detail = f'Playbook commit unreadable: {error}'
+                head = None
+            else:
+                detail = None
+            want = str(book.get('commit') or '')
+            if detail is None and want and (head == want or head.startswith(want)):
+                lines.append(f'OK playbook commit: {head}')
+                checks.append({'name': 'playbook', 'ok': True, 'commit': head})
+            else:
+                detail = detail or f'Playbook commit {head} != declared {want}'
+                problems.append(detail)
+                lines.append('FAIL playbook: ' + detail)
+                checks.append({'name': 'playbook', 'ok': False, 'detail': detail})
+        else:
+            lines.append('OK playbook commit: not declared')
+            checks.append({'name': 'playbook', 'ok': True, 'detail': 'not declared'})
+        probe = getattr(self.host, 'display_ready', None)
+        if probe is None:
+            lines.append('OK display: no display probe on this host')
+            checks.append({'name': 'display', 'ok': True, 'detail': 'no display probe on this host'})
+        else:
+            for item in self.c['instances']:
+                result = probe(item, self.c)
+                detail = result.get('detail') or ''
+                if result.get('ready'):
+                    lines.append(f'OK display {item.get("key")}: {detail}')
+                    checks.append({'name': 'display', 'ok': True, 'instance': item.get('key'), **result})
+                else:
+                    problems.append(detail or f'Display not ready: {item.get("display")}')
+                    lines.append(f'FAIL display {item.get("key")}: {detail}')
+                    checks.append({'name': 'display', 'ok': False, 'instance': item.get('key'), **result})
+        return problems, lines, checks
+
+    def runtime_checks(self, value):
+        """Resources plus ledger claims. value is an admission snapshot; this does not record one."""
+        problems, lines, checks = self.resource_report(value)
+        try:
+            text = self.ledger_text()
+            policy = claim_admission(text, self.c['host'], self.c['owner'], self.c.get('stale_claim_hours'), value)
+        except Exception as error:  # noqa: BLE001
+            detail = f'Ledger unreadable: {error}'
+            problems.append(detail)
+            lines.append('FAIL ledger: ' + detail)
+            checks.append({'name': 'ledger', 'ok': False, 'detail': detail})
+            return problems, lines, checks
+        blocking = policy.get('blocking') or []
+        if blocking:
+            detail = 'Open host claim; no profile changes permitted'
+            problems.append(detail)
+            lines.append('FAIL ledger: ' + detail)
+            checks.append({'name': 'ledger', 'ok': False, 'blocking': len(blocking)})
+        else:
+            lines.append('OK ledger: no blocking claim')
+            checks.append({'name': 'ledger', 'ok': True, 'stale_claim_skipped': len(policy.get('stale_claim_skipped') or [])})
+        return problems, lines, checks
+
+    def preflight(self, runtime=True):
+        """One read-only receipt. runtime=False is the half that runs before up creates any state."""
+        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname')
+        problems, lines, checks = self.static_checks()
+        if runtime:
+            path = Path(self.c['work_root'])
+            while not path.exists():
+                path = path.parent
+            value = self.host.resources(path)
+            value['max_eden'] = getattr(self.host, 'max_eden', 1)
+            extra_problems, extra_lines, extra_checks = self.runtime_checks(value)
+            problems.extend(extra_problems)
+            lines.extend(extra_lines)
+            checks.extend(extra_checks)
+        return {'phase': 'preflight', 'ok': not problems, 'mutation': False, 'host': self.c['host'],
+                'lines': lines, 'checks': checks, 'message': '; '.join(problems) if problems else 'preflight ok'}
+
+    def _watchdog_text(self, item, source_name):
+        path = self.directory / 'instances.json'
+        if not source_name or not path.is_file():
+            return ''
+        instances = json.loads(path.read_text())
+        source = (instances.get(item['key']) or {}).get(source_name)
+        if not source or not Path(source).is_file():
+            return ''
+        return '\n'.join(Path(source).read_text(errors='replace').splitlines()[-40:])
+
+    def observe_watchdog(self, seen):
+        """Control-log mtime, a declared state probe, and files that appeared after the first look."""
+        require(self.journal.is_file(), 'No owned lifecycle journal')
+        self.state = json.loads(self.journal.read_text())
+        self.check_state()
+        spec = self.c.get('watchdog') or {}
+        samples = {}
+        for item in self.state['instances']:
+            control = Path(item['run']) / 'control.jsonl'
+            try:
+                activity = control.stat().st_mtime
+            except OSError:
+                activity = 0
+            text = self._watchdog_text(item, (spec.get('state_probe') or {}).get('source'))
+            state = None
+            for rule in (spec.get('state_probe') or {}).get('rules') or []:
+                if rule.get('pattern') and re.search(rule['pattern'], text):
+                    state = rule.get('state')
+            new_files = []
+            for detector in spec.get('detectors') or []:
+                if not isinstance(detector, dict) or detector.get('kind') != 'new-files':
+                    continue
+                directory = Path(detector['directory'])
+                pattern = detector.get('pattern') or '*'
+                current = set()
+                if directory.is_dir():
+                    current = {path.name for path in directory.iterdir()
+                               if path.is_file() and fnmatch.fnmatch(path.name, pattern)}
+                known = seen.get(item['key'])
+                if known is None:
+                    seen[item['key']] = current
+                else:
+                    new_files.extend(sorted(current - known))
+                    seen[item['key']] = current
+            samples[item['key']] = {'activity': activity, 'state': state, 'new_files': new_files,
+                                    'log_delta': text, 'screen_class': state}
+        return samples
+
+    def send_park(self, decision):
+        """Send only the declared park sequence. Lifecycle up/down/status still send no input."""
+        require(self.journal.is_file(), 'No owned lifecycle journal')
+        self.state = json.loads(self.journal.read_text())
+        self.check_state()
+        sent = []
+        for item in self.state['instances']:
+            if item['key'] != decision['instance']:
+                continue
+            tools = str(Path(item['app']['path']).parent / 'tools')
+            if tools not in sys.path:
+                sys.path.insert(0, tools)
+            from edenctl import Client
+            client = Client(item['socket'], 10)
+            for step in decision.get('park') or []:
+                player = int(step.get('player', 0))
+                if 'buttons' in step:
+                    client.request('input.button', {'player': player, 'buttons': step['buttons'], 'hold': True,
+                                                    'lease_ms': int(step.get('hold', 150))})
+                elif 'stick' in step:
+                    stick_x, stick_y, stick_ms = step['stick']
+                    client.request('input.stick', {'player': player, 'x': stick_x, 'y': stick_y, 'hold': True,
+                                                   'lease_ms': int(stick_ms)})
+                else:
+                    raise Refused('watchdog park step needs buttons or stick')
+                sent.append(step)
+            client.request('input.reset', {})
+        require(sent, 'watchdog park found no matching instance')
+        return sent
+
+    def watchdog(self, now=None, samples=None, rounds=None, pause=None):
+        """Watch until a demo drift or an idle outside a declared safe state, then park or Down."""
+        spec = self.c.get('watchdog') or {}
+        dog = IdleWatchdog(spec)
+        rounds = spec.get('rounds', 1) if rounds is None else rounds
+        pause = spec.get('poll_s', 0) if pause is None else pause
+        seen, decision, current = {}, None, samples
+        for _ in range(max(1, int(rounds))):
+            if samples is None:
+                current = self.observe_watchdog(seen)
+            moment = now if now is not None else time.time()
+            decision = dog.decide(moment, current)
+            if decision is not None or samples is not None:
+                break
+            if pause:
+                self.host.sleep(pause)
+        if decision is None:
+            return {'phase': 'watchdog', 'action': None, 'ok': True, 'mutation': False,
+                    'lines': ['OK watchdog: no idle or demo drift']}
+        receipt = {**decision, 'utc': stamp(), 'phase': 'watchdog', 'ok': True,
+                   'mutation': decision['action'] == 'down',
+                   'lines': [f"ACTION watchdog: {decision['reason']} on {decision['instance']}; {decision['action']}"]}
+        if self.directory.exists():
+            save(self.directory / 'watchdog-receipt.json', receipt)
+        actor = getattr(self, 'watchdog_actor', None)
+        if actor is not None:
+            actor(receipt)
+            return receipt
+        if decision['action'] == 'down':
+            receipt['down'] = self.down()
+        elif decision['action'] == 'park':
+            receipt['park_sent'] = self.send_park(decision)
+        if self.directory.exists():
+            save(self.directory / 'watchdog-receipt.json', receipt)
+        return receipt
 
     def poll(self, predicate, cap, what):
         end = self.host.clock() + cap
@@ -1161,7 +1644,9 @@ class Lifecycle:
         self.record('prepared', {'key': item['key'], 'snapshot_entries': len(expected), 'persisted_volume': 0})
 
     def up(self):
-        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname; no claim/profile action')
+        report = self.preflight(runtime=False)
+        require(report['ok'], report['message'])
+        self._preflight_static = report
         with self.lock():
             require(not self.journal.exists(), 'Run already journalled; use down/status, never blind up retry')
             root = Path(self.c['work_root'])
@@ -1189,6 +1674,12 @@ class Lifecycle:
             self.write()
             try:
                 admission = self.admission()
+                problems, lines, checks = self.runtime_checks(admission)
+                require(not problems, '; '.join(problems))
+                self.state['preflight'] = {'ok': True, 'mutation': False,
+                                           'lines': self._preflight_static['lines'] + lines,
+                                           'checks': self._preflight_static['checks'] + checks}
+                self.write()
                 claim = self.ledger().claim(stale_claim_hours=self.c.get('stale_claim_hours'), admission=admission)
                 self.state['claimed'] = True
                 self.state['stale_claim_skipped'] = claim.get('stale_claim_skipped', [])
@@ -1272,7 +1763,8 @@ class Lifecycle:
                 self.state['phase'] = 'up'
                 self.write()
                 return {'phase': 'up', 'instances': instances, 'instances_file': str(self.directory / 'instances.json'),
-                        'stale_claim_skipped': self.state['stale_claim_skipped']}
+                        'stale_claim_skipped': self.state['stale_claim_skipped'],
+                        'preflight': self.state.get('preflight')}
             except BaseException as error:
                 self.state['up_error'] = repr(error)
                 self.write()
@@ -1414,11 +1906,11 @@ class Lifecycle:
                 'cleanup_failures': value.get('cleanup_failures', [])}
 
 
-def forward(host, mode, config, execute, run=subprocess.run):
+def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=None, watchdog_pause=None):
     """One bounded SSH request; remote account login shell must be pwsh."""
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
     if config.get('host') == 'ally' and not mode.startswith('ledger-'):
-        return forward_windows(host, mode, config, execute)
+        return forward_windows(host, mode, config, execute, watchdog_rounds=watchdog_rounds, watchdog_pause=watchdog_pause)
     bootstrap = 'import json,sys; p=json.load(sys.stdin); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
     script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 900 "
               "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
@@ -1426,18 +1918,22 @@ def forward(host, mode, config, execute, run=subprocess.run):
     command = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host,
                '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
-    packet = {'mode': mode, 'config': config, 'execute': execute, 'source': source}
+    packet = {'mode': mode, 'config': config, 'execute': execute, 'source': source,
+              'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause}
     done = run(command, input=json.dumps(packet), capture_output=True, text=True, timeout=900)
     require(done.returncode == 0, 'SSH lifecycle failed: ' + done.stderr[-2000:] + done.stdout[-2000:])
     return json.loads(done.stdout)
 
 
-def dispatch(mode, config, execute=False):
-    require(mode == 'status' or execute, 'Runtime mutation needs explicit --execute; tests inject fakes')
+def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=None):
+    require(mode in ('status', 'preflight') or execute, 'Runtime mutation needs explicit --execute; tests inject fakes')
     if mode.startswith('ledger-'):
         return Ledger(config['ledger'], config['host'], config['owner'], config['token']).operate(
             mode[7:], config.get('stale_claim_hours'), config.get('admission'))
-    return getattr(Lifecycle(config), mode)()
+    tool = Lifecycle(config)
+    if mode == 'watchdog':
+        return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
+    return getattr(tool, mode)()
 
 
 def remote_main(packet):
@@ -1452,34 +1948,39 @@ def remote_main(packet):
             return reply['result']
         globals()['_LEDGER_BRIDGE'] = bridge
         try:
-            value = dispatch(packet['mode'], packet['config'], packet['execute'])
+            value = dispatch(packet['mode'], packet['config'], packet['execute'],
+                             packet.get('watchdog_rounds'), packet.get('watchdog_pause'))
             print(json.dumps({'lifecycle_result': value}), flush=True)
         except BaseException as error:
             print(json.dumps({'lifecycle_error': str(error)}), flush=True)
     else:
-        print(json.dumps(dispatch(packet['mode'], packet['config'], packet['execute'])))
+        print(json.dumps(dispatch(packet['mode'], packet['config'], packet['execute'],
+                                  packet.get('watchdog_rounds'), packet.get('watchdog_pause'))))
 
 
-def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger):
+def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
+                    watchdog_rounds=None, watchdog_pause=None):
     # SSH exec is always non-login/noninteractive (-T, explicit MSI pwsh -NoProfile).
     # 1312 is a pre-launch Windows logon failure: retry ONCE, never replay a claim/Up.
     for attempt in range(2):
         try:
-            return _forward_windows_once(host, mode, config, execute, popen, ledger_factory)
+            return _forward_windows_once(host, mode, config, execute, popen, ledger_factory,
+                                          watchdog_rounds, watchdog_pause)
         except Refused as error:
             if not (attempt == 0 and getattr(error, 'transport_not_started', False)
                     and 'CreateProcessAsUserW failed: 1312' in str(error)):
                 raise
 
 
-def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger):
+def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
+                          watchdog_rounds=None, watchdog_pause=None):
     """Windows cmd-default SSH transport, with Linux-authoritative ledger RPC.
 
     No Windows SSH keys or copied ledger. Both sides retain the same durable token.
     The controller only honors its configured owner/host/path and bounded operations.
     """
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
-    require(mode == 'status' or execute, 'Windows up/down require --execute')
+    require(mode in ('status', 'preflight') or execute, 'Windows up/down require --execute')
     bootstrap = 'import json,sys; p=json.loads(sys.stdin.readline()); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
     script = ('& "C:\\Program Files\\Python312\\python.exe" -I -B -X utf8 -c ' +
               "'" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
@@ -1509,7 +2010,8 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
     token_seen = None
     try:
         process.stdin.write(json.dumps({'mode': mode, 'config': config, 'execute': execute,
-                                       'source': source, 'ledger_bridge': True}) + '\n')
+                                       'source': source, 'ledger_bridge': True,
+                                       'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause}) + '\n')
         process.stdin.flush()
         while True:
             remaining = end - time.monotonic()
@@ -1531,7 +2033,8 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
                 require(re.fullmatch(r'[0-9a-f]{32}', token) and token_seen in (None, token), 'Foreign bridge token')
                 token_seen = token
                 require(request['operation'] in ('read', 'claim', 'release'), 'Unknown bridge operation')
-                require(mode != 'status' or request['operation'] == 'read', 'Status cannot mutate a ledger')
+                require(mode not in ('status', 'preflight') or request['operation'] == 'read',
+                        'Preflight/status cannot mutate a ledger')
                 ledger = ledger_factory(config['ledger'], 'ally', config['owner'], token, config.get('ledger_ssh'))
                 try:
                     result = ledger.operate(request['operation'], request.get('stale_claim_hours'), request.get('admission'))
@@ -1566,16 +2069,24 @@ def main(argv=None):
         windows_launch(actual[1])
         return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('up', 'down', 'status'))
+    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'watchdog'))
     parser.add_argument('config', type=Path)
     parser.add_argument('--execute', action='store_true', help='explicit runtime authorization; NEVER used by offline tests')
     parser.add_argument('--ssh', help='executor host (remote login shell PowerShell 7)')
+    parser.add_argument('--rounds', type=int, default=None, help='watchdog polls (default: the config, else 1)')
+    parser.add_argument('--pause', type=float, default=None, help='seconds between watchdog polls')
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text())
-        require(args.mode == 'status' or args.execute, 'up/down require explicit --execute')
-        value = forward(args.ssh, args.mode, config, args.execute) if args.ssh else dispatch(args.mode, config, args.execute)
+        require(args.mode in ('status', 'preflight') or args.execute, 'up/down require explicit --execute')
+        value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause)
+                 if args.ssh else dispatch(args.mode, config, args.execute, args.rounds, args.pause))
+        if isinstance(value, dict) and args.mode in ('preflight', 'watchdog'):
+            for line in value.get('lines') or []:
+                print(line, file=sys.stderr)
         print(json.dumps(value, indent=2))
+        if isinstance(value, dict) and args.mode == 'preflight' and not value.get('ok', False):
+            return 1
         return 0
     except Exception as error:
         print(json.dumps({'phase': 'refused/failed', 'error': str(error)}), file=sys.stderr)

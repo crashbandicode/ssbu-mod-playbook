@@ -790,8 +790,10 @@ class LifecycleTests(unittest.TestCase):
     def test_trace_config_is_written_and_passed_at_launch(self):
         points = [{'target': 'libtraining_rooms.nro!hook_entry', 'registers': ['x0'], 'on_return': True},
                   {'target': 'main+0x15d9a70', 'mode': 'counters'}]
+        elf = Path(self.config['state_dir']).parent / 'plugin.elf'
+        elf.write_bytes(b'elf fixture')
         self.config['instances'][0]['trace'] = {'points': points, 'symbols': [
-            {'module': 'libtraining_rooms.nro', 'elf': str(Path(self.config['state_dir']).parent / 'plugin.elf')}]}
+            {'module': 'libtraining_rooms.nro', 'elf': str(elf)}]}
         c = self.controller()
         c.up()
         instances = json.loads((Path(self.config['state_dir']) / 'instances.json').read_text())
@@ -859,6 +861,127 @@ class LifecycleTests(unittest.TestCase):
                     host.unit = lambda _, values={**safe, **wrong}: values
                     with self.assertRaisesRegex(life.Refused, 'stop policy'):
                         host.launch(c.state['instances'][0], self.config)
+
+    def test_preflight_is_read_only_and_names_a_bad_pin(self):
+        value = self.controller().preflight()
+        self.assertTrue(value['ok'])
+        self.assertFalse(value['mutation'])
+        self.assertFalse(Path(self.config['state_dir']).exists())
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertFalse(self.ledger.claimed)
+        self.assertTrue(any(line.startswith('OK pin:') for line in value['lines']))
+        self.assertEqual(self.ledger_path.read_text(), '# TEMPORARY test data; not OWNER-COORDINATION\n')
+        self.plugin.write_bytes(b'changed')
+        bad = self.controller().preflight()
+        self.assertFalse(bad['ok'])
+        self.assertIn('Pinned input mismatch', bad['message'])
+        self.assertTrue(any(line.startswith('FAIL pin:') for line in bad['lines']))
+        self.assertFalse(self.ledger.claimed)
+
+    def test_preflight_requires_a_declared_update_version_and_commit(self):
+        self.config['expected_game_version'] = '13.0.5'
+        missing = self.controller().preflight()
+        self.assertFalse(missing['ok'])
+        self.assertIn('No game update pin for version 13.0.5', missing['message'])
+        update = self.base / 'update.nsp'
+        update.write_bytes(b'13.0.5 update')
+        self.config['game_updates'] = [{**{'path': str(update), 'sha256': life.digest(update)}, 'version': '13.0.5'}]
+        self.config['playbook'] = {'root': str(self.base), 'commit': 'abc1234'}
+        self.host.playbook_head = lambda root: 'abc1234deadbeef'
+        ready = self.controller().preflight()
+        self.assertTrue(ready['ok'], ready['message'])
+        self.assertTrue(any('13.0.5' in line for line in ready['lines']))
+        self.config['playbook']['commit'] = 'fff0000'
+        refused = self.controller().preflight()
+        self.assertFalse(refused['ok'])
+        self.assertIn('Playbook commit', refused['message'])
+
+    def test_preflight_reports_memory_compiler_and_claims_without_writing(self):
+        self.host.available = life.MIN_MEMORY - 1
+        low = self.controller().preflight()
+        self.assertIn('MemAvailable below 10 GiB', low['message'])
+        self.host.available = 24 * life.GIB
+        self.config['memory_floor_bytes'] = 30 * life.GIB
+        floored = self.controller().preflight()
+        self.assertIn('per-instance floor', floored['message'])
+        self.config.pop('memory_floor_bytes')
+        self.host.foreign = [{'pid': 9, 'name': 'rustc'}]
+        compiling = self.controller().preflight()
+        self.assertIn('Compiler already active on host', compiling['message'])
+        self.host.foreign = []
+        self.ledger.open_text = '2026-11-07T12:00:00+00:00 CLAIMED: OpenCode other/stream on Surface busy'
+        claimed = self.controller().preflight()
+        self.assertIn('Open host claim', claimed['message'])
+        self.assertFalse(Path(self.config['state_dir']).exists())
+        self.assertEqual(self.ledger_path.read_text(), '# TEMPORARY test data; not OWNER-COORDINATION\n')
+
+    def test_display_ready_follows_the_declaration(self):
+        host = life.Host()
+        with patch.object(life.Path, 'exists', return_value=False), patch.object(life.Path, 'is_symlink', return_value=False):
+            missing = host.display_ready({'display': ':244'}, {})
+            helper = host.display_ready({'display': ':244'}, {'display_helper': {'path': '/x'}})
+        self.assertFalse(missing['ready'])
+        self.assertIn('missing', missing['detail'])
+        self.assertTrue(helper['ready'])
+        with patch.object(life.Path, 'exists', return_value=True), patch.object(life.Path, 'is_symlink', return_value=False):
+            present = host.display_ready({'display': ':244'}, {})
+            busy = host.display_ready({'display': ':244'}, {'display_helper': {'path': '/x'}})
+        self.assertTrue(present['ready'])
+        self.assertFalse(busy['ready'])
+
+    def test_up_runs_preflight_before_any_state(self):
+        self.plugin.write_bytes(b'changed')
+        with self.assertRaisesRegex(life.Refused, 'Pinned input mismatch'):
+            self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+        self.assertFalse(Path(self.config['state_dir']).exists())
+
+    def test_watchdog_idle_safe_state_demo_and_park(self):
+        now = 1000
+        idle = life.IdleWatchdog({'safe_states': ['training']})
+        sample = {'activity': now, 'state': 'menu', 'new_files': [], 'log_delta': '', 'screen_class': 'menu'}
+        self.assertIsNone(idle.decide(now, {'a': sample}))
+        self.assertEqual(idle.decide(now, {'a': {**sample, 'activity': now - 301}})['action'], 'down')
+        self.assertIsNone(idle.decide(now, {'a': {**sample, 'activity': now - 9999, 'state': 'training'}}))
+        demo = life.IdleWatchdog({'idle_s': 300, 'detectors': [
+            {'kind': 'new-files', 'pattern': '*-doubles-*', 'directory': '/tmp/unused'}]})
+        drifted = demo.decide(now, {'a': {**sample, 'new_files': ['match-doubles-1']}})
+        self.assertEqual(drifted['reason'], 'demo-drift')
+        self.assertEqual(drifted['action'], 'down')
+        self.assertEqual(drifted['detector'], 'new-files')
+        screen = life.IdleWatchdog({'detectors': [{'kind': 'screen-class', 'demo_states': ['attract']}]})
+        immediate = screen.decide(now, {'a': {**sample, 'screen_class': 'attract'}})
+        self.assertEqual(immediate['reason'], 'demo-drift')
+        logged = life.IdleWatchdog({'detectors': [{'kind': 'log-line', 'pattern': 'attract'}]})
+        self.assertEqual(logged.decide(now, {'a': {**sample, 'log_delta': 'entered attract demo'}})['detector'], 'log-line')
+        parked = life.IdleWatchdog({'idle_s': 10, 'action': 'park', 'park': [{'buttons': 'b', 'hold': 150}]})
+        decision = parked.decide(100, {'a': {**sample, 'activity': 0, 'state': None}})
+        self.assertEqual(decision['action'], 'park')
+        self.assertEqual(decision['park'], [{'buttons': 'b', 'hold': 150}])
+        seen = []
+        self.config['watchdog'] = {'idle_s': 5, 'action': 'down'}
+        controller = self.controller()
+        controller.watchdog_actor = seen.append
+        receipt = controller.watchdog(now=100, samples={'a': {**sample, 'activity': 0}})
+        self.assertEqual(receipt['action'], 'down')
+        self.assertEqual(seen, [receipt])
+        self.assertFalse(self.ledger.claimed)
+        self.assertIn('ACTION watchdog', receipt['lines'][0])
+
+    def test_preflight_requires_a_declared_trace_elf(self):
+        self.config['instances'][0]['trace'] = {
+            'points': ['guest-point'],
+            'symbols': [{'module': 'main', 'elf': str(self.base / 'missing.elf')}]}
+        missing = self.controller().preflight()
+        self.assertFalse(missing['ok'])
+        self.assertIn('Trace ELF missing', missing['message'])
+        self.assertFalse(Path(self.config['state_dir']).exists())
+        elf = self.base / 'main.elf'
+        elf.write_bytes(b'not an executable; existence only')
+        self.config['instances'][0]['trace']['symbols'][0]['elf'] = str(elf)
+        ready = self.controller().preflight()
+        self.assertTrue(ready['ok'], ready['message'])
+        self.assertTrue(any(line.startswith('OK trace elf:') for line in ready['lines']))
 
 
 class LinuxStopTests(unittest.TestCase):
