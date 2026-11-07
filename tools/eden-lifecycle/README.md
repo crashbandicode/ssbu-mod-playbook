@@ -64,12 +64,13 @@ later poll until that line scrolls out of the window. The action ends the
 sidecar, so that repeated match runs the action once. A safe state skips idle
 and does not skip a demo detector. `safe_states` does nothing by itself.
 Idle still Downs the instance after `idle_s` while it waits in Training for
-a lane, unless a `state_probe` rule sets a state listed in `safe_states`. TrainingRooms names that state from a diagnostics line.
-The diag build writes `[FrameStrip] shown=true menu_open=false` to
-`practice-diagnostics.log` when the frame strip is shown and no menu is open
-(`diag_log`; that line is not copied into `practice-gates.log`). The probe
-is still only the last 40 lines, so the wait stays safe only while that line
-remains in the window:
+a lane, unless a `state_probe` rule sets a state listed in `safe_states`. The rule needs a line the
+plugin keeps printing in that state. A line printed only on a change does not hold it. TrainingRooms'
+`[FrameStrip] shown=` is one, and the 2026-11-07 Surface boot never printed it. In Training, the
+TrainingRooms diag build prints `[FrameStrip] p1 status=` to `practice-diagnostics.log` (`diag_log`)
+when Player 1's busy status changes. The probe is still only the last 40 lines, so the
+wait stays safe only while such a line remains in the window. The release build prints no such line. On
+a release window, rely on the demo detectors and a longer `idle_s`:
 
 ```json
 "watchdog": {
@@ -77,7 +78,7 @@ remains in the window:
   "safe_states": ["training"],
   "state_probe": {
     "source": "diag_log",
-    "rules": [{"pattern": "\\[FrameStrip\\] shown=true menu_open=false", "state": "training"}]
+    "rules": [{"pattern": "\\[FrameStrip\\] p1 status=", "state": "training"}]
   }
 }
 ```

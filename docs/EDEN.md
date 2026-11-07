@@ -122,20 +122,24 @@ the same pin and game checks before it creates state. `watchdog --execute`
 Downs an instance that sits idle outside a declared safe state (default five
 minutes) or that a declared detector calls a demo. A config that declares
 `watchdog` still Downs after `idle_s` while the instance waits in Training
-for a lane, unless a `state_probe` rule sets a state listed in `safe_states`. For TrainingRooms,
-the diag build's Training HUD line is on `diag_log`:
+for a lane, unless a `state_probe` rule sets a state listed in `safe_states`.
+The rule needs a line the plugin keeps printing in that state. A line printed
+only on a change does not hold the state. TrainingRooms' `[FrameStrip] shown=`
+is one, and the 2026-11-07 Surface boot never printed it at all. In Training,
+the TrainingRooms diag build prints `[FrameStrip] p1 status=` on `diag_log`
+when Player 1's busy status changes:
 
 ```json
 "safe_states": ["training"],
 "state_probe": {
   "source": "diag_log",
-  "rules": [{"pattern": "\\[FrameStrip\\] shown=true menu_open=false", "state": "training"}]
+  "rules": [{"pattern": "\\[FrameStrip\\] p1 status=", "state": "training"}]
 }
 ```
 
-That line is `[FrameStrip] shown=true menu_open=false` in
-`practice-diagnostics.log`. The probe sees the last 40 lines, so the state
-lasts only while the line is still in that window. A `new-files` detector
+The release build prints no such line. On a release window, rely on the demo
+detectors and a longer `idle_s`. The probe sees the last 40 lines, so the
+state lasts only while such a line is still in that window. A `new-files` detector
 keeps its baseline across sidecar polls. A `log-line` detector searches that
 same 40-line window, so one demo line keeps matching until the action ends
 the sidecar or the line scrolls out. A missing control log
