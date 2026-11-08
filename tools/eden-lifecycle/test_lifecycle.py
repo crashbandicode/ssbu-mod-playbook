@@ -1879,6 +1879,39 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(packet['ledger_bridge'])
         self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]), {'result': {'line': 'FAKE claim'}})
 
+    def test_windows_up_reads_with_the_inspect_token_then_claims_with_its_own(self):
+        # Up's admission reads the ledger with the read-only inspect token ('0' * 32, Lifecycle.ledger_text) before
+        # it claims with the run token. Reads bind nothing; a second mutating token is still refused.
+        run_token, other = 'c' * 32, 'd' * 32
+        def stream(*requests):
+            lines = [json.dumps({'ledger_request': {'operation': op, 'token': tok, 'admission': {},
+                                                    'stale_claim_hours': None}}) for op, tok in requests]
+            return '\n'.join(lines + [json.dumps({'lifecycle_result': {'phase': 'up'}})]) + '\n'
+        def transport(text):
+            class Process:
+                stdin = io.StringIO()
+                stdout = io.StringIO(text)
+                stderr = io.StringIO()
+                def poll(self):
+                    return 0
+                def wait(self, timeout):
+                    return 0
+            return lambda command, **kwargs: Process()
+        tokens = []
+        class Ledger:
+            def __init__(self, *args):
+                tokens.append(args[3])
+            def operate(self, operation, stale, admission):
+                return {'open': []} if operation == 'read' else {'line': 'FAKE ' + operation}
+        value = life.forward_windows('intpa@dreamland-ally', 'up', self.config, True,
+                                     transport(stream(('read', '0' * 32), ('claim', run_token), ('read', '0' * 32),
+                                                      ('release', run_token))), Ledger)
+        self.assertEqual(value['phase'], 'up')
+        self.assertEqual(tokens, ['0' * 32, run_token, '0' * 32, run_token])
+        with self.assertRaisesRegex(life.Refused, 'Foreign bridge token'):
+            life.forward_windows('intpa@dreamland-ally', 'up', self.config, True,
+                                 transport(stream(('claim', run_token), ('release', other))), Ledger)
+
     def test_windows_1312_retries_once_only_before_any_ledger_action(self):
         error = life.Refused('CreateProcessAsUserW failed: 1312')
         error.transport_not_started = True

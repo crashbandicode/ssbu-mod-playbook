@@ -2229,7 +2229,7 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
     error_thread = threading.Thread(target=stderr, daemon=True)
     error_thread.start()
     end = time.monotonic() + 900
-    token_seen = None
+    token_seen = bound = None
     try:
         process.stdin.write(json.dumps({'mode': mode, 'config': config, 'execute': execute,
                                        'source': source, 'ledger_bridge': True,
@@ -2252,9 +2252,14 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
             if 'ledger_request' in message:
                 request = message['ledger_request']
                 token = request['token']
-                require(re.fullmatch(r'[0-9a-f]{32}', token) and token_seen in (None, token), 'Foreign bridge token')
-                token_seen = token
+                require(re.fullmatch(r'[0-9a-f]{32}', token), 'Foreign bridge token')
                 require(request['operation'] in ('read', 'claim', 'release'), 'Unknown bridge operation')
+                # A read mutates nothing: Up's admission reads with the inspect token ('0' * 32, ledger_text)
+                # before it claims. Only claim and release bind the run's one token.
+                if request['operation'] != 'read':
+                    require(bound in (None, token), 'Foreign bridge token')
+                    bound = token
+                token_seen = token
                 require(mode not in ('status', 'preflight') or request['operation'] == 'read',
                         'Preflight/status cannot mutate a ledger')
                 ledger = ledger_factory(config['ledger'], 'ally', config['owner'], token, config.get('ledger_ssh'))
