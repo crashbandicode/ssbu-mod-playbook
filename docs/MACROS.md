@@ -416,8 +416,16 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
     failed two exact-match attempts on 2026-11-03. `"scale": "fit"` on the
     gate, or on the plan, scales the live frame to the reference's size when
     the sizes differ and the aspect ratio matches, then compares. The ROI
-    stays in reference coordinates. It is off unless set. The receipt records
-    that scaling was used. Tolerances stay as written. A hook gate that
+    stays in reference coordinates. A reference that is already the ROI
+    (`reference_is_roi`) does not contain the frame: set `"frame": [1280, 720]`
+    to the size those coordinates were captured at. The live frame is scaled
+    to that size, then cropped. If the mean difference is still over the
+    tolerance, both crops are compared again at half their size. That matches
+    a 640x360 shot and a 1280-wide shot of a frame rendered at 0.5x (upscaled
+    and blurrier). A different screen, such as the title or a demo, still
+    fails. It is off unless set. The receipt records that scaling, including
+    the half-size compare when that is what passed. Tolerances stay as written.
+    A hook gate that
     returns bare `True` checks the row without leaving screen or log
     evidence; the receipt warns, and the row still passes. Return a line, a
     count or a small dict from the hook when a later reader should see what

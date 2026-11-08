@@ -421,6 +421,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(seg['sha256'], sha(library / seg['file']))
         self.assertEqual(index['gates']['red']['sha256'], sha(library / index['gates']['red']['reference']))
         self.assertTrue(index['gates']['red']['reference_is_roi'])
+        self.assertEqual(index['gates']['red']['frame'], [64, 36])
         # The region-only reference still passes a live screenshot of the same screen.
         shot = self.dir / 'shot.png'
         Image.new('RGB', (64, 36), RED).save(shot)
@@ -1038,6 +1039,95 @@ class RunnerTests(unittest.TestCase):
         mismatched = json.loads((self.dir / 'out' / 'r1.json').read_text())
         self.assertEqual(mismatched['status'], 'FAILED')
         self.assertNotIn('scale', mismatched)
+
+    def _save_shots(self, shots):
+        paths = {}
+        for name, image in shots.items():
+            path = self.dir / f'{name}.png'
+            image.save(path)
+            paths[name] = path
+        return paths
+
+    def test_roi_scale_fit_matches_main_at_full_half_and_half_rendered(self):
+        # The library main gate is the ROI only. Its coordinates are the 1280x720 frame they were captured on.
+        library = json.loads((Path(runner.__file__).resolve().parent / 'library' / 'index.json').read_text())
+        self.assertEqual(library['gates']['main']['frame'], [1280, 720])
+        self.assertTrue(library['gates']['main']['reference_is_roi'])
+        roi = library['gates']['main']['roi']
+        frame = [1280, 720]
+        with Image.open(Path(runner.__file__).resolve().parent / 'library' / 'refs' / 'main.png') as ref_im:
+            reference = ref_im.convert('RGB')
+        self.assertEqual(reference.size, (roi[2] - roi[0], roi[3] - roi[1]))
+        full = Image.new('RGB', tuple(frame), (12, 24, 48))
+        full.paste(reference, (roi[0], roi[1]))
+        half = full.resize((640, 360), Image.Resampling.BOX)
+        rendered = half.resize(tuple(frame), Image.Resampling.BILINEAR)
+        title = Image.new('RGB', tuple(frame), (180, 40, 20))
+        with Image.open(Path(runner.__file__).resolve().parent / 'library' / 'refs' / 'css.png') as css:
+            title.paste(css.convert('RGB').resize(reference.size, Image.Resampling.BOX), (roi[0], roi[1]))
+        paths = self._save_shots({'full': full, 'half': half, 'rendered': rendered, 'title': title})
+        ref = self.dir / 'refs' / 'main.png'
+        reference.save(ref)
+
+        diff, note = runner.Runner.compare_region(paths['full'], ref, roi, True, 'fit', frame, 8)
+        self.assertEqual(diff, 0)
+        self.assertIsNone(note)
+        diff, note = runner.Runner.compare_region(paths['half'], ref, roi, True, 'fit', frame, 8)
+        self.assertLessEqual(diff, 8)
+        self.assertEqual(note, {'scale': 'fit', 'frame': [640, 360], 'reference': frame, 'compared': [150, 35]})
+        diff, note = runner.Runner.compare_region(paths['rendered'], ref, roi, True, 'fit', frame, 8)
+        self.assertLessEqual(diff, 8)
+        self.assertEqual(note['scale'], 'fit')
+        self.assertEqual(note['frame'], frame)
+        self.assertEqual(note['reference'], frame)
+        self.assertEqual(note['compared'], [150, 35])
+        diff, note = runner.Runner.compare_region(paths['title'], ref, roi, True, 'fit', frame, 8)
+        self.assertGreater(diff, 8)
+        self.assertNotIn('compared', note or {})
+        # Without the captured frame size, fit still ignores an ROI reference.
+        bare, bare_note = runner.Runner.compare_region(paths['half'], ref, roi, True, 'fit')
+        self.assertGreater(bare, 8)
+        self.assertIsNone(bare_note)
+
+        self.plan['gates']['main'] = {
+            'kind': 'image', 'reference': 'refs/main.png', 'sha256': sha(ref), 'roi': roi, 'frame': frame,
+            'reference_is_roi': True, 'scale': 'fit', 'tolerance': 8, 'cap': 0.4, 'interval': 0.01}
+        self.plan['rows'] = [{'id': 'menu', 'start': 'blue', 'end': 'main', 'steps': [{'gate': 'main'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+
+        def paint(path):
+            eden = FakeEden({})
+            original = eden.request
+
+            def request(method, params):
+                reply = original(method, params)
+                if method == 'ui.screenshot':
+                    shutil.copy(path, params['path'])
+                return reply
+
+            eden.request = request
+            return eden
+
+        self.assertEqual(self.make(paint(paths['half'])).run(), 'DONE')
+        receipt = json.loads((self.dir / 'out' / 'menu.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertEqual(receipt['scale'][0],
+                         {'gate': 'main', 'scale': 'fit', 'frame': [640, 360], 'reference': frame,
+                          'compared': [150, 35]})
+        (self.dir / 'out' / 'menu.json').unlink()
+        with self.assertRaises(RuntimeError):
+            self.make(paint(paths['title'])).run()
+        failed = json.loads((self.dir / 'out' / 'menu.json').read_text())
+        self.assertEqual(failed['status'], 'FAILED')
+        self.assertNotIn('scale', failed)
+
+        self.plan['gates']['main'].pop('frame')
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('needs "frame"', ' | '.join(runner.dry_run(self.manifest)['errors']))
+        self.plan['gates']['main']['frame'] = [0, 720]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('frame must be [width, height]', ' | '.join(runner.dry_run(self.manifest)['errors']))
 
     def test_receipt_warns_when_a_passing_hook_checked_nothing(self):
         (self.dir / 'always.py').write_text('def check(path, gate):\n    return True\n')

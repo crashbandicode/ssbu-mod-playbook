@@ -633,6 +633,7 @@
       "tolerance": 8,
       "cap": 30,
       "reference_is_roi": true,
+      "frame": [1280, 720],
       "from_run": "lr-03"
     },
     "stage": {

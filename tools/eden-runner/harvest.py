@@ -74,7 +74,10 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                             # Keep only the compared region: a full screenshot is ~600 KB, the region a few KB.
                             from PIL import Image
                             with Image.open(src) as im:
-                                im.convert('RGB').crop(tuple(gate['roi'])).save(library / dest)
+                                full = im.convert('RGB')
+                                full.crop(tuple(gate['roi'])).save(library / dest)
+                                # ROI coordinates belong to this frame. compare_region needs it for scale "fit".
+                                gate['frame'] = [full.size[0], full.size[1]]
                             gate['reference_is_roi'] = True
                             gate['sha256'] = digest(library / dest)
                         else:

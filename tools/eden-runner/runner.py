@@ -86,10 +86,14 @@ per-instance "trace", instances.json has "trace_jsonl": a log gate on it waits f
 More gates:
   {"kind": "change", "mark": "hud-before", "roi": [...], "min_diff": 8, "stable": true, "cap": 10}
       the region differs from the row's mark and has stopped moving (HUD portrait swapped, menu value changed)
-  {"kind": "image", "scale": "fit"}
+  {"kind": "image", "scale": "fit", "frame": [1280, 720]}
       opt-in, on the gate or the plan. Scale the live frame to the reference size when the aspect ratio matches,
-      then compare. The ROI stays in reference coordinates. Off unless set. The receipt records the scaling.
-      Tolerances are unchanged. A pass that came only from hook gates returning True gets a receipt warning and
+      then compare. The ROI stays in reference coordinates. A reference that is already the ROI has no frame of
+      its own: "frame" is the size those coordinates were captured at, and the live frame is scaled to that
+      before the crop. If the mean difference is still over the tolerance, both crops are compared again at
+      half their size, so a 1280-wide shot of a 0.5x render (upscaled and blurrier) can match. Off unless set.
+      The receipt records the scaling. Tolerances are unchanged. A pass that came only from hook gates
+      returning True gets a receipt warning and
       still passes; return a line, a count or a small dict from the hook when that pass should count as evidence.
   {"kind": "log", "source": "detector_log", "pattern": "sync_end .*frame=(\\d+) .*desync_seen=(\\d+)",
    "on_all": ["a", "b"], "equal": true, "expect_groups": {"2": "0"}, "cap": 120}
@@ -658,9 +662,15 @@ def dry_run(manifest_path):
             errors.append(f'gate {name}: recover segment {gate["recover"]!r} is not in segments')
         try:
             if kind == 'image':
-                scale = gate['scale'] if 'scale' in gate else None
+                scale = gate['scale'] if 'scale' in gate else plan.get('scale')
                 if scale not in (None, False, 'off', 'fit'):
                     errors.append(f'gate {name}: scale {scale!r} is not "fit" or "off"')
+                frame = gate.get('frame')
+                if frame is not None and not (isinstance(frame, list) and len(frame) == 2
+                                               and all(type(n) is int and n > 0 for n in frame)):
+                    errors.append(f'gate {name}: frame must be [width, height]')
+                elif gate.get('reference_is_roi') and scale == 'fit' and frame is None:
+                    errors.append(f'gate {name}: an ROI reference with scale "fit" needs "frame": [width, height]')
                 ref = base / gate['reference']
                 if not ref.is_file() and gate.get('acquire'):
                     to_acquire.append(name)  # captured the first time the run reaches the screen
@@ -1244,27 +1254,62 @@ class Runner:
         return abs(aw * bh - bw * ah) <= max(ah, bh)
 
     @staticmethod
-    def compare_region(path_a, path_b, roi, b_is_roi=False, scale=None):
+    def _mean_diff(left, right):
+        """Mean absolute difference per colour byte. Infinity when the two images are not the same size."""
+        first, second = left.tobytes(), right.tobytes()
+        if len(first) != len(second) or not first:
+            return float('inf')
+        return sum(abs(x - y) for x, y in zip(first, second)) / len(first)
+
+    @staticmethod
+    def compare_region(path_a, path_b, roi, b_is_roi=False, scale=None, reference_frame=None, tolerance=None):
         """Mean difference of the ROI, and a note when the live frame was scaled to the reference.
 
         scale "fit" resizes the frame to the reference size when the aspect matches. The ROI is in reference
-        coordinates, applied after that. A reference that is already the ROI (b_is_roi) is left alone: its aspect
-        is the crop's, not the frame's. Returns (difference, note or None)."""
+        coordinates, applied after that. A reference that is already the ROI (b_is_roi) does not carry the frame
+        size: reference_frame is the size those coordinates were captured at, and the live frame is resized to
+        that before the crop. When that compare is still over tolerance, both crops are compared again at half
+        their size. A 0.5x render shown in a full-size, blurrier frame matches there; a different screen does not.
+        Returns (difference, note or None)."""
         from PIL import Image
         with Image.open(path_a) as im_a, Image.open(path_b) as im_b:
             frame = im_a.convert('RGB')
             reference = im_b.convert('RGB')
             note = None
-            if (scale == 'fit' and not b_is_roi and frame.size != reference.size
-                    and Runner.same_aspect(frame.size, reference.size)):
-                note = {'scale': 'fit', 'frame': [frame.size[0], frame.size[1]],
-                        'reference': [reference.size[0], reference.size[1]]}
-                frame = frame.resize(reference.size, Image.Resampling.BOX)
-            region = frame.crop(tuple(roi)).tobytes()
-            other = (reference if b_is_roi else reference.crop(tuple(roi))).tobytes()
-        if len(region) != len(other):
-            return float('inf'), note
-        return sum(abs(x - y) for x, y in zip(region, other)) / max(len(region), 1), note
+            live = [frame.size[0], frame.size[1]]
+            if scale == 'fit' and b_is_roi and reference_frame:
+                if not (isinstance(reference_frame, (list, tuple)) and len(reference_frame) == 2
+                        and all(type(n) is int and n > 0 for n in reference_frame)):
+                    raise RuntimeError(f'frame {reference_frame!r} is not [width, height]')
+                target = (reference_frame[0], reference_frame[1])
+                if frame.size != target and Runner.same_aspect(frame.size, target):
+                    note = {'scale': 'fit', 'frame': live, 'reference': [target[0], target[1]]}
+                    frame = frame.resize(target, Image.Resampling.BOX)
+                region = frame.crop(tuple(roi))
+                other = reference
+            else:
+                if (scale == 'fit' and not b_is_roi and frame.size != reference.size
+                        and Runner.same_aspect(frame.size, reference.size)):
+                    note = {'scale': 'fit', 'frame': live, 'reference': [reference.size[0], reference.size[1]]}
+                    frame = frame.resize(reference.size, Image.Resampling.BOX)
+                region = frame.crop(tuple(roi))
+                other = reference if b_is_roi else reference.crop(tuple(roi))
+            if region.size != other.size:
+                return float('inf'), note
+            diff = Runner._mean_diff(region, other)
+            small = (max(1, region.size[0] // 2), max(1, region.size[1] // 2))
+            # Half the ROI is the 0.5x content. Bilinear, not BOX: a linear upsample of that content
+            # stays just over tolerance 8 under a box filter and matches under this one.
+            if (scale == 'fit' and b_is_roi and reference_frame and tolerance is not None
+                    and diff > tolerance and small != region.size):
+                coarse = Runner._mean_diff(region.resize(small, Image.Resampling.BILINEAR),
+                                            other.resize(small, Image.Resampling.BILINEAR))
+                if coarse <= tolerance:
+                    if note is None:
+                        note = {'scale': 'fit', 'frame': live, 'reference': [reference_frame[0], reference_frame[1]]}
+                    note['compared'] = [small[0], small[1]]
+                    diff = coarse
+            return diff, note
 
     @staticmethod
     def roi_diff(path_a, path_b, roi, b_is_roi=False):
@@ -1433,7 +1478,8 @@ class Runner:
                     self._gate_evidence = hook_evidence is not None
                 else:
                     diff, note = self.compare_region(
-                        path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'), scale)
+                        path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'), scale,
+                        gate.get('frame'), gate.get('tolerance', DEFAULT_TOLERANCE))
                     passed = diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
                 if passed:
                     record = {'gate': name, 'on': on, 'pass': True, 'shot': str(path)}
