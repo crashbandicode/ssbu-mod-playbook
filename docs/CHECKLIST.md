@@ -25,14 +25,14 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M13 | M | [Call the game function or hook its most specific post-prologue instruction](HOOKS.md). |
 | M14 | M | Keep [diag code, diag.txt and stand-in markers out of shipped NRO](BUILD.md). |
 | M15 | M | Ship [install-line-only logging](BUILD.md), with the C13 logging-product exception and no per-frame diagnostics. |
-| M16 | M | [Claim before Up; Down after failure too](LIFECYCLE.md); retain the claim until owned cleanup/restore/separate verify succeed. |
+| M16 | M | [Claim before Up; Down after failure too](LIFECYCLE.md); retain the claim until owned cleanup/restore/separate verify succeed; keep [coordination lines](HOSTS.md). |
 | M17 | M | Follow [host slots/10–9GiB admission](HOSTS.md); never source profile `a`, display `:61` or foreign runs. |
 | M18 | M | Keep [XPS half-resolution precedence, thermald on and timed rows on Surface/Yoga](HOSTS.md). |
 | M19 | M | Use [private profiles with immutable hard links and real mutable copies](PROFILES.md); change only your copy and verify storage. |
 | M20 | M | Keep [per-copy targets/fresh source times/locked seeds/shared cargo home/disk checks/deletion manifest](BUILD.md). |
 | M21 | M | [Gate every wait](MACROS.md); rounded-up fixed sleeps are only for states with neither log nor screenshot checks. |
 | M22 | M | Prepare [shared runner/dry-run before Up](TEST-PLAN.md), meet 15/30-minute deadlines, chain rows and preserve project media/hooks plus tool revision. |
-| M23 | M | Declare [fixture/segment/hook/bounded-record setup](TEST-PLAN.md); act on 40-input/15-minute-no-progress/runtime-margin pace limits. |
+| M23 | M | Declare [setup](TEST-PLAN.md); honor [40-input/15-minute-no-progress/runtime-margin pace limits](TEST-RUN.md); on STOP stop steering, then use a fixture, record the route once, or Down and fix rows. |
 | M24 | M | [Abort a missing precondition and retry a new label](TEST-RUN.md), bounded by the batch try cap. |
 | M25 | M | [Trace game facts on an existing run](TRACING.md); explain any diag rebuild/extra trace boot and retain actual trace/build evidence. |
 | M26 | M | Use the [shortest ruleset](TEST-PLAN.md): 1 stock, 1:00, items/hazards/FS off; justify longer tests. |
@@ -65,8 +65,9 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M53 | M | [Ban extracted game/mod assets and dumps from git](EVIDENCE.md); reviewed evidence screenshots and required reference crops are allowed. |
 | M54 | M | Treat [cleanup success separately from graceful/native health](LINUX-DOWN.md); inspect unit/console fatal tails and qualification limits. |
 | M55 | M | Stop only [owned displays/processes/paths](LIFECYCLE.md); ambiguous identity or failed restore/verify retains claim for recovery. |
-| M56 | M | [Export files/manifests then prune owned run copies after clean Down](PROFILES.md); keep receipts/logs, use --keep-state only when asked, and require 60 GB before Up. |
-| C01 | C | If sites may overlap, use [sharing/chaining](HOOK-SHARING.md), election before guard, both stand-ins and load orders; cite dated scan for N/A. |
+| M56 | M | [Export files/manifests then prune owned run copies after clean Down](PROFILES.md); keep receipts/logs, use --keep-state only when asked, and require [60 GB before Up](HOSTS.md). |
+| M57 | M | [Ignore context entirely](START.md); no agent watches, reports, measures or acts on context, or compacts/recycles/replaces/hands off because of it. |
+| C01 | C | If sites may overlap, use [sharing](HOOK-SHARING.md)/[chaining and stand-ins](HOOK-CHAIN.md), election before guard, both stand-ins and load orders; [N/A only when dated scan finds nobody](HOOKS.md). |
 | C02 | C | Online code obeys [read-only checked-RNG/native-order/simulated-state constraints](ONLINE.md), hook by hook. |
 | C03 | C | Online code passes [same replay A/B](ONLINE.md), identical detector values and positions. |
 | C04 | C | Online-only paths need [both-detector two-console proof](ONLINE.md) through later sessions, `desync_seen=0` at matching frame. |
