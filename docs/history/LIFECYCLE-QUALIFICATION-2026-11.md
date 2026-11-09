@@ -38,7 +38,7 @@ together or presented as one present suite:
   round trip gave **57 tests**. No real ledger/live profile was used;
   native/SSH qualification of that option was UNRUN and primary review/commit
   pending at that checkpoint.
-- A:12–20: **71 offline tests**, comprising 58 existing/shared tests
+- A:12–21: **71 offline tests**, comprising 58 existing/shared tests
   (including deferred load) and 13 Windows tests. Python `-B -I` ran under
   the 256 MiB/60 s guard against temporary trees, fake RPC/claims and mocked
   task/pipe processes. The real `WindowsHost.launch` task-build failure and
@@ -52,10 +52,10 @@ together or presented as one present suite:
   concurrent deferred-load regression. Runtime `lifecycle.py`,
   `defer_load`, frontend-ready behavior, instance `game` and `runner.py`
   were unchanged from follow-up base `ceae08f`.
-- R:278–280 and T:29–38: **89 offline tests**, 75 on `705cc21` plus
+- R:277–280 and T:29–38: **89 offline tests**, 75 on `705cc21` plus
   14 teardown regressions, detailed under the Linux incident below.
 
-The earlier R:442–466 draft limitations were native Surface/Yoga
+The earlier R:445–466 draft limitations were native Surface/Yoga
 systemd/Qt/AppImage/SSH integration UNRUN; no automatic remote file/socket
 forwarding or LDN frontend room setup; fresh-root-only operation rather
 than adoption of live runs; symlinks/special files refused; potentially
@@ -116,7 +116,7 @@ Raw local receipts, captured before the offline-only order, were
 and `proof.json`. Their SHA256-bound file payloads were evidence, rather
 than shell success alone. Failed journals, pristine snapshots and post-run
 private profiles were retained. No later remote cleanup/inspection was
-performed under that offline-only follow-up. (A:38–45.)
+performed under that offline-only follow-up. (A:36–42.)
 
 At **20:09:20.6411325Z**, an authorized inbound Block rule was created
 for `C:\Eden\life-p6b\work\profiles\profile-a\eden.exe`, named
@@ -124,9 +124,9 @@ for `C:\Eden\life-p6b\work\profiles\profile-a\eden.exe`, named
 showed enabled/inbound/Block. No Allow rule or prompt changed. This private
 rule was intentionally retained, with no re-query after the offline-only
 decision. The installed source verified unchanged;
-`C:\Eden\tracing-1103` was untouched. (A:47–53.)
+`C:\Eden\tracing-1103` was untouched. (A:44–50.)
 
-A:55–76 explicitly withheld qualification of SID task startup, full-width
+A:54–76 explicitly withheld qualification of SID task startup, full-width
 Job HANDLE behavior, 8 GiB commit/256-process/kill-on-close, owned pipe,
 mute/save/readback, terminal load/fresh frames and capped-stop/session-Job
 termination. It also withheld pairs, native 1312 and transport-loss recovery,
@@ -225,7 +225,7 @@ qualified by offline tests. (T:44–48.)
 
 ## Watchdog probe observation, 2026-11-07
 
-`docs/EDEN.md:126-145` and lifecycle README:71-90 at `87b3de0`
+`docs/EDEN.md:126-145` and lifecycle README:69-88 at `87b3de0`
 recorded a Surface boot that never printed `[FrameStrip] shown=`.
 TrainingRooms' diag `[FrameStrip] p1 status=` line was emitted when
 Player 1's busy status changed, not continuously. A state remained safe
