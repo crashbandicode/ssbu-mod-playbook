@@ -46,7 +46,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M34 | M | [Continue reachable rows after failures](TEST-RUN.md); recover/check start state, defer with cause, stop safely on unrecoverable state/crash. |
 | M35 | M | Make [no unsupported claims](EVIDENCE.md); keep operator quotes out of shipped docs, with the working-design trace exception. |
 | M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](EVIDENCE.md), with no secrets. |
-| M37 | M | [Only the user connects/disconnects or controls DBI/UMS](WORKFLOW.md); agents never mount/unmount/eject/remount/power off media. |
+| M37 | M | [Only the user connects/disconnects or controls DBI/UMS](INSTALL.md); agents never mount/unmount/eject/remount/power off media. |
 | M38 | M | Obtain [explicit action-specific orders](RELEASE.md) before push/tag/release/card writes; report lack of authorization. |
 | M39 | M | Use [Forgejo and temporary UTF-8 commit-message files](START.md); no GitHub publication or unordered push. |
 | M40 | M | Follow the external [model/effort/watcher/routing authority](START.md); do not duplicate its policy. |
@@ -76,7 +76,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C08 | C | A changed recorded decision needs [document/item/date citation, disclosed reversal and updated original record](DESIGN.md). |
 | C09 | C | Authorized release needs [minor bump, annotated tag, required assets and anonymous hash verification](RELEASE.md). |
 | C10 | C | Release must have a [byte-identical rebuild of the tagged commit](RELEASE.md). |
-| C11 | C | Authorized card work uses [fresh preflight, archives/rollback/readbacks and inspected non-repeated receipts](WORKFLOW.md); single writer, loader last, disconnect after final verify. |
+| C11 | C | Authorized card work uses [fresh preflight, archives/rollback/readbacks and inspected non-repeated receipts](INSTALL.md); single writer, loader last, disconnect after final verify. |
 | C12 | C | Multi-worker work needs [persistent sessions/routes, no context actions, done-checklists,<=60s polls, deadlines/stall alerts and direct acceptance](WORKERS.md). |
 | C13 | C | A logging product may ship [its data files as well as install line](BUILD.md), without per-frame diagnostics. |
 | C14 | C | Shared owners implement [ABI/election/early-late registration/hook-only guest service and per-site logs](HOOK-SHARING.md). |

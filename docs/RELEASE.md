@@ -33,4 +33,4 @@ rebuild; those manual acceptance steps remain required.
 
 The final evidence names the order, version/tag/commit, shipped SHA-256,
 gate results, anonymous download comparisons and byte-identical rebuild.
-Follow [INSTALL](WORKFLOW.md) separately for an authorized card transaction.
+Follow [INSTALL](INSTALL.md) separately for an authorized card transaction.

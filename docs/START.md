@@ -16,7 +16,7 @@ state or authorization. Read each tool script before running or copying it.
 | Eden run | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md), [WATCHDOG](WATCHDOG.md), [TEST-PLAN](TEST-PLAN.md), [TEST-RUN](TEST-RUN.md), [RUNNER](RUNNER.md), [MACROS](MACROS.md), [TILE-CURSOR](TILE-CURSOR.md), [TRACING](TRACING.md), [EVIDENCE](EVIDENCE.md), and the host's [LINUX-DOWN](LINUX-DOWN.md) or [WINDOWS](WINDOWS.md) |
 | GIF | [GIFS](GIFS.md), [EVIDENCE](EVIDENCE.md), and the Eden-run pages when capturing in Eden |
 | Release | [BUILD](BUILD.md), [EVIDENCE](EVIDENCE.md), [RELEASE](RELEASE.md) |
-| Card install, removal or swap | [INSTALL](WORKFLOW.md), [RELEASE](RELEASE.md) |
+| Card install, removal or swap | [INSTALL](INSTALL.md), [RELEASE](RELEASE.md) |
 | Online behavior | [ONLINE](ONLINE.md), [HOOKS](HOOKS.md), and the code-change/Eden-run pages |
 | Host or lifecycle change | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md), [WATCHDOG](WATCHDOG.md), [LINUX-DOWN](LINUX-DOWN.md) or [WINDOWS](WINDOWS.md), [EVIDENCE](EVIDENCE.md) |
 | Several workers or hosts | [WORKERS](WORKERS.md), plus each worker's task pages |
@@ -41,7 +41,7 @@ The model/effort gate, watcher and delegation routing come from
 Use Forgejo (`git.syntaxbyexample.com/intpa`), never GitHub. Write commit
 messages from a UTF-8 file. Push, tag, release and card writes each require
 the operator's order for that action; [RELEASE](RELEASE.md) and
-[INSTALL](WORKFLOW.md) retain the separate authorization boundaries.
+[INSTALL](INSTALL.md) retain the separate authorization boundaries.
 
 Run [compliance](CHECKLIST.md) once per phase or release candidate, with
 the branch base, design trace and explicit shipped NRO. Resolve every agent
