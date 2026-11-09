@@ -17,7 +17,7 @@ state or authorization. Read each tool script before running or copying it.
 | GIF | [GIFS](GIFS.md), [EVIDENCE](WORKFLOW.md), and the Eden-run pages when capturing in Eden |
 | Release | [BUILD](BUILD.md), [EVIDENCE](WORKFLOW.md), [RELEASE](WORKFLOW.md) |
 | Card install, removal or swap | [INSTALL](WORKFLOW.md), [RELEASE](WORKFLOW.md) |
-| Online behavior | [ONLINE](WORKFLOW.md), [HOOKS](HOOKS.md), and the code-change/Eden-run pages |
+| Online behavior | [ONLINE](ONLINE.md), [HOOKS](HOOKS.md), and the code-change/Eden-run pages |
 | Host or lifecycle change | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md), [WATCHDOG](WATCHDOG.md), [LINUX-DOWN](LINUX-DOWN.md) or [WINDOWS](WINDOWS.md), [EVIDENCE](WORKFLOW.md) |
 | Several workers or hosts | [WORKERS](WORKERS.md), plus each worker's task pages |
 

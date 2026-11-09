@@ -67,9 +67,9 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M55 | M | Stop only [owned displays/processes/paths](LIFECYCLE.md); ambiguous identity or failed restore/verify retains claim for recovery. |
 | M56 | M | Follow [60GB pre-Up admission and verified-clean-Down pruning](HOSTS.md); preserve receipts/logs/reports and failed-cleanup recovery state, never foreign copies. |
 | C01 | C | If sites may overlap, use [sharing/chaining](HOOK-SHARING.md), election before guard, both stand-ins and load orders; cite dated scan for N/A. |
-| C02 | C | Online code obeys [read-only checked-RNG/native-order/simulated-state constraints](WORKFLOW.md), hook by hook. |
-| C03 | C | Online code passes [same replay A/B](WORKFLOW.md), identical detector values and positions. |
-| C04 | C | Online-only paths need [both-detector two-console proof](WORKFLOW.md) through later sessions, desync0 at matching frame. |
+| C02 | C | Online code obeys [read-only checked-RNG/native-order/simulated-state constraints](ONLINE.md), hook by hook. |
+| C03 | C | Online code passes [same replay A/B](ONLINE.md), identical detector values and positions. |
+| C04 | C | Online-only paths need [both-detector two-console proof](ONLINE.md) through later sessions, desync0 at matching frame. |
 | C05 | C | Mods need [pinned ARCropolis and native-screen mod proof in that boot](PROFILES.md). |
 | C06 | C | Log-derived numbers come from [committed host-tested scripts](WORKFLOW.md), with the regeneration command beside them. |
 | C07 | C | Asset claims need [decoded expected/frame/stock comparison](WORKFLOW.md); rule out stock without committing extracted sources. |
