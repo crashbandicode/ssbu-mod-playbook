@@ -14,9 +14,9 @@ with the other [CHECKLIST](CHECKLIST.md) inputs. Its parser checks table and
 name presence; review clause completeness, meaningful assertions, parity and
 actual test passage yourself. It does not prove those properties.
 
-Fix the root cause. A guard, skip, player restriction, relaxed tolerance,
-lint `allow`, warning hidden behind a feature, or disabled setting that
-leaves the root in place is a workaround. Before shipping one, give the
+Fix the root cause. Any fix that leaves the root in place is a workaround,
+for example a guard, skip, player restriction, relaxed check or tolerance,
+lint `allow`, warning hidden behind a feature, or disabled setting. Before shipping one, give the
 operator the root cause or remaining unknowns, why it is not fixed now,
 the cost to the player, and your recommendation. Ship only after approval;
 list each approved workaround with its approval date in the evidence doc.
