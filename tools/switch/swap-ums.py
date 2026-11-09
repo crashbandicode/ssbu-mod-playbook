@@ -11,7 +11,7 @@ interrupt, undoes in reverse (delete the data files it made, delete the new NRO,
 back from the local copy), so the card ends fully swapped or as it was. The same tool with
 `remove` and `add` exchanged undoes a completed swap (the old NRO's local copy is in the first
 run's before/ folder). It never mounts, unmounts or ejects anything and never starts or stops
-hekate UMS: the user connects and disconnects the Switch (playbook WORKFLOW, Switch) and
+hekate UMS: the user connects and disconnects the Switch (playbook INSTALL, connection ownership) and
 exposes the card. Every read of the card skips the page cache (O_DIRECT; where a filesystem
 refuses it, the file's clean cached pages are dropped first), so a readback shows what the card
 holds. The card is read in place and never remounted.
@@ -699,7 +699,7 @@ class Transaction:
                 signal.signal(number, handler)
         print(json.dumps({k: self.receipt.get(k) for k in ('state', 'target_old', 'target_new', 'device_operations_closed')}, indent=2))
         if ok and self.mode in ('install', 'verify'):
-            # The user connects and disconnects the Switch (playbook WORKFLOW, Switch); this tool never does.
+            # The user connects and disconnects the Switch (playbook INSTALL, connection ownership); this tool never does.
             print(CLOSING)
         return 0 if ok else 1
 

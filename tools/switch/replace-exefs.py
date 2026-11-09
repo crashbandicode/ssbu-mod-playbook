@@ -8,7 +8,7 @@ this tool exists for the two files they refuse:
 
 One transaction replaces one file; run it twice for both. It never mounts, unmounts
 or ejects anything and never starts or stops DBI or hekate UMS: the user connects
-and disconnects the Switch (playbook WORKFLOW, Switch) and exposes the card, over
+and disconnects the Switch (playbook INSTALL, connection ownership) and exposes the card, over
 DBI MTP (default) or as a mounted USB disk ("transport": "ums").
 
   python3 -I replace-exefs.py preflight <dir>   # read-only: list, keep local copies, check `old`
@@ -612,7 +612,7 @@ class Transaction:
                 signal.signal(number, handler)
         print(json.dumps({k: self.receipt.get(k) for k in ('state', 'target', 'device_operations_closed')}, indent=2))
         if ok and self.mode in ('install', 'verify'):
-            # The user connects and disconnects the Switch (playbook WORKFLOW, Switch); this tool never does.
+            # The user connects and disconnects the Switch (playbook INSTALL, connection ownership); this tool never does.
             print(self.card.closing)
         return 0 if ok else 1
 
