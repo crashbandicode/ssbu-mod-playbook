@@ -11,7 +11,8 @@ game content, firmware, NROs, archives and unchanged sources may be links.
 Saves, replays, rewritten INI/config, shader caches, logs and unknown mutable
 files need real private copies. A write through a hard link changes every
 copy sharing it. After any `cp -al`, break writable links before first boot.
-Compare `du -sh` with `du -sh --apparent-size` and retain the output.
+Compare `du -sh` with `du -sh --apparent-size` and retain the output;
+the first (allocated-size) number should stay small.
 
 The lifecycle's conservative clone links game Contents/firmware and copies
 mutable/unknown files. Its pristine snapshot precedes **all** staging and
@@ -40,9 +41,11 @@ before Up; see [TEST-PLAN](TEST-PLAN.md). Keep original snapshots separate
 from run outputs: the original snapshot never becomes the output directory.
 
 If a row depends on any `ultimate/mods` stage, fighter, UI or sound
-replacement, pin the **card's `libarcropolis.nro`**. Without it the isolated
-plugin list loads stock assets. Before judging the plugin's view, prove the
-mod loaded on the game's own screen in the **same boot**; a stage uses the
+replacement, pin the **card's `libarcropolis.nro`**. Historical card copies
+are under `/home/intpa/ssbu-cpu-pilot-install/`,
+with digest prefix `92171b2f…`; freshly hash/pin the actual card copy.
+Without it the isolated plugin list loads stock assets. Before judging the
+plugin's view, prove the mod loaded on the game's own screen in the **same boot**; a stage uses the
 native stage select. Retain the config pin and native-screen proof. Decode
 expected and stock art for visual claims as required by [EVIDENCE](EVIDENCE.md).
 
@@ -80,4 +83,4 @@ Keep NROs, exported run files, receipts/logs/reports under their run label.
 
 Implementation: [clone, pin, stage and snapshot functions](../tools/eden-lifecycle/lifecycle.py).
 Historical paths, digests and the ARCropolis incident are in
-[host history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
+[route/media history](history/ROUTES-AND-MEDIA-2026-10--11.md).
