@@ -8,61 +8,61 @@ This on-demand audit appendix retains the complete source-to-home index and 52 d
 
 - TASK2 decision 1: each agent reads START, CHECKLIST and task concern pages; history on demand. Workers still perform their own reads/checklist/compliance and record the playbook commit.
 - TASK2 decision 2: reviewed evidence screenshots and required runner reference crops may be committed; extracted game/mod textures, models, sound, data.arc files and dumps may not.
-- All other original mandatory/conditional contracts, exceptions and evidence survive. The contradictory rlib permission is retired in favor of the existing mandatory cdylib-only rule.
+- The independent Opus loss review found wording, evidence and task-reading gaps in commits 01–28; TASK3 corrections restore those contracts, exceptions and evidence as recorded below. The contradictory rlib permission is retired in favor of the existing mandatory cdylib-only rule.
 - New baseline obligations are folded in fully: nonblocking hook/plugin locking with reach/seed/trace evidence; 60 GB pre-Up admission; evidence-first clean-Down pruning and bounded retention/retry semantics.
-- No runner, lifecycle, Switch, asset, build, release or library executable/data bytes changed. Installer POINTER text, one approved checker label and an isolated installer test are the only non-Markdown changes.
+- In migration commits 01–28, installer POINTER text, one approved checker label and an isolated installer test were the only non-Markdown changes. TASK3 additionally retargets 17 citation occurrences in ten tool files: comments, docstrings and two printed diagnostics only. All other tool bytes and executable logic remain unchanged; exact per-file byte replay and normalized AST evidence are retained in REPORT2.md.
 
 ## Validation and its limits
 
-- Gate G passes for every concern commit: 182 immutable source obligations point to present homes; local links resolve; exact protected source bytes/AST and synthetic fixture results survive. G is structural evidence, not a replacement for the full-clause review.
+- Gate G passes for each original concern commit and each TASK3 correction commit: 182 immutable source obligations point to present homes; local links resolve; exact protected source bytes/AST and synthetic fixture results survive. TASK3 permits only an exact old/new/count citation allowlist in ten tools, with reverse byte replay; no broad source-text exemption is used. G remains structural evidence, not a replacement for full-clause review.
 - All 11 compliance tests pass per commit. Installer 5 tests pass using only temporary fake homes. Wrapper 15 tests pass with fake none.service probes intercepted; no real host query or application execution.
 - Lifecycle 137 tests were attempted:136 passed and one AF_UNIX bind fixture errored with sandbox PermissionError. A separately reported run discovered 137, passed 136 and explicitly skipped that one fixture. It is not 137 passes; original error evidence is retained.
 - Baseline fixture/code/test identities and raw logs are saved in the operator workspace task2-validation/. No Eden boot, Switch/card/release/global-install/push/merge action occurred.
 
-## Measured Markdown counts
+## Measured Markdown counts after TASK3 corrections
 
 | File | Baseline lines | Final lines | Budget |
 | --- | ---: | ---: | ---: |
 | `README.md` | 132 | 32 | 30 |
-| `docs/BUILD.md` | 0 | 97 | 75 |
-| `docs/CHECKLIST.md` | 274 | 98 | 110 |
+| `docs/BUILD.md` | 0 | 100 | 75 |
+| `docs/CHECKLIST.md` | 274 | 99 | 110 |
 | `docs/DESIGN.md` | 0 | 48 | 50 |
 | `docs/EDEN.md` | 393 | 8 | 8 |
-| `docs/EVIDENCE.md` | 0 | 60 | 55 |
+| `docs/EVIDENCE.md` | 0 | 67 | 55 |
 | `docs/GIFS.md` | 168 | 64 | 65 |
 | `docs/HOOK-CHAIN.md` | 0 | 65 | 80 |
-| `docs/HOOK-SHARING.md` | 202 | 56 | 70 |
-| `docs/HOOKS.md` | 0 | 45 | 45 |
+| `docs/HOOK-SHARING.md` | 202 | 58 | 70 |
+| `docs/HOOKS.md` | 0 | 47 | 45 |
 | `docs/HOSTS.md` | 0 | 60 | 45 |
-| `docs/INSTALL.md` | 0 | 77 | 90 |
-| `docs/LIFECYCLE.md` | 0 | 96 | 90 |
+| `docs/INSTALL.md` | 0 | 83 | 90 |
+| `docs/LIFECYCLE.md` | 0 | 100 | 90 |
 | `docs/LINUX-DOWN.md` | 0 | 50 | 45 |
-| `docs/MACROS.md` | 497 | 65 | 55 |
-| `docs/ONLINE.md` | 0 | 39 | 40 |
-| `docs/PROFILES.md` | 0 | 83 | 45 |
+| `docs/MACROS.md` | 497 | 70 | 55 |
+| `docs/ONLINE.md` | 0 | 48 | 40 |
+| `docs/PROFILES.md` | 0 | 86 | 45 |
 | `docs/RELEASE.md` | 0 | 36 | 40 |
-| `docs/RUNNER.md` | 0 | 95 | 90 |
-| `docs/START.md` | 0 | 54 | 45 |
-| `docs/TEST-PLAN.md` | 0 | 89 | 100 |
-| `docs/TEST-RUN.md` | 0 | 89 | 75 |
+| `docs/RUNNER.md` | 0 | 98 | 90 |
+| `docs/START.md` | 0 | 58 | 45 |
+| `docs/TEST-PLAN.md` | 0 | 94 | 100 |
+| `docs/TEST-RUN.md` | 0 | 90 | 75 |
 | `docs/TILE-CURSOR.md` | 70 | 49 | 50 |
-| `docs/TRACING.md` | 0 | 85 | 85 |
-| `docs/WATCHDOG.md` | 0 | 48 | 45 |
-| `docs/WINDOWS.md` | 0 | 101 | 110 |
+| `docs/TRACING.md` | 0 | 90 | 85 |
+| `docs/WATCHDOG.md` | 0 | 63 | 45 |
+| `docs/WINDOWS.md` | 0 | 102 | 110 |
 | `docs/WORKERS.md` | 0 | 57 | 65 |
 | `docs/WORKFLOW.md` | 471 | 8 | 8 |
 | `docs/history/LIFECYCLE-QUALIFICATION-2026-11.md` | 0 | 236 | 220 |
-| `docs/history/MIGRATION-REVIEW.md` | 0 | 328 | audit/history |
+| `docs/history/MIGRATION-REVIEW.md` | 0 | 381 | audit/history |
 | `docs/history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md` | 0 | 201 | 80 |
 | `docs/history/PROVENANCE-2026-10-31--11-07.md` | 0 | 107 | 100 |
 | `docs/history/ROUTES-AND-MEDIA-2026-10--11.md` | 0 | 134 | 100 |
 | `skills/ssbu-mod-playbook/SKILL.md` | 57 | 39 | 40 |
 | `tools/PROVENANCE.md` | 96 | 21 | 20 |
 | `tools/eden-lifecycle/ALLY-OFFLINE-2026-11-03.md` | 90 | 6 | 6 |
-| `tools/eden-lifecycle/README.md` | 466 | 24 | 20 |
+| `tools/eden-lifecycle/README.md` | 466 | 27 | 20 |
 | `tools/eden-lifecycle/TEARDOWN-FIX-2026-11-03.md` | 48 | 6 | 6 |
 
-Total Markdown: **2964 → 2856** lines, including 1006 on-demand history/audit lines. Current policy/reference/redirect text: **1850**. Mandatory common reading: **2303 → 152** lines, plus the task pages START assigns. These are measured physical lines, including blanks/tables/code blocks.
+At the initial `419d703` checkpoint, total Markdown: **2964 → 2856** lines, including 1006 on-demand history/audit lines. At that checkpoint, policy/reference/redirect text: **1850** and mandatory common reading: **2303 → 152** lines, plus the task pages START assigns. These are measured physical lines, including blanks/tables/code blocks.
 
 Every current concern page is at most 110 lines. History exceptions: lifecycle qualification 236 lines preserves attempt chronology/qualification/probe observations; incidents 201 preserves distinct provider/load-order/host/hang records; routes 134 retains route/media/retry/replay examples. Provenance 107 preserves the original 96-line ledger intact. This complete migration review is a separate audit index.
 
@@ -84,7 +84,7 @@ Source spans refer to the immutable baseline commit above, including paths now r
 | `CL-M10` | `docs/CHECKLIST.md:67` | [docs/HOOKS.md](../HOOKS.md) |
 | `CL-M11` | `docs/CHECKLIST.md:69` | [docs/HOOKS.md](../HOOKS.md) |
 | `CL-M12` | `docs/CHECKLIST.md:72` | [docs/HOOKS.md](../HOOKS.md) |
-| `CL-C01` | `docs/CHECKLIST.md:75` | [docs/HOOK-SHARING.md](../HOOK-SHARING.md) |
+| `CL-C01` | `docs/CHECKLIST.md:75` | [docs/HOOK-SHARING.md](../HOOK-SHARING.md); [docs/HOOK-CHAIN.md](../HOOK-CHAIN.md); [docs/HOOKS.md](../HOOKS.md) |
 | `CL-M13` | `docs/CHECKLIST.md:80` | [docs/HOOKS.md](../HOOKS.md) |
 | `CL-M14` | `docs/CHECKLIST.md:82` | [docs/BUILD.md](../BUILD.md) |
 | `CL-M15` | `docs/CHECKLIST.md:91` | [docs/BUILD.md](../BUILD.md) |
@@ -92,20 +92,20 @@ Source spans refer to the immutable baseline commit above, including paths now r
 | `CL-C02` | `docs/CHECKLIST.md:99` | [docs/ONLINE.md](../ONLINE.md) |
 | `CL-C03` | `docs/CHECKLIST.md:103` | [docs/ONLINE.md](../ONLINE.md) |
 | `CL-C04` | `docs/CHECKLIST.md:105` | [docs/ONLINE.md](../ONLINE.md) |
-| `CL-M17` | `docs/CHECKLIST.md:113` | [docs/LIFECYCLE.md](../LIFECYCLE.md) |
+| `CL-M17` | `docs/CHECKLIST.md:113` | [docs/LIFECYCLE.md](../LIFECYCLE.md); [docs/HOSTS.md](../HOSTS.md) |
 | `CL-M18` | `docs/CHECKLIST.md:115` | [docs/HOSTS.md](../HOSTS.md) |
 | `CL-M19` | `docs/CHECKLIST.md:118` | [docs/HOSTS.md](../HOSTS.md) |
 | `CL-M20` | `docs/CHECKLIST.md:123` | [docs/PROFILES.md](../PROFILES.md) |
 | `CL-M21` | `docs/CHECKLIST.md:130` | [docs/BUILD.md](../BUILD.md) |
 | `CL-M22` | `docs/CHECKLIST.md:136` | [docs/MACROS.md](../MACROS.md) |
 | `CL-M23` | `docs/CHECKLIST.md:139` | [docs/TEST-PLAN.md](../TEST-PLAN.md) |
-| `CL-M24` | `docs/CHECKLIST.md:152` | [docs/TEST-PLAN.md](../TEST-PLAN.md) |
+| `CL-M24` | `docs/CHECKLIST.md:152` | [docs/TEST-PLAN.md](../TEST-PLAN.md); [docs/TEST-RUN.md](../TEST-RUN.md) |
 | `CL-C05` | `docs/CHECKLIST.md:158` | [docs/PROFILES.md](../PROFILES.md) |
 | `CL-M25` | `docs/CHECKLIST.md:164` | [docs/TEST-RUN.md](../TEST-RUN.md) |
 | `CL-M26` | `docs/CHECKLIST.md:166` | [docs/TRACING.md](../TRACING.md) |
 | `CL-M27` | `docs/CHECKLIST.md:174` | [docs/TEST-PLAN.md](../TEST-PLAN.md) |
 | `CL-M28` | `docs/CHECKLIST.md:179` | [docs/LIFECYCLE.md](../LIFECYCLE.md) |
-| `CL-M29` | `docs/CHECKLIST.md:181` | [docs/PROFILES.md](../PROFILES.md) |
+| `CL-M29` | `docs/CHECKLIST.md:181` | [docs/PROFILES.md](../PROFILES.md); [docs/HOSTS.md](../HOSTS.md) |
 | `CL-M30` | `docs/CHECKLIST.md:184` | [docs/TRACING.md](../TRACING.md) |
 | `CL-M31` | `docs/CHECKLIST.md:191` | [docs/START.md](../START.md) |
 | `CL-M32` | `docs/CHECKLIST.md:193` | [docs/EVIDENCE.md](../EVIDENCE.md) |
@@ -165,7 +165,7 @@ Source spans refer to the immutable baseline commit above, including paths now r
 | `KW-docs/MACROS.md:298` | `docs/MACROS.md:298` | [docs/TEST-RUN.md](../TEST-RUN.md) |
 | `KW-docs/MACROS.md:342` | `docs/MACROS.md:342` | [docs/MACROS.md](../MACROS.md) |
 | `KW-docs/MACROS.md:344` | `docs/MACROS.md:344` | [docs/MACROS.md](../MACROS.md) |
-| `KW-docs/MACROS.md:373` | `docs/MACROS.md:373` | [docs/RUNNER.md](../RUNNER.md) |
+| `KW-docs/MACROS.md:373` | `docs/MACROS.md:373` | [docs/LIFECYCLE.md](../LIFECYCLE.md) |
 | `KW-docs/TILE-CURSOR.md:50` | `docs/TILE-CURSOR.md:50` | [docs/TILE-CURSOR.md](../TILE-CURSOR.md) |
 | `KW-docs/WORKFLOW.md:34` | `docs/WORKFLOW.md:34` | [docs/BUILD.md](../BUILD.md) |
 | `KW-docs/WORKFLOW.md:50` | `docs/WORKFLOW.md:50` | [docs/HOOKS.md](../HOOKS.md) |
@@ -223,7 +223,7 @@ Source spans refer to the immutable baseline commit above, including paths now r
 | `CA01` | `tools/check/compliance.py:50` | [docs/BUILD.md](../BUILD.md) |
 | `CA02` | `tools/check/compliance.py:51` | [docs/DESIGN.md](../DESIGN.md) |
 | `CA03` | `tools/check/compliance.py:52` | [docs/HOOKS.md](../HOOKS.md) |
-| `CA04` | `tools/check/compliance.py:53` | [docs/HOOK-SHARING.md](../HOOK-SHARING.md) |
+| `CA04` | `tools/check/compliance.py:53` | [docs/HOOK-SHARING.md](../HOOK-SHARING.md); [docs/HOOK-CHAIN.md](../HOOK-CHAIN.md) |
 | `CA05` | `tools/check/compliance.py:54` | [docs/HOOKS.md](../HOOKS.md) |
 | `CA06` | `tools/check/compliance.py:55` | [docs/BUILD.md](../BUILD.md) |
 | `CA07` | `tools/check/compliance.py:56` | [docs/BUILD.md](../BUILD.md) |
@@ -241,7 +241,7 @@ Source spans refer to the immutable baseline commit above, including paths now r
 | `CA19` | `tools/check/compliance.py:68` | [docs/TEST-RUN.md](../TEST-RUN.md) |
 | `CA20` | `tools/check/compliance.py:69` | [docs/TRACING.md](../TRACING.md) |
 | `CA21` | `tools/check/compliance.py:70` | [docs/LIFECYCLE.md](../LIFECYCLE.md) |
-| `CA22` | `tools/check/compliance.py:71` | [docs/PROFILES.md](../PROFILES.md) |
+| `CA22` | `tools/check/compliance.py:71` | [docs/PROFILES.md](../PROFILES.md); [docs/HOSTS.md](../HOSTS.md) |
 | `CA23` | `tools/check/compliance.py:72` | [docs/TRACING.md](../TRACING.md) |
 | `CA24` | `tools/check/compliance.py:73` | [docs/START.md](../START.md) |
 | `CA25` | `tools/check/compliance.py:74` | [docs/EVIDENCE.md](../EVIDENCE.md) |
@@ -326,3 +326,56 @@ Source spans refer to the immutable baseline commit above, including paths now r
 Policy question retained for primary review: code accepts positive resource overrides below policy floors. This branch chooses the stricter fixed minima and documents the implementation limit; it does not silently authorize lower floors. The named hook MainThread-only exception still requires trace/run/hit-count evidence, and an unreached hook remains exposed.
 
 Outside-repo agent pointer blocks are not changed. REPORT2.md lists their observed paths/line spans and exact replacement text for the primary to apply only at authorized merge. Main remains untouched; no push is authorized by this migration.
+
+## TASK3 independent loss-review corrections
+
+The Opus review of `419d703` against `87b3de0` found 36 issues; its verdict was “merge after fixes”. The earlier all-contracts claim was too broad: the review found weaker grant/workaround/ledger/recovery wording, missing evidence demands, task-reading gaps and stale tool references. The corrections below address all 36, with Gate G per commit and unchanged original 182 source contracts.
+
+Operator decisions: finding 14 permits in-boot remedies after stopping steering (fixture, one route recording, or Down/fix rows); near-cap Down remains required. Findings 24–25 authorize only reference text retargeting. The decoded-texture side-by-side stays outside git; reviewed screenshots/reference crops retain the approved exception.
+
+Restored evidence includes runner path, dry-run receipt/log, order and Up times, macro.play calls, setup/pace output and run labels against the row list. START now exposes universal context and delegated-turn rules plus required tracing, shipping checks, shared-tool worktrees and conditional stand-in reading. ONLINE names the historical pair seed mechanism and requires operator approval for that recipe because current lifecycle has no seed input.
+
+| Opus finding | Correction commits | Current homes |
+| --- | --- | --- |
+| 1 | C01 `fe7ae23`, C02 `07998d7` | [docs/HOSTS.md](../HOSTS.md); [docs/WINDOWS.md](../WINDOWS.md) |
+| 2 | C03 `303dc8d` | [docs/DESIGN.md](../DESIGN.md) |
+| 3 | C01 `fe7ae23` | [docs/WINDOWS.md](../WINDOWS.md) |
+| 4 | C04 `131d11d` | [docs/INSTALL.md](../INSTALL.md) |
+| 5 | C05 `7ccf848` | [docs/LIFECYCLE.md](../LIFECYCLE.md) |
+| 6 | C05 `7ccf848` | [docs/LIFECYCLE.md](../LIFECYCLE.md) |
+| 7 | C06 `b295c8e` | [docs/RUNNER.md](../RUNNER.md) |
+| 8 | C19 `9dba141`, C20 `68e4d7a` | [docs/CHECKLIST.md](../CHECKLIST.md); [docs/START.md](../START.md) |
+| 9 | C19 `9dba141` | [docs/START.md](../START.md) |
+| 10 | C05 `7ccf848`, C19 `9dba141` | [docs/LIFECYCLE.md](../LIFECYCLE.md); [docs/START.md](../START.md) |
+| 11 | C07 `a012ae0` | [docs/TEST-PLAN.md](../TEST-PLAN.md) |
+| 12 | C08 `799030a` | [docs/TEST-RUN.md](../TEST-RUN.md) |
+| 13 | C07 `a012ae0` | [docs/TEST-PLAN.md](../TEST-PLAN.md) |
+| 14 | C08 `799030a`, C20 `68e4d7a` | [docs/CHECKLIST.md](../CHECKLIST.md); [docs/TEST-RUN.md](../TEST-RUN.md) |
+| 15 | C09 `5d93ac1` | [docs/BUILD.md](../BUILD.md) |
+| 16 | C10 `f6a5736` | [docs/EVIDENCE.md](../EVIDENCE.md) |
+| 17 | C10 `f6a5736` | [docs/EVIDENCE.md](../EVIDENCE.md) |
+| 18 | C10 `f6a5736` | [docs/EVIDENCE.md](../EVIDENCE.md) |
+| 19 | C19 `9dba141` | [docs/START.md](../START.md) |
+| 20 | C19 `9dba141` | [docs/START.md](../START.md) |
+| 21 | C07 `a012ae0`, C19 `9dba141` | [docs/START.md](../START.md); [docs/TEST-PLAN.md](../TEST-PLAN.md) |
+| 22 | C11 `42e1181` | [docs/TRACING.md](../TRACING.md) |
+| 23 | C12 `bb62c74` | [docs/ONLINE.md](../ONLINE.md) |
+| 24 | C24 `218e6c4`, C25 `81b1dfa` | [tools/eden-test/eden_test.py](../../tools/eden-test/eden_test.py); [tools/eden-runner/runner.py](../../tools/eden-runner/runner.py); [tools/eden-runner/harvest.py](../../tools/eden-runner/harvest.py) |
+| 25 | C26 `7cc703f`, C27 `35a111a` | [tools/switch/deploy-mtp.py](../../tools/switch/deploy-mtp.py); [tools/switch/upgrade2-mtp.py](../../tools/switch/upgrade2-mtp.py); [tools/switch/remove-mtp.py](../../tools/switch/remove-mtp.py); [tools/switch/upgrade2-ums.py](../../tools/switch/upgrade2-ums.py); [tools/switch/replace-exefs.py](../../tools/switch/replace-exefs.py); [tools/switch/swap-ums.py](../../tools/switch/swap-ums.py); [tools/check/compliance.py](../../tools/check/compliance.py) |
+| 26 | C16 `bd1e0b3` | [docs/PROFILES.md](../PROFILES.md) |
+| 27 | C10 `f6a5736`, C20 `68e4d7a` | [docs/CHECKLIST.md](../CHECKLIST.md); [docs/EVIDENCE.md](../EVIDENCE.md) |
+| 28 | C14 `929f49b` | [docs/HOOK-SHARING.md](../HOOK-SHARING.md) |
+| 29 | C06 `b295c8e` | [docs/RUNNER.md](../RUNNER.md) |
+| 30 | C06 `b295c8e` | [docs/RUNNER.md](../RUNNER.md) |
+| 31 | C15 `550f4f4` | [docs/MACROS.md](../MACROS.md) |
+| 32 | C07 `a012ae0`, C16 `bd1e0b3` | [docs/PROFILES.md](../PROFILES.md); [docs/TEST-PLAN.md](../TEST-PLAN.md) |
+| 33 | C04 `131d11d`, C09 `5d93ac1`, C13 `2c38433`, C18 `917dcf6` | [docs/BUILD.md](../BUILD.md); [docs/HOOKS.md](../HOOKS.md); [docs/INSTALL.md](../INSTALL.md); [docs/WORKERS.md](../WORKERS.md) |
+| 34 | C17 `4b73e0d`, C22 `1100305` | [docs/WATCHDOG.md](../WATCHDOG.md); [tools/eden-lifecycle/README.md](../../tools/eden-lifecycle/README.md) |
+| 35 | C10 `f6a5736`, C21 `c621e9a` | [docs/EDEN.md](../EDEN.md); [docs/EVIDENCE.md](../EVIDENCE.md) |
+| 36 | C23 `35395be` | [docs/history/LIFECYCLE-QUALIFICATION-2026-11.md](../history/LIFECYCLE-QUALIFICATION-2026-11.md) |
+
+Tool suites rerun after retargeting: wrapper 15, runner/harvest 44, replace-exefs 38, swap-ums 76, compliance 11: **184 passed, no skips**. Wrapper tests intercept exactly three fake none.service queries; card tests use temporary fake-card trees. Four older Switch scripts have no dedicated functional suite; a source scan covers forbidden card commands, not their transactions. No Eden, real card, remote query, global deployment, push or merge ran. The lifecycle suite was not rerun because its source/tests are unchanged; its earlier 136-pass/one-sandbox-blocked result above retains that limit.
+
+Exact per-tool source hashes, 17 allowed reference replacements, token/AST proof, suite commands and raw results are in the operator workspace task3-validation/tool-tests/. Gate-helper counterexamples:18 passed, including rejection of partial/extra allowed phrases, unrelated printed text and logic changes. REPORT2.md records actual correction commit/tree identities and per-commit G receipts; this final audit commit is its own closure.
+
+After TASK3: Markdown total 2988 lines; common mandatory reading START 58 + CHECKLIST 99 = 157, plus task pages. Every active concern page remains ≤110 lines.
