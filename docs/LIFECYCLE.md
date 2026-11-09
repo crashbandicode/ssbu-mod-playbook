@@ -24,8 +24,10 @@ kernel `hostname`, not an SSH alias; wrong-host Up/Down/status refuse before
 profile/claim operations. For Yoga append `--ssh memento-claw-yoga-ubuntu`:
 the same source/config travels on stdin through its PowerShell 7 login shell,
 without script staging. Run the shared runner there too; no implicit file or
-socket forwarding exists. Surface/XPS can use `ledger_ssh` for Yoga's
-authoritative ledger. Windows transport is specified in [WINDOWS](WINDOWS.md).
+socket forwarding exists. Surface and XPS **must** set
+`ledger_ssh:"memento-claw-yoga-ubuntu"` for Yoga's authoritative ledger:
+`ledger:"/tmp/deluxe-surface-1007/OWNER-COORDINATION.md"` on Yoga.
+Windows transport is specified in [WINDOWS](WINDOWS.md).
 
 Configure owner/label/host/hostname, disjoint fresh work/state roots, ledger,
 runner and rows pins, runtime/caps, and instance keys with distinct source,
@@ -92,5 +94,7 @@ not waive SIGBUS/panic/fatal console tails or prove graceful `game.stop`.
 Keep `lifecycle.json`, `actions.jsonl`, dry-run/snapshot/restore/verify receipts,
 run console/control logs and `instances.json` mappings/source aliases. Keep
 `run.json`/`memory.peak` and [evidence](EVIDENCE.md) under the run label.
+Change shared tools **in a worktree**, never the playbook clone live runs use:
+a half-edited file there can break another owner's Up or Down.
 Current mechanics: [lifecycle.py](../tools/eden-lifecycle/lifecycle.py);
 dated coverage/limits: [qualification history](history/LIFECYCLE-QUALIFICATION-2026-11.md).
