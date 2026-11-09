@@ -99,7 +99,7 @@ More gates:
    "on_all": ["a", "b"], "equal": true, "expect_groups": {"2": "0"}, "cap": 120}
       every listed instance logged a match this row, with the same captured values and desync_seen=0
 
-Run rules (playbook docs/MACROS.md, "Test runs"): rows run back to back while their gates pass. On a failure the runner
+Run rules (playbook docs/TEST-PLAN.md, rules 1–15): rows run back to back while their gates pass. On a failure the runner
 writes the row's receipt as FAILED with evidence (a screenshot, the tails of the logs that row's gates read, and
 trace.counters plus trace.read when that instance is tracing). It then follows on_failure: "continue" or "stop".
 The default is continue when the next row has a start gate and a recover list, and stop otherwise, so a rows.json
@@ -722,7 +722,7 @@ def dry_run(manifest_path):
             if 'play' in step and step['play'] not in plan.get('segments', {}):
                 errors.append(f'row {row["id"]}: unknown segment {step["play"]}')
             elif 'play' in step:
-                # Never play or record onto a screen nobody checked (MACROS "Hybrid", rule 3). 2026-11-03 lr-03
+                # Never play or record onto a screen nobody checked (MACROS, gate between segments). 2026-11-03 lr-03
                 # recorded title->main while the game sat in the attract-mode intro movie.
                 seg = plan['segments'][step['play']]
                 if not (seg.get('start_gate') or on in checked or step.get('unchecked')):
