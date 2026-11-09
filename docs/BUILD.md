@@ -86,7 +86,7 @@ the workspace's own crates immediately. Retain either an unpacked source
 stage or its identical archive, not both.
 
 Check `df -h /` before every build and Eden launch. Stop a build below
-40 GB free; the pre-Up Eden floor is 60 GB. Use [HOSTS](EDEN.md) and
+40 GB free; the pre-Up Eden floor is 60 GB. Use [HOSTS](HOSTS.md) and
 [LIFECYCLE](EDEN.md) for admission, copies and clean-Down pruning.
 Link byte-identical immutable files; make real copies for different or
 writable files as [PROFILES](EDEN.md) requires. When work finishes,

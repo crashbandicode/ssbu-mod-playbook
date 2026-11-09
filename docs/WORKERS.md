@@ -37,7 +37,7 @@ Routing/model/effort and watcher rules come from
    provider/turn error **and no worker activity for the following 2 minutes**;
    worker quiet **12 minutes without updating its report**. Other transient
    blips need no intervention. Ordinary provider retries can recover themselves.
-9. Hosts take turns under [HOSTS](EDEN.md): Surface/Yoga/XPS two instances,
+9. Hosts take turns under [HOSTS](HOSTS.md): Surface/Yoga/XPS two instances,
    Ally one; manual/foreign claims still block. Builders wait while Eden
    workers hold their Up/Down lock; Up refuses compilers. Gate a new head into
    a **new output folder**, preserving running workers' pinned paths/hashes.

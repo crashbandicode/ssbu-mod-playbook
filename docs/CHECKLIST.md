@@ -26,8 +26,8 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M14 | M | Keep [diag code, diag.txt and stand-in markers out of shipped NRO](BUILD.md). |
 | M15 | M | Ship [install-line-only logging](BUILD.md), with the C13 logging-product exception and no per-frame diagnostics. |
 | M16 | M | [Claim before Up; Down after failure too](EDEN.md); retain the claim until owned cleanup/restore/separate verify succeed. |
-| M17 | M | Follow [host slots/10–9GiB admission](EDEN.md); never source profilea, display61 or foreign runs. |
-| M18 | M | Keep [XPS half-resolution precedence, thermald on and timed rows on Surface/Yoga](EDEN.md). |
+| M17 | M | Follow [host slots/10–9GiB admission](HOSTS.md); never source profilea, display61 or foreign runs. |
+| M18 | M | Keep [XPS half-resolution precedence, thermald on and timed rows on Surface/Yoga](HOSTS.md). |
 | M19 | M | Use [private profiles with immutable hard links and real mutable copies](EDEN.md); change only your copy and verify storage. |
 | M20 | M | Keep [per-copy targets/fresh source times/locked seeds/shared cargo home/disk checks/deletion manifest](BUILD.md). |
 | M21 | M | [Gate every wait](MACROS.md); rounded-up fixed sleeps are only for states with neither log nor screenshot checks. |
@@ -65,7 +65,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M53 | M | [Ban extracted game/mod assets and dumps from git](WORKFLOW.md); reviewed evidence screenshots and required reference crops are allowed. |
 | M54 | M | Treat [cleanup success separately from graceful/native health](EDEN.md); inspect unit/console fatal tails and qualification limits. |
 | M55 | M | Stop only [owned displays/processes/paths](EDEN.md); ambiguous identity or failed restore/verify retains claim for recovery. |
-| M56 | M | Follow [60GB pre-Up admission and verified-clean-Down pruning](EDEN.md); preserve receipts/logs/reports and failed-cleanup recovery state, never foreign copies. |
+| M56 | M | Follow [60GB pre-Up admission and verified-clean-Down pruning](HOSTS.md); preserve receipts/logs/reports and failed-cleanup recovery state, never foreign copies. |
 | C01 | C | If sites may overlap, use [sharing/chaining](HOOK-SHARING.md), election before guard, both stand-ins and load orders; cite dated scan for N/A. |
 | C02 | C | Online code obeys [read-only checked-RNG/native-order/simulated-state constraints](WORKFLOW.md), hook by hook. |
 | C03 | C | Online code passes [same replay A/B](WORKFLOW.md), identical detector values and positions. |
