@@ -74,7 +74,9 @@ a warning; return line/count/dict and retain behavior evidence instead.
 `acquire:true` with missing image reference captures its settled region,
 stores hash and stops after the row as REVIEW (exit 4). Inspect references
 before running again. A gate `recover:<segment>` handles a known detour once
-by default (`recover_times`), then rechecks; useful after title-screen idle.
+by default (`recover_times`), then rechecks. Give the first gate of a run and
+the first gate after any pause or long hold a `recover` naming the intro-cancel
+segment (library `attract-cancel`), because title idle can start the attract movie.
 Row/batch recovery and policy remain in TEST-RUN.
 
 `replay rows.json --fixture <dir>` replays one passing row's gates/hooks
@@ -82,12 +84,13 @@ offline, no Eden/play steps. `capture_fixtures`/`--capture-fixtures` or
 `capture-fixture` saves `out/fixtures/<row>/fixture.json` plus screen/source
 files. `self-test` checks each declared start gate and each `screen_classes`
 reach/gate/recover/start cycle; classes/routes are plan data. Default
-`early_stop=3` repeated same-cause failures reports probable shared cause;
+`early_stop=3` repeated same-cause failures stops the run with `probable shared cause`;
 false disables it. Neither mode proves plugin behavior on unexercised paths.
 
 Failure saves screenshot, relevant log tails and trace counters/read when
-tracing; `failure_evidence`/`on_failure_hook` add evidence. STOP halts before
-next input; failed recovery/crash writes STOP-INPUT. No auto-reboot. Every
+tracing; `failure_evidence`/`on_failure_hook` add evidence. A `STOP` file in the
+run's `out/` (a coordinator may create it) halts the runner before its next
+input; failed recovery/crash writes STOP-INPUT. No auto-reboot. Every
 call enters `out/actions.jsonl`; row receipt `out/<row>.json`, artifacts
 `out/<row>/`, summary every row. Runner nonzero signals failed rows, but wrapper
 exit/pace limitations and required human inspection remain in TEST-RUN.
