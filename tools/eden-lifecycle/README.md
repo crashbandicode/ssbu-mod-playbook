@@ -207,7 +207,8 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
   Exact-token readback handles claim/release ACK loss without inventing an
   unclaimed state; ledger outage still attempts owned stop/restore but retains
   the claim until its history can be checked.
-- Admission: MemAvailable >=10GiB and disk >=40GB; no foreign Eden or compiler.
+- Admission: MemAvailable >=10GiB and disk >=60GB (`disk_floor_bytes` overrides it; 40GB before 2026-11-09); no
+  foreign Eden or compiler.
 - Fresh private profile: only game Contents/firmware are hard-linked. All
   mutable/unknown files are real copies; snapshots cover the full clone,
   including empty directories, unknown files, bytes and modes.
@@ -232,6 +233,17 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
 - State: lifecycle.json; actions.jsonl; dry-run.json; per-instance
   snapshot/restore/verify JSON; run-* full console/control logs; post-run-*
   profile evidence. The original snapshot never becomes the output directory.
+- Prune (`down`, after a clean Down): the files the run wrote (post-run-* against
+  the snapshot inventory; game content links and copy2 times skip the hash) go
+  to `--evidence-dir` (default `state/evidence/`) as `post-run-<key>/` plus a
+  `post-run-<key>.json` manifest; the caches Eden and the GPU driver rebuild
+  (`user/cache/shader`, `user/shader`, `xdg-cache`) are listed, not copied.
+  Then the work_root profiles, snapshot-* and post-run-* are deleted
+  without following links; on Windows a read-only attribute is cleared only on
+  a file with one link, never on a link into the installed app or source. The
+  journal's `prune` keeps the bytes (`unique_bytes`: all links pruned) and df
+  before and after. A prune error never undoes the release; the next `down`
+  finishes it without copying again. `--keep-state` skips it.
 
 ### Linux AppImage Down: main before FUSE (2026-11-03)
 

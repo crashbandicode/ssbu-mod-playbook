@@ -67,6 +67,7 @@ AGENT_ROWS = [
     ('Eden: failed precondition aborted and retried under the next label', 'M'),
     ('Eden: game-side facts from guest tracing (persistent trace.* points or the one-shot tracepoint) on a run already happening; diag rebuild or extra trace boot only with a stated reason', 'M'),
     ('Eden: profile restored, temp files removed, host released', 'M'),
+    ('Eden: the run\'s copies pruned at Down once its files were in out/ (the Prune line); Up refused below 60 GB free', 'M'),
     ('Eden: console.log searched for panic/abort/crash; run.json and memory.peak kept', 'M'),
     ('Every local command under the memory and time guard', 'M'),
     ('Evidence doc states run labels, build, what was done, what the log showed', 'M'),

@@ -169,6 +169,9 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   length in the log.
 - **M** Profile restored after the run: set-aside NROs back, saves and
   replays back, temp files removed, the host released.
+- **M** The run's copies pruned at `Down`: the files the run wrote copied to `out/post-run-<key>/` first, then
+  `work/`, `state/snapshot-*` and `state/post-run-*` deleted (`--keep-state` only when asked), and `Up` refused below
+  60 GB free (`disk_floor_bytes`) ([EDEN](EDEN.md), "Down"). Evidence: RESULTS.md's `Prune:` line.
 - **M** `console.log` searched for `panic`, `abort`, `crash` and `Unmapped`;
   an `Unmapped Read`/`Unmapped Write` below `0x1000` or inside the plugin's
   activity window fails the lane, because Eden tolerates the null read the

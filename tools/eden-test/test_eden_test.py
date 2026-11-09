@@ -21,6 +21,14 @@ if mode == 'up':
     (state / 'lifecycle.json').write_text(json.dumps({'phase': 'up', 'instances': [{'key': 'a', 'unit': 'none.service'}]}))
 else:
     j = json.loads((state / 'lifecycle.json').read_text()); j.update(phase='down', released=True, cleanup_failures=[])
+    if '--keep-state' in sys.argv:
+        j['prune'] = {'kept': 'now'}
+    elif '--evidence-dir' in sys.argv:
+        out = Path(sys.argv[sys.argv.index('--evidence-dir') + 1]); (out / 'post-run-a').mkdir(parents=True, exist_ok=True)
+        (out / 'post-run-a/run.log').write_text('run bytes')
+        j['prune'] = {'done': 'now', 'evidence': str(out), 'evidence_saved': 'now', 'copied_files': 1, 'listed_files': 0,
+                      'bytes': 3 * 10 ** 9, 'unique_bytes': 2 * 10 ** 9, 'disk_free_before': 10 ** 11,
+                      'disk_free_after': 10 ** 11 + 2 * 10 ** 9, 'skipped': [], 'left': []}
     (state / 'lifecycle.json').write_text(json.dumps(j))
 print(mode, 'ok')
 '''
@@ -158,6 +166,24 @@ class EdenTestTests(unittest.TestCase):
         self.assertLessEqual(len(results.splitlines()), 20)
         timing = json.loads((run / 'timing.json').read_text())
         self.assertTrue({'new', 'up_start', 'up_done', 'run_start', 'run_end', 'down_start', 'down_done'} <= set(timing))
+        # Down hands the lifecycle the run's out/ for the files the run wrote, and RESULTS.md gives the prune's bytes.
+        self.assertIn(f'--evidence-dir {run / "out"}', (run / 'lifecycle-down.log').read_text())
+        self.assertEqual((run / 'out/post-run-a/run.log').read_text(), 'run bytes')
+        self.assertIn('- Prune: 2.0 GB freed of 3.0 GB of copies (df +2.0 GB); 1 files the run wrote in out/post-run-*/, '
+                      '0 listed only', results)
+
+    def test_down_keep_state_skips_the_prune_and_says_so(self):
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        eden_test.main(['up', str(run)])
+        eden_test.main(['down', str(run), '--keep-state'])
+        self.assertIn('--keep-state', (run / 'lifecycle-down.log').read_text())
+        self.assertFalse((run / 'out/post-run-a').exists())
+        self.assertIn('- Prune: kept (--keep-state)', (run / 'RESULTS.md').read_text())
+        self.assertEqual(eden_test.prune_summary(run, {}), 'not run: work/ and state/ stay until a clean Down')
+        failed = {'evidence': str(run / 'out'), 'evidence_saved': 'now', 'error': "OSError('busy')"}
+        self.assertEqual(eden_test.prune_summary(run, {'prune': failed}),
+                         "FAILED: OSError('busy'); the run's files are in out/post-run-*/")
 
     def test_retry_clears_stop_input_and_reruns_on_the_same_boot(self):
         (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[], "note": "fail-once"}')

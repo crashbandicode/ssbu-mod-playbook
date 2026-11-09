@@ -11,7 +11,7 @@ from pathlib import Path, PureWindowsPath
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import mock_open, patch
+from unittest.mock import call, mock_open, patch
 
 spec = importlib.util.spec_from_file_location('lifecycle', Path(__file__).with_name('lifecycle.py'))
 life = importlib.util.module_from_spec(spec)
@@ -313,7 +313,7 @@ class LifecycleTests(unittest.TestCase):
         restore, verify = controller.restore, controller.verify
         controller.restore = lambda i: (self.order.append('restore'), restore(i))[-1]
         controller.verify = lambda i: (self.order.append('verify'), verify(i))[-1]
-        result = controller.down()
+        result = controller.down(keep_state=True)  # the restored copies are what this test reads
         self.assertEqual(result['phase'], 'down')
         self.assertEqual(life.inventory(profile), expected)
         self.assertTrue((controller.directory / 'post-run-a/new-run-output').exists())
@@ -325,6 +325,147 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(life.inventory(self.source), self.before_source)
         self.assertEqual(json.loads((Path(item['run']) / 'run.json').read_text())['state'], 'stopped')
         self.assertEqual((Path(item['run']) / 'memory.peak').read_text(), '1234\n')
+
+    def run_writes(self, item):
+        profile = Path(item['profile'])
+        (profile / 'user/sdmc/ultimate/TrainingRooms/rooms.log').write_text('run log line\n')
+        (profile / 'unknown/nested/data').write_text('changed by the run')
+        (profile / 'user/cache/shader/01006a800016e000').mkdir(parents=True)
+        (profile / 'user/cache/shader/01006a800016e000/vulkan.bin').write_bytes(b'rebuilt by Eden')
+
+    def test_down_saves_what_the_run_wrote_then_prunes_the_run_copies(self):
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        self.run_writes(item)
+        out = self.base / 'run/out'
+        result = c.down(evidence_dir=str(out))
+        self.assertEqual(result['phase'], 'down')
+        self.assertTrue(self.ledger.released)
+        # The run's own files are in out/ first: new, changed and the rewritten config. Pinned inputs and the
+        # snapshot's plugin moved aside are known bytes; the shader cache is listed, not copied.
+        manifest = json.loads((out / 'post-run-a.json').read_text())
+        self.assertEqual(sorted(entry['path'] for entry in manifest['copied']),
+                         ['unknown/nested/data', life.CONFIG, 'user/sdmc/ultimate/TrainingRooms/rooms.log'])
+        self.assertEqual(manifest['listed'], [{'path': 'user/cache/shader/01006a800016e000/vulkan.bin', 'size': 15}])
+        self.assertEqual(manifest['known_content'], 3)
+        self.assertEqual(manifest['gone'], [life.PLUGINS + '/old.nro'])
+        self.assertEqual((out / 'post-run-a/user/sdmc/ultimate/TrainingRooms/rooms.log').read_text(), 'run log line\n')
+        self.assertEqual((out / 'post-run-a/unknown/nested/data').read_text(), 'changed by the run')
+        # Then the copies are gone: the work_root profile, the snapshot and the post-run profile.
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertFalse((c.directory / 'snapshot-a').exists())
+        self.assertFalse((c.directory / 'post-run-a').exists())
+        # The journal, actions, receipts and the run's logs stay; so do the source profile and its game content.
+        for name in ('lifecycle.json', 'actions.jsonl', 'a-snapshot.json', 'a-restore.json', 'a-verify.json',
+                     'run-a/console.log', 'run-a/run.json', 'run-a/memory.peak'):
+            self.assertTrue((c.directory / name).is_file(), name)
+        self.assertEqual(life.inventory(self.source), self.before_source)
+        prune = self.state()['prune']
+        self.assertEqual(result['prune'], prune)
+        self.assertEqual((prune['copied_files'], prune['listed_files']), (3, 1))
+        # Game content is linked to the source, so it counts in bytes but not in unique_bytes.
+        self.assertGreater(prune['bytes'], prune['unique_bytes'])
+        self.assertGreater(prune['unique_bytes'], 0)
+        self.assertTrue(prune['done'] and prune['disk_free_before'] and prune['disk_free_after'])
+        self.assertEqual((prune['skipped'], prune['left']), ([], []))
+        again = c.down()
+        self.assertTrue(again['already_down'])
+        self.assertEqual(again['prune'], prune)
+
+    def test_keep_state_keeps_the_copies_until_a_down_without_it(self):
+        c = self.controller()
+        c.up()
+        self.run_writes(c.state['instances'][0])
+        result = c.down(keep_state=True)
+        self.assertIn('kept', result['prune'])
+        self.assertTrue((Path(self.config['work_root']) / 'profiles/profile-a').is_dir())
+        self.assertTrue((c.directory / 'snapshot-a').is_dir() and (c.directory / 'post-run-a').is_dir())
+        self.assertFalse((c.directory / 'evidence').exists())
+        later = self.controller().down()  # a fresh process, without the flag
+        self.assertTrue(later['already_down'] and later['prune']['done'])
+        self.assertNotIn('kept', later['prune'])
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertEqual((c.directory / 'evidence/post-run-a/unknown/nested/data').read_text(), 'changed by the run')
+        self.assertEqual(self.order.count('release'), 1)
+        path = self.base / 'config.json'
+        path.write_text(json.dumps(self.config))
+        with patch('sys.stderr', new=io.StringIO()) as error:
+            self.assertEqual(life.main(['status', str(path), '--keep-state']), 1)
+        self.assertIn('down options', error.getvalue())
+
+    def test_failed_down_prunes_nothing_and_the_clean_retry_does(self):
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        self.run_writes(item)
+        self.host.leftover = True
+        with self.assertRaisesRegex(life.Refused, 'Cleanup incomplete'):
+            c.down()
+        self.assertNotIn('prune', self.state())
+        self.assertEqual((Path(item['profile']) / 'unknown/nested/data').read_text(), 'changed by the run')
+        self.assertTrue((c.directory / 'snapshot-a').is_dir())
+        self.assertFalse((c.directory / 'evidence').exists())
+        self.host.leftover = False
+        result = c.down()
+        self.assertTrue(result['prune']['done'])
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertEqual((c.directory / 'evidence/post-run-a/unknown/nested/data').read_text(), 'changed by the run')
+
+    def test_prune_failure_keeps_the_release_and_the_next_down_finishes_without_copying_again(self):
+        c = self.controller()
+        c.up()
+        self.run_writes(c.state['instances'][0])
+        with patch.object(life, 'remove_tree', side_effect=OSError('synthetic busy file')):
+            result = c.down()
+        self.assertEqual(result['phase'], 'down')
+        self.assertTrue(self.ledger.released)
+        self.assertIn('synthetic busy file', result['prune']['error'])
+        self.assertTrue(result['prune']['evidence_saved'])
+        with patch.object(life.shutil, 'copy2', side_effect=AssertionError('evidence copied twice')):
+            again = self.controller().down()
+        self.assertTrue(again['prune']['done'])
+        self.assertNotIn('error', again['prune'])
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertTrue((c.directory / 'evidence/post-run-a/unknown/nested/data').is_file())
+
+    def test_evidence_folder_inside_a_pruned_tree_is_refused_before_anything_is_deleted(self):
+        c = self.controller()
+        c.up()
+        for folder in (c.directory, c.directory / 'post-run-a/out', Path(self.config['work_root']) / 'out'):
+            with self.subTest(folder=folder):
+                result = c.down(evidence_dir=str(folder))
+                self.assertIn('inside a pruned tree', result['prune']['error'])
+                self.assertTrue((c.directory / 'post-run-a').is_dir() and (c.directory / 'snapshot-a').is_dir())
+                self.assertTrue(Path(self.config['work_root']).is_dir())
+
+    def test_prune_never_follows_a_link_out_of_its_tree(self):
+        tree = self.base / 'tree'
+        (tree / 'd').mkdir(parents=True)
+        (tree / 'd/file').write_text('mine')
+        (tree / 'd/link').symlink_to(self.source, target_is_directory=True)
+        with self.assertRaisesRegex(life.Refused, 'Link inside a pruned tree'):
+            life.remove_tree(tree, [])
+        self.assertTrue((tree / 'd/file').is_file())
+        self.assertEqual(life.inventory(self.source), self.before_source)
+
+    def test_disk_floor_defaults_to_60_gb_and_is_configurable(self):
+        self.assertEqual(life.MIN_DISK, 60 * 10 ** 9)
+        self.host.disk = 59 * 10 ** 9
+        with self.assertRaisesRegex(life.Refused, 'Free disk below 60 GB'):
+            self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+        self.config['disk_floor_bytes'] = 50 * 10 ** 9
+        self.config['state_dir'] += '-floor'
+        self.assertEqual(self.controller().up()['phase'], 'up')
+        self.host.disk = 49 * 10 ** 9
+        report = self.controller().resource_report(self.host.resources(self.base))
+        self.assertEqual(report[0], ['Free disk below 50 GB'])
+        for bad in (0, -1, 1.5, True, '60'):
+            config = deepcopy(self.config)
+            config['disk_floor_bytes'] = bad
+            with self.assertRaisesRegex(life.Refused, 'disk_floor_bytes must be a positive integer'):
+                life.Lifecycle(config, self.host, self.ledger)
 
     def test_pair_uses_one_claim_and_fresh_admission_before_each_launch(self):
         self.pair()
@@ -1558,6 +1699,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(packet['execute'])
         self.assertIn('class Lifecycle', packet['source'])
         self.assertGreater(captured['timeout'], 0)
+        life.forward('memento-claw-yoga-ubuntu', 'down', {'fake': 'config'}, True, run=run, keep_state=True,
+                     evidence_dir='/home/intpa/eden-runs/x/out')
+        packet = json.loads(captured['input'])
+        self.assertEqual((packet['keep_state'], packet['evidence_dir']), (True, '/home/intpa/eden-runs/x/out'))
 
     def test_ssh_failure_is_not_success_and_unsafe_host_refuses(self):
         def fail(command, **kwargs):
@@ -1644,6 +1789,42 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(c.down()['phase'], 'down')
         self.assertEqual(life.inventory(self.source), original)
         self.assertTrue(json.loads((c.directory / 'a-source-verify.json').read_text())['unchanged'])
+
+    def test_windows_prune_removes_the_profile_links_but_never_the_installed_app_or_source(self):
+        original = life.inventory(self.source)
+        app = Path(self.config['instances'][0]['app']['path']).parent
+        installed = life.inventory(app)
+        c = self.controller()
+        c.up()
+        self.assertEqual((app / 'eden.exe').stat().st_nlink, 2)
+        self.assertTrue(c.down()['prune']['done'])
+        self.assertFalse(Path(self.config['work_root']).exists())
+        self.assertFalse((c.directory / 'post-run-a').exists() or (c.directory / 'snapshot-a').exists())
+        self.assertEqual((life.inventory(app), life.inventory(self.source)), (installed, original))
+        self.assertEqual((app / 'eden.exe').stat().st_nlink, 1)
+
+    def test_windows_read_only_attribute_is_cleared_only_on_a_private_file(self):
+        # The attribute belongs to the file's data, which a hard link shares with the installed app or source.
+        tree = self.base / 'tree'
+        (tree / 'd').mkdir(parents=True)
+        installed = self.base / 'installed.dll'
+        installed.write_bytes(b'installed')
+        os.link(installed, tree / 'd/shared.dll')
+        (tree / 'd/private.ini').write_text('private')
+        unlink, refused = Path.unlink, set()
+        def read_only(path, *args, **kwargs):
+            if path.name in ('shared.dll', 'private.ini') and path not in refused:
+                refused.add(path)
+                raise PermissionError('synthetic read-only attribute')
+            return unlink(path, *args, **kwargs)
+        skipped = []
+        with patch.object(Path, 'unlink', read_only), patch.object(Path, 'chmod', autospec=True) as chmod:
+            life.remove_tree(tree, skipped, windows=True)
+        self.assertEqual(skipped, [str(tree / 'd/shared.dll')])
+        self.assertEqual(chmod.call_args_list, [call(tree / 'd/private.ini', life.stat.S_IWRITE)])
+        self.assertFalse((tree / 'd/private.ini').exists())
+        self.assertTrue((tree / 'd/shared.dll').is_file())  # with the directories above it
+        self.assertEqual(installed.read_bytes(), b'installed')
 
     def test_windows_fresh_controller_can_down_nondefault_named_pipe_state(self):
         self.controller().up()

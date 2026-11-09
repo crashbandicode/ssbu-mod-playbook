@@ -2,7 +2,7 @@
 """Shared, journalled Eden lifecycle. Import is inert; see README.md for config.
 
   lifecycle.py up        config.json --execute [--ssh memento-claw-yoga-ubuntu]
-  lifecycle.py down      config.json --execute [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py down      config.json --execute [--ssh memento-claw-yoga-ubuntu] [--evidence-dir DIR] [--keep-state]
   lifecycle.py status    config.json           [--ssh memento-claw-yoga-ubuntu]
   lifecycle.py preflight config.json           [--ssh memento-claw-yoga-ubuntu]
   lifecycle.py watchdog  config.json --execute [--ssh memento-claw-yoga-ubuntu] [--rounds N] [--pause S]
@@ -14,6 +14,9 @@ and does not set auto false, up starts that watchdog as a sidecar until down.
 watchdog watches control activity and either parks with the declared input
 sequence or (the default) Downs with a receipt. A missing control log counts
 from the journal's Up time. Extra instance files are declared sources.
+A clean down copies the files the run wrote to the evidence folder, then prunes
+the run's copies (work_root profiles, state snapshot-*/post-run-*) unless
+--keep-state; the journal's prune gives the bytes.
 
 No runtime operations are performed by tests: inject a fake Host and Ledger.
 SSH executes the SAME source through the remote login shell's PowerShell 7,
@@ -55,7 +58,13 @@ MIN_MEMORY = 10 * GIB
 MIN_MEMORY_SECOND = 9 * GIB  # for a second Eden on the host (each instance is capped at 8 GiB)
 # Process names that are one running emulator instance (Linux comm, Windows image name).
 EDEN_INSTANCE_NAMES = {'eden', 'yuzu', 'eden.exe'}
-MIN_DISK = 40 * 10 ** 9
+# Up refuses below this much free disk; "disk_floor_bytes" in the config overrides it. Raised from 40 GB on 2026-11-09:
+# a run's copies are about 3 GB until Down prunes them, and several boots a day filled the XPS and the Yoga.
+MIN_DISK = 60 * 10 ** 9
+# Down copies the files a run wrote to the evidence folder before it prunes the run's copies, except the caches Eden
+# and the GPU driver rebuild: those are listed in the prune manifest. On qcf-sobs01 (Surface, 2026-11-09) they were
+# 273 of the 285 MiB each instance wrote: user/cache/shader/<title>/vulkan.bin and xdg-cache/nvidia/GLCache.
+REBUILT_CACHES = ('user/cache/shader', 'user/shader', 'xdg-cache')
 READ_ONLY = ('user/nand/user/Contents', 'user/nand/system/Contents', 'user/firmware')
 PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'
 CONFIG = 'user/config/qt-config.ini'
@@ -231,6 +240,62 @@ def clone_profile(source, target, read_only=READ_ONLY):
     shutil.copytree(source, target, copy_function=copy)
     require(inventory(target) == before, 'Clone differs from source')
     return before
+
+
+def tree_entries(root):
+    """(path, lstat) for root and everything under it, each directory before its contents. Refuses links, so a
+    prune never follows one out of its tree."""
+    stack = [Path(root)]
+    while stack:
+        path = stack.pop()
+        info = path.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and not getattr(path, 'is_junction', lambda: False)(),
+                'Link inside a pruned tree: ' + str(path))
+        yield path, info
+        if stat.S_ISDIR(info.st_mode):
+            stack.extend(path.iterdir())
+
+
+def remove_tree(root, skipped, windows=os.name == 'nt'):
+    """Delete root, files before their directories. A Windows read-only attribute is cleared only where no other path
+    shares the data: directories (always private), and files with one link. A hard link into an installed source or
+    app keeps its attributes and stays, listed in skipped with the directories above it."""
+    for path, info in reversed(list(tree_entries(root))):
+        directory = stat.S_ISDIR(info.st_mode)
+        if directory and any(s == str(path) or s.startswith(str(path) + os.sep) for s in skipped):
+            continue
+        remove = path.rmdir if directory else path.unlink
+        try:
+            remove()
+        except PermissionError:
+            if not windows or not directory and info.st_nlink != 1:
+                skipped.append(str(path))
+                continue
+            path.chmod(stat.S_IWRITE)
+            remove()
+
+
+def run_files(post_run, snapshot, expected):
+    """The files a run created or changed in its post-run profile, against the pristine snapshot's inventory, and the
+    snapshot files it removed. A file that still shares its snapshot twin's inode or modification time was not
+    rewritten (clone_profile links game content and copy2 keeps file times), so only the rest are hashed."""
+    post_run, snapshot = Path(post_run), Path(snapshot)
+    changed, present = [], set()
+    for path, info in tree_entries(post_run):
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        rel = path.relative_to(post_run)
+        present.add(str(rel))
+        before = expected.get(str(rel))
+        if before and before['type'] == 'file' and before['size'] == info.st_size:
+            twin = (snapshot / rel).lstat()
+            if ((twin.st_dev, twin.st_ino) == (info.st_dev, info.st_ino) or twin.st_mtime_ns == info.st_mtime_ns
+                    or digest(path) == before['sha256']):
+                continue
+        changed.append((rel, info))
+    gone = sorted(Path(name).as_posix() for name, value in expected.items()
+                  if value['type'] == 'file' and name not in present)
+    return changed, gone
 
 
 def active_claims(text, host):
@@ -500,9 +565,9 @@ def validate(config):
         book = config['playbook']
         require(isinstance(book, dict) and isinstance(book.get('root'), str) and isinstance(book.get('commit'), str)
                 and book['root'] and book['commit'], 'playbook needs root and commit strings')
-    if 'memory_floor_bytes' in config:
-        require(type(config['memory_floor_bytes']) is int and config['memory_floor_bytes'] > 0,
-                'memory_floor_bytes must be a positive integer')
+    for key in ('memory_floor_bytes', 'disk_floor_bytes'):
+        if key in config:
+            require(type(config[key]) is int and config[key] > 0, key + ' must be a positive integer')
     if 'watchdog' in config:
         spec = config['watchdog']
         require(isinstance(spec, dict), 'watchdog must be an object')
@@ -1321,10 +1386,11 @@ class Lifecycle:
     def resource_report(self, value):
         """Memory, disk, compilers and Eden slots. Same refusals admission uses, without writing."""
         problems, lines, checks = [], [], []
-        if value['disk_free'] < MIN_DISK:
-            problems.append('Free disk below 40 GB')
-            lines.append('FAIL disk: Free disk below 40 GB')
-            checks.append({'name': 'disk', 'ok': False, 'free': value['disk_free']})
+        floor = self.c.get('disk_floor_bytes', MIN_DISK)
+        if value['disk_free'] < floor:
+            problems.append(f'Free disk below {floor / 10 ** 9:g} GB')
+            lines.append(f'FAIL disk: Free disk below {floor / 10 ** 9:g} GB')
+            checks.append({'name': 'disk', 'ok': False, 'free': value['disk_free'], 'floor': floor})
         else:
             lines.append(f'OK disk: {value["disk_free"]} bytes free')
             checks.append({'name': 'disk', 'ok': True, 'free': value['disk_free']})
@@ -2101,7 +2167,87 @@ class Lifecycle:
         require(not failures, 'Cleanup incomplete; claim retained: ' + repr(failures))
         return {'phase': 'down', 'released': self.state['released'], 'game_stop_errors': stop_errors}
 
-    def down(self):
+    def prune(self, evidence_dir=None):
+        """After a clean Down, copy the files each instance's run wrote (its post-run profile against the snapshot)
+        to <evidence>/post-run-<key>/ with a manifest <evidence>/post-run-<key>.json, then delete the run's copies:
+        the work_root profiles, state/snapshot-<key> and state/post-run-<key>. The journal, actions.jsonl, the
+        receipts and the run-<key> logs stay. Evidence is saved once: a later Down finishes an interrupted delete."""
+        record = self.state.get('prune') or {}
+        record.pop('kept', None)
+        root = safe_absolute(self.c['work_root'])
+        items = self.state['instances']
+        post_runs = {item['key']: self.directory / ('post-run-' + item['key']) for item in items}
+        trees = [*(Path(item['profile']) for item in items), *(Path(item['snapshot']) for item in items),
+                 *post_runs.values()]
+        if not record.get('evidence_saved'):
+            evidence = safe_absolute(evidence_dir or self.directory / 'evidence')
+            require(evidence != self.directory and not any(evidence == tree or tree in evidence.parents
+                                                           for tree in (root, *trees)),
+                    'Evidence folder inside a pruned tree or the state folder itself')
+            evidence.mkdir(parents=True, exist_ok=True)
+            record = {'evidence': str(evidence), 'copied_files': 0, 'copied_bytes': 0, 'listed_files': 0}
+            for item in items:
+                key, post_run = item['key'], post_runs[item['key']]
+                if not post_run.is_dir():
+                    continue
+                expected = json.loads((self.directory / (key + '-snapshot.json')).read_text())
+                changed, gone = run_files(post_run, item['snapshot'], expected)
+                # Bytes already known before the run (pinned inputs, snapshot files moved aside) are not its output.
+                known = {value['sha256'] for value in expected.values() if value['type'] == 'file'}
+                known.update(pin['sha256'] for pin in [item['app'], *item['plugins'], *item.get('files', [])])
+                manifest = {'post_run': str(post_run), 'copied': [], 'listed': [], 'known_content': 0, 'gone': gone}
+                for rel, info in changed:
+                    name = rel.as_posix()
+                    if any(name.startswith(p + '/') for p in REBUILT_CACHES):
+                        manifest['listed'].append({'path': name, 'size': info.st_size})
+                        continue
+                    value = digest(post_run / rel)
+                    if value in known:
+                        manifest['known_content'] += 1
+                        continue
+                    target = evidence / ('post-run-' + key) / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(post_run / rel, target)
+                    require(digest(target) == value, 'Evidence copy differs: ' + str(target))
+                    manifest['copied'].append({'path': name, 'size': info.st_size, 'sha256': value})
+                save(evidence / ('post-run-' + key + '.json'), manifest)
+                record['copied_files'] += len(manifest['copied'])
+                record['copied_bytes'] += sum(entry['size'] for entry in manifest['copied'])
+                record['listed_files'] += len(manifest['listed'])
+            record['evidence_saved'] = stamp()
+            self.state['prune'] = record
+            self.write()
+        targets = [tree for tree in trees if tree.exists()]
+        inodes, size, skipped = {}, 0, []
+        for tree in targets:
+            for path, info in tree_entries(tree):
+                if stat.S_ISREG(info.st_mode):
+                    size += info.st_size
+                    seen = inodes.setdefault((info.st_dev, info.st_ino) if info.st_ino else str(path),
+                                             [0, info.st_nlink, info.st_size])
+                    seen[0] += 1
+        free = shutil.disk_usage(self.directory).free
+        for tree in targets:
+            remove_tree(tree, skipped)
+        for item in items:
+            source = root / ('source-' + item['key'] + '.json')  # the Ally's installed-source inventory
+            if source.is_file():
+                source.unlink()
+        for path in (root / 'profiles', root):
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+        # unique_bytes: files whose every link was in the pruned trees, so deleting them freed their blocks.
+        record.update(done=stamp(), bytes=size, unique_bytes=sum(s for n, links, s in inodes.values() if n >= links),
+                      disk_free_before=free, disk_free_after=shutil.disk_usage(self.directory).free,
+                      removed=[str(tree) for tree in targets], skipped=skipped,
+                      left=sorted(str(path) for path in root.iterdir()) if root.exists() else [])
+        record.pop('error', None)
+        self.state['prune'] = record
+        self.write()
+        self.record('prune', record)
+        return record
+
+    def down(self, keep_state=False, evidence_dir=None):
         require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname; no cleanup action')
         with self.lock():
             require(self.journal.is_file(), 'No owned lifecycle journal')
@@ -2109,8 +2255,23 @@ class Lifecycle:
             self.check_state()
             if self.state['phase'] == 'down':
                 self._stop_watchdog_unit()
-                return {'phase': 'down', 'released': self.state['released'], 'already_down': True}
-            return self._down()
+                result = {'phase': 'down', 'released': self.state['released'], 'already_down': True}
+            else:
+                result = self._down()
+            # Only a clean Down reaches here: _down raises while anything is left to stop, restore or release.
+            prune = self.state.get('prune') or {}
+            if keep_state and not prune.get('done'):
+                self.state['prune'] = {**prune, 'kept': stamp()}
+                self.write()
+            elif not prune.get('done'):
+                try:
+                    self.prune(evidence_dir)
+                except Exception as error:
+                    self.state['prune'] = {**(self.state.get('prune') or {}), 'error': repr(error)}
+                    self.write()
+                    self.record('prune-error', {'error': repr(error)})
+            result['prune'] = self.state.get('prune')
+            return result
 
     def status(self):
         require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname')
@@ -2126,11 +2287,13 @@ class Lifecycle:
                 'cleanup_failures': value.get('cleanup_failures', [])}
 
 
-def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=None, watchdog_pause=None):
+def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=None, watchdog_pause=None,
+            keep_state=False, evidence_dir=None):
     """One bounded SSH request; remote account login shell must be pwsh."""
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
     if config.get('host') == 'ally' and not mode.startswith('ledger-'):
-        return forward_windows(host, mode, config, execute, watchdog_rounds=watchdog_rounds, watchdog_pause=watchdog_pause)
+        return forward_windows(host, mode, config, execute, watchdog_rounds=watchdog_rounds, watchdog_pause=watchdog_pause,
+                               keep_state=keep_state, evidence_dir=evidence_dir)
     bootstrap = 'import json,sys; p=json.load(sys.stdin); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
     script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 900 "
               "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
@@ -2139,13 +2302,14 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
                '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
     packet = {'mode': mode, 'config': config, 'execute': execute, 'source': source,
-              'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause}
+              'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause,
+              'keep_state': keep_state, 'evidence_dir': evidence_dir}
     done = run(command, input=json.dumps(packet), capture_output=True, text=True, timeout=900)
     require(done.returncode == 0, 'SSH lifecycle failed: ' + done.stderr[-2000:] + done.stdout[-2000:])
     return json.loads(done.stdout)
 
 
-def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=None):
+def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
     require(mode in ('status', 'preflight') or execute, 'Runtime mutation needs explicit --execute; tests inject fakes')
     if mode.startswith('ledger-'):
         return Ledger(config['ledger'], config['host'], config['owner'], config['token']).operate(
@@ -2155,6 +2319,8 @@ def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=N
         return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
     if mode == 'watchdog-serve':
         return tool.watchdog_serve()
+    if mode == 'down':
+        return tool.down(keep_state=keep_state, evidence_dir=evidence_dir)
     return getattr(tool, mode)()
 
 
@@ -2171,23 +2337,25 @@ def remote_main(packet):
         globals()['_LEDGER_BRIDGE'] = bridge
         try:
             value = dispatch(packet['mode'], packet['config'], packet['execute'],
-                             packet.get('watchdog_rounds'), packet.get('watchdog_pause'))
+                             packet.get('watchdog_rounds'), packet.get('watchdog_pause'),
+                             packet.get('keep_state', False), packet.get('evidence_dir'))
             print(json.dumps({'lifecycle_result': value}), flush=True)
         except BaseException as error:
             print(json.dumps({'lifecycle_error': str(error)}), flush=True)
     else:
         print(json.dumps(dispatch(packet['mode'], packet['config'], packet['execute'],
-                                  packet.get('watchdog_rounds'), packet.get('watchdog_pause'))))
+                                  packet.get('watchdog_rounds'), packet.get('watchdog_pause'),
+                                  packet.get('keep_state', False), packet.get('evidence_dir'))))
 
 
 def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
-                    watchdog_rounds=None, watchdog_pause=None):
+                    watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
     # SSH exec is always non-login/noninteractive (-T, explicit MSI pwsh -NoProfile).
     # 1312 is a pre-launch Windows logon failure: retry ONCE, never replay a claim/Up.
     for attempt in range(2):
         try:
             return _forward_windows_once(host, mode, config, execute, popen, ledger_factory,
-                                          watchdog_rounds, watchdog_pause)
+                                          watchdog_rounds, watchdog_pause, keep_state, evidence_dir)
         except Refused as error:
             if not (attempt == 0 and getattr(error, 'transport_not_started', False)
                     and 'CreateProcessAsUserW failed: 1312' in str(error)):
@@ -2195,7 +2363,7 @@ def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_
 
 
 def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
-                          watchdog_rounds=None, watchdog_pause=None):
+                          watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
     """Windows cmd-default SSH transport, with Linux-authoritative ledger RPC.
 
     No Windows SSH keys or copied ledger. Both sides retain the same durable token.
@@ -2233,7 +2401,8 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
     try:
         process.stdin.write(json.dumps({'mode': mode, 'config': config, 'execute': execute,
                                        'source': source, 'ledger_bridge': True,
-                                       'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause}) + '\n')
+                                       'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause,
+                                       'keep_state': keep_state, 'evidence_dir': evidence_dir}) + '\n')
         process.stdin.flush()
         while True:
             remaining = end - time.monotonic()
@@ -2302,12 +2471,20 @@ def main(argv=None):
     parser.add_argument('--ssh', help='executor host (remote login shell PowerShell 7)')
     parser.add_argument('--rounds', type=int, default=None, help='watchdog polls (default: the config, else 1)')
     parser.add_argument('--pause', type=float, default=None, help='seconds between watchdog polls')
+    parser.add_argument('--keep-state', action='store_true',
+                        help='down: keep the run\'s copies (work_root, state snapshots) for debugging; only when asked')
+    parser.add_argument('--evidence-dir', help='down: where the files the run wrote are copied before the prune '
+                        '(default <state_dir>/evidence; eden_test.py passes the run\'s out/)')
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text())
         require(args.mode in ('status', 'preflight') or args.execute, 'up/down require explicit --execute')
-        value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause)
-                 if args.ssh else dispatch(args.mode, config, args.execute, args.rounds, args.pause))
+        require(args.mode == 'down' or not (args.keep_state or args.evidence_dir),
+                '--keep-state and --evidence-dir are down options')
+        options = {'keep_state': args.keep_state, 'evidence_dir': args.evidence_dir}
+        value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause,
+                         **options)
+                 if args.ssh else dispatch(args.mode, config, args.execute, args.rounds, args.pause, **options))
         if isinstance(value, dict) and args.mode in ('preflight', 'watchdog', 'watchdog-serve'):
             for line in value.get('lines') or []:
                 print(line, file=sys.stderr)

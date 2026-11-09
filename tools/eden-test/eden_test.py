@@ -7,11 +7,14 @@ after `git -C ~/ssbu-mod-playbook pull --ff-only` there and copying the rows fol
   eden_test.py new  --from <previous config.json> --label lr-14 --rows <rows folder>   new run folder + config
   eden_test.py up   <run folder>        offline dry run, then lifecycle up
   eden_test.py run  <run folder> [--retry]   runner (with --retry: clear STOP-INPUT first; passed rows skip)
-  eden_test.py down <run folder>        lifecycle down, harvest, RESULTS.md, timing.json
+  eden_test.py down <run folder> [--keep-state]   lifecycle down (and its prune), harvest, RESULTS.md, timing.json
   eden_test.py all  --from ... --label ... --rows ...   new + up + run + down (down always runs)
 
 A run folder is /home/intpa/eden-runs/<label>/ with config.json, rows/ (a copy of the rows folder), state/ and
-work/ (fresh every run), out/ (runner output) and RESULTS.md. Pins (Eden AppImage, plugins, files, game) carry over
+work/ (fresh every run), out/ (runner output) and RESULTS.md. A clean `down` copies the files the run wrote into
+out/post-run-<key>/ and prunes work/ and the state snapshots (about 3 GB a run); state/ keeps the journal and the
+run-<key>/ logs, and RESULTS.md's `Prune:` line gives the bytes. `--keep-state` skips the prune, only when asked.
+Pins (Eden AppImage, plugins, files, game) carry over
 from the previous config unchanged; `new` checks each pinned file still has its sha256, `--app` swaps in a
 different Eden AppImage and `--plugin <new build>` swaps the pinned plugin with the same file name (resolved path;
 sha256 read; the swap is recorded in config.json `plugin_swaps`). `--defer-load` leaves the frontend ready so rows
@@ -139,11 +142,11 @@ def cmd_new(args):
     return run
 
 
-def lifecycle(run, mode):
+def lifecycle(run, mode, *extra):
     config = json.loads((run / 'config.json').read_text())
     if config.get('host') not in ('surface', 'yoga', 'xps', 'ally'):
         raise SystemExit('config host must be surface, yoga, xps or ally')
-    argv = [sys.executable, '-B', '-I', str(LIFECYCLE), mode, str(run / 'config.json'), '--execute']
+    argv = [sys.executable, '-B', '-I', str(LIFECYCLE), mode, str(run / 'config.json'), '--execute', *extra]
     return sh(argv, run / f'lifecycle-{mode}.log')
 
 
@@ -348,6 +351,25 @@ def harvest_summary(run):
     return ', '.join(f'{key} {len(value) if isinstance(value, list) else value}' for key, value in data.items())
 
 
+def prune_summary(run, journal):
+    """The Down's prune receipt (the journal's `prune`, written by lifecycle.py): what it freed, where the files the
+    run wrote went, or why work/ and state/ are still there."""
+    prune = journal.get('prune')
+    if not prune:
+        return 'not run: work/ and state/ stay until a clean Down'
+    if prune.get('kept') and not prune.get('done'):
+        return 'kept (--keep-state): work/ and state/ stay until a Down without it'
+    where = Path(prune.get('evidence', '?'))
+    where = where.relative_to(run) if run in where.parents else where
+    if not prune.get('done'):
+        saved = f'; the run\'s files are in {where}/post-run-*/' if prune.get('evidence_saved') else ''
+        return 'FAILED: ' + one_line(prune.get('error'), 120) + saved
+    df = (prune['disk_free_after'] - prune['disk_free_before']) / 10 ** 9
+    return (f'{prune["unique_bytes"] / 10 ** 9:.1f} GB freed of {prune["bytes"] / 10 ** 9:.1f} GB of copies (df {df:+.1f} GB); '
+            f'{prune["copied_files"]} files the run wrote in {where}/post-run-*/, {prune["listed_files"]} listed only'
+            + (f'; {len(prune["skipped"])} skipped' if prune.get('skipped') else ''))
+
+
 def results_md(run, config):
     passed, failed, unrun, retained = row_accounting(run)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
@@ -370,6 +392,7 @@ def results_md(run, config):
         lines.append(f'  - unrun: {one_line(", ".join(unrun), 160)}')
     lines += [one_line(f'- Down: cleanup_failures={journal.get("cleanup_failures")}, released={journal.get("released")}; '
                        + '; '.join(unit_results(run)), 240),
+              one_line(f'- Prune: {prune_summary(run, journal)}', 240),
               f'- Harvest: {harvest_summary(run)}',
               f'- Timing: up {timing.get("up_done", 0) - timing.get("up_start", 0):.0f} s, rows {rows_seconds:.0f} s over '
               f'{max(len(runs), 1)} run call(s), down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s',
@@ -396,11 +419,12 @@ def restore_up_config(run):
     return aside
 
 
-def cmd_down(run):
+def cmd_down(run, keep_state=False):
     restore_up_config(run)
     config = json.loads((run / 'config.json').read_text())
     stamp(run, 'down_start')
-    code = lifecycle(run, 'down')
+    # A clean Down copies the files the run wrote to out/post-run-<key>/, then prunes work/ and the state snapshots.
+    code = lifecycle(run, 'down', '--evidence-dir', str(run / 'out'), *(['--keep-state'] if keep_state else []))
     stamp(run, 'down_done')
     done = subprocess.run([sys.executable, '-B', '-I', str(HARVEST), str(run / 'rows' / 'rows.json'),
                            '--label', config['label'], '--out', str(run / 'out')], capture_output=True, text=True)
@@ -424,8 +448,11 @@ def main(argv=None):
                        help='swap the pinned plugin with this file name for this build (repeatable; sha256 is read)')
         p.add_argument('--defer-load', action='store_true',
                        help='leave the frontend ready so rows can configure boot tracing before game.load')
-    for name in ('down', 'pace'):
-        sub.add_parser(name).add_argument('run', type=Path)
+    sub.add_parser('pace').add_argument('run', type=Path)
+    p = sub.add_parser('down')
+    p.add_argument('run', type=Path)
+    p.add_argument('--keep-state', action='store_true',
+                   help='keep work/ and the state snapshots for debugging (only when asked); a later down prunes them')
     p = sub.add_parser('up')
     p.add_argument('run', type=Path)
     p.add_argument('--skip-setup-plan', action='store_true',
@@ -441,7 +468,7 @@ def main(argv=None):
     elif args.mode == 'run':
         return cmd_run(args.run.resolve(), args.retry)
     elif args.mode == 'down':
-        cmd_down(args.run.resolve())
+        cmd_down(args.run.resolve(), args.keep_state)
     elif args.mode == 'pace':
         return cmd_pace(args.run.resolve())
     elif args.mode == 'all':

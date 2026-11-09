@@ -338,6 +338,10 @@ bounded cleanup can still restore/verify/release, but does not establish
 graceful shutdown or waive a fatal console tail. Non-empty `cleanup_failures`,
 unequal verification or an unreleased claim always mean cleanup failure.
 
+**A clean Down prunes the run's copies** (2026-11-09): the files the run wrote go to `out/post-run-<key>/`, then
+`work/`, `state/snapshot-*` and `state/post-run-*` are deleted, with the bytes in RESULTS.md's `Prune:` line;
+`--keep-state` keeps them, only when asked. Up refuses below 60 GB free (`disk_floor_bytes`; it was 40 GB).
+
 **AppImage backing processes must outlive Eden's main process.** lr-09's
 group-wide SIGTERM removed its FUSE mount while Eden still ran, producing
 main-process SIGBUS and a LAN helper Go fault. Shared lifecycle guest units
