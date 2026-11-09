@@ -11,6 +11,11 @@ For a hook-lock hang, [BUILD](BUILD.md) requires hook/thread reach review and
 traced thread/core evidence for any MainThread-only exception. Hang diagnosis
 can enable `core.use_gdbstub` before load and dump all threads; **GDB stub
 and guest tracing cannot run together**. An unreached hook remains exposed.
+Suspect a hook-lock hang when Eden stays alive but frames and all plugin logs
+stop: look for a spinning core, a hook in Arbitration waiting on its lock, and
+the plugin lock holder runnable but never scheduled. Dump every thread with
+`/home/intpa/smash-training-lobby/artifacts/phase23/rc6-eden/rows-hang-qp/gdbdump.py`
+(after verifying that historical helper's current path and identity).
 
 | Build capability | Evidence/limit |
 | --- | --- |
