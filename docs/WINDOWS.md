@@ -97,5 +97,5 @@ Job fallback. **A fresh Down process** proves no owned PID/task, post-run
 preservation, private/source equality and own release. Compare deployed
 source/binary hashes with the tested candidate. Offline suites qualify no
 additional live paths. Exact bases, counts, attempts, raw paths and HOLD
-scope remain in [qualification history](../tools/eden-lifecycle/README.md).
+scope remain in [qualification history](history/LIFECYCLE-QUALIFICATION-2026-11.md).
 Implementation: [WindowsHost and SSH bridge](../tools/eden-lifecycle/lifecycle.py).

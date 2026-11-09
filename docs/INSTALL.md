@@ -72,6 +72,6 @@ and that the user can disconnect. Keep per-file phases, rollback/readback
 and final verification evidence. [RELEASE](RELEASE.md) covers publication.
 
 The Switch scripts' fake-card suites and historical read-only/loop-image
-checks are documented in [provenance history](../tools/PROVENANCE.md).
+checks are documented in [provenance history](history/PROVENANCE-2026-10-31--11-07.md).
 They do not prove a new physical-card operation or grant current authority.
 Remount-era provenance is superseded by the no-remount rule above.

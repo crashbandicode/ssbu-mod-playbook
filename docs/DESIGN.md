@@ -24,7 +24,7 @@ list each approved workaround with its approval date in the evidence doc.
 When defects share a native field, assumption or lifecycle step, first
 consider one abstraction that owns the cause. Report whether that
 abstraction or separate fixes were chosen, and why. The dated copy-registry
-example is in [incident history](WORKFLOW.md).
+example is in [incident history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
 
 Every user-facing refusal added by the branch cites an approved restriction.
 This includes ordinary refusals such as busy or a loading save state, as well

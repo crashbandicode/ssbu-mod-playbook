@@ -80,4 +80,4 @@ Keep NROs, exported run files, receipts/logs/reports under their run label.
 
 Implementation: [clone, pin, stage and snapshot functions](../tools/eden-lifecycle/lifecycle.py).
 Historical paths, digests and the ARCropolis incident are in
-[host history](WORKFLOW.md).
+[host history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).

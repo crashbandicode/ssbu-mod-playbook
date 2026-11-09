@@ -82,4 +82,4 @@ Compare timestamps as UTC using `[DateTimeOffset]::Parse(...)`; PowerShell
 `[DateTime]'...Z'` converts to local time. Shutdown health and fatal tails
 remain separate from successful restoration. Exact null-read incidents,
 build chronology and historical host locations are in
-[host history](WORKFLOW.md).
+[host history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
