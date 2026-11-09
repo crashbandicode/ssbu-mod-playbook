@@ -10,11 +10,7 @@ record-ui-demo is shared here. It then puts one pointer block, between
 markers so it can be re-run, into ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md
 and ~/.config/opencode/AGENTS.md, and writes the Cursor rule
 ~/.cursor/rules/ssbu-mod-playbook.mdc. A real directory already at a link's
-place is reported and left alone. --check reports without changing anything.
-
-Operator order: leave all outside-repo instruction files unchanged, including
-CLAUDE.md and AGENTS.md. Do not run this installer to write their pointer blocks;
---check is permitted."""
+place is reported and left alone. --check reports without changing anything."""
 import argparse
 import os
 import sys
@@ -34,14 +30,10 @@ POINTER = f"""{START}
 
 For any work on a Super Smash Bros. Ultimate Skyline plugin (creating,
 changing, testing, validating, releasing or installing one, or driving Eden
-to test one), follow the `{NAME}` skill: update `{{repo}}` with
-`git pull --ff-only` and record its commit. Before work, every agent reads
-`docs/START.md`, `docs/CHECKLIST.md`, and the concern pages its task touches
-completely. START names pages per task; `history/` is read on demand.
-Every worker does its own reading and checklist. Read tool scripts before
-running or copying them, work through every M and applicable C item, and run
-`tools/check/compliance.py` with the branch base, design trace and explicit
-shipped NRO before declaring the work done.
+to test one), follow the `{NAME}` skill: pull and read
+`{{repo}}` completely (README.md, every file in docs/,
+tools/PROVENANCE.md) before changing code, work through docs/CHECKLIST.md,
+and run tools/check/compliance.py before declaring the work done.
 {END}
 """
 CURSOR_RULE = """---

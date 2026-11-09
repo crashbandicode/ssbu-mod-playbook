@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy what a run proved into the shared library (TEST-PLAN rule 7).
+"""Copy what a run proved into the shared library (MACROS "Test runs", rule 7).
 
   harvest.py <rows.json> --label lr-03 [--out <runner out folder>] [--dry-run]
 
