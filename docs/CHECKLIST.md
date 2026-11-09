@@ -39,13 +39,13 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M27 | M | [Restore the run-owned profile and release only after separate verification](LIFECYCLE.md). |
 | M28 | M | [Review panic/abort/crash/Unmapped and native pointer types](TRACING.md); retain console, run identity and memory evidence. |
 | M29 | M | Bound [every local command by memory/time](START.md); put `${var}` use in a script file. |
-| M30 | M | Keep [each run's outputs under its own label](WORKFLOW.md). |
-| M31 | M | Write the [short README with whole-screen1280-wide <10s GIF](WORKFLOW.md), dated build caption, install/build/license/AI lines. |
-| M32 | M | Keep [dated build/run/behavior/log evidence](WORKFLOW.md); row receipts and <=20-line RESULTS feed one phase compliance report. |
+| M30 | M | Keep [each run's outputs under its own label](EVIDENCE.md). |
+| M31 | M | Write the [short README with whole-screen1280-wide <10s GIF](EVIDENCE.md), dated build caption, install/build/license/AI lines. |
+| M32 | M | Keep [dated build/run/behavior/log evidence](EVIDENCE.md); row receipts and <=20-line RESULTS feed one phase compliance report. |
 | M33 | M | [Group every reachable open row into as few boots as possible](TEST-PLAN.md); split only for stated build/host/profile/boot needs. |
 | M34 | M | [Continue reachable rows after failures](TEST-RUN.md); recover/check start state, defer with cause, stop safely on unrecoverable state/crash. |
-| M35 | M | Make [no unsupported claims](WORKFLOW.md); keep operator quotes out of shipped docs, with the working-design trace exception. |
-| M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](WORKFLOW.md), with no secrets. |
+| M35 | M | Make [no unsupported claims](EVIDENCE.md); keep operator quotes out of shipped docs, with the working-design trace exception. |
+| M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](EVIDENCE.md), with no secrets. |
 | M37 | M | [Only the user connects/disconnects or controls DBI/UMS](WORKFLOW.md); agents never mount/unmount/eject/remount/power off media. |
 | M38 | M | Obtain [explicit action-specific orders](WORKFLOW.md) before push/tag/release/card writes; report lack of authorization. |
 | M39 | M | Use [Forgejo and temporary UTF-8 commit-message files](START.md); no GitHub publication or unordered push. |
@@ -53,7 +53,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M41 | M | [Every agent/worker reads START+CHECKLIST+task pages](START.md), records playbook commit, makes its checklist and runs compliance before READY. |
 | M42 | M | [Hooks never wait on a plugin thread](BUILD.md); preserve the new base's exact nonblocking contract. |
 | M43 | M | Declare an [empty diag feature and keep working tree clean](BUILD.md); retain these code-only checker obligations. |
-| M44 | M | Retain [exact build/shipped-NRO identity](WORKFLOW.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
+| M44 | M | Retain [exact build/shipped-NRO identity](EVIDENCE.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
 | M45 | M | [Pin resolved build paths and matching trace symbols](PROFILES.md); disclose mixed builds and separate client identity from app pins. |
 | M46 | M | [Snapshot before staging; mute/save/read back before load](LIFECYCLE.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
 | M47 | M | [Stop Linux main before FUSE/backing processes](LINUX-DOWN.md), using owned birth identity/pidfd and fail-closed claim retention. |
@@ -62,7 +62,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M50 | M | Respect [input lease/recording/hash/edit invariants](MACROS.md); incomplete recordings cannot become passing media. |
 | M51 | M | Budget [rows+boot/navigation+route work under runtime minus margin](TEST-PLAN.md); order wedge/crash/teardown checks last. |
 | M52 | M | [Review actual behavior and settled HUD state](RUNNER.md); fixture applied, bareTrue and clip saved do not prove behavior. |
-| M53 | M | [Ban extracted game/mod assets and dumps from git](WORKFLOW.md); reviewed evidence screenshots and required reference crops are allowed. |
+| M53 | M | [Ban extracted game/mod assets and dumps from git](EVIDENCE.md); reviewed evidence screenshots and required reference crops are allowed. |
 | M54 | M | Treat [cleanup success separately from graceful/native health](LINUX-DOWN.md); inspect unit/console fatal tails and qualification limits. |
 | M55 | M | Stop only [owned displays/processes/paths](LIFECYCLE.md); ambiguous identity or failed restore/verify retains claim for recovery. |
 | M56 | M | Follow [60GB pre-Up admission and verified-clean-Down pruning](HOSTS.md); preserve receipts/logs/reports and failed-cleanup recovery state, never foreign copies. |
@@ -71,8 +71,8 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C03 | C | Online code passes [same replay A/B](ONLINE.md), identical detector values and positions. |
 | C04 | C | Online-only paths need [both-detector two-console proof](ONLINE.md) through later sessions, desync0 at matching frame. |
 | C05 | C | Mods need [pinned ARCropolis and native-screen mod proof in that boot](PROFILES.md). |
-| C06 | C | Log-derived numbers come from [committed host-tested scripts](WORKFLOW.md), with the regeneration command beside them. |
-| C07 | C | Asset claims need [decoded expected/frame/stock comparison](WORKFLOW.md); rule out stock without committing extracted sources. |
+| C06 | C | Log-derived numbers come from [committed host-tested scripts](EVIDENCE.md), with the regeneration command beside them. |
+| C07 | C | Asset claims need [decoded expected/frame/stock comparison](EVIDENCE.md); rule out stock without committing extracted sources. |
 | C08 | C | A changed recorded decision needs [document/item/date citation, disclosed reversal and updated original record](DESIGN.md). |
 | C09 | C | Authorized release needs [minor bump, annotated tag, required assets and anonymous hash verification](WORKFLOW.md). |
 | C10 | C | Release must have a [byte-identical rebuild of the tagged commit](WORKFLOW.md). |

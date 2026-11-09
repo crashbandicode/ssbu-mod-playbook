@@ -44,7 +44,7 @@ replacement, pin the **card's `libarcropolis.nro`**. Without it the isolated
 plugin list loads stock assets. Before judging the plugin's view, prove the
 mod loaded on the game's own screen in the **same boot**; a stage uses the
 native stage select. Retain the config pin and native-screen proof. Decode
-expected and stock art for visual claims as required by [EVIDENCE](WORKFLOW.md).
+expected and stock art for visual claims as required by [EVIDENCE](EVIDENCE.md).
 
 Down stops all owned processes before restoring set-aside NROs, saves,
 replays and the complete snapshot; a separate full verification precedes

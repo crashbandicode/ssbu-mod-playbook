@@ -91,6 +91,6 @@ not waive SIGBUS/panic/fatal console tails or prove graceful `game.stop`.
 
 Keep `lifecycle.json`, `actions.jsonl`, dry-run/snapshot/restore/verify receipts,
 run console/control logs and `instances.json` mappings/source aliases. Keep
-`run.json`/`memory.peak` and [evidence](WORKFLOW.md) under the run label.
+`run.json`/`memory.peak` and [evidence](EVIDENCE.md) under the run label.
 Current mechanics: [lifecycle.py](../tools/eden-lifecycle/lifecycle.py);
 dated coverage/limits: [qualification history](../tools/eden-lifecycle/README.md).
