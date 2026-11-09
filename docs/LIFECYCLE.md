@@ -4,7 +4,7 @@ Use [TEST-PLAN](MACROS.md) and [TEST-RUN](MACROS.md) for product rows;
 `tools/eden-test/eden_test.py` is the run entry. The lifecycle owns isolation,
 claims, bounded launch and cleanup. Up/Down/status do not send project input,
 play macros or implement rows; an explicitly declared watchdog park is the
-limited [WATCHDOG](../tools/eden-lifecycle/README.md) exception and grants no new input authority.
+limited [WATCHDOG](WATCHDOG.md) exception and grants no new input authority.
 
 ```text
 python3 -B -I tools/eden-lifecycle/lifecycle.py preflight config.json

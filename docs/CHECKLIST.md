@@ -87,7 +87,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C19 | C | Windows cleanup uses [named pipes and exact session Job/task/PID identities](WINDOWS.md);1312 retry once only before admission. |
 | C20 | C | Windows qualification needs [new grant/queue/current identities/fresh-process evidence](WINDOWS.md); no-row/HOLD/offline proof grants no gameplay acceptance. |
 | C21 | C | Optional [stale-claim admission](LIFECYCLE.md) preserves every fail-closed predicate/receipt; never releases a foreign claim. |
-| C22 | C | Declared [watchdog state/probe/detector/park/sidecar](../tools/eden-lifecycle/README.md) keeps40-line-window and idle-vs-demo distinctions; safe label alone does nothing. |
+| C22 | C | Declared [watchdog state/probe/detector/park/sidecar](WATCHDOG.md) keeps40-line-window and idle-vs-demo distinctions; safe label alone does nothing. |
 | C23 | C | Macro editing obeys [frame/sample/game/player/press-release/replay/hash limits](MACROS.md), without savestate assumptions. |
 | C24 | C | GIF capture follows [distinct README/evidence envelopes, reasons/status/timing/frame review](GIFS.md); removals need comparable before/after clips. |
 | C25 | C | Image/hook gates preserve [static/tolerance/scaling/ROI/evidence/REVIEW semantics](MACROS.md); unchecked/bareTrue alone prove neither start state nor behavior. |
