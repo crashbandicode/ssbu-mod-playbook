@@ -121,3 +121,14 @@ to the frame, and ruled out stock. The caption example was Eden,
 screenshots/reference crops, while extracted assets, data.arc and dumps
 remain excluded from git; the old blanket game-derived-image wording is
 superseded by the approved scope in [EVIDENCE](../EVIDENCE.md).
+
+## Precondition retry and replay examples
+
+`docs/EDEN.md:373-380` at `87b3de0` recorded Judge-log's 30-second
+wait for `gamewatch session=` and exit 2 when absent, so a wrong fighter
+cost a short abort rather than a full match. The capped retry batch used
+the next label and obtained **10 valid matches in 11 tries on 2026-10-30**;
+`tools/eden-solo/examples/retry-batch.ps1` retained that historical loop.
+`docs/CHECKLIST.md:108-109` recorded **four replay A/Bs**, including a
+replay without the plugin's fighter that emitted only its install line.
+These are examples, not replacement coverage requirements or current results.

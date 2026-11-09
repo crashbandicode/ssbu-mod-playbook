@@ -16,7 +16,7 @@ and guest tracing cannot run together**. An unreached hook remains exposed.
 | --- | --- |
 | Since `20261031-…` | One-shot `tracepoint.*`; on older builds this is the available form. |
 | Since `20261103-063f1b80bb2c-persistent-tracing-…` | Persistent points and JSONL; old unmapped logs can be sampled, without exact fault PC. |
-| Since `20261104-f916cf4b8c68` unmapped-stop | `unmapped_access:"log"` counts every guest data access, exact PC/module; first 16 then powers of two emit. Save total/emitted/suppressed receipt. |
+| Since `20261104-f916cf4b8c68` unmapped-stop | `unmapped_access:"log"` counts every guest unmapped data access, exact PC/module; first 16 then powers of two emit. Save total/emitted/suppressed receipt. |
 | Direct fault API | Stops first access anywhere, including stock; use only to inspect registers for an access already found. Lifecycle config accepts **log/off only**. |
 
 Check the **pinned build's** `docs/GUEST_TRACEPOINT.md`, `CLIControl.md` and

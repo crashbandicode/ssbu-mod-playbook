@@ -222,3 +222,15 @@ live check, not a new boot authorized by this task. No host/ledger query,
 input, row, live-unit change or push/tag/release/card/DBI action occurred in
 that correction task. Runtime hard-cap/crash interruption was not newly
 qualified by offline tests. (T:44–48.)
+
+## Watchdog probe observation, 2026-11-07
+
+`docs/EDEN.md:126-145` and lifecycle README:71-90 at `87b3de0`
+recorded a Surface boot that never printed `[FrameStrip] shown=`.
+TrainingRooms' diag `[FrameStrip] p1 status=` line was emitted when
+Player 1's busy status changed, not continuously. A state remained safe
+only while a matching line remained among the last 40 lines; a change-only
+line could not promise ongoing visibility after scrolling. The release
+build printed no such line. Its advice was demo detectors and a longer
+declared idle interval, not assuming the diag probe would work there.
+Current window/detector/idle contracts live in [WATCHDOG](../WATCHDOG.md).
