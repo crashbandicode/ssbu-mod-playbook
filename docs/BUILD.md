@@ -3,7 +3,7 @@
 Use a working plugin's small layout: pure, host-tested logic in `model.rs`
 (or `model/`), Switch hooks and install code in `runtime.rs` under
 `#[cfg(target_os = "switch")]`. `lib.rs` declares the modules. Reuse reviewed
-`share.rs`/`chain.rs` where appropriate; [HOOKS](WORKFLOW.md) covers site safety.
+`share.rs`/`chain.rs` where appropriate; [HOOKS](HOOKS.md) covers site safety.
 
 Required build configuration:
 

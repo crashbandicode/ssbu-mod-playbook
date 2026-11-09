@@ -19,10 +19,10 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M07 | M | Fix [root causes](DESIGN.md); approve/date any workaround before shipping and assess one shared abstraction. |
 | M08 | M | Every added [user-facing refusal](DESIGN.md) cites a nearby restriction ID with genuine recorded operator approval. |
 | M09 | M | Before code, [trace every verbatim operator clause](DESIGN.md) to design and existing proving tests; prove parity in shared cases. |
-| M10 | M | [Install nothing unless game13.0.5](WORKFLOW.md); log unsupported-version outcome. |
-| M11 | M | Apply [64-byte guards to every hook/called/relied site](WORKFLOW.md); log and leave mismatches alone with sharing exceptions. |
-| M12 | M | [Scan a dated card copy before site selection](WORKFLOW.md), including virtual slots; scan absence is not runtime proof. |
-| M13 | M | [Call the game function or hook its most specific post-prologue instruction](WORKFLOW.md). |
+| M10 | M | [Install nothing unless game13.0.5](HOOKS.md); log unsupported-version outcome. |
+| M11 | M | Apply [64-byte guards to every hook/called/relied site](HOOKS.md); log and leave mismatches alone with sharing exceptions. |
+| M12 | M | [Scan a dated card copy before site selection](HOOKS.md), including virtual slots; scan absence is not runtime proof. |
+| M13 | M | [Call the game function or hook its most specific post-prologue instruction](HOOKS.md). |
 | M14 | M | Keep [diag code, diag.txt and stand-in markers out of shipped NRO](BUILD.md). |
 | M15 | M | Ship [install-line-only logging](BUILD.md), with the C13 logging-product exception and no per-frame diagnostics. |
 | M16 | M | [Claim before Up; Down after failure too](EDEN.md); retain the claim until owned cleanup/restore/separate verify succeed. |
