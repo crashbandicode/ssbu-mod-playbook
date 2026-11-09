@@ -80,7 +80,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C12 | C | Multi-worker work needs [persistent sessions/routes, no context actions, done-checklists,<=60s polls, deadlines/stall alerts and direct acceptance](WORKERS.md). |
 | C13 | C | A logging product may ship [its data files as well as install line](BUILD.md), without per-frame diagnostics. |
 | C14 | C | Shared owners implement [ABI/election/early-late registration/hook-only guest service and per-site logs](HOOK-SHARING.md). |
-| C15 | C | Foreign hooks obey [far/branch/stub/trampoline/called-relied/restore rules](HOOK-SHARING.md); both plugin and stand-in counters keep running. |
+| C15 | C | Foreign hooks obey [far/branch/stub/trampoline/called-relied/restore rules](HOOK-CHAIN.md); both plugin and stand-in counters keep running. |
 | C16 | C | Windows work uses [fresh private/source roots, exact MSI/session/SID/helper pins and unchanged source verification](../tools/eden-lifecycle/README.md). |
 | C17 | C | Windows guests need [launch-once token tasks and bounded8GiB-commit/256-process/kill-on-close Jobs](../tools/eden-lifecycle/README.md). |
 | C18 | C | Windows firewall changes are [explicitly authorized token Block-only](../tools/eden-lifecycle/README.md); no Allow edits/prompt dismissal/implicit hosting authority. |

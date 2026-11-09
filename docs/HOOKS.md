@@ -11,7 +11,7 @@ low-half-first MOVZ/MOVK pair within eight instructions; its nearby range
 applies to that pair recognition. It does not find every computed offset,
 MOVZ/ORR-free form or plugin added after the snapshot. A quiet scan is not
 runtime safety proof. [HOOK-SHARING](HOOK-SHARING.md) and
-[HOOK-CHAIN](HOOK-SHARING.md) govern sharing, foreign hooks and load orders.
+[HOOK-CHAIN](HOOK-CHAIN.md) govern sharing, foreign hooks and load orders.
 
 Install nothing unless the game reads `13.0.5`; otherwise log
 `result=unsupported_version`. Guard 64 bytes at every hooked site, every

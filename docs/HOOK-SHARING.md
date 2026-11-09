@@ -33,7 +33,7 @@ guards the shared site and refuses only when the owner could not hook it.
 Registration must work both before and after the owner's `main`:
 
 - Before `main`, check the version and read the original site, accepting
-  the stock or valid foreign forms under [HOOK-CHAIN](HOOK-SHARING.md).
+  the stock or valid foreign forms under [HOOK-CHAIN](HOOK-CHAIN.md).
 - After `main`, answer from stored per-site state (hooked versus not
   hooked), rather than re-reading the owner's own patched bytes. Keep the
   equivalent of a `HOOKED` flag; a fresh guard would reject later guests.
@@ -49,7 +49,7 @@ The install line records `role=owner … guests=<n>` or
 registered before the owner's `main`; later registrations do not make the
 boot count a total. A multi-site plugin logs each site's role separately.
 
-Prove both load orders and the [foreign stand-ins](HOOK-SHARING.md) in Eden.
+Prove both load orders and the [foreign stand-ins](HOOK-CHAIN.md) in Eden.
 Keep callback activity, owner/guest and hook-only outcomes per site; historical
 passing examples do not qualify a changed implementation. Reusable source
 examples are gsp-visualizer/ssbu-quiet-elite-switch `src/share.rs` and
