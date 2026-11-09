@@ -84,7 +84,10 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   never wait on a plugin thread"). Evidence: a lock-reach test, like
   TrainingRoomsForUltimate's `tests/hook_locks.rs`/`tests/lock_order.rs`,
   passing on the branch and failing on a seeded violation; or the
-  recorded reason none applies (no plugin threads, or no locks).
+  recorded reason none applies (no plugin threads, or no locks). Every
+  hook counts as exposed; only one a trace shows on MainThread alone may
+  be excepted, by name, with the run label and hit counts (never reached:
+  still exposed).
 - **M** No diag code or strings in the shipped NRO (`diag` feature off; no
   `diag.txt` or `standin` strings). Evidence: `compliance.py`.
 - **M** The shipped NRO writes its install line and nothing per frame.

@@ -92,11 +92,14 @@ lock-free mailbox). The plugin side never waits for the game either.
 - **Why:** the game's MainThread waits for some task groups by spinning,
   not sleeping. If such a task runs a hook that waits on a plugin lock,
   and the plugin thread holding it shares MainThread's core, the holder is
-  never scheduled again: the game hangs for good. Horizon doesn't
-  time-slice a lower-priority thread either, so expect the same hang on a
-  console. A hook on MainThread itself frees its core when it
-  waits; the trap is a hook on a worker (TaskWorker) thread. Which thread
-  runs a given hook is rarely known, so treat every hook as exposed.
+  never scheduled again: the game hangs for good. Horizon schedules
+  strictly by priority, so a console is expected to hang the same way; it
+  hasn't been seen on a console yet. A hook on MainThread itself frees
+  its core when it waits; the trap is a hook on a worker (TaskWorker)
+  thread. So every hook counts as exposed unless a trace shows it only
+  ever runs on MainThread. Such a hook may be listed by name in the
+  check's exceptions, with the trace's run label and hit counts. A hook
+  the trace never reached stays exposed.
 - **Seen in TrainingRooms rc.6 (2026-11-09).** The Quickplay
   waiting-area freeze (`rc6-qpf3`, read through the GDB stub):
   - MainThread spun on core 0 in a task join;
