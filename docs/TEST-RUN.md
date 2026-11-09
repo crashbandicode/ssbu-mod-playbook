@@ -35,11 +35,12 @@ rows (`--rows failed` / wrapper `--retry`); PASS receipts are skipped.
 with reasons and evidence paths. Fix the batch together; do not reboot per bug.
 
 Poll `pace` and the runner log until completion, in steps <=60 seconds.
+Retain the `setup` list and `pace:` output as evidence of the pace budget.
 `pace` reports hand-driven inputs outside recording, minus runner hook inputs;
 time since a newly passed row; and time left to the config runtime cap.
 It prints STOP/exits 2 past **40 inputs**, **15 minutes without progress**,
-or **5 minutes before the cap**. On STOP near cap, Down. Otherwise stop
-steering, apply a fixture, record the missing route once, or Down and fix rows.
+or **5 minutes before the cap**. On any pace STOP, **stop steering**. Near the
+cap, Down; otherwise use a fixture, record the route once, or Down and fix rows.
 Clip retakes use a fresh boot. Reporting is partly informational: a wrapper
 run printing pace does not universally enforce its stop. The runner's built-in
 first-row timer starts at runner start and disables after a pass; it does not
