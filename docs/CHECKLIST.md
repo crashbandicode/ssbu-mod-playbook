@@ -16,9 +16,9 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M04 | M | Pass all five [separate Cargo gates](WORKFLOW.md): test, warning-free clippy, no-default, Skyline release and diag. |
 | M05 | M | [Hooks allocate no heap](WORKFLOW.md); use counting allocator and install-line `heap_allocations=0`. |
 | M06 | M | Use [fixed buffers, static writer stack and stack-built file paths](WORKFLOW.md). |
-| M07 | M | Fix [root causes](WORKFLOW.md); approve/date any workaround before shipping and assess one shared abstraction. |
-| M08 | M | Every added [user-facing refusal](WORKFLOW.md) cites a nearby restriction ID with genuine recorded operator approval. |
-| M09 | M | Before code, [trace every verbatim operator clause](WORKFLOW.md) to design and existing proving tests; prove parity in shared cases. |
+| M07 | M | Fix [root causes](DESIGN.md); approve/date any workaround before shipping and assess one shared abstraction. |
+| M08 | M | Every added [user-facing refusal](DESIGN.md) cites a nearby restriction ID with genuine recorded operator approval. |
+| M09 | M | Before code, [trace every verbatim operator clause](DESIGN.md) to design and existing proving tests; prove parity in shared cases. |
 | M10 | M | [Install nothing unless game13.0.5](WORKFLOW.md); log unsupported-version outcome. |
 | M11 | M | Apply [64-byte guards to every hook/called/relied site](WORKFLOW.md); log and leave mismatches alone with sharing exceptions. |
 | M12 | M | [Scan a dated card copy before site selection](WORKFLOW.md), including virtual slots; scan absence is not runtime proof. |
@@ -73,7 +73,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C05 | C | Mods need [pinned ARCropolis and native-screen mod proof in that boot](EDEN.md). |
 | C06 | C | Log-derived numbers come from [committed host-tested scripts](WORKFLOW.md), with the regeneration command beside them. |
 | C07 | C | Asset claims need [decoded expected/frame/stock comparison](WORKFLOW.md); rule out stock without committing extracted sources. |
-| C08 | C | A changed recorded decision needs [document/item/date citation, disclosed reversal and updated original record](WORKFLOW.md). |
+| C08 | C | A changed recorded decision needs [document/item/date citation, disclosed reversal and updated original record](DESIGN.md). |
 | C09 | C | Authorized release needs [minor bump, annotated tag, required assets and anonymous hash verification](WORKFLOW.md). |
 | C10 | C | Release must have a [byte-identical rebuild of the tagged commit](WORKFLOW.md). |
 | C11 | C | Authorized card work uses [fresh preflight, archives/rollback/readbacks and inspected non-repeated receipts](WORKFLOW.md); single writer, loader last, disconnect after final verify. |
