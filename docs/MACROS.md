@@ -16,7 +16,12 @@ report. Never play the next segment onto an unseen/unchecked screen.
 
 Use tile-cursor/logged settled checks for exact CSS/SSS picks. Menu stick
 bursts can explore a missing segment, then record it once. Do not extend the
-press/screenshot exploration loop into the test itself. Historical sleep
+press/screenshot exploration loop into the test itself. For a missing segment,
+`step.ps1` accepts `b:<button>[+<button>][:wait]`, `s:<x>:<y>:<ms>[:wait]`,
+and `w:<ms>`; inspect its screenshot after every segment. Menu stick pushes
+are 250 ms; `gv.py press` holds for its time plus 500 ms, then releases.
+`gv.py keepalive <label> <stop-file> <seconds>` holds down and taps ZL every
+0.7 s until the stop file; keep it in the one driver's scripted route. Historical sleep
 routes retain only route-shape/discovery value in
 [route history](history/ROUTES-AND-MEDIA-2026-10--11.md).
 
