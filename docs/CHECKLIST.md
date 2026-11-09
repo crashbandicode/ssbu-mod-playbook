@@ -79,6 +79,12 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   the site, with the scan cited.
 - **M** Hook after the prologue, or call the game function instead of
   hooking it; hook the most specific instruction.
+- **M** No game hook blocks on a lock a plugin thread can hold: the hook
+  `try_lock`s or reads a published value ([WORKFLOW](WORKFLOW.md), "Hooks
+  never wait on a plugin thread"). Evidence: a lock-reach test, like
+  TrainingRoomsForUltimate's `tests/hook_locks.rs`/`tests/lock_order.rs`,
+  passing on the branch and failing on a seeded violation; or the
+  recorded reason none applies (no plugin threads, or no locks).
 - **M** No diag code or strings in the shipped NRO (`diag` feature off; no
   `diag.txt` or `standin` strings). Evidence: `compliance.py`.
 - **M** The shipped NRO writes its install line and nothing per frame.

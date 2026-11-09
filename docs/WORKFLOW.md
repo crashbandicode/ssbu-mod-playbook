@@ -81,6 +81,57 @@ protects a site is reading its words at install time, in every load order,
 and logging the result per site, as [HOOK-SHARING](HOOK-SHARING.md)
 describes. Test that path in Eden with the diag stand-ins (`foreign=`).
 
+### Hooks never wait on a plugin thread
+
+A game hook (`#[skyline::hook]` or an inline hook) never blocks on a lock
+that a plugin thread can hold. The hook `try_lock`s and skips its work
+when the lock is busy, or reads a value the plugin side published (an
+atomic, a published copy like TrainingRooms' `hos_lock::Published`, a
+lock-free mailbox). The plugin side never waits for the game either.
+
+- **Why:** the game's MainThread waits for some task groups by spinning,
+  not sleeping. If such a task runs a hook that waits on a plugin lock,
+  and the plugin thread holding it shares MainThread's core, the holder is
+  never scheduled again: the game hangs for good. Horizon doesn't
+  time-slice a lower-priority thread either, so expect the same hang on a
+  console. A hook on MainThread itself frees its core when it
+  waits; the trap is a hook on a worker (TaskWorker) thread. Which thread
+  runs a given hook is rarely known, so treat every hook as exposed.
+- **Seen in TrainingRooms rc.6 (2026-11-09).** The Quickplay
+  waiting-area freeze (`rc6-qpf3`, read through the GDB stub):
+  - MainThread spun on core 0 in a task join;
+  - TaskWorker1 waited in the UI tick hook on the menu lock `EDITED`;
+  - `tr-menu`, holding `EDITED`, was runnable on core 0 and never
+    scheduled.
+
+  It struck after 37, 39 and 70 menu loops in three runs. A Training-entry
+  freeze right after a `mii-catalog` hand-off, into locks the per-frame
+  Mii hooks take, is very likely the same class (no stack yet).
+- **The symptom:** Eden keeps running, but the game stops presenting
+  frames and the plugin's logs stop, its own watchdog's included (its
+  threads starve on the same core).
+- **How to find it:**
+  - Trace the hook with `thread_id` and `core_id` ([EDEN](EDEN.md),
+    "Instrument the running game without rebuilding") to see which game
+    threads run it.
+  - For a hang, boot with Eden's GDB stub (`core.use_gdbstub` before
+    `game.load`; the stub and tracing can't be on together) and dump every
+    thread when it freezes. Look for a core that spins, a hook waiting on
+    its lock (state Arbitration), and a plugin thread that holds the lock,
+    runnable but never scheduled.
+  - `/home/intpa/smash-training-lobby/artifacts/phase23/rc6-eden/rows-hang-qp/gdbdump.py`
+    takes that dump without gdb.
+- **How to check it:** a test that walks the plugin's call graph from
+  every hook and from every plugin thread's entry, and fails when a lock a
+  hook's reach takes blocking is also taken by a plugin thread's reach.
+  - TrainingRoomsForUltimate's `tests/hook_locks.rs` and
+    `tests/lock_order.rs`, on `tests/common/callgraph.rs` (branch
+    `p23/rc6-qp-respawn-freeze`), are the reference.
+  - They follow helpers that take a lock for their caller.
+  - A seeded fixture must fail.
+  - A source scan can't see calls through `dyn`, trait objects or stored
+    closures: list those edges in the test by hand.
+
 ## 3. Log what happened
 
 - **Install line:** one line at boot, to `sd:/ultimate/<plugin>/events.log`

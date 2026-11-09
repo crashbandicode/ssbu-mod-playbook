@@ -52,6 +52,7 @@ AGENT_ROWS = [
     ('Card scan for the site (and vtable slot) over a dated card copy', 'M'),
     ('Hook sharing or chaining; both stand-in modes and load orders in Eden', 'C'),
     ('Hook after the prologue or the function called instead', 'M'),
+    ('Hooks never block on a lock a plugin thread can hold: lock-reach test passing (fails on a seeded violation), or why none applies', 'M'),
     ('Shipped NRO writes only its install line (plus a logging plugin\'s data files)', 'M'),
     ('Online: read-only rules reviewed hook by hook', 'C'),
     ('Online: replay A/B with the desync detector identical', 'C'),
