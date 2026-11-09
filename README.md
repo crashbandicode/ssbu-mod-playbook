@@ -23,8 +23,8 @@ hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
 
 ## Skill and checklist
 
-`skills/ssbu-mod-playbook/SKILL.md` is a thin skill that orders a full read
-of this playbook, a checklist built from [CHECKLIST](docs/CHECKLIST.md) and
+`skills/ssbu-mod-playbook/SKILL.md` requires START, CHECKLIST and the task
+concern pages, history on demand, a checklist built from [CHECKLIST](docs/CHECKLIST.md) and
 `tools/check/compliance.py` before completion. One copy serves the four
 agent tools through symlinks:
 
@@ -42,16 +42,7 @@ machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
 
 ## Delegated workers read it too
 
-The read is per agent, not per project: a primary that has read this
-playbook does not cover the workers it spawns. Every subagent, teammate or
-worker that creates, changes, tests, validates, releases or installs a
-plugin, or drives Eden to test one, reads this playbook completely first
-(`README.md`, every file in `docs/`, `tools/PROVENANCE.md`), builds its own
-checklist from [CHECKLIST](docs/CHECKLIST.md) and runs
-`tools/check/compliance.py` before it reports READY. The brief that spawns
-it says so explicitly, names the clone path and records the commit the worker
-followed. A worker that cannot read the playbook stops and says so instead of
-working from the brief alone.
+Every agent reads [START](docs/START.md), [CHECKLIST](docs/CHECKLIST.md), and the concern pages its task touches before work. History is read on demand. Workers read and build their own checklist; briefs name the clone/commit and require compliance before READY.
 
 ## The short version
 

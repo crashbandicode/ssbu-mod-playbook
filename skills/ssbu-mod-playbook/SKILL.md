@@ -1,57 +1,39 @@
 ---
 name: ssbu-mod-playbook
-description: Use for creating, changing, testing, validating, releasing or installing a Super Smash Bros. Ultimate (13.0.5) Skyline plugin, or for driving Eden to test one. Points at the operator's playbook and its completion checklist.
+description: Use for creating, changing, testing, validating, releasing or installing a Super Smash Bros. Ultimate (13.0.5) Skyline plugin, or driving Eden to test one. Follow the playbook's task reading and completion checklist.
 ---
 
 # SSBU Skyline plugin work
 
-The authoritative instructions are the playbook cloned at
-`~/ssbu-mod-playbook` (`/home/intpa/ssbu-mod-playbook` on the Ubuntu
-machines, `%USERPROFILE%\ssbu-mod-playbook` on Windows; origin
-`https://git.syntaxbyexample.com/intpa/ssbu-mod-playbook`). This skill does
-not restate them. It makes sure they are read and proven.
+Use the authoritative clone at `~/ssbu-mod-playbook`
+(`/home/intpa/ssbu-mod-playbook` on Ubuntu,
+`%USERPROFILE%\ssbu-mod-playbook` on Windows; origin
+`https://git.syntaxbyexample.com/intpa/ssbu-mod-playbook`).
 
-This applies to every agent that touches the plugin, including every
-subagent, teammate or worker you spawn: a parent's read does not cover its
-workers. Put the read order (steps 1–4 below, with the clone path) in every
-delegated brief, and require the worker's own compliance run before its
-READY.
+1. Update the authorized clone with `git pull --ff-only` and record its
+   commit in the project's handoff before changing anything.
+2. Every agent reads `docs/START.md`, `docs/CHECKLIST.md`, and the concern
+   pages its task touches completely. START provides the task matrix;
+   `docs/history/` is read on demand. A parent's read does not cover workers.
+3. Read each tool script before running or copying it. Build a handoff
+   checklist of every M, applicable C and reason for each N/A C.
+4. Every delegated brief names the clone, commit and reading order, requires
+   that worker's own checklist/compliance before READY, and ends with a
+   done-checklist. If the worker cannot read, it stops and reports that.
 
-## Before changing anything
+Follow the concern pages and reuse their tools. Record evidence as gates
+pass, and revisit the checklist after sizeable changes. Keep the handoff
+current. Global instructions and `/home/intpa/.codex/DELEGATION_ROUTING.md`
+own shell, delegation, model/effort and watcher policy.
 
-1. Bring the clone up to date (`git -C ~/ssbu-mod-playbook pull --ff-only`),
-   then record the commit you follow
-   (`git -C ~/ssbu-mod-playbook rev-parse --short HEAD`) in the project's
-   handoff file.
-2. Read, completely: `README.md`, every file in `docs/`, and
-   `tools/PROVENANCE.md`. Do not skim and do not stop at the short version.
-3. Read the scripts under `tools/` that the task will run or copy, before
-   running or copying them.
-4. Build the task's checklist from `docs/CHECKLIST.md`: every **M** item,
-   every **C** item whose condition holds, and for each **C** item that does
-   not hold the reason it is N/A. Keep it in the handoff file.
+Before completion, run `tools/check/compliance.py <plugin-repo>` with the
+branch `--base`, design `--trace` and explicit shipped `--nro`. Resolve every
+agent row as pass, fail, `N/A: <reason>` or not authorized, with evidence.
+Keep the report beside the evidence doc and disclose failed, skipped and
+unverified rows in the final message. Claim success only with evidence.
 
-## While working
-
-- Follow the playbook's layout, guards, hook rules and Eden rules; reuse its
-  tools instead of writing new ones.
-- Record evidence for each gate as you pass it (file, log line or command
-  output), not from memory at the end.
-- After any sizeable change, go back over the checklist.
-- The shell, delegation, model-gate and watcher rules come from the global
-  instructions and `/home/intpa/.codex/DELEGATION_ROUTING.md`, not from
-  here.
-
-## Before saying it is done
-
-1. Run `python3 -I ~/ssbu-mod-playbook/tools/check/compliance.py
-   <plugin repo> [--nro <shipped NRO>]` and replace every `agent` row with
-   `pass`, `fail`, `N/A: <reason>` or `not authorized`, each with evidence.
-   Keep the finished report next to the evidence doc.
-2. List the failed, skipped and unverified rows in the final message.
-3. Never push, tag, release or write to the Switch card without the
-   operator's explicit order for that action, and say so in the report when
-   the order was not given. The user connects and disconnects the Switch:
-   never mount, unmount, eject or remount the card, or start or stop DBI;
-   read and write the SD only through what the user exposed.
-4. Do not claim success for anything without the evidence that shows it.
+Push, tag, release and card writes each require the operator's explicit
+order; report when none was given. The user connects/disconnects the Switch
+and controls DBI/UMS and mounting. Never mount, unmount, eject or remount the
+card, or start/stop DBI/UMS; use only what the user exposed. Follow
+`docs/RELEASE.md` and `docs/INSTALL.md` for those actions.

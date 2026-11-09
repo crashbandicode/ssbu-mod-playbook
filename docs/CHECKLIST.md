@@ -1,6 +1,6 @@
 # Completion checklist
 
-Read [START](../README.md), this index, and every concern your task touches before work.
+Read [START](START.md), this index, and every concern your task touches before work.
 Every **M** applies; every **C** needs a pass or an explicit N/A reason. History is on demand.
 Each row is a summary; its linked page retains the full contract, exceptions and evidence.
 Keep `Requirement | Tag | Result | Evidence` beside the handoff/evidence. A claim without evidence is not a pass.
@@ -38,7 +38,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M26 | M | Use the [shortest ruleset](MACROS.md):1 stock,1:00, items/hazards/FS off; justify longer tests. |
 | M27 | M | [Restore the run-owned profile and release only after separate verification](EDEN.md). |
 | M28 | M | [Review panic/abort/crash/Unmapped and native pointer types](EDEN.md); retain console, run identity and memory evidence. |
-| M29 | M | Bound [every local command by memory/time](../README.md); put `${var}` use in a script file. |
+| M29 | M | Bound [every local command by memory/time](START.md); put `${var}` use in a script file. |
 | M30 | M | Keep [each run's outputs under its own label](WORKFLOW.md). |
 | M31 | M | Write the [short README with whole-screen1280-wide <10s GIF](WORKFLOW.md), dated build caption, install/build/license/AI lines. |
 | M32 | M | Keep [dated build/run/behavior/log evidence](WORKFLOW.md); row receipts and <=20-line RESULTS feed one phase compliance report. |
@@ -48,9 +48,9 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](WORKFLOW.md), with no secrets. |
 | M37 | M | [Only the user connects/disconnects or controls DBI/UMS](WORKFLOW.md); agents never mount/unmount/eject/remount/power off media. |
 | M38 | M | Obtain [explicit action-specific orders](WORKFLOW.md) before push/tag/release/card writes; report lack of authorization. |
-| M39 | M | Use [Forgejo and temporary UTF-8 commit-message files](../README.md); no GitHub publication or unordered push. |
-| M40 | M | Follow the external [model/effort/watcher/routing authority](../README.md); do not duplicate its policy. |
-| M41 | M | [Every agent/worker reads START+CHECKLIST+task pages](../README.md), records playbook commit, makes its checklist and runs compliance before READY. |
+| M39 | M | Use [Forgejo and temporary UTF-8 commit-message files](START.md); no GitHub publication or unordered push. |
+| M40 | M | Follow the external [model/effort/watcher/routing authority](START.md); do not duplicate its policy. |
+| M41 | M | [Every agent/worker reads START+CHECKLIST+task pages](START.md), records playbook commit, makes its checklist and runs compliance before READY. |
 | M42 | M | [Hooks never wait on a plugin thread](WORKFLOW.md); preserve the new base's exact nonblocking contract. |
 | M43 | M | Declare an [empty diag feature and keep working tree clean](WORKFLOW.md); retain these code-only checker obligations. |
 | M44 | M | Retain [exact build/shipped-NRO identity](WORKFLOW.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
@@ -77,7 +77,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C09 | C | Authorized release needs [minor bump, annotated tag, required assets and anonymous hash verification](WORKFLOW.md). |
 | C10 | C | Release must have a [byte-identical rebuild of the tagged commit](WORKFLOW.md). |
 | C11 | C | Authorized card work uses [fresh preflight, archives/rollback/readbacks and inspected non-repeated receipts](WORKFLOW.md); single writer, loader last, disconnect after final verify. |
-| C12 | C | Multi-worker work needs [persistent sessions/routes, no context actions, done-checklists,<=60s polls, deadlines/stall alerts and direct acceptance](WORKFLOW.md). |
+| C12 | C | Multi-worker work needs [persistent sessions/routes, no context actions, done-checklists,<=60s polls, deadlines/stall alerts and direct acceptance](WORKERS.md). |
 | C13 | C | A logging product may ship [its data files as well as install line](WORKFLOW.md), without per-frame diagnostics. |
 | C14 | C | Shared owners implement [ABI/election/early-late registration/hook-only guest service and per-site logs](HOOK-SHARING.md). |
 | C15 | C | Foreign hooks obey [far/branch/stub/trampoline/called-relied/restore rules](HOOK-SHARING.md); both plugin and stand-in counters keep running. |

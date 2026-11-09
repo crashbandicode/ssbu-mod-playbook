@@ -30,10 +30,14 @@ POINTER = f"""{START}
 
 For any work on a Super Smash Bros. Ultimate Skyline plugin (creating,
 changing, testing, validating, releasing or installing one, or driving Eden
-to test one), follow the `{NAME}` skill: pull and read
-`{{repo}}` completely (README.md, every file in docs/,
-tools/PROVENANCE.md) before changing code, work through docs/CHECKLIST.md,
-and run tools/check/compliance.py before declaring the work done.
+to test one), follow the `{NAME}` skill: update `{{repo}}` with
+`git pull --ff-only` and record its commit. Before work, every agent reads
+`docs/START.md`, `docs/CHECKLIST.md`, and the concern pages its task touches
+completely. START names pages per task; `docs/history/` is read on demand.
+Every worker does its own reading and checklist. Read tool scripts before
+running or copying them, work through every M and applicable C item, and run
+`tools/check/compliance.py` with the branch base, design trace and explicit
+shipped NRO before declaring the work done.
 {END}
 """
 CURSOR_RULE = """---
