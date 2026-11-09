@@ -47,7 +47,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M35 | M | Make [no unsupported claims](EVIDENCE.md); keep operator quotes out of shipped docs, with the working-design trace exception. |
 | M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](EVIDENCE.md), with no secrets. |
 | M37 | M | [Only the user connects/disconnects or controls DBI/UMS](WORKFLOW.md); agents never mount/unmount/eject/remount/power off media. |
-| M38 | M | Obtain [explicit action-specific orders](WORKFLOW.md) before push/tag/release/card writes; report lack of authorization. |
+| M38 | M | Obtain [explicit action-specific orders](RELEASE.md) before push/tag/release/card writes; report lack of authorization. |
 | M39 | M | Use [Forgejo and temporary UTF-8 commit-message files](START.md); no GitHub publication or unordered push. |
 | M40 | M | Follow the external [model/effort/watcher/routing authority](START.md); do not duplicate its policy. |
 | M41 | M | [Every agent/worker reads START+CHECKLIST+task pages](START.md), records playbook commit, makes its checklist and runs compliance before READY. |
@@ -74,8 +74,8 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C06 | C | Log-derived numbers come from [committed host-tested scripts](EVIDENCE.md), with the regeneration command beside them. |
 | C07 | C | Asset claims need [decoded expected/frame/stock comparison](EVIDENCE.md); rule out stock without committing extracted sources. |
 | C08 | C | A changed recorded decision needs [document/item/date citation, disclosed reversal and updated original record](DESIGN.md). |
-| C09 | C | Authorized release needs [minor bump, annotated tag, required assets and anonymous hash verification](WORKFLOW.md). |
-| C10 | C | Release must have a [byte-identical rebuild of the tagged commit](WORKFLOW.md). |
+| C09 | C | Authorized release needs [minor bump, annotated tag, required assets and anonymous hash verification](RELEASE.md). |
+| C10 | C | Release must have a [byte-identical rebuild of the tagged commit](RELEASE.md). |
 | C11 | C | Authorized card work uses [fresh preflight, archives/rollback/readbacks and inspected non-repeated receipts](WORKFLOW.md); single writer, loader last, disconnect after final verify. |
 | C12 | C | Multi-worker work needs [persistent sessions/routes, no context actions, done-checklists,<=60s polls, deadlines/stall alerts and direct acceptance](WORKERS.md). |
 | C13 | C | A logging product may ship [its data files as well as install line](BUILD.md), without per-frame diagnostics. |
