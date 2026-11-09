@@ -13,12 +13,12 @@ state or authorization. Read each tool script before running or copying it.
 | Task | Additional required pages |
 | --- | --- |
 | Code change | [DESIGN](DESIGN.md), [BUILD](BUILD.md), [HOOKS](HOOKS.md), [EVIDENCE](WORKFLOW.md); [HOOK-SHARING](HOOK-SHARING.md) and [HOOK-CHAIN](HOOK-CHAIN.md) for shared or possibly shared sites |
-| Eden run | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](EDEN.md), [WATCHDOG](../tools/eden-lifecycle/README.md), [TEST-PLAN](MACROS.md), [TEST-RUN](MACROS.md), [RUNNER](MACROS.md), [MACROS](MACROS.md), [TILE-CURSOR](TILE-CURSOR.md), [TRACING](EDEN.md), [EVIDENCE](WORKFLOW.md), and the host's [LINUX-DOWN](EDEN.md) or [WINDOWS](../tools/eden-lifecycle/README.md) |
+| Eden run | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md), [WATCHDOG](../tools/eden-lifecycle/README.md), [TEST-PLAN](MACROS.md), [TEST-RUN](MACROS.md), [RUNNER](MACROS.md), [MACROS](MACROS.md), [TILE-CURSOR](TILE-CURSOR.md), [TRACING](EDEN.md), [EVIDENCE](WORKFLOW.md), and the host's [LINUX-DOWN](EDEN.md) or [WINDOWS](../tools/eden-lifecycle/README.md) |
 | GIF | [GIFS](GIFS.md), [EVIDENCE](WORKFLOW.md), and the Eden-run pages when capturing in Eden |
 | Release | [BUILD](BUILD.md), [EVIDENCE](WORKFLOW.md), [RELEASE](WORKFLOW.md) |
 | Card install, removal or swap | [INSTALL](WORKFLOW.md), [RELEASE](WORKFLOW.md) |
 | Online behavior | [ONLINE](WORKFLOW.md), [HOOKS](HOOKS.md), and the code-change/Eden-run pages |
-| Host or lifecycle change | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](EDEN.md), [WATCHDOG](../tools/eden-lifecycle/README.md), [LINUX-DOWN](EDEN.md) or [WINDOWS](../tools/eden-lifecycle/README.md), [EVIDENCE](WORKFLOW.md) |
+| Host or lifecycle change | [HOSTS](HOSTS.md), [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md), [WATCHDOG](../tools/eden-lifecycle/README.md), [LINUX-DOWN](EDEN.md) or [WINDOWS](../tools/eden-lifecycle/README.md), [EVIDENCE](WORKFLOW.md) |
 | Several workers or hosts | [WORKERS](WORKERS.md), plus each worker's task pages |
 
 Build a task checklist in the handoff: every **M** rule, every applicable

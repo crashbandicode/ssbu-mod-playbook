@@ -1,7 +1,7 @@
 # Eden hosts and admission
 
 Read [START](START.md) and [CHECKLIST](CHECKLIST.md), then this page for host,
-display, admission or scheduling work. [LIFECYCLE](EDEN.md) owns claims
+display, admission or scheduling work. [LIFECYCLE](LIFECYCLE.md) owns claims
 and recovery; [WINDOWS](../tools/eden-lifecycle/README.md) adds the Ally requirements.
 
 | Executor | Maximum Eden instances | Additional policy |
@@ -24,7 +24,7 @@ The ledger admits a second claim only alongside a lifecycle-admitted claim
 (`host=<h> lifecycle=<token> Eden lifecycle admitted`), each with its own
 private profile. Manual or foreign claims block; unknown host/owner records
 also block. Optional stale admission has the narrow predicate and receipts in
-[LIFECYCLE](EDEN.md); it never releases another owner's claim.
+[LIFECYCLE](LIFECYCLE.md); it never releases another owner's claim.
 No foreign Eden/compiler is adopted or killed. An authorized same-run pair
 uses `pair_authorized:true`, distinct instance inputs, profiles and displays;
 resource and process checks repeat before **each** launch.

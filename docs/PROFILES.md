@@ -1,7 +1,7 @@
 # Private profiles and pinned inputs
 
 Read this page for any Eden profile, fixture, pin or mod change. Use the
-current [lifecycle](EDEN.md) private clone, not the historical pair
+current [lifecycle](LIFECYCLE.md) private clone, not the historical pair
 `prep.py` full-copy recipe. Never change profile `a`, installed profiles,
 another worker's roots or any profile outside the run's ownership.
 

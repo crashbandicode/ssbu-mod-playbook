@@ -25,7 +25,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M13 | M | [Call the game function or hook its most specific post-prologue instruction](HOOKS.md). |
 | M14 | M | Keep [diag code, diag.txt and stand-in markers out of shipped NRO](BUILD.md). |
 | M15 | M | Ship [install-line-only logging](BUILD.md), with the C13 logging-product exception and no per-frame diagnostics. |
-| M16 | M | [Claim before Up; Down after failure too](EDEN.md); retain the claim until owned cleanup/restore/separate verify succeed. |
+| M16 | M | [Claim before Up; Down after failure too](LIFECYCLE.md); retain the claim until owned cleanup/restore/separate verify succeed. |
 | M17 | M | Follow [host slots/10–9GiB admission](HOSTS.md); never source profilea, display61 or foreign runs. |
 | M18 | M | Keep [XPS half-resolution precedence, thermald on and timed rows on Surface/Yoga](HOSTS.md). |
 | M19 | M | Use [private profiles with immutable hard links and real mutable copies](PROFILES.md); change only your copy and verify storage. |
@@ -36,7 +36,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M24 | M | [Abort a missing precondition and retry a new label](MACROS.md), bounded by the batch try cap. |
 | M25 | M | [Trace game facts on an existing run](EDEN.md); explain any diag rebuild/extra trace boot and retain actual trace/build evidence. |
 | M26 | M | Use the [shortest ruleset](MACROS.md):1 stock,1:00, items/hazards/FS off; justify longer tests. |
-| M27 | M | [Restore the run-owned profile and release only after separate verification](EDEN.md). |
+| M27 | M | [Restore the run-owned profile and release only after separate verification](LIFECYCLE.md). |
 | M28 | M | [Review panic/abort/crash/Unmapped and native pointer types](EDEN.md); retain console, run identity and memory evidence. |
 | M29 | M | Bound [every local command by memory/time](START.md); put `${var}` use in a script file. |
 | M30 | M | Keep [each run's outputs under its own label](WORKFLOW.md). |
@@ -55,7 +55,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M43 | M | Declare an [empty diag feature and keep working tree clean](BUILD.md); retain these code-only checker obligations. |
 | M44 | M | Retain [exact build/shipped-NRO identity](WORKFLOW.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
 | M45 | M | [Pin resolved build paths and matching trace symbols](PROFILES.md); disclose mixed builds and separate client identity from app pins. |
-| M46 | M | [Snapshot before staging; mute/save/read back before load](EDEN.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
+| M46 | M | [Snapshot before staging; mute/save/read back before load](LIFECYCLE.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
 | M47 | M | [Stop Linux main before FUSE/backing processes](EDEN.md), using owned birth identity/pidfd and fail-closed claim retention. |
 | M48 | M | Change [shared tools only in a separate worktree](MACROS.md); generic extensions get tests; commit/reuse successful route inputs. |
 | M49 | M | Keep [one driver per instance and same-frame macro chords](MACROS.md); review settled state before playback. |
@@ -64,7 +64,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M52 | M | [Review actual behavior and settled HUD state](MACROS.md); fixture applied, bareTrue and clip saved do not prove behavior. |
 | M53 | M | [Ban extracted game/mod assets and dumps from git](WORKFLOW.md); reviewed evidence screenshots and required reference crops are allowed. |
 | M54 | M | Treat [cleanup success separately from graceful/native health](EDEN.md); inspect unit/console fatal tails and qualification limits. |
-| M55 | M | Stop only [owned displays/processes/paths](EDEN.md); ambiguous identity or failed restore/verify retains claim for recovery. |
+| M55 | M | Stop only [owned displays/processes/paths](LIFECYCLE.md); ambiguous identity or failed restore/verify retains claim for recovery. |
 | M56 | M | Follow [60GB pre-Up admission and verified-clean-Down pruning](HOSTS.md); preserve receipts/logs/reports and failed-cleanup recovery state, never foreign copies. |
 | C01 | C | If sites may overlap, use [sharing/chaining](HOOK-SHARING.md), election before guard, both stand-ins and load orders; cite dated scan for N/A. |
 | C02 | C | Online code obeys [read-only checked-RNG/native-order/simulated-state constraints](WORKFLOW.md), hook by hook. |
@@ -86,7 +86,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C18 | C | Windows firewall changes are [explicitly authorized token Block-only](../tools/eden-lifecycle/README.md); no Allow edits/prompt dismissal/implicit hosting authority. |
 | C19 | C | Windows cleanup uses [named pipes and exact session Job/task/PID identities](../tools/eden-lifecycle/README.md);1312 retry once only before admission. |
 | C20 | C | Windows qualification needs [new grant/queue/current identities/fresh-process evidence](../tools/eden-lifecycle/README.md); no-row/HOLD/offline proof grants no gameplay acceptance. |
-| C21 | C | Optional [stale-claim admission](EDEN.md) preserves every fail-closed predicate/receipt; never releases a foreign claim. |
+| C21 | C | Optional [stale-claim admission](LIFECYCLE.md) preserves every fail-closed predicate/receipt; never releases a foreign claim. |
 | C22 | C | Declared [watchdog state/probe/detector/park/sidecar](../tools/eden-lifecycle/README.md) keeps40-line-window and idle-vs-demo distinctions; safe label alone does nothing. |
 | C23 | C | Macro editing obeys [frame/sample/game/player/press-release/replay/hash limits](MACROS.md), without savestate assumptions. |
 | C24 | C | GIF capture follows [distinct README/evidence envelopes, reasons/status/timing/frame review](GIFS.md); removals need comparable before/after clips. |
