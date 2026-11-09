@@ -1,5 +1,7 @@
 # One hook owner and callback registration
 
+When the operator says “reuse” a hook, “use it instead”, or “both plugins
+should still work if they clash”, this is the required pattern.
 When plugins use the same event, one provider owns the patch and exports
 a callback-registration function; consumers register instead of installing
 another patch. The owner's hook runs its own logic, then every registered callback.
