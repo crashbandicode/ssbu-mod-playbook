@@ -5,10 +5,12 @@ Before choosing a site, scan a dated copy of the card's NROs with
 `tools/build/scan-offsets.py <nro-folder> <hex-offset>…`. Scan the site and,
 for a virtual function, its vtable slot. Keep the scan output and copy date;
 use fresh local copies from a card preflight when the set has changed.
+The dated 2026-10-31 copy is `/home/intpa/gsp-visualizer-work/card-20261031/`
+(before shaderdb-probe removal); a changed card set needs a new preflight copy.
 
 The scanner is advisory. It recognizes exact 32/64-bit constants and a
 low-half-first MOVZ/MOVK pair within eight instructions; its nearby range
-applies to that pair recognition. It does not find every computed offset,
+is −0x40 through +0x3f (the ±0x40 window, upper bound excluded), for that pair recognition. It does not find every computed offset,
 MOVZ/ORR-free form or plugin added after the snapshot. A quiet scan is not
 runtime safety proof. [HOOK-SHARING](HOOK-SHARING.md) and
 [HOOK-CHAIN](HOOK-CHAIN.md) govern sharing, foreign hooks and load orders.
