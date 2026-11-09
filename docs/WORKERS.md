@@ -27,7 +27,7 @@ Routing/model/effort and watcher rules come from
    A generic playbook link is insufficient. `lstick` in a button list means
    **L3 click**, not steering; same-frame chord policy still applies.
 6. Commit a working chord macro, route, fixture or hook to the project's
-   shared library immediately, with a one-line index. Workers read/reuse that
+   shared library immediately (for example `eden/lr*-shared`), with a one-line index. Workers read/reuse that
    index first; harvest reviewed proven routes to the shared runner library.
 7. The coordinator enforces Up in **15 minutes**, or **30** when segments need
    recording. At the deadline interrupt/redirect: Up now with rows needing
