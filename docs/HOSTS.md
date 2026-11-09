@@ -9,7 +9,7 @@ and recovery; [WINDOWS](WINDOWS.md) adds the Ally requirements.
 | Surface | 2 | Timed rows allowed. |
 | Yoga | 2 | Timed rows allowed; authoritative ledger host. |
 | XPS (`ubuntu-xps`) | 2 | Half resolution by default; thermald stays on. |
-| Ally | 1 | Native Windows isolation and live grant required. |
+| Ally | 1 | Native Windows isolation and live grant per run (each Up) required. |
 
 MemAvailable is at least **10 GiB for the first instance, 9 GiB for a second**.
 Count owned and foreign instances together. Check `df -h /` before every
