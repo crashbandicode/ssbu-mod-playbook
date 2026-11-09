@@ -35,7 +35,7 @@ CARD_COMMANDS = re.compile(
     r"|\beject['\"]?\s*,?\s*['\"]?(?:-|/dev/)"
     r"|(?:^|[;&|(]\s*|\bsudo\s+)mount\s+(?:-|/dev/)")
 # A string literal that refuses or restricts what the user asked for. Restrictions
-# need the operator's approval (WORKFLOW: workarounds and restrictions), so a branch
+# need the operator's approval (DESIGN: workarounds and restrictions), so a branch
 # that adds one must cite an approved entry of docs/RESTRICTIONS.md.
 REFUSAL = re.compile(
     r'"[^"\n]*(?:\bturn\b[^"\n]{0,40}\bon\b|\bunavailable\b|\bnot available\b|\brefus\w*'
