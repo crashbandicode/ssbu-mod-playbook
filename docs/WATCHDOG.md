@@ -18,8 +18,23 @@ a change-only line does not establish an indefinitely safe state. The
 matching line must remain in that window; use a suitably recurring line.
 Safe states suppress **idle only**, never a demo detector. A waiting Training
 instance can therefore Down after `idle_s` when the probe cannot identify it.
-Release builds may lack the diag state line: use demo detectors and a longer
-declared idle interval rather than assuming the diag probe works there.
+TrainingRooms release builds print no such diag state line: use demo detectors
+and a longer declared idle interval rather than assuming the diag probe works there.
+
+The TrainingRooms diag recipe uses `practice-diagnostics.log` (`diag_log`):
+
+```json
+"watchdog": {
+  "idle_s": 300,
+  "safe_states": ["training"],
+  "state_probe": {"source": "diag_log", "rules": [
+    {"pattern": "\\[FrameStrip\\] p1 status=", "state": "training"}
+  ]}
+}
+```
+
+It prints when P1's busy status changes; it establishes safety only while
+the line remains in the last-40-line window, never for an indefinite wait.
 
 | Detector | Semantics |
 | --- | --- |
