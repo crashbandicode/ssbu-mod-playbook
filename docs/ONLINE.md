@@ -19,12 +19,21 @@ the asymmetric plugin pins, run/build identities and changed-path evidence.
 Seed server/rating state where necessary so the game naturally takes the
 path, instead of forcing it with a diag build.
 
+The repo's seed mechanism is the **historical** `tools/eden-pair/local_pair.ps1`
+or `pair.ps1 -Runtime` with `-SeedS`/`-SeedY 'slot:rating[,slot:rating]'`. Their `launch.py`
+sets `EDEN_LAN_RUNTIME`, `EDEN_LAN_PROFILE_DIR` and `EDEN_LAN_FIGHTER_SEEDS`
+in Eden's bounded child environment. This is not a lifecycle config key or runner step:
+Linux lifecycle launch strips inherited runtime/seed variables, and
+`eden_settings` accepts only resolution. **Using that historical recipe needs
+the operator's approval**; read the pinned Eden build's `docs/ELITE_RATING_TESTS.md`
+and revalidate pins/admission/restore before any approved use.
+
 Use current lifecycle pair config and runner project/UI steps. Same-host
 pairs require explicit `pair_authorized:true`, distinct profiles/inputs and
 normal [HOSTS](HOSTS.md) admission. Pair frontend room setup happens **before
 game load**: lifecycle `defer_load`, runner room UI, then bounded terminal
-`game.load` and fresh-frame status. TLS/rating runtime isolate intended
-peers; preserve seed choices and settings with the run. The lifecycle does
+`game.load` and fresh-frame status. Keep TLS on to isolate intended peers;
+preserve approved rating-runtime seeds and settings with the run. The lifecycle does
 not itself implement LDN frontend room setup or implicit socket forwarding.
 
 A pair can share one authorized PC or use Surface/Yoga executors, with
