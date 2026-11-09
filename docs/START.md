@@ -7,8 +7,9 @@ agents driving Eden. A parent's reading does not cover its workers.
 Before work, update the authorized playbook clone with `git pull --ff-only`
 and record its commit in the project's handoff. Every agent reads this page,
 [CHECKLIST](CHECKLIST.md), and the concern pages its task touches completely.
-Read `docs/history/` on demand; historical observations are not current host
+Read top-level `history/` on demand; historical observations are not current host
 state or authorization. Read each tool script before running or copying it.
+Any broader global full-read instruction remains in force alongside the task pages.
 No agent watches, reports, measures or acts on its own or another session's context;
 none compacts, recycles, replaces or hands off because of it ([WORKERS](WORKERS.md), rule 2).
 
@@ -54,5 +55,6 @@ unverified rows. A green process exit alone is not acceptance.
 
 `tools/skill/install.py --check` reports installed links and pointers without
 writing. Inspect every printed status: exit 0 can include stale pointers or
-an obstructing real directory. Updating this repo does not update outside
-instruction blocks automatically; review those separately at deployment.
+an obstructing real directory. Leave all outside-repo instructions unchanged,
+including `CLAUDE.md` and `AGENTS.md`. Do not run the installer to write their
+pointer blocks; `--check` is permitted.

@@ -44,5 +44,5 @@ and firewall policy; the inbound Block lifecycle proof does not qualify them.
 admission/restoration. Finish with [LIFECYCLE](LIFECYCLE.md) Down and health review.
 
 Historical replay counts, rematch sequences and concrete pair routes are in
-[route history](history/ROUTES-AND-MEDIA-2026-10--11.md); none replaces new
+[route history](../history/ROUTES-AND-MEDIA-2026-10--11.md); none replaces new
 matching-frame receipts for the changed paths.

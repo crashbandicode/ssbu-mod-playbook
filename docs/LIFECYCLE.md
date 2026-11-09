@@ -97,4 +97,4 @@ run console/control logs and `instances.json` mappings/source aliases. Keep
 Change shared tools **in a worktree**, never the playbook clone live runs use:
 a half-edited file there can break another owner's Up or Down.
 Current mechanics: [lifecycle.py](../tools/eden-lifecycle/lifecycle.py);
-dated coverage/limits: [qualification history](history/LIFECYCLE-QUALIFICATION-2026-11.md).
+dated coverage/limits: [qualification history](../history/LIFECYCLE-QUALIFICATION-2026-11.md).

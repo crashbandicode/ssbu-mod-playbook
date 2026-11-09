@@ -22,6 +22,6 @@ Run through the required host PowerShell 7. The offline suite uses the normal
 Read [LIFECYCLE](../../docs/LIFECYCLE.md), [HOSTS](../../docs/HOSTS.md),
 [PROFILES](../../docs/PROFILES.md), and the applicable [Linux Down](../../docs/LINUX-DOWN.md)
 or [Windows](../../docs/WINDOWS.md) policy. [WATCHDOG](../../docs/WATCHDOG.md)
-describes its declared park exception. [Qualification history](../../docs/history/LIFECYCLE-QUALIFICATION-2026-11.md)
+describes its declared park exception. [Qualification history](../../history/LIFECYCLE-QUALIFICATION-2026-11.md)
 preserves dated bases, tests, receipts, incidents and unqualified paths;
 offline test success is neither a live grant nor native acceptance.

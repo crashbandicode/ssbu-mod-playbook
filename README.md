@@ -16,17 +16,18 @@ history is read on demand. Workers perform their own reading and checklist.
 | External actions | [Release](docs/RELEASE.md), [card transactions](docs/INSTALL.md) |
 
 [Tool provenance](tools/PROVENANCE.md) distinguishes current source identity
-from historical origin hashes. Dated observations live in [history](docs/history/);
+from historical origin hashes. Dated observations live in [history](history/);
 they do not establish present host state, tool qualification or authorization.
 
-The [skill](skills/ssbu-mod-playbook/SKILL.md) and generated pointer blocks
-connect this reading rule to Claude Code, Codex, Cursor and OpenCode:
+The [skill](skills/ssbu-mod-playbook/SKILL.md) retains task reading for every
+agent. Existing global full-read instructions still apply alongside START.
+Leave all outside-repo instructions unchanged, including `CLAUDE.md` and
+`AGENTS.md`. Do not run `tools/skill/install.py` to write their pointer blocks.
+Read-only inspection is allowed:
 
 ```text
-python3 -I tools/skill/install.py
 python3 -I tools/skill/install.py --check
 ```
 
-Install on each agent machine after cloning to `~/ssbu-mod-playbook`.
-Review `--check` output: exit 0 alone does not prove pointers are current.
+Review every status: exit 0 alone does not prove pointers are current.
 Push, tag, release and card writes each require the operator's order.

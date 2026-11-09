@@ -60,4 +60,4 @@ Retain `state_dir/watchdog-receipt.json`, state/detector evidence and sidecar
 status. Preflight scope and cleanup are in [LIFECYCLE](LIFECYCLE.md);
 implementation/config validation are in [lifecycle.py](../tools/eden-lifecycle/lifecycle.py).
 The observed TrainingRooms line availability and 2026-11-07 failed probe
-remain in [qualification history](history/LIFECYCLE-QUALIFICATION-2026-11.md).
+remain in [qualification history](../history/LIFECYCLE-QUALIFICATION-2026-11.md).

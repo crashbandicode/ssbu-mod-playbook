@@ -83,4 +83,4 @@ Keep NROs, exported run files, receipts/logs/reports under their run label.
 
 Implementation: [clone, pin, stage and snapshot functions](../tools/eden-lifecycle/lifecycle.py).
 Historical paths, digests and the ARCropolis incident are in
-[route/media history](history/ROUTES-AND-MEDIA-2026-10--11.md).
+[route/media history](../history/ROUTES-AND-MEDIA-2026-10--11.md).

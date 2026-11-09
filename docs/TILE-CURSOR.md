@@ -42,7 +42,7 @@ assuming a fixed Random-to-character sequence.
 On SSS, use the current log to choose the stage. Form-tab/page changes do
 not change that tile list; Up/Down move one row. Historical Random→Final
 Destination and CPU Joker routes are examples in
-[route history](history/ROUTES-AND-MEDIA-2026-10--11.md), not fixtures for all saves.
+[route history](../history/ROUTES-AND-MEDIA-2026-10--11.md), not fixtures for all saves.
 
 The plugin's `docs/EDEN-TEST.md` has its procedure/criteria and `docs/HOOKS.md`
 its sites: [ssbu-tile-cursor](https://git.syntaxbyexample.com/intpa/ssbu-tile-cursor).

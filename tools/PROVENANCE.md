@@ -4,7 +4,7 @@ The checked-out git commit and freshly measured file hashes identify the
 tools in use. Record the actual playbook commit and selected script/binary
 hashes with each task; old origin hashes do not identify current source.
 
-[The historical origin/change ledger](../docs/history/PROVENANCE-2026-10-31--11-07.md)
+[The historical origin/change ledger](../history/PROVENANCE-2026-10-31--11-07.md)
 preserves the 2026-10-31 copies, later changes, dates, hashes, source paths
 and qualification limits. Remount/polkit-era card recipes there are
 superseded by [INSTALL](../docs/INSTALL.md)'s no-remount contract.

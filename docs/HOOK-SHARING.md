@@ -12,7 +12,7 @@ Dedicated providers have their own ABIs, such as `add_nro_load_hook`, param
 hooks, ARCropolis callbacks or exported Online Deluxe state. A consumer needs
 the provider installed or an explicitly designed fallback. These exports
 are not interchangeable with inline-hook sharing v1. Dated provider/source
-examples are in [incident history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
+examples are in [incident history](../history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
 
 For peer plugins sharing main-image offset `X`, inline sharing v1 is:
 

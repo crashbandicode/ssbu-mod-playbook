@@ -2,9 +2,9 @@
 
 Historical examples from `87b3de0`; these are not present host state,
 current sleep-based recipes, permission to boot, or substitutes for gates.
-Current contracts: [MACROS](../MACROS.md), [TILE-CURSOR](../TILE-CURSOR.md),
-[TEST-PLAN](../TEST-PLAN.md), [TEST-RUN](../TEST-RUN.md),
-[RUNNER](../RUNNER.md), [GIFS](../GIFS.md) and [EVIDENCE](../EVIDENCE.md).
+Current contracts: [MACROS](../docs/MACROS.md), [TILE-CURSOR](../docs/TILE-CURSOR.md),
+[TEST-PLAN](../docs/TEST-PLAN.md), [TEST-RUN](../docs/TEST-RUN.md),
+[RUNNER](../docs/RUNNER.md), [GIFS](../docs/GIFS.md) and [EVIDENCE](../docs/EVIDENCE.md).
 Source references below name original files and line spans at that commit.
 
 ## Route shape and discoveries
@@ -120,7 +120,7 @@ to the frame, and ruled out stock. The caption example was Eden,
 **2026-10-29**, build `15d3f31`. Current evidence permits reviewed
 screenshots/reference crops, while extracted assets, data.arc and dumps
 remain excluded from git; the old blanket game-derived-image wording is
-superseded by the approved scope in [EVIDENCE](../EVIDENCE.md).
+superseded by the approved scope in [EVIDENCE](../docs/EVIDENCE.md).
 
 ## Precondition retry and replay examples
 

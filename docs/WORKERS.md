@@ -53,5 +53,5 @@ as evidence of this coordination contract. Do not infer native acceptance
 from a worker narrative, wrapper exit 0 or offline tests.
 
 Incidents motivating persistence, navigation reuse, chord handling and pacing
-are retained in [host history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md)
-and [route history](history/ROUTES-AND-MEDIA-2026-10--11.md).
+are retained in [host history](../history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md)
+and [route history](../history/ROUTES-AND-MEDIA-2026-10--11.md).

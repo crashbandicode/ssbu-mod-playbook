@@ -46,7 +46,7 @@ object can override that key with a non-negative integer: instance wins over
 run, then the XPS default. Surface, Yoga and Ally keep their settings unless
 an explicit setting applies. Keep thermald on; timed rows use Surface/Yoga.
 Thermal measurements and former build locations are dated
-[host history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md), not current identity.
+[host history](../history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md), not current identity.
 
 Queue unattended with bounded checks, a deadline, a memory/time guard, an
 outer timeout longer than the deadline, and output to a file. Recheck after

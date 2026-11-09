@@ -1,7 +1,7 @@
 # Completion checklist
 
 Read [START](START.md), this index, and every concern your task touches before work.
-Every **M** applies; every **C** needs a pass or an explicit N/A reason. History is on demand.
+Every **M** applies; every **C** needs a pass or an explicit N/A reason. Top-level `history/` is on demand.
 Each row is a summary; its linked page retains the full contract, exceptions and evidence.
 Keep `Requirement | Tag | Result | Evidence` beside the handoff/evidence. A claim without evidence is not a pass.
 Run `python3 -B -I tools/check/compliance.py <repo> --base <branch-start> --trace <design> --nro <shipped-file>` once per phase/candidate.

@@ -2,9 +2,9 @@
 
 This records dated evidence at source commit `87b3de0`, not current host
 state, permission to query/launch a host, or a production-READY claim.
-Current contracts live in [LIFECYCLE](../LIFECYCLE.md),
-[LINUX-DOWN](../LINUX-DOWN.md), [WINDOWS](../WINDOWS.md),
-[HOSTS](../HOSTS.md) and [WATCHDOG](../WATCHDOG.md).
+Current contracts live in [LIFECYCLE](../docs/LIFECYCLE.md),
+[LINUX-DOWN](../docs/LINUX-DOWN.md), [WINDOWS](../docs/WINDOWS.md),
+[HOSTS](../docs/HOSTS.md) and [WATCHDOG](../docs/WATCHDOG.md).
 Old UNRUN/paused/owner statements below describe their own checkpoints;
 later evidence supersedes them only for the exact path demonstrated.
 
@@ -200,7 +200,7 @@ explicit main-before-group order even for old control-group units and
 partial launch. It preserved package pins, profile layout, limits and
 full-cgroup ownership; extraction was not needed and would add space and
 startup cost. Display and Windows cleanup paths were unchanged. Current
-identity, bounded stop and fail-closed rules live in [LINUX-DOWN](../LINUX-DOWN.md).
+identity, bounded stop and fail-closed rules live in [LINUX-DOWN](../docs/LINUX-DOWN.md).
 
 The **89-test** checkpoint ran real Host stop methods on a synthetic
 process graph with lower-numbered FUSE/helpers. It covered TERM success,
@@ -233,4 +233,4 @@ only while a matching line remained among the last 40 lines; a change-only
 line could not promise ongoing visibility after scrolling. The release
 build printed no such line. Its advice was demo detectors and a longer
 declared idle interval, not assuming the diag probe would work there.
-Current window/detector/idle contracts live in [WATCHDOG](../WATCHDOG.md).
+Current window/detector/idle contracts live in [WATCHDOG](../docs/WATCHDOG.md).

@@ -46,5 +46,5 @@ or hard-cap/crash interruption behavior. At the dated 2026-11-03 checkpoint,
 the live check was assigned to the next lead batch's post-merge Down. That
 historical assignment is not evidence of a present host state or later pass.
 The dated incident, raw receipts and test bases/counts are preserved in
-[qualification history](history/LIFECYCLE-QUALIFICATION-2026-11.md).
+[qualification history](../history/LIFECYCLE-QUALIFICATION-2026-11.md).
 Implementation: [Host stop methods](../tools/eden-lifecycle/lifecycle.py).

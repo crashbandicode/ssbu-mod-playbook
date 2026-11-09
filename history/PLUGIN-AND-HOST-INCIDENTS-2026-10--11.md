@@ -3,10 +3,10 @@
 Historical observations at source `87b3de0`; dates, paths, hashes and
 qualifications describe those runs only. They do not identify present host
 state, qualify a changed implementation or grant permission to operate.
-Current rules live in [BUILD](../BUILD.md), [DESIGN](../DESIGN.md),
-[HOOKS](../HOOKS.md), [HOOK-SHARING](../HOOK-SHARING.md),
-[HOOK-CHAIN](../HOOK-CHAIN.md), [HOSTS](../HOSTS.md),
-[TRACING](../TRACING.md) and [WORKERS](../WORKERS.md).
+Current rules live in [BUILD](../docs/BUILD.md), [DESIGN](../docs/DESIGN.md),
+[HOOKS](../docs/HOOKS.md), [HOOK-SHARING](../docs/HOOK-SHARING.md),
+[HOOK-CHAIN](../docs/HOOK-CHAIN.md), [HOSTS](../docs/HOSTS.md),
+[TRACING](../docs/TRACING.md) and [WORKERS](../docs/WORKERS.md).
 References below name original source paths/lines at `87b3de0`.
 
 ## Build and design incidents
@@ -198,4 +198,4 @@ plugin holder. Dump helper:
 TrainingRoomsForUltimate `tests/hook_locks.rs`, `tests/lock_order.rs`,
 `tests/common/callgraph.rs`, branch `p23/rc6-qp-respawn-freeze`.
 Current try-lock/publication, plugin-side no-wait, trace exceptions,
-seeded failure and manual dynamic-edge obligations live in [BUILD](../BUILD.md).
+seeded failure and manual dynamic-edge obligations live in [BUILD](../docs/BUILD.md).

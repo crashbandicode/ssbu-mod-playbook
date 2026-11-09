@@ -91,4 +91,4 @@ needs get a shared test; plugin navigation/checks belong in project hooks.
 Change shared tools **in a worktree**, never the clone used by live runs.
 Current dry-run/setup mechanics: [runner.py](../tools/eden-runner/runner.py),
 [eden_test.py](../tools/eden-test/eden_test.py). Examples/incidents remain in
-[route history](history/ROUTES-AND-MEDIA-2026-10--11.md).
+[route history](../history/ROUTES-AND-MEDIA-2026-10--11.md).

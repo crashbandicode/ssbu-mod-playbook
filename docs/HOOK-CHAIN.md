@@ -62,4 +62,4 @@ the card scan cited by [HOOKS](HOOKS.md). `foreign=1` in elite-rematch is
 its historical equivalent: inline stand-ins on three sites and a replacement
 hook on lookup. Source examples live in the plugins' `src/chain.rs`,
 `model::entry`, `runtime::hook_inline`, `hook_lookup` and share probes;
-dated results are in [incident history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
+dated results are in [incident history](../history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).

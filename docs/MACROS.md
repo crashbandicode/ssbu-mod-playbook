@@ -23,7 +23,7 @@ are 250 ms; `gv.py press` holds for its time plus 500 ms, then releases.
 `gv.py keepalive <label> <stop-file> <seconds>` holds down and taps ZL every
 0.7 s until the stop file; keep it in the one driver's scripted route. Historical sleep
 routes retain only route-shape/discovery value in
-[route history](history/ROUTES-AND-MEDIA-2026-10--11.md).
+[route history](../history/ROUTES-AND-MEDIA-2026-10--11.md).
 
 Record with Tools → Input Macros (Record new; countdown/red recording), or
 control `macro.record`, `macro.marker`, `macro.stop`. Record from marker

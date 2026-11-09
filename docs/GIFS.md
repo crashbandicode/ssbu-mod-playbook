@@ -49,7 +49,7 @@ set encoder fps to `0` to preserve each source frame's time. A fixed fps
 changes playback speed. The old `trim_gif.py` uses the first frame's delay
 for every frame; do not use that timing-losing output as faithful game-speed
 evidence. Historical size experiments and the disclosed fixed-fps speed
-change are in [media history](history/ROUTES-AND-MEDIA-2026-10--11.md).
+change are in [media history](../history/ROUTES-AND-MEDIA-2026-10--11.md).
 
 Inspect metadata and view first, middle and last frames, then the action:
 the clip includes start, action and result; text reads; loading screens or

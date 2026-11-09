@@ -31,7 +31,7 @@ Keep the diagnostic output in its own `dist/` folder so it cannot replace
 the shipped release. Run `tools/build/nro_size.py <shipped-nro>` and keep
 the resident size (`.text` + `.rodata` + `.data` + `.bss`), which costs the
 game memory. The historical LTO measurements are in
-[incident history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
+[incident history](../history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md).
 
 Hooks allocate no heap. Use a counting global allocator and show
 `heap_allocations=0` in the install line. Use fixed buffers, a writer thread
@@ -44,7 +44,7 @@ published by the plugin side: an atomic, a published copy such as
 TrainingRooms' `hos_lock::Published`, or a lock-free mailbox. The plugin
 side never waits for the game either. A worker hook can deadlock the game
 when MainThread spins waiting for that worker and the lock holder cannot
-run on MainThread's core; [incident history](history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md)
+run on MainThread's core; [incident history](../history/PLUGIN-AND-HOST-INCIDENTS-2026-10--11.md)
 records the observed scheduler failure and hang-diagnosis procedure.
 
 Treat every hook as exposed to game-worker execution. Only a trace showing
