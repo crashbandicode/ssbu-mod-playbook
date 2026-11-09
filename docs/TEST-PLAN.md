@@ -2,7 +2,7 @@
 
 Read [START](START.md), [CHECKLIST](CHECKLIST.md), [HOSTS](HOSTS.md),
 [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md) and this page for an Eden
-run. [TEST-RUN](TEST-RUN.md) governs execution; [RUNNER](MACROS.md) describes
+run. [TEST-RUN](TEST-RUN.md) governs execution; [RUNNER](RUNNER.md) describes
 schema and evidence limits. These paragraphs preserve test-run rules 1–15
 from the former MACROS page; their homes are listed below.
 

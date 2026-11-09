@@ -57,11 +57,11 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M45 | M | [Pin resolved build paths and matching trace symbols](PROFILES.md); disclose mixed builds and separate client identity from app pins. |
 | M46 | M | [Snapshot before staging; mute/save/read back before load](LIFECYCLE.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
 | M47 | M | [Stop Linux main before FUSE/backing processes](LINUX-DOWN.md), using owned birth identity/pidfd and fail-closed claim retention. |
-| M48 | M | Change [shared tools only in a separate worktree](MACROS.md); generic extensions get tests; commit/reuse successful route inputs. |
+| M48 | M | Change [shared tools only in a separate worktree](RUNNER.md); generic extensions get tests; commit/reuse successful route inputs. |
 | M49 | M | Keep [one driver per instance and same-frame macro chords](MACROS.md); review settled state before playback. |
 | M50 | M | Respect [input lease/recording/hash/edit invariants](MACROS.md); incomplete recordings cannot become passing media. |
 | M51 | M | Budget [rows+boot/navigation+route work under runtime minus margin](TEST-PLAN.md); order wedge/crash/teardown checks last. |
-| M52 | M | [Review actual behavior and settled HUD state](MACROS.md); fixture applied, bareTrue and clip saved do not prove behavior. |
+| M52 | M | [Review actual behavior and settled HUD state](RUNNER.md); fixture applied, bareTrue and clip saved do not prove behavior. |
 | M53 | M | [Ban extracted game/mod assets and dumps from git](WORKFLOW.md); reviewed evidence screenshots and required reference crops are allowed. |
 | M54 | M | Treat [cleanup success separately from graceful/native health](LINUX-DOWN.md); inspect unit/console fatal tails and qualification limits. |
 | M55 | M | Stop only [owned displays/processes/paths](LIFECYCLE.md); ambiguous identity or failed restore/verify retains claim for recovery. |
@@ -90,8 +90,8 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C22 | C | Declared [watchdog state/probe/detector/park/sidecar](WATCHDOG.md) keeps40-line-window and idle-vs-demo distinctions; safe label alone does nothing. |
 | C23 | C | Macro editing obeys [frame/sample/game/player/press-release/replay/hash limits](MACROS.md), without savestate assumptions. |
 | C24 | C | GIF capture follows [distinct README/evidence envelopes, reasons/status/timing/frame review](GIFS.md); removals need comparable before/after clips. |
-| C25 | C | Image/hook gates preserve [static/tolerance/scaling/ROI/evidence/REVIEW semantics](MACROS.md); unchecked/bareTrue alone prove neither start state nor behavior. |
-| C26 | C | Reused/new segments retain [sha256/start/end gates, receipts and reviewed harvest provenance](MACROS.md). |
+| C25 | C | Image/hook gates preserve [static/tolerance/scaling/ROI/evidence/REVIEW semantics](RUNNER.md); unchecked/bareTrue alone prove neither start state nor behavior. |
+| C26 | C | Reused/new segments retain [sha256/start/end gates, receipts and reviewed harvest provenance](RUNNER.md). |
 | C27 | C | Before shipping, use the [full card plugin set for one match through results/back](TEST-RUN.md); inspect every install line and console. |
 
 Machine checks are useful approximations, not semantic proof. See each concern's evidence and tooling limits.
