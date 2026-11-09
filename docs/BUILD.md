@@ -89,7 +89,7 @@ Check `df -h /` before every build and Eden launch. Stop a build below
 40 GB free; the pre-Up Eden floor is 60 GB. Use [HOSTS](HOSTS.md) and
 [LIFECYCLE](EDEN.md) for admission, copies and clean-Down pruning.
 Link byte-identical immutable files; make real copies for different or
-writable files as [PROFILES](EDEN.md) requires. When work finishes,
+writable files as [PROFILES](PROFILES.md) requires. When work finishes,
 delete its build products with a deletion manifest, while keeping shipped
 NROs, receipts, logs and reports. Preserve pinned outputs of live runs;
 new heads build into new folders under [WORKERS](WORKERS.md).

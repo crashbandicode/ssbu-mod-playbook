@@ -28,7 +28,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M16 | M | [Claim before Up; Down after failure too](EDEN.md); retain the claim until owned cleanup/restore/separate verify succeed. |
 | M17 | M | Follow [host slots/10–9GiB admission](HOSTS.md); never source profilea, display61 or foreign runs. |
 | M18 | M | Keep [XPS half-resolution precedence, thermald on and timed rows on Surface/Yoga](HOSTS.md). |
-| M19 | M | Use [private profiles with immutable hard links and real mutable copies](EDEN.md); change only your copy and verify storage. |
+| M19 | M | Use [private profiles with immutable hard links and real mutable copies](PROFILES.md); change only your copy and verify storage. |
 | M20 | M | Keep [per-copy targets/fresh source times/locked seeds/shared cargo home/disk checks/deletion manifest](BUILD.md). |
 | M21 | M | [Gate every wait](MACROS.md); rounded-up fixed sleeps are only for states with neither log nor screenshot checks. |
 | M22 | M | Prepare [shared runner/dry-run before Up](MACROS.md), meet15/30min deadlines, chain rows and preserve project media/hooks plus tool revision. |
@@ -54,7 +54,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M42 | M | [Hooks never wait on a plugin thread](BUILD.md); preserve the new base's exact nonblocking contract. |
 | M43 | M | Declare an [empty diag feature and keep working tree clean](BUILD.md); retain these code-only checker obligations. |
 | M44 | M | Retain [exact build/shipped-NRO identity](WORKFLOW.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
-| M45 | M | [Pin resolved build paths and matching trace symbols](EDEN.md); disclose mixed builds and separate client identity from app pins. |
+| M45 | M | [Pin resolved build paths and matching trace symbols](PROFILES.md); disclose mixed builds and separate client identity from app pins. |
 | M46 | M | [Snapshot before staging; mute/save/read back before load](EDEN.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
 | M47 | M | [Stop Linux main before FUSE/backing processes](EDEN.md), using owned birth identity/pidfd and fail-closed claim retention. |
 | M48 | M | Change [shared tools only in a separate worktree](MACROS.md); generic extensions get tests; commit/reuse successful route inputs. |
@@ -70,7 +70,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C02 | C | Online code obeys [read-only checked-RNG/native-order/simulated-state constraints](WORKFLOW.md), hook by hook. |
 | C03 | C | Online code passes [same replay A/B](WORKFLOW.md), identical detector values and positions. |
 | C04 | C | Online-only paths need [both-detector two-console proof](WORKFLOW.md) through later sessions, desync0 at matching frame. |
-| C05 | C | Mods need [pinned ARCropolis and native-screen mod proof in that boot](EDEN.md). |
+| C05 | C | Mods need [pinned ARCropolis and native-screen mod proof in that boot](PROFILES.md). |
 | C06 | C | Log-derived numbers come from [committed host-tested scripts](WORKFLOW.md), with the regeneration command beside them. |
 | C07 | C | Asset claims need [decoded expected/frame/stock comparison](WORKFLOW.md); rule out stock without committing extracted sources. |
 | C08 | C | A changed recorded decision needs [document/item/date citation, disclosed reversal and updated original record](DESIGN.md). |
