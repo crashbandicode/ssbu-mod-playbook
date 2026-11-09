@@ -18,7 +18,7 @@ Pins (Eden AppImage, plugins, files, game) carry over
 from the previous config unchanged; `new` checks each pinned file still has its sha256, `--app` swaps in a
 different Eden AppImage and `--plugin <new build>` swaps the pinned plugin with the same file name (resolved path;
 sha256 read; the swap is recorded in config.json `plugin_swaps`). `--defer-load` leaves the frontend ready so rows
-can configure boot tracing before game.load. Same-boot fixing (MACROS rule 8): after a failed row,
+can configure boot tracing before game.load. Same-boot fixing (TEST-PLAN rule 8): after a failed row,
 fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 """
 import argparse
@@ -154,7 +154,7 @@ SETUP_VIA = ('fixture', 'segment', 'record', 'hook')
 
 
 def setup_plan_problems(spec):
-    """MACROS rule 13: rows.json names how each starting state is reached, before Up.
+    """TEST-PLAN rule 13: rows.json names how each starting state is reached, before Up.
     "setup": [{"state": "Training, P1 Kirby, CPU Kirby", "via": "fixture", "ref": "files: settings.json"}, ...]"""
     plan = spec.get('setup') if isinstance(spec, dict) else None
     if not isinstance(plan, list) or not plan:
@@ -171,7 +171,7 @@ def cmd_up(run, skip_setup_plan=False):
     rows = run / 'rows' / 'rows.json'
     problems = setup_plan_problems(json.loads(rows.read_text()))
     if problems and not skip_setup_plan:
-        raise SystemExit('setup plan: ' + '; '.join(problems) + ' (MACROS rule 13; --skip-setup-plan only to re-run '
+        raise SystemExit('setup plan: ' + '; '.join(problems) + ' (TEST-PLAN rule 13; --skip-setup-plan only to re-run '
                          'rows that already have their segments)')
     if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
@@ -195,7 +195,7 @@ def cmd_run(run, retry=False):
     return code
 
 
-# MACROS rule 13: a boot reaches its starting state through a fixture or a recorded segment, not by an agent steering
+# TEST-PLAN rule 13: a boot reaches its starting state through a fixture or a recorded segment, not by an agent steering
 # menus one input at a time. These budgets make that visible while the boot is still up.
 MANUAL_INPUT_BUDGET = 40
 NO_ROW_MINUTES = 15
@@ -273,7 +273,7 @@ def cmd_pace(run):
     print('pace: ' + json.dumps(report))
     if report['over']:
         print('STOP: ' + '; '.join(report['over']) + '. Down now if the cap is near. Otherwise reach the starting state with a '
-              'fixture or record the route once as a segment (MACROS rule 13), or Down and fix the rows; don\'t keep '
+              'fixture or record the route once as a segment (TEST-PLAN rule 13), or Down and fix the rows; don\'t keep '
               'steering by hand.')
         return 2
     return 0
