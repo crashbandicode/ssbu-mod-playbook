@@ -1,9 +1,12 @@
 # Build and runtime discipline
 
-Use a working plugin's small layout: pure, host-tested logic in `model.rs`
+Copy reviewed `Cargo.toml`, `rust-toolchain.toml`, `lib.rs`, `share.rs` and `chain.rs`
+from gsp-visualizer. Keep pure, host-tested logic in `model.rs`
 (or `model/`), Switch hooks and install code in `runtime.rs` under
 `#[cfg(target_os = "switch")]`. `lib.rs` declares the modules. Reuse reviewed
 `share.rs`/`chain.rs` where appropriate; [HOOKS](HOOKS.md) covers site safety.
+The model holds `SUPPORTED_VERSION` and each site's 64-byte 13.0.5 table.
+Tests/examples include it by `#[path = "../src/model.rs"] mod model;`, without rlib.
 
 Required build configuration:
 
@@ -90,8 +93,8 @@ Check `df -h /` before every build and Eden launch. Stop a build below
 [LIFECYCLE](LIFECYCLE.md) for admission, copies and clean-Down pruning.
 Link byte-identical immutable files; make real copies for different or
 writable files as [PROFILES](PROFILES.md) requires. When work finishes,
-delete its build products with a deletion manifest, while keeping shipped
-NROs, receipts, logs and reports. Preserve pinned outputs of live runs;
+delete its build products with a deletion manifest, while keeping every NRO
+the evidence cites (shipped and diag), receipts, logs and reports. Preserve pinned outputs of live runs;
 new heads build into new folders under [WORKERS](WORKERS.md).
 
 Before completion, keep a clean working tree and record the shipped NRO identity.
