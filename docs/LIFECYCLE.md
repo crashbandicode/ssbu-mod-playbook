@@ -25,7 +25,7 @@ profile/claim operations. For Yoga append `--ssh memento-claw-yoga-ubuntu`:
 the same source/config travels on stdin through its PowerShell 7 login shell,
 without script staging. Run the shared runner there too; no implicit file or
 socket forwarding exists. Surface/XPS can use `ledger_ssh` for Yoga's
-authoritative ledger. Windows transport is specified in [WINDOWS](../tools/eden-lifecycle/README.md).
+authoritative ledger. Windows transport is specified in [WINDOWS](WINDOWS.md).
 
 Configure owner/label/host/hostname, disjoint fresh work/state roots, ledger,
 runner and rows pins, runtime/caps, and instance keys with distinct source,
@@ -79,7 +79,7 @@ not ACKs. Runtime defaults to 5400 seconds and permits up to 10800.
 Down attempts exact owned forced cleanup even after capped `game.stop`
 failure. Check unit/cgroup and PID birth identity; never `pkill -f` or adopt
 foreign processes. [LINUX-DOWN](LINUX-DOWN.md) requires main before FUSE;
-[WINDOWS](../tools/eden-lifecycle/README.md) requires exact session Job/task/PID cleanup. Only after
+[WINDOWS](WINDOWS.md) requires exact session Job/task/PID cleanup. Only after
 all owned PIDs are absent: preserve post-run evidence, restore full snapshot,
 perform **separate** complete verify, then release only the exact owned claim.
 Leftovers, restore/verify failure or unreleased claim mean cleanup failure and

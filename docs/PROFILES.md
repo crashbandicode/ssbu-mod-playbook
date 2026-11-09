@@ -49,7 +49,7 @@ expected and stock art for visual claims as required by [EVIDENCE](WORKFLOW.md).
 Down stops all owned processes before restoring set-aside NROs, saves,
 replays and the complete snapshot; a separate full verification precedes
 release. Windows also verifies the installed source inventory unchanged;
-see [WINDOWS](../tools/eden-lifecycle/README.md). Cleanup failure prunes nothing.
+see [WINDOWS](WINDOWS.md). Cleanup failure prunes nothing.
 
 **After a clean Down/release**, export new/changed post-run files against the
 snapshot inventory, then prune work-root profiles, `state/snapshot-*` and

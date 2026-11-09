@@ -81,11 +81,11 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C13 | C | A logging product may ship [its data files as well as install line](BUILD.md), without per-frame diagnostics. |
 | C14 | C | Shared owners implement [ABI/election/early-late registration/hook-only guest service and per-site logs](HOOK-SHARING.md). |
 | C15 | C | Foreign hooks obey [far/branch/stub/trampoline/called-relied/restore rules](HOOK-CHAIN.md); both plugin and stand-in counters keep running. |
-| C16 | C | Windows work uses [fresh private/source roots, exact MSI/session/SID/helper pins and unchanged source verification](../tools/eden-lifecycle/README.md). |
-| C17 | C | Windows guests need [launch-once token tasks and bounded8GiB-commit/256-process/kill-on-close Jobs](../tools/eden-lifecycle/README.md). |
-| C18 | C | Windows firewall changes are [explicitly authorized token Block-only](../tools/eden-lifecycle/README.md); no Allow edits/prompt dismissal/implicit hosting authority. |
-| C19 | C | Windows cleanup uses [named pipes and exact session Job/task/PID identities](../tools/eden-lifecycle/README.md);1312 retry once only before admission. |
-| C20 | C | Windows qualification needs [new grant/queue/current identities/fresh-process evidence](../tools/eden-lifecycle/README.md); no-row/HOLD/offline proof grants no gameplay acceptance. |
+| C16 | C | Windows work uses [fresh private/source roots, exact MSI/session/SID/helper pins and unchanged source verification](WINDOWS.md). |
+| C17 | C | Windows guests need [launch-once token tasks and bounded8GiB-commit/256-process/kill-on-close Jobs](WINDOWS.md). |
+| C18 | C | Windows firewall changes are [explicitly authorized token Block-only](WINDOWS.md); no Allow edits/prompt dismissal/implicit hosting authority. |
+| C19 | C | Windows cleanup uses [named pipes and exact session Job/task/PID identities](WINDOWS.md);1312 retry once only before admission. |
+| C20 | C | Windows qualification needs [new grant/queue/current identities/fresh-process evidence](WINDOWS.md); no-row/HOLD/offline proof grants no gameplay acceptance. |
 | C21 | C | Optional [stale-claim admission](LIFECYCLE.md) preserves every fail-closed predicate/receipt; never releases a foreign claim. |
 | C22 | C | Declared [watchdog state/probe/detector/park/sidecar](../tools/eden-lifecycle/README.md) keeps40-line-window and idle-vs-demo distinctions; safe label alone does nothing. |
 | C23 | C | Macro editing obeys [frame/sample/game/player/press-release/replay/hash limits](MACROS.md), without savestate assumptions. |

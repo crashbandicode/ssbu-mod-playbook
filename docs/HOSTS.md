@@ -2,7 +2,7 @@
 
 Read [START](START.md) and [CHECKLIST](CHECKLIST.md), then this page for host,
 display, admission or scheduling work. [LIFECYCLE](LIFECYCLE.md) owns claims
-and recovery; [WINDOWS](../tools/eden-lifecycle/README.md) adds the Ally requirements.
+and recovery; [WINDOWS](WINDOWS.md) adds the Ally requirements.
 
 | Executor | Maximum Eden instances | Additional policy |
 | --- | ---: | --- |
