@@ -56,14 +56,14 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M44 | M | Retain [exact build/shipped-NRO identity](WORKFLOW.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
 | M45 | M | [Pin resolved build paths and matching trace symbols](PROFILES.md); disclose mixed builds and separate client identity from app pins. |
 | M46 | M | [Snapshot before staging; mute/save/read back before load](LIFECYCLE.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
-| M47 | M | [Stop Linux main before FUSE/backing processes](EDEN.md), using owned birth identity/pidfd and fail-closed claim retention. |
+| M47 | M | [Stop Linux main before FUSE/backing processes](LINUX-DOWN.md), using owned birth identity/pidfd and fail-closed claim retention. |
 | M48 | M | Change [shared tools only in a separate worktree](MACROS.md); generic extensions get tests; commit/reuse successful route inputs. |
 | M49 | M | Keep [one driver per instance and same-frame macro chords](MACROS.md); review settled state before playback. |
 | M50 | M | Respect [input lease/recording/hash/edit invariants](MACROS.md); incomplete recordings cannot become passing media. |
 | M51 | M | Budget [rows+boot/navigation+route work under runtime minus margin](MACROS.md); order wedge/crash/teardown checks last. |
 | M52 | M | [Review actual behavior and settled HUD state](MACROS.md); fixture applied, bareTrue and clip saved do not prove behavior. |
 | M53 | M | [Ban extracted game/mod assets and dumps from git](WORKFLOW.md); reviewed evidence screenshots and required reference crops are allowed. |
-| M54 | M | Treat [cleanup success separately from graceful/native health](EDEN.md); inspect unit/console fatal tails and qualification limits. |
+| M54 | M | Treat [cleanup success separately from graceful/native health](LINUX-DOWN.md); inspect unit/console fatal tails and qualification limits. |
 | M55 | M | Stop only [owned displays/processes/paths](LIFECYCLE.md); ambiguous identity or failed restore/verify retains claim for recovery. |
 | M56 | M | Follow [60GB pre-Up admission and verified-clean-Down pruning](HOSTS.md); preserve receipts/logs/reports and failed-cleanup recovery state, never foreign copies. |
 | C01 | C | If sites may overlap, use [sharing/chaining](HOOK-SHARING.md), election before guard, both stand-ins and load orders; cite dated scan for N/A. |

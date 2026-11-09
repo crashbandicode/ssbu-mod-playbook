@@ -78,7 +78,7 @@ not ACKs. Runtime defaults to 5400 seconds and permits up to 10800.
 
 Down attempts exact owned forced cleanup even after capped `game.stop`
 failure. Check unit/cgroup and PID birth identity; never `pkill -f` or adopt
-foreign processes. [LINUX-DOWN](EDEN.md) requires main before FUSE;
+foreign processes. [LINUX-DOWN](LINUX-DOWN.md) requires main before FUSE;
 [WINDOWS](../tools/eden-lifecycle/README.md) requires exact session Job/task/PID cleanup. Only after
 all owned PIDs are absent: preserve post-run evidence, restore full snapshot,
 perform **separate** complete verify, then release only the exact owned claim.
