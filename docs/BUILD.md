@@ -48,7 +48,7 @@ Treat every hook as exposed to game-worker execution. Only a trace showing
 that a named hook runs exclusively on MainThread permits its named test
 exception; retain the run label and hit counts. A hook not reached by that
 trace remains exposed. Trace `thread_id` and `core_id` under
-[TRACING](EDEN.md), rather than assuming a hook's calling thread.
+[TRACING](TRACING.md), rather than assuming a hook's calling thread.
 
 Keep a lock-reach test that walks the call graph from every hook and every
 plugin-thread entry, following helpers that acquire locks for their caller.

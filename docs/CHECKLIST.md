@@ -34,10 +34,10 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M22 | M | Prepare [shared runner/dry-run before Up](TEST-PLAN.md), meet15/30min deadlines, chain rows and preserve project media/hooks plus tool revision. |
 | M23 | M | Declare [fixture/segment/hook/bounded-record setup](TEST-PLAN.md); act on40-input/15min-no-progress/runtime-margin pace limits. |
 | M24 | M | [Abort a missing precondition and retry a new label](TEST-RUN.md), bounded by the batch try cap. |
-| M25 | M | [Trace game facts on an existing run](EDEN.md); explain any diag rebuild/extra trace boot and retain actual trace/build evidence. |
+| M25 | M | [Trace game facts on an existing run](TRACING.md); explain any diag rebuild/extra trace boot and retain actual trace/build evidence. |
 | M26 | M | Use the [shortest ruleset](TEST-PLAN.md):1 stock,1:00, items/hazards/FS off; justify longer tests. |
 | M27 | M | [Restore the run-owned profile and release only after separate verification](LIFECYCLE.md). |
-| M28 | M | [Review panic/abort/crash/Unmapped and native pointer types](EDEN.md); retain console, run identity and memory evidence. |
+| M28 | M | [Review panic/abort/crash/Unmapped and native pointer types](TRACING.md); retain console, run identity and memory evidence. |
 | M29 | M | Bound [every local command by memory/time](START.md); put `${var}` use in a script file. |
 | M30 | M | Keep [each run's outputs under its own label](WORKFLOW.md). |
 | M31 | M | Write the [short README with whole-screen1280-wide <10s GIF](WORKFLOW.md), dated build caption, install/build/license/AI lines. |
