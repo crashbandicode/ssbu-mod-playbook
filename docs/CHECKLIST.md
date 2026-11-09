@@ -31,18 +31,18 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M19 | M | Use [private profiles with immutable hard links and real mutable copies](PROFILES.md); change only your copy and verify storage. |
 | M20 | M | Keep [per-copy targets/fresh source times/locked seeds/shared cargo home/disk checks/deletion manifest](BUILD.md). |
 | M21 | M | [Gate every wait](MACROS.md); rounded-up fixed sleeps are only for states with neither log nor screenshot checks. |
-| M22 | M | Prepare [shared runner/dry-run before Up](MACROS.md), meet15/30min deadlines, chain rows and preserve project media/hooks plus tool revision. |
-| M23 | M | Declare [fixture/segment/hook/bounded-record setup](MACROS.md); act on40-input/15min-no-progress/runtime-margin pace limits. |
+| M22 | M | Prepare [shared runner/dry-run before Up](TEST-PLAN.md), meet15/30min deadlines, chain rows and preserve project media/hooks plus tool revision. |
+| M23 | M | Declare [fixture/segment/hook/bounded-record setup](TEST-PLAN.md); act on40-input/15min-no-progress/runtime-margin pace limits. |
 | M24 | M | [Abort a missing precondition and retry a new label](MACROS.md), bounded by the batch try cap. |
 | M25 | M | [Trace game facts on an existing run](EDEN.md); explain any diag rebuild/extra trace boot and retain actual trace/build evidence. |
-| M26 | M | Use the [shortest ruleset](MACROS.md):1 stock,1:00, items/hazards/FS off; justify longer tests. |
+| M26 | M | Use the [shortest ruleset](TEST-PLAN.md):1 stock,1:00, items/hazards/FS off; justify longer tests. |
 | M27 | M | [Restore the run-owned profile and release only after separate verification](LIFECYCLE.md). |
 | M28 | M | [Review panic/abort/crash/Unmapped and native pointer types](EDEN.md); retain console, run identity and memory evidence. |
 | M29 | M | Bound [every local command by memory/time](START.md); put `${var}` use in a script file. |
 | M30 | M | Keep [each run's outputs under its own label](WORKFLOW.md). |
 | M31 | M | Write the [short README with whole-screen1280-wide <10s GIF](WORKFLOW.md), dated build caption, install/build/license/AI lines. |
 | M32 | M | Keep [dated build/run/behavior/log evidence](WORKFLOW.md); row receipts and <=20-line RESULTS feed one phase compliance report. |
-| M33 | M | [Group every reachable open row into as few boots as possible](MACROS.md); split only for stated build/host/profile/boot needs. |
+| M33 | M | [Group every reachable open row into as few boots as possible](TEST-PLAN.md); split only for stated build/host/profile/boot needs. |
 | M34 | M | [Continue reachable rows after failures](MACROS.md); recover/check start state, defer with cause, stop safely on unrecoverable state/crash. |
 | M35 | M | Make [no unsupported claims](WORKFLOW.md); keep operator quotes out of shipped docs, with the working-design trace exception. |
 | M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](WORKFLOW.md), with no secrets. |
@@ -60,7 +60,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M48 | M | Change [shared tools only in a separate worktree](MACROS.md); generic extensions get tests; commit/reuse successful route inputs. |
 | M49 | M | Keep [one driver per instance and same-frame macro chords](MACROS.md); review settled state before playback. |
 | M50 | M | Respect [input lease/recording/hash/edit invariants](MACROS.md); incomplete recordings cannot become passing media. |
-| M51 | M | Budget [rows+boot/navigation+route work under runtime minus margin](MACROS.md); order wedge/crash/teardown checks last. |
+| M51 | M | Budget [rows+boot/navigation+route work under runtime minus margin](TEST-PLAN.md); order wedge/crash/teardown checks last. |
 | M52 | M | [Review actual behavior and settled HUD state](MACROS.md); fixture applied, bareTrue and clip saved do not prove behavior. |
 | M53 | M | [Ban extracted game/mod assets and dumps from git](WORKFLOW.md); reviewed evidence screenshots and required reference crops are allowed. |
 | M54 | M | Treat [cleanup success separately from graceful/native health](LINUX-DOWN.md); inspect unit/console fatal tails and qualification limits. |

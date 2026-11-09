@@ -32,7 +32,7 @@ Routing/model/effort and watcher rules come from
 7. The coordinator enforces Up in **15 minutes**, or **30** when segments need
    recording. At the deadline interrupt/redirect: Up now with rows needing
    no new route, record missing routes in that boot, mark unstaged rows BLOCKED.
-   [TEST-PLAN](MACROS.md) owns full grouping/setup/budget requirements.
+   [TEST-PLAN](TEST-PLAN.md) owns full grouping/setup/budget requirements.
 8. Watch for stalls with these exact triggers: direct input outside runner;
    provider/turn error **and no worker activity for the following 2 minutes**;
    worker quiet **12 minutes without updating its report**. Other transient

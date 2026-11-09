@@ -36,7 +36,7 @@ identity too; the application pin alone does not pin that client.
 Stage only the approved pinned plugins and files. The lifecycle sets all
 pre-existing NROs aside, installs the pin list, rebases/verifies NAND and
 SDMC paths and starts fresh output folders. Fixtures belong in the plan
-before Up; see [TEST-PLAN](MACROS.md). Keep original snapshots separate
+before Up; see [TEST-PLAN](TEST-PLAN.md). Keep original snapshots separate
 from run outputs: the original snapshot never becomes the output directory.
 
 If a row depends on any `ultimate/mods` stage, fighter, UI or sound
