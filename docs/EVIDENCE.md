@@ -14,7 +14,12 @@ runner receipts are that doc; the phase compliance report collects them.
 Keep outputs under their run label. Preserve row receipts and summary,
 screenshots, log/trace evidence, `run.json`, `memory.peak`, build identity
 and lifecycle cleanup/verify/release receipts. Record resolved build paths
-and hashes; do not silently pool runs made on different Eden builds. Search
+and hashes; do not silently pool runs made on different Eden builds. Record
+the actual playbook commit and selected script/binary hashes with each task;
+old origin hashes do not identify current source. Resolve external binaries,
+clients and extractor dependencies afresh, rather than from source-era paths.
+Explicit artifact paths outrank newest-file inference; a tag is required only
+for an authorized release, not ordinary build/run evidence. Search
 the console for panic, abort, crash and unmapped accesses, and apply
 [TRACING](TRACING.md)'s failure and pointer-review rules. A clean search
 does not establish absence of an unlogged null read.
@@ -27,7 +32,7 @@ remain in [TEST-PLAN](TEST-PLAN.md) and [TEST-RUN](TEST-RUN.md).
 
 Every numerical claim computed from logs comes from a committed script
 over those logged files, with host tests. Name its command beside the
-numbers. Use synthetic fair data and a planted bias where relevant so the
+numbers. Test the scripts on the host with synthetic fair data and a planted bias so the
 test proves the calculation can distinguish them; an unrelated test file
 does not establish the calculation's correctness.
 
@@ -40,8 +45,10 @@ and next commands. Include no secrets.
 For a claim that a particular picture, icon or mod asset is visible, decode
 the expected source image and the stock alternative. Put the captured
 frame beside both, retain the decoded file paths and side-by-side evidence,
-and rule out the stock case. Use `tools/assets/arc_get.py` for stock files
+and rule out the stock case. The side-by-side contains decoded textures:
+keep it outside git and record its path and hash. Use `tools/assets/arc_get.py` for stock files
 and `tools/assets/bntx_view.py` for BNTX decoding after reading the scripts.
+These decoders have no host tests; review each decoded image yourself.
 This source comparison and [PROFILES](PROFILES.md)'s ARCropolis pin plus
 native-screen proof in the same boot are separate necessary gates.
 
