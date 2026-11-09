@@ -1,7 +1,7 @@
 # Native Windows lifecycle
 
 This page adds to [HOSTS](HOSTS.md), [PROFILES](PROFILES.md) and
-[LIFECYCLE](LIFECYCLE.md). Every live Ally campaign needs the operator's grant
+[LIFECYCLE](LIFECYCLE.md). Every live Ally run (each Up) needs the operator's grant
 and normal queue/ledger turn. Offline preparation includes **no host query,
 claim or launch**. Fresh identity observations follow GO; old pins, paths,
 session numbers and HOLD plans confer no current authority.
@@ -90,8 +90,9 @@ Qualification is dated, not a claim about present host availability:
 | Graceful stop, pair mode | Not qualified by that proof. |
 | Native 1312, transport loss, cap exhaustion/runtime expiry | Still require their own native qualification. |
 
-A later narrow proof uses fresh identities/roots after a new grant, no
-foreign native/WSL Eden/compiler, >=10 GiB available and current pre-Up disk
+A later qualification proof is **one no-input** (`lifecycle_only:true`)
+Up/load/Down unless the grant explicitly names more. After a new grant use fresh
+identities/roots, no foreign native/WSL Eden/compiler, >=10 GiB available and current pre-Up disk
 floor. Record terminal load plus fresh frame, limits and capped-stop → exact
 Job fallback. **A fresh Down process** proves no owned PID/task, post-run
 preservation, private/source equality and own release. Compare deployed
