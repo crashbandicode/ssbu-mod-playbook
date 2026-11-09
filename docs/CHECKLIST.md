@@ -10,12 +10,12 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 
 | ID | Tag | One-line rule summary and canonical home |
 | --- | --- | --- |
-| M01 | M | Build a [cdylib only](WORKFLOW.md); no rlib; record shipped resident size. |
-| M02 | M | Keep [exact release/toolchain/Skyline pins](WORKFLOW.md): opt s, LTO,1 codegen unit, abort, Skyline=0.6.0, Rust1.98.1. |
-| M03 | M | Keep [pure host-tested model logic and Switch-only runtime](WORKFLOW.md). |
-| M04 | M | Pass all five [separate Cargo gates](WORKFLOW.md): test, warning-free clippy, no-default, Skyline release and diag. |
-| M05 | M | [Hooks allocate no heap](WORKFLOW.md); use counting allocator and install-line `heap_allocations=0`. |
-| M06 | M | Use [fixed buffers, static writer stack and stack-built file paths](WORKFLOW.md). |
+| M01 | M | Build a [cdylib only](BUILD.md); no rlib; record shipped resident size. |
+| M02 | M | Keep [exact release/toolchain/Skyline pins](BUILD.md): opt s, LTO,1 codegen unit, abort, Skyline=0.6.0, Rust1.98.1. |
+| M03 | M | Keep [pure host-tested model logic and Switch-only runtime](BUILD.md). |
+| M04 | M | Pass all five [separate Cargo gates](BUILD.md): test, warning-free clippy, no-default, Skyline release and diag. |
+| M05 | M | [Hooks allocate no heap](BUILD.md); use counting allocator and install-line `heap_allocations=0`. |
+| M06 | M | Use [fixed buffers, static writer stack and stack-built file paths](BUILD.md). |
 | M07 | M | Fix [root causes](DESIGN.md); approve/date any workaround before shipping and assess one shared abstraction. |
 | M08 | M | Every added [user-facing refusal](DESIGN.md) cites a nearby restriction ID with genuine recorded operator approval. |
 | M09 | M | Before code, [trace every verbatim operator clause](DESIGN.md) to design and existing proving tests; prove parity in shared cases. |
@@ -23,13 +23,13 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M11 | M | Apply [64-byte guards to every hook/called/relied site](WORKFLOW.md); log and leave mismatches alone with sharing exceptions. |
 | M12 | M | [Scan a dated card copy before site selection](WORKFLOW.md), including virtual slots; scan absence is not runtime proof. |
 | M13 | M | [Call the game function or hook its most specific post-prologue instruction](WORKFLOW.md). |
-| M14 | M | Keep [diag code, diag.txt and stand-in markers out of shipped NRO](WORKFLOW.md). |
-| M15 | M | Ship [install-line-only logging](WORKFLOW.md), with the C13 logging-product exception and no per-frame diagnostics. |
+| M14 | M | Keep [diag code, diag.txt and stand-in markers out of shipped NRO](BUILD.md). |
+| M15 | M | Ship [install-line-only logging](BUILD.md), with the C13 logging-product exception and no per-frame diagnostics. |
 | M16 | M | [Claim before Up; Down after failure too](EDEN.md); retain the claim until owned cleanup/restore/separate verify succeed. |
 | M17 | M | Follow [host slots/10–9GiB admission](EDEN.md); never source profilea, display61 or foreign runs. |
 | M18 | M | Keep [XPS half-resolution precedence, thermald on and timed rows on Surface/Yoga](EDEN.md). |
 | M19 | M | Use [private profiles with immutable hard links and real mutable copies](EDEN.md); change only your copy and verify storage. |
-| M20 | M | Keep [per-copy targets/fresh source times/locked seeds/shared cargo home/disk checks/deletion manifest](WORKFLOW.md). |
+| M20 | M | Keep [per-copy targets/fresh source times/locked seeds/shared cargo home/disk checks/deletion manifest](BUILD.md). |
 | M21 | M | [Gate every wait](MACROS.md); rounded-up fixed sleeps are only for states with neither log nor screenshot checks. |
 | M22 | M | Prepare [shared runner/dry-run before Up](MACROS.md), meet15/30min deadlines, chain rows and preserve project media/hooks plus tool revision. |
 | M23 | M | Declare [fixture/segment/hook/bounded-record setup](MACROS.md); act on40-input/15min-no-progress/runtime-margin pace limits. |
@@ -51,8 +51,8 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M39 | M | Use [Forgejo and temporary UTF-8 commit-message files](START.md); no GitHub publication or unordered push. |
 | M40 | M | Follow the external [model/effort/watcher/routing authority](START.md); do not duplicate its policy. |
 | M41 | M | [Every agent/worker reads START+CHECKLIST+task pages](START.md), records playbook commit, makes its checklist and runs compliance before READY. |
-| M42 | M | [Hooks never wait on a plugin thread](WORKFLOW.md); preserve the new base's exact nonblocking contract. |
-| M43 | M | Declare an [empty diag feature and keep working tree clean](WORKFLOW.md); retain these code-only checker obligations. |
+| M42 | M | [Hooks never wait on a plugin thread](BUILD.md); preserve the new base's exact nonblocking contract. |
+| M43 | M | Declare an [empty diag feature and keep working tree clean](BUILD.md); retain these code-only checker obligations. |
 | M44 | M | Retain [exact build/shipped-NRO identity](WORKFLOW.md); explicit artifacts outrank newest-file inference and a tag is required only for release. |
 | M45 | M | [Pin resolved build paths and matching trace symbols](EDEN.md); disclose mixed builds and separate client identity from app pins. |
 | M46 | M | [Snapshot before staging; mute/save/read back before load](EDEN.md); bounded terminal jobs, durable journal and ACK-loss-safe owned claims. |
@@ -78,7 +78,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C10 | C | Release must have a [byte-identical rebuild of the tagged commit](WORKFLOW.md). |
 | C11 | C | Authorized card work uses [fresh preflight, archives/rollback/readbacks and inspected non-repeated receipts](WORKFLOW.md); single writer, loader last, disconnect after final verify. |
 | C12 | C | Multi-worker work needs [persistent sessions/routes, no context actions, done-checklists,<=60s polls, deadlines/stall alerts and direct acceptance](WORKERS.md). |
-| C13 | C | A logging product may ship [its data files as well as install line](WORKFLOW.md), without per-frame diagnostics. |
+| C13 | C | A logging product may ship [its data files as well as install line](BUILD.md), without per-frame diagnostics. |
 | C14 | C | Shared owners implement [ABI/election/early-late registration/hook-only guest service and per-site logs](HOOK-SHARING.md). |
 | C15 | C | Foreign hooks obey [far/branch/stub/trampoline/called-relied/restore rules](HOOK-SHARING.md); both plugin and stand-in counters keep running. |
 | C16 | C | Windows work uses [fresh private/source roots, exact MSI/session/SID/helper pins and unchanged source verification](../tools/eden-lifecycle/README.md). |
