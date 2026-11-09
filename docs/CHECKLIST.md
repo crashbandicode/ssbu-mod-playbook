@@ -33,7 +33,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M21 | M | [Gate every wait](MACROS.md); rounded-up fixed sleeps are only for states with neither log nor screenshot checks. |
 | M22 | M | Prepare [shared runner/dry-run before Up](TEST-PLAN.md), meet15/30min deadlines, chain rows and preserve project media/hooks plus tool revision. |
 | M23 | M | Declare [fixture/segment/hook/bounded-record setup](TEST-PLAN.md); act on40-input/15min-no-progress/runtime-margin pace limits. |
-| M24 | M | [Abort a missing precondition and retry a new label](MACROS.md), bounded by the batch try cap. |
+| M24 | M | [Abort a missing precondition and retry a new label](TEST-RUN.md), bounded by the batch try cap. |
 | M25 | M | [Trace game facts on an existing run](EDEN.md); explain any diag rebuild/extra trace boot and retain actual trace/build evidence. |
 | M26 | M | Use the [shortest ruleset](TEST-PLAN.md):1 stock,1:00, items/hazards/FS off; justify longer tests. |
 | M27 | M | [Restore the run-owned profile and release only after separate verification](LIFECYCLE.md). |
@@ -43,7 +43,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | M31 | M | Write the [short README with whole-screen1280-wide <10s GIF](WORKFLOW.md), dated build caption, install/build/license/AI lines. |
 | M32 | M | Keep [dated build/run/behavior/log evidence](WORKFLOW.md); row receipts and <=20-line RESULTS feed one phase compliance report. |
 | M33 | M | [Group every reachable open row into as few boots as possible](TEST-PLAN.md); split only for stated build/host/profile/boot needs. |
-| M34 | M | [Continue reachable rows after failures](MACROS.md); recover/check start state, defer with cause, stop safely on unrecoverable state/crash. |
+| M34 | M | [Continue reachable rows after failures](TEST-RUN.md); recover/check start state, defer with cause, stop safely on unrecoverable state/crash. |
 | M35 | M | Make [no unsupported claims](WORKFLOW.md); keep operator quotes out of shipped docs, with the working-design trace exception. |
 | M36 | M | Keep [handoff branch/commit/evidence/live-state/next commands current](WORKFLOW.md), with no secrets. |
 | M37 | M | [Only the user connects/disconnects or controls DBI/UMS](WORKFLOW.md); agents never mount/unmount/eject/remount/power off media. |
@@ -92,7 +92,7 @@ Final reporting lists failed, skipped and unverified rows. Per-run `RESULTS.md` 
 | C24 | C | GIF capture follows [distinct README/evidence envelopes, reasons/status/timing/frame review](GIFS.md); removals need comparable before/after clips. |
 | C25 | C | Image/hook gates preserve [static/tolerance/scaling/ROI/evidence/REVIEW semantics](MACROS.md); unchecked/bareTrue alone prove neither start state nor behavior. |
 | C26 | C | Reused/new segments retain [sha256/start/end gates, receipts and reviewed harvest provenance](MACROS.md). |
-| C27 | C | Before shipping, use the [full card plugin set for one match through results/back](MACROS.md); inspect every install line and console. |
+| C27 | C | Before shipping, use the [full card plugin set for one match through results/back](TEST-RUN.md); inspect every install line and console. |
 
 Machine checks are useful approximations, not semantic proof. See each concern's evidence and tooling limits.
 An approval JSON, old receipt, example pass count, or zero wrapper exit is not a new authorization or complete acceptance.

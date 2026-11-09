@@ -1,6 +1,6 @@
 # Eden lifecycle: claim through release
 
-Use [TEST-PLAN](TEST-PLAN.md) and [TEST-RUN](MACROS.md) for product rows;
+Use [TEST-PLAN](TEST-PLAN.md) and [TEST-RUN](TEST-RUN.md) for product rows;
 `tools/eden-test/eden_test.py` is the run entry. The lifecycle owns isolation,
 claims, bounded launch and cleanup. Up/Down/status do not send project input,
 play macros or implement rows; an explicitly declared watchdog park is the

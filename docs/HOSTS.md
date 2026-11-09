@@ -53,7 +53,7 @@ outer timeout longer than the deadline, and output to a file. Recheck after
 an atomic claim race and wait again when another owner wins. Use current
 admission rules rather than the old one-instance queue example. Every actual
 attempt has a unique label and always attempts Down; precondition retries
-and try caps are in [TEST-RUN](MACROS.md).
+and try caps are in [TEST-RUN](TEST-RUN.md).
 
 Evidence: resource/limit receipts, authoritative claim/release lines, host
 and display identity, compiler-lock coordination, and any setting readbacks.

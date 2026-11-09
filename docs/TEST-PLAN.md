@@ -2,7 +2,7 @@
 
 Read [START](START.md), [CHECKLIST](CHECKLIST.md), [HOSTS](HOSTS.md),
 [PROFILES](PROFILES.md), [LIFECYCLE](LIFECYCLE.md) and this page for an Eden
-run. [TEST-RUN](MACROS.md) governs execution; [RUNNER](MACROS.md) describes
+run. [TEST-RUN](TEST-RUN.md) governs execution; [RUNNER](MACROS.md) describes
 schema and evidence limits. These paragraphs preserve test-run rules 1–15
 from the former MACROS page; their homes are listed below.
 
@@ -34,11 +34,11 @@ from the former MACROS page; their homes are listed below.
 7. **Keep what worked.** At Down commit project rows/hooks, segments and
    reviewed reference screenshots/crops with SHA256 into `eden/`, plus the
    shared runner's playbook commit. Do not vendor `runner.py`. Harvest proven
-   routes and reuse them next time; [TEST-RUN](MACROS.md) covers review.
+   routes and reuse them next time; [TEST-RUN](TEST-RUN.md) covers review.
 8. **One boot covers every reachable open row.** Split only for a different
    build, plugin set, host/profile, or when fresh boot/first load is itself
    tested. Fix/defer a failing row and continue that same boot when reachable;
-   recovery, summary and stop conditions are in [TEST-RUN](MACROS.md).
+   recovery, summary and stop conditions are in [TEST-RUN](TEST-RUN.md).
    Cheap independent rows go first, wedge/crash/teardown/long matches last.
 9. **Short reports.** Per-run RESULTS <=20 lines, coordination <=5 lines;
    full compliance once per phase/candidate, with all manual dispositions.
