@@ -7,6 +7,8 @@ or mount point the user exposed. Never mount, unmount, eject, power off or
 remount the card, or start/stop DBI/UMS. If it is not visible, stop and ask
 the user. Compliance scans scripts for forbidden disk commands; passing
 that scan does not establish actual connection ownership or authorization.
+The documented Switch connection host is Surface; inspect `tools/switch/examples/`
+for schemas, and verify the current user-exposed endpoint before use.
 
 Read the selected script before use. Verify its current identity and the
 current operator grant, endpoint, files, paths and hashes. Approval booleans
@@ -22,6 +24,10 @@ separate transactions automatically.
 | Replace plugin on exposed mounted card | `upgrade2-ums.py` | `preflight`, `install`, `verify` |
 | Swap mutually exclusive plugins on mounted card | `swap-ums.py` | `preflight`, `install`, `verify` |
 | Replace Skyline loader over MTP or mounted card | `replace-exefs.py` | `preflight`, `install`, `verify` |
+
+`swap-ums.py` has never run on a real card. `replace-exefs.py` has only one
+read-only real-card preflight (2026-11-01), with no real-card writes. Disclose
+these qualification limits when requesting the operator's order.
 
 Use a transaction folder containing the NRO where applicable and
 `operator-approval.json` (`operator_order`, `operator_install_authorized`,
