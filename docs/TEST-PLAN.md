@@ -5,6 +5,7 @@ Read [START](START.md), [CHECKLIST](CHECKLIST.md), [HOSTS](HOSTS.md),
 run. [TEST-RUN](TEST-RUN.md) governs execution; [RUNNER](RUNNER.md) describes
 schema and evidence limits. These paragraphs preserve test-run rules 1–15
 from the former MACROS page; their homes are listed below.
+Read [HOOK-CHAIN](HOOK-CHAIN.md) when the batch has sharing or stand-in rows.
 
 1. **Runner ready before Up.** Use the existing shared
    `tools/eden-runner/runner.py`, the project's `rows.json` and optional
@@ -31,6 +32,8 @@ from the former MACROS page; their homes are listed below.
    between rows in that same boot after their own dry-run passes. Before Up
    do only the required dry-run; extra offline suites, input-pin inventories
    and code review wait until after the run. Required safety admission stays.
+   Evidence: runner path, dry-run receipt and log, order and Up times, and
+   `macro.play` calls in `control.jsonl`.
 7. **Keep what worked.** At Down commit project rows/hooks, segments and
    reviewed reference screenshots/crops with SHA256 into `eden/`, plus the
    shared runner's playbook commit. Do not vendor `runner.py`. Harvest proven
@@ -40,6 +43,7 @@ from the former MACROS page; their homes are listed below.
    tested. Fix/defer a failing row and continue that same boot when reachable;
    recovery, summary and stop conditions are in [TEST-RUN](TEST-RUN.md).
    Cheap independent rows go first, wedge/crash/teardown/long matches last.
+   Evidence: run labels against the row list.
 9. **Short reports.** Per-run RESULTS <=20 lines, coordination <=5 lines;
    full compliance once per phase/candidate, with all manual dispositions.
 10. **One entry.** Use `tools/eden-test/eden_test.py` on the executor, with
@@ -79,6 +83,7 @@ items/hazards/FS meter off**, Final Destination or Battlefield. Save it in
 the copy, never profile `a`, and pick by name each time. End deliberately
 with one-stock walk-off when suitable. A longer match needs a test-specific
 reason in the handoff. Retain ruleset screenshot or logged match length.
+Hazards are under the rules editor's collapsed **Advanced** row.
 The caller owns this fixture: the lifecycle does not drive rule menus.
 
 Reuse the shared navigation index before building anything. Generic runner
