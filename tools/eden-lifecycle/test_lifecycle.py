@@ -610,6 +610,122 @@ class LifecycleTests(unittest.TestCase):
                              {'pid': 503, 'name': 'eden-lan-runtim'}]
         self.controller().admission()
 
+    # Operator 2026-11-10: "if there's headroom it should be allowed". Compiles at nice >= 10 admit an Up when
+    # MemAvailable covers the instance floor plus the compile reserve; un-niced compiles and perf_sensitive configs refuse.
+    def niced(self):
+        return [{'pid': 901, 'name': 'cargo', 'nice': 19}, {'pid': 902, 'name': 'rustc', 'nice': 19},
+                {'pid': 903, 'name': 'cc1', 'nice': 10}]
+
+    def test_niced_compile_with_headroom_admits_with_the_reserve_on_the_floor(self):
+        # The default: the Surface's two-job TrainingRooms build/test peak (2.43 GiB) plus a margin (README).
+        self.assertEqual((life.COMPILE_RESERVE, life.COMPILE_NICE_MIN), (4 * life.GIB, 10))
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.foreign = self.niced()
+        self.host.available = life.MIN_MEMORY + life.COMPILE_RESERVE + life.GIB
+        self.controller().admission()
+        report = self.controller().preflight()
+        self.assertTrue(report['ok'], report['message'])
+        compiler = next(line for line in report['lines'] if line.startswith(('OK compiler', 'FAIL compiler')))
+        self.assertTrue(compiler.startswith('OK compiler: 3 running, all at nice >= 10 (lowest 10); compile reserve '
+                                            f'{life.COMPILE_RESERVE} bytes'), compiler)
+        memory = next(line for line in report['lines'] if line.startswith(('OK memory', 'FAIL memory')))
+        self.assertEqual(memory, f'OK memory: {self.host.available} bytes available, floor {life.MIN_MEMORY} + compile '
+                                 f'reserve {life.COMPILE_RESERVE}; headroom {life.GIB}')
+        check = next(c for c in report['checks'] if c['name'] == 'memory')
+        self.assertEqual((check['reserve'], check['headroom']), (life.COMPILE_RESERVE, life.GIB))
+        # The whole Up goes through, claim and launch included.
+        self.assertEqual(self.controller().up()['phase'], 'up')
+
+    def test_unniced_compile_still_refuses(self):
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.available = 30 * life.GIB
+        for unniced in ({'pid': 904, 'name': 'rustc', 'nice': 0}, {'pid': 905, 'name': 'cc1', 'nice': 9},
+                        {'pid': 906, 'name': 'cargo'}):   # no nice read (the Windows host): un-niced
+            self.host.foreign = self.niced() + [unniced]
+            with self.assertRaisesRegex(life.Refused, 'Compiler already active on host: 1 of 4 below nice 10'):
+                self.controller().admission()
+            report = self.controller().preflight()
+            self.assertFalse(report['ok'])
+            self.assertTrue(any(line.startswith('FAIL compiler: Compiler already active on host: 1 of 4 below nice 10 '
+                                                '(build under nice -n 19); seen: cargo 901 nice 19')
+                                for line in report['lines']), report['lines'])
+        self.assertFalse(self.ledger.claimed)
+
+    def test_niced_compile_without_headroom_refuses(self):
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.foreign = self.niced()
+        self.host.available = life.MIN_MEMORY + life.COMPILE_RESERVE - 1
+        with self.assertRaisesRegex(life.Refused, 'below the floor .* plus the compile reserve .* while niced compilers run'):
+            self.controller().admission()
+        # Below the plain floor the plain message stands.
+        self.host.available = life.MIN_MEMORY - 1
+        with self.assertRaisesRegex(life.Refused, 'MemAvailable below 10 GiB'):
+            self.controller().admission()
+        # A second instance: 9 GiB plus the reserve.
+        self.host.foreign = self.niced() + [{'pid': 501, 'name': 'eden'}]
+        self.host.max_eden = 2
+        self.host.available = life.MIN_MEMORY_SECOND + life.COMPILE_RESERVE
+        self.controller().admission()
+        self.host.available -= 1
+        with self.assertRaisesRegex(life.Refused, f'below the floor {life.MIN_MEMORY_SECOND} plus the compile reserve'):
+            self.controller().admission()
+        # compile_reserve_bytes overrides the default.
+        self.host.foreign = self.niced()
+        self.config['compile_reserve_bytes'] = life.GIB
+        self.host.available = life.MIN_MEMORY + life.GIB
+        self.controller().admission()
+        self.host.available -= 1
+        with self.assertRaisesRegex(life.Refused, f'compile reserve {life.GIB} '):
+            self.controller().admission()
+        for bad in (0, -1, 1.5, True, '1'):
+            config = deepcopy(self.config)
+            config['compile_reserve_bytes'] = bad
+            with self.assertRaisesRegex(life.Refused, 'compile_reserve_bytes must be a positive integer'):
+                life.Lifecycle(config, self.host, self.ledger)
+
+    def test_perf_sensitive_refuses_any_compiler(self):
+        self.config['perf_sensitive'] = True
+        self.host.foreign = self.niced()
+        self.host.available = 30 * life.GIB
+        with self.assertRaisesRegex(life.Refused, r'Compiler already active on host \(perf_sensitive'):
+            self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+        self.assertFalse(Path(self.config['work_root']).exists())
+        report = self.controller().preflight()
+        self.assertIn('perf_sensitive: no compiler may run', report['message'])
+        check = next(c for c in report['checks'] if c['name'] == 'compiler')
+        self.assertEqual((check['ok'], check['perf_sensitive']), (False, True))
+        # With no compiler a perf_sensitive run is admitted as before.
+        self.host.foreign = []
+        self.assertTrue(self.controller().preflight()['ok'])
+        for bad in ('yes', 1, None):
+            config = deepcopy(self.config)
+            config['perf_sensitive'] = bad
+            with self.assertRaisesRegex(life.Refused, 'perf_sensitive must be true or false'):
+                life.Lifecycle(config, self.host, self.ledger)
+
+    def test_no_compiler_keeps_the_plain_floor(self):
+        Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)
+        self.host.foreign = []
+        self.host.available = life.MIN_MEMORY
+        self.controller().admission()
+        report = self.controller().preflight()
+        self.assertIn('OK compiler: none running', report['lines'])
+        self.assertIn(f'OK memory: {life.MIN_MEMORY} bytes available, floor {life.MIN_MEMORY}', report['lines'])
+        check = next(c for c in report['checks'] if c['name'] == 'memory')
+        self.assertNotIn('reserve', check)
+        self.host.available -= 1
+        with self.assertRaisesRegex(life.Refused, 'MemAvailable below 10 GiB'):
+            self.controller().admission()
+
+    def test_stat_nice_reads_field_19_past_the_comm(self):
+        line = '4242 (rustc) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 1 0 0 39 19 1 0 123 456 789 0'
+        self.assertEqual(life.stat_nice(line), 19)
+        self.assertEqual(life.stat_nice(line.replace('(rustc)', '(a b) c)')), 19)
+        self.assertEqual(life.stat_nice(line.replace(' 39 19 ', ' 20 0 ')), 0)
+        self.assertEqual(life.stat_nice(line.replace(' 39 19 ', ' 30 10 ')), 10)
+        self.assertEqual(life.stat_nice(Path('/proc/self/stat').read_text()), os.nice(0))
+
     def test_a_second_eden_needs_9_gib_and_the_first_10(self):
         # Operator 2026-11-04: lower the free-memory check to 9 GiB for a second instance (each is capped at 8 GiB).
         Path(self.config['state_dir']).mkdir(parents=True, exist_ok=True)

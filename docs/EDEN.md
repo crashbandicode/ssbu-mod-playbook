@@ -118,7 +118,20 @@ in Elite Smash. The details are in Eden's `ELITE_RATING_TESTS.md`.
 `tools/eden-lifecycle/lifecycle.py preflight` checks the config's pins, game
 base, optional update version, optional playbook commit, memory, disk,
 compilers, ledger claims and a declared display. It writes nothing. `up` runs
-the same pin and game checks before it creates state. `watchdog --execute`
+the same pin and game checks before it creates state.
+
+**Compiles beside an Up** (operator 2026-11-10; [WORKFLOW](WORKFLOW.md) "Running agent workers without churn", rule 8):
+
+- While compilers run, `up` is admitted only when every compiler process runs at nice 10 or higher, and MemAvailable
+  covers the instance floor plus the compile reserve (4 GiB by default, `compile_reserve_bytes` in the
+  config).
+- `"perf_sensitive": true` refuses any compiler, as before.
+- Preflight prints the check:
+  - the compiler line gives the processes seen with their nice values, or the reason it fails (an un-niced count, or
+    `perf_sensitive`);
+  - the memory line gives the floor, the reserve and the headroom left, for example
+    `OK memory: <n> bytes available, floor 10737418240 + compile reserve <r>; headroom <h>`.
+- Build on an Eden host under `nice -n 19` with `CARGO_BUILD_JOBS=2`. `watchdog --execute`
 Downs an instance that sits idle outside a declared safe state (default five
 minutes) or that a declared detector calls a demo. A config that declares
 `watchdog` still Downs after `idle_s` while the instance waits in Training

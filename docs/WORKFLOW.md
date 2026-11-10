@@ -164,7 +164,8 @@ Eden checks then read lines instead of interpreting screenshots
 ## 4. Gates
 
 Run one cargo subcommand per call, with `CARGO_TERM_COLOR=never` and
-`CARGO_TERM_HYPERLINKS=false`:
+`CARGO_TERM_HYPERLINKS=false`. On a host that runs Eden, also run each call under `nice -n 19` with
+`CARGO_BUILD_JOBS=2`, so an Eden `Up` can be admitted beside it ("Running agent workers without churn", rule 8):
 
 ```text
 cargo test
@@ -331,11 +332,22 @@ the work itself.
    - a worker **quiet for 12 minutes without updating its report**.
 
    Anything else needs no action.
-8. **Hosts take turns.** At most two Eden boots on the Surface, Yoga or XPS, and one on the Ally (the lifecycle enforces it). The ledger admits a second claim only when the open one is the lifecycle's own (`host=<h> lifecycle=<token> Eden lifecycle admitted`, each run with its own profile copy); a manual or foreign claim still blocks (operator 2026-11-04). The lifecycle refuses `Up`
-   while any compiler runs, so builders wait while an Eden worker holds a
-   lock file around Up and Down. Gate runs for a new head write to a **new
-   folder**, so NRO paths and hashes that running Eden workers pinned stay
-   valid.
+8. **Hosts take turns.** At most two Eden boots on the Surface, Yoga or XPS, and one on the Ally (the lifecycle enforces it). The ledger admits a second claim only when the open one is the lifecycle's own (`host=<h> lifecycle=<token> Eden lifecycle admitted`, each run with its own profile copy); a manual or foreign claim still blocks (operator 2026-11-04). Compiles may run beside Eden when the host has headroom (operator 2026-11-10: "if there's headroom it should be
+   allowed"):
+   - **Build at low priority.** On an Eden host, run every cargo call under `nice -n 19` with two jobs
+     (`CARGO_BUILD_JOBS=2`), so the emulator keeps the CPU.
+   - **What the lifecycle admits.** While compilers run, it admits an `Up` only when every compiler process runs at
+     nice 10 or higher, and MemAvailable covers the instance floor (10 GiB for the first instance, 9 GiB for a second)
+     plus a compile reserve.
+     - The reserve's default is 4 GiB, measured from a two-job TrainingRooms build and test on the Surface (peak 2.43 GiB); set `compile_reserve_bytes` in the config to change it.
+     - An un-niced compiler still refuses the `Up`. A Windows host reports no nice value, so any compiler there refuses
+       it.
+     - A running Eden is never stopped by a compile; only Ups are checked.
+   - **Performance-sensitive runs** set `"perf_sensitive": true` in the config. The lifecycle then refuses an `Up`
+     while any compiler runs, as before. These runs (timed sessions, drills, grading, frame data) go only to the Yoga,
+     the Ally or the XPS.
+   - Gate runs for a new head write to a **new folder**, so NRO paths and hashes that running Eden workers pinned stay
+     valid.
 9. **The coordinator accepts on evidence it has seen.** It looks at the
    frames and log lines itself, and decodes the source for any asset claim
    ([GIFS](GIFS.md)), before closing a row. A worker's PASS on a visual

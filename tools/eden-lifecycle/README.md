@@ -44,7 +44,8 @@ Preflight still counts foreign Edens only. It checks every
 `expected_game_version` against `game_updates` or an instance `updates` list,
 an optional `playbook` object (`root` and `commit`; a short hash matches a
 longer HEAD), free memory (`memory_floor_bytes`, or the 10 GiB / 9 GiB
-admission floors), free disk, compilers, open ledger claims, and a declared
+admission floors), free disk, compilers (each one's nice value; see "Compiles beside an Up" below), open ledger
+claims, and a declared
 display when the host can probe one. A declared trace `symbols` ELF must
 exist. A leftover `control.sock` or `<key>.trace.jsonl` in the state directory
 is reported and left untouched; `up` removes that socket and moves the trace
@@ -163,9 +164,43 @@ must be recorded/acquired by that shared runner, not accepted by the lifecycle.
 For an explicitly assigned same-host pair, set `pair_authorized:true` and add
 key `b` with a distinct display/source/inputs. One lifecycle claim covers the
 pair; memory/disk and foreign-process checks repeat before EACH launch. The
-second guest is the sole deliberate exception to one Eden per host. Different
-owners' existing Eden/compiler processes always refuse Up; open claims are
+second guest is the sole deliberate exception to one Eden per host. Other owners' Eden instances count against the
+host's slot limit; their compilers refuse Up unless the headroom rule below admits it. Open claims are
 strictly blocking unless the optional policy below applies.
+
+### Compiles beside an Up (2026-11-10)
+
+Operator: "why are we restricting the compilation? if there's headroom it should be allowed."
+
+- **Before:** any compiler process on the host (`cargo`, `rustc`, `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`,
+  `cc1`, `cc1plus`, `ninja`, `cmake`) refused an Up.
+- **Now:** while compilers run, Up is admitted only when both hold:
+  - every compiler process runs at nice >= 10 (`COMPILE_NICE_MIN`; the nice is read from `/proc/<pid>/stat`);
+  - MemAvailable is at least the instance floor (10 GiB, or 9 GiB for a second instance, or `memory_floor_bytes`)
+    plus the compile reserve.
+- **The reserve:** `compile_reserve_bytes` (a positive integer); the default `COMPILE_RESERVE` is 4 GiB.
+  Measured on the Surface, 2026-11-10, a clean TrainingRooms `889919e1` source copy with empty target dirs, each command under `nice -n 19` with `CARGO_BUILD_JOBS=2`, the process tree sampled every 0.2 s:
+  - `cargo skyline build --release --features diag`: 129 s; the tree peaked at 1,723,875,328 B RSS (1.61 GiB), one `rustc` at 1.68 GB; the scope's `memory.peak` 2.03 GB, page cache included;
+  - `cargo test`: 500 s; the tree peaked at 2,613,547,008 B (2.43 GiB), two `rustc` at once, the larger 1.86 GB; `memory.peak` 4.97 GB, page cache included.
+  - 4 GiB is the larger tree peak plus 1.57 GiB of margin, for clippy and the no-default-features build and for cache the kernel can't drop at once. MemAvailable already counts the compile's current memory, so the reserve covers its growth to the peak.
+- **What still refuses:**
+  - an un-niced compiler, below nice 10: `Compiler already active on host: <n> of <m> below nice 10 (build under
+    nice -n 19)`;
+  - a Windows host, which reports no nice value, so any compiler there counts as un-niced;
+  - `"perf_sensitive": true` (a boolean): any compiler at all, as before (`Compiler already active on host
+    (perf_sensitive: no compiler may run)`). Timed sessions, drills, grading and frame data set it, and run only on
+    the Yoga, the Ally or the XPS.
+- **Preflight and admission print the check:**
+  - `OK compiler: <m> running, all at nice >= 10 (lowest <n>); compile reserve <r> bytes added to the memory floor;
+    seen: <name> <pid> nice <n>, …`;
+  - `OK memory: <a> bytes available, floor <f> + compile reserve <r>; headroom <h>`, or `FAIL memory: MemAvailable
+    <a> is below the floor <f> plus the compile reserve <r> (<f+r>) while niced compilers run`.
+- With no compiler running, nothing changed.
+- To measure again (another plugin, more jobs, another host), use `compile_peak.py`. It runs a command and sums its
+  process tree's RSS every 0.2 s; its docstring gives the commands of the 2026-11-10 measurement. Set
+  `compile_reserve_bytes` from the larger peak plus a margin.
+- The optional stale-claim policy below still needs an admission with no foreign process at all, so a niced compile
+  keeps an old claim blocking.
 The caller is responsible for obtaining its normal scheduling/queue turn.
 
 ### Optional stale-claim admission (2026-11-03)
@@ -207,8 +242,9 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
   Exact-token readback handles claim/release ACK loss without inventing an
   unclaimed state; ledger outage still attempts owned stop/restore but retains
   the claim until its history can be checked.
-- Admission: MemAvailable >=10GiB and disk >=60GB (`disk_floor_bytes` overrides it; 40GB before 2026-11-09); no
-  foreign Eden or compiler.
+- Admission: MemAvailable >=10GiB and disk >=60GB (`disk_floor_bytes` overrides it; 40GB before 2026-11-09); Eden
+  instances within the host's limit; no compiler, unless every compiler runs at nice >= 10 and MemAvailable also
+  covers the compile reserve ("Compiles beside an Up"; never with `perf_sensitive`).
 - Fresh private profile: only game Contents/firmware are hard-linked. All
   mutable/unknown files are real copies; snapshots cover the full clone,
   including empty directories, unknown files, bytes and modes.

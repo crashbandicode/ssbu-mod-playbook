@@ -8,7 +8,8 @@
   lifecycle.py watchdog  config.json --execute [--ssh memento-claw-yoga-ubuntu] [--rounds N] [--pause S]
 
 preflight is read-only: pins, game base, declared update version, playbook commit,
-memory floor, disk, compilers, ledger claims and a declared display. It runs
+memory floor, disk, compilers (each one's nice; niced compiles are admitted with headroom),
+ledger claims and a declared display. It runs
 again, still without writing, before every up. When the config declares watchdog
 and does not set auto false, up starts that watchdog as a sidecar until down.
 watchdog watches control activity and either parks with the declared input
@@ -61,6 +62,17 @@ EDEN_INSTANCE_NAMES = {'eden', 'yuzu', 'eden.exe'}
 # Up refuses below this much free disk; "disk_floor_bytes" in the config overrides it. Raised from 40 GB on 2026-11-09:
 # a run's copies are about 3 GB until Down prunes them, and several boots a day filled the XPS and the Yoga.
 MIN_DISK = 60 * 10 ** 9
+# Compiles beside an Up (operator 2026-11-10: "if there's headroom it should be allowed"). An Up is admitted while
+# compilers run when every one of them runs at nice >= COMPILE_NICE_MIN, so the emulator keeps CPU priority, and
+# MemAvailable covers the instance floor plus this reserve for the compile's own growth. "compile_reserve_bytes" in the
+# config overrides it; "perf_sensitive": true keeps the old rule (no compiler at all). Measured on the Surface
+# 2026-11-10 (TrainingRooms 889919e1, clean target dirs, nice 19, CARGO_BUILD_JOBS=2, the process tree summed every
+# 0.2 s): `cargo skyline build --release --features diag` peaked at 1.72 GB (1.61 GiB) RSS, `cargo test` at 2.61 GB
+# (2.43 GiB). 4 GiB keeps a margin of 1.57 GiB over the larger one.
+COMPILE_RESERVE = 4 * GIB
+COMPILE_NICE_MIN = 10
+# Linux comm names that count as a compiler (the same set resources() lists).
+COMPILER_NAMES = ('cargo', 'rustc', 'cc', 'c++', 'gcc', 'g++', 'clang', 'clang++', 'cc1', 'cc1plus', 'ninja', 'cmake')
 # Down copies the files a run wrote to the evidence folder before it prunes the run's copies, except the caches Eden
 # and the GPU driver rebuild: those are listed in the prune manifest. On qcf-sobs01 (Surface, 2026-11-09) they were
 # 273 of the 285 MiB each instance wrote: user/cache/shader/<title>/vulkan.bin and xdg-cache/nvidia/GLCache.
@@ -565,9 +577,11 @@ def validate(config):
         book = config['playbook']
         require(isinstance(book, dict) and isinstance(book.get('root'), str) and isinstance(book.get('commit'), str)
                 and book['root'] and book['commit'], 'playbook needs root and commit strings')
-    for key in ('memory_floor_bytes', 'disk_floor_bytes'):
+    for key in ('memory_floor_bytes', 'disk_floor_bytes', 'compile_reserve_bytes'):
         if key in config:
             require(type(config[key]) is int and config[key] > 0, key + ' must be a positive integer')
+    if 'perf_sensitive' in config:
+        require(type(config['perf_sensitive']) is bool, 'perf_sensitive must be true or false')
     if 'watchdog' in config:
         spec = config['watchdog']
         require(isinstance(spec, dict), 'watchdog must be an object')
@@ -624,6 +638,12 @@ def run_lock(stream):
             msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def stat_nice(text):
+    """The nice value from a /proc/<pid>/stat line: proc(5) field 19. The comm in parentheses may hold spaces or a ")",
+    so the fields are counted after the last ")": field 3 (state) is the first of them."""
+    return int(text.rsplit(')', 1)[1].split()[16])
+
+
 class Host:
     # Linux rigs (Surface, Yoga, XPS: 32 GB): two Eden instances at once, each under its own 8 GiB unit (operator
     # 2026-11-04; the XPS 2026-11-06).
@@ -645,12 +665,14 @@ class Host:
         for entry in Path('/proc').glob('[0-9]*'):
             try:
                 comm = (entry / 'comm').read_text().strip().lower()
-                if comm.startswith(('eden', 'yuzu')) or comm in (
-                        'cargo', 'rustc', 'cc', 'c++', 'gcc', 'g++', 'clang', 'clang++', 'cc1', 'cc1plus', 'ninja', 'cmake'):
+                if comm.startswith(('eden', 'yuzu')) or comm in COMPILER_NAMES:
                     groups = (entry / 'cgroup').read_text()
                     if not any(unit in groups for unit in owned_units):
-                        processes.append({'pid': int(entry.name), 'name': comm})
-            except (FileNotFoundError, ProcessLookupError):
+                        process = {'pid': int(entry.name), 'name': comm}
+                        if comm in COMPILER_NAMES:
+                            process['nice'] = stat_nice((entry / 'stat').read_text())
+                        processes.append(process)
+            except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
                 pass
         return {'mem_available': memory, 'disk_free': shutil.disk_usage(disk_path).free, 'foreign_processes': processes}
 
@@ -1373,7 +1395,9 @@ class Lifecycle:
         # second launch looks like the only Eden on the host.
         value['owned_running'] = len(tuple(owned))
         self.record('admission', value)
-        # Compilers always block an Up. Other Eden instances are allowed up to the host's limit (operator 2026-11-04:
+        # Compilers block an Up unless every one runs at nice >= COMPILE_NICE_MIN and MemAvailable covers the floor plus
+        # the compile reserve (operator 2026-11-10); a perf_sensitive config still refuses any compiler. Other Eden
+        # instances are allowed up to the host's limit (operator 2026-11-04:
         # the Surface and the Yoga can each run two emulators; the Ally stays at one). Only the emulator binary counts
         # as an instance; its AppImage launcher and LAN helper processes belong to the same instance.
         # The first instance needs 10 GiB available. A second one, foreign or already launched by this run,
@@ -1397,10 +1421,31 @@ class Lifecycle:
         foreign = value['foreign_processes']
         edens = [p for p in foreign if str(p.get('name', '')).lower() in EDEN_INSTANCE_NAMES]
         others = [p for p in foreign if not str(p.get('name', '')).lower().startswith(('eden', 'yuzu'))]
+        reserve = 0
         if others:
-            problems.append('Compiler already active on host')
-            lines.append('FAIL compiler: Compiler already active on host')
-            checks.append({'name': 'compiler', 'ok': False, 'processes': others})
+            # A process with no readable nice (the Windows host reports none) counts as un-niced.
+            niced = [p for p in others if type(p.get('nice')) is int and p['nice'] >= COMPILE_NICE_MIN]
+            unniced = [p for p in others if p not in niced]
+            seen = ', '.join(f'{p.get("name")} {p.get("pid")} nice {p.get("nice", "?")}' for p in others[:6])
+            seen += f' (+{len(others) - 6} more)' if len(others) > 6 else ''
+            check = {'name': 'compiler', 'running': len(others), 'unniced': len(unniced), 'processes': others}
+            if self.c.get('perf_sensitive'):
+                detail = 'Compiler already active on host (perf_sensitive: no compiler may run)'
+                problems.append(detail)
+                lines.append(f'FAIL compiler: {detail}; seen: {seen}')
+                checks.append(dict(check, ok=False, perf_sensitive=True))
+            elif unniced:
+                detail = (f'Compiler already active on host: {len(unniced)} of {len(others)} below nice '
+                          f'{COMPILE_NICE_MIN} (build under nice -n 19)')
+                problems.append(detail)
+                lines.append(f'FAIL compiler: {detail}; seen: {seen}')
+                checks.append(dict(check, ok=False))
+            else:
+                reserve = self.c.get('compile_reserve_bytes', COMPILE_RESERVE)
+                lowest = min(p['nice'] for p in others)
+                lines.append(f'OK compiler: {len(others)} running, all at nice >= {COMPILE_NICE_MIN} (lowest {lowest}); '
+                             f'compile reserve {reserve} bytes added to the memory floor; seen: {seen}')
+                checks.append(dict(check, ok=True, lowest_nice=lowest, reserve=reserve))
         else:
             lines.append('OK compiler: none running')
             checks.append({'name': 'compiler', 'ok': True})
@@ -1424,17 +1469,31 @@ class Lifecycle:
         checks.append(slot)
         need = MIN_MEMORY_SECOND if running else MIN_MEMORY
         floor = self.c.get('memory_floor_bytes', need)
-        if value['mem_available'] < floor:
+        available = value['mem_available']
+        memory = {'name': 'memory', 'available': available, 'floor': floor}
+        if reserve:
+            memory.update(reserve=reserve, headroom=available - floor - reserve)
+        if available < floor:
             if 'memory_floor_bytes' in self.c:
-                detail = f'MemAvailable {value["mem_available"]} is below the per-instance floor {floor}'
+                detail = f'MemAvailable {available} is below the per-instance floor {floor}'
             else:
                 detail = f'MemAvailable below {need // GIB} GiB'
             problems.append(detail)
             lines.append('FAIL memory: ' + detail)
-            checks.append({'name': 'memory', 'ok': False, 'available': value['mem_available'], 'floor': floor})
+            checks.append(dict(memory, ok=False))
+        elif available < floor + reserve:
+            detail = (f'MemAvailable {available} is below the floor {floor} plus the compile reserve {reserve} '
+                      f'({floor + reserve}) while niced compilers run')
+            problems.append(detail)
+            lines.append('FAIL memory: ' + detail)
+            checks.append(dict(memory, ok=False))
+        elif reserve:
+            lines.append(f'OK memory: {available} bytes available, floor {floor} + compile reserve {reserve}; '
+                         f'headroom {available - floor - reserve}')
+            checks.append(dict(memory, ok=True))
         else:
-            lines.append(f'OK memory: {value["mem_available"]} bytes available, floor {floor}')
-            checks.append({'name': 'memory', 'ok': True, 'available': value['mem_available'], 'floor': floor})
+            lines.append(f'OK memory: {available} bytes available, floor {floor}')
+            checks.append(dict(memory, ok=True))
         return problems, lines, checks
 
     def ledger_text(self):
