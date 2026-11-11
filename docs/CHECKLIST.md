@@ -31,9 +31,10 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 - **M** Release profile `opt-level = "s"`, `lto = true`,
   `codegen-units = 1`, `panic = "abort"`; `skyline = "=0.6.0"`; toolchain
   `1.98.1`.
-  - `opt-level = "z"` instead of `"s"` only when measured, all three recorded: the resident before and after; the
-    stack analysis on the `"z"` ELF, which reads prologues LLVM's machine outliner split into
-    `OUTLINED_FUNCTION_*`; and a timed Eden run of the plugin's frame-precise rows. TrainingRooms rc.8 R6
+  - `opt-level = "z"` instead of `"s"` only when measured, all four recorded (an agent row in the report): the
+    resident before and after; the stack analysis on the `"z"` ELF, which reads prologues LLVM's machine outliner
+    split into `OUTLINED_FUNCTION_*`; the svc-clobber check on it, following those bodies (an outlined body may read
+    the caller's x8–x17); and a timed Eden run of the plugin's frame-precise rows. TrainingRooms rc.8 R6
     (2026-11-11): −741,376 B resident; its poll path grew 145,504 → 177,184 B.
 - **M** Pure logic in `model.rs` with host tests; `runtime.rs` only under
   `#[cfg(target_os = "switch")]`.

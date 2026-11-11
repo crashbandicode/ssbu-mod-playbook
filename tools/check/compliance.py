@@ -315,6 +315,11 @@ def rows_for(repo, nro_path, base=None, traces=()):
              if toml_value(release, k) not in v}
     row('release profile opt-level "s" (or "z", measured), lto, codegen-units 1, panic abort', 'M', not wrong,
         'Cargo.toml [profile.release]' + (f' differs: {wrong}' if wrong else ' as required'))
+    if toml_value(release, 'opt-level') == '"z"':
+        # What makes "z" allowed can't be read from the repo: the agent records each measurement (CHECKLIST).
+        rows.append(('opt-level "z" measured: resident before and after; the stack analysis and the svc-clobber check '
+                     'on the "z" ELF, both following OUTLINED_FUNCTION_* bodies; a timed Eden run of the frame-precise '
+                     'rows', 'M', 'agent', ''))
     row('skyline pinned to =0.6.0', 'M', 'skyline = "=0.6.0"' in cargo,
         'Cargo.toml' if 'skyline = "=0.6.0"' in cargo else 'Cargo.toml: pin not found')
     row('diag cargo feature declared', 'M', bool(re.search(r'^\s*diag\s*=\s*\[', cargo, re.M)),

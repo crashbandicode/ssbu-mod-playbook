@@ -118,10 +118,19 @@ class ReleaseProfile(unittest.TestCase):
         rows = {name: result for name, _, result, _ in rows_for(repo, None)}
         return next(v for k, v in rows.items() if k.startswith('release profile'))
 
+    def measured(self, opt):
+        cargo = ('[package]\nname = "p"\n[lib]\ncrate-type = ["cdylib"]\n[profile.release]\n'
+                 f'opt-level = {opt}\nlto = true\ncodegen-units = 1\npanic = "abort"\n')
+        repo, _ = repo_with({'Cargo.toml': cargo}, {})
+        return [result for name, _, result, _ in rows_for(repo, None) if name.startswith('opt-level "z" measured')]
+
     def test_s_and_measured_z_pass_and_other_levels_fail(self):
         # TrainingRooms rc.8 R6 (2026-11-11): "z" when measured (CHECKLIST); "3" and "2" stay refused.
         self.assertEqual(self.row('"s"'), 'pass')
         self.assertEqual(self.row('"z"'), 'pass')
+        # "z" adds the agent row for its measurements; "s" doesn't.
+        self.assertIn('agent', self.measured('"z"'))
+        self.assertEqual(self.measured('"s"'), [])
         self.assertEqual(self.row('3'), 'fail')
         self.assertEqual(self.row('"2"'), 'fail')
 
