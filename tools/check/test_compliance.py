@@ -94,6 +94,13 @@ class Refusals(unittest.TestCase):
                         'fn b() { notify("Character swap unavailable"); }\n'})
         self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:2'])
 
+    def test_a_removed_comment_or_assertion_gives_no_budget_to_a_new_refusal(self):
+        """The docs lane's review of R12 (2026-11-11): text the row never counts can't offset a real new refusal."""
+        for skipped in ('// notify("Character swap unavailable");', 'assert_eq!(m, "Character swap unavailable");'):
+            repo, base = repo_with({'src/a.rs': f'fn a(m: &str) {{\n    {skipped}\n}}\n'},
+                                   {'src/a.rs': 'fn a(m: &str) {\n    notify("Character swap unavailable");\n}\n'})
+            self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:2'], skipped)
+
     def test_rows_fail_without_approval_and_ask_for_base_when_none_is_given(self):
         repo, base = repo_with({'src/a.rs': ''}, {'src/a.rs': 'fn b() { notify("Only when Player Swapping is On"); }\n'})
         row = {name: (result, ev) for name, _, result, ev in rows_for(repo, None, base)}
