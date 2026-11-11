@@ -83,6 +83,11 @@ On 2026-11-02 `check/compliance.py` reads `src/` recursively for the version, gu
 version in `src/model.rs` or any file under `src/model/`: plugins that split model and runtime into folders
 (TrainingRoomsForUltimate: `src/model/`, `src/runtime/`) were reported as failing rows they meet.
 
+On 2026-11-11 (pending the operator's approval) `check/compliance.py`'s release-profile row accepts `opt-level = "z"`
+as well as `"s"`; CHECKLIST says when `"z"` may be used (measured). TrainingRooms rc.8 R6: −741,376 B resident, the
+timed Eden rows held, and its stack analysis had to read prologues the machine outliner split. Test:
+`test_compliance.py` `ReleaseProfile`.
+
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and

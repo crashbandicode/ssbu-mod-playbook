@@ -22,7 +22,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-RELEASE_PROFILE = {'opt-level': '"s"', 'lto': 'true', 'codegen-units': '1', 'panic': '"abort"'}
+# opt-level "z" is allowed when measured (CHECKLIST: resident, the stack analysis on the "z" ELF, a timed Eden run;
+# TrainingRooms rc.8 R6, 2026-11-11).
+RELEASE_PROFILE = {'opt-level': ('"s"', '"z"'), 'lto': ('true',), 'codegen-units': ('1',), 'panic': ('"abort"',)}
 DIAG_MARKERS = (b'diag.txt', b'standin')
 SCRIPT_SUFFIXES = {'.py', '.ps1', '.psm1', '.sh', '.bash', '.cmd', '.bat'}
 # A command that mounts, unmounts, ejects or powers off a disk, written as a
@@ -310,8 +312,8 @@ def rows_for(repo, nro_path, base=None, traces=()):
         f'Cargo.toml crate-type = {types or "missing"}')
     release = section(cargo, 'profile.release')
     wrong = {k: toml_value(release, k) for k, v in RELEASE_PROFILE.items()
-             if toml_value(release, k) != v}
-    row('release profile opt-level "s", lto, codegen-units 1, panic abort', 'M', not wrong,
+             if toml_value(release, k) not in v}
+    row('release profile opt-level "s" (or "z", measured), lto, codegen-units 1, panic abort', 'M', not wrong,
         'Cargo.toml [profile.release]' + (f' differs: {wrong}' if wrong else ' as required'))
     row('skyline pinned to =0.6.0', 'M', 'skyline = "=0.6.0"' in cargo,
         'Cargo.toml' if 'skyline = "=0.6.0"' in cargo else 'Cargo.toml: pin not found')

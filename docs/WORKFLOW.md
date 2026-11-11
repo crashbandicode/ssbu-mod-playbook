@@ -21,7 +21,8 @@ starting over.
 - `crate-type = ["cdylib"]` only.
 - `skyline = "=0.6.0"` under `[target.'cfg(target_os = "switch")'.dependencies]`.
 - `panic = "abort"`.
-- Release profile: `opt-level = "s"`, `lto = true`, `codegen-units = 1`.
+- Release profile: `opt-level = "s"`, `lto = true`, `codegen-units = 1`. `"z"` is smaller and does more calls;
+  use it only as [CHECKLIST](CHECKLIST.md) says (measured).
 - An empty `diag` feature.
 
 Whatever doesn't touch the game belongs in `model.rs`. `cargo test` checks it
