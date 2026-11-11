@@ -83,6 +83,12 @@ On 2026-11-02 `check/compliance.py` reads `src/` recursively for the version, gu
 version in `src/model.rs` or any file under `src/model/`: plugins that split model and runtime into folders
 (TrainingRoomsForUltimate: `src/model/`, `src/runtime/`) were reported as failing rows they meet.
 
+On 2026-11-11 `check/compliance.py`'s refusal row compares refusal text, not touched lines: an added line's refusal
+literal counts as new only when HEAD's non-test Rust sources hold it more often than the merge base's (`git grep -F
+-c`). A touched call (`f(b, "…")` to `f(&b, "…")`) or a move between files adds none; a further copy of an existing
+message still counts. TrainingRooms rc.8's by-reference change was reported as two new refusals. Tests:
+`test_compliance.py` `Refusals` (three new cases).
+
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and

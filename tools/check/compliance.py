@@ -185,12 +185,30 @@ def test_lines(lines):
     return inside
 
 
+def refusal_uses(repo, ref, literal):
+    """How many lines of the non-test Rust sources at `ref` hold the refusal `literal` (quotes included)."""
+    out = git(repo, 'grep', '-F', '-c', '-e', literal, ref, '--', '*.rs')
+    total = 0
+    for line in (out or '').splitlines():
+        path, _, count = line[len(ref) + 1:].rpartition(':') if line.startswith(f'{ref}:') else line.rpartition(':')
+        if path and count.isdigit() and not is_test_path(path):
+            total += int(count)
+    return total
+
+
 def new_refusals(repo, base):
     """Each refusal string the branch adds, with the restriction ID it cites (or None).
-    Comment lines, assertions, test files and `#[cfg(test)]` items are skipped. None when the diff can't be read."""
+    Comment lines, assertions, test files and `#[cfg(test)]` items are skipped. None when the diff can't be read.
+
+    A refusal is new when its text is: an added line whose refusal literals the branch's merge base already had as often
+    (a touched call, `f(b, "…")` to `f(&b, "…")`, or one moved between files) adds no refusal (2026-11-11, TrainingRooms
+    rc.8: a by-reference change re-reported two unchanged "…refused before the native request" calls). A further copy
+    of an existing message is new, line by line, up to the number of copies the branch adds."""
     added = added_lines(repo, base)
     if added is None:
         return None
+    merge_base = git(repo, 'merge-base', base, 'HEAD') or base
+    new_copies = {}
     hits, files, tests = [], {}, {}
     for path, number, text in added:
         code = text.strip()
@@ -202,6 +220,14 @@ def new_refusals(repo, base):
             tests[path] = test_lines(files[path])
         if number in tests[path]:
             continue
+        literals = [m.group(0) for m in REFUSAL.finditer(code)]
+        for literal in literals:
+            if literal not in new_copies:
+                new_copies[literal] = refusal_uses(repo, 'HEAD', literal) - refusal_uses(repo, merge_base, literal)
+        if all(new_copies[literal] <= 0 for literal in literals):
+            continue
+        for literal in literals:
+            new_copies[literal] -= 1
         lines = files[path]
         window = lines[max(0, number - 4):number] if lines else [text]
         tags = [m.group(1) for line in window for m in [RESTRICTION_TAG.search(line)] if m]
