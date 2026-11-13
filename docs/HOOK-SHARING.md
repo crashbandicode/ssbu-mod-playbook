@@ -33,7 +33,7 @@ work."*
 | --- | --- | --- |
 | `libnro_hook.nro` | `add_nro_load_hook` (Skyline's `nro::add_hook`) | Training Modpack fork (`src/lib.rs`) |
 | `libparam_hook.nro` | param load hook (`add_hook(params_main)`) | Training Modpack fork (`src/training/mod.rs`) |
-| ARCropolis | `arcrop_register_callback`, `arcrop_load_file` | ssbu-fx-control (`src/runtime/arc.rs`) |
+| ARCropolis | `arcrop_register_callback`, `arcrop_load_file` | no shipped plugin on `main`; TrainingRooms' diag-only probe (`src/runtime/ui/probe.rs`) calls `arcrop_load_file` and `arcrop_register_event_callback` |
 | Online Deluxe | `ssbu_online_deluxe_online_context_v1` (exported state instead of hooks) | ssbu-fx-control (`src/runtime/online.rs`) |
 
 These are dedicated providers: the consumer needs the provider installed
