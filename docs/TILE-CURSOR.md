@@ -33,7 +33,8 @@ step.ps1 -Label e19 -Steps 'b:lstick+up:700,b:lstick+right:700'
   consecutive within a row. Read the actual neighbours from the log instead
   of assuming a row width; the CSS tile count depends on the save's DLC.
 
-Each step writes a line, and so does the hand when it stops:
+Each step writes a line, and so does the hand when it stops (each line
+starts with a tick count, left out here):
 
 ```text
 step screen=css dir=left from=85 to=84 token=p2 x=288.0 y=-77.0

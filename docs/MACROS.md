@@ -71,14 +71,15 @@ it to the runner. A test run does not proceed this way ("Test runs", below).
 - **Character and stage select:** use the tile cursor
   ([TILE-CURSOR](TILE-CURSOR.md)). The stick overshoots, and the D-pad moves
   the hand only a little.
-- **Held inputs are leases.** `gv.py press` holds for its time plus 500 ms,
-  then releases. `call eNN input.reset` releases everything.
+- **Held inputs are leases.** `gv.py press` holds for its time, then
+  releases; its lease is that time plus 500 ms. `call eNN input.reset`
+  releases everything.
 - **Idle players get dropped.** The game drops a player after about 30 s
   without input, and walking off the stage counts as a self-destruct.
   `gv.py keepalive eNN <stop-file> <seconds>` holds down and taps ZL every
   0.7 s until the stop file appears. `match.ps1` and
-  `tools/eden-pair/chain.ps1` (several matches, answering each pop-up) are
-  built on it.
+  `tools/eden-pair/chain.ps1` (several matches, answering each pop-up, through
+  `drive.py keepalive`, the same loop) are built on it.
 - **Wait for a log line, not a fixed time, wherever one exists.** Online
   pairing took anywhere from 2 s to 125 s. In elite-rematch's run e25, a
   press timed by sleeps landed with 3 s left on a pop-up's countdown, and the
@@ -102,7 +103,7 @@ it to the runner. A test run does not proceed this way ("Test runs", below).
 
 Eden's own guide is `docs/InputMacros.md` in the Eden build, with a tutorial,
 `InputMacrosTutorial.md`, at
-`/home/intpa/eden-android-timer-build/stage/docs/user/`. In short:
+`/home/intpa/eden-android-timer-build/stage/docs/user/` on the Yoga. In short:
 
 - **Record:** use **Tools → Input Macros…** (*Record new*; a 3-2-1 countdown;
   red means recording), or use the CLI: `macro record "<name>"`, then
@@ -280,8 +281,8 @@ The rules:
     - `up <run>` does the dry run, then the lifecycle `up`. `run <run>` runs
       the rows; after a fix, `run <run> --retry`, on the same boot. `down
       <run>` does the lifecycle `down`, the harvest, a `RESULTS.md` skeleton
-      of 20 lines or fewer (build, rows, the unit's exit result, harvest,
-      timing) and `timing.json`.
+      of 20 lines or fewer (build, plugins, rows, the unit's exit result,
+      prune, harvest, timing) and `timing.json`.
     - `all` does new, up, run and down in one go, for a batch you don't
       expect to fix mid-boot.
     - `--plugin <new build>` on `new` swaps the pinned plugin with that file
@@ -390,7 +391,10 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
 - **Steps:** `play` a segment (`macro.play`, wait for it to finish, then
   `input.reset`), `gate`, `shot`, `copy` (save an instance file into the row
   folder), `wait_ms` (only where no gate exists), `library` (a shared-library
-  segment by name) and `gif` (record the nested steps; [GIFS](GIFS.md)).
+  segment by name), `gif` (record the nested steps; [GIFS](GIFS.md)), `mark`
+  (a "before" shot for a `change` gate), `json_diff` (compare a file with an
+  earlier `copy`), `ui` and `call` (Eden's frontend and allowed control
+  methods) and `run` (a project hook, above).
   A step has one kind. Further kinds register on `Runner.step_handlers`.
 - **Recording:** a segment whose file is missing but which has a `recipe` is
   recorded on its first `play` (`macro.record`, then the recipe's inputs,
@@ -408,7 +412,9 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
   the same way; it does not raise `KeyError`.
 - **Gates:** `log` (a regex over lines the row wrote), `json` (expected
   values in a file such as the settings), `image` (a region compared with a
-  reference shot) and `hook` (a Python check such as `css_check.py`).
+  reference shot), `hook` (a Python check such as `css_check.py`), `change`
+  (a region that differs from a `mark` and has settled), `ui` (a matching
+  frontend widget) and `status` (Eden's `status` fields).
   - Prefer a log line.
   - For an image gate, pick a region that doesn't animate. The default
     tolerance is a mean difference of 8 per colour byte; an exact match is

@@ -7,14 +7,13 @@ a label `eNN`, and every file a run writes is named after it.
 
 - **Eden:** the Eden-GIF build at
   `/home/intpa/Applications/Eden-GIF/current/Eden.AppImage`.
-  - On the Surface, `current` points at
-    `20261103-063f1b80bb2c-persistent-tracing-6a0c80d2b858` (2026-11-03
-    21:05Z): the build with persistent guest tracing (`trace.*`, below). It
-    was `20261031-b3e672c43f03-nv01-timer` before that, and the Yoga keeps
-    that one until eden-tracing installs the new build there. Check the
-    host's own `current`.
-  - The XPS (`ubuntu-xps`, Ubuntu 26.04, Iris Xe, added 2026-11-06) has
-    `current` at `20261104-1961a200485e-unmapped-stop-0c7f89f711d6`. It is a
+  - On 2026-11-13 the Surface, the Yoga and the XPS all had `current` at
+    `20261113-973abf9c2e3f-unmapped-stop-lan2c-svc-x8-x17-gdbstub-2f315fc4b7d9`
+    (AppImage sha256 `2f315fc4…`). Like every build from
+    `20261103-063f1b80bb2c-persistent-tracing-6a0c80d2b858` on, it has
+    persistent guest tracing (`trace.*`, below). Check the host's own
+    `current`.
+  - The XPS (`ubuntu-xps`, Ubuntu 26.04, Iris Xe, added 2026-11-06) is a
     Linux executor like the Surface: config `"host": "xps"`, `"hostname":
     "ubuntu-xps"`, `"ledger_ssh": "memento-claw-yoga-ubuntu"`. It runs two Eden
     instances at a time, like the Surface and Yoga (operator 2026-11-06: "the
@@ -30,12 +29,13 @@ a label `eNN`, and every file a run writes is named after it.
       default". Thermald stays on. A run or an instance may set
       `eden_settings` to `{"core.resolution_setup": <integer>}`; the instance
       value wins over the run, and either value wins over this default.
-      Surface, Yoga and Ally keep their boot settings unless that instance
-      sets the key.
-    - At load, thermald `--adaptive` cuts MMIO PL1 to 15 W. 29.5 W is the idle
-      value. `xps-dual-03` (0.5x, thermald on) ran a median of 59.3 simulated
+      Surface, Yoga and Ally keep their boot settings unless the run or that
+      instance sets the key.
+    - At load, thermald `--adaptive` cuts MMIO PL1 to 15 W. 29.5 W and 40 W
+      were idle readings. `xps-dual-03` (0.5x, thermald on) ran a median of 59.3 simulated
       frames/s. `xps-dual-04` (0.5x, thermald off) ran about 60, at 100 °C.
-    - Timed rows stay on the Surface or the Yoga.
+    - Timed (performance-sensitive) rows go only to the Yoga, the Ally or
+      the XPS ([WORKFLOW](WORKFLOW.md) rule 8).
     - The 13.0.5 update NSP was added to `~/Games/Roms/Switch Rom Updates and
       DLC` on 2026-11-06. Before that the XPS booted 13.0.3, and every
       13.0.5-guarded plugin refused.
@@ -80,8 +80,9 @@ Every launcher here (`gv.py prep`, the lifecycle behind `eden_test.py`) moves
 each NRO already in the profile's `plugins/` aside and installs only the
 pinned list. A mod in `ultimate/mods/` (stage, fighter, UI, sound) loads only
 through ARCropolis, so a run that tests anything a mod changes pins the card's
-`libarcropolis.nro` (`92171b2f…`, the same in every card snapshot under
-`/home/intpa/ssbu-cpu-pilot-install/`). Prove the mod loaded on the game's own
+`libarcropolis.nro` (`ac3e05a3…` on the card since 2026-11-08 02:37Z; the older
+card snapshots under `/home/intpa/ssbu-cpu-pilot-install/` hold the previous
+`92171b2f…`). Prove the mod loaded on the game's own
 screen in the same boot (for a stage: the native stage select) before judging
 the plugin's view of it. Without the pin the run shows stock assets and the
 check proves nothing (2026-11-04, TrainingRooms RC10).
@@ -101,9 +102,11 @@ pwsh -File tools/eden-solo/solo.ps1 -Action Up -Label e19 -Nro a.nro,b.nro [-Dia
 4. Runs `gv.py prep`:
    - moves every NRO already in the profile's `plugins/` into
      `plugins-set-aside-gsp-visualizer/`, then installs the `-Nro` list;
-   - renames each plugin's earlier output folder to `.before-eNN`, so each
-     run starts with fresh logs;
-   - copies `-Diag` to `ultimate/<plugin>/diag.txt`;
+   - renames the earlier output folders of gsp-visualizer, ssbu-tile-cursor,
+     ssbu-quiet-elite-switch and elite-rematch to `.before-eNN`, so each run
+     starts with fresh logs;
+   - copies `-Diag` to `ultimate/gsp-visualizer/diag.txt` and
+     `ultimate/ssbu-quiet-elite-switch/diag.txt`;
    - writes `PREP-eNN.json`.
 5. Starts a rootful X display `:68` and takes the Yoga GPU lock.
 6. Runs `gv.py launch` (bounded `eden-run.py`: 8 GiB, 5,400 s, background
@@ -226,8 +229,9 @@ JSONL file. The release's `docs/GUEST_TRACEPOINT.md` is the reference;
   (default 1,000 records/s) and losses are counted (`loss` lines, `trace
   counters`), not hidden. Its overhead on FPS isn't measured yet, so keep
   heavy points out of timing and performance rows.
-- **Not there yet:** data watchpoints, allocation accounting, hitch
-  sampling and `unmapped_access: "fault"`. Unmapped-access log lines now
+- **Not there yet:** data watchpoints, allocation accounting and hitch
+  sampling (`unmapped_access: "fault"` is in the unmapped-stop builds; see
+  "Read the results"). Unmapped-access log lines now
   carry a module/symbol and backtrace, but they are sampled, not the
   faulting instruction, so they don't replace the console crash check (see
   "Read the results").
@@ -325,8 +329,10 @@ clock, and a batch of ten pays that ten times.
   with its exact PC and module (the first 16, then power-of-two totals), and
   `edenctl call trace.unmapped_access '{}'` returns `total`/`emitted`/
   `suppressed`. A `total` of 0 is proof for the paths the run exercised; save
-  the receipt. `"fault"` stops the guest at the first access anywhere (no
-  module filter, the stock game's own reads included), so use it only to get
+  the receipt. `"fault"` stops the guest at the first access anywhere (the
+  stock game's own reads included; builds whose `GUEST_TRACEPOINT.md`
+  documents a `modules` list, such as `20261107-656ca2fcd596-…` and later,
+  can limit it to accesses from named modules), so use it only to get
   full registers for an access the log already found. The lifecycle accepts
   `log` and `off`.
 - **The run's end state:** `run.json` and `memory.peak` in the same folder.
@@ -351,7 +357,8 @@ bounded cleanup can still restore/verify/release, but does not establish
 graceful shutdown or waive a fatal console tail. Non-empty `cleanup_failures`,
 unequal verification or an unreleased claim always mean cleanup failure.
 
-**A clean Down prunes the run's copies** (2026-11-09): the files the run wrote go to `out/post-run-<key>/`, then
+**A clean Down prunes the run's copies** (2026-11-09): the files the run wrote go to `out/post-run-<key>/` (`eden_test.py down`;
+`lifecycle.py down` alone puts them in `<state_dir>/evidence/` unless given `--evidence-dir`), then
 `work/`, `state/snapshot-*` and `state/post-run-*` are deleted, with the bytes in RESULTS.md's `Prune:` line;
 `--keep-state` keeps them, only when asked. Up refuses below 60 GB free (`disk_floor_bytes`; it was 40 GB).
 
@@ -367,8 +374,10 @@ backing process first just because its PID sorts earlier. An ambiguous or
 surviving main identity retains the claim and blocks group stop/restore.
 Full owned-PID absence still precedes restore, separate verify and release.
 Keep the native unit/mount timeline and console: no SIGBUS/panic/fatal failure
-is dismissed as the expected CLI timeout. The ordering fix is offline-tested;
-the next lead batch's post-merge Down is its live check, not an extra boot.
+is dismissed as the expected CLI timeout. The ordering fix was offline-tested
+first; Surface Downs since 2026-11-09 (for example `pp-settle-1`) ran it live:
+their `forced-stop` record in `state/actions.jsonl` has `main_pid_stopped`
+and `main_stop_signals`.
 
 ## Queue runs
 
@@ -390,7 +399,8 @@ runner in the background that waits, then runs.
   costs 30 s rather than a match. The batch then runs again under the next
   label until the wanted number of runs succeeded, with a cap on tries and
   one line per start and end. `tools/eden-solo/examples/retry-batch.ps1` is
-  that loop (2026-10-30: 10 valid matches in 11 tries).
+  that loop (ssbu-gnw-judge-log's `eden/batch-g40.log`: 9 successful runs in
+  10 tries).
 - **Start it** with the usual memory and time guard, in the background, with
   a `timeout` longer than the deadline, and write its output to a file.
 
@@ -401,6 +411,7 @@ runner in the background that waits, then runs.
   rating runtime and TLS, so they can only pair with each other.
 - **Surface and Yoga:** `tools/eden-pair/` (elite-rematch's copies) uses
   instance `s` on the Surface, with its socket forwarded, and `y` on the
-  Yoga. `drive.py <eNN> <s|y> …` takes the same commands as `gv.py`.
+  Yoga. `drive.py <eNN> <s|y> …` takes `gv.py`'s `shot`, `press`, `stick`,
+  `call` and `keepalive`.
 - **A won match:** `match.ps1 -Winner eA -Loser eB` has the loser walk off
   the stage repeatedly while the winner holds still.
