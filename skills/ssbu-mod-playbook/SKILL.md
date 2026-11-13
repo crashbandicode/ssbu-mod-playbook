@@ -45,7 +45,8 @@ READY.
 ## Before saying it is done
 
 1. Run `python3 -I ~/ssbu-mod-playbook/tools/check/compliance.py
-   <plugin repo> [--nro <shipped NRO>]` and replace every `agent` row with
+   <plugin repo> [--nro <shipped NRO>] [--base <branch start>] [--trace <design report>]`
+   and replace every `agent` row with
    `pass`, `fail`, `N/A: <reason>` or `not authorized`, each with evidence.
    Keep the finished report next to the evidence doc.
 2. List the failed, skipped and unverified rows in the final message.

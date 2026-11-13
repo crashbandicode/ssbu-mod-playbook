@@ -124,13 +124,13 @@ lock-free mailbox). The plugin side never waits for the game either.
     its lock (state Arbitration), and a plugin thread that holds the lock,
     runnable but never scheduled.
   - `/home/intpa/smash-training-lobby/artifacts/phase23/rc6-eden/rows-hang-qp/gdbdump.py`
-    takes that dump without gdb.
+    (on the Surface) takes that dump without gdb.
 - **How to check it:** a test that walks the plugin's call graph from
   every hook and from every plugin thread's entry, and fails when a lock a
   hook's reach takes blocking is also taken by a plugin thread's reach.
   - TrainingRoomsForUltimate's `tests/hook_locks.rs` and
-    `tests/lock_order.rs`, on `tests/common/callgraph.rs` (branch
-    `p23/rc6-qp-respawn-freeze`), are the reference.
+    `tests/lock_order.rs`, on `tests/common/callgraph.rs` (on `main`), are
+    the reference.
   - They follow helpers that take a lock for their caller.
   - A seeded fixture must fail.
   - A source scan can't see calls through `dyn`, trait objects or stored
@@ -254,7 +254,8 @@ freed about 106 GB.
 - **One copy of the source per task.** Keep either an unpacked stage or its
   archive, not both.
 - **Check before you build:** run `df -h /` before a build or an Eden
-  launch, and stop below 40 GB free.
+  launch, and stop below 40 GB free. The lifecycle refuses an Eden `Up`
+  below 60 GB (`disk_floor_bytes`).
 - **When the work is done:** delete its build products and keep the NROs,
   receipts, logs and reports. Write a manifest of what you deleted.
 - **Copies:** link what is identical and copy what is not ([EDEN](EDEN.md),
@@ -281,7 +282,7 @@ re-reading, workers stopping early, and Eden routes rebuilt from scratch, not
 the work itself.
 
 1. **One persistent worker per Eden host.** Give each host (Surface, Yoga,
-   Ally) one worker with a standing goal: "keep closing the rows I send you
+   XPS, Ally) one worker with a standing goal: "keep closing the rows I send you
    until each one is PASS, FAIL or BLOCKED with a reason" (MACROS rule 12).
    New rows and follow-ups go to **that session** as messages; don't start a
    fresh worker for them. Coding follow-ups go back to the worker that wrote
@@ -293,8 +294,7 @@ the work itself.
    - **Context belongs to the operator.** No agent watches, reports, measures
      or acts on its own or another session's context, and none compacts,
      recycles or hands off because of it. Ignore the clawo broker's
-     `contextPercent` (that meter reads "100%" at about 256K tokens, a
-     quarter of GLM 5.3 Flash's 1M window).
+     `contextPercent`.
    - **Workers keep a handoff file current at row checkpoints:** what is done,
      the routes and segments built, the open rows, and the live run state
      (claims, run folder, build hashes).

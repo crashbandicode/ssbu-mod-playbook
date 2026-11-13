@@ -121,7 +121,8 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   the lifecycle enforces it), MemAvailable at least 10 GiB for the first instance and 9 GiB for a second one (operator 2026-11-04), never profile `a`,
   display `:61` or another agent's runs.
 - **M** The lifecycle boots every XPS Eden at 0.5x (`core.resolution_setup` = 1 before `game.load`; operator 2026-11-06:
-  "yes, make half res the XPS default"). Thermald stays on. Timed rows stay on the Surface and Yoga. At load, thermald
+  "yes, make half res the XPS default"). Thermald stays on. Timed rows run only on the Yoga, the Ally or the XPS
+  (operator 2026-11-10; [WORKFLOW](WORKFLOW.md) rule 8). At load, thermald
   `--adaptive` cuts PL1 to 15 W; 29.5 W is the idle value. `xps-dual-03` ran a median of 59.3 simulated frames/s with
   thermald on; `xps-dual-04` ran about 60 with thermald off, at 100 °C. An `eden_settings` value on the run or the
   instance overrides the default, and the instance wins ([EDEN](EDEN.md)).
@@ -135,7 +136,7 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 - **M** One `CARGO_TARGET_DIR` per source copy, never shared between copies
   of the same workspace, and the cargo home shared per host and toolchain;
   sources refreshed with new file times; `df -h /` checked before every build or Eden
-  launch, stopping below 40 GB free; finished work's build products deleted,
+  launch, stopping below 40 GB free (60 GB before an Eden `Up`); finished work's build products deleted,
   with a manifest, while NROs, receipts and logs are kept ([WORKFLOW](WORKFLOW.md),
   "Build caches and disk").
 - **M** Every wait gated on a log line or a screenshot check, between macro

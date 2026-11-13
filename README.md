@@ -3,8 +3,8 @@
 How the Smash Ultimate 13.0.5 Skyline plugins in this workspace get built,
 tested in Eden and installed, written down for the next agent. Dated
 2026-10-31. Paths, hosts and displays are this workspace's: the Yoga
-(`/home/intpa`) runs Eden, and the Switch is plugged into the Surface
-(`dreamland-surface.lan`) over USB.
+(`/home/intpa`), the Surface, the XPS and the Ally run Eden, and the Switch
+is plugged into the Surface (`dreamland-surface.lan`) over USB.
 
 | Doc | Read it to |
 | --- | --- |
@@ -14,12 +14,11 @@ tested in Eden and installed, written down for the next agent. Dated
 | [TILE-CURSOR](docs/TILE-CURSOR.md) | land on an exact fighter or stage |
 | [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
 | [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |
-
 | [CHECKLIST](docs/CHECKLIST.md) | prove the work is done: mandatory, conditional and example items, and the report |
 
 HOOK-SHARING is a 2026-10-31 copy of `/home/intpa/SKYLINE-HOOK-SHARING.md`.
-`tools/` has the scripts these docs use, copied as they ran (sources and
-hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
+`tools/` has the scripts these docs use, copied as they ran or written here
+(sources and hashes: [tools/PROVENANCE.md](tools/PROVENANCE.md)).
 
 ## Skill and checklist
 
@@ -38,7 +37,8 @@ It also writes a pointer block into `~/.claude/CLAUDE.md`,
 the read is required and not left to skill discovery. Run it on every
 machine that runs an agent, after cloning this repo to `~/ssbu-mod-playbook`
 (`/home/intpa/ssbu-mod-playbook` on the Ubuntu machines,
-`%USERPROFILE%\ssbu-mod-playbook` on Windows, where it makes junctions).
+`%USERPROFILE%\ssbu-mod-playbook` on Windows, where it makes junctions when
+symlinks aren't allowed).
 
 ## Delegated workers read it too
 
@@ -82,8 +82,10 @@ working from the brief alone.
 - **Eden:**
   - Claim and release in `/tmp/deluxe-surface-1007/OWNER-COORDINATION.md`;
     `solo.ps1` does both.
-  - Wait while anyone else holds a claim, run one Eden per host, and start
-    only with at least 10 GiB of MemAvailable. Queue the run so it starts
+  - Wait while anyone else holds a manual claim, run at most two Eden
+    instances on the Surface, Yoga or XPS and one on the Ally, and start
+    only with at least 10 GiB of MemAvailable (9 GiB for a second
+    instance). Queue the run so it starts
     itself when the host is free ([EDEN](docs/EDEN.md), "Queue runs").
   - Never use profile `a`, display `:61`, or another agent's runs.
   - Profiles are hard-linked copies (`gv.py prep`); a full copy fills the
@@ -118,7 +120,8 @@ working from the brief alone.
     between copies of the same workspace (cargo would link one copy's crate
     into another's build). Share the cargo home per host and toolchain,
     delete targets when the work is done, and check `df -h /` before builds
-    and Eden runs (stop below 40 GB).
+    and Eden runs (stop below 40 GB; the lifecycle refuses an Eden `Up`
+    below 60 GB).
   - In copies, link what is byte-identical and copy what differs or what
     the run writes in place ([WORKFLOW](docs/WORKFLOW.md), "Build caches and
     disk").

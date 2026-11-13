@@ -32,7 +32,7 @@ workspace's. None of these files was in a git repository before.
 | `switch/upgrade2-mtp.py` | `/home/intpa/gsp-visualizer/eden/upgrade2-mtp.py` | `7d6c49570eefa73a` |
 | `switch/remove-mtp.py` | `/home/intpa/gsp-visualizer/eden/remove-mtp.py` | `227616979ccf2604` |
 | `switch/upgrade2-ums.py` | written here 2026-11-01 (upgrade2-mtp.py's phases over a mounted card: hekate Nyx UMS or a card reader; adds a remount readback phase) | `0ac7a2ce3a044cf7` |
-| `switch/replace-exefs.py` | written here 2026-11-01 (upgrade2-mtp.py's and upgrade2-ums.py's phases for Skyline's `exefs/subsdk9` / `exefs/main.npdm`, one shared transaction over an MTP or mounted-card transport; adds `verify`, `extra_protected` and a readback of the whole `exefs/` folder). Tested only against a fake card; one read-only `preflight` ran on the real card 2026-11-01 16:02 ET (`preflight_verified`: `subsdk9` 9959ecb13eab6db8, `main.npdm` 0953885117632821) | `60cd5805592de2a6` |
+| `switch/replace-exefs.py` | written here 2026-11-01 (upgrade2-mtp.py's and upgrade2-ums.py's phases for Skyline's `exefs/subsdk9` / `exefs/main.npdm`, one shared transaction over an MTP or mounted-card transport; adds `verify`, `extra_protected` and a readback of the whole `exefs/` folder). Tested against a fake card; one read-only `preflight` ran on the real card 2026-11-01 16:02 ET (`preflight_verified`: `subsdk9` 9959ecb13eab6db8, `main.npdm` 0953885117632821), then an MTP `install` at 22:42Z (the card's `exefs/subsdk9` is ca627e6a91e4a6df, its rollback copy `ultimate/skyline_exefs/backups/pre-ca627e6a91e4a6df.subsdk9`) | `60cd5805592de2a6` |
 | `switch/tests/fake_gio.py` | written here 2026-11-01: runs the real `gio` and injects faults from a JSON plan (test double for `replace-exefs.py`) | `eae91c5ce8f06d86` |
 | `switch/tests/test_replace_exefs.py` | written here 2026-11-01: 38 tests of `replace-exefs.py` on a fake card (success, readback mismatch → rollback, failed rollback, re-run refusal, refusals before card access, both transports); 10 mutations of the script's safety steps each make it fail | `1e0fe2daa2f3eeb5` |
 | `switch/swap-ums.py` | written here 2026-11-02 (upgrade2-ums.py's and replace-exefs.py's transaction for swapping one installed plugin NRO for another on a mounted card, as one transaction: archive the old NRO on the card, stage the new one, remove, rename in, add data-folder files, read everything back, undo in reverse on a mismatch or interrupt; `watch` trees and free space; refuses the import marker `migration.json`). Tested only against a fake card tree and a read-only copy of the real card (never run on the real card) | `8f505c73dbc670a6` |
@@ -83,7 +83,7 @@ On 2026-11-02 `check/compliance.py` reads `src/` recursively for the version, gu
 version in `src/model.rs` or any file under `src/model/`: plugins that split model and runtime into folders
 (TrainingRoomsForUltimate: `src/model/`, `src/runtime/`) were reported as failing rows they meet.
 
-On 2026-11-11 (pending the operator's approval) `check/compliance.py`'s release-profile row accepts `opt-level = "z"`
+On 2026-11-11 (the commit asked for the operator's approval; merged into main as 913fa6e, 2026-11-13) `check/compliance.py`'s release-profile row accepts `opt-level = "z"`
 as well as `"s"`; CHECKLIST says when `"z"` may be used (measured). TrainingRooms rc.8 R6: −741,376 B resident, the
 timed Eden rows held, and its stack analysis had to read prologues the machine outliner split. Test:
 `test_compliance.py` `ReleaseProfile`.
