@@ -375,9 +375,10 @@ surviving main identity retains the claim and blocks group stop/restore.
 Full owned-PID absence still precedes restore, separate verify and release.
 Keep the native unit/mount timeline and console: no SIGBUS/panic/fatal failure
 is dismissed as the expected CLI timeout. The ordering fix was offline-tested
-first; Surface Downs since 2026-11-09 (for example `pp-settle-1`) ran it live:
-their `forced-stop` record in `state/actions.jsonl` has `main_pid_stopped`
-and `main_stop_signals`.
+first; Linux Downs have run it live since 2026-11-03 22:52Z (the first record is
+the Surface's `p4x-state-01`; `pp-settle-1` on 2026-11-09 is another): the
+`forced-stop` record in their state's `actions.jsonl` has `main_pid_stopped` and
+`main_stop_signals`.
 
 ## Queue runs
 

@@ -1,6 +1,7 @@
 # Linux AppImage teardown correction — 2026-11-03
 
-Worktree `/home/intpa/ssbu-mod-playbook-pkg6`, branch `pkg6-ally-lifecycle`,
+Worktree `/home/intpa/ssbu-mod-playbook-pkg6`, branch `pkg6-ally-lifecycle`
+(both gone by 2026-11-13; the fix is on main as `b96d3c1`),
 rebased onto main/playbook **705cc21d1503648766663e78bd5d18c74a169efd**.
 README, every docs/ file and tools/PROVENANCE.md read at that base. Existing
 Ally work was already cherry-picked; rebase skipped the two equivalent commits.
@@ -10,7 +11,8 @@ Ally work was already cherry-picked; rebase skipped the two equivalent commits.
 lr-09 used group-wide SIGTERM: its package FUSE mount deactivated at
 21:33:30.552764Z while Eden's own PID4042212 remained alive until SIGBUS.
 The combined console also held a Go companion instruction-fetch fault. Raw
-attribution: `/tmp/opencode/pkg6-shutdown-sigbus/REPORT.md`; no plugin fix implied.
+attribution: `/tmp/opencode/pkg6-shutdown-sigbus/REPORT.md` (gone by 2026-11-13, and not in the
+`/home/intpa/smash-training-lobby/tmp-archive-20261113/` copy of `/tmp/opencode`); no plugin fix implied.
 
 After a capped CLI stop, **main must be gone before group stop or backing-PID
 signals**. Use the exact unit's MainPID, cgroup membership and launch birth
@@ -39,10 +41,13 @@ space/startup costs or leaving FUSE/helper processes outside lifecycle ownership
   after Down reloaded the journal (`KeyError: verified`); fixed the fixture to
   inspect the reloaded controller state. No production behavior was weakened.
 - Frozen source/validation/mutation receipts and scoped checklist:
-  `/tmp/opencode/pkg6-teardown-fix/`. No runtime, runner.py or Windows backend
+  `/tmp/opencode/pkg6-teardown-fix/` (by 2026-11-13 moved to
+  `/home/intpa/smash-training-lobby/tmp-archive-20261113/tmp/opencode/pkg6-teardown-fix/`). No runtime, runner.py or Windows backend
   edit beyond the Linux Host implementation; existing deferred-load/trace
   behavior and restore/verify/release implementations are preserved.
-- **Independent review and live acceptance pending Primary.** No Eden boot,
+- **Independent review and live acceptance were then pending Primary.** No Eden boot,
   host/ledger query, input, row, live unit mutation, push/tag/release/card/DBI
-  action in this task. Lead's next post-merge Yoga batch Down is the live check.
+  action in this task. Lead's next post-merge Yoga batch Down was to be the live check. Linux Downs have run
+  the main-first stop live since 2026-11-03 22:52Z (the Surface's `/home/intpa/p4x-state-01/actions.jsonl`
+  `forced-stop` receipt records `main_pid_stopped` and `main_stop_signals`).
   Runtime hard-cap/crash interruption behavior is not newly qualified offline.

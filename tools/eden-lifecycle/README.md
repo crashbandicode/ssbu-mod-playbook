@@ -6,19 +6,19 @@
   (`pair_authorized` + `defer_load`). Each did up, rows, down, full restore,
   separate verify and release. lr-09 also exposed a teardown SIGBUS in Eden and
   its LAN helper; cleanup success was not clean shutdown health. The main-first
-  correction below is offline-tested; its live check belongs to the next lead run.
+  correction below was offline-tested then; Linux Downs have run it live since 2026-11-03 22:52Z (see that section).
 - **Ally (Windows):** one no-input proof passed at 21:27–21:29Z: up, game loaded,
   down through the Job fallback, restore, separate verify and release (below).
   Graceful `game.stop`, pairs, native error 1312 and transport loss aren't
-  qualified there yet.
+  qualified there yet. Since 2026-11-04 the Ally admits one Eden, so a pair can't run there.
 
-Companion to `../eden-runner/runner.py`; the lifecycle never sends input, plays
-macros or implements project rows.
+Companion to `../eden-runner/runner.py`; the lifecycle sends no input except a watchdog
+`park` sequence the config declares, and never plays macros or implements project rows.
 
-Playbook read: `c95d1f40255df6eca041eced2596d647c74dff5e` (README, all docs,
+Playbook read for the 2026-11-03 draft: `c95d1f40255df6eca041eced2596d647c74dff5e` (README, all docs,
 PROVENANCE); source references read: pkg4 runner3 lifecycle, lead lr03/runtime
-lifecycle, playbook gv/prep/launch/stop and the shared runner. Original files and
-runner.py remain untouched. Phase2 remains paused at product commit4814381,
+lifecycle, playbook gv/prep/launch/stop and the shared runner. That draft left the original files and
+runner.py untouched. Phase2 was then paused at product commit4814381,
 with no-default/review/native acceptance pending and no owned host claim/job.
 
 ## CLI and integration
@@ -104,7 +104,7 @@ files are `sources` on the run or the instance: a relative profile path,
 
 Wrap local commands in the usual memory/time guard and PowerShell7. The caller
 must place `down` in its own cleanup/finally, even if runner execution fails.
-`up` returns after loading, not after rows; systemd enforces the guest hard cap.
+`up` returns after loading (with `defer_load`, at the ready frontend), not after rows; systemd enforces the guest hard cap.
 Controller death leaves a durable journal/claim for a fresh `down`, never an
 expired-claim assumption or silent restart. `up` refuses a reused journal/root.
 
@@ -117,7 +117,8 @@ that SSH host. Hosts are `surface`, `yoga`, `xps` (hostname `ubuntu-xps`) and
 `ally`; the XPS runs two Eden instances, like the Surface and Yoga. Every XPS
 Eden boots at 0.5x (`core.resolution_setup` = 1, `Res1_2X`) before `game.load`.
 Operator 2026-11-06: "yes, make half res the XPS default". Thermald stays on.
-Timed rows stay on the Surface and Yoga. At load, thermald `--adaptive` cuts
+Timed rows stayed on the Surface and Yoga then; since 2026-11-10 timed (`perf_sensitive`) runs go only to
+the Yoga, the Ally or the XPS ("Compiles beside an Up"). At load, thermald `--adaptive` cuts
 MMIO PL1 to 15 W; 29.5 W is the idle value. `xps-dual-03` (thermald on) ran a
 median of 59.3 simulated frames/s; `xps-dual-04` (thermald off) ran about 60,
 at 100 °C. A run or instance `eden_settings` object may set
@@ -163,10 +164,11 @@ must be recorded/acquired by that shared runner, not accepted by the lifecycle.
 
 For an explicitly assigned same-host pair, set `pair_authorized:true` and add
 key `b` with a distinct display/source/inputs. One lifecycle claim covers the
-pair; memory/disk and foreign-process checks repeat before EACH launch. The
-second guest is the sole deliberate exception to one Eden per host. Other owners' Eden instances count against the
+pair; memory/disk and foreign-process checks repeat before EACH launch. Both
+guests count against the host's slot limit (two Edens on the Surface, Yoga and XPS; one on the Ally, so no pair there). Other owners' Eden instances count against the
 host's slot limit; their compilers refuse Up unless the headroom rule below admits it. Open claims are
-strictly blocking unless the optional policy below applies.
+strictly blocking unless they are other runs' lifecycle claims on this host (`host=<h> lifecycle=<token> Eden
+lifecycle admitted`), fewer than the host's limit, or the optional policy below applies.
 
 ### Compiles beside an Up (2026-11-10)
 
@@ -242,7 +244,7 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
   Exact-token readback handles claim/release ACK loss without inventing an
   unclaimed state; ledger outage still attempts owned stop/restore but retains
   the claim until its history can be checked.
-- Admission: MemAvailable >=10GiB and disk >=60GB (`disk_floor_bytes` overrides it; 40GB before 2026-11-09); Eden
+- Admission: MemAvailable >=10GiB (9GiB when an Eden already runs) and disk >=60GB (`disk_floor_bytes` overrides it; 40GB before 2026-11-09); Eden
   instances within the host's limit; no compiler, unless every compiler runs at nice >= 10 and MemAvailable also
   covers the compile reserve ("Compiles beside an Up"; never with `perf_sensitive`).
 - Fresh private profile: only game Contents/firmware are hard-linked. All
@@ -264,7 +266,7 @@ profile `a` are forbidden. This does not implement frontend LDN room setup.
   performs a separate complete read/verify. Any leftover/restore/verify failure
   retains the claim. A verified retry can finish cleanup without restoring twice.
 - `instances.json` is the shared runner's plain a/b mapping: socket,
-  console_log, control_log, profile, settings, diag_log, detector_log; per-run
+  console_log, control_log, profile, game, settings, diag_log, detector_log; per-run
   profile source aliases may be added via `sources`.
 - State: lifecycle.json; actions.jsonl; dry-run.json; per-instance
   snapshot/restore/verify JSON; run-* full console/control logs; post-run-*
@@ -307,8 +309,9 @@ Full owned-process absence, post-run preservation, restore, **separate** verify
 and exact release remain in that order. A stop timeout alone is not a clean-log
 waiver: inspect SIGBUS/fatal/panic tails and unit exit status separately. No
 AppImage extraction, binary-pin or profile-layout change is needed. Native
-mount lifetime/clean-log confirmation is pending the lead's post-merge Down;
-offline tests do not establish it.
+mount lifetime/clean-log confirmation was then pending the lead's post-merge Down;
+offline tests do not establish it. Linux Downs have run this order live since 2026-11-03 22:52Z (the Surface's
+`p4x-state-01`); their forced-stop receipts record `main_pid_stopped` and `main_stop_signals`.
 
 The suite at this fix is **89 offline tests** (75 on base `705cc21`, plus 14
 regressions), including main-only escalation, old control-group units,
@@ -376,8 +379,8 @@ ended/deleted, then all owned PIDs must be absent before restore/release.
 
 Offline suite at the follow-up checkpoint: **74 tests**, including sixteen Windows
 fake/command/bridge tests and Primary's concurrent deferred-load regression.
-Native single-boot qualification is tracked separately in the Primary inbox;
-pair mode and transport-loss recovery remain unqualified. SSH always uses a
+Native single-boot qualification passed later that day (below);
+pair mode and transport-loss recovery remained unqualified. SSH always uses a
 non-login exec, no PTY and explicit `-NoProfile -NonInteractive` MSI PowerShell;
 `CreateProcessAsUserW failed: 1312` is retried once only before any ledger
 operation, never by replaying an admitted Up. That retry contract is fault-tested
@@ -427,7 +430,7 @@ Ally qualification.
 queue/ledger turn.** No host query, claim or launch is part of offline
 preparation. The checked-in
 `ally-proof-HOLD.template.json` reserves `C:\Eden\life-p6-go01\{work,state}` but
-does not assert those paths are currently unused. Its pins and session are
+does not assert those paths are currently unused; the 2026-11-03 proof used them, so the next proof needs new ones. Its pins and session are
 deliberately invalid, so its draft cannot execute as delivered. It is a plan,
 not a launcher or an authorization token; no queue worker is armed.
 
@@ -438,14 +441,14 @@ historical, **not re-pinned current identities**. Preserve the GO reference and
 observation timestamp with that proof's source/config receipt. The source
 already uses the SID-based task principal; offline tests also reject an invalid
 SID before any task command and parse XML containing spaced/Unicode Python
-paths. Native startup remains unqualified.
+paths. Native startup stayed unqualified until that proof.
 
-Obtain a new operator grant and the Ally's normal queue/ledger turn; it currently
-belongs to eden-tracing. Do not reuse the failed `life-p6`, `life-p6b` or
+Obtain a new operator grant and the Ally's normal queue/ledger turn (on 2026-11-03 it
+belonged to eden-tracing). Do not reuse the failed `life-p6`, `life-p6b` or
 `life-p6c` journals, change tracing-1103, or touch the installed profile in place.
 Use fresh work/state paths, current binary/helper pins and the actual interactive
 session/SID. Confirm no foreign native/WSL Eden/compiler, >=10GiB available and
->=40GB free, and the private executable's inbound Block policy. Then perform one
+>=60GB free (40GB before 2026-11-09), and the private executable's inbound Block policy. Then perform one
 no-row up/game-loaded/down proof: record the named pipe, terminal load plus fresh
 frame status, 8GiB/256-process/kill-on-close Job limits, and capped game.stop →
 exact session Job fallback. A fresh Down process must leave no owned PID/task,
@@ -453,14 +456,17 @@ preserve the post-run profile, restore and separately verify the full private
 snapshot and unchanged source inventory, and append only its own release.
 Retain console/control logs, Job/task/firewall receipts and authoritative ledger
 readback; compare the actually deployed source/binary hashes with the tested
-candidate. Pair mode, native 1312 handling and transport-loss recovery need their
-own later qualification; offline tests are not permission to run these now.
+candidate. Native 1312 handling and transport-loss recovery need their
+own later qualification (a pair can't run on the Ally: its limit is one Eden); offline tests are not permission to run these now.
 
 ## Tests and open gaps
 
 ```text
 python3 -B -I test_lifecycle.py
 ```
+
+At `913fa6e` (2026-11-13) this runs 143 tests, all passing; `python3 -B -I test_compile_peak.py` runs 1 more.
+The counts below are from the 2026-11-03 draft.
 
 `offline-final-v2.log`: **49 tests**, all fake host/RPC/claims and temporary file trees,
 including actual shared-runner dry-run integration, generated native launch
@@ -475,20 +481,22 @@ release-pairing regression). The parser itself is unchanged. Added offline
 regressions cover old+clean, old+foreign-process, young and omitted-field
 behavior, invalid configuration, fail-closed boundaries, and an in-memory
 local/remote ledger dispatch round trip: **57 tests total**. No real ledger or
-live profile is used. Native/SSH qualification of the new option remains UNRUN;
-Primary review and commit are pending.
+live profile is used. Native/SSH qualification of the new option was then UNRUN;
+it was committed to main as `b51d92e`.
 
-Open draft gaps: native Surface/Yoga systemd/Qt/AppImage/SSH integration is
-UNRUN; no automatic remote file/socket forwarding or LDN frontend room setup;
+Open draft gaps on 2026-11-03: native Surface/Yoga systemd/Qt/AppImage/SSH integration was
+UNRUN (it has run since; see "Live status"); no automatic remote file/socket forwarding or LDN frontend room setup;
 only fresh isolated profile roots (not adoption of existing live runs); profile
 symlinks/special files are refused rather than followed. Full profile hashing
 includes immutable content and may be costly for large installations. Host
 queue policy remains caller-owned. Crash-at-every-write fault injection and
 independent source review are still needed before treating the draft as a
 qualified replacement for existing live lifecycles. No push/tag/release/card
-operation has been performed.
+operation had been performed.
 
 ## Scoped playbook checklist
+
+As recorded for the 2026-11-03 draft; native runs have happened since (see "Live status").
 
 | Requirement | Tag | Disposition |
 | --- | --- | --- |
