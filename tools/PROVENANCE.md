@@ -88,6 +88,14 @@ as well as `"s"`; CHECKLIST says when `"z"` may be used (measured). TrainingRoom
 timed Eden rows held, and its stack analysis had to read prologues the machine outliner split. Test:
 `test_compliance.py` `ReleaseProfile`.
 
+On 2026-11-11 `check/compliance.py`'s refusal row compares refusal text, not touched lines. The lines the branch
+removes that the row would count (not comments, assertions, test files or `#[cfg(test)]` items, read in the merge
+base's files) give each refusal literal a budget, and an added line whose literals all have budget adds no refusal. A
+touched call (`f(b, "…")` to `f(&b, "…")`) or a move between files adds none. A further copy of an existing message
+still counts, and so does a refusal offset only by a removed comment or assertion. A base file git can't show gives
+no budget. TrainingRooms rc.8's by-reference change was reported as two new refusals. Tests: `test_compliance.py`
+`Refusals` (four new cases).
+
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and

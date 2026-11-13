@@ -76,6 +76,31 @@ class Refusals(unittest.TestCase):
             'fn after() { notify("Swap unavailable"); }\n')})
         self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:10'])
 
+    def test_a_touched_call_whose_refusal_text_was_already_there_is_not_reported(self):
+        """2026-11-11 TrainingRooms rc.8: `bank_refused(b, …)` became `bank_refused(&b, …)`, the same message."""
+        call = 'bank_refused({}, "CPU bank member switch refused before the native request", false);'
+        repo, base = repo_with({'src/a.rs': 'fn a(b: u8) {\n    ' + call.format('b') + '\n}\n'},
+                               {'src/a.rs': 'fn a(b: u8) {\n    ' + call.format('&b') + '\n}\n'})
+        self.assertEqual(new_refusals(repo, base), [])
+
+    def test_a_refusal_moved_to_another_file_is_not_reported(self):
+        line = 'fn a() { notify("Character swap unavailable"); }\n'
+        repo, base = repo_with({'src/a.rs': line, 'src/b.rs': ''}, {'src/a.rs': '', 'src/b.rs': line})
+        self.assertEqual(new_refusals(repo, base), [])
+
+    def test_a_further_copy_of_an_existing_refusal_is_reported(self):
+        repo, base = repo_with({'src/a.rs': 'fn a() { notify("Character swap unavailable"); }\n'}, {
+            'src/a.rs': 'fn a() { notify("Character swap unavailable"); }\n'
+                        'fn b() { notify("Character swap unavailable"); }\n'})
+        self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:2'])
+
+    def test_a_removed_comment_or_assertion_gives_no_budget_to_a_new_refusal(self):
+        """The docs lane's review of R12 (2026-11-11): text the row never counts can't offset a real new refusal."""
+        for skipped in ('// notify("Character swap unavailable");', 'assert_eq!(m, "Character swap unavailable");'):
+            repo, base = repo_with({'src/a.rs': f'fn a(m: &str) {{\n    {skipped}\n}}\n'},
+                                   {'src/a.rs': 'fn a(m: &str) {\n    notify("Character swap unavailable");\n}\n'})
+            self.assertEqual([h[0] for h in new_refusals(repo, base)], ['src/a.rs:2'], skipped)
+
     def test_rows_fail_without_approval_and_ask_for_base_when_none_is_given(self):
         repo, base = repo_with({'src/a.rs': ''}, {'src/a.rs': 'fn b() { notify("Only when Player Swapping is On"); }\n'})
         row = {name: (result, ev) for name, _, result, ev in rows_for(repo, None, base)}

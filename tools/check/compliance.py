@@ -129,24 +129,36 @@ def git(repo, *args):
     return done.stdout.strip() if done.returncode == 0 else None
 
 
-def added_lines(repo, base, suffix='.rs'):
-    """(path, line number, text) of every line `base...HEAD` adds to a file ending in
-    `suffix`; None when git can't produce the diff (unknown base)."""
+def changed_lines(repo, base, suffix='.rs'):
+    """(added, removed): (path, line number, text) of every line `base...HEAD` adds (numbered in HEAD's file) and removes
+    (numbered in the merge base's file) in files ending in `suffix`; None when git can't produce the diff."""
     diff = git(repo, 'diff', '--unified=0', '--no-color', '--no-ext-diff', f'{base}...HEAD', '--',
                f'*{suffix}')
     if diff is None:
         return None
-    added, path, number = [], None, 0
+    added, removed, old_path, path, old_number, number = [], [], None, None, 0, 0
     for line in diff.splitlines():
-        if line.startswith('+++ '):
+        if line.startswith('--- '):
+            old_path = line[6:] if line.startswith('--- a/') else None
+        elif line.startswith('+++ '):
             path = line[6:] if line.startswith('+++ b/') else None
         elif line.startswith('@@'):
-            match = re.search(r'\+(\d+)', line)
-            number = int(match.group(1)) if match else 0
+            match = re.search(r'-(\d+)(?:,\d+)? \+(\d+)', line)
+            old_number, number = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
         elif line.startswith('+') and path:
             added.append((path, number, line[1:]))
             number += 1
-    return added
+        elif line.startswith('-') and old_path:
+            removed.append((old_path, old_number, line[1:]))
+            old_number += 1
+    return added, removed
+
+
+def added_lines(repo, base, suffix='.rs'):
+    """(path, line number, text) of every line `base...HEAD` adds to a file ending in
+    `suffix`; None when git can't produce the diff (unknown base)."""
+    changed = changed_lines(repo, base, suffix)
+    return None if changed is None else changed[0]
 
 
 def is_test_path(path):
@@ -187,27 +199,66 @@ def test_lines(lines):
     return inside
 
 
+def git_show(repo, ref, path):
+    """The file at `ref` as written (`git()` strips), or None."""
+    try:
+        done = subprocess.run(['git', '-C', str(repo), 'show', f'{ref}:{path}'], capture_output=True, text=True,
+                              timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def refusal_line(path, number, text, lines):
+    """The refusal literals on a source line the refusal row counts, or []: comment lines, assertions, test files and
+    `#[cfg(test)]` items (by `lines`, the line's own file) hold none."""
+    code = text.strip()
+    if code.startswith(('//', '/*', '*')) or is_test_path(path) or not REFUSAL.search(code) \
+            or re.match(r'(?:debug_)?assert(?:_eq|_ne)?!', code) or number in test_lines(lines):
+        return []
+    return [m.group(0) for m in REFUSAL.finditer(code)]
+
+
 def new_refusals(repo, base):
     """Each refusal string the branch adds, with the restriction ID it cites (or None).
-    Comment lines, assertions, test files and `#[cfg(test)]` items are skipped. None when the diff can't be read."""
-    added = added_lines(repo, base)
-    if added is None:
+    Comment lines, assertions, test files and `#[cfg(test)]` items are skipped. None when the diff can't be read.
+
+    A refusal is new when its text is (2026-11-11, TrainingRooms rc.8: a by-reference change re-reported two unchanged
+    "…refused before the native request" calls). The lines the branch removes that count under the same rules, read in
+    the merge base's files, give each literal a budget; an added line whose every refusal literal still has budget uses
+    one each and adds no refusal: a touched call (`f(b, "…")` to `f(&b, "…")`) or one moved between files. A removed
+    comment or assertion gives none, nor does a base file git can't show (fails closed). A further copy of an existing
+    message is new. Moving a message from one feature to another reads as a move: the row's text check can't tell
+    them apart, the review does."""
+    changed = changed_lines(repo, base)
+    if changed is None:
         return None
-    hits, files, tests = [], {}, {}
-    for path, number, text in added:
-        code = text.strip()
-        if code.startswith(('//', '/*', '*')) or is_test_path(path) or not REFUSAL.search(code) \
-                or re.match(r'(?:debug_)?assert(?:_eq|_ne)?!', code):
+    added, removed = changed
+    merge_base = git(repo, 'merge-base', base, 'HEAD') or base
+    budget, base_files = {}, {}
+    for path, number, text in removed:
+        if path not in base_files:
+            shown = git_show(repo, merge_base, path)
+            base_files[path] = shown.splitlines() if shown is not None else None
+        if base_files[path] is None:
             continue
+        for literal in refusal_line(path, number, text, base_files[path]):
+            budget[literal] = budget.get(literal, 0) + 1
+    hits, files = [], {}
+    for path, number, text in added:
         if path not in files:
             files[path] = read(repo / path).splitlines()
-            tests[path] = test_lines(files[path])
-        if number in tests[path]:
+        literals = refusal_line(path, number, text, files[path])
+        if not literals:
+            continue
+        if all(budget.get(literal, 0) > 0 for literal in literals):
+            for literal in literals:
+                budget[literal] -= 1
             continue
         lines = files[path]
         window = lines[max(0, number - 4):number] if lines else [text]
         tags = [m.group(1) for line in window for m in [RESTRICTION_TAG.search(line)] if m]
-        hits.append((f'{path}:{number}', code[:90], tags[-1] if tags else None))
+        hits.append((f'{path}:{number}', text.strip()[:90], tags[-1] if tags else None))
     return hits
 
 
