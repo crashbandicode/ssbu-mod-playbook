@@ -7,10 +7,12 @@ pushes overshoot there, and the plain D-pad moves the hand only a little.
 Install it next to the plugin under test. It does nothing on other screens or
 without L3, so it doesn't change what you are testing.
 
-- **NRO:** `/home/intpa/ssbu-tile-cursor/dist/libssbu_tile_cursor.nro`
-  (0.1.0, build `15d3f31`, sha256 `b8313ca2…`). This is the build the Eden
-  tests used. `pair.ps1` installs it automatically. With `solo.ps1`, add it
-  to `-Nro`.
+- **NRO:** `/home/intpa/ssbu-tile-cursor/dist/libssbu_tile_cursor.nro` on
+  the Yoga (0.1.0, build `15d3f31`, sha256 `b8313ca2…`, the same file as
+  release v0.1.0). This is the build the Eden tests used, and the one the
+  Eden configs pin. `pair.ps1` installs it automatically. With `solo.ps1`,
+  add it to `-Nro`. As of 2026-11-13, `main` (`a052fd5`, 2026-10-30) builds
+  a different NRO that hasn't run in Eden, so don't rebuild it into `dist/`.
 - **Log:** `<sdmc>/ultimate/ssbu-tile-cursor/events.log`. It is written every
   100 ms, so the host copy is current.
 - **Not on the Switch card.** It is an Eden tool.
