@@ -15,6 +15,7 @@ is plugged into the Surface (`dreamland-surface.lan`) over USB.
 | [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
 | [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |
 | [CHECKLIST](docs/CHECKLIST.md) | prove the work is done: mandatory, conditional and example items, and the report |
+| [HARNESS-LESSONS](docs/HARNESS-LESSONS.md) | avoid known failed-run causes: verify-first rules, input macros, rows that inherit state, two-PC rooms, writing briefs |
 
 HOOK-SHARING is a 2026-10-31 copy of `/home/intpa/SKYLINE-HOOK-SHARING.md`, with its ARCropolis row corrected on 2026-11-13.
 `tools/` has the scripts these docs use, copied as they ran or written here
