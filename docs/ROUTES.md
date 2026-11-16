@@ -5,6 +5,20 @@ blocks every Eden row reuses. Before them, each lane hand-built its boot route a
 TrainingRooms rc.15 lanes and the Online Deluxe lane lost more than eight boots to setup mistakes this playbook
 already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
 
+## What is proven, and when to use it
+
+- **Proven (XPS, 2026-11-16, "Proof" below):**
+  - `configure_boot`, `load_game`, `wait_lines`, `to_main`;
+  - `main_to_stage`, `pick_stage` (by name);
+  - `pick_fighters` for P1 only;
+  - `enter_training`, `chord`, `fixture`, `back_to_main`.
+- **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
+- **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
+  rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
+  example a stage by name or a fixture per row.
+- **A one-off Eden glitch is not a route bug.** Down, rerun once, and note it. Change a block only when the failure
+  repeats.
+
 ## How to call a block
 
 A block is a runner step hook. A row names it with `routes:` and no path:
