@@ -253,9 +253,9 @@ SWITCH_SCHEMES = ('usb://', 'pi://', 'switch://', 'autopilot://')
 # reviewed), each checked to pass on its own screen and fail on the others (library/routes/refs/hw-refs.json).
 SWITCH_REFS = {'main': 'hw-main', 'stage': 'hw-sss', 'css': 'hw-css', 'ready': 'hw-ready',
                'training': 'hw-training', 'tr-menu': 'hw-tr-menu', 'profile': 'hw-profile',
-               'launch-error': 'hw-launch-error'}
+               'launch-error': 'hw-launch-error', 'home': 'hw-home'}
 SWITCH_CAPS = {'main': 10, 'stage': 45, 'css': 60, 'ready': 10, 'training': 60, 'tr-menu': 10, 'profile': 10,
-               'launch-error': 5}
+               'launch-error': 5, 'home': 10}
 
 
 def on_switch(ctx):
@@ -354,6 +354,23 @@ def _mean_diff(a, b):
         else float('inf')
 
 
+def match_frame(png, spec, compare_region):
+    """(difference, note) of one frame against an image spec: the plain compare; for dim-tolerant specs the
+    brightness-lifted compare when the plain one fails; and the contrast floor on any pass."""
+    tolerance = spec.get('tolerance', 8)
+    diff, note = compare_region(png, Path(spec['reference']), spec['roi'], spec.get('reference_is_roi'),
+                                spec.get('scale') or 'fit', spec.get('frame'), tolerance)
+    if diff > tolerance and spec.get('dim_tolerant'):
+        dimmed, gain = dim_compare(png, spec, tolerance)
+        if dimmed <= tolerance:
+            diff, note = dimmed, {**(note or {}), 'dimmed_gain': gain}
+    if diff <= tolerance and spec.get('dim_tolerant') and not structure_ok(png, spec):
+        # A flat frame (black loading screen, blank capture) can sit within the tolerance of a dark,
+        # text-light reference such as the TR menu's key line; the reference's text must be there.
+        diff, note = float('inf'), {**(note or {}), 'flat': True}
+    return diff, note
+
+
 def _frame_gate(ctx, key, spec, cap):
     """An image gate on recorder frames: the same reference, ROI, frame size, scale and tolerance as the gate."""
     reference = Path(spec['reference'])
@@ -362,16 +379,7 @@ def _frame_gate(ctx, key, spec, cap):
     last = None
     while True:
         png = frame(ctx, 'gate-' + key)
-        diff, note = ctx.runner.compare_region(png, reference, spec['roi'], spec.get('reference_is_roi'),
-                                               spec.get('scale') or 'fit', spec.get('frame'), tolerance)
-        if diff > tolerance and spec.get('dim_tolerant'):
-            dimmed, gain = dim_compare(png, spec, tolerance)
-            if dimmed <= tolerance:
-                diff, note = dimmed, {**(note or {}), 'dimmed_gain': gain}
-        if diff <= tolerance and spec.get('dim_tolerant') and not structure_ok(png, spec):
-            # A flat frame (black loading screen, blank capture) can sit within the tolerance of a dark,
-            # text-light reference such as the TR menu's key line; the reference's text must be there.
-            diff, note = float('inf'), {**(note or {}), 'flat': True}
+        diff, note = match_frame(png, spec, ctx.runner.compare_region)
         if diff <= tolerance:
             ctx.log({'gate': key, 'on': ctx.on, 'pass': True, 'frame': str(png), 'diff': round(diff, 2),
                      **(note or {})})

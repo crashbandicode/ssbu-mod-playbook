@@ -361,6 +361,44 @@ class SwitchGateTests(unittest.TestCase):
         self.assertFalse(routes.passes(ctx, 'tr-menu', 0.5))
 
 
+class SwitchDiscriminationTests(unittest.TestCase):
+    """Every real-Switch gate passes its own screen, normal and dimmed (the console's ~1/3 auto-dim), and fails
+    every other gate's screen content placed at its ROI, normal and dimmed: HOME vs main vs TR menu vs HUD and the
+    rest. Built from the committed references only (no game stills in the repo)."""
+
+    @staticmethod
+    def frame_with(spec, content, factor):
+        from PIL import Image
+        frame = Image.new('RGB', (1280, 720))
+        x0, y0, x1, y1 = spec['roi']
+        frame.paste(content.resize((x1 - x0, y1 - y0)), (x0, y0))
+        return frame.point(lambda v: int(v * factor)) if factor != 1 else frame
+
+    def test_every_gate_only_matches_its_own_screen(self):
+        from PIL import Image
+        folder = Path(tempfile.mkdtemp())
+        gates = sorted(routes.SWITCH_REFS)
+        self.assertIn('home', gates)
+        refs = {g: Image.open(routes._switch_spec(g)['reference']).convert('RGB') for g in gates}
+        wrong = []
+        for g in gates:
+            spec = routes._switch_spec(g)
+            for factor in (1, 0.33, 0.35):
+                own = folder / f'{g}-own-{factor}.png'
+                self.frame_with(spec, refs[g], factor).save(own)
+                diff, note = routes.match_frame(own, spec, runner.Runner.compare_region)
+                self.assertLessEqual(diff, spec['tolerance'], f'{g} own x{factor}: {diff} {note}')
+                for h in gates:
+                    if h == g:
+                        continue
+                    other = folder / f'{g}-as-{h}-{factor}.png'
+                    self.frame_with(spec, refs[h], factor).save(other)
+                    diff, _ = routes.match_frame(other, spec, runner.Runner.compare_region)
+                    if diff <= spec['tolerance']:
+                        wrong.append((g, h, factor, round(diff, 1)))
+        self.assertEqual(wrong, [], 'a gate passed another screen')
+
+
 class SwitchBootTests(unittest.TestCase):
     def run_boot(self, screens):
         """screens: what each look sees, in order ('main', 'profile', 'launch-error' or None)."""

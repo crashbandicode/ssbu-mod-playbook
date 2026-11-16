@@ -19,7 +19,8 @@
    "P0-title-title.png": 82.1,
    "P0-profile-profile-select.png": 126.2,
    "P0-profile-after-load.png": 116.3,
-   "P0b-profile-after-load.png": 116.3
+   "P0b-profile-after-load.png": 116.3,
+   "final-still.png": 120.3
   }
  },
  "hw-sss": {
@@ -42,7 +43,8 @@
    "P0-title-title.png": 42.0,
    "P0-profile-profile-select.png": 128.2,
    "P0-profile-after-load.png": 31.8,
-   "P0b-profile-after-load.png": 31.8
+   "P0b-profile-after-load.png": 31.8,
+   "final-still.png": 203.9
   }
  },
  "hw-css": {
@@ -65,7 +67,8 @@
    "P0-title-title.png": 64.7,
    "P0-profile-profile-select.png": 107.2,
    "P0-profile-after-load.png": 116.4,
-   "P0b-profile-after-load.png": 119.4
+   "P0b-profile-after-load.png": 119.4,
+   "final-still.png": 124.3
   }
  },
  "hw-ready": {
@@ -88,7 +91,8 @@
    "P0-title-title.png": 83.0,
    "P0-profile-profile-select.png": 94.4,
    "P0-profile-after-load.png": 58.0,
-   "P0b-profile-after-load.png": 58.0
+   "P0b-profile-after-load.png": 58.0,
+   "final-still.png": 128.3
   }
  },
  "hw-training": {
@@ -111,7 +115,8 @@
    "P0-title-title.png": 168.5,
    "P0-profile-profile-select.png": 35.2,
    "P0-profile-after-load.png": 178.7,
-   "P0b-profile-after-load.png": 178.7
+   "P0b-profile-after-load.png": 178.7,
+   "final-still.png": 58.8
   }
  },
  "hw-tr-menu": {
@@ -134,7 +139,8 @@
    "P0-title-title.png": 169.4,
    "P0-profile-profile-select.png": 205.0,
    "P0-profile-after-load.png": 34.7,
-   "P0b-profile-after-load.png": 29.0
+   "P0b-profile-after-load.png": 29.0,
+   "final-still.png": 200.0
   }
  },
  "hw-profile": {
@@ -157,7 +163,8 @@
    "P0-title-title.png": 173.6,
    "P0-profile-profile-select.png": 0.0,
    "P0-profile-after-load.png": 214.3,
-   "P0b-profile-after-load.png": 225.5
+   "P0b-profile-after-load.png": 225.5,
+   "final-still.png": 87.8
   }
  },
  "hw-launch-error": {
@@ -180,7 +187,32 @@
    "P0-title-title.png": 81.7,
    "P0-profile-profile-select.png": 103.9,
    "P0-profile-after-load.png": 0.0,
-   "P0b-profile-after-load.png": 29.0
+   "P0b-profile-after-load.png": 29.0,
+   "final-still.png": 136.6
+  }
+ },
+ "hw-home": {
+  "source": "/home/intpa/smash-training-lobby/artifacts/harness-lib/hw-proof-1/final-still.png",
+  "roi": [
+   30,
+   140,
+   480,
+   180
+  ],
+  "sha256": "efc0a1f72d2c298f93a997f141b4f08334bed10909d5fd778f5494d884e6a3e0",
+  "diffs": {
+   "P0-main2-m1.png": 131.1,
+   "P1-main-to-sss-sss.png": 50.7,
+   "P2d-hand-hand-up.png": 105.6,
+   "P2d-hand-picked.png": 149.3,
+   "P2e-plus-training-entered.png": 23.8,
+   "F01-menu-footer-menu-open.png": 178.2,
+   "F01-menu-footer-hud-before.png": 25.4,
+   "P0-title-title.png": 154.0,
+   "P0-profile-profile-select.png": 85.8,
+   "P0-profile-after-load.png": 216.4,
+   "P0b-profile-after-load.png": 216.4,
+   "final-still.png": 0.0
   }
  }
 }

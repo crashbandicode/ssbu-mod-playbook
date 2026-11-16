@@ -145,6 +145,14 @@ instance differs, and every input is a macro (no manual presses).
   references (`library/routes/refs/`), cut from the reviewed switch-hw-ledger-rc15 stills:
   - each one passes on its own screen and fails on the others (`hw-refs.json`);
   - the Eden references don't apply there (window grabs are 1280x674; the card is a true 16:9 frame).
+- **Auto-dim (a calibration on the operator's review list):** after about 5 min without input the console dims
+  its screen to about 1/3.
+  - When the plain compare fails, the `hw-*` gates compare again with the ROI lifted to the reference's brightness
+    (gain 1.3–4).
+  - Every pass also needs a third of the reference's contrast, so a flat frame can't pass.
+  - `test_routes.py` (SwitchDiscriminationTests) pins it: each gate passes only its own screen, at normal and
+    dimmed brightness; every other gate's content at its ROI fails, HOME vs main vs TR menu vs HUD included.
+  - **The root alternative:** stop the console from dimming. That's a console setting, and the operator's choice.
 - **One driver per console:** `up` refuses while any process holds the tty or the claim file
   (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
 - **Hardware blocks:**
