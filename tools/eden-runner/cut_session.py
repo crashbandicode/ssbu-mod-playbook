@@ -16,6 +16,12 @@ Outputs (all under OUT unless a gif label names its own `out`, which is taken re
   rows    OUT/clips/<row>.gif, an evidence clip per row-start/row-end pair, with the same receipt.
   stills  OUT/stills/<row>-<label>.png, full size, one per `shot` mark.
 
+Per-row files (plan session_recording.per_row_files): the runner split the recording at each row start and logged
+a `clip` event per closed file (row, path, clip = the <out>/<row>/clip.* link, file_rec_ms = rec_ms at which that
+file began, rows = every row the file holds). Each row's GIFs and stills are then cut from its own clip at
+rec_ms - file_rec_ms, never by scrubbing one giant file; a row without a closed clip is skipped with a reason.
+--recording PATH turns this off (one file, global rec_ms).
+
 A JSON summary goes to stdout. Exit 0 ok, 1 when a cut failed, 2 when recording.jsonl has no `start` event
 (the recording was unavailable), 3 when the recording file cannot be found.
 
@@ -41,7 +47,7 @@ PRESETS = {'evidence': {'width': 640, 'fps': 15, 'max_s': None, 'max_bytes': 10 
 MAX_FPS = 15
 FRAME_CAP = 900          # decoded frames held in memory per clip (640x360 RGB ~ 0.7 MB each)
 FRAME_NS = 1_000_000_000 // 60
-EVENTS = ('start', 'row-start', 'row-end', 'shot', 'gif-start', 'gif-end', 'stop')
+EVENTS = ('start', 'row-start', 'row-end', 'shot', 'gif-start', 'gif-end', 'stop', 'clip')
 STILL_TOLERANCE_NS = 500_000_000   # a still whose nearest decoded frame is further than this is not trusted
 
 
@@ -490,6 +496,28 @@ def find_recording(marks, explicit):
         return None
 
 
+def clip_sources(marks):
+    """Per-row files: {row: {'path', 'base_ms'}} from the `clip` events. The linked clip is preferred, else the OBS
+    file; a file that also held rows whose own split failed maps those rows too. base_ms None (a file that began
+    without an acknowledged split) cannot place marks."""
+    out = {}
+    for mark in marks:
+        if mark.get('event') != 'clip':
+            continue
+        clip = mark.get('clip')
+        path = clip if clip and Path(clip).is_file() else mark.get('path')
+        if not path:
+            continue
+        base = mark.get('file_rec_ms')
+        base = float(base) if isinstance(base, (int, float)) and not isinstance(base, bool) else None
+        rows = [r for r in (mark.get('rows') or []) if r is not None]
+        if mark.get('row') is not None and mark['row'] not in rows:
+            rows.insert(0, mark['row'])
+        for row in rows:
+            out[str(row)] = {'path': str(path), 'base_ms': base}
+    return out
+
+
 def unavailable_reason(out_dir):
     """Why the runner could not start the session recording, from its record in <out>/actions.jsonl
     ({"session_recording": "unavailable", "error"|"reason": ...}); None when it logged none."""
@@ -528,15 +556,30 @@ def run(out_dir, rows=None, only=None, recording=None, partial=False, offset_ms=
     marks, bad = parse_marks(log)
     if not any(m.get('event') == 'start' for m in marks):
         return _no_start(out_dir, f'{log} has no start event')
-    source = find_recording(marks, recording)
-    if source is None:
+    clips = {} if recording else clip_sources(marks)
+    source = None if clips else find_recording(marks, recording)
+    if source is None and not clips:
         return {'ok': False, 'error': 'the session recording file was not found: pass --recording PATH '
                                       '(the stop mark names none that exists here)'}, EXIT_NO_RECORDING
     want = set(only) if only else {'gifs', 'rows', 'stills'}
     row_filter = set(rows) if rows else None
     paired = pair_marks(marks)
-    summary = {'out': str(out_dir), 'recording': str(source), 'partial': bool(partial), 'offset_ms': offset_ms,
+    summary = {'out': str(out_dir), 'recording': str(source) if source else 'per-row files',
+               'per_row_files': bool(clips), 'partial': bool(partial), 'offset_ms': offset_ms,
                'gifs': [], 'rows': [], 'stills': [], 'skipped': [], 'failed': [], 'warnings': []}
+
+    def source_of(row):
+        """(file, offset_ms, None) for a row's marks, or (None, None, reason)."""
+        if not clips:
+            return source, offset_ms, None
+        clip = clips.get(str(row))
+        if clip is None:
+            return None, None, 'no per-row clip for this row (its file is not closed yet, or its split failed)'
+        if clip['base_ms'] is None:
+            return None, None, 'its file began without an acknowledged split (no rec_ms origin)'
+        if not Path(clip['path']).is_file():
+            return None, None, f'per-row clip {clip["path"]} not found'
+        return Path(clip['path']), offset_ms - clip['base_ms'], None
     if bad:
         summary['warnings'].append(f'recording.jsonl: {len(bad)} unreadable line(s) skipped (first: {bad[0]})')
     if not any(m.get('event') == 'stop' for m in marks):
@@ -558,8 +601,12 @@ def run(out_dir, rows=None, only=None, recording=None, partial=False, offset_ms=
                 continue
             target = gif_out_path(out_dir, span) if kind == 'gifs' \
                 else out_dir / 'clips' / f'{safe_name(span["row"])}.gif'
+            span_source, span_offset, why = source_of(span['row'])
+            if span_source is None:
+                summary['skipped'].append({'kind': kind, 'row': span['row'], 'name': span['name'], 'reason': why})
+                continue
             try:
-                receipt, reason = cut_span(span, source, target, offset_ms, partial)
+                receipt, reason = cut_span(span, span_source, target, span_offset, partial)
             except Exception as e:  # noqa: BLE001 - one bad span must not stop the rest
                 summary['failed'].append({'kind': kind, 'row': span['row'], 'name': span['name'],
                                           'error': f'{type(e).__name__}: {e}'[:300]})
@@ -571,36 +618,49 @@ def run(out_dir, rows=None, only=None, recording=None, partial=False, offset_ms=
 
     if 'stills' in want:
         shots = [s for s in paired['shots'] if wanted(s['row'])]
-        if shots:
-            taken = set()
-            try:
-                pipeline = Pipeline(source)
-            except Exception as e:  # noqa: BLE001
-                summary['failed'].append({'kind': 'stills', 'error': f'{type(e).__name__}: {e}'[:300]})
-                pipeline = None
-            for shot in shots if pipeline else []:
-                name = still_name(shot, taken)
-                at_ns = span_ns(shot['ms'], shot['ms'], offset_ms)[0]
+        taken, pipeline, pipeline_source = set(), None, None
+        for shot in shots:
+            shot_source, shot_offset, why = source_of(shot['row'])
+            if shot_source is None:
+                summary['skipped'].append({'kind': 'still', 'row': shot['row'], 'name': shot['label'], 'reason': why})
+                continue
+            if str(shot_source) != pipeline_source:
+                # Marks are chronological: finish this file before opening the next.
+                # Keeping one decoder per row exhausts resources on long sessions.
+                if pipeline is not None:
+                    pipeline.close()
+                pipeline_source, pipeline = str(shot_source), None
                 try:
-                    got = pipeline.still(at_ns)
+                    pipeline = Pipeline(shot_source)
                 except Exception as e:  # noqa: BLE001
-                    summary['failed'].append({'kind': 'still', 'row': shot['row'], 'name': shot['label'],
+                    summary['failed'].append({'kind': 'stills', 'row': shot['row'], 'source': str(shot_source),
                                               'error': f'{type(e).__name__}: {e}'[:300]})
-                    continue
-                if got is None or abs(got[0] - at_ns) > STILL_TOLERANCE_NS:
-                    reason = 'recording does not reach this mark yet' if got is None \
-                        else f'nearest decoded frame is {abs(got[0] - at_ns) / 1e6:.0f} ms away'
-                    summary['skipped'].append({'kind': 'still', 'row': shot['row'], 'name': shot['label'],
-                                               'reason': reason})
-                    continue
-                path = out_dir / 'stills' / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                got[1].save(path, format='PNG')
-                summary['stills'].append({'path': str(path), 'row': shot['row'], 'label': shot['label'],
-                                          'rec_ms': shot['ms'], 'size': list(got[1].size),
-                                          'bytes': path.stat().st_size})
-            if pipeline:
-                pipeline.close()
+                    pipeline = None
+            if pipeline is None:
+                continue
+            name = still_name(shot, taken)
+            at_ns = span_ns(shot['ms'], shot['ms'], shot_offset)[0]
+            try:
+                got = pipeline.still(at_ns)
+            except Exception as e:  # noqa: BLE001
+                summary['failed'].append({'kind': 'still', 'row': shot['row'], 'name': shot['label'],
+                                          'error': f'{type(e).__name__}: {e}'[:300]})
+                continue
+            if got is None or abs(got[0] - at_ns) > STILL_TOLERANCE_NS:
+                reason = 'recording does not reach this mark yet' if got is None \
+                    else f'nearest decoded frame is {abs(got[0] - at_ns) / 1e6:.0f} ms away'
+                summary['skipped'].append({'kind': 'still', 'row': shot['row'], 'name': shot['label'],
+                                           'reason': reason})
+                continue
+            path = out_dir / 'stills' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            got[1].save(path, format='PNG')
+            summary['stills'].append({'path': str(path), 'row': shot['row'], 'label': shot['label'],
+                                      'rec_ms': shot['ms'], 'size': list(got[1].size),
+                                      'bytes': path.stat().st_size, 'source': str(shot_source),
+                                      'at_s': round(at_ns / 1e9, 3)})
+        if pipeline is not None:
+            pipeline.close()
 
     summary['counts'] = {k: len(summary[k]) for k in ('gifs', 'rows', 'stills', 'skipped', 'failed')}
     summary['ok'] = not summary['failed']

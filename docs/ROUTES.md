@@ -168,6 +168,19 @@ instance differs, and every input is a macro (no manual presses).
     2026-11-16.
   - **Backends without it:** the run goes on without a session recording. Eden has no `recording.session_*`
     methods today.
+  - **One file per row** (`"per_row_files": true`, optional `"split_cap_s": 10`): the row-start mark becomes a
+    split (`recording.session_split`: OBS `SplitRecordFile`, then the `RecordFileChanged` event). OBS splits at its
+    next keyframe, so the row's input waits for the event. The file that began at row N's split is row N's clip;
+    it closes at the next split or at the stop (a failed or interrupted row too). Then the runner hard-links it
+    to `<out>/<row>/clip.mp4`, puts `clip` in the row's receipt, and logs a `clip` event in `recording.jsonl`.
+    `cut_session.py` then cuts each row's GIFs and stills from its own clip.
+    - **A split with no event within the cap fails loudly:** the row-start mark carries `split.ok: false`, the
+      row gets no clip, and the open file goes on to hold that row too (`rows` in its `clip` event). There's
+      never a Start/Stop instead mid-session: that race was F04 (obs_500/501).
+    - **Precondition:** OBS's record output needs manual splitting on. Simple output mode has no UI for it, and
+      it resets when OBS restarts or Settings > Output is applied. `switch_hw.py up` checks it and refuses while
+      it's off. The fix is `obsws.py split-enable` (switch-remote tools/host); `up --allow-no-split` runs without
+      it. The runner itself never changes OBS settings.
 - **One driver per console:** `up` refuses while any process holds the tty or the claim file
   (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
 - **Hardware blocks:**

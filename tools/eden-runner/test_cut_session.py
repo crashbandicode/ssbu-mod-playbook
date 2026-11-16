@@ -65,6 +65,41 @@ class WithoutPyGObject(unittest.TestCase):
                     sys.modules[name] = module
 
 
+class StillResources(unittest.TestCase):
+    def test_per_row_stills_keep_only_one_decoder_open(self):
+        from unittest.mock import patch
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            marks = [mark("start")]
+            for row in ("A", "B", "C"):
+                clip = out / f"{row}.mp4"
+                clip.touch()
+                marks += [mark("clip", row, path=str(clip), file_rec_ms=0, rows=[row]),
+                          mark("shot", row, "one", 1000), mark("shot", row, "two", 1200)]
+            marks.append(mark("stop"))
+            (out / "recording.jsonl").write_text("\n".join(json.dumps(m) for m in marks)+"\n")
+
+            class Decoder:
+                active = peak = starts = 0
+
+                def __init__(self, path):
+                    Decoder.active += 1
+                    Decoder.starts += 1
+                    Decoder.peak = max(Decoder.peak, Decoder.active)
+
+                def still(self, at):
+                    return at, Image.new("RGB", (16, 9))
+
+                def close(self):
+                    Decoder.active -= 1
+
+            with patch.object(cs, "Pipeline", Decoder):
+                summary, code = cs.run(out, only=["stills"])
+            self.assertEqual((code, len(summary["stills"])), (0, 6))
+            self.assertEqual((Decoder.starts, Decoder.active, Decoder.peak), (3, 0, 1))
+
+
 class ParseMarks(unittest.TestCase):
     def write(self, text):
         d = Path(tempfile.mkdtemp())
@@ -116,6 +151,13 @@ class Pairing(unittest.TestCase):
         self.assertEqual(paired['rows'], [])
         self.assertEqual(len(paired['unusable']), 2)
 
+    def test_clip_events_map_rows_to_their_files(self):
+        marks = [mark('clip', None, path='/r/rec-1.mp4', clip=None, file_rec_ms=0, rows=[]),
+                 mark('clip', 'A', path='/r/rec-2.mp4', clip='/missing/clip.mp4', file_rec_ms=1040, rows=['A', 'B']),
+                 mark('clip', None, path='/r/late.mp4', clip=None, file_rec_ms=None, rows=['C'])]
+        self.assertEqual(cs.clip_sources(marks), {'A': {'path': '/r/rec-2.mp4', 'base_ms': 1040.0},
+                                                  'B': {'path': '/r/rec-2.mp4', 'base_ms': 1040.0},
+                                                  'C': {'path': '/r/late.mp4', 'base_ms': None}})
     def test_same_gif_name_in_two_rows_is_two_spans(self):
         la = gif_label('a')
         paired = cs.pair_marks([mark('gif-start', 'R1', la, 0), mark('gif-end', 'R1', la, 1000),
@@ -395,6 +437,47 @@ class RealCuts(unittest.TestCase):
         self.assertEqual(receipt['width'], 1280)
         self.assertAlmostEqual(receipt['duration_s'], 2.0, delta=0.2)
         self.assertEqual(receipt['preset'], 'docs')
+
+    def test_per_row_files_cut_each_row_from_its_own_clip(self):
+        from PIL import Image
+        r2 = self.out / 'R2' / 'clip' / 'rec-2.mp4'
+        r2.parent.mkdir(parents=True)
+        shutil.copy(self.video, r2)
+        label = gif_label('demo', 'evidence', 'gifs/demo.gif')
+        # R1's file began at rec_ms 10000, R2's at 20000; R3's split failed (R2's file holds it); R4 has no clip yet.
+        # No stop mark and no giant file: nothing is cut from a whole-session recording.
+        self.write([mark('start'),
+                    mark('row-start', 'R1', None, 10000), mark('gif-start', 'R1', label, 11000),
+                    mark('shot', 'R1', 'R1:menu', 12500), mark('gif-end', 'R1', label, 13500),
+                    mark('row-end', 'R1', None, 15000),
+                    mark('row-start', 'R2', None, 20000), mark('clip', 'R1', path=str(self.video), clip=None,
+                                                               file_rec_ms=10000, rows=['R1']),
+                    mark('shot', 'R2', 'late', 24200), mark('row-end', 'R2', None, 25000),
+                    mark('row-start', 'R3', None, 25500), mark('shot', 'R3', 'r3', 21000),
+                    mark('row-end', 'R3', None, 25900),
+                    mark('clip', 'R2', path='/gone/rec-2.mp4', clip=str(r2), file_rec_ms=20000, rows=['R2', 'R3']),
+                    mark('row-start', 'R4', None, 30000), mark('shot', 'R4', 'x', 30500)])
+        summary, code = cs.run(self.out, only=['gifs', 'stills'])
+        self.assertEqual(code, 0, summary)
+        self.assertTrue(summary['per_row_files'])
+        stills = {Path(s['path']).name: s for s in summary['stills']}
+        self.assertEqual(sorted(stills), ['R1-menu.png', 'R2-late.png', 'R3-r3.png'])
+        self.assertEqual(stills['R1-menu.png']['source'], str(self.video))
+        self.assertEqual(stills['R2-late.png']['source'], str(r2))      # the linked clip, not the gone OBS path
+        self.assertEqual((stills['R1-menu.png']['at_s'], stills['R2-late.png']['at_s']), (2.5, 4.2))
+        self.assertAlmostEqual(self.grey(Image.open(stills['R1-menu.png']['path'])), 80, delta=10)
+        self.assertAlmostEqual(self.grey(Image.open(stills['R2-late.png']['path'])), 160, delta=10)
+        self.assertAlmostEqual(self.grey(Image.open(stills['R3-r3.png']['path'])), 40, delta=10)
+        skipped = [s for s in summary['skipped'] if s['row'] == 'R4']
+        self.assertIn('no per-row clip', skipped[0]['reason'])
+        receipt = json.loads((self.out / 'gifs' / 'demo.gif.json').read_text())
+        self.assertEqual(receipt['source']['recording'], str(self.video))
+        self.assertEqual((receipt['source']['start_s'], receipt['source']['offset_ms']), (1.0, -10000))
+        gif = Image.open(self.out / 'gifs' / 'demo.gif')
+        self.assertAlmostEqual(self.grey(gif.convert('RGB')), 40, delta=10)
+        # --recording turns per-row mode off
+        summary, _ = cs.run(self.out, only=['stills'], recording=str(self.video), rows=['R1'])
+        self.assertFalse(summary['per_row_files'])
 
     def test_row_clip_stills_and_row_filter(self):
         self.session([mark('row-start', 'R1', None, 1000), mark('shot', 'R1', 'a', 1500), mark('row-end', 'R1', None, 2000),

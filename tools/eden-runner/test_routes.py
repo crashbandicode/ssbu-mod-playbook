@@ -296,6 +296,48 @@ class SwitchHwTests(unittest.TestCase):
         switch_hw.capture_log(path, 'h', 1, stop=lambda: len(calls) >= 3, connect=connect, retry_s=0)
         self.assertEqual(path.read_text(), 'a\nbc\nd\n')
 
+    def test_up_refuses_when_obs_cannot_split_per_row(self):
+        import contextlib
+        import io
+        import switch_hw
+        folder = Path(tempfile.mkdtemp())
+        split = {'ok': False, 'why': 'simple_file_output.split_file is None: manual file splitting is off'}
+        calls = []
+
+        class Client:
+            def request(self, method, params=None):
+                calls.append(method)
+                if method == 'ui.screenshot':
+                    Path(params['path']).write_bytes(b'png')
+                if method == 'recording.split_check':
+                    return {'ok': True, 'result': dict(split)}
+                return {'ok': True, 'result': {'version': 'x'}}
+
+            def close(self):
+                pass
+        saved = (switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen)
+        switch_hw.CLAIM = folder / 'claim'
+        switch_hw.holders = lambda device: []
+        switch_hw._client = lambda device: Client()
+        switch_hw.subprocess.Popen = lambda *a, **k: type('P', (), {'pid': 4242})()
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                switch_hw.up(folder / 'run', '/dev/null', 'h:1', 'test')
+            self.assertIn('split-enable', str(cm.exception))
+            self.assertFalse((folder / 'claim').exists())  # released on the refusal
+            self.assertNotIn('SetOutputSettings', calls)    # read-only: up never changes OBS
+            with contextlib.redirect_stdout(io.StringIO()):
+                switch_hw.up(folder / 'run2', '/dev/null', 'h:1', 'test', allow_no_split=True)
+            journal = json.loads((folder / 'run2' / 'journal.json').read_text())
+            self.assertFalse(journal['obs_split']['ok'])
+            (folder / 'claim').unlink()
+            split['ok'], split['why'] = True, None
+            with contextlib.redirect_stdout(io.StringIO()):
+                switch_hw.up(folder / 'run3', '/dev/null', 'h:1', 'test')
+            self.assertTrue(json.loads((folder / 'run3' / 'journal.json').read_text())['obs_split']['ok'])
+        finally:
+            switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen = saved
+
     def test_factory_routes_usb_to_switch_remote(self):
         folder = Path(tempfile.mkdtemp())
         (folder / 'switch_remote.py').write_text('def make_client(s):\n    return ("fake", s)\n')
@@ -635,6 +677,132 @@ class SessionRecordingTests(unittest.TestCase):
         out = self.run_plan(client)
         self.assertFalse((out / 'recording.jsonl').exists())
         self.assertEqual(json.loads((out / 'a.json').read_text())['status'], 'PASS')
+
+    class SplitClient:
+        """recording.session_split like switch-remote's OBS client: a new file per acknowledged split."""
+
+        def __init__(self, folder, ack=lambda label: True):
+            self.folder, self.ack, self.calls, self.n, self.rec_ms, self.cur = folder, ack, [], 0, 0, None
+
+        def new_file(self):
+            self.n += 1
+            path = self.folder / f'rec-{self.n}.mp4'
+            path.write_bytes(b'mp4' * self.n)
+            return str(path)
+
+        def request(self, method, params=None):
+            self.calls.append(method)
+            params = params or {}
+            if method == 'recording.session_start':
+                self.cur = self.new_file()
+                return {'ok': True, 'result': {'started_wall': 1.0, 'already_active': False, 'path': self.cur}}
+            if method == 'recording.session_split':
+                self.rec_ms += 1000
+                base = {'active': True, 'rec_ms': self.rec_ms, 'wall': 1.0, 'closed': [], 'late_paths': []}
+                if not self.ack(params['label']):
+                    return {'ok': True, 'result': {**base, 'split_ok': False, 'error': 'split_unacknowledged'}}
+                prev, self.cur = self.cur, self.new_file()
+                return {'ok': True, 'result': {**base, 'split_ok': True, 'new_path': self.cur, 'prev_path': prev,
+                                               'file_rec_ms': self.rec_ms + 40,
+                                               'closed': [{'path': prev, 'finalized': True}]}}
+            if method == 'recording.session_mark':
+                self.rec_ms += 1000
+                return {'ok': True, 'result': {'active': True, 'rec_ms': self.rec_ms, 'wall': 1.0}}
+            if method == 'recording.session_stop':
+                return {'ok': True, 'result': {'path': self.cur, 'finalized': True, 'stopped_wall': 2.0,
+                                               'late_paths': []}}
+            if method == 'ui.tree':
+                return {'ok': True, 'result': [{'id': 'w', 'class': 'GRenderWindow'}]}
+            if method == 'ui.screenshot':
+                Path(params['path']).write_bytes(b'png')
+            return {'ok': True, 'result': {}}
+
+    def run_split_plan(self, rows, ack=lambda label: True):
+        folder = Path(tempfile.mkdtemp())
+        client = self.SplitClient(folder, ack)
+        plan = {'start': 's', 'gates': {'never': {'kind': 'log', 'source': 'console_log', 'pattern': 'never', 'cap': 0.3}},
+                'session_recording': {'marks': ['row-start', 'row-end', 'shot'], 'per_row_files': True},
+                'rows': [{'id': rid, 'start': 's', 'end': 's', 'steps': steps} for rid, steps in rows]}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        log = folder / 'console.log'
+        log.write_text('')
+        r = runner.Runner(folder / 'rows.json', {'sw': {'socket': 'x', 'console_log': str(log)}}, folder / 'out', 15,
+                          client_factory=lambda s: client)
+        try:
+            r.run()
+        except BaseException:
+            pass
+        out = folder / 'out'
+        events = [json.loads(l) for l in (out / 'recording.jsonl').read_text().splitlines()]
+        return folder, out, events, client
+
+    def test_per_row_files_split_at_each_row_start(self):
+        folder, out, events, client = self.run_split_plan([('a', [{'shot': 'one'}]), ('b', [])])
+        self.assertEqual([(e['event'], e.get('row')) for e in events],
+                         [('start', None), ('row-start', 'a'), ('clip', None), ('shot', 'a'), ('row-end', 'a'),
+                          ('row-start', 'b'), ('clip', 'a'), ('row-end', 'b'), ('stop', None), ('clip', 'b')])
+        self.assertEqual(client.calls.count('recording.session_split'), 2)
+        self.assertEqual(client.calls.count('recording.session_mark'), 3)  # shot, row-end x2 stay plain marks
+        start_a = events[1]
+        self.assertTrue(start_a['split']['ok'])
+        self.assertEqual((start_a['rec_ms'], start_a['split']['requested_rec_ms']), (1040, 1000))
+        pre = events[2]
+        self.assertEqual((pre['path'], pre['clip']), (str(folder / 'rec-1.mp4'), None))  # before any row: no clip
+        for row, n in (('a', 2), ('b', 3)):
+            receipt = json.loads((out / f'{row}.json').read_text())
+            self.assertEqual(receipt['clip'], str(out / row / 'clip.mp4'))
+            self.assertEqual(receipt['clip_source'], str(folder / f'rec-{n}.mp4'))
+            self.assertTrue(receipt['clip_finalized'])
+            # a hard link: the same file, never a move (the original recording stays)
+            self.assertTrue((folder / f'rec-{n}.mp4').is_file())
+            self.assertTrue((out / row / 'clip.mp4').samefile(folder / f'rec-{n}.mp4'))
+        self.assertEqual(events[-1]['clip'], str(out / 'b' / 'clip.mp4'))
+        self.assertEqual(client.calls.count('recording.session_start'), 1)
+        self.assertNotIn('recording.start', client.calls)
+        self.assertNotIn('recording.stop', client.calls)
+
+    def test_unacknowledged_split_fails_loudly_and_the_row_has_no_clip(self):
+        folder, out, events, client = self.run_split_plan([('a', []), ('b', []), ('c', [])],
+                                                           ack=lambda label: not label.startswith('b:'))
+        start_b = [e for e in events if e['event'] == 'row-start' and e['row'] == 'b'][0]
+        self.assertEqual((start_b['split']['ok'], start_b['split']['error']), (False, 'split_unacknowledged'))
+        clips = {e['row']: e for e in events if e['event'] == 'clip'}
+        self.assertNotIn('b', clips)
+        self.assertNotIn('clip', json.loads((out / 'b.json').read_text()))
+        # a's file went on through b: a's clip says so
+        self.assertEqual(clips['a']['rows'], ['a', 'b'])
+        self.assertEqual(json.loads((out / 'a.json').read_text())['clip_spans_rows'], ['a', 'b'])
+        self.assertEqual(clips['c']['path'], str(folder / 'rec-3.mp4'))
+        actions = (out / 'actions.jsonl').read_text()
+        self.assertIn('"session_split": "failed"', actions)
+        # never a Start/Stop substitute mid-session
+        self.assertEqual((client.calls.count('recording.session_start'), client.calls.count('recording.session_stop')),
+                         (1, 1))
+
+    def test_failed_rows_get_their_clip_and_the_stop_closes_the_last(self):
+        # b fails and the run stops there (rows after it never run): the stop closes b's file
+        folder, out, events, client = self.run_split_plan([('a', []), ('b', [{'gate': 'never'}]), ('c', [])])
+        self.assertFalse((out / 'c.json').exists())
+        receipt = json.loads((out / 'b.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertEqual(receipt['clip'], str(out / 'b' / 'clip.mp4'))
+        self.assertTrue((out / 'b' / 'clip.mp4').samefile(folder / 'rec-3.mp4'))
+        self.assertEqual([e['event'] for e in events[-2:]], ['stop', 'clip'])
+        self.assertEqual(events[-1]['row'], 'b')
+        self.assertEqual(json.loads((out / 'a.json').read_text())['clip'], str(out / 'a' / 'clip.mp4'))
+
+    def test_dry_run_validates_per_row_files(self):
+        folder = Path(tempfile.mkdtemp())
+        plan = {'start': 's', 'session_recording': {'marks': ['shot'], 'per_row_files': 'yes', 'split_cap_s': 0},
+                'rows': [{'id': 'a', 'start': 's', 'end': 's', 'steps': [{'shot': 'x'}]}]}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        errors = runner.dry_run(folder / 'rows.json')['errors']
+        self.assertTrue(any('per_row_files must be' in e for e in errors), errors)
+        self.assertTrue(any('split_cap_s' in e for e in errors), errors)
+        plan['session_recording'] = {'marks': ['shot'], 'per_row_files': True}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        errors = runner.dry_run(folder / 'rows.json')['errors']
+        self.assertTrue(any('keep it in marks' in e for e in errors), errors)
 
     def test_dry_run_validates_it(self):
         folder = Path(tempfile.mkdtemp())

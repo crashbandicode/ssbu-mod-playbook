@@ -18,7 +18,9 @@ Before writing anything, `up` checks:
   - no other process holds the pad's tty (one driver per console);
   - the claim file is free (/home/intpa/.cache/switch-pad.claim, O_EXCL, released by `down`);
   - the pad answers VERSION;
-  - OBS gives a still.
+  - OBS gives a still;
+  - OBS can split the recording per row (recording.split_check; refused when off unless --allow-no-split; the
+    result is journal.json "obs_split").
 `up` then starts the log capture (pid in journal.json). `down` sends RESET, stops the capture and removes the claim.
 It never powers, sleeps or reboots the console; HOME → X → A (`switch.terminate`) closes the game when a row needs it.
 """
@@ -112,7 +114,7 @@ def _client(device):
     return runner.default_client_factory()(f'usb://{device}')
 
 
-def up(run, device, log_host, owner):
+def up(run, device, log_host, owner, allow_no_split=False):
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
     others = holders(device)
@@ -136,6 +138,14 @@ def up(run, device, log_host, owner):
         shot = client.request('ui.screenshot', {'path': str(still)})
         if not shot.get('ok') or not still.is_file():
             raise SystemExit(f'no OBS still: {shot}')
+        # Per-row files (plan session_recording.per_row_files) need OBS's manual file splitting on. Checked here,
+        # read-only: neither `up` nor the runner changes OBS settings (obsws.py split-enable does, by hand).
+        split = client.request('recording.split_check', {})
+        journal['obs_split'] = split.get('result') if split.get('ok') else {'ok': False, 'why': split.get('error')}
+        if not journal['obs_split'].get('ok') and not allow_no_split:
+            raise SystemExit(f'refused: OBS cannot split the recording per row: {journal["obs_split"].get("why")}. '
+                             'Fix: /usr/bin/python3 -I <switch-remote>/tools/host/obsws.py split-enable (then up '
+                             'again), or up --allow-no-split for a plan without "per_row_files"')
         client.request('input.reset')
         client.close()
         journal.update(version=version['result'], still=str(still))
@@ -167,7 +177,9 @@ def down(run):
         log = run / 'out' / 'recording.jsonl'
         if log.is_file():
             events = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
-            if events and events[-1].get('event') != 'stop' and any(e.get('event') == 'start' for e in events):
+            # per_row_files logs a "clip" event after the stop: look at the last start/stop, not the last line
+            bounds = [e.get('event') for e in events if e.get('event') in ('start', 'stop')]
+            if bounds and bounds[-1] == 'start':
                 stopped = client.request('recording.session_stop', {})
                 out['session_stop'] = stopped.get('result') if stopped.get('ok') else stopped.get('error')
                 journal['session_recording'] = out['session_stop']
@@ -201,6 +213,8 @@ def main(argv=None):
     p.add_argument('--device', default=DEFAULT_DEVICE)
     p.add_argument('--log-host', default=DEFAULT_LOG)
     p.add_argument('--owner', default=os.environ.get('USER', 'runner'))
+    p.add_argument('--allow-no-split', action='store_true',
+                   help='go up even when OBS cannot split the recording per row (plans without per_row_files)')
     p = sub.add_parser('down')
     p.add_argument('run')
     p = sub.add_parser('capture-log')
@@ -208,7 +222,7 @@ def main(argv=None):
     p.add_argument('--log-host', default=DEFAULT_LOG)
     args = parser.parse_args(argv)
     if args.cmd == 'up':
-        up(args.run, args.device, args.log_host, args.owner)
+        up(args.run, args.device, args.log_host, args.owner, args.allow_no_split)
     elif args.cmd == 'down':
         down(args.run)
     else:

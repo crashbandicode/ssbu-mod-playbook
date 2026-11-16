@@ -127,7 +127,9 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -535,6 +537,13 @@ def check_plan_policies(plan, base, errors):
                 errors.append(f'session_recording log {log!r} must be a plain file name in the out folder')
             if 'chapters' in cfg and not isinstance(cfg['chapters'], bool):
                 errors.append('session_recording chapters must be true or false')
+            if 'per_row_files' in cfg and not isinstance(cfg['per_row_files'], bool):
+                errors.append('session_recording per_row_files must be true or false')
+            if cfg.get('per_row_files') and 'row-start' not in cfg.get('marks', Runner.SESSION_EVENTS):
+                errors.append('session_recording per_row_files splits at the row-start mark: keep it in marks')
+            cap = cfg.get('split_cap_s', 10)
+            if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not 0 < cap <= 60:
+                errors.append('session_recording split_cap_s must be a number of seconds in (0, 60]')
     if plan.get('on_failure') not in (None, 'continue', 'stop'):
         errors.append(f'plan on_failure {plan.get("on_failure")!r} must be "continue" or "stop"')
     hook = plan.get('on_failure_hook')
@@ -1039,6 +1048,7 @@ class Runner:
         self._gate_latest = None
         self.session = None
         self.session_unavailable = None
+        self.session_file = None  # per_row_files: {'path', 'row', 'rows', 'file_rec_ms'} of the file OBS writes now
 
     # --- control -------------------------------------------------------------------------------------------------
     def log(self, record):
@@ -1057,7 +1067,8 @@ class Runner:
         """One control call. An accepted job is followed to completion within job_cap seconds. With running_ok, a
         job still running at the cap is fine: a ui click that opens a modal dialog (Host Room, a confirm box) stays
         running until that dialog is handled, by design (CLIControl.md); the next gate checks the outcome."""
-        if method not in ('macro.stop', 'input.reset', 'recording.session_mark', 'recording.session_stop'):
+        if method not in ('macro.stop', 'input.reset', 'recording.session_mark', 'recording.session_split',
+                          'recording.session_stop'):
             self.check_stop()  # cleanup and bookkeeping calls still go through after a STOP
         reply = self.clients[on].request(method, params or {})
         self.log({'on': on, 'method': method, 'params': params, 'ok': reply.get('ok')})
@@ -2102,8 +2113,10 @@ class Runner:
             self.log({'session_recording': 'unavailable', 'error': self.session_unavailable})
             return None
         self.session = {'on': on}
+        self.session_file = {'path': result.get('path'), 'row': None, 'rows': [], 'file_rec_ms': 0}
         self._session_log({'event': 'start', 'wall': result.get('started_wall') or time.time(), 'rec_ms': None,
-                           'active': True, 'already_active': result.get('already_active')})
+                           'active': True, 'already_active': result.get('already_active'),
+                           **({'path': result['path']} if result.get('path') else {})})
         return result
 
     def session_mark(self, event, row_id, label=None, force=False):
@@ -2113,14 +2126,97 @@ class Runner:
         params = {'label': label or f'{row_id}:{event}'}
         if cfg.get('chapters') and event == 'row-start':
             params['chapter'] = True
+        # per_row_files: a row starts in a file of its own. The row-start mark is the split (SplitRecordFile, then
+        # the client waits for RecordFileChanged: the file begins at OBS's next keyframe, and the row's input waits
+        # for it). The file that began at row N's split is row N's clip; it closes at the next split or the stop.
+        split = event == 'row-start' and bool(cfg.get('per_row_files'))
+        if split:
+            params['cap_s'] = cfg.get('split_cap_s', 10)
+        method = 'recording.session_split' if split else 'recording.session_mark'
         try:
-            result = self.call(self.session['on'], 'recording.session_mark', params) or {}
+            result = self.call(self.session['on'], method, params) or {}
         except Exception as error:  # noqa: BLE001 - a lost mark is logged; the row's own result stands
             result = {'error': repr(error)[:200], 'active': None}
         record = {'event': event, 'row': row_id, 'label': params['label'], 'wall': result.get('wall') or time.time(),
                   'rec_ms': result.get('rec_ms'), 'active': result.get('active')}
         if result.get('error'):
             record['error'] = result['error']
+        if split:
+            ok = bool(result.get('split_ok'))
+            record['split'] = {'ok': ok, 'file': result.get('new_path'), 'file_rec_ms': result.get('file_rec_ms'),
+                               'requested_rec_ms': result.get('rec_ms'), 'late_paths': result.get('late_paths') or []}
+            if ok and isinstance(result.get('file_rec_ms'), (int, float)):
+                record['rec_ms'] = result['file_rec_ms']  # the row (and its file) begins at the split's keyframe
+            if not ok:  # loud: no clip for this row, and never a Start/Stop instead (that race was F04)
+                record['split']['error'] = result.get('error') or 'split_failed'
+                self.log({'session_split': 'failed', 'row': row_id, 'error': record['split']['error']})
+                print(json.dumps({'session_split': 'FAILED', 'row': row_id, 'error': record['split']['error'],
+                                  'clip': None}), flush=True)
+        self._session_log(record)
+        if split:
+            self._split_files(row_id, result)
+        return record
+
+    def _split_files(self, row_id, result):
+        """Row -> file bookkeeping after a row-start split (see session_mark)."""
+        late = [p for p in (result.get('late_paths') or []) if p]
+        if late:  # OBS changed files without our split (one acknowledged after its cap): those files have no row
+            self._close_session_file(note='ended by a late split')
+            for path in late[:-1]:
+                self._clip_record({'path': path, 'row': None, 'rows': [], 'file_rec_ms': None}, path, None,
+                                  note='late split file')
+            self.session_file = {'path': late[-1], 'row': None, 'rows': [], 'file_rec_ms': None}
+        if result.get('split_ok'):
+            closed = {c.get('path'): c.get('finalized') for c in result.get('closed') or [] if isinstance(c, dict)}
+            current = self.session_file or {}
+            self._close_session_file(finalized=closed.get(current.get('path')),
+                                     path=current.get('path') or result.get('prev_path'))
+            self.session_file = {'path': result.get('new_path'), 'row': row_id, 'rows': [row_id],
+                                 'file_rec_ms': result.get('file_rec_ms')}
+        elif self.session_file is not None and row_id is not None:
+            self.session_file['rows'].append(row_id)  # this row gets no clip; the open file also holds it
+
+    def _close_session_file(self, finalized=None, path=None, note=None):
+        f, self.session_file = self.session_file, None
+        path = path or (f or {}).get('path')
+        if f is None or not path:
+            return None
+        return self._clip_record(f, path, finalized, note)
+
+    def _clip_record(self, f, path, finalized, note=None):
+        """A closed file: hard-link it to <out>/<row>/clip.<ext> (a copy across file systems), put "clip" in the row's
+        receipt and a "clip" event in recording.jsonl. The original is never moved or deleted."""
+        row, clip, error = f.get('row'), None, None
+        if row is not None:
+            src = Path(path)
+            target_dir = self.out / row
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ext = src.suffix or '.mp4'
+            target, n = target_dir / f'clip{ext}', 2
+            while target.exists() or target.is_symlink():
+                target, n = target_dir / f'clip-{n}{ext}', n + 1
+            try:
+                try:
+                    os.link(src, target)
+                except OSError:
+                    shutil.copy2(src, target)
+                clip = str(target)
+            except OSError as e:
+                error = repr(e)[:200]
+            receipt_path = self.out / f'{row}.json'
+            if clip and receipt_path.is_file():
+                receipt = json.loads(receipt_path.read_text())
+                receipt.update(clip=clip, clip_source=str(path), clip_rec_ms_base=f.get('file_rec_ms'),
+                               clip_finalized=finalized)
+                if len(f.get('rows') or []) > 1:
+                    receipt['clip_spans_rows'] = f['rows']
+                receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+        record = {'event': 'clip', 'row': row, 'path': str(path), 'clip': clip, 'file_rec_ms': f.get('file_rec_ms'),
+                  'rows': f.get('rows') or [], 'finalized': finalized, 'rec_ms': None}
+        if note:
+            record['note'] = note
+        if error:
+            record['error'] = error
         self._session_log(record)
         return record
 
@@ -2134,6 +2230,17 @@ class Runner:
         self._session_log({'event': 'stop', 'wall': result.get('stopped_wall') or time.time(), 'rec_ms': None,
                            'active': False, 'path': result.get('path'), **({'error': result['error']}
                                                                             if result.get('error') else {})})
+        if (self.session_config() or {}).get('per_row_files') and self.session_file is not None:
+            late = [p for p in (result.get('late_paths') or []) if p]
+            if late:
+                self._split_files(None, {'late_paths': late})
+            open_file = self.session_file
+            stop_path = result.get('path')
+            if open_file.get('path') and stop_path and stop_path != open_file['path']:
+                self.log({'session_split': 'stop path differs', 'open': open_file['path'], 'stop': stop_path})
+            # the last row's file is closed by the stop (a failed or interrupted last row too)
+            self._close_session_file(finalized=result.get('finalized'), path=open_file.get('path') or stop_path)
+        self.session_file = None
         self.session = None
         return result
 

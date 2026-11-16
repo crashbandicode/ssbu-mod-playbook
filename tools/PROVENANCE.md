@@ -121,3 +121,12 @@ Written here 2026-11-16 (harness-lib), not copies:
 den-runner/library/routes/refs/main-recorder.png (2026-11-16): the sidebar icons, ROI [1150,160,1230,640], cut from a main-menu recorder frame of harness-lib-ally-1 (reviewed); 1f11f1a2355a14dc.
 
 den-runner/cut_session.py and 	est_cut_session.py (2026-11-16): copied from ssbu-switch-remote ebde113 	ools/host/cut_session.py and 	ools/host/tests/test_cut_session.py; the test's import path now points beside the module. They cut the gif-start/gif-end clips, per-row clips and shot stills out of the one session recording (GStreamer imported lazily). Live proof: live-rec-1 (client 91512f5, playbook 16cc318; artifacts/harness-lib/live-rec-1). 31/31 tests.
+
+2026-11-16 (harness-lib-sol): per-row OBS files imported from switch-remote-2 patch `ebf4d8e2b6d7e25dcad837422b78482763569997`
+(base `d77d0b2`): `eden-runner/{runner.py,switch_hw.py,cut_session.py,test_routes.py,test_cut_session.py}` and ROUTES.
+The row-start split waits for `RecordFileChanged`; the next split/stop links the closed file into its row and receipt.
+Source packet: `smash-training-lobby/artifacts/switch-hw-session-1/playbook-patch/`; live proof supplied by that lane:
+`artifacts/switch-hw-clip-proof-1` (three rows, three files). This review made no live OBS or console calls.
+Review correction: the still cutter closes the prior decoder before opening the next, reusing one within each file.
+`StillResources.test_per_row_stills_keep_only_one_decoder_open` failed with three open decoders on the imported patch
+and passes with a peak of one. Validation: test_routes 44/44, test_runner 44/44, test_cut_session 34/34 (with GStreamer).
