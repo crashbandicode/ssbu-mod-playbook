@@ -155,8 +155,10 @@ class RunnerEffects(unittest.TestCase):
         r = make_plan(folder, [row('p', 'say PASS', 'before', 'after'), row('f', 'say FAIL', 'before', 'after'),
                                row('u', 'say UNSURE', 'before', 'after'),
                                row('e', 'say FAIL', 'before', 'after', effect=True),
-                               row('n', 'say PASS', 'same-before', 'same-after')],
+                               row('n', 'say PASS', 'same-before', 'same-after'), row('k', 'say FAIL', 'before', 'after')],
                       require_effect=True, judge={'cmd': 'judge.py', 'wait_s': 60},
+                      known_issues={'a': {'title': 'P1 swap', 'reason': 'portrait', 'rows': ['k']}},
+                      evidence_index={'P1-SWAP-EVIDENCE.md': {'title': 'P1', 'rows': ['p', 'k']}},
                       session_recording={'marks': ['row-start', 'row-end', 'shot'], 'per_row_files': True})
         r.run()
         status = {rid: receipt(folder, rid)['status'] for rid in 'pfuen'}
@@ -170,8 +172,9 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual(receipt(folder, 'n')['clip_check']['reason'], 'no-visible-effect')
         job = json.loads((folder / 'out' / 'judge' / 'jobs' / 'p.json').read_text())
         self.assertEqual([s['phase'] for s in job['shots']], ['before', 'after'])
-        self.assertEqual(job['shots'][0]['label'], 'before:p-before')  # judge.py: shots [{label, path}]
-        self.assertIsInstance(job['frames'], list)
+        self.assertEqual(job['shots'][0]['label'], 'before:before')  # judge.py: shots [{label, path}]
+        self.assertEqual(job['frames'], [])  # clip frames go in as shots labelled "clip start/mid/end"
+        self.assertIn('frame_error', job)    # (the fake clip has no video: none here)
         real = Path('/home/intpa/smash-training-lobby/artifacts/switch-hw-runbook/judge/judge.py')
         if real.is_file():  # the calibrated judge accepts the job as written
             import importlib.util
@@ -181,8 +184,33 @@ class RunnerEffects(unittest.TestCase):
             self.assertEqual(mod.load_job(folder / 'out' / 'judge' / 'jobs' / 'p.json')['row'], 'p')
         self.assertTrue(job['clip'].endswith('clip.mp4'))  # queued once the row's own clip file was closed
         rerun = json.loads((folder / 'out' / 'rerun.json').read_text())
-        self.assertEqual(rerun['rows'], ['f', 'u', 'e', 'n'])
+        self.assertEqual(rerun['rows'], ['f', 'u', 'e', 'n'])  # k: a known product issue, not rerun
+        k = receipt(folder, 'k')
+        self.assertEqual((k['status'], k['known_issue']['ids']), ('KNOWN-PRODUCT-ISSUE', ['a']))
+        self.assertIn('| k | a |', (folder / 'out' / 'FAILING.md').read_text())
+        evidence = (folder / 'out' / 'P1-SWAP-EVIDENCE.md').read_text()
+        self.assertEqual([l.split(' | ')[0] for l in evidence.splitlines() if l.startswith('| p') or l.startswith('| k')],
+                         ['| p', '| k'])
         self.assertIn('--rows f,u,e,n', rerun['command'])
+
+    def test_judge_fails_landing_late_stop_the_run_a_row_or_two_late(self):
+        folder = Path(tempfile.mkdtemp())
+
+        def row(rid, word):
+            return {'id': rid, 'expected': f'say {word}', 'steps': [{'shot': f'{rid}-before'}, {'wait_ms': 2000},
+                                                                     {'shot': f'{rid}-after'}],
+                    'shots': [{'name': f'{rid}-before', 'phase': 'before'}, {'name': f'{rid}-after', 'phase': 'after'}]}
+        r = make_plan(folder, [row('j1', 'FAIL'), row('j2', 'FAIL'), row('j3', 'FAIL'), row('k1', 'PASS'),
+                               row('k2', 'PASS'), row('k3', 'PASS'), row('k4', 'PASS')],
+                      require_effect=True, judge={'cmd': 'judge.py', 'wait_s': 60}, stop_after_consecutive_failures=3,
+                      session_recording={'marks': ['row-start', 'row-end', 'shot'], 'per_row_files': True})
+        with self.assertRaises(harness.EarlyStop) as stop:
+            r.run()
+        self.assertIn('j1, j2, j3', str(stop.exception))
+        self.assertEqual([receipt(folder, i)['status'] for i in ('j1', 'j2', 'j3')], ['FAILED'] * 3)
+        ran = [i for i in ('k1', 'k2', 'k3', 'k4') if (folder / 'out' / f'{i}.json').exists()]
+        self.assertTrue(1 <= len(ran) <= 2, ran)  # the deterministic gates passed; the verdicts stopped it late
+        self.assertFalse((folder / 'out' / 'k4.json').exists())
 
     def test_three_consecutive_failures_stop_the_run_not_fewer(self):
         folder = Path(tempfile.mkdtemp())

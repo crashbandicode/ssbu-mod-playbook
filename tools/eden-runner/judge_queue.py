@@ -18,6 +18,7 @@ RAN-UNVERIFIED rows carry "review": true and a reason; FAILING.md lists them wit
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -133,9 +134,23 @@ def merge_receipt(receipt_path, update):
     return receipt
 
 
-def apply_verdict(receipt, check, verdict, frames):
+def known_issue(known, verdict):
+    """{ids, titles, judge_reason} when a judge FAIL of this row belongs to a known product issue (plan known_issues,
+    already narrowed to the row's families): the issues whose reason regex matches the judge reason, else all."""
+    if not known or (verdict or {}).get('verdict') != 'FAIL':
+        return None
+    reason = verdict.get('reason') or ''
+    ids = [k for k, v in known.items() if v.get('reason') and re.search(v['reason'], reason, re.I)] or sorted(known)
+    return {'ids': ids, 'titles': [known[k]['title'] for k in ids], 'judge_reason': reason}
+
+
+def apply_verdict(receipt, check, verdict, frames, known=None):
     status, reason, review = final_status(receipt.get('gates_status', receipt.get('status')),
                                           receipt.get('effects_passed') or [], check, verdict)
+    issue = known_issue(known, verdict) if status == 'FAILED' and (check or {}).get('ok', True) else None
+    if issue:  # not chased, not counted by the consecutive-failure stop; listed apart in FAILING.md
+        status, reason, review = 'KNOWN-PRODUCT-ISSUE', f'known issue {",".join(issue["ids"])}: {issue["judge_reason"]}', False
+        receipt['known_issue'] = issue
     receipt['judge'] = {'state': 'done', **(verdict or {}), 'frames': frames, 'landed': time.time()}
     receipt['clip_check'] = check
     receipt['status'] = status
@@ -182,10 +197,18 @@ def work(job_path):
         except Exception as error:  # noqa: BLE001 - an unreadable clip is recorded, the judge still gets the shots
             frame_error = repr(error)[:300]
     # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
+    # the evidence shots first, then the clip frames as shots labelled "clip start/mid/end" (an overlay left on screen
+    # at the clip's end, e.g. a Break the Targets HUD, is a FAIL: session-1 LEG-04)
     job['frames_by_name'] = frames
-    job['frames'] = [frames[k] for k in FRAME_NAMES if frames.get(k)]
-    job['shots'] = [{**s, 'label': f'{s.get("phase", "step")}:{s["name"]}'} for s in job.get('shots') or []]
-    job['judge_shots'] = [s for s in job['shots'] if s.get('path')]
+    job['frames'] = []
+    # evidence-only labels: the row's own still labels (row id prefix dropped); a label that would give the verdict
+    # away (FAIL/PASS) is neutral (judge/make_jobs.py rule)
+    def label(s, i):
+        name = s['name'][len(job['row']) + 1:] if s['name'].startswith(job['row'] + '-') else s['name']
+        return f'shot-{i}' if re.search(r'FAIL|PASS', name) else f'{s.get("phase", "step")}:{name}'
+    job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(job.get('shots') or [], 1)]
+    job['judge_shots'] = [s for s in job['shots'] if s.get('path')] + \
+        [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip'} for k in FRAME_NAMES if frames.get(k)]
     if frame_error:
         job['frame_error'] = frame_error
     job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
@@ -197,13 +220,13 @@ def work(job_path):
         check = {'ok': True, 'error': repr(error)[:300]}
         verdict = {'verdict': 'UNSURE', 'reason': f'judge worker error: {error!r}'[:300], 'shots_cited': [],
                    'model': None}
-    merge_receipt(job['receipt'], lambda r: apply_verdict(r, check, verdict, frames))
+    merge_receipt(job['receipt'], lambda r: apply_verdict(r, check, verdict, frames, job.get('known_issues')))
     (folder / 'done.json').write_text(json.dumps({'verdict': verdict, 'clip_check': check}, indent=2) + '\n')
     return verdict
 
 
 # ---- the runner side -----------------------------------------------------------------------------------------------
-def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip):
+def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip, known=None):
     """The job file of one row: what the judge sees (expected line, labelled full-size shots, clip frames to come)."""
     receipt = json.loads(Path(receipt_path).read_text())
     folder = Path(out) / 'judge' / row['id']
@@ -221,7 +244,8 @@ def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip):
            'notes': row.get('name'), 'judge_args': judge_cfg.get('args') or [],
            'plan_dir': str(plan_dir), 'judge_cmd': judge_cfg.get('cmd'), 'timeout_s': judge_cfg.get('timeout_s',
                                                                                                     JUDGE_TIMEOUT_S),
-           'effects_passed': receipt.get('effects_passed') or [], 'queued': time.time()}
+           'effects_passed': receipt.get('effects_passed') or [], 'queued': time.time(),
+           'known_issues': {k: v for k, v in (known or {}).items() if row['id'] in v.get('rows', [])}}
     path = Path(out) / 'judge' / 'jobs' / f'{row["id"]}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(job, indent=2) + '\n')
@@ -243,7 +267,7 @@ def failing_report(out, plan, manifest_path):
     lines = ['# FAILING: rows to look at after the run', '',
              f'Plan `{manifest_path}`; receipts in `{out}`. FAILED and RAN-UNVERIFIED rows (judge pending = no verdict '
              'landed before the report).', '', '| Row | Status | Reason | Stills |', '|---|---|---|---|']
-    failing, pending = [], []
+    failing, pending, known = [], [], []
     for row in plan.get('rows', []):
         path = out / f'{row["id"]}.json'
         if not path.is_file():
@@ -252,6 +276,11 @@ def failing_report(out, plan, manifest_path):
         status = receipt.get('status')
         if (receipt.get('judge') or {}).get('state') == 'pending':
             pending.append(row['id'])
+        if status == 'KNOWN-PRODUCT-ISSUE':
+            issue = receipt.get('known_issue') or {}
+            known.append(f'| {row["id"]} | {",".join(issue.get("ids", []))} | '
+                         f'{(issue.get("judge_reason") or "")[:300].replace("|", "/")} | `{receipt.get("clip", "")}` |')
+            continue
         if status not in ('FAILED', 'RAN-UNVERIFIED'):
             continue
         failing.append(row['id'])
@@ -268,6 +297,9 @@ def failing_report(out, plan, manifest_path):
                f'--out {out} --rows {",".join(failing)}')
     lines += ['', f'{len(failing)} rows. Judge pending: {pending or "none"}.', '', 'Rerun just these rows:', '',
               f'    {command}', '']
+    if known:
+        lines += ['## KNOWN-PRODUCT-ISSUE (not chased, not rerun; the fix lane has the clips)', '',
+                  '| Row | Issue | Judge reason | Clip |', '|---|---|---|---|', *known, '']
     (out / 'FAILING.md').write_text('\n'.join(lines))
     (out / 'rerun.json').write_text(json.dumps({'rows': failing, 'judge_pending': pending, 'command': command},
                                                indent=2) + '\n')

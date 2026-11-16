@@ -1084,6 +1084,7 @@ class Runner:
         self.effects_passed = []  # effect gates ("effect": true on the gate or its step) that passed in this row
         self.consecutive_failures = 0
         self.judge_workers = []   # (row id, Popen) of the background judge jobs (judge_queue.py)
+        self.executed_rows = []   # this run's rows, in the order they ran (the verdict stop rule's order)
 
     # --- effect gates, the judge and the stop rule (operator rule, 2026-11-16) ---------------------------------------
     def judge_config(self):
@@ -1120,7 +1121,8 @@ class Runner:
             return None
         row = next((r for r in self.plan['rows'] if r['id'] == row_id), {'id': row_id})
         try:
-            job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip)
+            job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip,
+                                        self.plan.get('known_issues'))
             proc = judge_queue.start_worker(job, self.out / 'judge' / 'workers.log')
         except Exception as error:  # noqa: BLE001 - a job that can't start leaves the row RAN-UNVERIFIED
             judge_queue.merge_receipt(receipt_path, lambda r: r.update(
@@ -1132,6 +1134,58 @@ class Runner:
         judge_queue.merge_receipt(receipt_path, lambda r: r['judge'].update(state='pending', job=str(job)))
         self.log({'judge': row_id, 'queued': str(job), 'clip': clip})
         return job
+
+    def verdict_stop(self):
+        """The stop rule over landed verdicts: N FAILED rows in a row, in this run's row order (a judge FAIL turns a
+        receipt FAILED after the row ended). A row whose verdict is still pending ends the scan (undecided), so the
+        stop may come a row or two late. Returns the early-stop record, or None."""
+        n = self.plan.get('stop_after_consecutive_failures')
+        if not n or not self.judge_config():
+            return None
+        streak = []
+        for row_id in self.executed_rows:
+            path = self.out / f'{row_id}.json'
+            try:
+                receipt = json.loads(path.read_text())
+            except (OSError, ValueError):
+                break
+            if receipt.get('status') == 'FAILED':
+                if self.known_issue_row(row_id):
+                    continue
+                streak.append(row_id)
+                if len(streak) >= int(n):
+                    early = {'result': f'{len(streak)} consecutive failed rows by verdict: {", ".join(streak)}',
+                             'cause': 'consecutive-failures', 'kind': 'verdicts', 'count': len(streak),
+                             'rows': list(streak), 'rule': 'stop_after_consecutive_failures'}
+                    self.early_stop = early
+                    return early
+            elif (receipt.get('judge') or {}).get('state') == 'pending':
+                break
+            elif receipt.get('status') == 'KNOWN-PRODUCT-ISSUE':
+                continue  # an operator-known product issue neither counts nor breaks a streak
+            else:
+                streak = []
+        return None
+
+    def known_issue_row(self, row_id):
+        return any(row_id in (issue or {}).get('rows', []) for issue in (self.plan.get('known_issues') or {}).values())
+
+    def index_evidence(self, row_id, clip):
+        """plan evidence_index {file: {title, rows}}: one line per landed clip of a listed row (P1-SWAP-EVIDENCE.md)."""
+        for name, spec in (self.plan.get('evidence_index') or {}).items():
+            if row_id not in (spec or {}).get('rows', []):
+                continue
+            path = self.out / name
+            if not path.is_file():
+                path.write_text(f'# {spec.get("title", name)}\n\nRun `{self.out}`, plan `{self.manifest_path}`. One '
+                                'line per row as its clip closes (status at that moment; the judge verdict lands '
+                                'later in the receipt).\n\n| Row | Status | Clip | Receipt |\n|---|---|---|---|\n')
+            try:
+                status = json.loads((self.out / f'{row_id}.json').read_text()).get('status')
+            except (OSError, ValueError):
+                status = None
+            with path.open('a') as f:
+                f.write(f'| {row_id} | {status} | `{clip}` | `{self.out / (row_id + ".json")}` |\n')
 
     def finish_judging(self):
         """After the last row (the console is idle): wait for the outstanding verdicts (plan judge.wait_s, default
@@ -2119,6 +2173,9 @@ class Runner:
         if consecutive:
             # The operator's stop rule (2026-11-16): a failed row is recorded, recovered (clean state) and the run goes
             # on; it stops only after N failed rows in a row. Replaces the "probable shared cause" count.
+            if self.known_issue_row(row.get('id')):
+                # a row of a known product issue's family: recorded FAILED, not counted toward the stop
+                return kind, cause, None
             if row.get('id') != getattr(self, '_last_failed_row', None):
                 self.consecutive_failures += 1
                 self._last_failed_row = row.get('id')
@@ -2364,6 +2421,8 @@ class Runner:
         self._session_log(record)
         for judged in dict.fromkeys([row, *(f.get('rows') or [])]):  # the clip is closed: its rows' judge jobs
             if judged is not None:
+                if clip:
+                    self.index_evidence(judged, clip)
                 self.queue_judge(judged, clip)
         return record
 
@@ -2436,6 +2495,11 @@ class Runner:
                 if early:
                     raise harness.EarlyStop(early['result'])
                 raise mismatch
+            late = self.verdict_stop()  # judge FAILs land a row or two late: the stop rule counts them in row order
+            if late:
+                self.stop_input(row, late['result'])
+                raise harness.EarlyStop(late['result'])
+            self.executed_rows.append(row['id'])
             self.row_dir = self.out / row['id']
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()

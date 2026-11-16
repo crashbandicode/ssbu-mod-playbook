@@ -408,7 +408,32 @@ class SwitchHwTests(unittest.TestCase):
             return Sock(chunks.pop(0))
         path = Path(tempfile.mkdtemp()) / 'skyline.log'
         switch_hw.capture_log(path, 'h', 1, stop=lambda: len(calls) >= 3, connect=connect, retry_s=0)
-        self.assertEqual(path.read_text(), 'a\nbc\nd\n')
+        lines = path.read_text().splitlines()
+        self.assertEqual([l for l in lines if not l.startswith('[capture]')], ['a', 'bc', 'd'])
+        self.assertEqual(sum(l.startswith(switch_hw.CONNECTED + ' h:1 ') for l in lines), 2)  # up's live line
+
+    def test_capture_drops_a_silent_connection_and_reconnects(self):
+        import switch_hw
+        calls, now = [], [0.0]
+
+        class Silent:
+            def settimeout(self, t):
+                pass
+
+            def recv(self, n):
+                now[0] += 50.0
+                raise switch_hw.socket.timeout()
+
+            def close(self):
+                pass
+
+        def connect(addr, timeout):
+            calls.append(addr)
+            return Silent()
+        path = Path(tempfile.mkdtemp()) / 'skyline.log'
+        switch_hw.capture_log(path, 'h', 1, stop=lambda: len(calls) >= 3, connect=connect, retry_s=0, idle_s=120,
+                              clock=lambda: now[0])
+        self.assertEqual(path.read_text().count('idle 120 s: reconnecting'), 2)  # half-open: not forever
 
     def test_up_refuses_when_obs_cannot_split_per_row(self):
         import contextlib
@@ -433,7 +458,14 @@ class SwitchHwTests(unittest.TestCase):
         switch_hw.CLAIM = folder / 'claim'
         switch_hw.holders = lambda device: []
         switch_hw._client = lambda device: Client()
-        switch_hw.subprocess.Popen = lambda *a, **k: type('P', (), {'pid': 4242})()
+        live = [True]
+
+        def popen(args, **k):  # the capture: its connected line arrives (or, with live off, nothing does)
+            if live[0]:
+                with open(args[4], 'a') as log:
+                    log.write('[capture] connected h:1 now\n')
+            return type('P', (), {'pid': 4242, 'terminate': lambda self: None})()
+        switch_hw.subprocess.Popen = popen
         try:
             with self.assertRaises(SystemExit) as cm:
                 switch_hw.up(folder / 'run', '/dev/null', 'h:1', 'test')
@@ -448,7 +480,15 @@ class SwitchHwTests(unittest.TestCase):
             split['ok'], split['why'] = True, None
             with contextlib.redirect_stdout(io.StringIO()):
                 switch_hw.up(folder / 'run3', '/dev/null', 'h:1', 'test')
-            self.assertTrue(json.loads((folder / 'run3' / 'journal.json').read_text())['obs_split']['ok'])
+            journal = json.loads((folder / 'run3' / 'journal.json').read_text())
+            self.assertTrue(journal['obs_split']['ok'])
+            self.assertEqual(journal['log_live'], '[capture] connected h:1 now')
+            (folder / 'claim').unlink()
+            live[0] = False  # no Skyline line within the cap: refused, claim released
+            with self.assertRaises(SystemExit) as cm:
+                switch_hw.up(folder / 'run4', '/dev/null', 'h:1', 'test', log_cap_s=0.5)
+            self.assertIn('no Skyline log line', str(cm.exception))
+            self.assertFalse((folder / 'claim').exists())
         finally:
             switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen = saved
 

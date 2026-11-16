@@ -107,8 +107,28 @@ class LineWriter:
         self.handle.flush()
 
 
-def capture_log(path, host, port, stop=None, connect=socket.create_connection, retry_s=0.5):
-    """Read Skyline's TCP log forever (reconnecting) and append complete lines to path. Read-only."""
+CONNECTED = '[capture] connected'
+IDLE_S = 120.0
+
+
+def _keepalive(sock):
+    """TCP keepalive (idle 10 s, 5 s apart, 3 probes): a peer that vanished without a FIN (console asleep, Wi-Fi drop)
+    errors the recv instead of leaving a half-open socket that times out forever. switch-hw-session-1's capture
+    stopped writing at 15:25:58Z while its process lived on: the loop below only reconnected on EOF or an error."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (('TCP_KEEPIDLE', 10), ('TCP_KEEPINTVL', 5), ('TCP_KEEPCNT', 3)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except (OSError, AttributeError):
+        pass
+
+
+def capture_log(path, host, port, stop=None, connect=socket.create_connection, retry_s=0.5, idle_s=IDLE_S,
+                clock=time.monotonic):
+    """Read Skyline's TCP log forever (reconnecting) and append complete lines to path. Read-only. Each connection
+    writes a `[capture] connected host:port <UTC>` line (up's liveness gate reads it); a connection with no data for
+    idle_s seconds is dropped and made again (a half-open socket never ends on its own)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('ab') as f:
@@ -119,15 +139,22 @@ def capture_log(path, host, port, stop=None, connect=socket.create_connection, r
             except OSError:
                 time.sleep(retry_s)
                 continue
+            _keepalive(sock)
             sock.settimeout(1.0)
+            writer.feed(f'{CONNECTED} {host}:{port} {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n'.encode())
+            last = clock()
             try:
                 while not (stop and stop()):
                     try:
                         data = sock.recv(65536)
                     except socket.timeout:
+                        if clock() - last > idle_s:
+                            writer.feed(f'[capture] idle {idle_s:.0f} s: reconnecting\n'.encode())
+                            break
                         continue
                     if not data:
                         break
+                    last = clock()
                     writer.feed(data)
             except OSError:
                 pass
@@ -374,7 +401,24 @@ def _client(device):
     return runner.default_client_factory()(f'usb://{device}')
 
 
-def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None):
+def wait_log_line(log, cap_s, start=None, poll=0.25, clock=time.monotonic):
+    """The first complete line written to `log` past byte `start` (default: its size now), or None within cap_s."""
+    log = Path(log)
+    if start is None:
+        start = log.stat().st_size if log.is_file() else 0
+    until = clock() + cap_s
+    while clock() < until:
+        if log.is_file() and log.stat().st_size > start:
+            with log.open('rb') as f:
+                f.seek(start)
+                line = f.readline()
+            if line.endswith(b'\n'):
+                return line.decode(errors='replace').rstrip()[:300]
+        time.sleep(poll)
+    return None
+
+
+def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None, log_cap_s=30.0):
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
     others = holders(device)
@@ -411,10 +455,17 @@ def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None):
         journal.update(version=version['result'], still=str(still))
         host, _, port = log_host.rpartition(':')
         log = run / 'skyline.log'
+        log_start = log.stat().st_size if log.is_file() else 0  # lines from this capture on count as live
         proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), 'capture-log', str(log),
                                  '--log-host', log_host], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=open(run / 'capture-log.err', 'ab'), start_new_session=True)
         journal.update(capture_pid=proc.pid, log=str(log), log_host=log_host)
+        live = wait_log_line(log, log_cap_s, start=log_start)
+        if live is None:
+            proc.terminate()
+            raise SystemExit(f'refused: no Skyline log line in {log} within {log_cap_s:.0f} s (log gates would be '
+                             f'blind); is the console on the network and the plugin logging to {log_host}?')
+        journal['log_live'] = live
         instances = {'sw': {'socket': f'usb://{device}', 'console_log': str(log), 'skyline_log': str(log),
                             'screenshot_target': 'switch', 'hardware': True}}
         if bridge_host:
