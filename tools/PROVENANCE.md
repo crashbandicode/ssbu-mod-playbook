@@ -119,3 +119,5 @@ Written here 2026-11-16 (harness-lib), not copies:
   booted again.
 
 den-runner/library/routes/refs/main-recorder.png (2026-11-16): the sidebar icons, ROI [1150,160,1230,640], cut from a main-menu recorder frame of harness-lib-ally-1 (reviewed); 1f11f1a2355a14dc.
+
+den-runner/cut_session.py and 	est_cut_session.py (2026-11-16): copied from ssbu-switch-remote ebde113 	ools/host/cut_session.py and 	ools/host/tests/test_cut_session.py; the test's import path now points beside the module. They cut the gif-start/gif-end clips, per-row clips and shot stills out of the one session recording (GStreamer imported lazily). Live proof: live-rec-1 (client 91512f5, playbook 16cc318; artifacts/harness-lib/live-rec-1). 31/31 tests.
