@@ -284,6 +284,17 @@ calls, no direct `input.button` or `input.stick` calls.
     stage-id assertion.
   - Expectations now persist in `out/routes-expect.json`.
 
+### Frame-repeat candidate: `tile-frame-surface-1` (2026-11-16)
+
+The aid at `8f830a2` (NRO `66f00442…`, [candidate pin](TILE-CURSOR.md#frame-repeat-candidate-2026-11-16)) counts 15
+elapsed screen updates between repeats. One detached Surface boot ran muted with the GDB stub on before load.
+Its SSS held 32-frame macro logged exactly 0→1→2→3, each settled; the shared 2-frame walk then settled at Battlefield 1.
+The CSS gate expired at 60 s on the native loading frame; `screen=css tiles=87` appeared later, after that failure.
+CSS proof is unrun, with no second boot launched. The run is 3 PASS/1 FAILED/1 unrun, not a whole-proof pass.
+Down 0 restored and separately verified 2016 entries, released the claim, and pruned the owned copies.
+Evidence: `smash-training-lobby/artifacts/harness-lib/tile-frame-surface-1/`; no console panic/abort/crash/Unmapped
+matches. The established pin remains the default pending CSS acceptance.
+
 ### Windows host type: `harness-lib-ally-1` (the Ally, 2026-11-16, Up 03:46Z, Down 04:02Z)
 
 - **Setup:** the same 11 rows and plugins as on the XPS, with the GDB stub on port 6693.

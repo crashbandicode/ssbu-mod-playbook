@@ -130,3 +130,12 @@ Source packet: `smash-training-lobby/artifacts/switch-hw-session-1/playbook-patc
 Review correction: the still cutter closes the prior decoder before opening the next, reusing one within each file.
 `StillResources.test_per_row_stills_keep_only_one_decoder_open` failed with three open decoders on the imported patch
 and passes with a peak of one. Validation: test_routes 44/44, test_runner 44/44, test_cut_session 34/34 (with GStreamer).
+
+2026-11-16 (harness-lib-sol), tile-cursor frame-repeat candidate: `ssbu-tile-cursor` source `8f830a2`, branch
+`frame-repeat` from `15d3f3153278e62510252ed7ce35581af6a5c73d`; compiled on XPS, never Surface. Host Rust 1.98.1
+(`48a229cea`), Skyline Rust 1.95.0-nightly (`a423f68a0`, 2026-02-13), Skyline 0.6.0. NRO SHA256
+`66f00442eb7a93de3196714aebba85807e106663e4e9d5dbb3894d7c5e071ecd`; new pin
+`/home/intpa/trainingrooms-eden-pkg6/nro/aid/frame-repeat-8f830a2/libssbu_tile_cursor.nro` (Surface/XPS/Yoga).
+13 host tests, zero-warning clippy, no-default build and release pass. Partial Surface proof `tile-frame-surface-1`:
+SSS repeat/walk pass; CSS transition exceeded 60 s, CSS walk unrun. Not accepted as default yet.
+Full provenance and source patch: `smash-training-lobby/artifacts/harness-lib/{tile-frame-PROVENANCE.json,tile-frame-source.patch}`.

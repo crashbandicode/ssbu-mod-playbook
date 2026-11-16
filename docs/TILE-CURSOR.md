@@ -18,6 +18,21 @@ without L3, so it doesn't change what you are testing.
   100 ms, so the host copy is current.
 - **Not on the Switch card.** It is an Eden tool.
 
+## Frame-repeat candidate (2026-11-16)
+
+Source `8f830a2` on `frame-repeat`, based directly on `15d3f31`, replaces the wall-clock repeat with one step on
+press and another every 15 elapsed CSS/SSS frame updates. Host speed cannot add repeats to a 2-frame hold.
+Build host: XPS; host Rust 1.98.1, Skyline Rust 1.95.0-nightly (`a423f68a0`, 2026-02-13).
+
+- New isolated pin on Surface/XPS/Yoga: `/home/intpa/trainingrooms-eden-pkg6/nro/aid/frame-repeat-8f830a2/libssbu_tile_cursor.nro`.
+- SHA256: `66f00442eb7a93de3196714aebba85807e106663e4e9d5dbb3894d7c5e071ecd`.
+- Host tests: 13 pass; all-target clippy with `-D warnings`, no-default-features build and Skyline release pass.
+- Surface `tile-frame-surface-1`: SSS held 32frames gave exactly `0→1→2→3`, then the shared 2-frame walk settled at
+  Battlefield 1. The existing 60 s CSS gate expired during native loading; CSS appeared later in events.log.
+  CSS walking/held-repeat remains **unverified**, so this candidate has not replaced the established default pin.
+- Evidence: `smash-training-lobby/artifacts/harness-lib/tile-frame-surface-1/`, full build provenance in
+  `tile-frame-PROVENANCE.json` beside it. Down restored/verified/released and pruned the owned profile.
+
 ## Stepping
 
 ```text
