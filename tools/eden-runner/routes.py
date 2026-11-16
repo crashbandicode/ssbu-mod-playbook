@@ -17,6 +17,9 @@ Blocks (docs/ROUTES.md has what each guarantees on exit):
   chord            play a same-frame chord macro (reset L+R+A, TR save/load, tile steps) by name
   fixture          read fighters, stage, damage and positions from game state, assert them, reset, settle
   back_to_main     Training -> main menu, proven by the main gate
+  pick_stage_hw    real Switch: stage select -> the named stage by a counted tile-* walk, a still for review, no A
+  pick_fighter_hw  real Switch: CSS -> P1's token on the named fighter the same way, a still for review, no A
+  confirm_pick     real Switch: A only on a pick whose still was reviewed and approved (out/routes-review.json)
 Online pair blocks are in routes_online.py.
 
 Library files: library/routes/index.json (macros with sha256 and provenance) and library/routes/tables.json
@@ -1400,6 +1403,141 @@ def switch_to_training(ctx):
     # The HUD comes up before the preloader starts (T-01, 15:03:27 HUD, 15:03:30 "Loading 3/7"): gate on its end.
     out['preload'] = preload_clear(ctx)
     return _save(ctx, 'routes-switch-training', out)
+
+
+# --- stage and fighter by name on a real Switch: the tile cursor without a live tile log -----------------------------
+# The tile cursor (ssbu-tile-cursor, frame-repeat build 8f830a2) runs on the card too, but its events.log sits on the
+# SD card and can't be read while SSBU runs, so TileWalker (which waits on its step/settled lines) can't run here.
+# These blocks walk a fixed plan of single tile-* steps instead: steps don't wrap, so enough Up and Left steps always
+# reach tile 0, and Down/Right then count rows and columns. The row width is not in tables.json; it is pinned from
+# the console's own character select (switch-hw-feature-ledger nav/css2-css.png, 2026-11-16 19:13Z: 13 tiles a row in
+# rows 0-5, Mario..Jigglypuff first; the last row, Sephiroth..Random, is shorter and offset, so it is refused).
+# Nothing is placed without an image check: the walk ends on a still and writes out/routes-review.json with
+# approved=false. The reviewer looks at the still and sets approved=true; only then does confirm_pick press A.
+
+SSS_HW_COLUMNS = 11   # Training's stage select (TILE-CURSOR "On the stage select")
+TILE_GAP_S = 0.6      # the hand eases over about 8 frames (TILE-CURSOR "Stepping"); no line marks the end here
+# The console save's own CSS grid, read off nav/css2-css.png (2026-11-16 19:13Z). It differs from tables.json
+# (TrainingRooms' roster_grid, which has Piranha Plant and Mii Swordfighter tiles this save doesn't show), so the
+# table's tile numbers are wrong here from Joker on; a pick goes by name through this grid. The short last row is
+# drawn from the fourth column and is not mapped (its Down/Up neighbours aren't known without the tile log).
+CSS_HW_ROWS = (
+    ('Mario', 'Donkey Kong', 'Link', 'Samus', 'Dark Samus', 'Yoshi', 'Kirby', 'Fox', 'Pikachu', 'Luigi', 'Ness',
+     'Captain Falcon', 'Jigglypuff'),
+    ('Peach', 'Daisy', 'Bowser', 'Ice Climbers', 'Sheik', 'Zelda', 'Dr. Mario', 'Pichu', 'Falco', 'Marth', 'Lucina',
+     'Young Link', 'Ganondorf'),
+    ('Mewtwo', 'Roy', 'Chrom', 'Mr. Game & Watch', 'Meta Knight', 'Pit', 'Dark Pit', 'Zero Suit Samus', 'Wario',
+     'Snake', 'Ike', 'Pokemon Trainer', 'Diddy Kong'),
+    ('Lucas', 'Sonic', 'King Dedede', 'Olimar', 'Lucario', 'R.O.B.', 'Toon Link', 'Wolf', 'Villager', 'Mega Man',
+     'Wii Fit Trainer', 'Rosalina & Luma', 'Little Mac'),
+    ('Greninja', 'Palutena', 'PAC-MAN', 'Robin', 'Shulk', 'Bowser Jr.', 'Duck Hunt', 'Ryu', 'Ken', 'Cloud', 'Corrin',
+     'Bayonetta', 'Inkling'),
+    ('Ridley', 'Simon', 'Richter', 'King K. Rool', 'Isabelle', 'Incineroar', 'Joker', 'Hero', 'Banjo & Kazooie',
+     'Terry', 'Byleth', 'Min Min', 'Steve'),
+)
+
+
+def css_hw_cell(name):
+    """(row, column) of a fighter on this console's CSS grid, by name."""
+    for r, row in enumerate(CSS_HW_ROWS):
+        for c, cell in enumerate(row):
+            if _norm(cell) == _norm(name):
+                return r, c
+    raise KeyError(f'{name!r} is not in the console grid rows 0-5 (CSS_HW_ROWS); the short last row is not mapped')
+
+
+def hw_walk_plan(screen, target):
+    """[(direction, count), ...] of tile-* steps from where the walk starts to `target`.
+
+    sss: `target` is the tile; the select opens with tile 0 hovered (checked by the stage gate first), so only Down
+    then Right. css: `target` is the fighter's name. The hand holds P1's token below the grid; the first Up puts it
+    on some tile, six more Ups and twelve Lefts reach the top-left tile from anywhere, then Down and Right count the
+    row and column.
+    """
+    if screen == 'sss':
+        row, col = divmod(int(target), SSS_HW_COLUMNS)
+        plan = []
+    elif screen == 'css':
+        row, col = css_hw_cell(target)
+        plan = [('up', len(CSS_HW_ROWS) + 1), ('left', len(CSS_HW_ROWS[0]) - 1)]
+    else:
+        raise ValueError(f'unknown screen {screen!r}')
+    plan += [('down', row), ('right', col)]
+    return [(d, n) for d, n in plan if n]
+
+
+def _walk_hw(ctx, plan, gap=TILE_GAP_S):
+    steps = 0
+    for direction, count in plan:
+        for _ in range(count):
+            ctx.check_stop()
+            play(ctx, f'tile-{direction}')
+            time.sleep(gap)
+            steps += 1
+    return steps
+
+
+def _review_file(ctx):
+    out = getattr(ctx.runner, 'out', None)
+    if not out:
+        raise RuntimeError('the hardware pick blocks need the runner out folder for routes-review.json')
+    return Path(out) / 'routes-review.json'
+
+
+def _ask_review(ctx, kind, expect, still, extra):
+    record = {'kind': kind, 'expect': expect, 'still': still, 'approved': False,
+              'asked': time.strftime('%H:%M:%SZ', time.gmtime()), **extra}
+    _review_file(ctx).write_text(json.dumps(record) + '\n')
+    return record
+
+
+def pick_stage_hw(ctx, stage, allow_derived=False):
+    """Real Switch: Training's stage select -> the named stage hovered, ending on a still for review (no A)."""
+    _need_switch(ctx, 'pick_stage_hw')
+    entry = stage_entry(stage)
+    if not entry.get('proven') and not allow_derived:
+        raise RuntimeError(f'stage {entry["name"]} tile {entry["tile"]} is derived, not proven; pass allow_derived')
+    gate(ctx, 'sss')  # hw-sss: the Training name panel, so tile 0 is hovered
+    plan = hw_walk_plan('sss', entry['tile'])
+    steps = _walk_hw(ctx, plan)
+    still = str(ctx.shot(f'routes-sss-hw-{_norm(entry["name"])}'))
+    return _ask_review(ctx, 'stage', entry['name'], still, {'tile': entry['tile'], 'plan': plan, 'steps': steps})
+
+
+def pick_fighter_hw(ctx, p1):
+    """Real Switch: the character select -> P1's token on `p1`, ending on a still for review (no A). The CPU is set
+    by the lane's own fixture (TR's CPU Character), never the coin (ROUTES "The CPU's coin: not proven")."""
+    _need_switch(ctx, 'pick_fighter_hw')
+    row, col = css_hw_cell(p1)
+    name = CSS_HW_ROWS[row][col]
+    gate(ctx, 'css')
+    plan = hw_walk_plan('css', name)
+    steps = _walk_hw(ctx, plan)
+    still = str(ctx.shot(f'routes-css-hw-{_norm(name)}'))
+    return _ask_review(ctx, 'fighter', name, still, {'cell': [row, col], 'plan': plan, 'steps': steps})
+
+
+def confirm_pick(ctx, expect, transition_cap=60):
+    """A on the reviewed pick: refuses unless routes-review.json names `expect` and approved is true. A stage pick
+    then waits for the character select, a fighter pick for the READY banner."""
+    _need_switch(ctx, 'confirm_pick')
+    path = _review_file(ctx)
+    if not path.is_file():
+        raise RuntimeError('confirm_pick: no routes-review.json; run pick_stage_hw or pick_fighter_hw first')
+    record = json.loads(path.read_text())
+    if _norm(record.get('expect')) != _norm(expect):
+        raise RuntimeError(f'confirm_pick: the review is for {record.get("expect")!r}, not {expect!r}')
+    if record.get('approved') is not True:
+        raise RuntimeError(f'confirm_pick: {record.get("still")} is not approved; look at it, then set approved=true')
+    play(ctx, 'tap-a1')
+    if record['kind'] == 'stage':
+        gate(ctx, 'css', transition_cap)
+        remember(ctx, stage=record['expect'], tile=record['tile'])
+    else:
+        gate(ctx, 'ready')
+        remember(ctx, p1=record['expect'])
+    path.write_text(json.dumps({**record, 'used': time.strftime('%H:%M:%SZ', time.gmtime())}) + '\n')
+    return _save(ctx, 'routes-confirm-pick', {**record, 'after': str(ctx.shot(f'routes-confirmed-{_norm(expect)}'))})
 
 
 def tr_menu(ctx):

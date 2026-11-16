@@ -1297,6 +1297,98 @@ class SwitchBootTests(unittest.TestCase):
             self.run_boot([None, 'launch-error', 'launch-error'])
 
 
+class HwPickTests(unittest.TestCase):
+    """pick_stage_hw / pick_fighter_hw / confirm_pick: counted tile walks with no tile log, A only after review."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp())
+        self.log = self.folder / 'events.log'
+        self.log.write_text('')
+        self.gates, self.played = [], []
+        self.old = routes.gate, routes.play, routes.time.sleep
+        routes.gate = lambda ctx, name, cap=None: self.gates.append(name) or 'ok'
+        routes.time.sleep = lambda s: None
+
+    def tearDown(self):
+        routes.gate, routes.play, routes.time.sleep = self.old
+
+    def ctx(self, game):
+        runner_obj = FakeRunner({'socket': 'usb:///dev/ttyACM0'}, game)
+        runner_obj.out = str(self.folder)
+
+        def play(ctx, name):
+            self.played.append(name)
+            if name.startswith('tile-'):
+                game.step(name.split('-', 1)[1])
+        routes.play = play
+        return FakeCtx(runner_obj, self.folder)
+
+    def test_plans_from_the_console_grid(self):
+        self.assertEqual(routes.hw_walk_plan('css', 'Fox'), [('up', 7), ('left', 12), ('right', 7)])
+        self.assertEqual(routes.hw_walk_plan('css', 'Olimar'), [('up', 7), ('left', 12), ('down', 3), ('right', 3)])
+        # The console has no Piranha Plant tile: Joker is row 5 column 6 there, not tables.json's tile 72.
+        self.assertEqual(routes.css_hw_cell('Joker'), (5, 6))
+        self.assertEqual(routes.css_hw_cell('Steve'), (5, 12))
+        self.assertEqual(routes.hw_walk_plan('sss', routes.stage_entry('Battlefield')['tile']), [('right', 1)])
+        self.assertEqual(routes.hw_walk_plan('sss', 0), [])
+        for unmapped in ('Sephiroth', 'Piranha Plant', 'Random'):
+            with self.assertRaises(KeyError):
+                routes.hw_walk_plan('css', unmapped)  # the short last row and tiles this save lacks
+
+    def test_every_grid_name_is_a_tables_fighter(self):
+        for row in routes.CSS_HW_ROWS:
+            self.assertEqual(len(row), 13)
+            for name in row:
+                if name != 'Pokemon Trainer':  # a shared slot: no single kind in tables.json
+                    routes.fighter_entry(name)
+
+    def test_css_walk_lands_from_any_first_tile(self):
+        # The console's grid (nav/css2-css.png): six rows of 13, then the short row of 7. The first Up lands anywhere.
+        for start in (0, 12, 40, 77, 80):
+            for name in ('Fox', 'Olimar', 'Wario', 'Steve', 'Mario', 'Joker'):
+                game = FakeTileGame(self.log, [13] * 6 + [7], 'css', start)
+                out = routes.pick_fighter_hw(self.ctx(game), name)
+                r, c = routes.css_hw_cell(name)
+                self.assertEqual(game.at, r * 13 + c, (start, name))
+                self.assertFalse(out['approved'])
+        self.assertNotIn('tap-a1', self.played)
+        self.assertTrue(all(n.startswith('tile-') for n in self.played))
+
+    def test_sss_walk(self):
+        game = FakeTileGame(self.log, [11] * 10 + [6], 'sss', 0)
+        out = routes.pick_stage_hw(self.ctx(game), 'Final Destination')
+        self.assertEqual(game.at, 4)
+        self.assertEqual(self.gates, ['sss'])
+        self.assertEqual(out['expect'], 'Final Destination')
+
+    def test_confirm_needs_an_approved_review_of_the_same_pick(self):
+        game = FakeTileGame(self.log, [13] * 6 + [9], 'css', 0)
+        ctx = self.ctx(game)
+        with self.assertRaises(RuntimeError):
+            routes.confirm_pick(ctx, 'Fox')  # no review yet
+        routes.pick_fighter_hw(ctx, 'Fox')
+        with self.assertRaises(RuntimeError):
+            routes.confirm_pick(ctx, 'Fox')  # not approved
+        review = self.folder / 'routes-review.json'
+        record = json.loads(review.read_text())
+        review.write_text(json.dumps({**record, 'approved': True}))
+        with self.assertRaises(RuntimeError):
+            routes.confirm_pick(ctx, 'Olimar')  # approved, but for another pick
+        self.assertNotIn('tap-a1', self.played)
+        out = routes.confirm_pick(ctx, 'Fox')
+        self.assertEqual(self.played[-1], 'tap-a1')
+        self.assertEqual(self.gates[-1], 'ready')
+        self.assertIn('used', json.loads(review.read_text()))
+        self.assertEqual(out['expect'], 'Fox')
+
+    def test_refuses_off_switch(self):
+        game = FakeTileGame(self.log, [11], 'sss', 0)
+        ctx = self.ctx(game)
+        ctx.instance = {'socket': '/tmp/eden.sock'}
+        with self.assertRaises(RuntimeError):
+            routes.pick_stage_hw(ctx, 'Battlefield')
+
+
 class ExpectTests(unittest.TestCase):
     def test_expectations_survive_a_new_runner_process(self):
         folder = Path(tempfile.mkdtemp())

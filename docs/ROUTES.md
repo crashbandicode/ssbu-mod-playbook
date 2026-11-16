@@ -218,6 +218,19 @@ instance differs, and every input is a macro (no manual presses).
       on synthetic frames, and checked against the session's real frames (Loading 3/7 and 4/7, Ready 8/8, a
       minigame notice, the HUD, the menu). It hasn't run live yet, and it's unproven on Eden.
   - `switch_close`: HOME, X, then A on the close dialog.
+  - `pick_stage_hw {stage}`, `pick_fighter_hw {p1}`, `confirm_pick {expect}` (2026-11-16, host-tested; not yet run on
+    the console):
+    - **Why:** the tile cursor on the card writes its `events.log` to the SD, which can't be read while SSBU runs, so
+      `TileWalker` can't run.
+    - **Walk:** a counted walk of single `tile-*` steps instead. The stage select opens on tile 0 (`sss` gate), then
+      Down/Right by `tables.json`. On the CSS, Up ×7 and Left ×12 reach the top-left tile from anywhere, then
+      Down/Right.
+    - **CSS grid:** read from the console save's own still (`CSS_HW_ROWS`, six rows of 13). That save has no Piranha
+      Plant or Mii Swordfighter tile, so `tables.json` tile numbers are wrong there from Joker on. The short last row
+      isn't mapped.
+    - **A only after review:** the walk ends on a still and `out/routes-review.json` with `approved: false`. The
+      reviewer looks and sets `approved: true`; only then does `confirm_pick` press A (then the `css` or `ready` gate).
+      The CPU is still set by TR's CPU Character, never the coin.
 
 ### Hardware proof: `hw-run-1` (the real Switch, 2026-11-16 12:45–12:49Z)
 
