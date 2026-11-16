@@ -1015,8 +1015,10 @@ class SessionRecordingTests(unittest.TestCase):
     class SplitClient:
         """recording.session_split like switch-remote's OBS client: a new file per acknowledged split."""
 
-        def __init__(self, folder, ack=lambda label: True):
+        def __init__(self, folder, ack=lambda label: True, stopped_at=(), refuse_start=False):
             self.folder, self.ack, self.calls, self.n, self.rec_ms, self.cur = folder, ack, [], 0, 0, None
+            # OBS is found stopped at these row starts (1 = the first executed row); refuse_start: it won't restart
+            self.stopped_at, self.refuse_start, self.ensures = set(stopped_at), refuse_start, 0
 
         def new_file(self):
             self.n += 1
@@ -1030,6 +1032,15 @@ class SessionRecordingTests(unittest.TestCase):
             if method == 'recording.session_start':
                 self.cur = self.new_file()
                 return {'ok': True, 'result': {'started_wall': 1.0, 'already_active': False, 'path': self.cur}}
+            if method == 'recording.session_ensure':
+                self.ensures += 1
+                if self.ensures not in self.stopped_at:
+                    return {'ok': True, 'result': {'active_before': True, 'restarted': False, 'path': self.cur}}
+                if self.refuse_start:
+                    return {'ok': False, 'error': {'code': 'capture_failed', 'message': 'obs: obs_500'}}
+                self.cur, self.rec_ms = self.new_file(), 0
+                return {'ok': True, 'result': {'active_before': False, 'restarted': True, 'path': self.cur,
+                                               'started_wall': 1.0, 'rec_ms': 0}}
             if method == 'recording.session_split':
                 self.rec_ms += 1000
                 base = {'active': True, 'rec_ms': self.rec_ms, 'wall': 1.0, 'closed': [], 'late_paths': []}
@@ -1051,9 +1062,9 @@ class SessionRecordingTests(unittest.TestCase):
                 Path(params['path']).write_bytes(b'png')
             return {'ok': True, 'result': {}}
 
-    def run_split_plan(self, rows, ack=lambda label: True):
+    def run_split_plan(self, rows, ack=lambda label: True, **client_options):
         folder = Path(tempfile.mkdtemp())
-        client = self.SplitClient(folder, ack)
+        client = self.SplitClient(folder, ack, **client_options)
         plan = {'start': 's', 'gates': {'never': {'kind': 'log', 'source': 'console_log', 'pattern': 'never', 'cap': 0.3}},
                 'session_recording': {'marks': ['row-start', 'row-end', 'shot'], 'per_row_files': True},
                 'rows': [{'id': rid, 'start': 's', 'end': 's', 'steps': steps} for rid, steps in rows]}
@@ -1124,6 +1135,34 @@ class SessionRecordingTests(unittest.TestCase):
         self.assertEqual([e['event'] for e in events[-2:]], ['stop', 'clip'])
         self.assertEqual(events[-1]['row'], 'b')
         self.assertEqual(json.loads((out / 'a.json').read_text())['clip'], str(out / 'a' / 'clip.mp4'))
+
+    def test_stopped_recording_is_restarted_before_the_row_and_is_its_clip(self):
+        folder, out, events, client = self.run_split_plan([('a', []), ('b', [{'shot': 'x'}])], stopped_at=[2])
+        self.assertEqual([(e['event'], e.get('row')) for e in events],
+                         [('start', None), ('row-start', 'a'), ('clip', None), ('row-end', 'a'),
+                          ('recording-restarted', 'b'), ('clip', 'a'), ('row-start', 'b'), ('shot', 'b'),
+                          ('row-end', 'b'), ('stop', None), ('clip', 'b')])
+        restarted = events[4]
+        self.assertEqual((restarted['ok'], restarted['path']), (True, str(folder / 'rec-3.mp4')))
+        self.assertTrue(events[6]['split']['restarted'])
+        self.assertEqual(client.calls.count('recording.session_split'), 1)  # b needed no split
+        # ensure came before b's first input (its shot)
+        self.assertLess(len(client.calls) - client.calls[::-1].index('recording.session_ensure'),
+                        len(client.calls) - client.calls[::-1].index('ui.screenshot'))
+        b = json.loads((out / 'b.json').read_text())
+        self.assertEqual((b['status'], b['clip_source']), ('PASS', str(folder / 'rec-3.mp4')))
+        self.assertEqual(json.loads((out / 'a.json').read_text())['clip_source'], str(folder / 'rec-2.mp4'))
+
+    def test_a_recording_that_cannot_restart_stops_the_run_before_the_row(self):
+        folder, out, events, client = self.run_split_plan([('a', []), ('b', [{'shot': 'x'}]), ('c', [])],
+                                                           stopped_at=[2], refuse_start=True)
+        b = json.loads((out / 'b.json').read_text())
+        self.assertEqual((b['status'], b['not_executed'], b['results']), ('FAILED', True, []))
+        self.assertIn('could not be restarted', b['error'])
+        self.assertFalse((out / 'c.json').exists())
+        self.assertNotIn('ui.screenshot', client.calls)  # b's shot never ran
+        failed = [e for e in events if e['event'] == 'recording-restarted']
+        self.assertEqual((failed[0]['row'], failed[0]['ok']), ('b', False))
 
     def test_dry_run_validates_per_row_files(self):
         folder = Path(tempfile.mkdtemp())

@@ -47,7 +47,7 @@ PRESETS = {'evidence': {'width': 640, 'fps': 15, 'max_s': None, 'max_bytes': 10 
 MAX_FPS = 15
 FRAME_CAP = 900          # decoded frames held in memory per clip (640x360 RGB ~ 0.7 MB each)
 FRAME_NS = 1_000_000_000 // 60
-EVENTS = ('start', 'row-start', 'row-end', 'shot', 'gif-start', 'gif-end', 'stop', 'clip')
+EVENTS = ('start', 'row-start', 'row-end', 'shot', 'gif-start', 'gif-end', 'stop', 'clip', 'recording-restarted')
 STILL_TOLERANCE_NS = 500_000_000   # a still whose nearest decoded frame is further than this is not trusted
 
 

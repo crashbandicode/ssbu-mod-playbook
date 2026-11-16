@@ -138,6 +138,8 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
+import judge_queue  # noqa: E402
+import subprocess  # noqa: E402
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
 GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status')
@@ -849,11 +851,41 @@ def dry_run(manifest_path):
             if recover_steps_of(plan, nxt) is None:
                 errors.append(f'row {row["id"]}: on_failure continue needs a recover list on {nxt["id"]} or the plan')
         state = row['end']
+    effects = effect_report(plan, base, errors)
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
               'gates': len(plan.get('gates', {})), 'errors': errors,
               'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing or to_acquire else 'READY')}
+    report.update(effects)
     return report
+
+
+def effect_report(plan, base, errors):
+    """Dry-run facts of the checked-effect rules: rows with an effect gate, rows the judge sees (an "expected"
+    line), the judge command, the stop rule. A missing judge script is a warning (its rows end RAN-UNVERIFIED)."""
+    def walk(steps):
+        for s in steps or []:
+            if isinstance(s, dict) and isinstance(s.get('gif'), dict):
+                yield from walk(s['gif'].get('steps'))
+            elif isinstance(s, dict):
+                yield s
+    gates = plan.get('gates', {})
+    rows = [r for r in plan.get('rows', []) if not str(r.get('id', '')).startswith('S-')]
+    effect = [r['id'] for r in rows if any(s.get('gate') in gates and (s.get('effect') or gates[s['gate']].get('effect'))
+                                           for s in walk(r.get('steps')))]
+    for name, gate in gates.items():
+        if gate.get('effect') and gate.get('kind') == 'change' and not gate.get('mark'):
+            errors.append(f'effect gate {name}: a change gate needs "mark"')
+    out = {'effect_rows': len(effect), 'rows_without_effect_gate': len(rows) - len(effect),
+           'expected_rows': sum(1 for r in rows if r.get('expected')),
+           'require_effect': bool(plan.get('require_effect')),
+           'stop_after_consecutive_failures': plan.get('stop_after_consecutive_failures')}
+    judge = plan.get('judge')
+    if isinstance(judge, dict) and judge.get('cmd'):
+        out['judge'] = {'cmd': judge['cmd'], 'present': (base / judge['cmd']).is_file()}
+        if not out['judge']['present']:
+            out.setdefault('warnings', []).append(f'judge {judge["cmd"]} not found: judged rows end RAN-UNVERIFIED')
+    return out
 
 
 class StopRun(Exception):
@@ -1049,6 +1081,69 @@ class Runner:
         self.session = None
         self.session_unavailable = None
         self.session_file = None  # per_row_files: {'path', 'row', 'rows', 'file_rec_ms'} of the file OBS writes now
+        self.effects_passed = []  # effect gates ("effect": true on the gate or its step) that passed in this row
+        self.consecutive_failures = 0
+        self.judge_workers = []   # (row id, Popen) of the background judge jobs (judge_queue.py)
+
+    # --- effect gates, the judge and the stop rule (operator rule, 2026-11-16) ---------------------------------------
+    def judge_config(self):
+        cfg = self.plan.get('judge')
+        return cfg if isinstance(cfg, dict) and cfg.get('cmd') else None
+
+    def passed_status(self, receipt):
+        """Status of a row whose steps all passed: never PASS before its effect is checked. With a judge, the row is
+        RAN-UNVERIFIED (judge pending) until judge_queue merges the verdict; without one, PASS needs a passed effect
+        gate when the plan has require_effect."""
+        receipt['gates_status'] = 'PASS'
+        receipt['effects_passed'] = list(self.effects_passed)
+        if self.judge_config():
+            receipt['status'] = 'RAN-UNVERIFIED'
+            receipt['status_reason'] = 'judge pending'
+            receipt['judge'] = {'state': 'pending'}
+            return receipt['status']
+        status, reason = judge_queue.gates_only_status(self.effects_passed, self.plan.get('require_effect'))
+        receipt['status'] = status
+        if reason:
+            receipt['status_reason'] = reason
+            receipt['review'] = True
+        return status
+
+    def queue_judge(self, row_id, clip=None):
+        """Write the row's judge job and start its worker; never blocks the console. Only rows whose deterministic
+        gates passed are judged (a FAILED row keeps its gate failure)."""
+        cfg = self.judge_config()
+        receipt_path = self.out / f'{row_id}.json'
+        if cfg is None or not receipt_path.is_file():
+            return None
+        receipt = json.loads(receipt_path.read_text())
+        if receipt.get('gates_status') != 'PASS' or (receipt.get('judge') or {}).get('state') != 'pending':
+            return None
+        row = next((r for r in self.plan['rows'] if r['id'] == row_id), {'id': row_id})
+        try:
+            job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip)
+            proc = judge_queue.start_worker(job, self.out / 'judge' / 'workers.log')
+        except Exception as error:  # noqa: BLE001 - a job that can't start leaves the row RAN-UNVERIFIED
+            judge_queue.merge_receipt(receipt_path, lambda r: r.update(
+                judge={'state': 'error', 'error': repr(error)[:300]}, status='RAN-UNVERIFIED', review=True,
+                status_reason=f'judge job could not start: {error!r}'[:300]))
+            self.log({'judge': row_id, 'error': repr(error)[:300]})
+            return None
+        self.judge_workers.append((row_id, proc))
+        judge_queue.merge_receipt(receipt_path, lambda r: r['judge'].update(state='pending', job=str(job)))
+        self.log({'judge': row_id, 'queued': str(job), 'clip': clip})
+        return job
+
+    def finish_judging(self):
+        """After the last row (the console is idle): wait for the outstanding verdicts (plan judge.wait_s, default
+        900 s), then write FAILING.md and rerun.json."""
+        cfg = self.judge_config() or {}
+        until = time.monotonic() + float(cfg.get('wait_s', 900))
+        for row_id, proc in self.judge_workers:
+            try:
+                proc.wait(timeout=max(0.0, until - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                self.log({'judge': row_id, 'still_running': True})
+        return judge_queue.failing_report(self.out, self.plan, self.manifest_path)
 
     # --- control -------------------------------------------------------------------------------------------------
     def log(self, record):
@@ -1068,7 +1163,7 @@ class Runner:
         job still running at the cap is fine: a ui click that opens a modal dialog (Host Room, a confirm box) stays
         running until that dialog is handled, by design (CLIControl.md); the next gate checks the outcome."""
         if method not in ('macro.stop', 'input.reset', 'recording.session_mark', 'recording.session_split',
-                          'recording.session_stop'):
+                          'recording.session_ensure', 'recording.session_stop'):
             self.check_stop()  # cleanup and bookkeeping calls still go through after a STOP
         reply = self.clients[on].request(method, params or {})
         self.log({'on': on, 'method': method, 'params': params, 'ok': reply.get('ok')})
@@ -1733,6 +1828,9 @@ class Runner:
         self.last_hook_evidence = None
         evidence = self.gate(on, step['gate'])
         result = {'gate': step['gate'], 'on': on, 'evidence': evidence}
+        if step.get('effect') or self.plan['gates'][step['gate']].get('effect'):
+            self.effects_passed.append(step['gate'])  # a checked effect: what the row is for, not navigation
+            result['effect'] = True
         if self.last_image_scale:
             result['scale'] = self.last_image_scale
         if self.last_hook_evidence is not None:
@@ -2016,8 +2114,21 @@ class Runner:
             kind, cause = harness.classify_failure(error, facts)
         self.cause_counts[cause] = self.cause_counts.get(cause, 0) + 1
         count = self.cause_counts[cause]
-        limit = harness.early_stop_limit(self.plan)
         early = None
+        consecutive = self.plan.get('stop_after_consecutive_failures')
+        if consecutive:
+            # The operator's stop rule (2026-11-16): a failed row is recorded, recovered (clean state) and the run goes
+            # on; it stops only after N failed rows in a row. Replaces the "probable shared cause" count.
+            if row.get('id') != getattr(self, '_last_failed_row', None):
+                self.consecutive_failures += 1
+                self._last_failed_row = row.get('id')
+            if cause != 'runner-stop' and self.consecutive_failures >= int(consecutive):
+                early = {'result': f'{self.consecutive_failures} consecutive failed rows (last: {row.get("id")}, '
+                                   f'{cause})', 'cause': cause, 'kind': kind, 'count': self.consecutive_failures,
+                         'rule': 'stop_after_consecutive_failures'}
+                self.early_stop = early
+            return kind, cause, early
+        limit = harness.early_stop_limit(self.plan)
         if cause != 'runner-stop' and limit is not None and count >= limit:
             early = {'result': f'probable shared cause: {cause}', 'cause': cause, 'kind': kind, 'count': count}
             self.early_stop = early
@@ -2111,6 +2222,8 @@ class Runner:
         except Exception as error:  # noqa: BLE001 - a backend without session recording runs on without one
             self.session_unavailable = repr(error)[:200]
             self.log({'session_recording': 'unavailable', 'error': self.session_unavailable})
+            if cfg.get('per_row_files'):  # per-row clips were asked for: never run a row unrecorded
+                raise StopRun(f'session recording could not start: {self.session_unavailable}') from error
             return None
         self.session = {'on': on}
         self.session_file = {'path': result.get('path'), 'row': None, 'rows': [], 'file_rec_ms': 0}
@@ -2126,6 +2239,9 @@ class Runner:
         params = {'label': label or f'{row_id}:{event}'}
         if cfg.get('chapters') and event == 'row-start':
             params['chapter'] = True
+        if event == 'row-start' and cfg.get('per_row_files') and self.ensure_recording(row_id):
+            # OBS was not recording: the restart's new file is this row's clip (no split needed)
+            return self._session_log_row_start(row_id, params['label'])
         # per_row_files: a row starts in a file of its own. The row-start mark is the split (SplitRecordFile, then
         # the client waits for RecordFileChanged: the file begins at OBS's next keyframe, and the row's input waits
         # for it). The file that began at row N's split is row N's clip; it closes at the next split or the stop.
@@ -2155,6 +2271,34 @@ class Runner:
         self._session_log(record)
         if split:
             self._split_files(row_id, result)
+        return record
+
+    def ensure_recording(self, row_id):
+        """Never run a row unrecorded: before a row's first input, OBS must be recording. If it isn't, StartRecord
+        (recording.session_ensure: confirmed active, RecordStateChanged STARTED) and log `recording-restarted`; the
+        new file is the row's file. A start that fails stops the run (StopRun) before the row's input.
+        Returns True when it restarted the recording."""
+        try:
+            result = self.call(self.session['on'], 'recording.session_ensure', {'cap_s': 5}) or {}
+        except Exception as error:  # noqa: BLE001
+            self._session_log({'event': 'recording-restarted', 'row': row_id, 'ok': False, 'rec_ms': None,
+                               'reason': 'OBS was not recording at the row start', 'error': repr(error)[:300]})
+            raise StopRun(f'row {row_id}: OBS is not recording and could not be restarted: {error!r}'[:400]) \
+                from error
+        if not result.get('restarted'):
+            return False
+        self._session_log({'event': 'recording-restarted', 'row': row_id, 'ok': True, 'rec_ms': None,
+                           'wall': result.get('started_wall') or time.time(), 'path': result.get('path'),
+                           'reason': 'OBS was not recording at the row start'})
+        self._close_session_file(note='the recording stopped outside the runner')
+        self.session_file = {'path': result.get('path'), 'row': row_id, 'rows': [row_id], 'file_rec_ms': 0}
+        return True
+
+    def _session_log_row_start(self, row_id, label):
+        record = {'event': 'row-start', 'row': row_id, 'label': label, 'wall': time.time(), 'rec_ms': 0,
+                  'active': True, 'split': {'ok': True, 'file': (self.session_file or {}).get('path'),
+                                            'file_rec_ms': 0, 'restarted': True}}
+        self._session_log(record)
         return record
 
     def _split_files(self, row_id, result):
@@ -2218,6 +2362,9 @@ class Runner:
         if error:
             record['error'] = error
         self._session_log(record)
+        for judged in dict.fromkeys([row, *(f.get('rows') or [])]):  # the clip is closed: its rows' judge jobs
+            if judged is not None:
+                self.queue_judge(judged, clip)
         return record
 
     def session_stop(self):
@@ -2253,9 +2400,14 @@ class Runner:
             return self._run_rows(only)
         finally:
             try:
-                self.session_stop()
+                self.session_stop()  # closes the last row's clip: its judge job starts here
             finally:
                 self.write_summary()
+                if self.judge_config() or self.plan.get('require_effect'):
+                    try:
+                        self.finish_judging()  # FAILING.md + rerun.json (waits for the verdicts; the console is idle)
+                    except Exception as error:  # noqa: BLE001 - the report never hides the run's own result
+                        self.log({'failing_report_error': repr(error)[:300]})
 
     def _run_rows(self, only):
         previous_end = self.plan['start']
@@ -2269,8 +2421,10 @@ class Runner:
             if receipt_path.exists():
                 prior = json.loads(receipt_path.read_text())
                 prior_status = prior.get('status')
-            if prior_status == 'PASS':
-                self.note(row['id'], 'pass')
+            if prior_status == 'PASS' or (prior_status == 'RAN-UNVERIFIED' and prior.get('gates_status') == 'PASS'
+                                          and (only is None or row['id'] not in only)):
+                # a RAN-UNVERIFIED row is listed for review (FAILING.md), and reruns only when named (--rows)
+                self.note(row['id'], 'pass' if prior_status == 'PASS' else 'unverified')
                 previous_end = row['end']
                 continue
             if only is not None and row['id'] not in only:
@@ -2291,22 +2445,32 @@ class Runner:
             self.last_hook_evidence = None
             self.screen_reached = False
             self.last_gate_outcome = None
+            self.effects_passed = []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
-            self.session_start()
-            start_mark = self.session_mark('row-start', row['id'])
+            try:
+                self.session_start()
+                start_mark = self.session_mark('row-start', row['id'])
+            except StopRun as error:  # never run a row unrecorded: stopped before any of its input
+                receipt.update(status='FAILED', error=repr(error), ended=time.time(), not_executed=True)
+                receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                self.note(row['id'], 'fail', receipt='FAILED')
+                print(json.dumps({'row': row['id'], 'status': 'FAILED', 'error': repr(error)[:300],
+                                  'receipt': str(receipt_path)}), flush=True)
+                raise
             try:
                 if (self.recovered_to != row['id'] and prior_status == 'FAILED'
                         and start_gate_of(self.plan, row) and recover_steps_of(self.plan, row) is not None):
                     self.recover_to(row)
                 for step in row['steps']:
                     self.execute_step(step, receipt['results'])
-                receipt['status'] = 'PASS'
+                status = self.passed_status(receipt)
+                self.consecutive_failures, self._last_failed_row = 0, None
                 if self.scales_used:
                     receipt['scale'] = self.scales_used
                 if self.gate_saw_evidence and not any(self.gate_saw_evidence):
                     receipt['warnings'] = ['passed with no screen or log evidence from its gates']
-                self.note(row['id'], 'pass')
+                self.note(row['id'], 'pass' if status == 'PASS' else 'unverified')
                 if self.capture_fixtures or self.plan.get('capture_fixtures'):
                     receipt['fixture'] = str(harness.capture_passing_row(self, row, self.out / 'fixtures' / row['id']))
                 if not self.pace['first_row_done']:
@@ -2378,7 +2542,9 @@ class Runner:
                 print(json.dumps({'row': row['id'], 'status': receipt['status'],
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
                                   'receipt': str(receipt_path)}), flush=True)
-            if receipt['status'] == 'PASS':
+                if not (self.session_config() or {}).get('per_row_files') or self.session is None:
+                    self.queue_judge(row['id'])  # no per-row clip file: judge the shots now
+            if receipt['status'] in ('PASS', 'RAN-UNVERIFIED'):
                 previous_end = row['end']
                 if self.acquired:
                     # A new reference is a claim about what the screen should look like: a model looks once, then reruns.
@@ -2458,7 +2624,9 @@ def main(argv=None):
     parser.add_argument('--fixture', type=Path, help='replay: directory containing fixture.json')
     parser.add_argument('--capture-fixtures', action='store_true',
                         help='save an offline fixture for each passing row')
-    parser.add_argument('--rows', help='comma-separated row ids, or "failed" to rerun rows whose receipt is FAILED')
+    parser.add_argument('--rows', '--only', dest='rows',
+                        help='comma-separated row ids, "failed" (receipt FAILED) or "failing" (FAILED or '
+                             'RAN-UNVERIFIED: the FAILING.md / rerun.json list)')
     parser.add_argument('--on-failure', choices=('continue', 'stop'),
                         help='override the plan/row on_failure policy for this run')
     parser.add_argument('--pace-minutes', type=float, default=15)
@@ -2502,11 +2670,12 @@ def main(argv=None):
         print(json.dumps(result, indent=2))
         return 0 if result.get('ok') else 1
     only = None
-    if args.rows == 'failed':
+    if args.rows in ('failed', 'failing'):
+        wanted = ('FAILED',) if args.rows == 'failed' else ('FAILED', 'RAN-UNVERIFIED')
         only = set()
         for row in json.loads(manifest.read_text()).get('rows', []):
             receipt = out / f'{row["id"]}.json'
-            if receipt.is_file() and json.loads(receipt.read_text()).get('status') == 'FAILED':
+            if receipt.is_file() and json.loads(receipt.read_text()).get('status') in wanted:
                 only.add(row['id'])
     elif args.rows:
         only = set(args.rows.split(','))
