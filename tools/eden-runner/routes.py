@@ -228,6 +228,10 @@ def gate(ctx, name, cap=None):
     """Check a route gate through the runner (receipts, screenshots, failure evidence all apply)."""
     key = f'routes.{name}'
     gates = ctx.runner.plan.setdefault('gates', {})
+    if on_switch(ctx):
+        if name not in SWITCH_REFS:
+            raise RuntimeError(f'gate routes.{name}: no real-Switch reference (SWITCH_REFS)')
+        return _frame_gate(ctx, f'routes.{name}', _switch_spec(name), cap or SWITCH_CAPS.get(name, 30))
     if key not in gates:
         gates[key] = _gate_spec(name)
     if desktop_shots(ctx) and name in RECORDER_GATES:
@@ -244,6 +248,26 @@ def gate(ctx, name, cap=None):
         gates[key] = saved
 
 
+SWITCH_SCHEMES = ('usb://', 'pi://', 'switch://', 'autopilot://')
+# Real-Switch gates: references cut from the capture card's 1280x720 OBS stills (the switch-hw-ledger-rc15 preamble,
+# reviewed), each checked to pass on its own screen and fail on the others (library/routes/refs/hw-refs.json).
+SWITCH_REFS = {'main': 'hw-main', 'stage': 'hw-sss', 'css': 'hw-css', 'ready': 'hw-ready',
+               'training': 'hw-training', 'tr-menu': 'hw-tr-menu', 'profile': 'hw-profile'}
+SWITCH_CAPS = {'main': 10, 'stage': 45, 'css': 60, 'ready': 10, 'training': 60, 'tr-menu': 10, 'profile': 10}
+
+
+def on_switch(ctx):
+    """True when this instance is a real Switch driven through the pad (switch_hw.py up)."""
+    return str(ctx.instance.get('socket', '')).startswith(SWITCH_SCHEMES)
+
+
+def _switch_spec(name):
+    ref = SWITCH_REFS[name]
+    table = json.loads((ROUTES / 'refs' / 'hw-refs.json').read_text())[ref]
+    return {'kind': 'image', 'reference': str(ROUTES / 'refs' / f'{ref}.png'), 'sha256': table['sha256'],
+            'roi': table['roi'], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit', 'tolerance': 18}
+
+
 def desktop_shots(ctx):
     """True where ui.screenshot grabs the whole desktop (the Ally: screenshot_target "screen"; a window grab is black
     under Vulkan there). Image gates then read a game frame from Eden's recorder instead (frame())."""
@@ -251,7 +275,10 @@ def desktop_shots(ctx):
 
 
 def frame(ctx, name, cap=10.0):
-    """One game frame as a PNG in the row folder, from Eden's GIF recorder (game pixels only, 1280 wide)."""
+    """One game frame as a PNG in the row folder: on a real Switch an OBS still of the capture card; on Eden, one
+    frame from Eden's GIF recorder (game pixels only, 1280 wide)."""
+    if on_switch(ctx):
+        return Path(ctx.shot(name))
     from PIL import Image
     stamp = time.strftime('%H%M%S', time.gmtime()) + f'-{time.time_ns() % 10**6:06d}'
     gif = Path(ctx.row_dir) / f'{ctx.on}-{stamp}-{name}.frame.gif'
@@ -405,7 +432,10 @@ def chord(ctx, name, expect=None, source=None, cap=10):
     """Step hook: press a named same-frame chord (reset-lra, tr-save, tr-load, tile-up, ...) and, when the chord has
     a known diag line (or `expect` is given), wait for that line after the press."""
     source, expect = (source, expect) if expect else CHORD_LINES.get(name, (None, None))
-    cursor = LogCursor(instance_path(ctx, source)) if expect else None
+    try:
+        cursor = LogCursor(instance_path(ctx, source)) if expect else None
+    except KeyError:
+        cursor = None  # that log isn't available here (a real Switch has no diag log); the chord still plays
     try:
         sha = play(ctx, name)
         line = cursor.wait(expect, cap, ctx).group(0) if cursor else None
@@ -872,6 +902,16 @@ def read_state(ctx, cap=6.0):
 def enter_training(ctx, cap=90):
     """CSS ready -> Training (Plus), proven by the game: fresh state lines for both bodies, then the HUD gate.
     A fresh profile's fighter tip is closed with A while the HUD gate fails (remaining-2 boot_training)."""
+    if on_switch(ctx):
+        # The release NRO prints no state lines: the Training HUD gate is the proof (A closes a first-run tip).
+        play(ctx, 'enter-training')
+        for _ in range(4):
+            if passes(ctx, 'training', 20):
+                break
+            play(ctx, 'tap-a1')
+        else:
+            gate(ctx, 'training')
+        return _save(ctx, 'routes-enter-training', {'shot': str(ctx.shot('routes-training'))})
     stage_cursor = LogCursor(instance_path(ctx, 'diag_log'))
     play(ctx, 'enter-training')
     until = time.monotonic() + cap
@@ -980,7 +1020,10 @@ def fixture(ctx, p1=None, cpu=None, stage=None, reset=True, damage=0.0, lr=None,
 def select_screen(ctx, cap=2.5):
     """'sss' or 'css' when an L3+Up step is logged on that screen (the tile cursor names it), else None. On the CSS a
     step logs only while the hand carries a token; on the SSS the hand always steps."""
-    cursor = LogCursor(instance_path(ctx, 'tile_log'))
+    try:
+        cursor = LogCursor(instance_path(ctx, 'tile_log'))
+    except KeyError:
+        return None  # no tile cursor (a real Switch: it isn't on the card)
     try:
         play(ctx, 'tile-up')
         return cursor.wait(r'step screen=(css|sss) ', cap, ctx).group(1)
@@ -1026,3 +1069,91 @@ def back_to_main(ctx, presses=10):
             looks.append('other')
             play(ctx, 'tap-b1')
     raise RuntimeError(f'not back on the main menu after {presses} looks: {looks}')
+
+
+# --- a real Switch (switch_hw.py up; the pad plays the same macros, OBS stills feed the image gates) ----------------
+
+TR_INSTALL = r'plugin=training_rooms/\S+ game=13\.0\.5 .*result=installed'
+
+
+def _need_switch(ctx, block):
+    if not on_switch(ctx):
+        raise RuntimeError(f'{block} drives a real Switch; this instance is not one')
+
+
+def switch_boot(ctx, cap=420):
+    """HOME (SSBU first tile) -> SSBU -> the main menu, unattended.
+
+    Starts with one harmless B (the first input after an idle console can be swallowed while the pad re-registers,
+    and B undims HOME). Then switch-remote's `switch.launch`: HOME, the SSBU-tile image gate, A. Then, until the
+    main gate passes: A on "Who is using the software?" (the pre-selected first profile), else Start, which skips the
+    opening movie and leaves the title. Proven only on the ledger stills' screens; nothing is pressed on a screen
+    no gate recognises except Start. Returns the TrainingRooms install line from the live Skyline log when present.
+    """
+    _need_switch(ctx, 'switch_boot')
+    if passes(ctx, 'main', 4):
+        return {'already': 'main'}
+    log = LogCursor(instance_path(ctx, 'console_log'))
+    play(ctx, 'tap-b1')
+    launched = ctx.call('switch.launch', {}, job_cap=30)
+    looks = []
+    until = time.monotonic() + cap
+    install = None
+    while True:
+        ctx.check_stop()
+        for line in log.read():
+            if install is None and re.search(TR_INSTALL, line):
+                install = line[:200]
+        if passes(ctx, 'main', 4):
+            looks.append('main')
+            break
+        if passes(ctx, 'profile', 2):
+            looks.append('profile')
+            play(ctx, 'tap-a1')
+            continue
+        looks.append('start')
+        play(ctx, 'attract-cancel')
+        if time.monotonic() > until:
+            raise RuntimeError(f'switch_boot: no main menu within {cap} s; looks {looks[-6:]}')
+    log.close()
+    return _save(ctx, 'routes-switch-boot', {'launch': launched, 'looks': looks, 'tr_install': install,
+                                            'shot': str(ctx.shot('routes-switch-main'))})
+
+
+def switch_to_training(ctx):
+    """Main menu -> Training on the stage select's first tile (the Training stage) with whoever P1 is.
+
+    The tile cursor isn't on the card, so there is no stage or fighter by name here. The stage select opens on the
+    Training stage; A picks it. On the character select a READY banner means css_preserve kept the fighters;
+    otherwise the hand (on P1's panel) goes up onto the grid and A places P1 (the hardware ledger's P2d). Then Plus,
+    and the Training HUD gate (A closes a first-run tip).
+    """
+    _need_switch(ctx, 'switch_to_training')
+    out = {'stage': main_to_stage(ctx)}
+    play(ctx, 'tap-a1')
+    gate(ctx, 'css')
+    if not passes(ctx, 'ready', 4):
+        play(ctx, 'hand-up-21')
+        play(ctx, 'tap-a1')
+        gate(ctx, 'ready')
+        out['placed'] = True
+    out['ready'] = str(ctx.shot('routes-switch-ready'))
+    out['training'] = enter_training(ctx)
+    return _save(ctx, 'routes-switch-training', out)
+
+
+def tr_menu(ctx):
+    """Training HUD -> the TrainingRooms menu (B+Up in one frame) -> closed again (B, B), each proven by a gate."""
+    gate(ctx, 'training')
+    play(ctx, 'tr-menu-open')
+    opened = gate(ctx, 'tr-menu')
+    play(ctx, 'tr-menu-close')
+    closed = gate(ctx, 'training')
+    return {'opened': str(opened), 'closed': str(closed)}
+
+
+def switch_close(ctx):
+    """Close SSBU: HOME, X, the close dialog's A (switch-remote's `switch.terminate`, each step image-checked)."""
+    _need_switch(ctx, 'switch_close')
+    result = ctx.call('switch.terminate', {}, job_cap=60)
+    return _save(ctx, 'routes-switch-close', {'terminate': result})

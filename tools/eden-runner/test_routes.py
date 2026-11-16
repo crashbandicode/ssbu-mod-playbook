@@ -230,6 +230,128 @@ class TableTests(unittest.TestCase):
         self.assertEqual([e['buttons'] for e in tile['events']], [16, 16 | 16384, 0])
 
 
+class RecipeTests(unittest.TestCase):
+    def test_combo_in_one_frame_with_min_hold(self):
+        import recipe_macro
+        doc = recipe_macro.compile_recipe('open', [{'buttons': 'b+up', 'hold': 10, 'gap': 0.1}])
+        self.assertEqual([(e['frame'], e['buttons']) for e in doc['events']], [(0, 8194), (2, 0)])
+        self.assertEqual(doc['duration_frames'], 2 + 6)
+        doc = recipe_macro.compile_recipe('x', [{'buttons': 'plus', 'hold': 100}, {'stick': [0, -1, 250], 'gap': 0}])
+        self.assertEqual([(e['frame'], e['buttons'], e['sticks'][1]) for e in doc['events']],
+                         [(0, 1024, 0), (6, 0, 0), (42, 0, -1.0), (57, 0, 0)])
+        with self.assertRaises(ValueError):
+            recipe_macro.compile_recipe('h', [{'buttons': 'home'}])
+
+    def test_plan_compiles_to_a_ready_dry_run(self):
+        import recipe_macro
+        folder = Path(tempfile.mkdtemp())
+        plan = {'game_id': '01006A800016E000', 'start': 's',
+                'gates': {'g': {'kind': 'log', 'source': 'console_log', 'pattern': 'x', 'cap': 1}},
+                'segments': {'menu': {'recipe': [{'buttons': 'b+up', 'hold': 100}]}},
+                'rows': [{'id': 'r', 'start': 's', 'end': 's', 'steps': [{'gate': 'g'}, {'play': 'menu'}]}]}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        self.assertEqual(recipe_macro.compile_plan(folder / 'rows.json'), ['menu'])
+        report = runner.dry_run(folder / 'rows.json')
+        self.assertEqual(report['result'], 'READY', report)
+        self.assertEqual(recipe_macro.compile_plan(folder / 'rows.json'), [])  # already compiled
+
+
+class SwitchHwTests(unittest.TestCase):
+    def test_line_writer_keeps_lines_whole(self):
+        import io
+        import switch_hw
+        buf = io.BytesIO()
+        w = switch_hw.LineWriter(buf)
+        w.feed(b'plugin=training_rooms/0.2.0 game=13.0.5 res')
+        self.assertEqual(buf.getvalue(), b'')
+        w.feed(b'ult=installed\r\nnext')
+        self.assertEqual(buf.getvalue(), b'plugin=training_rooms/0.2.0 game=13.0.5 result=installed\n')
+        w.close()
+        self.assertTrue(buf.getvalue().endswith(b'next\n'))
+
+    def test_capture_reconnects_and_stops(self):
+        import switch_hw
+        chunks = [[b'a\nb', b'c\n'], [b'd\n']]
+        calls = []
+
+        class Sock:
+            def __init__(self, data):
+                self.data = list(data)
+
+            def settimeout(self, t):
+                pass
+
+            def recv(self, n):
+                return self.data.pop(0) if self.data else b''
+
+            def close(self):
+                pass
+
+        def connect(addr, timeout):
+            calls.append(addr)
+            if not chunks:
+                raise OSError('refused')
+            return Sock(chunks.pop(0))
+        path = Path(tempfile.mkdtemp()) / 'skyline.log'
+        switch_hw.capture_log(path, 'h', 1, stop=lambda: len(calls) >= 3, connect=connect, retry_s=0)
+        self.assertEqual(path.read_text(), 'a\nbc\nd\n')
+
+    def test_factory_routes_usb_to_switch_remote(self):
+        folder = Path(tempfile.mkdtemp())
+        (folder / 'switch_remote.py').write_text('def make_client(s):\n    return ("fake", s)\n')
+        old = os.environ.get('SWITCH_REMOTE_DIR')
+        os.environ['SWITCH_REMOTE_DIR'] = str(folder)
+        sys.modules.pop('switch_remote', None)
+        try:
+            self.assertEqual(runner.default_client_factory()('usb:///dev/ttyACM0'), ('fake', 'usb:///dev/ttyACM0'))
+        finally:
+            sys.modules.pop('switch_remote', None)
+            if old is None:
+                os.environ.pop('SWITCH_REMOTE_DIR', None)
+            else:
+                os.environ['SWITCH_REMOTE_DIR'] = old
+
+
+class SwitchGateTests(unittest.TestCase):
+    def test_hw_gates_read_stills(self):
+        from PIL import Image
+        folder = Path(tempfile.mkdtemp())
+        spec = routes._switch_spec('tr-menu')
+        frame = Image.new('RGB', (1280, 720))
+        frame.paste(Image.open(spec['reference']).convert('RGB'), tuple(spec['roi'][:2]))
+        good, blank = folder / 'good.png', folder / 'blank.png'
+        frame.save(good)
+        Image.new('RGB', (1280, 720)).save(blank)
+        shots = []
+
+        class R:
+            plan = {'gates': {}}
+
+            @staticmethod
+            def compare_region(*a):
+                return runner.Runner.compare_region(*a)
+
+        ctx = FakeCtx.__new__(FakeCtx)
+        ctx.runner, ctx.on, ctx.row_dir = R(), 'sw', folder
+        ctx.instance = {'socket': 'usb:///dev/ttyACM0'}
+        counter = []
+
+        def shot(name):  # a fresh file per still, as runner.shot makes (the gate deletes failed stills)
+            counter.append(1)
+            path = folder / f'shot-{len(counter)}.png'
+            path.write_bytes(Path(shots.pop(0)).read_bytes())
+            return str(path)
+        ctx.shot = shot
+        self.assertTrue(routes.on_switch(ctx))
+        shots[:] = [str(blank), str(good)]
+        passed = routes.gate(ctx, 'tr-menu', cap=5)
+        self.assertEqual(Path(passed).read_bytes(), good.read_bytes())
+        shots[:] = [str(blank)] * 50
+        self.assertFalse(routes.passes(ctx, 'tr-menu', 0.5))
+        with self.assertRaises(RuntimeError):
+            routes.gate(ctx, 'native-pause', cap=1)
+
+
 class ExpectTests(unittest.TestCase):
     def test_expectations_survive_a_new_runner_process(self):
         folder = Path(tempfile.mkdtemp())

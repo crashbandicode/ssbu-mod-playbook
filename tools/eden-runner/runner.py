@@ -956,9 +956,25 @@ class PipeClient:
         return response
 
 
+SWITCH_SCHEMES = ('usb://', 'pi://', 'switch://', 'autopilot://')
+
+
+def switch_remote_dir():
+    """Where the real-Switch client lives (ssbu-switch-remote tools/host), like EDENCTL_DIR for Eden."""
+    import os
+    return os.environ.get('SWITCH_REMOTE_DIR', str(Path.home() / 'ssbu-switch-remote' / 'tools' / 'host'))
+
+
 def default_client_factory():
-    """Unix socket path -> edenctl Client; \\\\.\\pipe\\name -> PipeClient (Windows hosts such as the Ally)."""
+    """Unix socket path -> edenctl Client; \\\\.\\pipe\\name -> PipeClient (Windows hosts such as the Ally);
+    usb://TTY (the ESP32-S3 wired pad on a real Switch), pi://, switch:// or autopilot:// -> switch-remote's client,
+    which answers the same control methods (macro.play device-timed at 60 Hz, input.*, ui.screenshot from OBS)."""
     def make(socket_path):
+        if str(socket_path).startswith(SWITCH_SCHEMES):
+            if switch_remote_dir() not in sys.path:
+                sys.path.insert(0, switch_remote_dir())
+            from switch_remote import make_client
+            return make_client(str(socket_path))
         if str(socket_path).startswith('\\\\.\\pipe\\'):
             return PipeClient(socket_path)
         sys.path.insert(0, EDENCTL_DIR)
