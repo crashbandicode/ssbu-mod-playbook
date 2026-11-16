@@ -7,18 +7,15 @@ pushes overshoot there, and the plain D-pad moves the hand only a little.
 Install it next to the plugin under test. It does nothing on other screens or
 without L3, so it doesn't change what you are testing.
 
-- **NRO:** 0.1.0, build `15d3f31`, sha256 `b8313ca2…`, the same file as
-  release v0.1.0. This is the build the Eden tests used, and the one the
-  Eden configs pin. `pair.ps1` installs it automatically. With `solo.ps1`,
-  add it to `-Nro`. As of 2026-11-13, `main` (`a052fd5`, 2026-10-30) builds
-  a different NRO that hasn't run in Eden, so don't rebuild it into `dist/`.
-  - On 2026-11-16 the old path `/home/intpa/ssbu-tile-cursor/dist/` was gone on the Yoga. The Yoga and XPS configs
-    pin `/home/intpa/trainingrooms-eden-pkg6/nro/aid/libssbu_tile_cursor.nro`, the same sha256.
+- **Accepted NRO:** frame-repeat build `8f830a2`, based directly on `15d3f31`; full pin and hash below.
+  Re-pin existing Eden configs explicitly. `pair.ps1` installs the configured aid; with `solo.ps1`, add it to `-Nro`.
+  The historical v0.1.0 pin (`b8313ca2…`) repeats by wall time. Source `main` (`a052fd5`) builds a different,
+  Eden-unproven NRO; do not rebuild that into the accepted pin.
 - **Log:** `<sdmc>/ultimate/ssbu-tile-cursor/events.log`. It is written every
   100 ms, so the host copy is current.
 - **Not on the Switch card.** It is an Eden tool.
 
-## Frame-repeat candidate (2026-11-16)
+## Accepted frame-repeat pin (2026-11-16)
 
 Source `8f830a2` on `frame-repeat`, based directly on `15d3f31`, replaces the wall-clock repeat with one step on
 press and another every 15 elapsed CSS/SSS frame updates. Host speed cannot add repeats to a 2-frame hold.
@@ -27,17 +24,24 @@ Build host: XPS; host Rust 1.98.1, Skyline Rust 1.95.0-nightly (`a423f68a0`, 202
 - New isolated pin on Surface/XPS/Yoga: `/home/intpa/trainingrooms-eden-pkg6/nro/aid/frame-repeat-8f830a2/libssbu_tile_cursor.nro`.
 - SHA256: `66f00442eb7a93de3196714aebba85807e106663e4e9d5dbb3894d7c5e071ecd`.
 - Host tests: 13 pass; all-target clippy with `-D warnings`, no-default-features build and Skyline release pass.
-- Surface `tile-frame-surface-1`: SSS held 32frames gave exactly `0→1→2→3`, then the shared 2-frame walk settled at
-  Battlefield 1. The existing 60 s CSS gate expired during native loading; CSS appeared later in events.log.
-  CSS walking/held-repeat remains **unverified**, so this candidate has not replaced the established default pin.
-- Evidence: `smash-training-lobby/artifacts/harness-lib/tile-frame-surface-1/`, full build provenance in
-  `tile-frame-PROVENANCE.json` beside it. Down restored/verified/released and pruned the owned profile.
+- Surface `tile-frame-surface-2`: **5/5 PASS**, muted, GDB stub on before load, detached controller and ledger.
+  On both SSS and CSS, held 32 frames logged exactly `0→1→2→3`, with settled checks (CSS hover equals tile).
+  Shared 2-frame walks settled Battlefield 1 and Mario 0, ending at Ready to Fight; stills visually checked.
+- Surface calibration: the sole approved retry used `pick_stage(transition_cap=180)` for native CSS loading,
+  with unchanged image/log discrimination. The first run exhausted the default 60 seconds during loading;
+  its partial SSS evidence and failed receipt remain intact. No further extension or boot was used.
+- Evidence: `smash-training-lobby/artifacts/harness-lib/tile-frame-surface-{1,2}/`; full build provenance in
+  `tile-frame-PROVENANCE.json` beside them. This proves cursor selection, not a post-load stage-id assertion.
+Down returned 0: all 2016 profile entries matched the snapshot, cleanup failures were empty, the ledger claim
+was released and copies were pruned. No owned process remained, and the console had no panic/abort/crash/Unmapped
+matches. The terminal `game.stop` timeout required a forced stop; the receipts retain that shutdown detail.
+
 
 ## Stepping
 
 ```text
 gv.py press e19 lstick,right 150     # one tile right
-gv.py press e19 lstick,left 1100     # held: repeats every 250 ms
+gv.py press e19 lstick,left 1100     # held: repeats every 15 game frames; wall-time count varies
 step.ps1 -Label e19 -Steps 'b:lstick+up:700,b:lstick+right:700'
 ```
 

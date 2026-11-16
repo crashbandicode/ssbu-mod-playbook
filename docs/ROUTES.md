@@ -284,16 +284,23 @@ calls, no direct `input.button` or `input.stick` calls.
     stage-id assertion.
   - Expectations now persist in `out/routes-expect.json`.
 
-### Frame-repeat candidate: `tile-frame-surface-1` (2026-11-16)
+### Frame-repeat fix: `tile-frame-surface-2` (2026-11-16)
 
-The aid at `8f830a2` (NRO `66f00442…`, [candidate pin](TILE-CURSOR.md#frame-repeat-candidate-2026-11-16)) counts 15
-elapsed screen updates between repeats. One detached Surface boot ran muted with the GDB stub on before load.
-Its SSS held 32-frame macro logged exactly 0→1→2→3, each settled; the shared 2-frame walk then settled at Battlefield 1.
-The CSS gate expired at 60 s on the native loading frame; `screen=css tiles=87` appeared later, after that failure.
-CSS proof is unrun, with no second boot launched. The run is 3 PASS/1 FAILED/1 unrun, not a whole-proof pass.
-Down 0 restored and separately verified 2016 entries, released the claim, and pruned the owned copies.
-Evidence: `smash-training-lobby/artifacts/harness-lib/tile-frame-surface-1/`; no console panic/abort/crash/Unmapped
-matches. The established pin remains the default pending CSS acceptance.
+The aid at `8f830a2` (NRO `66f00442…`, [accepted pin](TILE-CURSOR.md#accepted-frame-repeat-pin-2026-11-16)) counts
+15 elapsed screen updates between repeats. The Surface retry passed all 5 rows, muted with the GDB stub enabled
+before load, through a detached controller and ledger claim. SSS and CSS held 32-frame macros each logged exactly
+0→1→2→3, settled at every step; CSS also matched the hovered tile. Shared 2-frame walks then settled Battlefield 1
+and Mario 0, ending at Ready to Fight. Stills were visually checked. This is cursor selection evidence, not a
+post-load stage-id assertion.
+
+The first run `tile-frame-surface-1` passed SSS but expired its default 60-second CSS gate on native loading.
+The sole approved retry used a Surface-calibrated `transition_cap=180` for that transition only, preserving the
+same image gate and step/settled/hover discrimination. The earlier failed receipt remains intact; no extra
+extension or third boot was used. Evidence: `smash-training-lobby/artifacts/harness-lib/tile-frame-surface-{1,2}/`.
+
+Down returned 0: all 2016 profile entries matched the snapshot, cleanup failures were empty, the ledger claim
+was released and copies were pruned. No owned process remained, and the console had no panic/abort/crash/Unmapped
+matches. The terminal `game.stop` timeout required a forced stop; the receipts retain that shutdown detail.
 
 ### Windows host type: `harness-lib-ally-1` (the Ally, 2026-11-16, Up 03:46Z, Down 04:02Z)
 
