@@ -522,6 +522,19 @@ def check_plan_policies(plan, base, errors):
     if isinstance(plan.get('recover'), list):
         for step in plan['recover']:
             _check_known_step(plan, base, step, 'plan recover', errors)
+    if 'session_recording' in plan:
+        cfg = plan['session_recording']
+        if not isinstance(cfg, dict):
+            errors.append('session_recording must be an object')
+        else:
+            unknown = [m for m in cfg.get('marks', []) if m not in Runner.SESSION_EVENTS]
+            if unknown:
+                errors.append(f'session_recording marks {unknown} are not {list(Runner.SESSION_EVENTS)}')
+            log = cfg.get('log', 'recording.jsonl')
+            if not isinstance(log, str) or '/' in log or '\\' in log or log.startswith('.'):
+                errors.append(f'session_recording log {log!r} must be a plain file name in the out folder')
+            if 'chapters' in cfg and not isinstance(cfg['chapters'], bool):
+                errors.append('session_recording chapters must be true or false')
     if plan.get('on_failure') not in (None, 'continue', 'stop'):
         errors.append(f'plan on_failure {plan.get("on_failure")!r} must be "continue" or "stop"')
     hook = plan.get('on_failure_hook')
@@ -1024,6 +1037,8 @@ class Runner:
         self._arm_frames = False
         self._gate_baseline = None
         self._gate_latest = None
+        self.session = None
+        self.session_unavailable = None
 
     # --- control -------------------------------------------------------------------------------------------------
     def log(self, record):
@@ -1042,8 +1057,8 @@ class Runner:
         """One control call. An accepted job is followed to completion within job_cap seconds. With running_ok, a
         job still running at the cap is fine: a ui click that opens a modal dialog (Host Room, a confirm box) stays
         running until that dialog is handled, by design (CLIControl.md); the next gate checks the outcome."""
-        if method not in ('macro.stop', 'input.reset'):
-            self.check_stop()
+        if method not in ('macro.stop', 'input.reset', 'recording.session_mark', 'recording.session_stop'):
+            self.check_stop()  # cleanup and bookkeeping calls still go through after a STOP
         reply = self.clients[on].request(method, params or {})
         self.log({'on': on, 'method': method, 'params': params, 'ok': reply.get('ok')})
         if not reply.get('ok'):
@@ -1714,7 +1729,9 @@ class Runner:
         return result
 
     def _step_shot(self, on, step):
-        return {'shot': str(self.shot(on, step['shot']))}
+        path = str(self.shot(on, step['shot']))
+        mark = self.session_mark('shot', (self.current_row or {}).get('id'), label=step['shot'])
+        return {'shot': path, **({'rec_ms': mark.get('rec_ms')} if mark else {})}
 
     def _step_mark(self, on, step):
         self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
@@ -2026,6 +2043,73 @@ class Runner:
         (self.out / 'summary.json').write_text(json.dumps(payload, indent=2) + '\n')
         return failed
 
+    # --- one continuous recording per session (plan "session_recording") -------------------------------------------
+    # The backend's recording.session_start/_mark/_stop (switch-remote's client on a real Switch: OBS StartRecord,
+    # GetRecordStatus.outputDuration, CreateRecordChapter, StopRecord). Clips and stills are cut offline from the one
+    # recording using <out>/<log>, instead of a gif step per moment. A backend without these methods (Eden today)
+    # logs that once and the run goes on without a session recording.
+    SESSION_EVENTS = ('row-start', 'row-end', 'shot')
+
+    def session_config(self):
+        cfg = self.plan.get('session_recording')
+        return cfg if isinstance(cfg, dict) else None
+
+    def _session_log(self, record):
+        cfg = self.session_config() or {}
+        record = dict(record)
+        record.setdefault('wall', time.time())
+        rec_ms = record.get('rec_ms')
+        record['frame'] = round(rec_ms * 60 / 1000) if isinstance(rec_ms, (int, float)) else None
+        with (self.out / cfg.get('log', 'recording.jsonl')).open('a') as f:
+            f.write(json.dumps(record) + '\n')
+
+    def session_start(self):
+        cfg = self.session_config()
+        if cfg is None or self.session is not None or self.session_unavailable:
+            return None
+        on = cfg.get('on', self.default)
+        try:
+            result = self.call(on, 'recording.session_start', {}) or {}
+        except Exception as error:  # noqa: BLE001 - a backend without session recording runs on without one
+            self.session_unavailable = repr(error)[:200]
+            self.log({'session_recording': 'unavailable', 'error': self.session_unavailable})
+            return None
+        self.session = {'on': on}
+        self._session_log({'event': 'start', 'wall': result.get('started_wall') or time.time(), 'rec_ms': None,
+                           'active': True, 'already_active': result.get('already_active')})
+        return result
+
+    def session_mark(self, event, row_id, label=None):
+        cfg = self.session_config()
+        if cfg is None or self.session is None or event not in cfg.get('marks', self.SESSION_EVENTS):
+            return None
+        params = {'label': label or f'{row_id}:{event}'}
+        if cfg.get('chapters') and event == 'row-start':
+            params['chapter'] = True
+        try:
+            result = self.call(self.session['on'], 'recording.session_mark', params) or {}
+        except Exception as error:  # noqa: BLE001 - a lost mark is logged; the row's own result stands
+            result = {'error': repr(error)[:200], 'active': None}
+        record = {'event': event, 'row': row_id, 'label': params['label'], 'wall': result.get('wall') or time.time(),
+                  'rec_ms': result.get('rec_ms'), 'active': result.get('active')}
+        if result.get('error'):
+            record['error'] = result['error']
+        self._session_log(record)
+        return record
+
+    def session_stop(self):
+        if self.session is None:
+            return None
+        try:
+            result = self.call(self.session['on'], 'recording.session_stop', {}) or {}
+        except Exception as error:  # noqa: BLE001
+            result = {'error': repr(error)[:200]}
+        self._session_log({'event': 'stop', 'wall': result.get('stopped_wall') or time.time(), 'rec_ms': None,
+                           'active': False, 'path': result.get('path'), **({'error': result['error']}
+                                                                            if result.get('error') else {})})
+        self.session = None
+        return result
+
     def run(self, only=None):
         self.outcomes = {}
         self.recovered_to = None
@@ -2034,7 +2118,10 @@ class Runner:
         try:
             return self._run_rows(only)
         finally:
-            self.write_summary()
+            try:
+                self.session_stop()
+            finally:
+                self.write_summary()
 
     def _run_rows(self, only):
         previous_end = self.plan['start']
@@ -2072,6 +2159,8 @@ class Runner:
             self.last_gate_outcome = None
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
+            self.session_start()
+            start_mark = self.session_mark('row-start', row['id'])
             try:
                 if (self.recovered_to != row['id'] and prior_status == 'FAILED'
                         and start_gate_of(self.plan, row) and recover_steps_of(self.plan, row) is not None):
@@ -2140,6 +2229,10 @@ class Runner:
                 raise
             finally:
                 receipt['ended'] = time.time()
+                end_mark = self.session_mark('row-end', row['id'])
+                if self.session is not None:
+                    receipt['rec_ms'] = [start_mark.get('rec_ms') if start_mark else None,
+                                         end_mark.get('rec_ms') if end_mark else None]
                 if self.acquired:
                     receipt['acquired_references'] = self.acquired
                 receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')

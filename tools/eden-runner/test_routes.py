@@ -399,6 +399,72 @@ class SwitchDiscriminationTests(unittest.TestCase):
         self.assertEqual(wrong, [], 'a gate passed another screen')
 
 
+class SessionRecordingTests(unittest.TestCase):
+    """plan "session_recording": one continuous recording, marks around every executed row (failed ones too), a
+    mark per shot, the stop in run()'s finally; a backend without it runs on without one."""
+
+    class Client:
+        def __init__(self, supports=True):
+            self.supports, self.calls, self.rec_ms = supports, [], 0
+
+        def request(self, method, params=None):
+            self.calls.append(method)
+            if method.startswith('recording.session'):
+                if not self.supports:
+                    return {'ok': False, 'error': {'code': 'unknown_method'}}
+                self.rec_ms += 1000
+                return {'ok': True, 'result': {'rec_ms': self.rec_ms, 'active': True, 'wall': 1.0,
+                                               'path': '/rec.mp4' if method.endswith('stop') else None}}
+            if method == 'ui.tree':
+                return {'ok': True, 'result': [{'id': 'w', 'class': 'GRenderWindow'}]}
+            if method == 'ui.screenshot':
+                Path(params['path']).write_bytes(b'png')
+            return {'ok': True, 'result': {}}
+
+    def run_plan(self, client, **extra):
+        folder = Path(tempfile.mkdtemp())
+        plan = {'start': 's', 'gates': {'never': {'kind': 'log', 'source': 'console_log', 'pattern': 'never', 'cap': 0.3}},
+                'session_recording': {'marks': ['row-start', 'row-end', 'shot'], 'chapters': True},
+                'rows': [{'id': 'a', 'start': 's', 'end': 's', 'steps': [{'shot': 'one'}]},
+                         {'id': 'b', 'start': 's', 'end': 's', 'steps': [{'gate': 'never'}]}], **extra}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        log = folder / 'console.log'
+        log.write_text('')
+        r = runner.Runner(folder / 'rows.json', {'sw': {'socket': 'x', 'console_log': str(log)}}, folder / 'out', 15,
+                          client_factory=lambda s: client)
+        try:
+            r.run()
+        except BaseException:
+            pass
+        return folder / 'out'
+
+    def test_marks_and_stop_even_after_a_failure(self):
+        client = self.Client()
+        out = self.run_plan(client)
+        events = [json.loads(l)['event'] for l in (out / 'recording.jsonl').read_text().splitlines()]
+        self.assertEqual(events, ['start', 'row-start', 'shot', 'row-end', 'row-start', 'row-end', 'stop'])
+        self.assertEqual(json.loads((out / 'b.json').read_text())['status'], 'FAILED')
+        self.assertEqual(len(json.loads((out / 'b.json').read_text())['rec_ms']), 2)
+        self.assertEqual(client.calls.count('recording.session_start'), 1)
+        self.assertEqual(client.calls[-1] if client.calls[-1].startswith('recording') else
+                         [c for c in client.calls if c.startswith('recording')][-1], 'recording.session_stop')
+
+    def test_backend_without_it_runs_on(self):
+        client = self.Client(supports=False)
+        out = self.run_plan(client)
+        self.assertFalse((out / 'recording.jsonl').exists())
+        self.assertEqual(json.loads((out / 'a.json').read_text())['status'], 'PASS')
+
+    def test_dry_run_validates_it(self):
+        folder = Path(tempfile.mkdtemp())
+        plan = {'start': 's', 'session_recording': {'marks': ['bogus'], 'log': '../x'},
+                'rows': [{'id': 'a', 'start': 's', 'end': 's', 'steps': [{'shot': 'x'}]}]}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        errors = runner.dry_run(folder / 'rows.json')['errors']
+        self.assertTrue(any('marks' in e for e in errors), errors)
+        self.assertTrue(any('log' in e for e in errors), errors)
+
+
 class SwitchBootTests(unittest.TestCase):
     def run_boot(self, screens):
         """screens: what each look sees, in order ('main', 'profile', 'launch-error' or None)."""

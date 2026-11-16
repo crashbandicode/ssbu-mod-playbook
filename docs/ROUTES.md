@@ -153,6 +153,18 @@ instance differs, and every input is a macro (no manual presses).
   - `test_routes.py` (SwitchDiscriminationTests) pins it: each gate passes only its own screen, at normal and
     dimmed brightness; every other gate's content at its ROI fails, HOME vs main vs TR menu vs HUD included.
   - **The root alternative:** stop the console from dimming. That's a console setting, and the operator's choice.
+- **One recording per session** (plan key `"session_recording": {"marks": ["row-start", "row-end", "shot"],
+  "chapters": true, "log": "recording.jsonl"}`), instead of a `gif` step per moment, which cost about 7 s each on
+  hardware.
+  - **Start and stop:** the runner starts the backend's session recording before the first executed row and stops
+    it in `run()`'s `finally`. The backend is switch-remote's `recording.session_*`, over OBS.
+  - **Marks:** every executed row is marked at its start and end (failed rows included), and so is every `shot`
+    step. Each mark is one JSON line in `<out>/recording.jsonl` (`event`, `row`, `label`, `wall`, `rec_ms`,
+    `frame`). Receipts carry `rec_ms: [start, end]`. Clips and stills are cut from the one recording afterwards.
+  - **If the runner died:** `switch_hw.py down` stops a recording that this run started and never stopped. OBS is
+    shared, so nothing else is touched.
+  - **Backends without it:** the run goes on without a session recording. Eden has no `recording.session_*`
+    methods today.
 - **One driver per console:** `up` refuses while any process holds the tty or the claim file
   (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
 - **Hardware blocks:**

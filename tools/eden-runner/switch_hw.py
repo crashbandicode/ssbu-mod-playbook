@@ -162,6 +162,15 @@ def down(run):
     try:
         client = _client(journal['device'])
         out['reset'] = client.request('input.reset').get('ok')
+        # A session recording this run's runner started and didn't stop (it crashed or was killed): stop it. Only
+        # that one: OBS is shared, so a recording without our open start in recording.jsonl is never touched.
+        log = run / 'out' / 'recording.jsonl'
+        if log.is_file():
+            events = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+            if events and events[-1].get('event') != 'stop' and any(e.get('event') == 'start' for e in events):
+                stopped = client.request('recording.session_stop', {})
+                out['session_stop'] = stopped.get('result') if stopped.get('ok') else stopped.get('error')
+                journal['session_recording'] = out['session_stop']
         client.close()
     except Exception as error:  # noqa: BLE001 - Down always continues to the release
         out['reset_error'] = repr(error)
