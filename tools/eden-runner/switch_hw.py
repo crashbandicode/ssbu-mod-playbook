@@ -422,7 +422,19 @@ def wait_log_line(log, cap_s, start=None, poll=0.25, clock=time.monotonic):
     return None
 
 
-def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None, log_cap_s=30.0):
+def external_log_connected(path):
+    """The last connection line of another process's Skyline capture, or None. This module's capture writes
+    `[capture] connected …`; switch-remote's skyline_tcplog.py writes `### <UTC> connected (#n)`."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    lines = [line for line in path.read_bytes().decode(errors='replace').splitlines()
+             if line.startswith(CONNECTED) or re.match(r'### \S+ connected \(#\d+\)', line)]
+    return lines[-1] if lines else None
+
+
+def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None, log_cap_s=30.0,
+       log_file=None):
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
     others = holders(device)
@@ -457,19 +469,29 @@ def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None, log
         client.request('input.reset')
         client.close()
         journal.update(version=version['result'], still=str(still))
-        host, _, port = log_host.rpartition(':')
-        log = run / 'skyline.log'
-        log_start = log.stat().st_size if log.is_file() else 0  # lines from this capture on count as live
-        proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), 'capture-log', str(log),
-                                 '--log-host', log_host], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=open(run / 'capture-log.err', 'ab'), start_new_session=True)
-        journal.update(capture_pid=proc.pid, log=str(log), log_host=log_host)
-        live = wait_log_line(log, log_cap_s, start=log_start)
-        if live is None:
-            proc.terminate()
-            raise SystemExit(f'refused: no Skyline log line in {log} within {log_cap_s:.0f} s (log gates would be '
-                             f'blind); is the console on the network and the plugin logging to {log_host}?')
-        journal['log_live'] = live
+        if log_file:
+            # Skyline's logger takes ONE client per game boot. When another process already holds it (the card
+            # installer's capture), a second capture would never connect: use that capture's file instead, and
+            # prove it is the live one by its connection line, never by opening our own.
+            log = Path(log_file)
+            connected = external_log_connected(log)
+            if not connected:
+                raise SystemExit(f'refused: {log} has no capture connection line: not a live capture')
+            journal.update(log=str(log), log_external=True, log_live=connected[:200])
+        else:
+            host, _, port = log_host.rpartition(':')
+            log = run / 'skyline.log'
+            log_start = log.stat().st_size if log.is_file() else 0  # lines from this capture on count as live
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), 'capture-log', str(log),
+                                     '--log-host', log_host], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=open(run / 'capture-log.err', 'ab'), start_new_session=True)
+            journal.update(capture_pid=proc.pid, log=str(log), log_host=log_host)
+            live = wait_log_line(log, log_cap_s, start=log_start)
+            if live is None:
+                proc.terminate()
+                raise SystemExit(f'refused: no Skyline log line in {log} within {log_cap_s:.0f} s (log gates would '
+                                 f'be blind); is the console on the network and the plugin logging to {log_host}?')
+            journal['log_live'] = live
         instances = {'sw': {'socket': f'usb://{device}', 'console_log': str(log), 'skyline_log': str(log),
                             'screenshot_target': 'switch', 'hardware': True}}
         if bridge_host:
@@ -554,6 +576,8 @@ def main(argv=None):
                    help='go up even when OBS cannot split the recording per row (plans without per_row_files)')
     p.add_argument('--bridge-host', default=None,
                    help=f'HOST[:PORT] of the ssbu-hw-bridge NRO (port {BRIDGE_PORT} when omitted)')
+    p.add_argument('--log-file', help="another process's live Skyline capture (the logger takes one client per "
+                                      'boot): use it instead of opening a connection')
     p = sub.add_parser('down')
     p.add_argument('run')
     p = sub.add_parser('capture-log')
@@ -573,7 +597,8 @@ def main(argv=None):
     if getattr(args, 'bridge_host', None) and ':' not in args.bridge_host:
         args.bridge_host = f'{args.bridge_host}:{BRIDGE_PORT}'
     if args.cmd == 'up':
-        up(args.run, args.device, args.log_host, args.owner, args.allow_no_split, args.bridge_host)
+        up(args.run, args.device, args.log_host, args.owner, args.allow_no_split, args.bridge_host,
+           log_file=args.log_file)
     elif args.cmd == 'down':
         down(args.run)
     elif args.cmd == 'restore':

@@ -371,6 +371,19 @@ class SwitchHwTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
                 switch_hw.bridge_state(run, fresh=['roster'], cap=0.3)
 
+    def test_external_log_needs_a_connection_line(self):
+        import switch_hw
+        folder = Path(tempfile.mkdtemp())
+        mine, theirs, dead = folder / 'a.log', folder / 'b.log', folder / 'c.log'
+        mine.write_text('[capture] connected 192.168.0.224:6969 2026-11-16T19:20:09Z\nTCP Socket Connected.\n')
+        theirs.write_text('### 2026-11-16T19:20:09.266Z skyline_tcplog start host=192.168.0.224:6969\n'
+                          '### 2026-11-16T19:20:09.269Z connected (#1)\nTCP Socket Connected.\n')
+        dead.write_text('### 2026-11-16T19:20:09.266Z skyline_tcplog start host=192.168.0.224:6969\n')
+        self.assertTrue(switch_hw.external_log_connected(mine).startswith('[capture] connected'))
+        self.assertIn('connected (#1)', switch_hw.external_log_connected(theirs))
+        self.assertIsNone(switch_hw.external_log_connected(dead))
+        self.assertIsNone(switch_hw.external_log_connected(folder / 'missing.log'))
+
     def test_line_writer_keeps_lines_whole(self):
         import io
         import switch_hw
