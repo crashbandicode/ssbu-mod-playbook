@@ -230,6 +230,21 @@ class TableTests(unittest.TestCase):
         self.assertEqual([e['buttons'] for e in tile['events']], [16, 16 | 16384, 0])
 
 
+class ExpectTests(unittest.TestCase):
+    def test_expectations_survive_a_new_runner_process(self):
+        folder = Path(tempfile.mkdtemp())
+
+        class R:
+            out = folder
+        first = FakeCtx.__new__(FakeCtx)
+        first.runner = R()
+        routes.remember(first, stage_id=3)
+        routes.remember(first, p1_kind=0)
+        second = FakeCtx.__new__(FakeCtx)
+        second.runner = R()  # a retry: a new runner object, nothing in memory
+        self.assertEqual(routes.expected(second), {'stage_id': 3, 'p1_kind': 0})
+
+
 class SettledTests(unittest.TestCase):
     def body(self, x, status=0, situation=0):
         return {'x': x, 'y': 0.01, 'status': status, 'situation': situation, 'kind': 0, 'lr': 1.0, 'dmg': 0.0}

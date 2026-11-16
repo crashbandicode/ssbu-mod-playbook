@@ -720,6 +720,30 @@ def fighter_entry(name):
                    'are not picked by kind)')
 
 
+def _expect_file(ctx):
+    out = getattr(ctx.runner, 'out', None)
+    return Path(out) / 'routes-expect.json' if out else None
+
+
+def expected(ctx):
+    """What the route picked (stage id, fighter kinds), kept in the run's out folder so a `run --retry` in a new
+    runner process still asserts it (harness-lib-surface-1: r06 ran in the retry process and lost the stage id)."""
+    found = dict(getattr(ctx.runner, 'routes_expect', {}) or {})
+    path = _expect_file(ctx)
+    if not found and path is not None and path.is_file():
+        found = json.loads(path.read_text())
+    return found
+
+
+def remember(ctx, **values):
+    merged = {**expected(ctx), **values}
+    ctx.runner.routes_expect = merged
+    path = _expect_file(ctx)
+    if path is not None:
+        path.write_text(json.dumps(merged) + '\n')
+    return merged
+
+
 def pick_stage(ctx, stage, allow_derived=False):
     """Stage select -> the named stage, by tile-cursor steps, then A -> the character select.
 
@@ -739,7 +763,7 @@ def pick_stage(ctx, stage, allow_derived=False):
     play(ctx, 'tap-a1')
     gate(ctx, 'css')
     expected = {'stage_id': entry['id'], 'stage': entry['name'], 'tile': entry['tile']}
-    ctx.runner.routes_expect = {**getattr(ctx.runner, 'routes_expect', {}), **expected}
+    remember(ctx, **expected)
     return _save(ctx, 'routes-pick-stage', {**expected, 'walk': walk, 'still': still,
                                             'derived': not entry.get('proven')})
 
@@ -801,8 +825,7 @@ def pick_fighters(ctx, p1, cpu=None, coin_route=False):
     out['p1_walk'] = walker.walk_to(p1_entry['tile'])
     out['p1_still'] = str(ctx.shot(f'routes-css-p1-{_norm(p1_entry["name"])}'))
     play(ctx, 'tap-a1')
-    ctx.runner.routes_expect = {**getattr(ctx.runner, 'routes_expect', {}), 'p1_kind': p1_entry['kind'],
-                                **({'cpu_kind': cpu_entry['kind']} if cpu_entry else {})}
+    remember(ctx, p1_kind=p1_entry['kind'], **({'cpu_kind': cpu_entry['kind']} if cpu_entry else {}))
     out['ready_still'] = str(ctx.shot('routes-css-ready'))
     return _save(ctx, 'routes-pick-fighters', out)
 
@@ -906,7 +929,7 @@ def fixture(ctx, p1=None, cpu=None, stage=None, reset=True, damage=0.0, lr=None,
     picked); reset: the native L+R+A reset first; damage: both bodies' damage after it; lr: P1's facing if given.
     Settled means both bodies grounded and waiting with x/y equal on two consecutive fresh reads, at most `reads`.
     """
-    expect = dict(getattr(ctx.runner, 'routes_expect', {}))
+    expect = expected(ctx)
     want_p1 = fighter_entry(p1)['kind'] if p1 is not None else expect.get('p1_kind')
     want_cpu = fighter_entry(cpu)['kind'] if cpu is not None else expect.get('cpu_kind')
     want_stage = stage_entry(stage)['id'] if stage is not None else expect.get('stage_id')

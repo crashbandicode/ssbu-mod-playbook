@@ -7,9 +7,9 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
 
 ## What is proven, and when to use it
 
-- **Proven host types** (2026-11-16, "Proof" below): the Linux host type (XPS) and the Windows host type (Ally).
-  The Yoga and the Surface haven't booted these blocks; a Yoga proof boot was deferred because the feature lanes
-  have slot priority. Proven blocks:
+- **Proven hosts** (2026-11-16, "Proof" below): the XPS and the Surface (Linux) and the Ally (Windows). The Yoga
+  hasn't booted these blocks; its proof boot was deferred because the feature lanes have slot priority. Proven
+  blocks:
   - `configure_boot`, `load_game`, `wait_lines`, `to_main`;
   - `main_to_stage`, `pick_stage` (by name);
   - `pick_fighters` for P1 only;
@@ -150,6 +150,30 @@ eden-ldn-coexistence runtime-12/13 (Local Wireless). They have not been booted a
 | `enter_training`, `fixture` | both bodies after the native reset, x/y unchanged across 2 fresh reads, damage 0 |
 | `chord` | `tr-save`: `state saved slot=1 entry=1`; `reset-lra`; `tr-load`: `state placed entry=1 x=40 y=24.129 lr=-1` |
 | `back_to_main` | from Training (pause, Quit, held B twice) to the main gate |
+
+### The Surface: `harness-lib-surface-1` (2026-11-16, Up 04:33Z, Down 04:43Z)
+
+- **Setup:** one Eden on display `:74`, with the same 11 rows and plugins and the GDB stub on port 6694.
+  - The host also runs OBS, Claw/OpenCode and a restic backup, so its load average was 6–14 on 8 cores. None of
+    those processes was touched.
+  - Eden's threads were reniced to 10 after Up and before the load, since the lifecycle has no nice option.
+- **Result:** 11/11 PASS.
+  - Battlefield settled at tile 1. Its stage id 0 is in the camera lines; the row's own assertion ran without the
+    expectation (see the retry below).
+  - Final Destination settled at tile 4 and the game reported stage id 3.
+  - Mario was picked; the chords printed their lines and the fixtures settled.
+  - `back_to_main` went quit → character select → stage select → Start fallback → main menu.
+- **Down:** released. The console had 0 lines with `panic`, `abort`, `crash` or `Unmapped`.
+- **What the Surface needed:**
+  - **Rendering:** Vulkan on the discrete Ampere-class GPU; window grabs are 1280x674, the same as the XPS, so the
+    library references match.
+  - **Load:** loading took 150 s; the game reported 43 FPS at `loading_complete`.
+  - **Tile steps:** one 8-frame `tile-*` macro made two steps there. The tile cursor repeats a held step every
+    250 ms of wall time, and 8 frames of a slow game outlast that. The macros now hold the D-pad 2 frames.
+- **Retried once in this boot:** the r05 tile double step above, rerun with `run --retry` after the macro fix.
+  - The retry ran in a new runner process, which didn't have the stage that r04 picked, so r06 skipped its
+    stage-id assertion.
+  - Expectations now persist in `out/routes-expect.json`.
 
 ### Windows host type: `harness-lib-ally-1` (the Ally, 2026-11-16, Up 03:46Z, Down 04:02Z)
 
