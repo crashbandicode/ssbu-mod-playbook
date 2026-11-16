@@ -163,6 +163,9 @@ instance differs, and every input is a macro (no manual presses).
     `frame`). Receipts carry `rec_ms: [start, end]`. Clips and stills are cut from the one recording afterwards.
   - **If the runner died:** `switch_hw.py down` stops a recording that this run started and never stopped. OBS is
     shared, so nothing else is touched.
+  - **Clips:** `/usr/bin/python3 tools/eden-runner/cut_session.py <out> [--only gifs|rows|stills]` cuts each clip from
+    the recording into its preset. It needs PyGObject/GStreamer, so run it without `-I`. Live proof: live-rec-1,
+    2026-11-16.
   - **Backends without it:** the run goes on without a session recording. Eden has no `recording.session_*`
     methods today.
 - **One driver per console:** `up` refuses while any process holds the tty or the claim file
