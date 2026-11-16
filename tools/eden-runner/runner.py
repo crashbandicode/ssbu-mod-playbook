@@ -147,6 +147,8 @@ CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.ge
 # One verb per step. Runner.step_handlers maps each of these to a method; add a kind there, not a new if-chain.
 STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 'call', 'wait_ms', 'gif', 'library')
 UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
+# Shared step-hook modules next to runner.py, named without ".py" in a run step: {"run": "routes:to_main"}.
+SHARED_HOOKS = ('routes', 'routes_online')
 # Eden recording.start limits (tools/edenctl.py, docs/GIFRecording.md): fps 1-30, width 160-1280,
 # duration_ms 100-120000. Presets below are the playbook's defaults (docs/GIFS.md), not a ceiling:
 # a plan or row gif_presets entry, or fields on the gif step, override them. Leaving the operator's
@@ -906,7 +908,11 @@ def load_step(base, spec):
     path, _, function = spec.partition(':')
     if not function:
         raise ValueError(f'step hook {spec!r} needs "<file>.py:<function>"')
-    module_path = Path(path) if Path(path).is_absolute() else base / path
+    if path in SHARED_HOOKS:
+        # The shared route blocks next to this file (docs/ROUTES.md): {"run": "routes:to_main"}.
+        module_path = _HERE / f'{path}.py'
+    else:
+        module_path = Path(path) if Path(path).is_absolute() else base / path
     module_spec = importlib.util.spec_from_file_location('step_hook_' + module_path.stem, module_path)
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)

@@ -1,0 +1,93 @@
+{
+ "about": "ROUTES macros (docs/ROUTES.md). Same-frame chords live in these files and are played with macro.play; never send a chord as separate presses. routes.play() checks each sha256 before playing. Status per entry: \"proven\" names the run that showed it working.",
+ "macros": {
+  "tile-up": {
+   "file": "macros/tile-up.edenmacro.json",
+   "sha256": "3fc24a8af179ecff7a99dc8b87aa99f6ee1b28508831292d2cc78b72b2e6d08a",
+   "cap": 20,
+   "frames": 12,
+   "what": "L3, then L3+Up on frame 2, released frame 10: one tile-cursor step (CSS/SSS)",
+   "source": "authored 2026-11-16 harness-lib; mask shape of rc15-tech owned-chord-lstick-*40 (passed XPS chord1)"
+  },
+  "tile-down": {
+   "file": "macros/tile-down.edenmacro.json",
+   "sha256": "50e5fd84446e5f44631d237fc0f12c8b01c01719888b0fe5305ff092532dd406",
+   "cap": 20,
+   "frames": 12,
+   "what": "L3, then L3+Down: one tile-cursor step",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "tile-left": {
+   "file": "macros/tile-left.edenmacro.json",
+   "sha256": "238f2426aec2aa87f46a0f989d640fe8263ada3a5abb3be00ca1261226a7d49b",
+   "cap": 20,
+   "frames": 12,
+   "what": "L3, then L3+Left: one tile-cursor step",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "tile-right": {
+   "file": "macros/tile-right.edenmacro.json",
+   "sha256": "2109081d1fd62b5b78ef085ff38b5c04a88a53c0247d4128583168b594d35fcd",
+   "cap": 20,
+   "frames": 12,
+   "what": "L3, then L3+Right: one tile-cursor step",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "tap-a1": {
+   "file": "macros/tap-a1.edenmacro.json",
+   "sha256": "a6662d148f41e5c7fabf37fce979325b6749fa8ef66e664be99a78c66b3513dd",
+   "cap": 20,
+   "frames": 8,
+   "what": "A on frame 1, released frame 5 (steve-place shape)",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "tap-b1": {
+   "file": "macros/tap-b1.edenmacro.json",
+   "sha256": "3e52bd1789aada59a521eae856d4f9d36d2fb6c189a511f628d5d82ae8f5acab",
+   "cap": 20,
+   "frames": 8,
+   "what": "B on frame 1, released frame 5",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "tap-plus1": {
+   "file": "macros/tap-plus1.edenmacro.json",
+   "sha256": "425bc0e0d6d6a4f7e659575d926a46ec2d1157ac301d18db4a26cc6415ae9b1d",
+   "cap": 20,
+   "frames": 8,
+   "what": "Plus on frame 1, released frame 5",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "hand-right-6": {
+   "file": "macros/hand-right-6.edenmacro.json",
+   "sha256": "f4003f5c0ce81c6d76c4a27e166f23937038848baf834bf6ca5145d02d05011c",
+   "cap": 20,
+   "frames": 9,
+   "what": "left stick right for 6 frames (CSS empty hand hop)",
+   "source": "authored 2026-11-16 harness-lib"
+  },
+  "reset-lra": {
+   "file": "macros/reset-lra.edenmacro.json",
+   "sha256": "54e917aa28b0af97505e73a53fa991d3f79ed597b79ae8bc07f364c5fc6dbdd7",
+   "cap": 20,
+   "frames": 80,
+   "what": "L, then L+R+A in one frame: the native Training reset",
+   "source": "byte copy of smash-training-lobby/artifacts/rc15-integration/runtime-plan/remaining-2/segments/reset-center.edenmacro.json (remaining-2, PASS 7/7, 2026-11-15)"
+  },
+  "tr-save": {
+   "file": "macros/tr-save.edenmacro.json",
+   "sha256": "fd05baa42ae7353f6be4ef1fa861d55b958ad1de31e05229286ad18b52bbe56c",
+   "cap": 20,
+   "frames": 14,
+   "what": "ZL+Down in one frame: TrainingRooms save-state chord (default button_config.ini)",
+   "source": "byte copy of smash-training-lobby/artifacts/rc15-integration/runtime-plan/remaining-2/segments/chord-save.edenmacro.json (remaining-2 PASS)"
+  },
+  "tr-load": {
+   "file": "macros/tr-load.edenmacro.json",
+   "sha256": "1f1f8ca9d99c990e8fa6ae9348fc31f6ae36e7f2fa09c88d84485abfd2f0cb74",
+   "cap": 20,
+   "frames": 19,
+   "what": "ZL+Up in one frame: TrainingRooms load-state chord (default button_config.ini)",
+   "source": "byte copy of smash-training-lobby/artifacts/rc15-integration/runtime-plan/remaining-2/segments/chord-load.edenmacro.json (remaining-2 PASS)"
+  }
+ }
+}
