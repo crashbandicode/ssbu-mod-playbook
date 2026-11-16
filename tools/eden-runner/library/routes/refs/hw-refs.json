@@ -214,5 +214,25 @@
    "P0b-profile-after-load.png": 216.4,
    "final-still.png": 0.0
   }
+ },
+ "hw-notice-fighters": {
+  "sha256": "169c86b86c115b61790f464e69aabf866ac32721d78fc4febb124a4032952988",
+  "roi": [
+   613,
+   307,
+   667,
+   329
+  ],
+  "source": "switch-hw-session-1 out/T-01/sw-150331Z-597681-home-0.png (Fighters / Loading 3/7)"
+ },
+ "hw-notice-loading": {
+  "sha256": "504e12bdc7fef8de82f8ff21e36eba557c0d12af02f7d02ca0523fa3c5498550",
+  "roi": [
+   594,
+   343,
+   654,
+   366
+  ],
+  "source": "switch-hw-session-1 out/T-01/sw-150331Z-597681-home-0.png (Fighters / Loading 3/7)"
  }
 }

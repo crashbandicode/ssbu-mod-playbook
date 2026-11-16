@@ -173,8 +173,25 @@ instance differs, and every input is a macro (no manual presses).
 - **Hardware blocks:**
   - `switch_boot`: B, HOME, the SSBU tile gate, A, the profile A, then Start until the main menu.
   - `switch_to_training`: Training on the stage select's first tile with whoever P1 is. The tile cursor isn't on
-    the card, so there's no stage or fighter by name.
-  - `tr_menu`: B+Up, the menu gate, B and B, the HUD gate.
+    the card, so there's no stage or fighter by name. Ends with `preload_clear`.
+  - `tr_menu`: `preload_clear`, B+Up, the menu gate, B and B, the HUD gate.
+  - `preload_clear` (`{"run": "routes:preload_clear"}`, or `routes.preload_clear(ctx)` from a hook, on the
+    Training HUD before any menu input):
+    - **Why:** TR's preloader builds the planned fighters after a Training scene starts, and pad input sent
+      meanwhile is lost. In `switch-hw-session-1` T-01 (15:03Z), an R into the TR menu was lost at "Loading 4/7",
+      12 s after the HUD.
+    - **What it gates on:** the notice in the middle of the screen. "Fighters / Loading n/m" means it's still
+      working. Any other "Fighters" state ("Ready 8/8", "All loaded (..)", "Loaded n/m", "Swap .. to load") means
+      it's done.
+    - **An absent box proves nothing.** The box disappears between steps (90 frames per state), and the HUD comes
+      up about 3 s before the first step. The release build logs none of it.
+    - **No preload:** with no Loading notice within `appear` (10 s) and no `[NRO hook] Loaded` line meanwhile,
+      the gate passes.
+    - **Later calls:** a pass is kept in `out/routes-preload.json`, so later calls pass at once until the log
+      gains a `[NRO hook] Loaded` line (a new scene or a fighter change).
+    - **References and proof:** `hw-notice-fighters`, `hw-notice-loading` (from a session-1 frame). Host-tested
+      on synthetic frames, and checked against the session's real frames (Loading 3/7 and 4/7, Ready 8/8, a
+      minigame notice, the HUD, the menu). It hasn't run live yet, and it's unproven on Eden.
   - `switch_close`: HOME, X, then A on the close dialog.
 
 ### Hardware proof: `hw-run-1` (the real Switch, 2026-11-16 12:45–12:49Z)

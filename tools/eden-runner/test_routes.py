@@ -399,6 +399,153 @@ class SwitchDiscriminationTests(unittest.TestCase):
         self.assertEqual(wrong, [], 'a gate passed another screen')
 
 
+class PreloadNoticeTests(unittest.TestCase):
+    """TR's preloader notice (switch-hw-session-1 T-01, 15:03Z: an R lost at "Fighters / Loading 4/7"): the
+    classifier and the preload_clear gate, on frames built from the committed notice references only."""
+
+    BOX = (310, 290, 970, 387)
+
+    @staticmethod
+    def ref(name):
+        from PIL import Image
+        entry = json.loads((routes.ROUTES / 'refs' / 'hw-refs.json').read_text())[name]
+        return Image.open(routes.ROUTES / 'refs' / f'{name}.png').convert('RGB'), entry['roi']
+
+    def frame(self, box=True, header=True, word='Loading', dx=0, dim=1.0, menu=False):
+        from PIL import Image, ImageDraw
+        im = Image.new('RGB', (1280, 720), (13, 13, 13) if menu else (212, 212, 212))
+        draw = ImageDraw.Draw(im)
+        if not menu:
+            for x in range(0, 1280, 48):  # the Training stage grid
+                draw.line([(x, 0), (x, 720)], fill=(150, 150, 150), width=2)
+            for y in range(0, 720, 48):
+                draw.line([(0, y), (1280, y)], fill=(150, 150, 150), width=2)
+        else:
+            draw.text((60, 140), 'Reactions (4)   Mash   0 of 30', fill=(230, 230, 230))
+        if box:
+            draw.rectangle(self.BOX, fill=(13, 13, 13))
+            if header:
+                head, roi = self.ref('hw-notice-fighters')
+                im.paste(head, tuple(roi[:2]))
+            if word:
+                img, roi = self.ref('hw-notice-loading')
+                if word == 'Load':  # "Loaded n/m" and "All loaded" share it: blank "ing" (from column 37)
+                    img = img.copy()
+                    ImageDraw.Draw(img).rectangle((37, 0, img.size[0], img.size[1]), fill=(13, 13, 13))
+                elif word == 'Loaded':  # "Load" + an "e"-like (the "o") + the "d", glyph-aligned
+                    base = img.copy()
+                    img = base.copy()
+                    ImageDraw.Draw(img).rectangle((37, 0, img.size[0], img.size[1]), fill=(13, 13, 13))
+                    img.paste(base.crop((9, 0, 19, base.size[1])), (38, 0))
+                    img.paste(base.crop((28, 0, 37, base.size[1])), (49, 0))
+                elif word == 'other':  # some other second line ("Ready 7/7", "Swap P1 once to load")
+                    img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                im.paste(img, (roi[0] + dx, roi[1]))
+        if dim != 1.0:
+            im = im.point(lambda v: int(v * dim))
+        return im
+
+    def save(self, im, folder, name):
+        path = Path(folder) / f'{name}.png'
+        im.save(path)
+        return path
+
+    def test_classifier(self):
+        folder = tempfile.mkdtemp()
+        cases = {
+            'loading': dict(), 'loading-right': dict(dx=24), 'loading-left': dict(dx=-30),
+            'loading-dim': dict(dim=0.33),
+            'final-load': dict(word='Load'), 'final-loaded': dict(word='Loaded'), 'final-other': dict(word='other'),
+            'final-blank': dict(word=None), 'final-dim': dict(word='Load', dim=0.35),
+            'other-notice': dict(header=False, word='other'), 'stage': dict(box=False),
+            'stage-dim': dict(box=False, dim=0.33), 'menu': dict(box=False, menu=True),
+            'menu-with-box-pixels': dict(menu=True)}
+        want = {'loading': 'loading', 'loading-right': 'loading', 'loading-left': 'loading', 'loading-dim': 'loading',
+                'final-load': 'fighters', 'final-loaded': 'fighters', 'final-other': 'fighters',
+                'final-blank': 'fighters', 'final-dim': 'fighters', 'other-notice': 'other', 'stage': None,
+                'stage-dim': None, 'menu': None, 'menu-with-box-pixels': None}
+        got = {name: routes.preload_notice(self.save(self.frame(**kw), folder, name)) for name, kw in cases.items()}
+        self.assertEqual(got, want)
+
+    def test_word_margin(self):
+        """The "Loading" word stays far from its look-alikes: the limit (0.3) sits between them."""
+        word, _ = self.ref('hw-notice-loading')
+        ref = routes._ink(word)
+        self.assertEqual(routes.ink_mismatch(ref, ref), 0.0)
+        for kw in (dict(word='Load'), dict(word='Loaded')):
+            im = self.frame(**kw)
+            _, roi = self.ref('hw-notice-loading')
+            self.assertGreater(routes.ink_mismatch(routes._ink(im.crop(tuple(roi))), ref), 0.4, kw)
+
+    def ctx_with_frames(self, frames, on_look=None):
+        out = Path(tempfile.mkdtemp())
+        log = out / 'skyline.log'
+        log.write_text('[NRO hook] Loaded richter. BindFlag: Lazy\n')
+        fake = FakeRunner({'socket': 'usb:///dev/ttyACM0', 'console_log': str(log)}, None)
+        fake.out = str(out)
+        row = out / 'S-BOOT'
+        row.mkdir()
+        ctx = FakeCtx(fake, row)
+        seq = list(frames)
+        looks = []
+
+        def shot(name):
+            kw = seq.pop(0) if len(seq) > 1 else seq[0]
+            looks.append(kw)
+            if on_look:
+                on_look(len(looks), log)
+            return self.save(self.frame(**kw), row, f'{name}-{len(looks)}')
+        ctx.shot = shot
+        return ctx, log, looks
+
+    def test_gate_waits_through_gaps_for_the_final_notice(self):
+        none, loading, final = dict(box=False), dict(), dict(word='Load')
+        # HUD before the preloader starts, Loading, a gap between steps, Loading again, the final notice.
+        ctx, log, looks = self.ctx_with_frames([none, loading, none, none, loading, final])
+        result = routes.preload_clear(ctx, cap=30, appear=60)
+        self.assertEqual(result['preload'], 'final notice')
+        self.assertEqual(len(looks), 6)
+        self.assertEqual([k for _, k in result['looks']], [None, 'loading', None, 'loading', 'fighters'])
+        record = json.loads((Path(ctx.runner.out) / 'routes-preload.json').read_text())
+        self.assertEqual(record['size'], log.stat().st_size)
+        # Same scene: passes at once, no look.
+        again = routes.preload_clear(ctx, cap=30, appear=60)
+        self.assertEqual(again['preload'], 'done earlier')
+        self.assertEqual(len(looks), 6)
+        # Unloads (helpers given back) don't re-arm it; a new load (new scene, fighter change) does.
+        with log.open('a') as f:
+            f.write('[NRO hook] Unloaded lucas.\n')
+        self.assertEqual(routes.preload_clear(ctx, cap=30, appear=60)['preload'], 'done earlier')
+        with log.open('a') as f:
+            f.write('[NRO hook] Loaded mario. BindFlag: Lazy\n')
+        self.assertEqual(routes.preload_clear(ctx, cap=30, appear=60)['preload'], 'final notice')
+        self.assertEqual(len(looks), 7)
+
+    def test_no_notice_needs_the_appear_window_and_a_quiet_log(self):
+        def loads(n, log):
+            if n <= 4:
+                with log.open('a') as f:
+                    f.write(f'[NRO hook] Loaded fighter{n}. BindFlag: Lazy\n')
+        ctx, _, looks = self.ctx_with_frames([dict(box=False)], on_look=loads)
+        result = routes.preload_clear(ctx, cap=30, appear=1.0)
+        self.assertEqual(result['preload'], 'no notice')
+        self.assertGreaterEqual(len(looks), 5)  # not before the loads stopped
+        self.assertGreaterEqual(result['seconds'], 1.0)
+
+    def test_a_standing_other_notice_is_no_preload(self):
+        ctx, _, _ = self.ctx_with_frames([dict(header=False, word='other')])
+        self.assertEqual(routes.preload_clear(ctx, cap=30, appear=0.6)['preload'], 'no notice')
+
+    def test_gate_fails_while_loading_never_ends(self):
+        ctx, _, _ = self.ctx_with_frames([dict()])
+        with self.assertRaisesRegex(RuntimeError, 'did not finish'):
+            routes.preload_clear(ctx, cap=1, appear=60)
+
+    def test_refs_are_pinned(self):
+        for name in ('hw-notice-fighters', 'hw-notice-loading'):
+            self.assertIsNotNone(routes._notice_ref(name)[0])
+
+
 class SessionRecordingTests(unittest.TestCase):
     """plan "session_recording": one continuous recording, marks around every executed row (failed ones too), a
     mark per shot, the stop in run()'s finally; a backend without it runs on without one."""

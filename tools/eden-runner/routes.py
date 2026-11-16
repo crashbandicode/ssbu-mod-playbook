@@ -1198,6 +1198,148 @@ def switch_boot(ctx, cap=420):
                                             'shot': str(ctx.shot('routes-switch-main'))})
 
 
+# --- TrainingRooms' preloader ("Fighters" notice): no menu input until it is done ---------------------------------
+# After a Training scene starts, TR's Cycle Preload builds the planned fighters and reports it in TR's notice box
+# (the middle of the screen): "Fighters / Loading n/m" while it works, then one final state ("All loaded (..)",
+# "Ready n/m", "Loaded n/m", "Swap .. to load"). Pad input is lost while it builds (switch-hw-session-1 T-01, 15:03Z:
+# an R into the TR menu was lost at "Loading 4/7", 12 s after the Training HUD). Each Loading state shows 90 frames
+# and the final one 180 (Swap: 120), so the box also disappears between steps: an absent box alone is no proof.
+# The release build logs none of it ([PreloadStatus] is diagnostic-only); its loads show as "[NRO hook] Loaded x".
+# The quick menu hides the notice. References: hw-notice-fighters / hw-notice-loading (hardware OBS frames).
+NOTICE_INSIDE = (400, 294, 880, 306)  # inside the box, above its header text
+NOTICE_ABOVE = (400, 272, 880, 284)   # the stage just above the box
+NOTICE_WORD_SLIDE = 48                # "Loading n/m" is centred, so two-digit counts move the word
+NRO_LOADED = re.compile(rb'\[NRO hook\] Loaded ')
+
+
+def _ink(image):
+    """Text mask of a crop: pixels brighter than halfway between its darkest and brightest. Dimming keeps it."""
+    gray = image.convert('L')
+    lo, hi = gray.getextrema()
+    if hi - lo < 40:
+        return None
+    cut = (lo + hi) / 2
+    return [v > cut for v in gray.tobytes()]
+
+
+def ink_mismatch(a, b):
+    """Differing text pixels over all text pixels of two masks (0 = the same glyphs, 1 = nothing in common)."""
+    if a is None or b is None or len(a) != len(b):
+        return 1.0
+    union = sum(1 for x, y in zip(a, b) if x or y)
+    return sum(1 for x, y in zip(a, b) if x != y) / union if union else 1.0
+
+
+def _notice_ref(name):
+    from PIL import Image
+    entry = json.loads((ROUTES / 'refs' / 'hw-refs.json').read_text())[name]
+    path = ROUTES / 'refs' / f'{name}.png'
+    if _sha256(path) != entry['sha256']:
+        raise RuntimeError(f'{path} does not match its sha256 {entry["sha256"][:12]}')
+    with Image.open(path) as im:
+        return _ink(im), tuple(entry['roi'])
+
+
+def preload_notice(png, limit=0.3):
+    """What TR's notice box shows in one 1280x720 frame: 'loading' (the preloader at "Loading n/m"), 'fighters'
+    (the preloader at any other state: its work is over), 'other' (another notice), or None (no box)."""
+    from PIL import Image, ImageStat
+    with Image.open(png) as im:
+        frame = im.convert('RGB')
+    if frame.size != (1280, 720):
+        frame = frame.resize((1280, 720), Image.Resampling.BOX)
+    gray = frame.convert('L')
+    inside, above = ImageStat.Stat(gray.crop(NOTICE_INSIDE)), ImageStat.Stat(gray.crop(NOTICE_ABOVE))
+    # A flat near-black band under the lit stage; a dimmed screen keeps the ratio, the TR menu is dark above too.
+    if not (inside.stddev[0] < 6 and inside.mean[0] < 40 and above.mean[0] > 2 * inside.mean[0] + 15):
+        return None
+    header, roi = _notice_ref('hw-notice-fighters')
+    if ink_mismatch(_ink(frame.crop(roi)), header) > limit:
+        return 'other'
+    word, (x0, y0, x1, y1) = _notice_ref('hw-notice-loading')
+    best = min(ink_mismatch(_ink(frame.crop((x0 + dx, y0, x1 + dx, y1))), word)
+               for dx in range(-NOTICE_WORD_SLIDE, NOTICE_WORD_SLIDE + 1))
+    return 'loading' if best <= limit else 'fighters'
+
+
+def _preload_record(ctx):
+    out = getattr(ctx.runner, 'out', None)
+    return Path(out) / 'routes-preload.json' if out else None
+
+
+def _log_size(path):
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
+def _loaded_since(path, offset):
+    """True when the log gained an "[NRO hook] Loaded" line after offset (or shrank: rotated, unknown)."""
+    size = _log_size(path)
+    if size is None or size < offset:
+        return True
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        return bool(NRO_LOADED.search(f.read()))
+
+
+def preload_clear(ctx, cap=180, appear=10.0):
+    """Gate: TR's preloader is done in this Training scene, so menu input isn't lost. Call it on the Training HUD.
+
+    Passes on the preloader's final notice (a "Fighters" notice that isn't "Loading"), or when no notice comes within
+    `appear` seconds and the log shows no fighter load meanwhile (nothing to preload). A pass records the console log
+    size in out/routes-preload.json; later calls pass at once while the log gains no "[NRO hook] Loaded" line (a new
+    scene or a fighter change loads one and re-arms the gate). Not a sleep: every wait ends on what the screen shows.
+    """
+    try:
+        log = instance_path(ctx, 'console_log')
+    except KeyError:
+        log = None
+    record = _preload_record(ctx)
+    if log is not None and record is not None and record.is_file():
+        last = json.loads(record.read_text())
+        if last.get('log') == str(log) and not _loaded_since(log, last.get('size', 0)):
+            return {'preload': 'done earlier', 'since': last.get('at')}
+    start = time.monotonic()
+    offset = _log_size(log) if log is not None else None
+    quiet_since = start
+    looks, kept = [], []
+    while True:
+        ctx.check_stop()
+        png = Path(frame(ctx, 'preload'))
+        kind = preload_notice(png)
+        now = time.monotonic()
+        if log is not None and offset is not None and _loaded_since(log, offset):
+            quiet_since, offset = now, _log_size(log) or 0
+        if not looks or kind != looks[-1][1]:
+            looks.append((round(now - start, 1), kind))
+            kept.append(png)
+        elif png not in kept:
+            png.unlink(missing_ok=True)
+        seen = any(k == 'loading' for _, k in looks)
+        done = None
+        if kind == 'fighters':
+            done = 'final notice'
+        elif kind != 'loading' and not seen and now - start >= appear and now - quiet_since >= appear / 2:
+            # No box, or another notice (a minigame's standing score, FS-58 "Eggs-ercise"), which the preloader's
+            # notice would queue behind: no Loading seen and no fighter load in the log meanwhile.
+            done = 'no notice'
+        if done:
+            result = {'preload': done, 'seconds': round(now - start, 1), 'looks': looks,
+                      'evidence': [str(p) for p in kept[-3:]]}
+            if record is not None and log is not None:
+                record.write_text(json.dumps({'log': str(log), 'size': _log_size(log) or 0,
+                                              'at': time.strftime('%H:%M:%SZ', time.gmtime()), **result},
+                                             default=str) + '\n')
+            ctx.log({'gate': 'preload-clear', 'on': ctx.on, 'pass': True, **result})
+            return result
+        if now - start > cap:
+            raise RuntimeError(f'preload_clear: the preloader did not finish within {cap} s; looks {looks[-6:]}; '
+                               f'last {png}')
+        time.sleep(0.3)
+
+
 def switch_to_training(ctx):
     """Main menu -> Training on the stage select's first tile (the Training stage) with whoever P1 is.
 
@@ -1217,12 +1359,18 @@ def switch_to_training(ctx):
         out['placed'] = True
     out['ready'] = str(ctx.shot('routes-switch-ready'))
     out['training'] = enter_training(ctx)
+    # The HUD comes up before the preloader starts (T-01, 15:03:27 HUD, 15:03:30 "Loading 3/7"): gate on its end.
+    out['preload'] = preload_clear(ctx)
     return _save(ctx, 'routes-switch-training', out)
 
 
 def tr_menu(ctx):
-    """Training HUD -> the TrainingRooms menu (B+Up in one frame) -> closed again (B, B), each proven by a gate."""
+    """Training HUD -> the TrainingRooms menu (B+Up in one frame) -> closed again (B, B), each proven by a gate.
+    On a real Switch it waits for TR's preloader first (preload_clear): input sent while it builds is lost. (The
+    notice references are hardware frames; on Eden a row calls routes:preload_clear itself once that is proven.)"""
     gate(ctx, 'training')
+    if on_switch(ctx):
+        preload_clear(ctx)
     play(ctx, 'tr-menu-open')
     opened = gate(ctx, 'tr-menu')
     play(ctx, 'tr-menu-close')
