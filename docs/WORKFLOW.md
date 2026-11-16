@@ -256,6 +256,21 @@ freed about 106 GB.
 - **Check before you build:** run `df -h /` before a build or an Eden
   launch, and stop below 40 GB free. The lifecycle refuses an Eden `Up`
   below 60 GB (`disk_floor_bytes`).
+- **Standing cleanup rule** (proposed 2026-11-16, after the Yoga and XPS sweep; operator: "we shouldn't be out of
+  space if we've been cleaning up properly"):
+  - **Run folders** (`/home/intpa/eden-runs/<label>`): once Down has pruned the copies, the folder still holds
+    `out/`, the receipts and `post-run-*`. Delete it when **all** of these hold:
+    - its release is proven (RESULTS `released=True`, or a ledger RELEASED for its lifecycle token);
+    - it is at least 6 h old;
+    - no process uses it;
+    - an artifacts manifest or receipt cites the label (the harvest exists on the Surface).
+    Pinned input folders (`inputs-*`, `_*-inputs`) stay while any config pins them.
+  - **Lane caches** (`/home/intpa/build-hosts/lanes/<lane>`): each lane deletes its own cache when its branch
+    merges or the lane ends. Another worker may delete a cache only when it is unused, unwritten for 6 h and not the
+    newest dir of an active lane family.
+  - **The sweep:** first a dry-run table per host (path, size, last write, the reason, the evidence), then exactly
+    that list, then before/after free space. Never touch Games, `.steam`, `.codex`, `.local`, `.cache`,
+    `eden-assets`, other projects' folders, playbook clones or the Eden install.
 - **When the work is done:** delete its build products and keep the NROs,
   receipts, logs and reports. Write a manifest of what you deleted.
 - **Copies:** link what is identical and copy what is not ([EDEN](EDEN.md),
