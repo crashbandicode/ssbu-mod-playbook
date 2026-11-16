@@ -7,7 +7,8 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
 
 ## What is proven, and when to use it
 
-- **Proven (XPS, 2026-11-16, "Proof" below):**
+- **Proven on the XPS host type only** (2026-11-16, "Proof" below). The Yoga, Surface and Ally haven't booted these
+  blocks; a Yoga proof boot was deferred because the feature lanes have slot priority:
   - `configure_boot`, `load_game`, `wait_lines`, `to_main`;
   - `main_to_stage`, `pick_stage` (by name);
   - `pick_fighters` for P1 only;
@@ -63,10 +64,16 @@ from a constant.
 ### The CPU's coin: not proven
 
 The CPU's coin rests on the Random tile, the last one. Picking it up needs the empty hand moved onto it with the
-analog stick. On 2026-11-16 four approaches on the XPS failed:
-- two missed the coin and pressed A elsewhere, which started Training with a random CPU, because P1 was placed and
-  the screen was ready to fight;
-- one left the hand on the CPU panel.
+analog stick. On 2026-11-16 four approaches on the XPS (`harness-lib-xps-1`, r05) failed:
+1. **From Mii Gunner (tile 85):** P1 placed there, then six 6-frame pushes right, each followed by A. The first A
+   started Training (Mii Gunner against a random Daisy).
+2. **lr-04's recorded route from Steve (78):** `lr04-cpu-approach` and `lr04-cpu-pick` (right 26 and 20 frames,
+   down 14 and 18, then A) left the hand on the CPU panel below the coin. The A did nothing.
+3. **The same two right pushes with no down push** (`coin-pick`, first version): the A started Training.
+4. **The same with 10 frames down:** the A started Training.
+
+Each started Training because P1 was placed and the screen was ready to fight, so an A that misses the coin starts
+the match.
 
 `pick_fighters` therefore refuses a `cpu` argument unless `coin_route` is true, which is for testing a route only.
 Set the CPU with the lane's own fixture and assert it with `fixture {"cpu": …}`.
