@@ -449,6 +449,40 @@ class SessionRecordingTests(unittest.TestCase):
         self.assertEqual(client.calls[-1] if client.calls[-1].startswith('recording') else
                          [c for c in client.calls if c.startswith('recording')][-1], 'recording.session_stop')
 
+    def test_hardware_gif_is_marked_not_recorded(self):
+        folder = Path(tempfile.mkdtemp())
+        plan = {'start': 's', 'session_recording': {'marks': ['row-start', 'row-end']},
+                'rows': [{'id': 'g', 'start': 's', 'end': 's',
+                          'steps': [{'gif': {'name': 'clip', 'preset': 'evidence', 'steps': [{'shot': 'mid'}]}}]}]}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        client = self.Client()
+        r = runner.Runner(folder / 'rows.json', {'sw': {'socket': 'usb:///dev/ttyACM0'}}, folder / 'out', 15,
+                          client_factory=lambda s: client)
+        r.run()
+        events = [json.loads(l) for l in (folder / 'out' / 'recording.jsonl').read_text().splitlines()]
+        self.assertEqual([e['event'] for e in events], ['start', 'row-start', 'gif-start', 'gif-end', 'row-end', 'stop'])
+        self.assertIn('"gif":"clip"', events[2]['label'])
+        self.assertNotIn('recording.start', client.calls)
+        self.assertNotIn('recording.stop', client.calls)
+        receipt = json.loads((folder / 'out' / 'g.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertIn('deferred', receipt['results'][0]['gif'])
+
+    def test_hardware_gif_without_session_is_refused(self):
+        folder = Path(tempfile.mkdtemp())
+        plan = {'start': 's', 'rows': [{'id': 'g', 'start': 's', 'end': 's',
+                                        'steps': [{'gif': {'name': 'clip', 'preset': 'evidence', 'steps': []}}]}]}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        r = runner.Runner(folder / 'rows.json', {'sw': {'socket': 'usb:///dev/ttyACM0'}}, folder / 'out', 15,
+                          client_factory=lambda s: self.Client())
+        try:
+            r.run()
+        except BaseException:
+            pass
+        receipt = json.loads((folder / 'out' / 'g.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertIn('session recording', receipt['error'])
+
     def test_backend_without_it_runs_on(self):
         client = self.Client(supports=False)
         out = self.run_plan(client)

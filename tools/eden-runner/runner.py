@@ -1796,6 +1796,8 @@ class Runner:
     def _step_gif(self, on, step):
         gif = step['gif']
         row = self.current_row or {}
+        if str(self.instances[on].get('socket', '')).startswith(SWITCH_SCHEMES):
+            return self._step_gif_marked(on, step, row)
         spec = resolve_gif_spec(self.plan, row, gif)
         api = gif_api_error(spec)
         if api:
@@ -1842,6 +1844,31 @@ class Runner:
             if status.get('dropped_frames') is not None:
                 info['dropped_frames'] = status['dropped_frames']
         return {'gif': info}
+
+    def _step_gif_marked(self, on, step, row):
+        """A gif on a real Switch: no recording.start/stop per clip (OBS rejected a StartRecord while the previous
+        output was still finalizing, and a short clip's stop came before its start went active: hw-run-2b F04/F08).
+        The session recording runs throughout; this marks gif-start and gif-end, runs the nested steps, and the clip
+        is cut offline from the session recording by those marks (preset, name and out are in the marks)."""
+        gif = step['gif']
+        spec = resolve_gif_spec(self.plan, row, gif)
+        if self.session is None:
+            raise GifRefused(f'gif {gif.get("name")}: on a real Switch a gif is cut from the session recording; '
+                             'set plan "session_recording"', {'why': 'no session recording',
+                                                              'preset': spec.get('preset')})
+        label = json.dumps({'gif': gif.get('name'), 'preset': spec['preset'], 'out': gif.get('out'),
+                            'width': spec['width'], 'fps': spec['fps'], 'max_duration_s': spec['max_duration_s'],
+                            'max_bytes': spec.get('max_bytes')}, separators=(',', ':'))
+        start = self.session_mark('gif-start', row.get('id'), label=label, force=True)
+        nested = []
+        try:
+            for child in gif.get('steps') or []:
+                self.execute_step(child, nested)
+        finally:
+            end = self.session_mark('gif-end', row.get('id'), label=label, force=True)
+        return {'gif': {'deferred': 'cut offline from the session recording', 'name': gif.get('name'),
+                        'preset': spec['preset'], 'out': gif.get('out'),
+                        'rec_ms': [start and start.get('rec_ms'), end and end.get('rec_ms')], 'steps': nested}}
 
     def game_running(self, on):
         """False when status says the game stopped or crashed, or the control call itself failed."""
@@ -2048,7 +2075,7 @@ class Runner:
     # GetRecordStatus.outputDuration, CreateRecordChapter, StopRecord). Clips and stills are cut offline from the one
     # recording using <out>/<log>, instead of a gif step per moment. A backend without these methods (Eden today)
     # logs that once and the run goes on without a session recording.
-    SESSION_EVENTS = ('row-start', 'row-end', 'shot')
+    SESSION_EVENTS = ('row-start', 'row-end', 'shot', 'gif-start', 'gif-end')
 
     def session_config(self):
         cfg = self.plan.get('session_recording')
@@ -2079,9 +2106,9 @@ class Runner:
                            'active': True, 'already_active': result.get('already_active')})
         return result
 
-    def session_mark(self, event, row_id, label=None):
+    def session_mark(self, event, row_id, label=None, force=False):
         cfg = self.session_config()
-        if cfg is None or self.session is None or event not in cfg.get('marks', self.SESSION_EVENTS):
+        if cfg is None or self.session is None or (not force and event not in cfg.get('marks', self.SESSION_EVENTS)):
             return None
         params = {'label': label or f'{row_id}:{event}'}
         if cfg.get('chapters') and event == 'row-start':
