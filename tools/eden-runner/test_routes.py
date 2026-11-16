@@ -32,6 +32,7 @@ class LogCursorTests(unittest.TestCase):
             f.write(' 2\n')
         self.assertEqual(cursor.read(), ['new 2'])
 
+    @unittest.skipIf(os.name == 'nt', 'Windows uses the unheld cursor; a held handle blocks the rename')
     def test_rotation_drains_old_file_then_reads_new(self):
         cursor = routes.LogCursor(self.path)
         with self.path.open('a') as f:

@@ -143,7 +143,7 @@ class LogCursor:
             data = self.pending + self._read_unheld()
             lines = data.split(b'\n')
             self.pending = lines.pop()
-            return [line.decode('utf-8', 'replace') for line in lines if line.strip()]
+            return [line.decode('utf-8', 'replace').rstrip('\r') for line in lines if line.strip()]
         chunks = []
         if self.handle is None:
             self._open(seek_end=False)
@@ -166,7 +166,7 @@ class LogCursor:
         data = self.pending + b''.join(chunks)
         lines = data.split(b'\n')
         self.pending = lines.pop()
-        return [line.decode('utf-8', 'replace') for line in lines if line.strip()]
+        return [line.decode('utf-8', 'replace').rstrip('\r') for line in lines if line.strip()]
 
     def wait(self, pattern, cap, ctx=None, interval=0.1):
         """The first new line matching pattern (a regex), or RuntimeError after cap seconds with the lines seen."""
