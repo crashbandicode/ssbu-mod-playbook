@@ -157,7 +157,8 @@ class RunnerEffects(unittest.TestCase):
                                row('e', 'say FAIL', 'before', 'after', effect=True),
                                row('n', 'say PASS', 'same-before', 'same-after'), row('k', 'say FAIL', 'before', 'after')],
                       require_effect=True, judge={'cmd': 'judge.py', 'wait_s': 60},
-                      known_issues={'a': {'title': 'P1 swap', 'reason': 'portrait', 'rows': ['k']}},
+                      # matched by its exact signature only (no "else all" fallback since switch-hw-session-2)
+                      known_issues={'a': {'title': 'P1 swap', 'reason': 'stand-in judge: FAIL', 'rows': ['k']}},
                       evidence_index={'P1-SWAP-EVIDENCE.md': {'title': 'P1', 'rows': ['p', 'k']}},
                       session_recording={'marks': ['row-start', 'row-end', 'shot'], 'per_row_files': True})
         r.run()

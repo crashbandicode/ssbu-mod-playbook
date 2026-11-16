@@ -1150,9 +1150,7 @@ class Runner:
             except (OSError, ValueError):
                 break
             if receipt.get('status') == 'FAILED':
-                if self.known_issue_row(row_id):
-                    continue
-                streak.append(row_id)
+                streak.append(row_id)  # a family row's FAILED counts; only KNOWN-PRODUCT-ISSUE verdicts are exempt
                 if len(streak) >= int(n):
                     early = {'result': f'{len(streak)} consecutive failed rows by verdict: {", ".join(streak)}',
                              'cause': 'consecutive-failures', 'kind': 'verdicts', 'count': len(streak),
@@ -2173,9 +2171,8 @@ class Runner:
         if consecutive:
             # The operator's stop rule (2026-11-16): a failed row is recorded, recovered (clean state) and the run goes
             # on; it stops only after N failed rows in a row. Replaces the "probable shared cause" count.
-            if self.known_issue_row(row.get('id')):
-                # a row of a known product issue's family: recorded FAILED, not counted toward the stop
-                return kind, cause, None
+            # (switch-hw-session-2, the primary: only a KNOWN-PRODUCT-ISSUE verdict, i.e. a judge reason matching an
+            # issue's exact signature, is exempt; a row merely listed in an issue's family that fails counts.)
             if row.get('id') != getattr(self, '_last_failed_row', None):
                 self.consecutive_failures += 1
                 self._last_failed_row = row.get('id')

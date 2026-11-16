@@ -136,11 +136,15 @@ def merge_receipt(receipt_path, update):
 
 def known_issue(known, verdict):
     """{ids, titles, judge_reason} when a judge FAIL of this row belongs to a known product issue (plan known_issues,
-    already narrowed to the row's families): the issues whose reason regex matches the judge reason, else all."""
+    already narrowed to the row's families): only the issues whose reason regex (the issue's exact signature) matches
+    the judge reason. No match → None: the row stays FAILED (switch-hw-session-2: the old fallback "else all" labelled
+    a clean-state failure and a possible product finding KNOWN-PRODUCT-ISSUE)."""
     if not known or (verdict or {}).get('verdict') != 'FAIL':
         return None
     reason = verdict.get('reason') or ''
-    ids = [k for k, v in known.items() if v.get('reason') and re.search(v['reason'], reason, re.I)] or sorted(known)
+    ids = [k for k, v in known.items() if v.get('reason') and re.search(v['reason'], reason, re.I)]
+    if not ids:
+        return None
     return {'ids': ids, 'titles': [known[k]['title'] for k in ids], 'judge_reason': reason}
 
 
