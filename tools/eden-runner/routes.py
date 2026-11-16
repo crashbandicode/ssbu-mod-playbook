@@ -252,8 +252,10 @@ SWITCH_SCHEMES = ('usb://', 'pi://', 'switch://', 'autopilot://')
 # Real-Switch gates: references cut from the capture card's 1280x720 OBS stills (the switch-hw-ledger-rc15 preamble,
 # reviewed), each checked to pass on its own screen and fail on the others (library/routes/refs/hw-refs.json).
 SWITCH_REFS = {'main': 'hw-main', 'stage': 'hw-sss', 'css': 'hw-css', 'ready': 'hw-ready',
-               'training': 'hw-training', 'tr-menu': 'hw-tr-menu', 'profile': 'hw-profile'}
-SWITCH_CAPS = {'main': 10, 'stage': 45, 'css': 60, 'ready': 10, 'training': 60, 'tr-menu': 10, 'profile': 10}
+               'training': 'hw-training', 'tr-menu': 'hw-tr-menu', 'profile': 'hw-profile',
+               'launch-error': 'hw-launch-error'}
+SWITCH_CAPS = {'main': 10, 'stage': 45, 'css': 60, 'ready': 10, 'training': 60, 'tr-menu': 10, 'profile': 10,
+               'launch-error': 5}
 
 
 def on_switch(ctx):
@@ -1095,8 +1097,8 @@ def switch_boot(ctx, cap=420):
         return {'already': 'main'}
     log = LogCursor(instance_path(ctx, 'console_log'))
     play(ctx, 'tap-b1')
-    launched = ctx.call('switch.launch', {}, job_cap=30)
-    looks = []
+    launched = [ctx.call('switch.launch', {}, job_cap=30)]
+    looks, notes = [], []
     until = time.monotonic() + cap
     install = None
     while True:
@@ -1111,12 +1113,23 @@ def switch_boot(ctx, cap=420):
             looks.append('profile')
             play(ctx, 'tap-a1')
             continue
+        if passes(ctx, 'launch-error', 2):
+            # "Unable to start software" (switch-hw-ledger launch 1, 12:14Z: erpt 2009-0005, loader InvalidNso at
+            # process creation; a relaunch 8 s after the Close booted). The transient rule: OK, then ONE relaunch.
+            looks.append('launch-error')
+            if len(launched) > 1:
+                raise RuntimeError('switch_boot: "Unable to start software" again after one relaunch; erpt 2009-0005 '
+                                   'suspected, FTP-verify the card before another try')
+            notes.append('launch error dismissed and relaunched once; erpt 2009-0005 suspected; FTP-verify')
+            ctx.call('switch.dismiss', {}, job_cap=30)
+            launched.append(ctx.call('switch.launch', {}, job_cap=30))
+            continue
         looks.append('start')
         play(ctx, 'attract-cancel')
         if time.monotonic() > until:
             raise RuntimeError(f'switch_boot: no main menu within {cap} s; looks {looks[-6:]}')
     log.close()
-    return _save(ctx, 'routes-switch-boot', {'launch': launched, 'looks': looks, 'tr_install': install,
+    return _save(ctx, 'routes-switch-boot', {'launch': launched, 'looks': looks, 'notes': notes, 'tr_install': install,
                                             'shot': str(ctx.shot('routes-switch-main'))})
 
 

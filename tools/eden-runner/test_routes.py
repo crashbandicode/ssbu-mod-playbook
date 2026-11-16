@@ -352,6 +352,48 @@ class SwitchGateTests(unittest.TestCase):
             routes.gate(ctx, 'native-pause', cap=1)
 
 
+class SwitchBootTests(unittest.TestCase):
+    def run_boot(self, screens):
+        """screens: what each look sees, in order ('main', 'profile', 'launch-error' or None)."""
+        folder = Path(tempfile.mkdtemp())
+        log = folder / 'skyline.log'
+        log.write_text('')
+        calls, played = [], []
+        seq = list(screens)
+        state = {'now': None}
+
+        def passes(ctx, name, cap):
+            if name == 'main':  # every look starts with main: take the next screen
+                state['now'] = seq.pop(0) if seq else None
+            return state['now'] == name
+
+        ctx = FakeCtx.__new__(FakeCtx)
+        ctx.runner, ctx.on, ctx.row_dir = type('R', (), {'plan': {'gates': {}}})(), 'sw', folder
+        ctx.instance = {'socket': 'usb:///dev/ttyACM0', 'console_log': str(log)}
+        ctx.call = lambda method, params=None, job_cap=15: calls.append(method) or {'ok': True}
+        ctx.check_stop = lambda: None
+        ctx.shot = lambda name: str(folder / f'{name}.png')
+        old_passes, old_play = routes.passes, routes.play
+        routes.passes, routes.play = passes, lambda c, name: played.append(name)
+        try:
+            return routes.switch_boot(ctx, cap=5), calls, played
+        finally:
+            routes.passes, routes.play = old_passes, old_play
+
+    def test_profile_then_start_then_main(self):
+        out, calls, played = self.run_boot([None, 'profile', None, 'main'])
+        self.assertEqual(calls, ['switch.launch'])
+        self.assertEqual(played, ['tap-b1', 'tap-a1', 'attract-cancel'])
+        self.assertEqual(out['looks'][-1], 'main')
+
+    def test_launch_error_relaunches_once_then_fails(self):
+        out, calls, _ = self.run_boot([None, 'launch-error', 'main'])
+        self.assertEqual(calls, ['switch.launch', 'switch.dismiss', 'switch.launch'])
+        self.assertIn('erpt 2009-0005', out['notes'][0])
+        with self.assertRaises(RuntimeError):
+            self.run_boot([None, 'launch-error', 'launch-error'])
+
+
 class ExpectTests(unittest.TestCase):
     def test_expectations_survive_a_new_runner_process(self):
         folder = Path(tempfile.mkdtemp())

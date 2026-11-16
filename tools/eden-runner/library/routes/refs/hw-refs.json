@@ -17,7 +17,9 @@
    "F01-menu-footer-menu-open.png": 105.9,
    "F01-menu-footer-hud-before.png": 87.5,
    "P0-title-title.png": 82.1,
-   "P0-profile-profile-select.png": 126.2
+   "P0-profile-profile-select.png": 126.2,
+   "P0-profile-after-load.png": 116.3,
+   "P0b-profile-after-load.png": 116.3
   }
  },
  "hw-sss": {
@@ -38,7 +40,9 @@
    "F01-menu-footer-menu-open.png": 85.1,
    "F01-menu-footer-hud-before.png": 192.2,
    "P0-title-title.png": 42.0,
-   "P0-profile-profile-select.png": 128.2
+   "P0-profile-profile-select.png": 128.2,
+   "P0-profile-after-load.png": 31.8,
+   "P0b-profile-after-load.png": 31.8
   }
  },
  "hw-css": {
@@ -59,7 +63,9 @@
    "F01-menu-footer-menu-open.png": 103.4,
    "F01-menu-footer-hud-before.png": 68.1,
    "P0-title-title.png": 64.7,
-   "P0-profile-profile-select.png": 107.2
+   "P0-profile-profile-select.png": 107.2,
+   "P0-profile-after-load.png": 116.4,
+   "P0b-profile-after-load.png": 119.4
   }
  },
  "hw-ready": {
@@ -80,7 +86,9 @@
    "F01-menu-footer-menu-open.png": 59.4,
    "F01-menu-footer-hud-before.png": 173.5,
    "P0-title-title.png": 83.0,
-   "P0-profile-profile-select.png": 94.4
+   "P0-profile-profile-select.png": 94.4,
+   "P0-profile-after-load.png": 58.0,
+   "P0b-profile-after-load.png": 58.0
   }
  },
  "hw-training": {
@@ -101,7 +109,9 @@
    "F01-menu-footer-menu-open.png": 135.9,
    "F01-menu-footer-hud-before.png": 5.1,
    "P0-title-title.png": 168.5,
-   "P0-profile-profile-select.png": 35.2
+   "P0-profile-profile-select.png": 35.2,
+   "P0-profile-after-load.png": 178.7,
+   "P0b-profile-after-load.png": 178.7
   }
  },
  "hw-tr-menu": {
@@ -122,7 +132,9 @@
    "F01-menu-footer-menu-open.png": 0.0,
    "F01-menu-footer-hud-before.png": 103.1,
    "P0-title-title.png": 169.4,
-   "P0-profile-profile-select.png": 205.0
+   "P0-profile-profile-select.png": 205.0,
+   "P0-profile-after-load.png": 34.7,
+   "P0b-profile-after-load.png": 29.0
   }
  },
  "hw-profile": {
@@ -143,7 +155,32 @@
    "F01-menu-footer-menu-open.png": 212.2,
    "F01-menu-footer-hud-before.png": 27.8,
    "P0-title-title.png": 173.6,
-   "P0-profile-profile-select.png": 0.0
+   "P0-profile-profile-select.png": 0.0,
+   "P0-profile-after-load.png": 214.3,
+   "P0b-profile-after-load.png": 225.5
+  }
+ },
+ "hw-launch-error": {
+  "source": "preamble/P0-profile-after-load.png",
+  "roi": [
+   380,
+   280,
+   720,
+   320
+  ],
+  "sha256": "f0593cca96025925f6b40255fdc556c0109e46d156c0eec4fb12fb6b8791268b",
+  "diffs": {
+   "P0-main2-m1.png": 136.5,
+   "P1-main-to-sss-sss.png": 109.3,
+   "P2d-hand-hand-up.png": 110.1,
+   "P2d-hand-picked.png": 125.7,
+   "P2e-plus-training-entered.png": 193.8,
+   "F01-menu-footer-menu-open.png": 37.8,
+   "F01-menu-footer-hud-before.png": 191.2,
+   "P0-title-title.png": 81.7,
+   "P0-profile-profile-select.png": 103.9,
+   "P0-profile-after-load.png": 0.0,
+   "P0b-profile-after-load.png": 29.0
   }
  }
 }

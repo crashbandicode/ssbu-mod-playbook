@@ -154,6 +154,23 @@ instance differs, and every input is a macro (no manual presses).
   - `tr_menu`: B+Up, the menu gate, B and B, the HUD gate.
   - `switch_close`: HOME, X, then A on the close dialog.
 
+### Hardware proof: `hw-run-1` (the real Switch, 2026-11-16 12:45–12:49Z)
+
+The console was handed over by switch-remote-2, claimed and released. The run was unattended: 20 `macro.play`
+calls, no direct `input.button` or `input.stick` calls.
+
+| Row | Shown |
+| --- | --- |
+| h01 boot | B, `switch.launch` (SSBU-tile gate, A), the profile A, then Start ×11 through the movie and title to the main gate (95 s); the TrainingRooms rc.15 install line on the live Skyline log |
+| h02 Training | main → stage select (gate) → A → CSS (gate) → hand up + A (P1 placed) → READY → Plus → the Training HUD gate |
+| h03 TR menu | B+Up → the TrainingRooms menu gate → B, B → the HUD gate |
+| h04 close | `switch.terminate`: HOME (SSBU-tile gate), X, the close dialog, A; the final still is HOME with SSBU selected and closed |
+
+- **Evidence:** `smash-training-lobby/artifacts/harness-lib/hw-proof-1/`.
+- **Launch errors:** `switch_boot` also recognises "Unable to start software" (switch-hw-ledger launch 1: erpt
+  2009-0005). It presses OK and relaunches once, notes "FTP-verify", and fails on a second error.
+  - The host tests cover that branch. The console hasn't shown it in this proof.
+
 ## What the selects need
 
 - **Leaving a select:** the character and stage selects go back only on a held B (`leave-css`, 90 frames); a tap
