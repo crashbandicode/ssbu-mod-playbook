@@ -108,7 +108,10 @@ class LineWriter:
 
 
 CONNECTED = '[capture] connected'
-IDLE_S = 120.0
+# None: a quiet connection is kept. Skyline's TCP logger takes ONE client per game boot, so dropping a quiet but live
+# connection (switch-hw-session-2, 17:53Z: "idle 120 s: reconnecting") lost the log for the rest of the boot; a dead
+# peer is found by the TCP keepalive below instead. A number re-enables the old drop-and-reconnect (tests, Eden).
+IDLE_S = None
 
 
 def _keepalive(sock):
@@ -127,8 +130,9 @@ def _keepalive(sock):
 def capture_log(path, host, port, stop=None, connect=socket.create_connection, retry_s=0.5, idle_s=IDLE_S,
                 clock=time.monotonic):
     """Read Skyline's TCP log forever (reconnecting) and append complete lines to path. Read-only. Each connection
-    writes a `[capture] connected host:port <UTC>` line (up's liveness gate reads it); a connection with no data for
-    idle_s seconds is dropped and made again (a half-open socket never ends on its own)."""
+    writes a `[capture] connected host:port <UTC>` line (up's liveness gate reads it). A quiet connection is kept
+    (idle_s None, the default: TCP keepalive ends a half-open one); with idle_s set, a connection with no data for
+    idle_s seconds is dropped and made again."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('ab') as f:
@@ -148,7 +152,7 @@ def capture_log(path, host, port, stop=None, connect=socket.create_connection, r
                     try:
                         data = sock.recv(65536)
                     except socket.timeout:
-                        if clock() - last > idle_s:
+                        if idle_s is not None and clock() - last > idle_s:
                             writer.feed(f'[capture] idle {idle_s:.0f} s: reconnecting\n'.encode())
                             break
                         continue

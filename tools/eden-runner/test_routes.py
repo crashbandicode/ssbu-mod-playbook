@@ -435,6 +435,34 @@ class SwitchHwTests(unittest.TestCase):
                               clock=lambda: now[0])
         self.assertEqual(path.read_text().count('idle 120 s: reconnecting'), 2)  # half-open: not forever
 
+    def test_capture_keeps_a_quiet_connection_by_default(self):
+        """Skyline takes one client per boot: the default never drops a quiet live connection (session-2 17:53Z)."""
+        import switch_hw
+        calls, now = [], [0.0]
+
+        class Quiet:
+            def settimeout(self, t):
+                pass
+
+            def setsockopt(self, *a):
+                pass
+
+            def recv(self, n):
+                now[0] += 50.0
+                raise switch_hw.socket.timeout()
+
+            def close(self):
+                pass
+
+        def connect(addr, timeout):
+            calls.append(addr)
+            return Quiet()
+        path = Path(tempfile.mkdtemp()) / 'skyline.log'
+        switch_hw.capture_log(path, 'h', 1, stop=lambda: now[0] > 1000, connect=connect, retry_s=0,
+                              clock=lambda: now[0])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('reconnecting', path.read_text())
+
     def test_up_refuses_when_obs_cannot_split_per_row(self):
         import contextlib
         import io
