@@ -65,6 +65,14 @@
    "what": "left stick right for 6 frames (CSS empty hand hop)",
    "source": "authored 2026-11-16 harness-lib"
   },
+  "coin-pick": {
+   "file": "macros/coin-pick.edenmacro.json",
+   "sha256": "ef2c526343348b89dd25ccb0aacf5e7e01d3676561783015f2b6f4fb1c079488",
+   "cap": 20,
+   "frames": 93,
+   "what": "CSS: empty hand from Steve (78) right 26+20 frames onto the CPU coin on Random (86), A, then L3+Left",
+   "source": "authored 2026-11-16 harness-lib from library lr04-cpu-approach/lr04-cpu-pick without their down pushes"
+  },
   "reset-lra": {
    "file": "macros/reset-lra.edenmacro.json",
    "sha256": "54e917aa28b0af97505e73a53fa991d3f79ed597b79ae8bc07f364c5fc6dbdd7",

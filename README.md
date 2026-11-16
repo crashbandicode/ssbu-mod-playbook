@@ -12,6 +12,7 @@ is plugged into the Surface (`dreamland-surface.lan`) over USB.
 | [EDEN](docs/EDEN.md) | bring up one isolated Eden instance and drive it |
 | [MACROS](docs/MACROS.md) | drive routes: macro segments with checks between, scripted routes, recording and editing Eden macros |
 | [TILE-CURSOR](docs/TILE-CURSOR.md) | land on an exact fighter or stage |
+| [ROUTES](docs/ROUTES.md) | reuse the shared setup blocks: boot, main menu, stage and fighter by name, chords, fixtures, pairs |
 | [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
 | [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |
 | [CHECKLIST](docs/CHECKLIST.md) | prove the work is done: mandatory, conditional and example items, and the report |

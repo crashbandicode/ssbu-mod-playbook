@@ -194,9 +194,16 @@ def gate(ctx, name, cap=None):
     gates = ctx.runner.plan.setdefault('gates', {})
     if key not in gates:
         gates[key] = _gate_spec(name)
-    if cap is not None:
-        gates[key] = {**gates[key], 'cap': cap}
-    return ctx.gate(key)
+    if cap is None:
+        return ctx.gate(key)
+    # A short look must not change the gate's own cap for later callers (harness-lib-xps-1 r05, 03:00Z: a 3 s look
+    # in back_to_main left routes.css at 3 s, and the CSS load after the stage pick outlasted it).
+    saved = gates[key]
+    gates[key] = {**saved, 'cap': cap}
+    try:
+        return ctx.gate(key)
+    finally:
+        gates[key] = saved
 
 
 def passes(ctx, name, cap):
@@ -234,8 +241,10 @@ def play(ctx, name):
 # What TrainingRooms' diag build prints for its chords (states.rs:1226 and :821). A chord with an expectation waits for
 # the line written after the press, so a chord that never registered fails instead of passing on its input.
 CHORD_LINES = {
-    'tr-save': ('diag_log', r'\[TrainingRooms\] state saved slot=\d+ entry=0\b'),
-    'tr-load': ('diag_log', r'\[TrainingRooms\] state placed entry=0 x=(-?[\d.]+) y=(-?[\d.]+) lr=(-?\d+)'),
+    # The save logs one `state saved` line, for the last entry it wrote (harness-lib-xps-1 r07: `chords_passed
+    # bits=0x1`, `state saved_notice slot=1`, `state saved slot=1 entry=1 (file queued)`), so any entry counts.
+    'tr-save': ('diag_log', r'\[TrainingRooms\] state saved slot=\d+ entry=\d+'),
+    'tr-load': ('diag_log', r'\[TrainingRooms\] state placed entry=\d+ x=(-?[\d.]+) y=(-?[\d.]+) lr=(-?\d+)'),
 }
 
 
@@ -438,8 +447,21 @@ def main_to_stage(ctx):
     pinned to an earlier screen."""
     to_main(ctx)
     play(ctx, 'main-stage')
-    gate(ctx, 'stage')
-    return {'screen': 'stage', 'shot': str(ctx.shot('routes-stage'))}
+    how = wait_sss(ctx)
+    return {'screen': 'stage', 'proof': how, 'shot': str(ctx.shot('routes-stage'))}
+
+
+def wait_sss(ctx, cap=45):
+    """The stage select, by the library `stage` gate (the Training name, shown while tile 0 is hovered) or, when
+    another stage is hovered, by a tile-cursor step logged with screen=sss."""
+    until = time.monotonic() + cap
+    while True:
+        if passes(ctx, 'stage', 3):
+            return 'stage-gate'
+        if select_screen(ctx) == 'sss':
+            return 'tile-cursor screen=sss'
+        if time.monotonic() > until:
+            raise RuntimeError(f'the stage select did not appear within {cap} s')
 
 
 # --- the tile cursor ------------------------------------------------------------------------------------------------
@@ -557,7 +579,7 @@ def pick_stage(ctx, stage, allow_derived=False):
     if not entry.get('proven') and not allow_derived:
         raise RuntimeError(f'stage {entry["name"]} tile {entry["tile"]} is derived, not proven; pass allow_derived '
                            'and confirm the id after the load')
-    gate(ctx, 'stage')
+    wait_sss(ctx)
     walker = TileWalker(ctx, 'sss')
     walk = walker.walk_to(entry['tile'])
     still = str(ctx.shot(f'routes-sss-{_norm(entry["name"])}'))
@@ -580,38 +602,39 @@ def _probe_step(ctx, walker, direction='left', cap=2.5):
     return {'from': found.group(1), 'to': found.group(2), 'token': found.group(3)}
 
 
-def pick_fighters(ctx, p1, cpu=None, hops=6):
-    """CSS: the CPU's coin onto `cpu` (when given), then P1's token onto `p1`; both by TrainingRooms' tile table.
+def pick_fighters(ctx, p1, cpu=None, coin_route=False):
+    """CSS: P1's token onto `p1` by TrainingRooms' tile table, checked by `settled at=N hovered=N`, then placed.
 
-    The hand starts holding P1's token below the grid. With a CPU: P1's token goes to the tile left of Random (where
-    the CPU's coin rests) and is placed; short analog hops right put the empty hand on the coin; A picks it up and an
-    L3 step must log token=p2 (TILE-CURSOR.md); the coin is walked to its tile and dropped; B returns P1's token to
-    the hand; P1's token is walked to its tile and placed. Every tile is checked by `settled at=N hovered=N`.
+    The hand starts holding P1's token below the grid. The CPU's coin (`cpu` with coin_route=true) is NOT PROVEN: P1
+    is placed on Steve, coin-pick pushes the empty hand onto the coin, A, and an L3 step must log token=p2; the coin
+    is walked and dropped, B returns P1's token and P1 is walked. On the XPS the approach missed four times.
     """
     gate(ctx, 'css')
     p1_entry = fighter_entry(p1)
     cpu_entry = fighter_entry(cpu) if cpu is not None else None
+    if cpu_entry is not None and not coin_route:
+        # NOT PROVEN (harness-lib-xps-1, 2026-11-16 02:52-03:09Z): four analog approaches to the CPU's coin either
+        # missed it or pressed A where the READY banner took it and started Training with a random CPU. Until a
+        # route is proven, set the CPU with the lane's own fixture and assert it with routes:fixture.
+        raise RuntimeError('pick_fighters: the CSS coin route for the CPU is not proven; pass coin_route=true only to '
+                           'test it, or set the CPU by fixture and assert it with routes:fixture {"cpu": ...}')
     random_tile = next(e['tile'] for e in tables()['css_tiles'] if e.get('random'))
     walker = TileWalker(ctx, 'css')
     out = {'p1': p1_entry, 'cpu': cpu_entry}
     if cpu_entry is not None:
-        out['park'] = walker.walk_to(random_tile - 1)
+        # lr-04's proven coin route starts from P1's token placed on the first tile of the last row (Steve, 78):
+        # lr04-cpu-approach and lr04-cpu-pick push the empty hand right and down onto the coin, press A, then one
+        # L3+Left step that must log token=p2. A stray A with P1 placed and the CPU on Random starts the match
+        # (harness-lib-xps-1 r05, 02:52Z: short hops from tile 85 started Training as Mii Gunner vs Daisy), so no
+        # other A is pressed until the coin is proven in the hand.
+        park = next(e['tile'] for e in tables()['css_tiles'] if e.get('name') == 'Steve')
+        out['park'] = walker.walk_to(park)
         play(ctx, 'tap-a1')
-        picked = None
-        tries = []
-        for _ in range(hops):
-            play(ctx, 'hand-right-6')
-            play(ctx, 'tap-a1')
-            probe = _probe_step(ctx, walker)
-            tries.append(probe)
-            if probe and probe['token'] == 'p2':
-                picked = probe
-                break
-            if probe and probe['token'] == 'p1':
-                play(ctx, 'tap-a1')  # P1's token came back up; put it down again and hop on
-        out['coin_tries'] = tries
-        if picked is None:
-            raise RuntimeError(f'the CPU coin was not picked up in {hops} hops: {tries}')
+        walker.cursor.mark()
+        play(ctx, 'coin-pick')  # lr-04's right pushes without its down pushes (they left the hand on the panel)
+        found = walker.cursor.wait(r'step screen=css dir=left from=(\S+) to=(\S+) token=p2', 4, ctx)
+        picked = {'from': found.group(1), 'to': found.group(2), 'token': 'p2'}
+        out['coin'] = picked
         walker.at = None if picked['to'] == 'none' else int(picked['to'])
         out['cpu_walk'] = walker.walk_to(cpu_entry['tile'])
         out['cpu_still'] = str(ctx.shot(f'routes-css-cpu-{_norm(cpu_entry["name"])}'))
@@ -766,30 +789,57 @@ def fixture(ctx, p1=None, cpu=None, stage=None, reset=True, damage=0.0, lr=None,
         if now != want_stage:
             problems.append(f'stage id {now} != {want_stage}')
     out['settled'] = current
+    names = {e['kind']: e['name'] for e in tables()['css_tiles'] if 'kind' in e}
+    out['fighters'] = {'p1': names.get(current[0]['kind']), 'cpu': names.get(current[1]['kind'])}
     out['shot'] = str(ctx.shot('routes-fixture'))
     _save(ctx, 'routes-fixture', out)
     if problems:
         raise RuntimeError('FIXTURE: ' + '; '.join(problems))
-    return {'settled': current, 'stage_id': out.get('stage_id'), 'reads': len(out['reads'])}
+    return {'settled': current, 'fighters': out['fighters'], 'stage_id': out.get('stage_id'),
+            'reads': len(out['reads'])}
 
 
 # --- back out --------------------------------------------------------------------------------------------------------
 
+def select_screen(ctx, cap=2.5):
+    """'sss' or 'css' when an L3+Up step is logged on that screen (the tile cursor names it), else None. On the CSS a
+    step logs only while the hand carries a token; on the SSS the hand always steps."""
+    cursor = LogCursor(instance_path(ctx, 'tile_log'))
+    try:
+        play(ctx, 'tile-up')
+        return cursor.wait(r'step screen=(css|sss) ', cap, ctx).group(1)
+    except RuntimeError:
+        return None
+    finally:
+        cursor.close()
+
+
 def back_to_main(ctx, presses=10):
     """Training -> main menu: native pause, Quit Training, confirm (library frames from lr-03), then back out of the
     character and stage selects until the main gate passes. Each look is a gate; nothing waits on a fixed sleep."""
-    play(ctx, 'pause-open')
-    gate(ctx, 'native-pause')
-    play(ctx, 'focus-native-quit-frames')
-    gate(ctx, 'quit-focus')
-    play(ctx, 'confirm-native-quit-frames')
     looks = []
+    if passes(ctx, 'training', 4):
+        play(ctx, 'pause-open')
+        gate(ctx, 'native-pause')
+        play(ctx, 'focus-native-quit-frames')
+        gate(ctx, 'quit-focus')
+        play(ctx, 'confirm-native-quit-frames')
+        looks.append('training-quit')
     for n in range(presses):
-        if passes(ctx, 'main', 3):
+        # 6 s, not 3: a B pressed while the main menu is still drawing opens its sidebar, and the main gate (the
+        # highlighted Smash tile) then fails until another B closes it (harness-lib-xps-1 r08, 03:16Z).
+        if passes(ctx, 'main', 6):
             return _save(ctx, 'routes-back-to-main', {'looks': looks, 'shot': str(ctx.shot('routes-main-back'))})
+        # The character and stage selects go back only on a held B (a 4-frame tap does nothing there:
+        # harness-lib-xps-1 r05 retry, 02:56Z, eight taps left the stage select up). leave-css holds B 90 frames.
         if passes(ctx, 'css', 3):
             looks.append('css')
-            play(ctx, 'leave-css')  # B held 90 frames: leaves the character select
+            play(ctx, 'leave-css')
+        elif select_screen(ctx) == 'sss':
+            # The library `stage` gate is the Training name crop: it fails once another stage is hovered, so the
+            # stage select is recognised by the tile cursor's own screen name instead.
+            looks.append('sss')
+            play(ctx, 'leave-css')
         else:
             looks.append('other')
             play(ctx, 'tap-b1')

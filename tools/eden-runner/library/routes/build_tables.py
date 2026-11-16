@@ -21,7 +21,10 @@ from pathlib import Path
 
 PROVEN_SSS = {
     0: 'rc15-tech-s0-direct-99ed57de-chord1 (XPS, 2026-11-16): native-training-name gate on entry, tile 0',
-    1: 'rc15-tech-s0-direct-99ed57de-chord1: settled screen=sss at=1, native-battlefield-name gate passed',
+    1: 'rc15-tech-s0-direct-99ed57de-chord1: settled screen=sss at=1, native-battlefield-name gate passed; '
+       'harness-lib-xps-1: camera_setup stage=0 after the load',
+    4: 'harness-lib-xps-1 (XPS, 2026-11-16 03:18Z): settled at=4, still names Final Destination, and after the load '
+       'camera_setup stage=3',
     6: 'rc15-mashout-grab-135a130f-unstick10-1 (Yoga, 2026-11-16): settled at=6; still names Kongo Jungle',
 }
 

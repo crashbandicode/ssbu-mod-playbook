@@ -155,6 +155,8 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   boot. At `Down`, segments, runner and row list committed to `eden/`.
   Evidence: the runner's path and dry-run log, the order and `Up` times, and
   the `macro.play` calls in `control.jsonl`.
+- **M** Eden rows use the shared ROUTES blocks; hand-built boot routes need a reason ([ROUTES](ROUTES.md)).
+  Evidence: the `routes:` steps in `rows.json`, or the reason written beside a hand-built route.
 - **M** Starting states come from a fixture, a segment, a hook or one bounded
   recording, named in `rows.json` `"setup"` before `Up` (`eden_test.py up`
   refuses without it); `eden_test.py pace` stayed under budget (40

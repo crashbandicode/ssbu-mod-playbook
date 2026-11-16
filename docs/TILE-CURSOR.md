@@ -7,12 +7,13 @@ pushes overshoot there, and the plain D-pad moves the hand only a little.
 Install it next to the plugin under test. It does nothing on other screens or
 without L3, so it doesn't change what you are testing.
 
-- **NRO:** `/home/intpa/ssbu-tile-cursor/dist/libssbu_tile_cursor.nro` on
-  the Yoga (0.1.0, build `15d3f31`, sha256 `b8313ca2…`, the same file as
-  release v0.1.0). This is the build the Eden tests used, and the one the
+- **NRO:** 0.1.0, build `15d3f31`, sha256 `b8313ca2…`, the same file as
+  release v0.1.0. This is the build the Eden tests used, and the one the
   Eden configs pin. `pair.ps1` installs it automatically. With `solo.ps1`,
   add it to `-Nro`. As of 2026-11-13, `main` (`a052fd5`, 2026-10-30) builds
   a different NRO that hasn't run in Eden, so don't rebuild it into `dist/`.
+  - On 2026-11-16 the old path `/home/intpa/ssbu-tile-cursor/dist/` was gone on the Yoga. The Yoga and XPS configs
+    pin `/home/intpa/trainingrooms-eden-pkg6/nro/aid/libssbu_tile_cursor.nro`, the same sha256.
 - **Log:** `<sdmc>/ultimate/ssbu-tile-cursor/events.log`. It is written every
   100 ms, so the host copy is current.
 - **Not on the Switch card.** It is an Eden tool.
@@ -65,9 +66,18 @@ that `at` equals `to` instead.
 
 ## On the stage select
 
-From Random, six L3 + Right steps landed on Final Destination (tiles 0→6).
-Down and Up move one row and back. Switching the form tab or the page
-doesn't change the tile list.
+On Training's stage select (2026-11-16), the grid is 11 tiles wide. Tile 0 is the Training stage. Tile k is
+TrainingRooms' `lobby_stages::STAGES[k]`: Battlefield 1, Small Battlefield 2, Big Battlefield 3, Final
+Destination 4, Peach's Castle 5, Kongo Jungle 6.
+- **Evidence:** the hover on entering is tile 0; the XPS stills show Battlefield at 1; a Yoga still shows Kongo
+  Jungle at 6.
+- **Not this screen:** the older note "from Random, six L3 + Right steps landed on Final Destination (tiles 0→6)"
+  came from another stage select. A walk to tile 6 for Final Destination therefore picked Kongo Jungle.
+- **Picking by name:** `routes:pick_stage` takes the stage's name and checks its id from game state after the load
+  ([ROUTES](ROUTES.md)).
+- **Rows and pages:** Down and Up move one row and back. Switching the form tab or the page doesn't change the
+  tile list.
+- **Leaving:** a held B leaves the stage select and the character select. A 4-frame B tap does nothing on either.
 
 The repo's `docs/EDEN-TEST.md` has the whole test procedure and pass
 criteria, and `docs/HOOKS.md` has the hook sites.

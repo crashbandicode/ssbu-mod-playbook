@@ -1,7 +1,9 @@
 # Harness lessons: what failed runs taught
 
 These rules come from the 2026-11-15 TrainingRooms rc.14/rc.15 campaign. Each one cost at least one Eden attempt or a
-build slot before it was written down. Read it before you write runner rows, macros or a two-PC room.
+build slot before it was written down. Read it before you write runner rows, macros or a two-PC room. The shared
+[ROUTES](ROUTES.md) blocks (2026-11-16) build in the boot, menu, stage, fighter, chord, fixture and log-reading rules
+below; call them instead of writing those steps again.
 
 ## Verify, don't recall
 
