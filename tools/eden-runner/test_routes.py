@@ -312,6 +312,34 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(recipe_macro.compile_plan(folder / 'rows.json'), [])  # already compiled
 
 
+LEDGER_HW = Path('/home/intpa/smash-training-lobby/artifacts/switch-hw-feature-ledger')
+SESSION1 = Path('/home/intpa/smash-training-lobby/artifacts/switch-hw-session-1/out/T-01')
+
+
+@unittest.skipUnless(LEDGER_HW.is_dir() and SESSION1.is_dir(), 'needs the 2026-11-16 hardware stills')
+class TrainingInkGateTests(unittest.TestCase):
+    """The hw Training gate on another stage: the plate is translucent, the text is not (run-1 S-B07, 19:34Z)."""
+
+    def test_peachs_castle_passes_and_other_screens_fail(self):
+        from runner import Runner
+        spec = routes._switch_spec('training')
+        compare = Runner.compare_region  # a staticmethod
+        positives = [LEDGER_HW / 'run-1/out/S-B07/sw-193412Z-029675-FAIL.png',
+                     next(SESSION1.glob('*T-01-closed.png'))]
+        negatives = [next(SESSION1.glob('*rec-reset-row.png')), LEDGER_HW / 'run-1/up-still.png',
+                     LEDGER_HW / 'nav/boot-skip-a.png', LEDGER_HW / 'nav/sss-bf-sel.png',
+                     LEDGER_HW / 'nav/shots/01-s00-start.png', LEDGER_HW / 'nav/css-css.png']
+        for png in positives:
+            self.assertLessEqual(routes.ink_compare(png, spec), spec['ink_limit'], png)
+        for png in negatives:
+            self.assertGreater(routes.ink_compare(png, spec), 0.6, png)
+        diff, note = routes.match_frame(positives[0], spec, compare)
+        self.assertEqual(diff, 0.0)
+        self.assertIn('ink_mismatch', note)
+        for png in negatives:
+            self.assertGreater(routes.match_frame(png, spec, compare)[0], spec['tolerance'], png)
+
+
 class SwitchHwTests(unittest.TestCase):
     BRIDGE_LINES = [
         '[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=v1 port=6970 guards=0x7f frame=0 wall=10',

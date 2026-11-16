@@ -269,9 +269,16 @@ def on_switch(ctx):
 def _switch_spec(name):
     ref = SWITCH_REFS[name]
     table = json.loads((ROUTES / 'refs' / 'hw-refs.json').read_text())[ref]
-    return {'kind': 'image', 'reference': str(ROUTES / 'refs' / f'{ref}.png'), 'sha256': table['sha256'],
+    spec = {'kind': 'image', 'reference': str(ROUTES / 'refs' / f'{ref}.png'), 'sha256': table['sha256'],
             'roi': table['roi'], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit', 'tolerance': 18,
             'dim_tolerant': True}
+    if name in SWITCH_INK:
+        spec['ink_limit'] = SWITCH_INK[name]
+    return spec
+
+
+# Gates whose label sits on a translucent plate: the text shape decides when the pixels differ (ink_compare).
+SWITCH_INK = {'training': 0.3}
 
 
 def desktop_shots(ctx):
@@ -351,6 +358,23 @@ def structure_ok(path, spec):
         return sum(ImageStat.Stat(live).stddev) * gain >= sum(ImageStat.Stat(want).stddev) / 3
 
 
+def ink_compare(path, spec):
+    """Text-shape mismatch of the live ROI against the reference (ink masks, routes._ink): for a label on a
+    translucent plate, whose background is the stage behind it. The Training HUD's "Total Damage" plate shows the
+    stage through it, so hw-training (cut on the Training stage's grid) differs by 52 on Peach's Castle
+    (switch-hw-feature-ledger run-1 S-B07, 19:34Z) while its text is the same."""
+    from PIL import Image
+    with Image.open(path) as im, Image.open(spec['reference']) as ref:
+        frame = im.convert('RGB')
+        if spec.get('frame') and frame.size != tuple(spec['frame']):
+            frame = frame.resize(tuple(spec['frame']), Image.Resampling.BOX)
+        live = frame.crop(tuple(spec['roi']))
+        want = ref.convert('RGB')
+        if live.size != want.size:
+            return 1.0
+        return ink_mismatch(_ink(live), _ink(want))
+
+
 def _mean_diff(a, b):
     first, second = a.tobytes(), b.tobytes()
     return sum(abs(x - y) for x, y in zip(first, second)) / len(first) if first and len(first) == len(second) \
@@ -367,6 +391,10 @@ def match_frame(png, spec, compare_region):
         dimmed, gain = dim_compare(png, spec, tolerance)
         if dimmed <= tolerance:
             diff, note = dimmed, {**(note or {}), 'dimmed_gain': gain}
+    if diff > tolerance and spec.get('ink_limit') is not None:
+        mismatch = ink_compare(png, spec)
+        if mismatch <= spec['ink_limit']:
+            diff, note = 0.0, {**(note or {}), 'ink_mismatch': round(mismatch, 3)}
     if diff <= tolerance and spec.get('dim_tolerant') and not structure_ok(png, spec):
         # A flat frame (black loading screen, blank capture) can sit within the tolerance of a dark,
         # text-light reference such as the TR menu's key line; the reference's text must be there.
