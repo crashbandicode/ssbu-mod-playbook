@@ -7,8 +7,9 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
 
 ## What is proven, and when to use it
 
-- **Proven on the XPS host type only** (2026-11-16, "Proof" below). The Yoga, Surface and Ally haven't booted these
-  blocks; a Yoga proof boot was deferred because the feature lanes have slot priority:
+- **Proven host types** (2026-11-16, "Proof" below): the Linux host type (XPS) and the Windows host type (Ally).
+  The Yoga and the Surface haven't booted these blocks; a Yoga proof boot was deferred because the feature lanes
+  have slot priority. Proven blocks:
   - `configure_boot`, `load_game`, `wait_lines`, `to_main`;
   - `main_to_stage`, `pick_stage` (by name);
   - `pick_fighters` for P1 only;
@@ -125,6 +126,8 @@ eden-ldn-coexistence runtime-12/13 (Local Wireless). They have not been booted a
 
 ## Proof
 
+### Linux host type: `harness-lib-xps-1`
+
 `harness-lib-xps-1` ran on the XPS on 2026-11-16, Up 02:49Z, Down 03:21Z.
 
 - **Setup:**
@@ -148,7 +151,35 @@ eden-ldn-coexistence runtime-12/13 (Local Wireless). They have not been booted a
 | `chord` | `tr-save`: `state saved slot=1 entry=1`; `reset-lra`; `tr-load`: `state placed entry=1 x=40 y=24.129 lr=-1` |
 | `back_to_main` | from Training (pause, Quit, held B twice) to the main gate |
 
-Not shown in this boot:
+### Windows host type: `harness-lib-ally-1` (the Ally, 2026-11-16, Up 03:46Z, Down 04:02Z)
+
+- **Setup:** the same 11 rows and plugins as on the XPS, with the GDB stub on port 6693.
+  - Eden ran as `C:\Eden\app\eden.exe` (`e5e8d0f0…`).
+  - The lifecycle ran from Linux with `--ssh intpa@dreamland-ally`.
+  - The runner and the blocks ran on the Ally with `python.exe -X utf8`. Not `-I`: Pillow is in the user's
+    site-packages there.
+- **Result:** 11/11 PASS.
+  - Battlefield settled at tile 1 and the game reported stage id 0; Final Destination settled at tile 4, stage id 3.
+  - Mario (kind 0) was picked, and the fixtures settled.
+  - `tr-save` and `tr-load` printed their TrainingRooms lines.
+  - The run went back to the main menu, then into Training on Final Destination.
+- **Down:** released and restored. The console had 0 lines with `panic`, `abort`, `crash` or `Unmapped`.
+- **What Windows needs:** `ui.screenshot` grabs the whole desktop there, and the library references (cut from
+  1280x674 window grabs) don't match a true 16:9 frame. So on Windows the blocks:
+  - read the main menu from one recorder frame (`frame()`), compared with `library/routes/refs/main-recorder.png`,
+    the sidebar icons cut from this boot's verified main-menu frame;
+  - recognise the selects by the tile cursor's `screen=` and Training by fresh `state pos` lines;
+  - keep the pause and quit frames as evidence only;
+  - read logs without holding the file open, so the plugin's rename-rotation still works.
+- **Retried in this boot:**
+  - Pillow was missing under `-I`.
+  - The first main reference was the highlighted Smash tile, and the main menu came back with Games & More
+    highlighted. That run's Bs went on to the title screen, so `back_to_main` now falls back to `to_main` after
+    three Bs.
+  - On the passing retry, `back_to_main` started from the title screen. The Training → character select → stage
+    select part ran in the attempt before it, which logged `training-quit`, `css` and `sss`.
+
+Not shown in either boot:
 - the CPU's coin (above);
 - damage cleared from above 0 (it was 0 every time);
 - the online blocks.

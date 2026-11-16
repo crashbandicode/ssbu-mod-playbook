@@ -117,3 +117,5 @@ Written here 2026-11-16 (harness-lib), not copies:
 - **Proof:** the blocks were booted on the XPS as harness-lib-xps-1, with 11/11 rows passing (ROUTES  Proof).
 - **Not booted:** the online blocks restate checks from runtime-calibration-4 and eden-ldn-coexistence, and were not
   booted again.
+
+den-runner/library/routes/refs/main-recorder.png (2026-11-16): the sidebar icons, ROI [1150,160,1230,640], cut from a main-menu recorder frame of harness-lib-ally-1 (reviewed); 1f11f1a2355a14dc.
