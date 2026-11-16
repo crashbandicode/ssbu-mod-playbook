@@ -1120,6 +1120,11 @@ class Runner:
         if receipt.get('gates_status') != 'PASS' or (receipt.get('judge') or {}).get('state') != 'pending':
             return None
         row = next((r for r in self.plan['rows'] if r['id'] == row_id), {'id': row_id})
+        if row.get('judge') == 'skip':
+            # a setup row (fixture, navigation): no gameplay effect to judge; its gates are its evidence
+            receipt.update(status='PASS', status_reason='setup row: judge skipped', judge={'state': 'skipped'})
+            receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+            return None
         try:
             job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip,
                                         self.plan.get('known_issues'))

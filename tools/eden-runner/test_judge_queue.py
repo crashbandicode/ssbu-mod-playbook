@@ -194,6 +194,15 @@ class RunnerEffects(unittest.TestCase):
                          ['| p', '| k'])
         self.assertIn('--rows f,u,e,n', rerun['command'])
 
+    def test_setup_row_with_judge_skip_is_not_judged(self):
+        folder = Path(tempfile.mkdtemp())
+        r = make_plan(folder, [{'id': 's', 'judge': 'skip', 'steps': [{'gate': 'nav'}]}],
+                      require_effect=True, judge={'cmd': 'judge.py', 'wait_s': 60})
+        r.run()
+        s = receipt(folder, 's')
+        self.assertEqual((s['status'], s['judge']['state']), ('PASS', 'skipped'))
+        self.assertFalse((folder / 'out' / 'judge' / 'jobs' / 's.json').exists())
+
     def test_judge_fails_landing_late_stop_the_run_a_row_or_two_late(self):
         folder = Path(tempfile.mkdtemp())
 
