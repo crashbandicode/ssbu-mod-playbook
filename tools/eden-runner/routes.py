@@ -80,16 +80,29 @@ class LogCursor:
     newline. `mark()` restarts from the current end, so a wait sees only lines written after the input it follows.
     """
 
-    def __init__(self, path, from_start=False):
+    def __init__(self, path, from_start=False, hold=None):
         self.path = Path(path)
         self.handle = None
         self.inode = None
+        self.offset = 0
         self.pending = b''
         self.backlog = []
         self.rotations = 0
+        # On Windows an open handle without FILE_SHARE_DELETE would make the plugin's own rotation (rename) fail, so
+        # the cursor opens, reads and closes each time; lines written to the old file after the last read and before
+        # its rename are then lost. Poll often (wait() polls every 0.1 s).
+        self.hold = (os.name != 'nt') if hold is None else hold
         self._open(seek_end=not from_start)
 
     def _open(self, seek_end):
+        if not self.hold:
+            try:
+                stat = os.stat(self.path)
+            except OSError:
+                self.inode, self.offset = None, 0
+                return
+            self.inode, self.offset = stat.st_ino, (stat.st_size if seek_end else 0)
+            return
         if self.handle is not None:
             self.handle.close()
             self.handle = None
@@ -107,7 +120,30 @@ class LogCursor:
         self.backlog = []
         self._open(seek_end=True)
 
+    def _read_unheld(self):
+        try:
+            now = os.stat(self.path)
+        except OSError:
+            return b''
+        if self.inode is None or now.st_ino != self.inode or now.st_size < self.offset:
+            if self.inode is not None:
+                self.rotations += 1
+            self.inode, self.offset = now.st_ino, 0
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(self.offset)
+                data = f.read()
+        except OSError:
+            return b''
+        self.offset += len(data)
+        return data
+
     def read(self):
+        if not self.hold:
+            data = self.pending + self._read_unheld()
+            lines = data.split(b'\n')
+            self.pending = lines.pop()
+            return [line.decode('utf-8', 'replace') for line in lines if line.strip()]
         chunks = []
         if self.handle is None:
             self._open(seek_end=False)
@@ -194,6 +230,8 @@ def gate(ctx, name, cap=None):
     gates = ctx.runner.plan.setdefault('gates', {})
     if key not in gates:
         gates[key] = _gate_spec(name)
+    if gates[key].get('kind') == 'image' and desktop_shots(ctx):
+        return _frame_gate(ctx, key, gates[key], cap or gates[key].get('cap', 30))
     if cap is None:
         return ctx.gate(key)
     # A short look must not change the gate's own cap for later callers (harness-lib-xps-1 r05, 03:00Z: a 3 s look
@@ -204,6 +242,63 @@ def gate(ctx, name, cap=None):
         return ctx.gate(key)
     finally:
         gates[key] = saved
+
+
+def desktop_shots(ctx):
+    """True where ui.screenshot grabs the whole desktop (the Ally: screenshot_target "screen"; a window grab is black
+    under Vulkan there). Image gates then read a game frame from Eden's recorder instead (frame())."""
+    return ctx.instance.get('screenshot_target') == 'screen'
+
+
+def frame(ctx, name, cap=10.0):
+    """One game frame as a PNG in the row folder, from Eden's GIF recorder (game pixels only, 1280 wide)."""
+    from PIL import Image
+    stamp = time.strftime('%H%M%S', time.gmtime()) + f'-{time.time_ns() % 10**6:06d}'
+    gif = Path(ctx.row_dir) / f'{ctx.on}-{stamp}-{name}.frame.gif'
+    png = gif.with_suffix('').with_suffix('.png')
+    ctx.call('recording.start', {'path': str(gif), 'fps': 10, 'width': 1280, 'duration_ms': 300})
+    until = time.monotonic() + cap
+    while True:
+        ctx.check_stop()
+        status = ctx.call('recording.status', {}) or {}
+        if isinstance(status, dict) and (status.get('state') == 'error' or status.get('error')):
+            raise RuntimeError(f'recording for frame {name}: {status}')
+        if gif.is_file() and (not isinstance(status, dict) or status.get('state') != 'recording'):
+            try:
+                with Image.open(gif) as im:
+                    im.convert('RGB').save(png)
+                gif.unlink(missing_ok=True)
+                return png
+            except OSError:
+                pass  # still being finalised
+        if time.monotonic() > until:
+            raise RuntimeError(f'no recorder frame for {name} within {cap} s: {status}')
+        time.sleep(0.2)
+
+
+def _frame_gate(ctx, key, spec, cap):
+    """An image gate on recorder frames: the same reference, ROI, frame size, scale and tolerance as the gate."""
+    reference = Path(spec['reference'])
+    tolerance = spec.get('tolerance', 8)
+    until = time.monotonic() + cap
+    last = None
+    while True:
+        png = frame(ctx, 'gate-' + key)
+        diff, note = ctx.runner.compare_region(png, reference, spec['roi'], spec.get('reference_is_roi'),
+                                               spec.get('scale') or 'fit', spec.get('frame'), tolerance)
+        if diff <= tolerance:
+            ctx.log({'gate': key, 'on': ctx.on, 'pass': True, 'frame': str(png), 'diff': round(diff, 2),
+                     **(note or {})})
+            if last is not None:
+                last.unlink(missing_ok=True)
+            return str(png)
+        if last is not None:
+            last.unlink(missing_ok=True)
+        last = png
+        if time.monotonic() > until:
+            raise RuntimeError(f'gate {key} on {ctx.on} did not pass within {cap} s (recorder frames; last diff '
+                               f'{diff:.1f} > {tolerance}; {png})')
+        time.sleep(0.3)
 
 
 def passes(ctx, name, cap):

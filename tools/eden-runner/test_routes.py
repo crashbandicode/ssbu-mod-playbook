@@ -46,6 +46,19 @@ class LogCursorTests(unittest.TestCase):
             f.write('second of new\n')
         self.assertEqual(cursor.read(), ['second of new'])
 
+    def test_unheld_mode_for_windows(self):
+        cursor = routes.LogCursor(self.path, hold=False)
+        self.assertIsNone(cursor.handle)
+        with self.path.open('a') as f:
+            f.write('a\n')
+        self.assertEqual(cursor.read(), ['a'])
+        os.replace(self.path, self.dir / 'practice-diagnostics.previous.log')  # works: no handle is held
+        self.path.write_text('new\n')
+        self.assertEqual(cursor.read(), ['new'])
+        self.assertEqual(cursor.rotations, 1)
+        self.path.write_text('t\n')  # truncated below the cursor's offset
+        self.assertEqual(cursor.read(), ['t'])
+
     def test_truncation_reads_from_start(self):
         cursor = routes.LogCursor(self.path)
         self.path.write_text('x\n')
