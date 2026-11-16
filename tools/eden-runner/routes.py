@@ -230,8 +230,8 @@ def gate(ctx, name, cap=None):
     gates = ctx.runner.plan.setdefault('gates', {})
     if key not in gates:
         gates[key] = _gate_spec(name)
-    if gates[key].get('kind') == 'image' and desktop_shots(ctx):
-        return _frame_gate(ctx, key, gates[key], cap or gates[key].get('cap', 30))
+    if desktop_shots(ctx) and name in RECORDER_GATES:
+        return RECORDER_GATES[name](ctx, cap or gates[key].get('cap', 30))
     if cap is None:
         return ctx.gate(key)
     # A short look must not change the gate's own cap for later callers (harness-lib-xps-1 r05, 03:00Z: a 3 s look
@@ -299,6 +299,62 @@ def _frame_gate(ctx, key, spec, cap):
             raise RuntimeError(f'gate {key} on {ctx.on} did not pass within {cap} s (recorder frames; last diff '
                                f'{diff:.1f} > {tolerance}; {png})')
         time.sleep(0.3)
+
+
+# Windows (recorder frames). The library references were cut from 1280x674 window grabs, so they don't match a true
+# 1280x720 recorder frame (harness-lib-ally-1 r03, 03:51Z: the main menu was on screen, mean difference 113). The
+# main menu has its own recorder reference, cut from that boot's verified frame. The selects are recognised by the
+# tile cursor's screen name, and Training by fresh game-state lines. The pause and quit frames are kept as evidence;
+# leaving Training is proven by the select or the main menu that follows.
+RECORDER_MAIN = {'kind': 'image', 'reference': str(ROUTES / 'refs' / 'main-recorder.png'),
+                 'sha256': '8584f3557f906066db83efbe726280f5dd523b0667383afe51c0ad070ade1516',
+                 'roi': [100, 270, 440, 380], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit',
+                 'tolerance': 18, 'from_run': 'harness-lib-ally-1'}
+
+
+def _until(cap, check):
+    until = time.monotonic() + cap
+    while True:
+        found = check()
+        if found:
+            return found
+        if time.monotonic() > until:
+            return None
+        time.sleep(0.3)
+
+
+def _recorder_main(ctx, cap):
+    return _frame_gate(ctx, 'routes.main-recorder', RECORDER_MAIN, cap)
+
+
+def _probe_gate(screen):
+    def check(ctx, cap):
+        if _until(cap, lambda: select_screen(ctx, cap=min(2.5, cap)) == screen) is None:
+            raise RuntimeError(f'gate routes.{screen}: no tile-cursor step on screen={screen} within {cap} s')
+        return str(frame(ctx, f'gate-routes.{screen}'))
+    return check
+
+
+def _training_state(ctx, cap):
+    try:
+        read_state(ctx, cap=min(cap, 6.0))
+    except RuntimeError as error:
+        raise RuntimeError(f'gate routes.training: {error}') from None
+    return str(frame(ctx, 'gate-routes.training'))
+
+
+def _evidence_only(name):
+    def check(ctx, cap):
+        path = frame(ctx, f'evidence-{name}')
+        ctx.log({'gate': f'routes.{name}', 'on': ctx.on, 'checked': False, 'frame': str(path),
+                 'why': 'no recorder reference; the next screen proves the step'})
+        return str(path)
+    return check
+
+
+RECORDER_GATES = {'main': _recorder_main, 'css': _probe_gate('css'), 'stage': _probe_gate('sss'),
+                  'training': _training_state, 'native-pause': _evidence_only('native-pause'),
+                  'quit-focus': _evidence_only('quit-focus')}
 
 
 def passes(ctx, name, cap):
