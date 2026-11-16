@@ -203,6 +203,23 @@ class TileWalkerTests(unittest.TestCase):
             walker.step('right')
 
 
+class StageTransitionTests(unittest.TestCase):
+    def test_transition_deadline_changes_only_the_css_wait(self):
+        from unittest.mock import Mock, patch
+        ctx = Mock()
+        for cap in (60, 180):
+            with patch.multiple(routes, wait_sss=Mock(), TileWalker=Mock(), play=Mock(),
+                                gate=Mock(), remember=Mock(), _save=Mock()):
+                if cap == 60:
+                    routes.pick_stage(ctx, "Battlefield")
+                else:
+                    routes.pick_stage(ctx, "Battlefield", transition_cap=cap)
+                routes.gate.assert_called_once_with(ctx, "css", cap)
+                routes.wait_sss.assert_called_once_with(ctx)
+                routes.TileWalker.return_value.walk_to.assert_called_once_with(1)
+                routes.play.assert_called_once_with(ctx, "tap-a1")
+
+
 class TableTests(unittest.TestCase):
     def test_tables_come_from_trainingrooms(self):
         t = routes.tables()

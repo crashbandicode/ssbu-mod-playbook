@@ -841,7 +841,7 @@ def remember(ctx, **values):
     return merged
 
 
-def pick_stage(ctx, stage, allow_derived=False):
+def pick_stage(ctx, stage, allow_derived=False, transition_cap=60):
     """Stage select -> the named stage, by tile-cursor steps, then A -> the character select.
 
     The target tile comes from tables.json. A tile no run has proven is refused unless allow_derived is true; the
@@ -858,7 +858,7 @@ def pick_stage(ctx, stage, allow_derived=False):
     walk = walker.walk_to(entry['tile'])
     still = str(ctx.shot(f'routes-sss-{_norm(entry["name"])}'))
     play(ctx, 'tap-a1')
-    gate(ctx, 'css')
+    gate(ctx, 'css', transition_cap)
     expected = {'stage_id': entry['id'], 'stage': entry['name'], 'tile': entry['tile']}
     remember(ctx, **expected)
     return _save(ctx, 'routes-pick-stage', {**expected, 'walk': walk, 'still': still,

@@ -327,3 +327,5 @@ Not shown in either boot:
 - the CPU's coin (above);
 - damage cleared from above 0 (it was 0 every time);
 - the online blocks.
+
+Surface calibration (2026-11-16): `pick_stage` accepts `transition_cap` (default 60 seconds). The single approved tile-repeat retry uses 180 seconds for native SSS-to-CSS loading on the Surface. Only the transition deadline changes; CSS image discrimination and step/settled/hover checks are unchanged. A timeout at 180 seconds stops the proof without another extension.
