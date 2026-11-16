@@ -170,6 +170,15 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual(receipt(folder, 'n')['clip_check']['reason'], 'no-visible-effect')
         job = json.loads((folder / 'out' / 'judge' / 'jobs' / 'p.json').read_text())
         self.assertEqual([s['phase'] for s in job['shots']], ['before', 'after'])
+        self.assertEqual(job['shots'][0]['label'], 'before:p-before')  # judge.py: shots [{label, path}]
+        self.assertIsInstance(job['frames'], list)
+        real = Path('/home/intpa/smash-training-lobby/artifacts/switch-hw-runbook/judge/judge.py')
+        if real.is_file():  # the calibrated judge accepts the job as written
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('real_judge', real)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertEqual(mod.load_job(folder / 'out' / 'judge' / 'jobs' / 'p.json')['row'], 'p')
         self.assertTrue(job['clip'].endswith('clip.mp4'))  # queued once the row's own clip file was closed
         rerun = json.loads((folder / 'out' / 'rerun.json').read_text())
         self.assertEqual(rerun['rows'], ['f', 'u', 'e', 'n'])

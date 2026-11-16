@@ -156,7 +156,8 @@ def run_judge(job_path, job):
         return {'verdict': 'UNSURE', 'reason': f'judge unavailable: {script} not found', 'shots_cited': [],
                 'model': None}
     try:
-        proc = subprocess.run([sys.executable, '-I', str(script), '--job', str(job_path), '--out', str(out)],
+        proc = subprocess.run([sys.executable, '-I', str(script), '--job', str(job_path), '--out', str(out),
+                               *[str(a) for a in job.get('judge_args') or []]],
                               capture_output=True, text=True, timeout=job.get('timeout_s', JUDGE_TIMEOUT_S))
     except subprocess.TimeoutExpired:
         return {'verdict': 'UNSURE', 'reason': 'judge timed out', 'shots_cited': [], 'model': None}
@@ -180,10 +181,14 @@ def work(job_path):
             frames = sample_frames(job['clip'], folder)
         except Exception as error:  # noqa: BLE001 - an unreadable clip is recorded, the judge still gets the shots
             frame_error = repr(error)[:300]
-    job['frames'] = frames
+    # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
+    job['frames_by_name'] = frames
+    job['frames'] = [frames[k] for k in FRAME_NAMES if frames.get(k)]
+    job['shots'] = [{**s, 'label': f'{s.get("phase", "step")}:{s["name"]}'} for s in job.get('shots') or []]
+    job['judge_shots'] = [s for s in job['shots'] if s.get('path')]
     if frame_error:
         job['frame_error'] = frame_error
-    job_path.write_text(json.dumps(job, indent=2) + '\n')
+    job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
     try:
         check = clip_check(job, frames)
         verdict = run_judge(job_path, job) if check.get('ok', True) else \
@@ -213,6 +218,7 @@ def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip):
     job = {'row': row['id'], 'name': row.get('name'), 'expected': row.get('expected'),
            'verdict_hint': row.get('verdict_hint'), 'covers': row.get('covers', []), 'shots': shots,
            'clip': clip, 'frames_wanted': list(FRAME_NAMES), 'receipt': str(receipt_path), 'dir': str(folder),
+           'notes': row.get('name'), 'judge_args': judge_cfg.get('args') or [],
            'plan_dir': str(plan_dir), 'judge_cmd': judge_cfg.get('cmd'), 'timeout_s': judge_cfg.get('timeout_s',
                                                                                                     JUDGE_TIMEOUT_S),
            'effects_passed': receipt.get('effects_passed') or [], 'queued': time.time()}
