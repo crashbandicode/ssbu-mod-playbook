@@ -115,6 +115,45 @@ eden-ldn-coexistence runtime-12/13 (Local Wireless). They have not been booted a
   armed before the request lands; the guest gives up after about 30 s.
   - Before boot, the guest's frontend joins the room before its `game.load` ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
 
+## A real Switch (the same rows, the pad and OBS)
+
+Rows for the console use the same `rows.json` format, segments, gates and `routes:` hooks as Eden. Only the
+instance differs, and every input is a macro (no manual presses).
+
+```text
+/usr/bin/python3 -I tools/eden-runner/recipe_macro.py rows.json            # recipes -> .edenmacro.json + sha256
+/usr/bin/python3 -I tools/eden-runner/runner.py dry-run rows.json          # READY before the console
+/usr/bin/python3 -I tools/eden-runner/switch_hw.py up <run dir>            # claim, pad, OBS, live Skyline log
+/usr/bin/python3 -I tools/eden-runner/runner.py run rows.json --instances <run dir>/instances.json --out <run dir>/out
+/usr/bin/python3 -I tools/eden-runner/switch_hw.py down <run dir>          # always
+```
+
+- **Input:** `usb:///dev/ttyACM0` (the ESP32-S3 pad, switch-pad 0.1.2) goes to switch-remote's client
+  (`SWITCH_REMOTE_DIR`, default `~/ssbu-switch-remote/tools/host`).
+  - `macro.play` uploads the Eden macro with `MBEGIN`/`MEV` and the pad plays it at 60 Hz of its own clock, so
+    same-frame chords stay same-frame.
+  - The client pings every 300 ms; the pad's 1 s watchdog then never fires mid-macro.
+  - HOME and Capture are refused inside macros; the `switch_boot` and `switch_close` hooks press them.
+- **Recipes:** `recipe_macro.py` compiles them offline. `b+up` is one frame, and every hold is at least 2 frames.
+  The runner never records on hardware.
+- **Logs:** `switch_hw.py` captures Skyline's TCP log (`192.168.0.224:6969`) one complete line at a time into the
+  instance's `console_log`, so log gates and `LogCursor` work as on Eden.
+  - The card runs the RELEASE NRO: TrainingRooms prints its install line and `cpu_common_load` there, and no diag
+    lines. Menus and Training need image gates.
+  - SD files (`events.log`, settings) are FTP reads after the session, not live gates.
+- **Images:** `ui.screenshot` is an OBS still of the capture card. The `routes` gates read it against `hw-*`
+  references (`library/routes/refs/`), cut from the reviewed switch-hw-ledger-rc15 stills:
+  - each one passes on its own screen and fails on the others (`hw-refs.json`);
+  - the Eden references don't apply there (window grabs are 1280x674; the card is a true 16:9 frame).
+- **One driver per console:** `up` refuses while any process holds the tty or the claim file
+  (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
+- **Hardware blocks:**
+  - `switch_boot`: B, HOME, the SSBU tile gate, A, the profile A, then Start until the main menu.
+  - `switch_to_training`: Training on the stage select's first tile with whoever P1 is. The tile cursor isn't on
+    the card, so there's no stage or fighter by name.
+  - `tr_menu`: B+Up, the menu gate, B and B, the HUD gate.
+  - `switch_close`: HOME, X, then A on the close dialog.
+
 ## What the selects need
 
 - **Leaving a select:** the character and stage selects go back only on a held B (`leave-css`, 90 frames); a tap
