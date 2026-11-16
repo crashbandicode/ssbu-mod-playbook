@@ -350,6 +350,15 @@ class SwitchGateTests(unittest.TestCase):
         self.assertFalse(routes.passes(ctx, 'tr-menu', 0.5))
         with self.assertRaises(RuntimeError):
             routes.gate(ctx, 'native-pause', cap=1)
+        # The console's auto-dim (about 1/3 the luminance) still passes; a dark unrelated frame doesn't.
+        dim = folder / 'dim.png'
+        frame.point(lambda v: int(v * 0.33)).save(dim)
+        shots[:] = [str(dim)]
+        self.assertTrue(routes.passes(ctx, 'tr-menu', 1))
+        gray = folder / 'gray.png'
+        Image.new('RGB', (1280, 720), (20, 20, 20)).save(gray)
+        shots[:] = [str(gray)] * 50
+        self.assertFalse(routes.passes(ctx, 'tr-menu', 0.5))
 
 
 class SwitchBootTests(unittest.TestCase):

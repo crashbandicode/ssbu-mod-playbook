@@ -267,7 +267,8 @@ def _switch_spec(name):
     ref = SWITCH_REFS[name]
     table = json.loads((ROUTES / 'refs' / 'hw-refs.json').read_text())[ref]
     return {'kind': 'image', 'reference': str(ROUTES / 'refs' / f'{ref}.png'), 'sha256': table['sha256'],
-            'roi': table['roi'], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit', 'tolerance': 18}
+            'roi': table['roi'], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit', 'tolerance': 18,
+            'dim_tolerant': True}
 
 
 def desktop_shots(ctx):
@@ -305,6 +306,54 @@ def frame(ctx, name, cap=10.0):
         time.sleep(0.2)
 
 
+def dim_compare(path, spec, tolerance):
+    """For a screen the console has auto-dimmed (after ~5 min without input; luminance about 1/3), the live ROI is
+    scaled up to the reference's mean brightness, then compared again. Gains from 1.3 to 4 count as dimming, and
+    the gain is clamped there. Returns (difference, gain), or (inf, None) when the frame isn't dimmer.
+    (hw-run-2 F04, 2026-11-16: a dimmed TR page failed a brightness-based gate.)"""
+    from PIL import Image, ImageStat
+    with Image.open(path) as im, Image.open(spec['reference']) as ref:
+        frame = im.convert('RGB')
+        if spec.get('frame') and frame.size != tuple(spec['frame']):
+            frame = frame.resize(tuple(spec['frame']), Image.Resampling.BOX)
+        live = frame.crop(tuple(spec['roi']))
+        want = ref.convert('RGB')
+        if live.size != want.size:
+            return float('inf'), None
+        lum_live = sum(ImageStat.Stat(live).mean) / 3
+        lum_ref = sum(ImageStat.Stat(want).mean) / 3
+        if lum_live <= 0 or lum_ref / lum_live < 1.3:
+            return float('inf'), None
+        gain = min(4.0, lum_ref / lum_live)
+        lifted = live.point(lambda v: min(255, int(round(v * gain))))
+        # A dimmed copy of the screen keeps its structure; a flat dark frame lifted to the same mean doesn't.
+        if sum(ImageStat.Stat(lifted).stddev) < 0.5 * sum(ImageStat.Stat(want).stddev):
+            return float('inf'), None
+        return _mean_diff(lifted, want), round(gain, 2)
+
+
+def structure_ok(path, spec):
+    """The live ROI has at least a third of the reference's contrast (per-channel standard deviation), after the
+    same brightness lift a dimmed screen gets: the screen's own detail is there, not just its mean colour."""
+    from PIL import Image, ImageStat
+    with Image.open(path) as im, Image.open(spec['reference']) as ref:
+        frame = im.convert('RGB')
+        if spec.get('frame') and frame.size != tuple(spec['frame']):
+            frame = frame.resize(tuple(spec['frame']), Image.Resampling.BOX)
+        live = frame.crop(tuple(spec['roi']))
+        want = ref.convert('RGB')
+        lum_live = sum(ImageStat.Stat(live).mean) / 3
+        lum_ref = sum(ImageStat.Stat(want).mean) / 3
+        gain = min(4.0, max(1.0, lum_ref / lum_live)) if lum_live > 0 else 1.0
+        return sum(ImageStat.Stat(live).stddev) * gain >= sum(ImageStat.Stat(want).stddev) / 3
+
+
+def _mean_diff(a, b):
+    first, second = a.tobytes(), b.tobytes()
+    return sum(abs(x - y) for x, y in zip(first, second)) / len(first) if first and len(first) == len(second) \
+        else float('inf')
+
+
 def _frame_gate(ctx, key, spec, cap):
     """An image gate on recorder frames: the same reference, ROI, frame size, scale and tolerance as the gate."""
     reference = Path(spec['reference'])
@@ -315,6 +364,14 @@ def _frame_gate(ctx, key, spec, cap):
         png = frame(ctx, 'gate-' + key)
         diff, note = ctx.runner.compare_region(png, reference, spec['roi'], spec.get('reference_is_roi'),
                                                spec.get('scale') or 'fit', spec.get('frame'), tolerance)
+        if diff > tolerance and spec.get('dim_tolerant'):
+            dimmed, gain = dim_compare(png, spec, tolerance)
+            if dimmed <= tolerance:
+                diff, note = dimmed, {**(note or {}), 'dimmed_gain': gain}
+        if diff <= tolerance and spec.get('dim_tolerant') and not structure_ok(png, spec):
+            # A flat frame (black loading screen, blank capture) can sit within the tolerance of a dark,
+            # text-light reference such as the TR menu's key line; the reference's text must be there.
+            diff, note = float('inf'), {**(note or {}), 'flat': True}
         if diff <= tolerance:
             ctx.log({'gate': key, 'on': ctx.on, 'pass': True, 'frame': str(png), 'diff': round(diff, 2),
                      **(note or {})})
