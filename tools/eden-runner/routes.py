@@ -307,8 +307,10 @@ def _frame_gate(ctx, key, spec, cap):
 # tile cursor's screen name, and Training by fresh game-state lines. The pause and quit frames are kept as evidence;
 # leaving Training is proven by the select or the main menu that follows.
 RECORDER_MAIN = {'kind': 'image', 'reference': str(ROUTES / 'refs' / 'main-recorder.png'),
-                 'sha256': '8584f3557f906066db83efbe726280f5dd523b0667383afe51c0ad070ade1516',
-                 'roi': [100, 270, 440, 380], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit',
+                 # The sidebar icons: the same whichever main tile is highlighted (r08: back from the selects,
+                 # Games & More was highlighted and a Smash-tile crop missed it).
+                 'sha256': '1f11f1a2355a14dca5aa1c6170d5f57c0619a77caac63c6af4ecc201af195b1b',
+                 'roi': [1150, 160, 1230, 640], 'reference_is_roi': True, 'frame': [1280, 720], 'scale': 'fit',
                  'tolerance': 18, 'from_run': 'harness-lib-ally-1'}
 
 
@@ -991,6 +993,12 @@ def back_to_main(ctx, presses=10):
             # stage select is recognised by the tile cursor's own screen name instead.
             looks.append('sss')
             play(ctx, 'leave-css')
+        elif looks.count('other') >= 3:
+            # Three B presses past the selects and still no main menu: one B too many reaches the title screen
+            # (harness-lib-ally-1 r08). to_main presses Start until the main menu shows.
+            looks.append('to_main')
+            out = to_main(ctx)
+            return _save(ctx, 'routes-back-to-main', {'looks': looks, 'to_main': out})
         else:
             looks.append('other')
             play(ctx, 'tap-b1')
