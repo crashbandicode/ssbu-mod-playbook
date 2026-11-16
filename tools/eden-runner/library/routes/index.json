@@ -3,33 +3,33 @@
  "macros": {
   "tile-up": {
    "file": "macros/tile-up.edenmacro.json",
-   "sha256": "3fc24a8af179ecff7a99dc8b87aa99f6ee1b28508831292d2cc78b72b2e6d08a",
+   "sha256": "90804c2ba02737ac71172160edf0a5f17d9835a00bc48832466cb94f16337df9",
    "cap": 20,
-   "frames": 12,
+   "frames": 6,
    "what": "L3, then L3+Up on frame 2, released frame 10: one tile-cursor step (CSS/SSS)",
    "source": "authored 2026-11-16 harness-lib; mask shape of rc15-tech owned-chord-lstick-*40 (passed XPS chord1)"
   },
   "tile-down": {
    "file": "macros/tile-down.edenmacro.json",
-   "sha256": "50e5fd84446e5f44631d237fc0f12c8b01c01719888b0fe5305ff092532dd406",
+   "sha256": "ee10df82df7cb814c1e07d8e141f457ac0954bd00175f8ca8fa0c9daa239c662",
    "cap": 20,
-   "frames": 12,
+   "frames": 6,
    "what": "L3, then L3+Down: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
   "tile-left": {
    "file": "macros/tile-left.edenmacro.json",
-   "sha256": "238f2426aec2aa87f46a0f989d640fe8263ada3a5abb3be00ca1261226a7d49b",
+   "sha256": "1d95116973fd2d43e6a7fb85c50db14730184307005385791359eb12fb159ff9",
    "cap": 20,
-   "frames": 12,
+   "frames": 6,
    "what": "L3, then L3+Left: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
   "tile-right": {
    "file": "macros/tile-right.edenmacro.json",
-   "sha256": "2109081d1fd62b5b78ef085ff38b5c04a88a53c0247d4128583168b594d35fcd",
+   "sha256": "b4b29ecf6f15719ee240af49cef2db723e344c4f01cb1bb80b232d6d94ec3525",
    "cap": 20,
-   "frames": 12,
+   "frames": 6,
    "what": "L3, then L3+Right: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
