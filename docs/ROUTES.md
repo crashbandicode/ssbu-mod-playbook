@@ -181,6 +181,13 @@ instance differs, and every input is a macro (no manual presses).
       it resets when OBS restarts or Settings > Output is applied. `switch_hw.py up` checks it and refuses while
       it's off. The fix is `obsws.py split-enable` (switch-remote tools/host); `up --allow-no-split` runs without
       it. The runner itself never changes OBS settings.
+- **The bridge NRO (optional, 2026-11-17):** with the test-only `ssbu-hw-bridge` installed beside TrainingRooms,
+  `switch_hw.py up <run> --bridge-host 192.168.0.224[:6970]` gives the instance Eden's keys too: `diag_log` is
+  `<run>/bridge.log` (TR's own oracle lines plus ` frame= wall=`, also appended to `console_log`), `settings` is
+  `<run>/bridge/settings.json` (fetched after every `settings.json written` line), and the folder beside it is a
+  request spool where `diag-pos.req`, `diag-save.req`, `diag-load.req`, `diag-item.req` and `diag-settings-next.json`
+  become the bridge's `pos`, `save`, `load`, `item`, `set` requests. So `read_state`, settings fixtures and log gates run
+  as on Eden. Design: `ssbu-hw-bridge/docs/DESIGN.md`.
 - **One driver per console:** `up` refuses while any process holds the tty or the claim file
   (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
 - **Hardware blocks:**

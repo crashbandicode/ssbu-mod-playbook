@@ -165,7 +165,10 @@ class BridgeMirror:
         raw = raw.rstrip(b'\r')
         data = self.FILE_DATA.match(raw)
         if data:
-            self.parts.setdefault(data.group(1), []).append(base64.b64decode(data.group(3)))
+            try:
+                self.parts.setdefault(data.group(1), []).append(base64.b64decode(data.group(3), validate=True))
+            except ValueError:  # a cut or damaged chunk: the transfer's file_end then reports mirrored=false
+                self.parts.setdefault(data.group(1), []).append(b'\0damaged')
             return
         end = self.FILE_END.match(raw)
         if end:
@@ -203,7 +206,7 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             sock.settimeout(0.1)
             pending = b''
             try:
-                sock.sendall(b'hello\nfile settings.json\n')
+                sock.sendall(b'file settings.json\n')  # the bridge greets each new client by itself
                 while not (stop and stop()):
                     for request in mirror.wanted + spool_requests(spool):
                         sock.sendall(request + b'\n')
@@ -219,7 +222,11 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                     lines = (pending + data).split(b'\n')
                     pending = lines.pop()
                     for raw in lines:
-                        mirror.line(raw)
+                        try:
+                            mirror.line(raw)
+                        except (OSError, ValueError) as error:  # one bad line never stops the capture
+                            blog.write(b'[Adapter] line not handled: ' + repr(error).encode() + b'\n')
+                            blog.flush()
             except OSError:
                 pass
             finally:

@@ -387,6 +387,9 @@ class SwitchHwTests(unittest.TestCase):
         self.assertEqual((run / 'bridge' / 'settings.json').read_bytes(), body)
         self.assertEqual((run / 'bridge' / 'files' / 'settings.json').read_bytes(), body)
         mirror.line(b'[Bridge] file_end name=x.json bytes=1 sha256=' + b'0' * 64 + b' result=ok')
+        mirror.line(b'[Bridge] file_data name=cut.json seq=0 b64=Zm9vYm')  # a chunk cut short
+        mirror.line(b'[Bridge] file_end name=cut.json bytes=4 sha256=' + hashlib.sha256(b'foob').hexdigest().encode() + b' result=ok')
+        self.assertFalse((run / 'bridge' / 'files' / 'cut.json').exists())
         self.assertFalse((run / 'bridge' / 'files' / 'x.json').exists())
         mirror.line(b'[TrainingRooms] settings.json written by the writer thread frame=12 wall=13')
         mirror.line(b'[Ui] press A page=3 cursor=0 depth=1 screen=Page row=None recording= frame=14 wall=15')
@@ -430,7 +433,7 @@ class SwitchHwTests(unittest.TestCase):
                 raise OSError('refused')
             return Sock(chunks.pop(0))
         switch_hw.capture_bridge(run, 'h', 6970, console, stop=lambda: len(calls) >= 2, connect=connect, retry_s=0)
-        self.assertEqual(sent[0], b'hello\nfile settings.json\n')
+        self.assertEqual(sent[0], b'file settings.json\n')
         self.assertIn(b'pos\n', sent)
         log = (run / 'bridge.log').read_text()
         self.assertIn('[TrainingRooms] state pos entry=0 kind=0 x=1 y=2 lr=1 dmg=0 status=0 situation=0 frame=5 wall=6\n', log)
