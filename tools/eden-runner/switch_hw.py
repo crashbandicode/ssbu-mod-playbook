@@ -39,6 +39,7 @@ It never powers, sleeps or reboots the console; HOME → X → A (`switch.termin
 """
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -194,7 +195,15 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
     run = Path(run)
     spool = run / 'bridge'
     spool.mkdir(parents=True, exist_ok=True)
-    with (run / 'bridge.log').open('ab') as blog, Path(console).open('ab') as clog, \
+    # One capture per run: the bridge serves one client, so a second capture would wait unaccepted and take the spool's
+    # requests (seen in Eden bridge-proof-yoga-7).
+    lock = (run / 'bridge.lock').open('w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit(f'refused: another capture-bridge holds {run / "bridge.lock"}') from None
+    with lock, (run / 'bridge.log').open('ab') as blog, Path(console).open('ab') as clog, \
             (run / 'bridge.requests.jsonl').open('a') as sent:
         mirror = BridgeMirror(run, [blog, clog])
         while not (stop and stop()):

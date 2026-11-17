@@ -439,6 +439,11 @@ class SwitchHwTests(unittest.TestCase):
         self.assertIn('[TrainingRooms] state pos entry=0 kind=0 x=1 y=2 lr=1 dmg=0 status=0 situation=0 frame=5 wall=6\n', log)
         self.assertEqual(console.read_text(), log)
         self.assertEqual(json.loads((run / 'bridge.requests.jsonl').read_text().splitlines()[0])['request'], 'pos')
+        import fcntl
+        with (run / 'bridge.lock').open('w') as held:  # a second capture of the same run is refused
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(SystemExit):
+                switch_hw.capture_bridge(run, 'h', 6970, console, stop=lambda: True, connect=connect, retry_s=0)
 
     def test_read_state_runs_unchanged_on_a_bridge_instance(self):
         import threading
