@@ -2,8 +2,10 @@
 """Up and Down for a REAL Switch run: the hardware counterpart of eden-lifecycle for tools/eden-runner.
 
     switch_hw.py up   <run dir> [--device /dev/ttyACM0] [--log-host 192.168.0.224:6969] [--owner TEXT]
+                      [--bridge-host 192.168.0.224:6970]
     switch_hw.py down <run dir>
     switch_hw.py capture-log <file> --log-host HOST:PORT      (started by `up`; you don't run it by hand)
+    switch_hw.py capture-bridge <run dir> --bridge-host HOST:PORT --console FILE   (started by `up --bridge-host`)
 
 `up` writes <run dir>/instances.json with one instance, "sw":
   socket          usb://<device>; the runner's client factory hands it to switch-remote's client (macro.play is
@@ -13,6 +15,17 @@
   screenshot_target "switch"
 There is no diag_log, tile_log or settings: on hardware the release NRO prints no diag lines, the tile cursor isn't
 on the card, and SD files are read over FTP after the session, not live.
+
+With `--bridge-host` (the test-only ssbu-hw-bridge NRO installed beside TrainingRooms, which serves TR's oracle lines and
+native reads on its own port) the instance also gets, as on Eden:
+  diag_log        <run dir>/bridge.log: the bridge's lines (TR's own oracle text plus ` frame= wall=`), also appended to
+                  console_log, so log gates, LogCursor and routes.read_state read them unchanged
+  settings        <run dir>/bridge/settings.json: TR's settings.json, fetched over the bridge at connect and after every
+                  `settings.json written` line, so json gates read it unchanged
+  bridge_files    <run dir>/bridge/files: other TR files (`bridge-file.req` beside settings.json names them, one per line)
+The folder beside settings.json is a request spool: `diag-pos.req`, `diag-save.req`, `diag-load.req`, `diag-item.req`
+and `diag-settings-next.json` (what Eden rows write beside TR's settings.json) become the bridge's `pos`, `save`, `load`,
+`item N` and `set <base64>` requests. `bridge.requests.jsonl` records each one sent.
 
 Before writing anything, `up` checks:
   - no other process holds the pad's tty (one driver per console);
@@ -25,8 +38,11 @@ Before writing anything, `up` checks:
 It never powers, sleeps or reboots the console; HOME → X → A (`switch.terminate`) closes the game when a row needs it.
 """
 import argparse
+import base64
+import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -38,6 +54,10 @@ HERE = Path(__file__).resolve().parent
 CLAIM = Path.home() / '.cache' / 'switch-pad.claim'
 DEFAULT_DEVICE = '/dev/ttyACM0'
 DEFAULT_LOG = '192.168.0.224:6969'
+# The bridge's port (ssbu-hw-bridge; Skyline's own log stays on 6969).
+BRIDGE_PORT = 6970
+REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req': 'load'}
+SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 
 
 def holders(device):
@@ -108,13 +128,112 @@ def capture_log(path, host, port, stop=None, connect=socket.create_connection, r
             time.sleep(retry_s)
 
 
+def spool_requests(spool):
+    """The request files Eden rows write beside TR's settings.json, oldest first, as bridge request lines; each file
+    is removed once read (what TR does with its diag-*.req files)."""
+    spool = Path(spool)
+    found = []
+    for path in spool.iterdir() if spool.is_dir() else []:
+        name = path.name
+        if path.is_file() and (name in REQUEST_FILES or name in ('diag-item.req', 'diag-settings-next.json', 'bridge-file.req')):
+            found.append((path.stat().st_mtime_ns, name, path))
+    lines = []
+    for _, name, path in sorted(found):
+        data = path.read_bytes()
+        path.unlink()
+        if name in REQUEST_FILES:
+            lines.append(REQUEST_FILES[name].encode())
+        elif name == 'diag-item.req':
+            lines.append(b'item ' + data.strip())
+        elif name == 'diag-settings-next.json':
+            lines.append(b'set ' + base64.b64encode(data))
+        else:
+            lines.extend(b'file ' + n.strip() for n in data.splitlines() if n.strip())
+    return lines
+
+
+class BridgeMirror:
+    """Lines from the bridge in: file transfers are reassembled into files (settings.json also to the instance's
+    `settings`), every other line goes to the bridge log and the console log, whole."""
+    FILE_DATA = re.compile(rb'^\[Bridge\] file_data name=(\S+) seq=(\d+) b64=(\S*)')
+    FILE_END = re.compile(rb'^\[Bridge\] file_end name=(\S+) bytes=(\d+) sha256=([0-9a-f]{64}) result=ok')
+
+    def __init__(self, run, logs):
+        self.run, self.logs, self.parts, self.wanted = Path(run), logs, {}, []
+
+    def line(self, raw):
+        raw = raw.rstrip(b'\r')
+        data = self.FILE_DATA.match(raw)
+        if data:
+            self.parts.setdefault(data.group(1), []).append(base64.b64decode(data.group(3)))
+            return
+        end = self.FILE_END.match(raw)
+        if end:
+            name, body = end.group(1), b''.join(self.parts.pop(end.group(1), []))
+            ok = len(body) == int(end.group(2)) and hashlib.sha256(body).hexdigest().encode() == end.group(3)
+            if ok:
+                target = self.run / 'bridge' / 'files' / name.decode()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(body)
+                if name == b'settings.json':
+                    (self.run / 'bridge' / 'settings.json.tmp').write_bytes(body)
+                    os.replace(self.run / 'bridge' / 'settings.json.tmp', self.run / 'bridge' / 'settings.json')
+            raw += b' mirrored=' + (b'true' if ok else b'false')
+        if raw.startswith(SETTINGS_WRITTEN):
+            self.wanted.append(b'file settings.json')
+        for log in self.logs:
+            log.write(raw + b'\n')
+            log.flush()
+
+
+def capture_bridge(run, host, port, console, stop=None, connect=socket.create_connection, retry_s=0.5):
+    """Hold the bridge's socket (reconnecting): its lines to bridge.log and the console log, the spool's requests out."""
+    run = Path(run)
+    spool = run / 'bridge'
+    spool.mkdir(parents=True, exist_ok=True)
+    with (run / 'bridge.log').open('ab') as blog, Path(console).open('ab') as clog, \
+            (run / 'bridge.requests.jsonl').open('a') as sent:
+        mirror = BridgeMirror(run, [blog, clog])
+        while not (stop and stop()):
+            try:
+                sock = connect((host, port), timeout=3)
+            except OSError:
+                time.sleep(retry_s)
+                continue
+            sock.settimeout(0.1)
+            pending = b''
+            try:
+                sock.sendall(b'hello\nfile settings.json\n')
+                while not (stop and stop()):
+                    for request in mirror.wanted + spool_requests(spool):
+                        sock.sendall(request + b'\n')
+                        sent.write(json.dumps({'wall': time.time(), 'request': request[:80].decode('ascii', 'replace')}) + '\n')
+                        sent.flush()
+                    mirror.wanted.clear()
+                    try:
+                        data = sock.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    lines = (pending + data).split(b'\n')
+                    pending = lines.pop()
+                    for raw in lines:
+                        mirror.line(raw)
+            except OSError:
+                pass
+            finally:
+                sock.close()
+            time.sleep(retry_s)
+
+
 def _client(device):
     sys.path.insert(0, str(HERE))
     import runner
     return runner.default_client_factory()(f'usb://{device}')
 
 
-def up(run, device, log_host, owner, allow_no_split=False):
+def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None):
     run = Path(run)
     run.mkdir(parents=True, exist_ok=True)
     others = holders(device)
@@ -157,6 +276,14 @@ def up(run, device, log_host, owner, allow_no_split=False):
         journal.update(capture_pid=proc.pid, log=str(log), log_host=log_host)
         instances = {'sw': {'socket': f'usb://{device}', 'console_log': str(log), 'skyline_log': str(log),
                             'screenshot_target': 'switch', 'hardware': True}}
+        if bridge_host:
+            (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
+            bridge = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), 'capture-bridge', str(run),
+                                       '--bridge-host', bridge_host, '--console', str(log)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=open(run / 'capture-bridge.err', 'ab'), start_new_session=True)
+            journal.update(bridge_pid=bridge.pid, bridge_host=bridge_host)
+            instances['sw'].update(diag_log=str(run / 'bridge.log'), bridge_log=str(run / 'bridge.log'),
+                                   settings=str(run / 'bridge' / 'settings.json'), bridge_files=str(run / 'bridge' / 'files'))
         (run / 'instances.json').write_text(json.dumps(instances, indent=2) + '\n')
     except BaseException:
         CLAIM.unlink(missing_ok=True)
@@ -186,13 +313,14 @@ def down(run):
         client.close()
     except Exception as error:  # noqa: BLE001 - Down always continues to the release
         out['reset_error'] = repr(error)
-    pid = journal.get('capture_pid')
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            out['capture_stopped'] = pid
-        except ProcessLookupError:
-            out['capture_stopped'] = 'gone'
+    for key, label in (('capture_pid', 'capture_stopped'), ('bridge_pid', 'bridge_stopped')):
+        pid = journal.get(key)
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                out[label] = pid
+            except ProcessLookupError:
+                out[label] = 'gone'
     claim = Path(journal['claim'])
     if claim.is_file() and json.loads(claim.read_text()).get('run') == str(run):
         claim.unlink()
@@ -215,16 +343,29 @@ def main(argv=None):
     p.add_argument('--owner', default=os.environ.get('USER', 'runner'))
     p.add_argument('--allow-no-split', action='store_true',
                    help='go up even when OBS cannot split the recording per row (plans without per_row_files)')
+    p.add_argument('--bridge-host', default=None,
+                   help=f'HOST[:PORT] of the ssbu-hw-bridge NRO (port {BRIDGE_PORT} when omitted)')
     p = sub.add_parser('down')
     p.add_argument('run')
     p = sub.add_parser('capture-log')
     p.add_argument('file')
     p.add_argument('--log-host', default=DEFAULT_LOG)
+    p = sub.add_parser('capture-bridge')
+    p.add_argument('run')
+    p.add_argument('--bridge-host', required=True)
+    p.add_argument('--console', required=True)
     args = parser.parse_args(argv)
+    if getattr(args, 'bridge_host', None) and ':' not in args.bridge_host:
+        args.bridge_host = f'{args.bridge_host}:{BRIDGE_PORT}'
     if args.cmd == 'up':
-        up(args.run, args.device, args.log_host, args.owner, args.allow_no_split)
+        up(args.run, args.device, args.log_host, args.owner, args.allow_no_split, args.bridge_host)
     elif args.cmd == 'down':
         down(args.run)
+    elif args.cmd == 'capture-bridge':
+        host, _, port = args.bridge_host.rpartition(':')
+        stopping = []
+        signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+        capture_bridge(args.run, host, int(port), args.console, stop=lambda: bool(stopping))
     else:
         host, _, port = args.log_host.rpartition(':')
         stopping = []

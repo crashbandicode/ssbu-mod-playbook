@@ -355,6 +355,145 @@ class SwitchHwTests(unittest.TestCase):
         finally:
             switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen = saved
 
+    def test_bridge_spool_turns_eden_request_files_into_bridge_requests(self):
+        import base64
+        import time
+        import switch_hw
+        spool = Path(tempfile.mkdtemp())
+        for name, data in [('diag-settings-next.json', b'{"menu":{}}'), ('diag-pos.req', b''), ('diag-item.req', b' 7\n'),
+                           ('bridge-file.req', b'save_states.json\nlibrary/a.json\n'), ('diag-save.req', b''),
+                           ('diag-load.req', b''), ('settings.json', b'{}')]:
+            (spool / name).write_bytes(data)
+            time.sleep(0.002)
+        lines = switch_hw.spool_requests(spool)
+        self.assertEqual(lines, [b'set ' + base64.b64encode(b'{"menu":{}}'), b'pos', b'item 7', b'file save_states.json',
+                                 b'file library/a.json', b'save', b'load'])
+        self.assertEqual(sorted(p.name for p in spool.iterdir()), ['settings.json'])  # requests consumed, the mirror kept
+        self.assertEqual(switch_hw.spool_requests(spool / 'missing'), [])
+
+    def test_bridge_mirror_writes_settings_and_keeps_lines_whole(self):
+        import base64
+        import hashlib
+        import io
+        import switch_hw
+        run = Path(tempfile.mkdtemp())
+        blog, clog = io.BytesIO(), io.BytesIO()
+        mirror = switch_hw.BridgeMirror(run, [blog, clog])
+        body = b'{"menu": {"input_delay": [3]}}' * 20
+        for seq, start in enumerate(range(0, len(body), 384)):
+            mirror.line(b'[Bridge] file_data name=settings.json seq=%d b64=' % seq + base64.b64encode(body[start:start + 384]))
+        digest = hashlib.sha256(body).hexdigest().encode()
+        mirror.line(b'[Bridge] file_end name=settings.json bytes=%d sha256=%s result=ok frame=9 wall=10\r' % (len(body), digest))
+        self.assertEqual((run / 'bridge' / 'settings.json').read_bytes(), body)
+        self.assertEqual((run / 'bridge' / 'files' / 'settings.json').read_bytes(), body)
+        mirror.line(b'[Bridge] file_end name=x.json bytes=1 sha256=' + b'0' * 64 + b' result=ok')
+        self.assertFalse((run / 'bridge' / 'files' / 'x.json').exists())
+        mirror.line(b'[TrainingRooms] settings.json written by the writer thread frame=12 wall=13')
+        mirror.line(b'[Ui] press A page=3 cursor=0 depth=1 screen=Page row=None recording= frame=14 wall=15')
+        self.assertEqual(mirror.wanted, [b'file settings.json'])
+        text = blog.getvalue().decode()
+        self.assertEqual(text, clog.getvalue().decode())
+        self.assertNotIn('file_data', text)
+        self.assertIn(' mirrored=true\n', text)
+        self.assertIn('x.json bytes=1 sha256=' + '0' * 64 + ' result=ok mirrored=false\n', text)
+        self.assertTrue(text.endswith('recording= frame=14 wall=15\n'))
+
+    def test_capture_bridge_sends_hello_and_spool_then_reconnects(self):
+        import switch_hw
+        run = Path(tempfile.mkdtemp())
+        console = run / 'skyline.log'
+        (run / 'bridge').mkdir()
+        (run / 'bridge' / 'diag-pos.req').write_bytes(b'')
+        sent, calls = [], []
+        chunks = [[b'[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 frame=0 wall=1\n[TrainingRooms] state pos entry=0 kind=0 ',
+                   b'x=1 y=2 lr=1 dmg=0 status=0 situation=0 frame=5 wall=6\n']]
+
+        class Sock:
+            def __init__(self, data):
+                self.data = list(data)
+
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, b):
+                sent.append(b)
+
+            def recv(self, n):
+                return self.data.pop(0) if self.data else b''
+
+            def close(self):
+                pass
+
+        def connect(addr, timeout):
+            calls.append(addr)
+            if not chunks:
+                raise OSError('refused')
+            return Sock(chunks.pop(0))
+        switch_hw.capture_bridge(run, 'h', 6970, console, stop=lambda: len(calls) >= 2, connect=connect, retry_s=0)
+        self.assertEqual(sent[0], b'hello\nfile settings.json\n')
+        self.assertIn(b'pos\n', sent)
+        log = (run / 'bridge.log').read_text()
+        self.assertIn('[TrainingRooms] state pos entry=0 kind=0 x=1 y=2 lr=1 dmg=0 status=0 situation=0 frame=5 wall=6\n', log)
+        self.assertEqual(console.read_text(), log)
+        self.assertEqual(json.loads((run / 'bridge.requests.jsonl').read_text().splitlines()[0])['request'], 'pos')
+
+    def test_read_state_runs_unchanged_on_a_bridge_instance(self):
+        import threading
+        run = Path(tempfile.mkdtemp())
+        (run / 'bridge').mkdir()
+        log = run / 'bridge.log'
+        log.write_text('[TrainingRooms] state pos entry=0 kind=9 x=0 y=0 lr=1 dmg=0 status=0 situation=0 frame=1 wall=1\n')
+        instance = {'socket': 'usb:///dev/ttyACM0', 'diag_log': str(log), 'settings': str(run / 'bridge' / 'settings.json')}
+        ctx = type('Ctx', (), {'instance': instance, 'check_stop': lambda self: None})()
+
+        def bridge():
+            for _ in range(100):
+                if (run / 'bridge' / 'diag-pos.req').exists():
+                    with log.open('a') as f:
+                        f.write('[TrainingRooms] state pos entry=1 kind=66 x=-65.37304 y=0 lr=-1 dmg=12.5 status=27 situation=2 frame=8 wall=9\n')
+                        f.write('[TrainingRooms] state pos entry=0 kind=0 x=6.5219345 y=0 lr=1 dmg=0 status=0 situation=0 frame=8 wall=9\n')
+                    return
+                threading.Event().wait(0.02)
+        t = threading.Thread(target=bridge)
+        t.start()
+        bodies = routes.read_state(ctx, cap=3)
+        t.join()
+        self.assertEqual(bodies[0]['kind'], 0)  # the stale entry-0 line before the request is not used
+        self.assertEqual((bodies[1]['kind'], bodies[1]['x'], bodies[1]['lr'], bodies[1]['status']), (66, -65.37304, -1.0, 27))
+
+    def test_up_with_a_bridge_gives_the_instance_eden_keys(self):
+        import contextlib
+        import io
+        import switch_hw
+        folder = Path(tempfile.mkdtemp())
+        popen = []
+
+        class Client:
+            def request(self, method, params=None):
+                if method == 'ui.screenshot':
+                    Path(params['path']).write_bytes(b'png')
+                return {'ok': True, 'result': {'version': 'x', 'ok': True}}
+
+            def close(self):
+                pass
+        saved = (switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen)
+        switch_hw.CLAIM = folder / 'claim'
+        switch_hw.holders = lambda device: []
+        switch_hw._client = lambda device: Client()
+        switch_hw.subprocess.Popen = lambda args, **k: popen.append(args) or type('P', (), {'pid': 4242 + len(popen)})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                switch_hw.up(folder / 'run', '/dev/null', 'h:1', 'test', bridge_host='192.168.0.224:6970')
+            sw = json.loads((folder / 'run' / 'instances.json').read_text())['sw']
+            self.assertEqual(sw['diag_log'], str(folder / 'run' / 'bridge.log'))
+            self.assertEqual(Path(sw['settings']).parent, folder / 'run' / 'bridge')
+            self.assertTrue(Path(sw['bridge_files']).is_dir())
+            self.assertIn('capture-bridge', popen[1])
+            self.assertEqual(popen[1][popen[1].index('--console') + 1], sw['console_log'])
+            self.assertEqual(json.loads((folder / 'run' / 'journal.json').read_text())['bridge_pid'], 4244)
+        finally:
+            switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen = saved
+
     def test_factory_routes_usb_to_switch_remote(self):
         folder = Path(tempfile.mkdtemp())
         (folder / 'switch_remote.py').write_text('def make_client(s):\n    return ("fake", s)\n')
