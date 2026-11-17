@@ -433,7 +433,7 @@ class SwitchHwTests(unittest.TestCase):
                 raise OSError('refused')
             return Sock(chunks.pop(0))
         switch_hw.capture_bridge(run, 'h', 6970, console, stop=lambda: len(calls) >= 2, connect=connect, retry_s=0)
-        self.assertEqual(sent[0], b'file settings.json\n')
+        self.assertEqual(sent[0], b'backup\nfile settings.json\n')
         self.assertIn(b'pos\n', sent)
         log = (run / 'bridge.log').read_text()
         self.assertIn('[TrainingRooms] state pos entry=0 kind=0 x=1 y=2 lr=1 dmg=0 status=0 situation=0 frame=5 wall=6\n', log)
@@ -501,6 +501,43 @@ class SwitchHwTests(unittest.TestCase):
             self.assertEqual(json.loads((folder / 'run' / 'journal.json').read_text())['bridge_pid'], 4244)
         finally:
             switch_hw.CLAIM, switch_hw.holders, switch_hw._client, switch_hw.subprocess.Popen = saved
+
+    def test_an_unrestored_backup_is_restored_before_a_new_one(self):
+        import io
+        import switch_hw
+        mirror = switch_hw.BridgeMirror(Path(tempfile.mkdtemp()), [io.BytesIO()])
+        mirror.line(b'[Bridge] req backup result=refused reason=backup_open frame=0 wall=1')
+        self.assertEqual(mirror.wanted, [b'restore', b'backup'])
+
+    def test_down_restores_the_fixture_and_keeps_a_receipt(self):
+        import switch_hw
+        run = Path(tempfile.mkdtemp())
+        sent = []
+
+        class Sock:
+            def __init__(self):
+                self.data = [b'[Bridge] hello x\n[Bridge] req restore result=ok files=3 written=1 removed=0 frame=1 wall=2\n']
+
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, b):
+                sent.append(b)
+
+            def recv(self, n):
+                return self.data.pop(0) if self.data else b''
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        receipt = switch_hw.restore_fixture(run, {'bridge_host': 'h:6970'}, connect=lambda a, timeout: Sock())
+        self.assertTrue(receipt['ok'])
+        self.assertEqual(sent, [b'restore\n'])
+        self.assertTrue(json.loads((run / 'bridge-restore.json').read_text())['ok'])
+        failed = switch_hw.bridge_request('h', 1, 'restore', cap=0.5, connect=lambda a, timeout: (_ for _ in ()).throw(OSError()))
+        self.assertIsNone(failed)
 
     def test_factory_routes_usb_to_switch_remote(self):
         folder = Path(tempfile.mkdtemp())

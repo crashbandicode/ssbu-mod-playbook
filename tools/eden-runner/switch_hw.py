@@ -57,7 +57,8 @@ DEFAULT_DEVICE = '/dev/ttyACM0'
 DEFAULT_LOG = '192.168.0.224:6969'
 # The bridge's port (ssbu-hw-bridge; Skyline's own log stays on 6969).
 BRIDGE_PORT = 6970
-REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req': 'load'}
+REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req': 'load',
+                 'bridge-backup.req': 'backup', 'bridge-restore.req': 'restore', 'bridge-verify.req': 'verify'}
 SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 
 
@@ -185,6 +186,9 @@ class BridgeMirror:
             raw += b' mirrored=' + (b'true' if ok else b'false')
         if raw.startswith(SETTINGS_WRITTEN):
             self.wanted.append(b'file settings.json')
+        if raw.startswith(b'[Bridge] req backup result=refused reason=backup_open'):
+            # A session that never restored: put the player's files back first, then open a fresh backup.
+            self.wanted.extend([b'restore', b'backup'])
         for log in self.logs:
             log.write(raw + b'\n')
             log.flush()
@@ -215,7 +219,8 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             sock.settimeout(0.1)
             pending = b''
             try:
-                sock.sendall(b'file settings.json\n')  # the bridge greets each new client by itself
+                # The fixture backup (D-Q12) comes first: the bridge refuses fixture requests until it is open.
+                sock.sendall(b'backup\nfile settings.json\n')  # the bridge greets each new client by itself
                 while not (stop and stop()):
                     for request in mirror.wanted + spool_requests(spool):
                         sock.sendall(request + b'\n')
@@ -241,6 +246,44 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             finally:
                 sock.close()
             time.sleep(retry_s)
+
+
+def bridge_request(host, port, request, cap=60.0, connect=socket.create_connection):
+    """One request on a fresh connection to the bridge (the capture is stopped first): its `[Bridge] req <verb>` reply."""
+    verb = request.split()[0].encode()
+    deadline = time.monotonic() + cap
+    while time.monotonic() < deadline:
+        try:
+            sock = connect((host, port), timeout=3)
+        except OSError:
+            time.sleep(0.5)
+            continue
+        with sock:
+            sock.settimeout(1.0)
+            sock.sendall(request.encode() + b'\n')
+            pending = b''
+            while time.monotonic() < deadline:
+                try:
+                    data = sock.recv(65536)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                lines = (pending + data).split(b'\n')
+                pending = lines.pop()
+                for line in lines:
+                    if line.startswith(b'[Bridge] req ' + verb + b' '):
+                        return line.decode(errors='replace')
+    return None
+
+
+def restore_fixture(run, journal, connect=socket.create_connection):
+    """D-Q12 at Down: the bridge writes back the files it backed up at Up and reads each one back; the receipt is kept."""
+    host, _, port = journal['bridge_host'].rpartition(':')
+    reply = bridge_request(host, int(port), 'restore', connect=connect)
+    receipt = {'wall': time.time(), 'restore': reply, 'ok': bool(reply and ' result=ok ' in reply + ' ')}
+    (Path(run) / 'bridge-restore.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    return receipt
 
 
 def _client(device):
@@ -337,6 +380,9 @@ def down(run):
                 out[label] = pid
             except ProcessLookupError:
                 out[label] = 'gone'
+    if journal.get('bridge_host'):
+        time.sleep(1.0)  # the bridge accepts the next client once the capture's connection has closed
+        out['bridge_restore'] = restore_fixture(run, journal)
     claim = Path(journal['claim'])
     if claim.is_file() and json.loads(claim.read_text()).get('run') == str(run):
         claim.unlink()
@@ -366,6 +412,8 @@ def main(argv=None):
     p = sub.add_parser('capture-log')
     p.add_argument('file')
     p.add_argument('--log-host', default=DEFAULT_LOG)
+    p = sub.add_parser('restore', help='put back the TR files the bridge backed up (also done by down)')
+    p.add_argument('run')
     p = sub.add_parser('capture-bridge')
     p.add_argument('run')
     p.add_argument('--bridge-host', required=True)
@@ -377,6 +425,8 @@ def main(argv=None):
         up(args.run, args.device, args.log_host, args.owner, args.allow_no_split, args.bridge_host)
     elif args.cmd == 'down':
         down(args.run)
+    elif args.cmd == 'restore':
+        print(json.dumps(restore_fixture(args.run, json.loads((Path(args.run) / 'journal.json').read_text()))))
     elif args.cmd == 'capture-bridge':
         host, _, port = args.bridge_host.rpartition(':')
         stopping = []
