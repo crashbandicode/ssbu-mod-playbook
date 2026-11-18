@@ -6,6 +6,7 @@
     switch_hw.py down <run dir>
     switch_hw.py capture-log <file> --log-host HOST:PORT      (started by `up`; you don't run it by hand)
     switch_hw.py capture-bridge <run dir> --bridge-host HOST:PORT --console FILE   (started by `up --bridge-host`)
+    switch_hw.py state <run dir> [--fresh pos,speed,roster,status] [--cap S]   (a bridge run: the console's state as JSON)
 
 `up` writes <run dir>/instances.json with one instance, "sw":
   socket          usb://<device>; the runner's client factory hands it to switch-remote's client (macro.play is
@@ -25,7 +26,12 @@ native reads on its own port) the instance also gets, as on Eden:
   bridge_files    <run dir>/bridge/files: other TR files (`bridge-file.req` beside settings.json names them, one per line)
 The folder beside settings.json is a request spool: `diag-pos.req`, `diag-save.req`, `diag-load.req`, `diag-item.req`
 and `diag-settings-next.json` (what Eden rows write beside TR's settings.json) become the bridge's `pos`, `save`, `load`,
-`item N` and `set <base64>` requests. `bridge.requests.jsonl` records each one sent.
+`item N` and `set <base64>` requests (`bridge-speed.req`, `bridge-roster.req` and `bridge-status.req` ask for a fresh
+speed, roster or status-id line). `bridge.requests.jsonl` records each one sent.
+
+`state` (and `bridge_state()` for a row) reads the console without Eden: the last B-FRAME (` frame= wall=` on every
+line), B-POS (`state pos`, both bodies), B-STAGE, B-ROSTER, B-ITEM, B-SPEED and B-STATUS-NAMES (`cpu_ids` ids) lines in
+bridge.log. `--fresh` first writes the named requests to the spool and waits for their new lines.
 
 Before writing anything, `up` checks:
   - no other process holds the pad's tty (one driver per console);
@@ -58,7 +64,8 @@ DEFAULT_LOG = '192.168.0.224:6969'
 # The bridge's port (ssbu-hw-bridge; Skyline's own log stays on 6969).
 BRIDGE_PORT = 6970
 REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req': 'load',
-                 'bridge-backup.req': 'backup', 'bridge-restore.req': 'restore', 'bridge-verify.req': 'verify'}
+                 'bridge-backup.req': 'backup', 'bridge-restore.req': 'restore', 'bridge-verify.req': 'verify',
+                 'bridge-speed.req': 'speed', 'bridge-roster.req': 'roster', 'bridge-status.req': 'status_names'}
 SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 
 
@@ -251,6 +258,72 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             time.sleep(retry_s)
 
 
+SUFFIX = re.compile(r' frame=(\d+) wall=(\d+)$')
+STATE_POS = re.compile(r'\[TrainingRooms\] state pos entry=(\d+) kind=(-?\d+) x=(\S+) y=(\S+) lr=(\S+) dmg=(\S+) '
+                       r'status=(-?\d+) situation=(-?\d+)')
+STAGE = re.compile(r'\[Bridge\] stage id=(-?\d+)')
+ROSTER = re.compile(r'\[Bridge\] roster entry=(\d+) kind=(-?\d+) nana=(true|false)')
+ITEM = re.compile(r'\[Bridge\] item entry=(\d+) held=(true|false) kind=(-?\d+)')
+SPEED = re.compile(r'\[Bridge\] speed fps=(\S+) ratio=(\S+) frames=(\d+) ms=(\d+)')
+STATUS_ID = re.compile(r'(FIGHTER_STATUS_KIND_[A-Z0-9_]+)=(-?\d+)')
+# Each fresh read: its spool file and the line that answers it (speed answers with its own line; roster re-sends the
+# roster lines on the next frames after its reply; status_names sends the id lines, then its reply; pos also needs both
+# bodies' `state pos` lines, checked below).
+FRESH = {'pos': ('diag-pos.req', r'\[Bridge\] req pos result='), 'speed': ('bridge-speed.req', r'\[Bridge\] speed fps='),
+         'roster': ('bridge-roster.req', r'\[Bridge\] roster entry='),
+         'status': ('bridge-status.req', r'\[Bridge\] req status_names result=')}
+
+
+def parse_bridge_state(lines):
+    """The newest value of each native read in bridge.log lines (oldest first): B-FRAME, B-POS, B-STAGE, B-ROSTER,
+    B-ITEM, B-SPEED and B-STATUS-NAMES. A key is absent until its line has been seen."""
+    out = {'pos': {}, 'roster': {}, 'items': {}, 'status_ids': {}}
+    for line in lines:
+        tail = SUFFIX.search(line)
+        if tail:
+            out['frame'], out['wall_ms'] = int(tail.group(1)), int(tail.group(2))
+        if (m := STATE_POS.search(line)):
+            out['pos'][int(m.group(1))] = {'kind': int(m.group(2)), 'x': float(m.group(3)), 'y': float(m.group(4)),
+                                           'lr': float(m.group(5)), 'dmg': float(m.group(6)), 'status': int(m.group(7)),
+                                           'situation': int(m.group(8)), 'frame': tail and int(tail.group(1))}
+        elif (m := STAGE.search(line)):
+            out['stage'] = int(m.group(1))
+        elif (m := ROSTER.search(line)):
+            out['roster'][int(m.group(1))] = {'kind': int(m.group(2)), 'nana': m.group(3) == 'true'}
+        elif (m := ITEM.search(line)):
+            out['items'][int(m.group(1))] = {'held': m.group(2) == 'true', 'kind': int(m.group(3))}
+        elif (m := SPEED.search(line)):
+            out['speed'] = {'fps': float(m.group(1)), 'ratio': float(m.group(2)), 'frames': int(m.group(3)),
+                            'ms': int(m.group(4))}
+        elif '[TrainingRooms] cpu_ids ' in line:
+            out['status_ids'].update({name: int(v) for name, v in STATUS_ID.findall(line)})
+    return out
+
+
+def bridge_state(run, fresh=(), cap=6.0):
+    """The console's state from a bridge run (`up --bridge-host`): `fresh` names (pos, speed, roster, status) are asked
+    for first through the spool and must answer within `cap` s; everything else is the newest line already seen."""
+    run = Path(run)
+    log = run / 'bridge.log'
+    start = log.stat().st_size if log.exists() else 0
+    for name in fresh:
+        (run / 'bridge' / FRESH[name][0]).write_bytes(b'')
+    want = {name: re.compile(FRESH[name][1]) for name in fresh}
+    seen, until = set(), time.monotonic() + cap
+    while len(seen) < len(want):
+        with log.open('rb') as f:
+            f.seek(start)
+            new = f.read().decode(errors='replace').splitlines()
+        seen = {name for name, regex in want.items() if any(regex.search(line) for line in new)}
+        if 'pos' in want and len({int(m.group(1)) for line in new if (m := STATE_POS.search(line))}) < 2:
+            seen.discard('pos')
+        if len(seen) < len(want):
+            if time.monotonic() > until:
+                raise RuntimeError(f'bridge state: no answer for {sorted(set(want) - seen)} within {cap} s')
+            time.sleep(0.1)
+    return parse_bridge_state(log.read_text(errors='replace').splitlines())
+
+
 def bridge_request(host, port, request, cap=60.0, connect=socket.create_connection):
     """One request on a fresh connection to the bridge (the capture is stopped first): its `[Bridge] req <verb>` reply."""
     verb = request.split()[0].encode()
@@ -427,6 +500,10 @@ def main(argv=None):
     p.add_argument('--log-host', default=DEFAULT_LOG)
     p = sub.add_parser('restore', help='put back the TR files the bridge backed up (also done by down)')
     p.add_argument('run')
+    p = sub.add_parser('state', help="a bridge run's console state (B-POS, FRAME, STAGE, ROSTER, ITEM, SPEED, STATUS) as JSON")
+    p.add_argument('run')
+    p.add_argument('--fresh', default='', help='comma list of pos,speed,roster,status to ask for first')
+    p.add_argument('--cap', type=float, default=6.0)
     p = sub.add_parser('capture-bridge')
     p.add_argument('run')
     p.add_argument('--bridge-host', required=True)
@@ -447,6 +524,8 @@ def main(argv=None):
             raise SystemExit('restore failed; the claim stays')
         if claim.is_file() and json.loads(claim.read_text()).get('dirty') and json.loads(claim.read_text()).get('run') == str(Path(args.run)):
             claim.unlink()
+    elif args.cmd == 'state':
+        print(json.dumps(bridge_state(args.run, [f for f in args.fresh.split(',') if f], args.cap), indent=2))
     elif args.cmd == 'capture-bridge':
         host, _, port = args.bridge_host.rpartition(':')
         stopping = []

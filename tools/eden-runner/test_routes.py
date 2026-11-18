@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -274,6 +275,64 @@ class RecipeTests(unittest.TestCase):
 
 
 class SwitchHwTests(unittest.TestCase):
+    BRIDGE_LINES = [
+        '[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=v1 port=6970 guards=0x7f frame=0 wall=10',
+        '[TrainingRooms] cpu_ids FIGHTER_STATUS_KIND_WAIT=0 FIGHTER_STATUS_KIND_CAPTURE_PULLED=63 frame=1 wall=11',
+        '[Bridge] stage id=3 frame=182 wall=12',
+        '[Bridge] roster entry=0 kind=0 nana=false frame=182 wall=12',
+        '[Bridge] roster entry=1 kind=84 nana=false frame=182 wall=12',
+        '[Bridge] item entry=0 held=true kind=429 frame=651 wall=13',
+        '[Bridge] speed fps=59.94 ratio=0.9990 frames=599 ms=9994 frame=700 wall=14',
+        '[TrainingRooms] state pos entry=0 kind=0 x=-35.999996 y=0.010259508 lr=1 dmg=0 status=0 situation=0 frame=701 wall=15',
+        '[TrainingRooms] state pos entry=1 kind=84 x=36 y=0.010259508 lr=-1 dmg=12.5 status=63 situation=2 frame=701 wall=15',
+    ]
+
+    def test_bridge_state_parses_every_native_read(self):
+        import switch_hw
+        state = switch_hw.parse_bridge_state(self.BRIDGE_LINES)
+        self.assertEqual((state['frame'], state['wall_ms']), (701, 15))
+        self.assertEqual(state['stage'], 3)
+        self.assertEqual(state['roster'], {0: {'kind': 0, 'nana': False}, 1: {'kind': 84, 'nana': False}})
+        self.assertEqual(state['items'], {0: {'held': True, 'kind': 429}})
+        self.assertEqual(state['speed'], {'fps': 59.94, 'ratio': 0.999, 'frames': 599, 'ms': 9994})
+        self.assertEqual(state['pos'][1], {'kind': 84, 'x': 36.0, 'y': 0.010259508, 'lr': -1.0, 'dmg': 12.5, 'status': 63,
+                                           'situation': 2, 'frame': 701})
+        self.assertEqual(state['status_ids'], {'FIGHTER_STATUS_KIND_WAIT': 0, 'FIGHTER_STATUS_KIND_CAPTURE_PULLED': 63})
+
+    def test_bridge_state_newest_line_wins(self):
+        import switch_hw
+        state = switch_hw.parse_bridge_state(self.BRIDGE_LINES + ['[Bridge] stage id=8 frame=900 wall=20',
+                                                                  '[Bridge] item entry=0 held=false kind=-1 frame=901 wall=21'])
+        self.assertEqual((state['stage'], state['items'][0]['held'], state['frame']), (8, False, 901))
+
+    def test_bridge_state_fresh_reads_wait_for_their_answers(self):
+        import tempfile
+        import threading
+        import switch_hw
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / 'bridge').mkdir()
+            log = run / 'bridge.log'
+            log.write_text(self.BRIDGE_LINES[0] + '\n')
+
+            def bridge():  # the capture: a request file in the spool becomes the bridge's answer in bridge.log
+                for _ in range(100):
+                    if (run / 'bridge' / 'diag-pos.req').exists() and (run / 'bridge' / 'bridge-speed.req').exists():
+                        with log.open('a') as f:
+                            f.write('[Bridge] req pos result=ok entries=0x3 frame=700 wall=14\n')
+                            f.write('\n'.join(self.BRIDGE_LINES[6:]) + '\n')
+                        return
+                    time.sleep(0.02)
+
+            worker = threading.Thread(target=bridge)
+            worker.start()
+            state = switch_hw.bridge_state(run, fresh=['pos', 'speed'], cap=5)
+            worker.join()
+            self.assertEqual(sorted(state['pos']), [0, 1])
+            self.assertEqual(state['speed']['fps'], 59.94)
+            with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
+                switch_hw.bridge_state(run, fresh=['roster'], cap=0.3)
+
     def test_line_writer_keeps_lines_whole(self):
         import io
         import switch_hw
