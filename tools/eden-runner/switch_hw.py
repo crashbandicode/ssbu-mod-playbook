@@ -67,6 +67,19 @@ REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req'
                  'bridge-backup.req': 'backup', 'bridge-restore.req': 'restore', 'bridge-verify.req': 'verify',
                  'bridge-speed.req': 'speed', 'bridge-roster.req': 'roster', 'bridge-status.req': 'status_names'}
 SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
+# Protocol v2 (bridge slice 3): written as `bridge-v2*.req` spool files, one request per line (`bridge_v2`).
+V2_VERBS = {'caps', 'scene', 'fighters', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch'}
+
+
+def bridge_v2(run, *requests):
+    """Queue protocol v2 request lines for the run's bridge capture (one spool file per call, sent in order)."""
+    spool = Path(run) / 'bridge'
+    spool.mkdir(parents=True, exist_ok=True)
+    path = spool / f'bridge-v2-{time.time_ns()}.req'
+    tmp = path.with_suffix('.tmp')
+    tmp.write_bytes(b''.join(r.encode() + b'\n' for r in requests))
+    os.replace(tmp, path)
+    return path
 
 
 def holders(device):
@@ -175,13 +188,17 @@ def spool_requests(spool):
     found = []
     for path in spool.iterdir() if spool.is_dir() else []:
         name = path.name
-        if path.is_file() and (name in REQUEST_FILES or name in ('diag-item.req', 'diag-settings-next.json', 'bridge-file.req')):
+        v2 = name.startswith('bridge-v2') and name.endswith('.req')
+        if path.is_file() and (v2 or name in REQUEST_FILES or name in ('diag-item.req', 'diag-settings-next.json', 'bridge-file.req')):
             found.append((path.stat().st_mtime_ns, name, path))
     lines = []
     for _, name, path in sorted(found):
         data = path.read_bytes()
         path.unlink()
-        if name in REQUEST_FILES:
+        if name.startswith('bridge-v2'):
+            # One protocol v2 request per line; only v2 verbs pass (the fixture verbs keep their own files).
+            lines.extend(line.strip() for line in data.splitlines() if line.strip().split(b' ')[0].decode('ascii', 'replace') in V2_VERBS)
+        elif name in REQUEST_FILES:
             lines.append(REQUEST_FILES[name].encode())
         elif name == 'diag-item.req':
             lines.append(b'item ' + data.strip())
@@ -297,23 +314,55 @@ ROSTER = re.compile(r'\[Bridge\] roster entry=(\d+) kind=(-?\d+) nana=(true|fals
 ITEM = re.compile(r'\[Bridge\] item entry=(\d+) held=(true|false) kind=(-?\d+)')
 SPEED = re.compile(r'\[Bridge\] speed fps=(\S+) ratio=(\S+) frames=(\d+) ms=(\d+)')
 STATUS_ID = re.compile(r'(FIGHTER_STATUS_KIND_[A-Z0-9_]+)=(-?\d+)')
-# Each fresh read: its spool file and the line that answers it (speed answers with its own line; roster re-sends the
-# roster lines on the next frames after its reply; status_names sends the id lines, then its reply; pos also needs both
-# bodies' `state pos` lines, checked below).
-FRESH = {'pos': ('diag-pos.req', r'\[Bridge\] req pos result='), 'speed': ('bridge-speed.req', r'\[Bridge\] speed fps='),
-         'roster': ('bridge-roster.req', r'\[Bridge\] roster entry='),
-         'status': ('bridge-status.req', r'\[Bridge\] req status_names result=')}
+# Protocol v2 lines (TR-independent: the bridge's own hooks).
+CAPS = re.compile(r'\[Bridge\] caps proto=(\d+) (.*?) ?tr=(\S+)')
+SCENE = re.compile(r'\[Bridge\] scene mode=(0x[0-9a-f]+) melee=(0x[0-9a-f]+) init=([01]) ldn=(\w+) class=(\w+)')
+FIGHTER = re.compile(r'\[Bridge\] fighter entry=(\d+) kind=(-?\d+) x=(\S+) y=(\S+) lr=(\S+) dmg=(\S+) status=(-?\d+) '
+                     r'situation=(-?\d+) stock=(-?\d+) dead=(-?\d+) item=(-?\d+)')
+GONE = re.compile(r'\[Bridge\] fighter entry=(\d+) gone')
+INPUT = re.compile(r'\[Bridge\] input slot=(\d+) src=(\w+) buttons=(0x[0-9a-f]+) lx=(-?\d+) ly=(-?\d+) rx=(-?\d+) ry=(-?\d+)')
+WATCH = re.compile(r'\[Bridge\] watch addr=(\S+) len=(\d+) val=(0x[0-9a-f]+) left=(\d+)')
+# Each fresh read: its spool file, the line that answers it, and the file's bytes (speed answers with its own line;
+# roster re-sends the roster lines on the next frames after its reply; status_names sends the id lines, then its reply;
+# pos also needs both bodies' `state pos` lines, checked below; the v2 reads are one-line v2 spool files).
+FRESH = {'pos': ('diag-pos.req', r'\[Bridge\] req pos result=', b''),
+         'speed': ('bridge-speed.req', r'\[Bridge\] speed fps=', b''),
+         'roster': ('bridge-roster.req', r'\[Bridge\] roster entry=', b''),
+         'status': ('bridge-status.req', r'\[Bridge\] req status_names result=', b''),
+         'scene': ('bridge-v2-scene.req', r'\[Bridge\] scene mode=', b'scene'),
+         'fighters': ('bridge-v2-fighters.req', r'\[Bridge\] fighters entries=', b'fighters'),
+         'caps': ('bridge-v2-caps.req', r'\[Bridge\] caps proto=', b'caps')}
 
 
 def parse_bridge_state(lines):
     """The newest value of each native read in bridge.log lines (oldest first): B-FRAME, B-POS, B-STAGE, B-ROSTER,
     B-ITEM, B-SPEED and B-STATUS-NAMES. A key is absent until its line has been seen."""
-    out = {'pos': {}, 'roster': {}, 'items': {}, 'status_ids': {}}
+    out = {'pos': {}, 'roster': {}, 'items': {}, 'status_ids': {}, 'fighters': {}, 'inputs': {}}
     for line in lines:
         tail = SUFFIX.search(line)
         if tail:
             out['frame'], out['wall_ms'] = int(tail.group(1)), int(tail.group(2))
-        if (m := STATE_POS.search(line)):
+        frame = tail and int(tail.group(1))
+        if (m := FIGHTER.search(line)):
+            g = m.groups()
+            out['fighters'][int(g[0])] = {'kind': int(g[1]), 'x': float(g[2]), 'y': float(g[3]), 'lr': float(g[4]),
+                                          'dmg': float(g[5]), 'status': int(g[6]), 'situation': int(g[7]),
+                                          'stock': int(g[8]), 'dead': int(g[9]), 'item': int(g[10]), 'frame': frame}
+        elif (m := GONE.search(line)):
+            out['fighters'].pop(int(m.group(1)), None)
+        elif (m := INPUT.search(line)):
+            g = m.groups()
+            out['inputs'].setdefault(g[1], {})[int(g[0])] = {'buttons': int(g[2], 16), 'lx': int(g[3]), 'ly': int(g[4]),
+                                                              'rx': int(g[5]), 'ry': int(g[6]), 'frame': frame}
+        elif (m := SCENE.search(line)):
+            out['scene'] = {'mode': int(m.group(1), 16), 'melee': int(m.group(2), 16), 'init': m.group(3) == '1',
+                            'ldn': m.group(4), 'class': m.group(5), 'frame': frame}
+        elif (m := CAPS.search(line)):
+            out['caps'] = {'proto': int(m.group(1)), 'tr': m.group(3), 'features': m.group(2).split()}
+        elif (m := WATCH.search(line)):
+            out['watch'] = {'addr': m.group(1), 'len': int(m.group(2)), 'val': int(m.group(3), 16), 'left': int(m.group(4)),
+                            'frame': frame}
+        elif (m := STATE_POS.search(line)):
             out['pos'][int(m.group(1))] = {'kind': int(m.group(2)), 'x': float(m.group(3)), 'y': float(m.group(4)),
                                            'lr': float(m.group(5)), 'dmg': float(m.group(6)), 'status': int(m.group(7)),
                                            'situation': int(m.group(8)), 'frame': tail and int(tail.group(1))}
@@ -338,7 +387,7 @@ def bridge_state(run, fresh=(), cap=6.0):
     log = run / 'bridge.log'
     start = log.stat().st_size if log.exists() else 0
     for name in fresh:
-        (run / 'bridge' / FRESH[name][0]).write_bytes(b'')
+        (run / 'bridge' / FRESH[name][0]).write_bytes(FRESH[name][2])
     want = {name: re.compile(FRESH[name][1]) for name in fresh}
     seen, until = set(), time.monotonic() + cap
     while len(seen) < len(want):
@@ -353,6 +402,23 @@ def bridge_state(run, fresh=(), cap=6.0):
                 raise RuntimeError(f'bridge state: no answer for {sorted(set(want) - seen)} within {cap} s')
             time.sleep(0.1)
     return parse_bridge_state(log.read_text(errors='replace').splitlines())
+
+
+def wait_scene(run, cls, cap=30.0, every=0.25):
+    """Wait until the bridge's scene class is `cls` (training, local_vs, menu, local_wireless, internet_online, unknown):
+    a fresh `scene` read each poll, so a class already reached answers at once. Returns the scene."""
+    until = time.monotonic() + cap
+    scene = None
+    while True:
+        try:
+            scene = bridge_state(run, ('scene',), cap=max(0.5, min(6.0, until - time.monotonic()))).get('scene')
+        except RuntimeError:
+            scene = None
+        if scene and scene['class'] == cls:
+            return scene
+        if time.monotonic() > until:
+            raise RuntimeError(f'scene class {cls} not reached within {cap} s: last {scene}')
+        time.sleep(every)
 
 
 def bridge_request(host, port, request, cap=60.0, connect=socket.create_connection):
@@ -587,7 +653,7 @@ def main(argv=None):
     p.add_argument('run')
     p = sub.add_parser('state', help="a bridge run's console state (B-POS, FRAME, STAGE, ROSTER, ITEM, SPEED, STATUS) as JSON")
     p.add_argument('run')
-    p.add_argument('--fresh', default='', help='comma list of pos,speed,roster,status to ask for first')
+    p.add_argument('--fresh', default='', help='comma list of pos,speed,roster,status,scene,fighters,caps to ask for first')
     p.add_argument('--cap', type=float, default=6.0)
     p = sub.add_parser('capture-bridge')
     p.add_argument('run')

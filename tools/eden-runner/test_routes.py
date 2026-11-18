@@ -362,6 +362,71 @@ class SwitchHwTests(unittest.TestCase):
                                            'situation': 2, 'frame': 701})
         self.assertEqual(state['status_ids'], {'FIGHTER_STATUS_KIND_WAIT': 0, 'FIGHTER_STATUS_KIND_CAPTURE_PULLED': 63})
 
+    V2_LINES = [
+        '[Bridge] caps proto=2 peek chain frame scene fighters input inject watch inject_net input_net tr=none frame=5 wall=1',
+        '[Bridge] scene mode=0x04040000 melee=0x20 init=1 ldn=none class=training frame=40 wall=2',
+        '[Bridge] fighter entry=0 kind=0 x=-36 y=0.01 lr=1 dmg=0 status=0 situation=0 stock=-1 dead=0 item=-1 frame=41 wall=2',
+        '[Bridge] fighter entry=1 kind=84 x=36 y=0.01 lr=-1 dmg=3.5 status=11 situation=0 stock=-1 dead=0 item=-1 frame=41 wall=2',
+        '[Bridge] input slot=0 src=final buttons=0x4 lx=0 ly=0 rx=0 ry=0 frame=42 wall=3',
+        '[Bridge] input slot=0 src=net buttons=0x0 lx=-120 ly=0 rx=0 ry=0 frame=42 wall=3',
+        '[Bridge] watch addr=main+0x53050f0 len=4 val=0x4040000 left=3 frame=43 wall=3',
+        '[Bridge] fighter entry=1 gone frame=44 wall=4',
+        '[Bridge] scene mode=0x02010000 melee=0x0d init=1 ldn=station_connected class=local_wireless tr_frame=7 frame=50 wall=5',
+    ]
+
+    def test_bridge_state_parses_the_v2_lines(self):
+        import switch_hw
+        state = switch_hw.parse_bridge_state(self.V2_LINES)
+        self.assertEqual(state['caps'], {'proto': 2, 'tr': 'none', 'features': [
+            'peek', 'chain', 'frame', 'scene', 'fighters', 'input', 'inject', 'watch', 'inject_net', 'input_net']})
+        self.assertEqual(state['scene'], {'mode': 0x02010000, 'melee': 0x0d, 'init': True, 'ldn': 'station_connected',
+                                          'class': 'local_wireless', 'frame': 50})
+        self.assertEqual(sorted(state['fighters']), [0], 'entry 1 went away')
+        self.assertEqual(state['fighters'][0], {'kind': 0, 'x': -36.0, 'y': 0.01, 'lr': 1.0, 'dmg': 0.0, 'status': 0,
+                                                'situation': 0, 'stock': -1, 'dead': 0, 'item': -1, 'frame': 41})
+        self.assertEqual(state['inputs']['final'][0], {'buttons': 4, 'lx': 0, 'ly': 0, 'rx': 0, 'ry': 0, 'frame': 42})
+        self.assertEqual(state['inputs']['net'][0]['lx'], -120)
+        self.assertEqual(state['watch'], {'addr': 'main+0x53050f0', 'len': 4, 'val': 0x4040000, 'left': 3, 'frame': 43})
+
+    def test_v2_requests_go_through_their_own_spool_files_and_other_verbs_are_dropped(self):
+        import time
+        import switch_hw
+        run = Path(tempfile.mkdtemp())
+        spool = run / 'bridge'
+        switch_hw.bridge_v2(run, 'scene', 'inject 0 AAAA')
+        time.sleep(0.002)
+        (spool / 'bridge-v2-x.req').write_bytes(b'inject_start 0 at=next\nrestore\n\nwatch main+0x53050f0 4 count=5\n')
+        lines = switch_hw.spool_requests(spool)
+        self.assertEqual(lines, [b'scene', b'inject 0 AAAA', b'inject_start 0 at=next', b'watch main+0x53050f0 4 count=5'])
+        self.assertEqual(list(spool.iterdir()), [])
+
+    def test_wait_scene_asks_fresh_and_waits_for_the_class(self):
+        import threading
+        import switch_hw
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / 'bridge').mkdir()
+            log = run / 'bridge.log'
+            log.write_text(self.V2_LINES[1] + '\n')
+
+            def bridge():
+                for _ in range(200):
+                    if any(p.read_bytes() == b'scene' for p in (run / 'bridge').glob('bridge-v2*.req')):
+                        for p in (run / 'bridge').glob('bridge-v2*.req'):
+                            p.unlink()
+                        with log.open('a') as f:
+                            f.write(self.V2_LINES[-1] + '\n')
+                        return
+                    time.sleep(0.02)
+
+            worker = threading.Thread(target=bridge)
+            worker.start()
+            scene = switch_hw.wait_scene(run, 'local_wireless', cap=5)
+            worker.join()
+            self.assertEqual(scene['mode'], 0x02010000)
+            with self.assertRaisesRegex(RuntimeError, 'scene class training not reached'):
+                switch_hw.wait_scene(run, 'training', cap=0.5)
+
     def test_bridge_state_newest_line_wins(self):
         import switch_hw
         state = switch_hw.parse_bridge_state(self.BRIDGE_LINES + ['[Bridge] stage id=8 frame=900 wall=20',

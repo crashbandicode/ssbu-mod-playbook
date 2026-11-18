@@ -996,6 +996,18 @@ def wait_native(ctx, test, cap=10.0, fresh=(), every=0.25):
         time.sleep(every)
 
 
+def wait_scene(ctx, cls, cap=30.0):
+    """Wait on the bridge's own scene class (protocol v2: training, local_vs, menu, local_wireless, internet_online,
+    unknown) instead of blind pad timing; returns the scene (mode, melee, init, ldn, class, frame)."""
+    return _switch_hw().wait_scene(instance_path(ctx, 'bridge_log').parent, cls, cap)
+
+
+def bridge_v2(ctx, *requests):
+    """Queue protocol v2 requests (caps, scene, fighters, input_watch, inject, inject_start, inject_stop, peek, chain,
+    watch) for the instance's bridge capture."""
+    return _switch_hw().bridge_v2(instance_path(ctx, 'bridge_log').parent, *requests)
+
+
 def frame_advancing(ctx, frames=30, cap=10.0):
     """The game is running (not paused or loading): the bridge's frame counter moves by `frames` within `cap` s."""
     start = native_state(ctx).get('frame')
