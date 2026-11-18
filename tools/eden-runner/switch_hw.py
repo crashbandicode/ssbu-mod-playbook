@@ -162,6 +162,7 @@ class BridgeMirror:
 
     def __init__(self, run, logs):
         self.run, self.logs, self.parts, self.wanted = Path(run), logs, {}, []
+        self.recovered = False
 
     def line(self, raw):
         raw = raw.rstrip(b'\r')
@@ -186,8 +187,10 @@ class BridgeMirror:
             raw += b' mirrored=' + (b'true' if ok else b'false')
         if raw.startswith(SETTINGS_WRITTEN):
             self.wanted.append(b'file settings.json')
-        if raw.startswith(b'[Bridge] req backup result=refused reason=backup_open'):
-            # A session that never restored: put the player's files back first, then open a fresh backup.
+        if raw.startswith(b'[Bridge] req backup result=refused reason=backup_open') and not self.recovered:
+            # A session that never restored: put the player's files back first, then open a fresh backup. Once per
+            # connection: a restore that can't complete yet must not loop.
+            self.recovered = True
             self.wanted.extend([b'restore', b'backup'])
         for log in self.logs:
             log.write(raw + b'\n')

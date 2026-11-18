@@ -508,6 +508,8 @@ class SwitchHwTests(unittest.TestCase):
         mirror = switch_hw.BridgeMirror(Path(tempfile.mkdtemp()), [io.BytesIO()])
         mirror.line(b'[Bridge] req backup result=refused reason=backup_open frame=0 wall=1')
         self.assertEqual(mirror.wanted, [b'restore', b'backup'])
+        mirror.line(b'[Bridge] req backup result=refused reason=backup_open frame=0 wall=2')
+        self.assertEqual(mirror.wanted, [b'restore', b'backup'], 'once per connection, never a loop')
 
     def test_down_restores_the_fixture_and_keeps_a_receipt(self):
         import switch_hw
