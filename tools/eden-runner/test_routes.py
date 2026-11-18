@@ -312,11 +312,10 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(recipe_macro.compile_plan(folder / 'rows.json'), [])  # already compiled
 
 
-LEDGER_HW = Path('/home/intpa/smash-training-lobby/artifacts/switch-hw-feature-ledger')
-SESSION1 = Path('/home/intpa/smash-training-lobby/artifacts/switch-hw-session-1/out/T-01')
+# vendored hardware stills (fixtures/training-ink/PROVENANCE.md): never read from the artifacts tree, which is pruned
+INK_FIXTURES = Path(__file__).resolve().parent / 'fixtures' / 'training-ink'
 
 
-@unittest.skipUnless(LEDGER_HW.is_dir() and SESSION1.is_dir(), 'needs the 2026-11-16 hardware stills')
 class TrainingInkGateTests(unittest.TestCase):
     """The hw Training gate on another stage: the plate is translucent, the text is not (run-1 S-B07, 19:34Z)."""
 
@@ -324,11 +323,9 @@ class TrainingInkGateTests(unittest.TestCase):
         from runner import Runner
         spec = routes._switch_spec('training')
         compare = Runner.compare_region  # a staticmethod
-        positives = [LEDGER_HW / 'run-1/out/S-B07/sw-193412Z-029675-FAIL.png',
-                     next(SESSION1.glob('*T-01-closed.png'))]
-        negatives = [next(SESSION1.glob('*rec-reset-row.png')), LEDGER_HW / 'run-1/up-still.png',
-                     LEDGER_HW / 'nav/boot-skip-a.png', LEDGER_HW / 'nav/sss-bf-sel.png',
-                     LEDGER_HW / 'nav/shots/01-s00-start.png', LEDGER_HW / 'nav/css-css.png']
+        positives = [INK_FIXTURES / 'pos-other-stage-plate.png', INK_FIXTURES / 'pos-t01-closed.png']
+        negatives = [INK_FIXTURES / n for n in ('neg-t01-rec-reset-row.png', 'neg-up-still.png', 'neg-css.png',
+                                                'neg-tr-menu.png')]
         for png in positives:
             self.assertLessEqual(routes.ink_compare(png, spec), spec['ink_limit'], png)
         for png in negatives:
