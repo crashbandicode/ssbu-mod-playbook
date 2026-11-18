@@ -694,7 +694,13 @@ class SwitchHwTests(unittest.TestCase):
         switch_hw.CLAIM = folder / 'claim'
         switch_hw.holders = lambda device: []
         switch_hw._client = lambda device: Client()
-        switch_hw.subprocess.Popen = lambda args, **k: popen.append(args) or type('P', (), {'pid': 4242 + len(popen)})()
+        def fake_popen(args, **k):  # the Skyline capture writes its connected line (up waits for a live log line)
+            popen.append(args)
+            if 'capture-log' in args:
+                with open(args[args.index('capture-log') + 1], 'a') as log:
+                    log.write('[capture] connected h:1 now\n')
+            return type('P', (), {'pid': 4242 + len(popen), 'terminate': lambda self: None})()
+        switch_hw.subprocess.Popen = fake_popen
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 switch_hw.up(folder / 'run', '/dev/null', 'h:1', 'test', bridge_host='192.168.0.224:6970')
