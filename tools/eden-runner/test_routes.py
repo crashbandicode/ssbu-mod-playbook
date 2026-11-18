@@ -495,6 +495,17 @@ class SwitchHwTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
                 switch_hw.bridge_state(run, fresh=['roster'], cap=0.3)
 
+    def test_the_bridges_own_status_names_fill_status_ids_without_tr(self):
+        import switch_hw
+        lines = ['[Bridge] status_names FIGHTER_STATUS_KIND_NONE=-1 FIGHTER_STATUS_KIND_WAIT=0 frame=5 wall=1',
+                 '[Bridge] status_names FIGHTER_STATUS_KIND_JUMP_SQUAT=10 FIGHTER_STATUS_KIND_JUMP=11 frame=5 wall=1',
+                 '[Bridge] req status_names result=ok count=4 frame=5 wall=1']
+        state = switch_hw.parse_bridge_state(lines)
+        self.assertEqual(state['status_ids'], {'FIGHTER_STATUS_KIND_NONE': -1, 'FIGHTER_STATUS_KIND_WAIT': 0,
+                                               'FIGHTER_STATUS_KIND_JUMP_SQUAT': 10, 'FIGHTER_STATUS_KIND_JUMP': 11})
+        self.assertIn('status_names', switch_hw.V2_VERBS)
+        self.assertEqual(switch_hw.FRESH['status_names'][2], b'status_names')
+
     def test_bridge_bodies_read_the_v2_fighters_in_any_battle_and_tr_pos_only_without_them(self):
         import threading
         import switch_hw

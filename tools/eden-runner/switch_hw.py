@@ -68,7 +68,7 @@ REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req'
                  'bridge-speed.req': 'speed', 'bridge-roster.req': 'roster', 'bridge-status.req': 'status_names'}
 SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 # Protocol v2 (bridge slice 3): written as `bridge-v2*.req` spool files, one request per line (`bridge_v2`).
-V2_VERBS = {'caps', 'scene', 'fighters', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch'}
+V2_VERBS = {'caps', 'scene', 'fighters', 'status_names', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch'}
 
 
 def bridge_v2(run, *requests):
@@ -382,7 +382,8 @@ FRESH = {'pos': ('diag-pos.req', r'\[Bridge\] req pos result=', b''),
          'status': ('bridge-status.req', r'\[Bridge\] req status_names result=', b''),
          'scene': ('bridge-v2-scene.req', r'\[Bridge\] scene mode=', b'scene'),
          'fighters': ('bridge-v2-fighters.req', r'\[Bridge\] fighters entries=', b'fighters'),
-         'caps': ('bridge-v2-caps.req', r'\[Bridge\] caps proto=', b'caps')}
+         'caps': ('bridge-v2-caps.req', r'\[Bridge\] caps proto=', b'caps'),
+         'status_names': ('bridge-v2-status.req', r'\[Bridge\] req status_names result=', b'status_names')}
 
 
 def parse_bridge_state(lines):
@@ -428,7 +429,7 @@ def parse_bridge_state(lines):
         elif (m := SPEED.search(line)):
             out['speed'] = {'fps': float(m.group(1)), 'ratio': float(m.group(2)), 'frames': int(m.group(3)),
                             'ms': int(m.group(4))}
-        elif '[TrainingRooms] cpu_ids ' in line:
+        elif '[TrainingRooms] cpu_ids ' in line or line.startswith('[Bridge] status_names '):
             out['status_ids'].update({name: int(v) for name, v in STATUS_ID.findall(line)})
     return out
 
@@ -470,7 +471,10 @@ def bridge_bodies(run, cap=1.5):
         except RuntimeError:
             known = {}
     v2 = 'fighters' in known.get('caps', {}).get('features', [])
-    state = bridge_state(run, ('fighters',) if v2 else ('pos',), cap)
+    # A slice 3 bridge names the statuses itself (the game's own binds) once per run; TR's cpu_ids still count.
+    names = ('status_names',) if v2 and 'status_names' in known.get('caps', {}).get('features', []) \
+        and not known.get('status_ids') else ()
+    state = bridge_state(run, (('fighters',) + names) if v2 else ('pos',), cap)
     state['bodies_from'] = 'fighters' if v2 else 'pos'
     state['pos'] = state['fighters'] if v2 else state['pos']
     return state
