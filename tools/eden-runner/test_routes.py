@@ -400,6 +400,40 @@ class SwitchHwTests(unittest.TestCase):
         self.assertEqual(lines, [b'scene', b'inject 0 AAAA', b'inject_start 0 at=next', b'watch main+0x53050f0 4 count=5'])
         self.assertEqual(list(spool.iterdir()), [])
 
+    def test_file_capture_mirrors_the_stream_and_hands_requests_over_whole(self):
+        import threading
+        import switch_hw
+        with tempfile.TemporaryDirectory() as tmp:
+            run, sd = Path(tmp) / 'run', Path(tmp) / 'sd'
+            sd.mkdir()
+            stream = sd / 'stream.log'
+            stream.write_bytes(b'[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 frame=0 wall=1\n[Bridge] scene mo')
+            stop = threading.Event()
+            worker = threading.Thread(target=switch_hw.capture_bridge_file, args=(run, sd, Path(tmp) / 'console.log'),
+                                      kwargs={'stop': stop.is_set, 'poll_s': 0.01})
+            worker.start()
+            try:
+                for _ in range(300):  # the opening requests arrive as one whole file
+                    if (sd / 'requests.txt').exists():
+                        break
+                    time.sleep(0.01)
+                self.assertEqual((sd / 'requests.txt').read_bytes(), b'backup\nfile settings.json\n')
+                (sd / 'requests.txt').unlink()  # the bridge takes it
+                switch_hw.bridge_v2(run, 'caps')
+                with stream.open('ab') as f:
+                    f.write(b'de=0x04040000 melee=0x20 init=1 ldn=none class=training frame=3 wall=2\n')
+                for _ in range(300):
+                    if (sd / 'requests.txt').exists() and 'class=training' in (run / 'bridge.log').read_text():
+                        break
+                    time.sleep(0.01)
+                self.assertEqual((sd / 'requests.txt').read_bytes(), b'caps\n')
+            finally:
+                stop.set()
+                worker.join()
+            lines = (run / 'bridge.log').read_text().splitlines()
+            self.assertEqual(lines[0], '[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 frame=0 wall=1')
+            self.assertEqual(lines[1], '[Bridge] scene mode=0x04040000 melee=0x20 init=1 ldn=none class=training frame=3 wall=2')
+
     def test_wait_scene_asks_fresh_and_waits_for_the_class(self):
         import threading
         import switch_hw

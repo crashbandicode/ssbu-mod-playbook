@@ -306,6 +306,56 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             time.sleep(retry_s)
 
 
+def capture_bridge_file(run, sd_dir, console, stop=None, poll_s=0.05):
+    """The bridge's file transport (Eden's room backend: every guest socket made after the room join is a room proxy
+    socket, so the host can't reach the bridge's TCP port). `sd_dir` is the instance's sdmc `ultimate/ssbu-hw-bridge`
+    folder: its `stream.log` (truncated by the bridge at boot) is mirrored like the socket, and requests are handed over
+    as one whole `requests.txt` (written aside, renamed in), the next batch only after the bridge took the last."""
+    run, sd_dir = Path(run), Path(sd_dir)
+    spool = run / 'bridge'
+    spool.mkdir(parents=True, exist_ok=True)
+    lock = (run / 'bridge.lock').open('w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SystemExit(f'refused: another capture-bridge holds {run / "bridge.lock"}') from None
+    stream, requests = sd_dir / 'stream.log', sd_dir / 'requests.txt'
+    with lock, (run / 'bridge.log').open('ab') as blog, Path(console).open('ab') as clog, \
+            (run / 'bridge.requests.jsonl').open('a') as sent:
+        mirror = BridgeMirror(run, [blog, clog])
+        queue, offset, pending = [b'backup', b'file settings.json'], 0, b''
+        while not (stop and stop()):
+            queue += mirror.wanted + spool_requests(spool)
+            mirror.wanted.clear()
+            if queue and not requests.exists():
+                tmp = requests.with_name('requests.txt.tmp')
+                tmp.write_bytes(b''.join(r + b'\n' for r in queue))
+                os.replace(tmp, requests)
+                for r in queue:
+                    sent.write(json.dumps({'wall': time.time(), 'request': r[:80].decode('ascii', 'replace')}) + '\n')
+                sent.flush()
+                queue = []
+            if stream.exists():
+                size = stream.stat().st_size
+                if size < offset:  # a new boot truncated it
+                    offset, pending = 0, b''
+                if size > offset:
+                    with stream.open('rb') as f:
+                        f.seek(offset)
+                        data = f.read(size - offset)
+                    offset += len(data)
+                    lines = (pending + data).split(b'\n')
+                    pending = lines.pop()
+                    for raw in lines:
+                        try:
+                            mirror.line(raw)
+                        except (OSError, ValueError) as error:
+                            blog.write(b'[Adapter] line not handled: ' + repr(error).encode() + b'\n')
+                            blog.flush()
+            time.sleep(poll_s)
+
+
 SUFFIX = re.compile(r' frame=(\d+) wall=(\d+)$')
 STATE_POS = re.compile(r'\[TrainingRooms\] state pos entry=(\d+) kind=(-?\d+) x=(\S+) y=(\S+) lr=(\S+) dmg=(\S+) '
                        r'status=(-?\d+) situation=(-?\d+)')
@@ -316,7 +366,8 @@ SPEED = re.compile(r'\[Bridge\] speed fps=(\S+) ratio=(\S+) frames=(\d+) ms=(\d+
 STATUS_ID = re.compile(r'(FIGHTER_STATUS_KIND_[A-Z0-9_]+)=(-?\d+)')
 # Protocol v2 lines (TR-independent: the bridge's own hooks).
 CAPS = re.compile(r'\[Bridge\] caps proto=(\d+) (.*?) ?tr=(\S+)')
-SCENE = re.compile(r'\[Bridge\] scene mode=(0x[0-9a-f]+) melee=(0x[0-9a-f]+) init=([01]) ldn=(\w+) class=(\w+)')
+SCENE = re.compile(r'\[Bridge\] scene mode=(0x[0-9a-f]+) melee=(0x[0-9a-f]+) init=([01]) ldn=(\w+) class=(\w+)'
+                   r'(?: battle=([01]) netplay=([01]))?')
 FIGHTER = re.compile(r'\[Bridge\] fighter entry=(\d+) kind=(-?\d+) x=(\S+) y=(\S+) lr=(\S+) dmg=(\S+) status=(-?\d+) '
                      r'situation=(-?\d+) stock=(-?\d+) dead=(-?\d+) item=(-?\d+)')
 GONE = re.compile(r'\[Bridge\] fighter entry=(\d+) gone')
@@ -357,6 +408,8 @@ def parse_bridge_state(lines):
         elif (m := SCENE.search(line)):
             out['scene'] = {'mode': int(m.group(1), 16), 'melee': int(m.group(2), 16), 'init': m.group(3) == '1',
                             'ldn': m.group(4), 'class': m.group(5), 'frame': frame}
+            if m.group(6) is not None:  # the game's live state (bridge since 2026-11-18 slice 3 s3-6)
+                out['scene'].update(battle=m.group(6) == '1', netplay=m.group(7) == '1')
         elif (m := CAPS.search(line)):
             out['caps'] = {'proto': int(m.group(1)), 'tr': m.group(3), 'features': m.group(2).split()}
         elif (m := WATCH.search(line)):
