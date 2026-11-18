@@ -638,6 +638,19 @@ class SwitchHwTests(unittest.TestCase):
         failed = switch_hw.bridge_request('h', 1, 'restore', cap=0.5, connect=lambda a, timeout: (_ for _ in ()).throw(OSError()))
         self.assertIsNone(failed)
 
+        def replying(line):
+            sock = Sock()
+            sock.data = [b'[Bridge] hello x\n' + line + b'\n']
+            return lambda a, timeout: sock
+        # switch-hw-sol-3 14:11Z: after an explicit successful restore the backup is gone, so Down's restore replies
+        # no_backup; that is nothing outstanding, not a dirty fixture. A pending restore is still dirty.
+        closed = switch_hw.restore_fixture(run, {'bridge_host': 'h:6970'},
+                                           connect=replying(b'[Bridge] req restore result=refused reason=no_backup frame=9 wall=9'))
+        self.assertEqual((closed['ok'], closed['state']), (True, 'no_open_backup'))
+        pending = switch_hw.restore_fixture(run, {'bridge_host': 'h:6970'}, connect=replying(
+            b'[Bridge] req restore result=pending reason=live_settings_refused_scene backup=kept frame=9 wall=9'))
+        self.assertEqual((pending['ok'], pending['state']), (False, 'incomplete'))
+
     def test_a_failed_restore_keeps_the_claim_and_fails_loudly(self):
         from unittest import mock
         import switch_hw

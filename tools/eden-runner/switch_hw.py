@@ -357,7 +357,13 @@ def restore_fixture(run, journal, connect=socket.create_connection):
     """D-Q12 at Down: the bridge writes back the files it backed up at Up and reads each one back; the receipt is kept."""
     host, _, port = journal['bridge_host'].rpartition(':')
     reply = bridge_request(host, int(port), 'restore', connect=connect)
-    receipt = {'wall': time.time(), 'restore': reply, 'ok': bool(reply and ' result=ok ' in reply + ' ')}
+    # `refused reason=no_backup` means no fixture backup is open: an earlier explicit restore already put the files back
+    # and read them back (it deletes the backup only then), or none was ever opened, in which case the bridge refused
+    # every fixture request. Either way nothing is outstanding (switch-hw-sol-3, 14:11Z).
+    closed = bool(reply and ' result=ok ' in reply + ' ')
+    absent = bool(reply and ' result=refused reason=no_backup' in reply)
+    receipt = {'wall': time.time(), 'restore': reply, 'ok': closed or absent,
+               'state': 'restored' if closed else 'no_open_backup' if absent else 'incomplete'}
     (Path(run) / 'bridge-restore.json').write_text(json.dumps(receipt, indent=2) + '\n')
     return receipt
 
