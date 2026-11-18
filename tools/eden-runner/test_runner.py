@@ -1290,31 +1290,36 @@ class BridgeAtShotTests(unittest.TestCase):
     def test_bridge_state_is_recorded_with_the_still_and_never_fails_it(self):
         import routes
         calls = []
-        state = {'pos': {'0': {'dmg': 34.8, 'x': -30.0, 'y': 0.01, 'lr': 1.0, 'status': 73, 'situation': 2,
-                               'frame': 9}}, 'frame': 9, 'status_ids': {'FIGHTER_STATUS_KIND_DAMAGE_FLY': 73},
-                 'stage': 308}
+        tr = {'pos': {'0': {'dmg': 34.8, 'x': -30.0, 'y': 0.01, 'lr': 1.0, 'status': 73, 'situation': 2,
+                            'frame': 9}}, 'frame': 9, 'status_ids': {'FIGHTER_STATUS_KIND_DAMAGE_FLY': 73},
+              'stage': 308, 'bodies_from': 'pos'}
+        # A slice 3 bridge: its own fighters in any battle scene (a local VS here, no TR status names).
+        v2 = {'pos': {4: {'dmg': 12.0, 'x': 40.0, 'y': 0.01, 'lr': -1.0, 'status': 10, 'situation': 0, 'stock': 1,
+                          'dead': 0, 'item': -1, 'frame': 77}}, 'frame': 77, 'status_ids': {}, 'bodies_from': 'fighters'}
+        answers = [tr, v2]
 
         class Hw:
             @staticmethod
-            def bridge_state(run, fresh, cap):
-                calls.append((run, fresh, cap))
-                if fresh != ('pos',):
-                    raise AssertionError(fresh)
-                return state
+            def bridge_bodies(run, cap):
+                calls.append((run, cap))
+                return answers.pop(0)
         fake = type('R', (), {'instances': {'sw': {'bridge_log': '/tmp/run-x/bridge.log'}, 'eden': {}},
                               'BRIDGE_SHOT_CAP_S': runner.Runner.BRIDGE_SHOT_CAP_S})()
         saved = routes._switch_hw
         routes._switch_hw = lambda: Hw
         try:
             got = runner.Runner.bridge_at_shot(fake, 'sw')
-            self.assertEqual(got, {'bridge': {'pos': state['pos'], 'frame': 9, 'status_ids': state['status_ids']}})
-            self.assertEqual(calls, [(Path('/tmp/run-x'), ('pos',), 1.5)])
+            self.assertEqual(got, {'bridge': {'pos': tr['pos'], 'frame': 9, 'status_ids': tr['status_ids'],
+                                              'bodies_from': 'pos'}})
+            got = runner.Runner.bridge_at_shot(fake, 'sw')
+            self.assertEqual(got, {'bridge': {'pos': v2['pos'], 'frame': 77, 'status_ids': {}, 'bodies_from': 'fighters'}})
+            self.assertEqual(calls, [(Path('/tmp/run-x'), 1.5)] * 2)
             self.assertEqual(runner.Runner.bridge_at_shot(fake, 'eden'), {})  # no bridge_log: nothing asked
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
 
-            def timeout(run, fresh, cap):
+            def timeout(run, cap):
                 raise RuntimeError("bridge state: no answer for ['pos']")
-            Hw.bridge_state = staticmethod(timeout)
+            Hw.bridge_bodies = staticmethod(timeout)
             self.assertIn('no answer', runner.Runner.bridge_at_shot(fake, 'sw')['bridge_error'])
         finally:
             routes._switch_hw = saved
