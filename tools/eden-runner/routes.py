@@ -256,9 +256,9 @@ SWITCH_SCHEMES = ('usb://', 'pi://', 'switch://', 'autopilot://')
 # reviewed), each checked to pass on its own screen and fail on the others (library/routes/refs/hw-refs.json).
 SWITCH_REFS = {'main': 'hw-main', 'stage': 'hw-sss', 'css': 'hw-css', 'ready': 'hw-ready',
                'training': 'hw-training', 'tr-menu': 'hw-tr-menu', 'profile': 'hw-profile',
-               'launch-error': 'hw-launch-error', 'home': 'hw-home'}
+               'launch-error': 'hw-launch-error', 'home': 'hw-home', 'corrupt': 'hw-corrupt-dialog'}
 SWITCH_CAPS = {'main': 10, 'stage': 45, 'css': 60, 'ready': 10, 'training': 60, 'tr-menu': 10, 'profile': 10,
-               'launch-error': 5, 'home': 10}
+               'launch-error': 5, 'home': 10, 'corrupt': 3}
 
 
 def on_switch(ctx):
@@ -1235,6 +1235,7 @@ def switch_boot(ctx, cap=420):
     looks, notes = [], []
     until = time.monotonic() + cap
     install = None
+    homes = 0
     while True:
         ctx.check_stop()
         for line in log.read():
@@ -1243,6 +1244,13 @@ def switch_boot(ctx, cap=420):
         if passes(ctx, 'main', 4):
             looks.append('main')
             break
+        # The system's "Corrupted data has been detected" dialog over HOME (2026-11-18 02:16Z): its focus is Check, so
+        # nothing is pressed there; the check needs the operator's rule. Before this gate the loop pressed Start on it
+        # for the whole cap.
+        if passes(ctx, 'corrupt', 2):
+            looks.append('corrupt')
+            raise RuntimeError('switch_boot: system dialog "Corrupted data has been detected" (focus on Check); '
+                               f'stopped with no input on it; looks {looks[-6:]}')
         if passes(ctx, 'profile', 2):
             looks.append('profile')
             play(ctx, 'tap-a1')
@@ -1257,6 +1265,14 @@ def switch_boot(ctx, cap=420):
             notes.append('launch error dismissed and relaunched once; erpt 2009-0005 suspected; FTP-verify')
             ctx.call('switch.dismiss', {}, job_cap=30)
             launched.append(ctx.call('switch.launch', {}, job_cap=30))
+            continue
+        # Plain HOME three looks running: the launch did not take (Start there opens the tile's Options).
+        if passes(ctx, 'home', 2):
+            looks.append('home')
+            homes += 1
+            if homes >= 3:
+                raise RuntimeError(f'switch_boot: back on HOME after the launch; looks {looks[-6:]}')
+            time.sleep(2)
             continue
         looks.append('start')
         play(ctx, 'attract-cancel')

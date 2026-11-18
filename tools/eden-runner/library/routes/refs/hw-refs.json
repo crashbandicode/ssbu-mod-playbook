@@ -234,5 +234,15 @@
    366
   ],
   "source": "switch-hw-session-1 out/T-01/sw-150331Z-597681-home-0.png (Fighters / Loading 3/7)"
+ },
+ "hw-corrupt-dialog": {
+  "source": "smash-training-lobby/artifacts/switch-hw-feature-ledger/run-17/out/S-A4-boot/sw-021610Z-258499-FAIL.png (2026-11-18 02:16Z, HOME dimmed under the system dialog)",
+  "roi": [
+   400,
+   285,
+   880,
+   365
+  ],
+  "sha256": "5a0cc92984cc9284394941c6e8de400c509b4b2d9811d313fb286760751b16d9"
  }
 }
