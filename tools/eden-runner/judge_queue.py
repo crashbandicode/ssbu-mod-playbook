@@ -111,6 +111,50 @@ def sample_frames(clip, folder, span_ms=None):
         pipe.close()
 
 
+DENSE_MAX = 6          # effect-window frames per row
+DENSE_MIN_GAP_MS = 600  # a gap between stills shorter than this needs no extra frame
+
+
+def dense_positions(receipt, n=DENSE_MAX, min_gap_ms=DENSE_MIN_GAP_MS):
+    """Clip ms of up to `n` effect-window frames: the midpoints of the longest gaps between consecutive stills of the
+    row (in clip time, rec_ms - clip_rec_ms_base) that hold no menu hook ('run' item) between them, i.e. gameplay the
+    stills skip over. Sorted; [] without times."""
+    base = receipt.get('clip_rec_ms_base')
+    if not isinstance(base, (int, float)):
+        return []
+    gaps, prev, menu = [], None, False
+    for item in receipt.get('results') or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get('shot') and isinstance(item.get('rec_ms'), (int, float)):
+            t = item['rec_ms'] - base
+            if prev is not None and not menu and t - prev >= min_gap_ms:
+                gaps.append((t - prev, round((prev + t) / 2)))
+            prev, menu = t, False
+        elif 'run' in item:
+            menu = True
+    return sorted(mid for _, mid in sorted(gaps, reverse=True)[:n])
+
+
+def sample_dense(clip, folder, positions_ms):
+    """{clip ms: png path} for the effect-window frames (full size); positions past the decodable end are skipped."""
+    import cut_session
+    folder.mkdir(parents=True, exist_ok=True)
+    pipe = cut_session.Pipeline(clip)
+    try:
+        out = {}
+        for ms in positions_ms:
+            got = pipe.still(int(ms) * 1_000_000)
+            if got is None:
+                continue
+            path = folder / f'dense-{int(ms):07d}.png'
+            got[1].save(path)
+            out[round(got[0] / 1_000_000)] = str(path)
+        return out
+    finally:
+        pipe.close()
+
+
 def clip_check(job, frames):
     """Deterministic: the expected-result shot exists, and the row changed something on screen."""
     shots = job.get('shots') or []
@@ -214,11 +258,12 @@ def work(job_path):
     job_path = Path(job_path)
     job = json.loads(job_path.read_text())
     folder = Path(job['dir'])
-    frames, frames_at, frame_error = {}, {}, None
+    frames, frames_at, dense, frame_error = {}, {}, {}, None
     if job.get('clip'):
         try:
             receipt = json.loads(Path(job['receipt']).read_text()) if job.get('receipt') else {}
             frames, frames_at = sample_frames(job['clip'], folder, clip_span_ms(receipt))
+            dense = sample_dense(job['clip'], folder, dense_positions(receipt))
         except Exception as error:  # noqa: BLE001 - an unreadable clip is recorded, the judge still gets the shots
             frame_error = repr(error)[:300]
     # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
@@ -235,7 +280,8 @@ def work(job_path):
     job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(job.get('shots') or [], 1)]
     job['judge_shots'] = [s for s in job['shots'] if s.get('path')] + \
         [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip',
-          **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)]
+          **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)] + \
+        [{'label': f'dense {ms / 1000:.1f}s', 'path': p, 'phase': 'clip', 'clip_ms': ms} for ms, p in sorted(dense.items())]
     if frame_error:
         job['frame_error'] = frame_error
     job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')

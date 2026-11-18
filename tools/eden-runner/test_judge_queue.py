@@ -99,6 +99,16 @@ class StatusRules(unittest.TestCase):
                          {'start': 200_000_000, 'mid': 5_692_000_000, 'end': 11_084_000_000})
         self.assertEqual(jq.frame_positions_ns(1_000_000_000)['start'], 100_000_000)
 
+    def test_dense_frames_fill_the_longest_gameplay_gaps_between_stills(self):
+        results = [{'shot': 'a', 'rec_ms': 1049}, {'play': 'op-lra'}, {'shot': 'b', 'rec_ms': 3049},
+                   {'shot': 'c', 'rec_ms': 3349}, {'run': 'hooks/x.py:nav'}, {'shot': 'd', 'rec_ms': 9049},
+                   {'shot': 'e', 'rec_ms': 10049}, {'shot': 'f', 'rec_ms': 13049}]
+        r = {'clip_rec_ms_base': 49, 'results': results}
+        # a->b 2000 (play only), b->c 300 (too short), c->d menu (skipped), d->e 1000, e->f 3000
+        self.assertEqual(jq.dense_positions(r), [2000, 9500, 11500])
+        self.assertEqual(jq.dense_positions(r, n=1), [11500])
+        self.assertEqual(jq.dense_positions({'results': results}), [])
+
     def test_final_status(self):
         self.assertEqual(jq.final_status('FAILED', [], None, {'verdict': 'PASS'})[0], 'FAILED')
         self.assertEqual(jq.final_status('PASS', [], {'ok': False, 'reason': 'no-visible-effect'},

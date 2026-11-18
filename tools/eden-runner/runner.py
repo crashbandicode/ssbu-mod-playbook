@@ -1897,7 +1897,26 @@ class Runner:
     def _step_shot(self, on, step):
         path = str(self.shot(on, step['shot']))
         mark = self.session_mark('shot', (self.current_row or {}).get('id'), label=step['shot'])
-        return {'shot': path, **({'rec_ms': mark.get('rec_ms')} if mark else {})}
+        out = {'shot': path, **({'rec_ms': mark.get('rec_ms')} if mark else {})}
+        out.update(self.bridge_at_shot(on))
+        return out
+
+    BRIDGE_SHOT_CAP_S = 1.5
+
+    def bridge_at_shot(self, on):
+        """{'bridge': {pos, frame, status_ids}} read through the ssbu-hw-bridge right after a still (judge evidence:
+        damage, x/y, facing, status, situation of both bodies), {'bridge_error': ...} when it does not answer in time
+        (outside Training), {} on instances without a bridge_log. Never fails the shot."""
+        blog = (self.instances.get(on) or {}).get('bridge_log')
+        if not blog:
+            return {}
+        try:
+            import routes
+            state = routes._switch_hw().bridge_state(Path(blog).parent, ('pos',), self.BRIDGE_SHOT_CAP_S)
+            return {'bridge': {'pos': state.get('pos'), 'frame': state.get('frame'),
+                               'status_ids': state.get('status_ids')}}
+        except Exception as error:  # noqa: BLE001 - no fresh answer: the still stands alone
+            return {'bridge_error': repr(error)[:160]}
 
     def _step_mark(self, on, step):
         self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
