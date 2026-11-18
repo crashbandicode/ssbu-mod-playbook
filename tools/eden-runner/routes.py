@@ -935,6 +935,44 @@ POS = (r'\[TrainingRooms\] state pos entry=(\d+) kind=(-?\d+) x=(-?[\d.]+) y=(-?
 STAGE_LINE = r'(?:\[TrainingRooms\] cpu_event camera_(?:setup|mode) [^\n]*|\[Btt\] layouts )stage=(-?\d+)'
 
 
+def _switch_hw():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('switch_hw', Path(__file__).with_name('switch_hw.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def native_state(ctx, fresh=(), cap=6.0):
+    """The bridge's native reads (ssbu-hw-bridge; `switch_hw.py up --bridge-host` or an Eden bridge capture): the newest
+    frame/wall, both bodies' `state pos`, stage, roster, items, speed and status ids (`switch_hw.bridge_state`).
+    `fresh` (pos, speed, roster, status) are asked for first. Needs the instance's `bridge_log`."""
+    return _switch_hw().bridge_state(instance_path(ctx, 'bridge_log').parent, tuple(fresh), cap)
+
+
+def wait_native(ctx, test, cap=10.0, fresh=(), every=0.25):
+    """Poll `native_state` until `test(state)` is true (e.g. the frame advancing in a fight, a held item); the last
+    state is returned, or RuntimeError after `cap` s with it."""
+    until = time.monotonic() + cap
+    while True:
+        ctx.check_stop()
+        state = native_state(ctx, fresh, cap=max(1.0, min(6.0, until - time.monotonic())))
+        if test(state):
+            return state
+        if time.monotonic() > until:
+            raise RuntimeError(f'native state did not match within {cap} s: frame={state.get("frame")} '
+                               f'stage={state.get("stage")} roster={state.get("roster")}')
+        time.sleep(every)
+
+
+def frame_advancing(ctx, frames=30, cap=10.0):
+    """The game is running (not paused or loading): the bridge's frame counter moves by `frames` within `cap` s."""
+    start = native_state(ctx).get('frame')
+    if start is None:
+        raise RuntimeError('no bridge frame yet (is the bridge connected?)')
+    return wait_native(ctx, lambda s: (s.get('frame') or 0) >= start + frames, cap)
+
+
 def read_state(ctx, cap=6.0):
     """One fresh dump of both bodies: touch diag-pos.req beside settings.json; TrainingRooms (diag build) prints
     `[TrainingRooms] state pos entry=N kind= x= y= lr= dmg= status= situation=` for P1 (0) and the CPU (1) and

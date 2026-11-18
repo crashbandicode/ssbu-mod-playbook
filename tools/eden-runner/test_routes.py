@@ -164,6 +164,44 @@ class FakeCtx:
         return f'{name}.png'
 
 
+class NativeStateTests(unittest.TestCase):
+    """routes.native_state / wait_native / frame_advancing over a bridge capture's bridge.log."""
+
+    def ctx(self):
+        import types
+        run = Path(tempfile.mkdtemp())
+        (run / 'bridge').mkdir()
+        log = run / 'bridge.log'
+        log.write_text('[Bridge] stage id=3 frame=100 wall=1\n[Bridge] roster entry=0 kind=0 nana=false frame=100 wall=1\n')
+        return types.SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None), log
+
+    def test_native_state_reads_the_bridge_log(self):
+        ctx, _ = self.ctx()
+        state = routes.native_state(ctx)
+        self.assertEqual((state['stage'], state['frame'], state['roster'][0]['kind']), (3, 100, 0))
+
+    def test_frame_advancing_waits_for_the_counter(self):
+        import threading
+        ctx, log = self.ctx()
+
+        def run():
+            for frame in range(110, 200, 10):
+                time.sleep(0.05)
+                with log.open('a') as f:
+                    f.write(f'[Bridge] item entry=0 held=false kind=-1 frame={frame} wall=2\n')
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        state = routes.frame_advancing(ctx, frames=50, cap=5)
+        worker.join()
+        self.assertGreaterEqual(state['frame'], 150)
+
+    def test_wait_native_reports_the_last_state_on_timeout(self):
+        ctx, _ = self.ctx()
+        with self.assertRaisesRegex(RuntimeError, 'frame=100 stage=3'):
+            routes.wait_native(ctx, lambda s: s.get('stage') == 8, cap=0.3, every=0.05)
+
+
 class TileWalkerTests(unittest.TestCase):
     def walker(self, widths, start, screen='sss'):
         folder = Path(tempfile.mkdtemp())

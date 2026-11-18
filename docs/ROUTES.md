@@ -189,7 +189,9 @@ instance differs, and every input is a macro (no manual presses).
   become the bridge's `pos`, `save`, `load`, `item`, `set` requests. So `read_state`, settings fixtures and log gates run
   as on Eden. `switch_hw.py state <run> [--fresh pos,speed,roster,status]` (or `switch_hw.bridge_state(run, fresh)` in
   a row) returns the console's newest B-FRAME, B-POS (both bodies), B-STAGE, B-ROSTER, B-ITEM, B-SPEED and
-  B-STATUS-NAMES as JSON, without an OBS still; `--fresh` asks the bridge first and waits for the answers. Design:
+  B-STATUS-NAMES as JSON, without an OBS still; `--fresh` asks the bridge first and waits for the answers. In a row,
+  `routes.native_state(ctx, fresh)`, `routes.wait_native(ctx, test, cap)` and `routes.frame_advancing(ctx)` read the
+  same through the instance's `bridge_log`. Design:
   `ssbu-hw-bridge/docs/DESIGN.md`.
 - **One driver per console:** `up` refuses while any process holds the tty or the claim file
   (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
