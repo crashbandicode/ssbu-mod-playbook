@@ -539,6 +539,27 @@ class SwitchHwTests(unittest.TestCase):
         failed = switch_hw.bridge_request('h', 1, 'restore', cap=0.5, connect=lambda a, timeout: (_ for _ in ()).throw(OSError()))
         self.assertIsNone(failed)
 
+    def test_a_failed_restore_keeps_the_claim_and_fails_loudly(self):
+        from unittest import mock
+        import switch_hw
+        run = Path(tempfile.mkdtemp())
+        claim = run / 'claim.json'
+        claim.write_text(json.dumps({'run': str(run)}))
+        (run / 'journal.json').write_text(json.dumps({'device': 'x', 'claim': str(claim), 'bridge_host': 'h:6970'}))
+        with mock.patch.object(switch_hw, '_client', side_effect=OSError('no pad')), \
+                mock.patch.object(switch_hw, 'restore_fixture', return_value={'ok': False, 'restore': None}), \
+                mock.patch.object(switch_hw.time, 'sleep'):
+            with self.assertRaises(SystemExit):
+                switch_hw.down(run)
+        self.assertTrue(claim.is_file(), 'the console stays claimed')
+        self.assertIn('fixture restore incomplete', json.loads(claim.read_text())['dirty'])
+        self.assertFalse(json.loads((run / 'journal.json').read_text())['down_result']['released'])
+        with mock.patch.object(switch_hw, '_client', side_effect=OSError('no pad')), \
+                mock.patch.object(switch_hw, 'restore_fixture', return_value={'ok': True, 'restore': 'ok'}), \
+                mock.patch.object(switch_hw.time, 'sleep'):
+            switch_hw.down(run)
+        self.assertFalse(claim.is_file(), 'a verified restore releases it')
+
     def test_factory_routes_usb_to_switch_remote(self):
         folder = Path(tempfile.mkdtemp())
         (folder / 'switch_remote.py').write_text('def make_client(s):\n    return ("fake", s)\n')

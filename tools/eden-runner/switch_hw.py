@@ -384,15 +384,25 @@ def down(run):
         time.sleep(1.0)  # the bridge accepts the next client once the capture's connection has closed
         out['bridge_restore'] = restore_fixture(run, journal)
     claim = Path(journal['claim'])
-    if claim.is_file() and json.loads(claim.read_text()).get('run') == str(run):
+    ours = claim.is_file() and json.loads(claim.read_text()).get('run') == str(run)
+    restored = not journal.get('bridge_host') or out['bridge_restore']['ok']
+    if ours and restored:
         claim.unlink()
         out['released'] = True
     else:
         out['released'] = False
+    if ours and not restored:
+        # The player's TR files may still hold fixture data: the console stays claimed until `restore` succeeds.
+        held = json.loads(claim.read_text())
+        held['dirty'] = f"fixture restore incomplete: {out['bridge_restore'].get('restore')}"
+        claim.write_text(json.dumps(held, indent=2) + '\n')
+        out['dirty'] = held['dirty']
     journal['down'] = time.time()
     journal['down_result'] = out
     (run / 'journal.json').write_text(json.dumps(journal, indent=2) + '\n')
     print(json.dumps(out))
+    if out.get('dirty'):
+        raise SystemExit(f"down: {out['dirty']}; the claim stays until `switch_hw.py restore {run}` succeeds")
 
 
 def main(argv=None):
@@ -426,7 +436,14 @@ def main(argv=None):
     elif args.cmd == 'down':
         down(args.run)
     elif args.cmd == 'restore':
-        print(json.dumps(restore_fixture(args.run, json.loads((Path(args.run) / 'journal.json').read_text()))))
+        journal = json.loads((Path(args.run) / 'journal.json').read_text())
+        receipt = restore_fixture(args.run, journal)
+        print(json.dumps(receipt))
+        claim = Path(journal['claim'])
+        if not receipt['ok']:
+            raise SystemExit('restore failed; the claim stays')
+        if claim.is_file() and json.loads(claim.read_text()).get('dirty') and json.loads(claim.read_text()).get('run') == str(Path(args.run)):
+            claim.unlink()
     elif args.cmd == 'capture-bridge':
         host, _, port = args.bridge_host.rpartition(':')
         stopping = []
