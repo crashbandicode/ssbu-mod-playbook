@@ -457,6 +457,25 @@ def bridge_state(run, fresh=(), cap=6.0):
     return parse_bridge_state(log.read_text(errors='replace').splitlines())
 
 
+def bridge_bodies(run, cap=1.5):
+    """Each live body's numbers for a still, in the judge's `pos` shape: the bridge's own `fighters` (protocol v2: every
+    battle scene, any mod, TR or not) when its caps line serves them, else TR's `state pos` (Training only). The
+    returned state's `pos` holds whichever answered and `bodies_from` says which. Without a caps line yet it asks for
+    one; a slice 2 bridge never answers it, and the TR read follows."""
+    log = Path(run) / 'bridge.log'
+    known = parse_bridge_state(log.read_text(errors='replace').splitlines() if log.exists() else [])
+    if 'caps' not in known:
+        try:
+            known = bridge_state(run, ('caps',), cap)
+        except RuntimeError:
+            known = {}
+    v2 = 'fighters' in known.get('caps', {}).get('features', [])
+    state = bridge_state(run, ('fighters',) if v2 else ('pos',), cap)
+    state['bodies_from'] = 'fighters' if v2 else 'pos'
+    state['pos'] = state['fighters'] if v2 else state['pos']
+    return state
+
+
 def wait_scene(run, cls, cap=30.0, every=0.25):
     """Wait until the bridge's scene class is `cls` (training, local_vs, menu, local_wireless, internet_online, unknown):
     a fresh `scene` read each poll, so a class already reached answers at once. Returns the scene."""

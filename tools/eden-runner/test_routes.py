@@ -495,6 +495,45 @@ class SwitchHwTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
                 switch_hw.bridge_state(run, fresh=['roster'], cap=0.3)
 
+    def test_bridge_bodies_read_the_v2_fighters_in_any_battle_and_tr_pos_only_without_them(self):
+        import threading
+        import switch_hw
+        for caps, want in ((self.V2_LINES[0], 'fighters'), (self.BRIDGE_LINES[0], 'pos')):
+            with tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                (run / 'bridge').mkdir()
+                log = run / 'bridge.log'
+                log.write_text(caps + '\n')
+                asked = []
+
+                def bridge():  # the capture: a spool file becomes the bridge's (or TR's) answer in bridge.log
+                    for _ in range(300):
+                        if not (run / 'bridge').exists():
+                            return
+                        for p in (run / 'bridge').iterdir():
+                            asked.append(p.name if p.name == 'diag-pos.req' else p.read_bytes().decode())
+                            p.unlink()
+                            with log.open('a') as f:
+                                if asked[-1] == 'fighters':
+                                    f.write('\n'.join(self.V2_LINES[2:4]) + '\n[Bridge] fighters entries=0x3 count=2 '
+                                            'frame=41 wall=2\n')
+                                    return
+                                if asked[-1] == 'diag-pos.req':
+                                    f.write('[Bridge] req pos result=ok entries=0x3 frame=700 wall=14\n'
+                                            + '\n'.join(self.BRIDGE_LINES[7:]) + '\n')
+                                    return
+                                # a slice 2 bridge has no `caps`: no answer
+                        time.sleep(0.02)
+
+                worker = threading.Thread(target=bridge)
+                worker.start()
+                state = switch_hw.bridge_bodies(run, cap=1.0)
+                worker.join()
+                self.assertEqual(asked, ['fighters'] if want == 'fighters' else ['caps', 'diag-pos.req'])
+                self.assertEqual(state['pos'], state[want])
+                self.assertEqual(state['pos'][1]['dmg'], 3.5 if want == 'fighters' else 12.5)
+                self.assertEqual(state['bodies_from'], want)
+
     def test_external_log_needs_a_connection_line(self):
         import switch_hw
         folder = Path(tempfile.mkdtemp())
