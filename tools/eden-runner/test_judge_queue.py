@@ -89,6 +89,16 @@ def receipt(folder, row):
 
 
 class StatusRules(unittest.TestCase):
+    def test_clip_frames_use_the_rows_real_length(self):
+        # 2026-11-18: GStreamer reported CPU-F001's per-row file as 8.3 s against an 11.4 s row, so "clip end" fell
+        # before the effect stills; the positions now come from the receipt's span in the file's own time
+        self.assertEqual(jq.clip_span_ms({'clip_rec_ms_base': 49, 'rec_ms': [49, 11433]}), 11384)
+        self.assertIsNone(jq.clip_span_ms({'rec_ms': [49, 11433]}))
+        self.assertIsNone(jq.clip_span_ms({'clip_rec_ms_base': 49, 'rec_ms': [49, None]}))
+        self.assertEqual(jq.frame_positions_ns(11_384_000_000),
+                         {'start': 200_000_000, 'mid': 5_692_000_000, 'end': 11_084_000_000})
+        self.assertEqual(jq.frame_positions_ns(1_000_000_000)['start'], 100_000_000)
+
     def test_final_status(self):
         self.assertEqual(jq.final_status('FAILED', [], None, {'verdict': 'PASS'})[0], 'FAILED')
         self.assertEqual(jq.final_status('PASS', [], {'ok': False, 'reason': 'no-visible-effect'},

@@ -67,26 +67,46 @@ def frame_diff(a, b):
     return sum(ImageStat.Stat(diff).mean) / 3
 
 
-def sample_frames(clip, folder):
-    """{start, mid, end: png path} from the clip (full size); {} plus an error when the clip can't be read."""
+def clip_span_ms(receipt):
+    """The row's length in its clip file's own time (ms): the row's last mark (receipt rec_ms[1]) minus
+    clip_rec_ms_base, or None. GStreamer's duration of a per-row OBS file can be short (2026-11-18: CPU-F001 8.3 s
+    against an 11.4 s row, REC-F005f 38.9 s against 41.5 s), which put "clip end" BEFORE the row's effect stills."""
+    base, span = receipt.get('clip_rec_ms_base'), receipt.get('rec_ms')
+    if isinstance(base, (int, float)) and isinstance(span, list) and len(span) == 2 \
+            and isinstance(span[1], (int, float)) and span[1] > base:
+        return span[1] - base
+    return None
+
+
+def frame_positions_ns(total_ns):
+    """Where start / mid / end are cut in a clip of `total_ns`."""
+    return {'start': min(200_000_000, total_ns // 10), 'mid': total_ns // 2, 'end': max(0, total_ns - 300_000_000)}
+
+
+def sample_frames(clip, folder, span_ms=None):
+    """({start, mid, end: png path}, {name: clip ms it was cut at}) from the clip (full size). The positions use the
+    row's real length `span_ms` (clip_span_ms of the receipt) when known, else GStreamer's duration; a position past
+    the decodable end falls back to the GStreamer-duration position. Raises when the clip can't be read."""
     import cut_session
     folder.mkdir(parents=True, exist_ok=True)
     pipe = cut_session.Pipeline(clip)
     try:
         ok, duration = pipe.pipe.query_duration(pipe.Gst.Format.TIME)
-        if not ok or duration <= 0:
+        if (not ok or duration <= 0) and not span_ms:
             raise RuntimeError('clip has no duration')
-        at = {'start': min(200_000_000, duration // 10), 'mid': duration // 2,
-              'end': max(0, duration - 300_000_000)}
-        out = {}
+        fallback = frame_positions_ns(duration) if ok and duration > 0 else {}
+        at = frame_positions_ns(int(span_ms * 1_000_000)) if span_ms else fallback
+        out, at_ms = {}, {}
         for name in FRAME_NAMES:
             got = pipe.still(at[name])
+            if got is None and fallback.get(name) is not None and fallback[name] != at[name]:
+                got = pipe.still(fallback[name])
             if got is None:
                 continue
             path = folder / f'clip-{name}.png'
             got[1].save(path)
-            out[name] = str(path)
-        return out
+            out[name], at_ms[name] = str(path), round(got[0] / 1_000_000)
+        return out, at_ms
     finally:
         pipe.close()
 
@@ -194,16 +214,18 @@ def work(job_path):
     job_path = Path(job_path)
     job = json.loads(job_path.read_text())
     folder = Path(job['dir'])
-    frames, frame_error = {}, None
+    frames, frames_at, frame_error = {}, {}, None
     if job.get('clip'):
         try:
-            frames = sample_frames(job['clip'], folder)
+            receipt = json.loads(Path(job['receipt']).read_text()) if job.get('receipt') else {}
+            frames, frames_at = sample_frames(job['clip'], folder, clip_span_ms(receipt))
         except Exception as error:  # noqa: BLE001 - an unreadable clip is recorded, the judge still gets the shots
             frame_error = repr(error)[:300]
     # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
     # the evidence shots first, then the clip frames as shots labelled "clip start/mid/end" (an overlay left on screen
     # at the clip's end, e.g. a Break the Targets HUD, is a FAIL: session-1 LEG-04)
     job['frames_by_name'] = frames
+    job['frames_at_ms'] = frames_at  # where each clip frame was cut (clip time, ms): the judge times them from this
     job['frames'] = []
     # evidence-only labels: the row's own still labels (row id prefix dropped); a label that would give the verdict
     # away (FAIL/PASS) is neutral (judge/make_jobs.py rule)
@@ -212,7 +234,8 @@ def work(job_path):
         return f'shot-{i}' if re.search(r'FAIL|PASS', name) else f'{s.get("phase", "step")}:{name}'
     job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(job.get('shots') or [], 1)]
     job['judge_shots'] = [s for s in job['shots'] if s.get('path')] + \
-        [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip'} for k in FRAME_NAMES if frames.get(k)]
+        [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip',
+          **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)]
     if frame_error:
         job['frame_error'] = frame_error
     job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
