@@ -1616,6 +1616,45 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(ready['ok'], ready['message'])
         self.assertTrue(any(line.startswith('OK trace elf:') for line in ready['lines']))
 
+    def test_pair_preflight_refuses_lan_online_unless_declared(self):
+        config = self.source / life.CONFIG
+        config.write_text(config.read_text() + '[Network]\nlan_online\\default=false\nlan_online=true\n')
+        single = self.controller().preflight()
+        self.assertTrue(single['ok'], single['message'])  # a single instance may use LAN Online
+        self.pair()
+        refused = self.controller().preflight()
+        self.assertFalse(refused['ok'])
+        self.assertIn('Pair instance a boots with lan_online=true', refused['message'])
+        self.assertIn('Pair instance b boots with lan_online=true', refused['message'])
+        with self.assertRaises(Exception):
+            self.controller().up()
+        self.assertFalse(Path(self.config['state_dir']).exists())
+        self.assertFalse(self.ledger.claimed)
+        fixture = self.base / 'qt-lan-off.ini'
+        fixture.write_text(config.read_text().replace('lan_online=true', 'lan_online=false'))
+        for item in self.config['instances']:
+            item['files'].append({'path': str(fixture), 'sha256': life.digest(fixture), 'to': life.CONFIG})
+        pinned = self.controller().preflight()
+        self.assertTrue(pinned['ok'], pinned['message'])
+        lan = [check for check in pinned['checks'] if check['name'] == 'pair-lan-online']
+        self.assertEqual([(check['instance'], check['value'], check['ok']) for check in lan],
+                         [('a', 'false', True), ('b', 'false', True)])
+        odd = self.base / 'qt-lan-odd.ini'  # fail closed: anything but false/absent refuses the pair
+        odd.write_text(config.read_text().replace('lan_online=true', 'lan_online=1'))
+        self.config['instances'][1]['files'][-1] = {'path': str(odd), 'sha256': life.digest(odd), 'to': life.CONFIG}
+        unclear = self.controller().preflight()
+        self.assertFalse(unclear['ok'])
+        self.assertIn('Pair instance b boots with lan_online=1', unclear['message'])
+        self.assertNotIn('Pair instance a', unclear['message'])
+        for item in self.config['instances']:
+            item['files'] = [pin for pin in item['files'] if pin['to'] != life.CONFIG]
+        self.config['lan_online_pair'] = True
+        declared = self.controller().preflight()
+        self.assertTrue(declared['ok'], declared['message'])
+        self.config['lan_online_pair'] = 'yes'
+        with self.assertRaises(Exception):
+            life.validate(self.config)
+
 
 class LinuxStopTests(unittest.TestCase):
     """Synthetic process graph: main, its AppImage mount and LAN helper; no processes run."""

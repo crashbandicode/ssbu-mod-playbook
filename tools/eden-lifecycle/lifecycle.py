@@ -565,6 +565,22 @@ def validate_eden_settings(settings, where):
         require(type(value) is int and value >= 0, where + ' core.resolution_setup must be a non-negative integer')
 
 
+def qt_value(path, name):
+    """The last plain `name=` value in a Qt ini (`name\\default=` lines are separate keys), or None."""
+    found = None
+    for line in Path(path).read_text(errors='replace').splitlines():
+        key, equal, value = line.partition('=')
+        if equal and key.strip() == name:
+            found = value.strip()
+    return found
+
+
+def effective_qt_config(item):
+    """The Qt config an instance boots with: its pinned fixture (applied after prepare), else the source's."""
+    pins = [pin for pin in item.get('files', []) if Path(pin.get('to', '')) == Path(CONFIG)]
+    return Path(pins[-1]['path']) if pins else Path(item['source']) / CONFIG
+
+
 def eden_boot_settings(config, item):
     """Host defaults, then the run, then the instance. An explicit key wins."""
     values = dict(HOST_EDEN_SETTINGS.get(config.get('host'), {}))
@@ -655,6 +671,8 @@ def validate(config):
             require(type(config[key]) is int and config[key] > 0, key + ' must be a positive integer')
     if 'perf_sensitive' in config:
         require(type(config['perf_sensitive']) is bool, 'perf_sensitive must be true or false')
+    if 'lan_online_pair' in config:
+        require(type(config['lan_online_pair']) is bool, 'lan_online_pair must be true or false')
     if 'watchdog' in config:
         spec = config['watchdog']
         require(isinstance(spec, dict), 'watchdog must be an object')
@@ -1652,6 +1670,27 @@ class Lifecycle:
                     problems.append(detail)
                     lines.append('FAIL trace elf: ' + detail)
                     checks.append({'name': 'trace-elf', 'ok': False, 'instance': item['key'], 'detail': detail})
+            if len(self.c['instances']) == 2:
+                # Eden<->Eden local wireless: with LAN Online on, the room LDN layer connects and the guest game then
+                # gives up ("Unable to join"; ldn2c-vanilla-yoga-1 vs ldn2c-eblan-yoga-1, 2026-11-18). A pair that
+                # really tests LAN Online declares lan_online_pair=true.
+                # Fail closed: an unreadable config or a value other than false/absent (Eden's default is false)
+                # refuses the pair too.
+                qt = effective_qt_config(item)
+                try:
+                    value = qt_value(qt, 'lan_online')
+                except OSError as error:
+                    value = 'unreadable: ' + error.__class__.__name__
+                check = {'name': 'pair-lan-online', 'instance': item['key'], 'path': str(qt), 'value': value}
+                if value not in (None, 'false') and self.c.get('lan_online_pair') is not True:
+                    detail = (f'Pair instance {item["key"]} boots with lan_online={value} ({qt}): pin a qt-config with '
+                              'lan_online=false, or set lan_online_pair=true for a LAN Online pair test')
+                    problems.append(detail)
+                    lines.append('FAIL pair lan_online: ' + detail)
+                    checks.append(dict(check, ok=False, detail=detail))
+                else:
+                    lines.append(f'OK pair lan_online: {item["key"]} {value} ({qt})')
+                    checks.append(dict(check, ok=True))
         expected = self.c.get('expected_game_version')
         if expected:
             matched = [pin for pin in update_pins(self.c) if pin.get('version') == expected]

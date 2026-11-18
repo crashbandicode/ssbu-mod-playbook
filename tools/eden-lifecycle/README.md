@@ -188,7 +188,17 @@ must be recorded/acquired by that shared runner, not accepted by the lifecycle.
 
 For an explicitly assigned same-host pair, set `pair_authorized:true` and add
 key `b` with a distinct display/source/inputs. One lifecycle claim covers the
-pair; memory/disk and foreign-process checks repeat before EACH launch. Both
+pair; memory/disk and foreign-process checks repeat before EACH launch.
+Preflight (so also Up) refuses a pair whose instance boots with `lan_online=true`
+(check `pair-lan-online`; the value is read from the pinned
+`user/config/qt-config.ini` fixture, else the source profile's). It fails
+closed: any value other than `false` or absent (Eden's default is off), or an
+unreadable config, also refuses. With LAN Online
+on, an Eden↔Eden local-wireless join fails: the room LDN layer connects, then
+the guest game gives up ("Unable to join"; `ldn2c-vanilla-yoga-1` failed,
+`ldn2c-eblan-yoga-1` joined with it off, 2026-11-18). Pin a Qt fixture with
+`lan_online=false`, or declare `lan_online_pair:true` for a pair that really
+tests LAN Online. Both
 guests count against the host's slot limit (two Edens on the Surface, Yoga and XPS; one on the Ally, so no pair there). Other owners' Eden instances count against the
 host's slot limit; their compilers refuse Up unless the headroom rule below admits it. Open claims are
 strictly blocking unless they are other runs' lifecycle claims on this host (`host=<h> lifecycle=<token> Eden
