@@ -11,9 +11,11 @@ rec_ms, frame, active, and path on stop). This turns those marks into GIFs and s
 Outputs (all under OUT unless a gif label names its own `out`, which is taken relative to OUT):
   gifs    one GIF per gif-start/gif-end pair at the label's `out` (default OUT/<row>/<gif>.gif) plus a receipt
           `<gif>.gif.json` (frames, duration_s, bytes, sha256, path, source recording and rec_ms span).
-          Presets: evidence = 640 wide, <= 15 fps, <= 10 MB (colours, then frames, are dropped to fit);
-          docs = 1280 wide, <= 10 s (a longer span is cut at 10 s).
-  rows    OUT/clips/<row>.gif, an evidence clip per row-start/row-end pair, with the same receipt.
+          Use preview (1280 wide, 12+ fps, <= 10 s) for gameplay images, preview-menu (10+ fps) for menus.
+          Legacy evidence and docs presets still cut GIFs for existing runs. A byte cap never drops frames.
+  rows    OUT/clips/<row>.gif, a review clip per row-start/row-end pair, with the same receipt.
+          Keep the original 1080p recording and a 2–3× zoom crop as evidence. Encode documentation and tutorial
+          clips as source-rate MP4s from that recording using the recipe in docs/GIFS.md.
   stills  OUT/stills/<row>-<label>.png, full size, one per `shot` mark.
 
 Per-row files (plan session_recording.per_row_files): the runner split the recording at each row start and logged
@@ -42,8 +44,13 @@ from pathlib import Path
 
 EXIT_FAILED, EXIT_NO_START, EXIT_NO_RECORDING = 1, 2, 3
 
-PRESETS = {'evidence': {'width': 640, 'fps': 15, 'max_s': None, 'max_bytes': 10 * 1024 * 1024},
-           'docs': {'width': 1280, 'fps': 15, 'max_s': 10.0, 'max_bytes': None}}
+GIF_PREVIEW_FPS = {'preview': 12, 'preview-menu': 10}
+PRESETS = {
+    **{name: {'width': 1280, 'fps': fps, 'max_s': 10.0, 'max_bytes': None}
+       for name, fps in GIF_PREVIEW_FPS.items()},
+    'evidence': {'width': 640, 'fps': 15, 'max_s': None, 'max_bytes': 10 * 1024 * 1024},
+    'docs': {'width': 1280, 'fps': 15, 'max_s': 10.0, 'max_bytes': None},
+}
 MAX_FPS = 15
 FRAME_CAP = 900          # decoded frames held in memory per clip (640x360 RGB ~ 0.7 MB each)
 FRAME_NS = 1_000_000_000 // 60
@@ -162,7 +169,10 @@ def clip_plan(kind, spec, start_ms, end_ms):
     preset = PRESETS[preset_name]
     width = spec.get('width') if isinstance(spec.get('width'), int) and spec['width'] > 0 else preset['width']
     fps = spec.get('fps') if isinstance(spec.get('fps'), (int, float)) and spec['fps'] > 0 else preset['fps']
-    fps = float(min(fps, preset['fps'], MAX_FPS))
+    preview_minimum = GIF_PREVIEW_FPS.get(preset_name)
+    if preview_minimum is not None and fps < preview_minimum:
+        raise ValueError(f'GIF {preset_name} needs at least {preview_minimum} fps')
+    fps = float(min(fps, MAX_FPS if preview_minimum is not None else preset['fps']))
     max_s = spec.get('max_duration_s') if isinstance(spec.get('max_duration_s'), (int, float)) \
         and spec['max_duration_s'] > 0 else preset['max_s']
     if preset['max_s'] is not None and max_s is not None:
@@ -196,6 +206,12 @@ class SlotPicker:
         self.latest = None
         self.picked = []
         self.last_pts = None
+        self.source_frames = 0
+
+    def source_fps(self):
+        if self.source_frames < 2:
+            return 0.0
+        return round((self.source_frames - 1) * 1e9 / (self.last_pts - self.t0), 3)
 
     def full(self):
         return self.max_frames is not None and len(self.picked) >= self.max_frames
@@ -209,6 +225,7 @@ class SlotPicker:
         if self.last_pts is not None and pts <= self.last_pts:
             return
         self.last_pts = pts
+        self.source_frames += 1
         while not self.full() and self.latest is not None and self.t0 + self.slot * self.step + self.tol < pts:
             self.picked.append(self._image())
             self.slot += 1
@@ -260,19 +277,14 @@ def gif_bytes(images, fps, colours):
 
 
 def encode_fitting(images, fps, max_bytes):
-    """(bytes, info): fewer colours first, then every 2nd/3rd/4th frame, until the GIF fits max_bytes.
-    Raises ValueError when even the smallest attempt is over."""
+    """Try smaller palettes against the byte cap while keeping the sampled frames and timing."""
     smallest = None
-    for decimate in (1, 2, 3, 4):
-        subset = images[::decimate]
-        for colours in (128, 64, 32, 16):
-            data = gif_bytes(subset, fps / decimate, colours)
-            info = {'frames': len(subset), 'fps': round(fps / decimate, 3), 'colours': colours,
-                    'frames_dropped': len(images) - len(subset)}
-            if max_bytes is None or len(data) <= max_bytes:
-                return data, info
-            smallest = len(data) if smallest is None else min(smallest, len(data))
-    raise ValueError(f'smallest attempt is {smallest} bytes, over the {max_bytes} limit')
+    for colours in (128, 64, 32, 16):
+        data = gif_bytes(images, fps, colours)
+        if max_bytes is None or len(data) <= max_bytes:
+            return data, {'frames': len(images), 'fps': round(fps, 3), 'colours': colours, 'frames_dropped': 0}
+        smallest = len(data) if smallest is None else min(smallest, len(data))
+    raise ValueError(f'smallest attempt is {smallest} bytes, over the {max_bytes} limit; trim or crop the source and retry')
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -386,7 +398,7 @@ class Pipeline:
 
 
 def cut_clip(recording, start_ns, plan):
-    """Decode the span, resample to the plan's fps. Returns (images, last_pts_ns)."""
+    """Decode and resample the span. Return the picked images, last PTS and actual source cadence."""
     max_frames = int(plan['duration_s'] * plan['fps'] + 0.5) or 1
     stop_ns = start_ns + int(plan['duration_s'] * 1e9)
     picker = SlotPicker(plan['fps'], max_frames)
@@ -395,7 +407,7 @@ def cut_clip(recording, start_ns, plan):
         images = pipeline.frames(start_ns, stop_ns, picker)
     finally:
         pipeline.close()
-    return images, picker.last_pts
+    return images, picker.last_pts, picker.source_fps()
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -405,8 +417,6 @@ def write_gif(images, out, fps, max_bytes, receipt_extra):
     """Write the GIF and its `<out>.json` receipt; returns the receipt."""
     data, info = encode_fitting(images, fps, max_bytes)
     out = Path(out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(data)
     # Pillow folds runs of identical frames into one longer frame, so count what the file holds.
     from PIL import Image
     with Image.open(io.BytesIO(data)) as written:
@@ -415,6 +425,11 @@ def write_gif(images, out, fps, max_bytes, receipt_extra):
         for i in range(stored):
             written.seek(i)
             total_ms += written.info.get('duration', 0)
+    minimum = GIF_PREVIEW_FPS.get(receipt_extra.get('preset'))
+    if minimum and (fps < minimum or stored < 2):
+        raise ValueError(f'preview needs at least {minimum} fps and more than one distinct image')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
     receipt = {'path': str(out), 'frames': stored, 'frames_sampled': info['frames'], 'fps': info['fps'],
                'duration_s': round(total_ms / 1000.0, 3), 'bytes': len(data),
                'sha256': hashlib.sha256(data).hexdigest(), 'colours': info['colours'],
@@ -427,7 +442,7 @@ def cut_span(span, recording, out_path, offset_ms, partial):
     """Cut one row/gif span to a GIF. Returns (receipt, None) or (None, reason) for a skip; raises on failure."""
     plan = clip_plan(span['kind'], span['spec'], span['start_ms'], span['end_ms'])
     start_ns, end_ns = span_ns(span['start_ms'], span['end_ms'], offset_ms)
-    images, last_pts = cut_clip(recording, start_ns, plan)
+    images, last_pts, source_fps = cut_clip(recording, start_ns, plan)
     if not images:
         if partial:
             return None, 'no frames decoded (recording not yet written that far)'
@@ -442,6 +457,12 @@ def cut_span(span, recording, out_path, offset_ms, partial):
                         'offset_ms': offset_ms},
              'preset': plan['preset'], 'row': span['row'], 'truncated': plan['truncated'],
              'attempts': span['attempts'], 'short_ms': round(short_ms) if short_ms > 3 * FRAME_NS / 1e6 else 0}
+    minimum = GIF_PREVIEW_FPS.get(plan['preset'])
+    if minimum is not None:
+        # Filled slots preserve time through a gap but do not add decoded source samples.
+        if source_fps < minimum:
+            raise ValueError(f'preview needs at least {minimum} fps; decoded source averaged {source_fps:g} fps')
+        extra['source_fps'] = source_fps
     if span['kind'] == 'gifs':
         extra['gif'] = span['name']
     return write_gif(images, out_path, plan['fps'], plan['max_bytes'], extra), None

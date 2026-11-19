@@ -391,7 +391,8 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
 - **Steps:** `play` a segment (`macro.play`, wait for it to finish, then
   `input.reset`), `gate`, `shot`, `copy` (save an instance file into the row
   folder), `wait_ms` (only where no gate exists), `library` (a shared-library
-  segment by name), `gif` (record the nested steps; [GIFS](GIFS.md)), `mark`
+  segment by name), `gif` (record an image preview or run an existing GIF
+  recipe; [GIFS](GIFS.md)), `mark`
   (a "before" shot for a `change` gate), `json_diff` (compare a file with an
   earlier `copy`), `ui` and `call` (Eden's frontend and allowed control
   methods) and `run` (a project hook, above).

@@ -13,7 +13,7 @@ is plugged into the Surface (`dreamland-surface.lan`) over USB.
 | [MACROS](docs/MACROS.md) | drive routes: macro segments with checks between, scripted routes, recording and editing Eden macros |
 | [TILE-CURSOR](docs/TILE-CURSOR.md) | land on an exact fighter or stage |
 | [ROUTES](docs/ROUTES.md) | reuse the shared setup blocks: boot, main menu, stage and fighter by name, chords, fixtures, pairs |
-| [GIFS](docs/GIFS.md) | make README GIFs with Eden's recorder |
+| [GIFS](docs/GIFS.md) | make documentation MP4s, GIF image previews and evidence clips |
 | [HOOK-SHARING](docs/HOOK-SHARING.md) | keep two plugins working when they hook the same place |
 | [CHECKLIST](docs/CHECKLIST.md) | prove the work is done: mandatory, conditional and example items, and the report |
 | [HARNESS-LESSONS](docs/HARNESS-LESSONS.md) | avoid known failed-run causes: verify-first rules, input macros, rows that inherit state, two-PC rooms, writing briefs |
@@ -73,8 +73,10 @@ working from the brief alone.
    label ([EDEN](docs/EDEN.md), "Queue runs"). If the plugin runs during
    online play, also run two consoles with the desync detector on both
    ([WORKFLOW](docs/WORKFLOW.md) §5).
-6. Write a short README with a full-screen GIF, plus a dated evidence doc
-   whose numbers a host-tested script regenerates from the logs.
+6. Write a short README with a captioned full-screen MP4. Use a smooth
+   GIF only where the preview requires an image. Keep the 1080p evidence
+   clip and a 2–3× zoom crop. Write a dated evidence doc whose numbers a
+   host-tested script regenerates from the logs ([GIFS](docs/GIFS.md)).
 7. Tag, release and install on the Switch only when the operator orders it.
    Installs go over DBI MTP, with readbacks and a rollback copy kept on the
    card (`replace-exefs.py` does the same for Skyline's `exefs/subsdk9`).

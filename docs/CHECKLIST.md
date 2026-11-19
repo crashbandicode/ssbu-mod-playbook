@@ -202,9 +202,17 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 
 ## Evidence and docs
 
-- **M** README: one paragraph, a full-screen GIF (1280 wide, under 10 s,
-  caption with date and build), the install path, the build commands, a
-  license line and the AI-assistance disclaimer.
+- **M** The README has one paragraph, a captioned full-screen demo, the
+  install path, the build commands, a license line and the AI-assistance
+  disclaimer. Give the date and build in the caption. Use MP4 for docs and
+  tutorials with H.264 (`libx264`, `yuv420p`), 1280×720 Lanczos-downscaled
+  from 1080p, source frame rate (60 fps for gameplay captured at 60 fps),
+  CRF 23–24, `slow`, `+faststart`, no audio and at most 10 s. Embed with
+  `<video src="..." autoplay muted loop playsinline controls>`.
+  Use GIF only where an image is required. Keep README GIF previews 1280
+  pixels wide and under 10 s, with at least 12 fps for gameplay and 10 fps
+  for menus. Never use keyframe-only clips. For test evidence, keep the
+  1080p clip and a 2–3× zoom crop ([GIFS](GIFS.md)).
 - **M** A dated evidence doc: run labels, the build (commit or NRO sha256),
   what was done, what the log showed. For Eden test runs, each run's short
   `RESULTS.md` plus the runner receipts are that doc; the phase's

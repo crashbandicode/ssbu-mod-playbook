@@ -164,7 +164,9 @@ instance differs, and every input is a macro (no manual presses).
   - **If the runner died:** `switch_hw.py down` stops a recording that this run started and never stopped. OBS is
     shared, so nothing else is touched.
   - **Clips:** `/usr/bin/python3 tools/eden-runner/cut_session.py <out> [--only gifs|rows|stills]` cuts each clip from
-    the recording into its preset. It needs PyGObject/GStreamer, so run it without `-I`. Live proof: live-rec-1,
+    the recording into its preset. It needs PyGObject/GStreamer, so run it without `-I`. Use its GIF output for
+    image previews and for existing GIF plans. Keep the 1080p recording and a 2–3× zoom crop for evidence. Encode
+    documentation and tutorial MP4s from the original recording ([GIFS](GIFS.md)). Live proof: live-rec-1,
     2026-11-16.
   - **Backends without it:** the run goes on without a session recording. Eden has no `recording.session_*`
     methods today.

@@ -833,6 +833,77 @@ class RunnerTests(unittest.TestCase):
         info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
         self.assertLessEqual(info['duration'], 10)
 
+    def test_dry_run_checks_preview_frame_rate_even_with_a_reason(self):
+        gif = {'name': 'hover', 'preset': 'preview', 'steps': []}
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [{'gif': gif}]}]
+        for preset, minimum in (('preview', 12), ('preview-menu', 10)):
+            with self.subTest(preset=preset):
+                gif.update(preset=preset, fps=minimum, reason='smaller file')
+                self.manifest.write_text(json.dumps(self.plan))
+                self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+                gif['fps'] -= 1
+                self.manifest.write_text(json.dumps(self.plan))
+                self.assertIn(f'at least {minimum} fps', ' | '.join(runner.dry_run(self.manifest)['errors']))
+
+    def test_preview_verifies_motion_in_written_gif(self):
+        raw = self.dir / 'raw.gif'
+        out = self.dir / 'preview.gif'
+        frames = [Image.new('RGB', (160, 90), color) for color in (RED, BLUE) * 6]
+        frames[0].save(raw, save_all=True, append_images=frames[1:], duration=[80, 90, 80] * 4, loop=0)
+        spec = runner.resolve_gif_spec({}, {}, {'name': 'demo', 'preset': 'preview', 'width': 160})
+        receipt = runner.publish_gif(raw, out, spec)
+        self.assertEqual(receipt['frames'], 12)
+        self.assertEqual(receipt['duration'], 1.0)
+
+        frames[0].save(raw, duration=1000)
+        with self.assertRaisesRegex(runner.GifRefused, r'at least 12 fps'):
+            runner.publish_gif(raw, out, spec)
+        self.assertFalse(out.exists())
+
+    def test_preview_accepts_a_sampled_hold_that_pillow_merges(self):
+        from PIL import GifImagePlugin
+        raw = self.dir / 'raw.gif'
+        out = self.dir / 'preview.gif'
+        frames = [Image.new('P', (160, 90), color) for color in (0, 1)]
+        for frame in frames:
+            frame.putpalette([*RED, *BLUE])
+        # Eden emits an image descriptor per successful sample, including identical frames.
+        with raw.open('wb') as capture:
+            capture.writelines(GifImagePlugin.getheader(frames[0])[0])
+            for frame, delay in zip([frames[0]] * 6 + [frames[1]] * 6, [80, 90, 80] * 4):
+                capture.writelines(GifImagePlugin.getdata(frame, duration=delay))
+            capture.write(b';')
+        with Image.open(raw) as capture:
+            self.assertEqual(capture.n_frames, 12)
+
+        spec = runner.resolve_gif_spec({}, {}, {'name': 'demo', 'preset': 'preview', 'width': 160})
+        receipt = runner.publish_gif(raw, out, spec)
+        self.assertEqual((receipt['frames'], receipt['frames_sampled'], receipt['duration']), (2, 12, 1.0))
+
+        frames[0].save(raw, save_all=True, append_images=frames[1:], duration=500, loop=0)
+        with self.assertRaisesRegex(runner.GifRefused, r'at least 12 fps.*sampled'):
+            runner.publish_gif(raw, out, spec)
+
+    def test_native_gif_size_fitting_keeps_all_frames(self):
+        from unittest.mock import patch
+        raw = self.dir / 'raw.gif'
+        out = self.dir / 'preview.gif'
+        frames = [Image.new('RGB', (160, 90), color) for color in (RED, BLUE) * 6]
+        frames[0].save(raw, save_all=True, append_images=frames[1:], duration=80, loop=0)
+        spec = runner.resolve_gif_spec({}, {}, {'name': 'demo', 'preset': 'docs', 'width': 160, 'max_bytes': 100})
+        real_save = Image.Image.save
+        attempts = []
+
+        def simulated_size(image, target, **kwargs):
+            attempts.append(len(kwargs['append_images']) + 1)
+            return real_save(image, target, **kwargs)
+
+        with patch.object(Image.Image, 'save', simulated_size):
+            with self.assertRaisesRegex(runner.GifRefused, r'trim or crop'):
+                runner.publish_gif(raw, out, spec)
+        self.assertEqual(attempts, [12] * 4)
+        self.assertFalse(out.exists())
+
     def test_dry_run_catches_a_bad_gif_or_recover_and_keeps_a_reason(self):
         self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
             {'gif': {'name': 'hover', 'preset': 'docs', 'width': 900, 'steps': [{'shot': 'mid'}]}}]}]

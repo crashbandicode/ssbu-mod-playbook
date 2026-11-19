@@ -44,7 +44,8 @@ gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screensh
 copy <instance key> [as <name>] (copy that instance file into the row folder), json_diff {source, before, allowed,
 must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists),
 library <name> (play a shared-library segment by its index name), gif {name, preset, steps, out?} (record the nested
-steps; presets "docs" and "evidence", or a preset the plan defines). A step has one kind. New kinds register on
+steps for a GIF image; use "preview" for gameplay and "preview-menu" for menus. "docs" and "evidence" remain
+for existing plans. See docs/GIFS.md for source-rate MP4 documentation clips). A step has one kind. New kinds register on
 Runner.step_handlers instead of another branch in the row loop.
 
 Shared library: a segment or gate written as {"library": "<name>"} comes from library/index.json next to this file
@@ -153,11 +154,11 @@ STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 
 UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
 # Shared step-hook modules next to runner.py, named without ".py" in a run step: {"run": "routes:to_main"}.
 SHARED_HOOKS = ('routes', 'routes_online')
-# Eden recording.start limits (tools/edenctl.py, docs/GIFRecording.md): fps 1-30, width 160-1280,
-# duration_ms 100-120000. Presets below are the playbook's defaults (docs/GIFS.md), not a ceiling:
-# a plan or row gif_presets entry, or fields on the gif step, override them. Leaving the operator's
-# envelope (docs: 1280 wide and under 10 s; evidence: 640 wide, fps at most 15, at most 10 MB) needs a reason.
+# Eden recording.start accepts fps 1..30, width 160..1280, duration_ms 100..120000.
+# Use GIF previews where the surface requires an image. Documentation/tutorial videos are source-rate MP4s.
+GIF_PREVIEW_FPS = {'preview': 12, 'preview-menu': 10}
 BUILTIN_GIF_PRESETS = {
+    **{name: {'width': 1280, 'fps': fps, 'max_duration_s': 10} for name, fps in GIF_PREVIEW_FPS.items()},
     'docs': {'width': 1280, 'fps': 10, 'max_duration_s': 10},
     'evidence': {'width': 640, 'fps': 10, 'max_duration_s': 10, 'max_bytes': 10 * 1024 * 1024},
 }
@@ -366,18 +367,25 @@ def gif_api_error(spec):
     return None
 
 
-def gif_outside_operator_rules(spec):
-    """True when the spec is outside both playbook envelopes and therefore needs a reason.
+def gif_preview_error(spec):
+    minimum = GIF_PREVIEW_FPS.get(spec['preset'])
+    if minimum is not None and spec['fps'] < minimum:
+        return f'GIF {spec["preset"]} needs at least {minimum} fps'
+    return None
 
-    docs (GIFS.md): full frame, 1280 wide, under 10 s. fps stays inside Eden's 1..30.
-    evidence: 640 wide, fps at most 15, a size cap of at most 10 MB. Duration may run up to
-    Eden's 120 s so a longer action still counts as evidence when the file stays small.
-    """
+
+def gif_policy_error(spec):
+    """Validate existing capture envelopes and the minimum rates for new GIF previews."""
+    error = gif_api_error(spec) or gif_preview_error(spec)
+    if error or spec.get('reason'):
+        return error
     width, fps, duration = spec['width'], spec['fps'], spec['max_duration_s']
     size = spec.get('max_bytes')
-    docs = width == 1280 and duration <= 10 and 1 <= fps <= 30
+    full_frame = width == 1280 and duration <= 10
     evidence = (width == 640 and fps <= 15 and duration <= 120 and size is not None and size <= EVIDENCE_MAX_BYTES)
-    return not (docs or evidence)
+    if not (full_frame or evidence):
+        return 'override outside the GIF capture defaults needs a "reason"'
+    return None
 
 
 def gif_dest_path(root, row_dir, gif):
@@ -482,11 +490,9 @@ def _check_gif(plan, base, row, step, where, errors):
         return
     if 'crop' in gif:
         errors.append(f'{where}: gif records the full frame and does not crop')
-    api = gif_api_error(spec)
-    if api:
-        errors.append(f'{where}: gif {gif.get("name")}: {api}')
-    elif gif_outside_operator_rules(spec) and not spec.get('reason'):
-        errors.append(f'{where}: gif {gif.get("name")} leaves the docs/evidence rules and needs a "reason"')
+    error = gif_policy_error(spec)
+    if error:
+        errors.append(f'{where}: gif {gif.get("name")}: {error}')
     if gif.get('out'):
         root = Path(plan['root']) if plan.get('root') else project_root(base)
         try:
@@ -516,11 +522,9 @@ def check_plan_policies(plan, base, errors):
         except ValueError as error:
             errors.append(f'gif preset {name}: {error}')
             continue
-        api = gif_api_error(probe)
-        if api:
-            errors.append(f'gif preset {name}: {api}')
-        elif gif_outside_operator_rules(probe) and not probe.get('reason'):
-            errors.append(f'gif preset {name} leaves the docs/evidence rules and needs a "reason"')
+        error = gif_policy_error(probe)
+        if error:
+            errors.append(f'gif preset {name}: {error}')
     if 'recover' in plan and not isinstance(plan['recover'], list):
         errors.append('plan recover must be a list of steps (a gate\'s recover stays a segment name)')
     if isinstance(plan.get('recover'), list):
@@ -570,8 +574,8 @@ def check_plan_policies(plan, base, errors):
 def publish_gif(raw_path, dest, spec):
     """Trim to the preset duration, scale the full frame to its width, and palette-encode.
 
-    No crop: docs GIFs are the whole frame (GIFS.md). Returns frames, duration, size, sha256 and path.
-    Raises GifRefused and deletes dest when the file still breaks the preset.
+    Returns the encoded frame count, duration, size, SHA-256 and path. Raises GifRefused and deletes dest
+    when the palette-reduced file exceeds its byte cap or a preview misses its minimum frame rate.
     """
     from PIL import Image, ImageSequence
     resample = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS', Image.BICUBIC)
@@ -595,56 +599,55 @@ def publish_gif(raw_path, dest, spec):
         raise GifRefused(f'gif {spec.get("preset")} captured no frames', {'preset': spec.get('preset'), 'why': 'no frames'})
     width = spec['width']
 
-    def scaled(source):
-        out = []
-        for frame in source:
-            height = max(1, round(width * frame.height / max(frame.width, 1)))
-            out.append(frame if frame.size == (width, height) else frame.resize((width, height), resample))
-        return out
+    pictures = []
+    for frame in frames:
+        height = max(1, round(width * frame.height / max(frame.width, 1)))
+        pictures.append(frame if frame.size == (width, height) else frame.resize((width, height), resample))
 
-    def save(source, durs, colors):
-        pictures = scaled(source)
-        height = pictures[0].height
-        sample = [0, len(pictures) // 2, len(pictures) - 1]
-        mosaic = Image.new('RGB', (width, height * 3))
-        for index, which in enumerate(sample):
-            mosaic.paste(pictures[which], (0, index * height))
-        palette = mosaic.quantize(colors=max(2, colors), method=Image.Quantize.MEDIANCUT)
-        encoded = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in pictures]
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        encoded[0].save(dest, save_all=True, append_images=encoded[1:], duration=durs[:len(encoded)],
-                        loop=0, disposal=1)
-        return dest.stat().st_size, len(encoded), pictures[0].size
-
-    colors, step = 128, 1
-    size, count, dimensions = save(frames, durations, colors)
+    height = pictures[0].height
+    sample = [0, len(pictures) // 2, len(pictures) - 1]
+    mosaic = Image.new('RGB', (width, height * 3))
+    for index, which in enumerate(sample):
+        mosaic.paste(pictures[which], (0, index * height))
+    dest.parent.mkdir(parents=True, exist_ok=True)
     max_bytes = spec.get('max_bytes')
-    kept, durs = frames, durations
-    while max_bytes and size > max_bytes and (colors > 16 or step * 2 < len(frames)):
-        if colors > 16:
-            colors //= 2
-        else:
-            step *= 2
-            kept = frames[::step] or frames[:1]
-            durs = []
-            for index in range(0, len(frames), step):
-                durs.append(max(1, sum(durations[index:index + step])))
-            durs = durs[:len(kept)]
-        size, count, dimensions = save(kept, durs, colors)
-    duration_s = round(sum(durs if step > 1 else durations[:count]) / 1000, 3)
+    for colors in (128, 64, 32, 16):
+        palette = mosaic.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+        encoded = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in pictures]
+        encoded[0].save(dest, save_all=True, append_images=encoded[1:], duration=durations, loop=0, disposal=1)
+        size = dest.stat().st_size
+        if not max_bytes or size <= max_bytes:
+            break
+
+    with Image.open(dest) as written:
+        dimensions = written.size
+        count = written.n_frames
+        total_ms = sum(frame.info.get('duration', 0) for frame in ImageSequence.Iterator(written))
+    duration_s = round(total_ms / 1000, 3)
+    preview_minimum = GIF_PREVIEW_FPS.get(spec.get('preset'))
     why = None
     if dimensions[0] != width:
         why = f'width is {dimensions[0]}, preset wants {width}'
     elif duration_s > spec['max_duration_s'] + 0.05:
         why = f'duration is {duration_s} s, preset allows {spec["max_duration_s"]} s'
     elif max_bytes and size > max_bytes:
-        why = f'size is {size} bytes, preset allows {max_bytes}'
+        why = f'size is {size} bytes, preset allows {max_bytes}; trim or crop the source and retry'
+    elif preview_minimum:
+        # Eden's GifWriter emits one descriptor per successful sample, even for identical images.
+        # Pillow may merge a sampled hold when re-encoding. Check raw cadence with one GIF tick of tolerance.
+        if len(frames) * 1000 < preview_minimum * (total - 10):
+            why = f'preview needs at least {preview_minimum} fps; sampled {len(frames)} frames in {total / 1000:g} s'
+        elif count < 2:
+            why = f'preview needs at least {preview_minimum} fps and more than one distinct image'
     if why:
         dest.unlink(missing_ok=True)
         raise GifRefused(f'gif breaks preset {spec.get("preset")}: {why}', {
             'preset': spec.get('preset'), 'why': why, 'frames': count, 'duration': duration_s, 'size': size})
-    return {'frames': count, 'duration': duration_s, 'size': size, 'sha256': digest(dest), 'path': str(dest),
-            'width': dimensions[0], 'fps': spec['fps']}
+    receipt = {'frames': count, 'duration': duration_s, 'size': size, 'sha256': digest(dest), 'path': str(dest),
+               'width': dimensions[0], 'fps': spec['fps']}
+    if preview_minimum:
+        receipt.update(frames_sampled=len(frames), sampled_fps=round(len(frames) * 1000 / total, 3))
+    return receipt
 
 
 def dry_run(manifest_path):
@@ -824,11 +827,9 @@ def dry_run(manifest_path):
                     probe = resolve_gif_spec(plan, row, {'name': name, 'preset': name,
                                                         **({'reason': row['gif_presets'][name].get('reason')}
                                                            if isinstance(row['gif_presets'][name], dict) else {})})
-                    api = gif_api_error(probe)
-                    if api:
-                        errors.append(f'row {row["id"]} gif preset {name}: {api}')
-                    elif gif_outside_operator_rules(probe) and not probe.get('reason'):
-                        errors.append(f'row {row["id"]} gif preset {name} leaves the docs/evidence rules and needs a "reason"')
+                    error = gif_policy_error(probe)
+                    if error:
+                        errors.append(f'row {row["id"]} gif preset {name}: {error}')
             except ValueError as error:
                 errors.append(f'row {row["id"]}: {error}')
         hook = row.get('on_failure_hook')
@@ -1986,14 +1987,11 @@ class Runner:
         if str(self.instances[on].get('socket', '')).startswith(SWITCH_SCHEMES):
             return self._step_gif_marked(on, step, row)
         spec = resolve_gif_spec(self.plan, row, gif)
-        api = gif_api_error(spec)
-        if api:
-            raise GifRefused(f'gif {gif.get("name")}: {api}', {'why': api, 'preset': spec.get('preset')})
+        error = gif_policy_error(spec)
+        if error:
+            raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': error, 'preset': spec.get('preset')})
         if 'crop' in gif:
             why = 'gif records the full frame and does not crop'
-            raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
-        if gif_outside_operator_rules(spec) and not spec.get('reason'):
-            why = 'override outside the GIF rules needs a reason'
             raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
         root = Path(self.plan['root']) if self.plan.get('root') else project_root(self.base)
         try:
@@ -2039,6 +2037,9 @@ class Runner:
         is cut offline from the session recording by those marks (preset, name and out are in the marks)."""
         gif = step['gif']
         spec = resolve_gif_spec(self.plan, row, gif)
+        error = gif_preview_error(spec)
+        if error:
+            raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': error, 'preset': spec['preset']})
         if self.session is None:
             raise GifRefused(f'gif {gif.get("name")}: on a real Switch a gif is cut from the session recording; '
                              'set plan "session_recording"', {'why': 'no session recording',

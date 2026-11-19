@@ -283,7 +283,9 @@ Follow [EDEN](EDEN.md):
 1. Set up a profile with only the NROs under test, plus the tile cursor.
 2. Script the route ([MACROS](MACROS.md)) and pick fighters or stages
    exactly ([TILE-CURSOR](TILE-CURSOR.md)).
-3. Read `events.log`, take screenshots, record the GIF ([GIFS](GIFS.md)).
+3. Read `events.log`, take screenshots and keep the 1080p evidence clip
+   with a 2–3× zoom crop. Use the original recording for documentation
+   MP4s. Record a GIF only where an image preview is required ([GIFS](GIFS.md)).
 
 For a sanity check before shipping, use the card's full plugin set, play one
 match to the results screen and back, then check each plugin's install line
@@ -392,9 +394,10 @@ both ways:
 
 ## 6. README and evidence
 
-- **README:** one paragraph on what the plugin does, a GIF, the install path,
-  the build commands, a license line, and the disclaimer about AI assistance
-  that the other READMEs carry.
+- **README:** one paragraph on what the plugin does, a captioned full-screen
+  MP4, the install path, the build commands, a license line and the
+  AI-assistance disclaimer. Use a smooth GIF only where an image preview
+  is required ([GIFS](GIFS.md)).
 - **Evidence:** `docs/EDEN-RESULTS.md`, `VALIDATION.md` or `docs/SAFETY.md`,
   dated, with the run label, the build (commit or NRO sha256), what was done
   and what the log showed. For an online plugin, include the detector's
