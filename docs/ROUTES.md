@@ -202,7 +202,13 @@ instance differs, and every input is a macro (no manual presses).
   - `switch_boot`: B, HOME, the SSBU tile gate, A, the profile A, then Start until the main menu.
   - `switch_to_training` starts from the native Games & More hover or the Training
     submenu item. It confirms the Training stage, verifies local fighter placement
-    and checks native Training and the loaded stage kind. Supply `p1` and
+    and checks native Training and the loaded stage kind. The native route
+    requires a new gameplay stage event after the CSS launch checkpoint.
+    It verifies same-boot event replay and rejects gaps, reconnects and old
+    event clocks. If the bridge emits no event on a same-stage return,
+    the route stops. A repeatable proof needs a new gameplay stage receipt
+    for every loaded Training battle, even when the numeric ID is unchanged.
+    Supply `p1` and
     `fighter_topology` when a named pick needs movement from an off-grid hand.
   - `tr_menu`: `preload_clear`, B+Up, the menu gate, B and B, the HUD gate.
   - `preload_clear` (`{"run": "routes:preload_clear"}`, or `routes.preload_clear(ctx)` from a hook, on the

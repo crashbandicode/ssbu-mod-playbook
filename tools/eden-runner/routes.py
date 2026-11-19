@@ -1469,14 +1469,15 @@ def _fields_match(state, criteria):
     return all(state.values.get(key) == value for key, value in criteria.items())
 
 
-def _wait_native_focus(io, before, criteria, cap=45):
+def _wait_native_focus(io, before, criteria, cap=45, *, finish=True):
     until = time.monotonic() + cap
     previous = before
     while True:
         state = native_picker.wait_sample(io, native_picker.UI, until, previous, in_flight=True)
         previous = state
         if _fields_match(state, criteria) and state.values['focus'] != before.values['focus']:
-            io.finish()
+            if finish:
+                io.finish()
             return state
         if state.values['focus'] != before.values['focus']:
             raise RuntimeError(f'unexpected native focus {state.values["focus"]!r}')
@@ -1497,16 +1498,18 @@ def _native_enter_training(ctx, cap, stage_ids):
         raise RuntimeError('Training entry needs a verified, placed local fighter')
     native_picker.number(tile, 'placed.at')
     native_picker.Target.read(tile, 'placed.')
+    io.mark_training_stage(ui, 5)
     io.send('enter-training')
-    after = _wait_native_focus(io, ui, {'screen': 'training', 'input.owner': 'native'}, cap)
+    after = _wait_native_focus(io, ui, {'screen': 'training', 'input.owner': 'native'}, cap, finish=False)
     stage_id = expected(ctx).get('stage_id')
     if stage_ids is None and stage_id is not None:
         stage_ids = {stage_id}
-    # A fresh body sample confirms the live Training frame ran its stage observation.
-    actual_stage = native_state(ctx, ('pos',)).get('stage')
+    actual_stage, stage_event = io.training_stage(min(6, cap))
     if stage_ids is not None and actual_stage not in stage_ids:
         raise RuntimeError(f'Training loaded stage {actual_stage!r}; expected one of {sorted(stage_ids)}')
-    return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage})
+    io.finish()
+    return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage,
+                                                'stage_event': stage_event})
 
 def _use_native_pick(ctx):
     if on_switch(ctx):
