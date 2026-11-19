@@ -137,11 +137,14 @@ def token_held(state, screen):
     raise RuntimeError(f'{screen}: local token ownership is {token!r}, carried slot is {carried!r}')
 
 
-def settled(state):
+def settled(state, *, after_step=False):
     at = state.values.get('at', 'unknown')
     if (state.values.get('settled') != '1' or at != state.values.get('hovered')
-            or (at != 'none' and not re.fullmatch(r'[0-9]+', at))
-            or number(state, 'settled.ack') != number(state, 'ack')):
+            or (at != 'none' and not re.fullmatch(r'[0-9]+', at))):
+        raise RuntimeError('tile hover has not settled natively')
+    idle = all(state.values.get(key) == 'unknown'
+               for key in ('settled.ack', 'ack.result', 'result', 'direction', 'from', 'to'))
+    if (after_step or not idle) and number(state, 'settled.ack') != number(state, 'ack'):
         raise RuntimeError('tile hover has not settled natively')
     return at
 
@@ -193,7 +196,7 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap):
             raise RuntimeError(f'wrong step: expected {direction} {at}->{dest}, observed {step!r}')
         if values.get('settled') != '1':
             continue
-        if settled(latest) != dest or Target.read(latest) != expected_tile:
+        if settled(latest, after_step=True) != dest or Target.read(latest) != expected_tile:
             raise RuntimeError('settled tile identity disagrees with the qualified topology')
         after_ui = wait_sample(io, UI, until, ui, in_flight=True)
         native_owner(after_ui, screen, ui)
