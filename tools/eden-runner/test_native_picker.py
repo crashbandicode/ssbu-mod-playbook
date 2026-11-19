@@ -498,5 +498,91 @@ class TrainingStageProofTests(unittest.TestCase):
             self.run_training(stage + '[Bridge] lost lines=1 reason=overrun frame=725 wall=10050\n',
                               self.ending(42))
 
+class NativeScreenGateTests(unittest.TestCase):
+    def run_gate(self, socket, name, samples, *, cap=1):
+        import json
+        import zlib
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        import routes
+
+        def wire(sample):
+            boot, rev, _ = sample.clock
+            # The framing parser requires the canonical six headers first.
+            header = ('schema', 'rev', 'boot', 'ack', 'ack.result', 'focus')
+            fields = {**sample.values, 'ack': '0', 'ack.result': 'unsupported'}
+            order = (*header, *(key for key in fields if key not in header))
+            payload = [f'{key}={fields[key]}' for key in order]
+            crc = zlib.crc32('\n'.join(payload).encode())
+            return (f'[Bridge] req providers result=ok count=1 boot={boot}\n'
+                    f'[Bridge] state begin name=ssbu.ui schema=ssbu.ui/1 rev={rev} boot={boot}'
+                    f' lines={len(payload)} filtered=0\n'
+                    + ''.join(f'[Bridge] state.{i} {line}\n' for i, line in enumerate(payload))
+                    + f'[Bridge] state end name=ssbu.ui rev={rev} crc={crc:08x}\n')
+
+        with TemporaryDirectory() as directory:
+            log = Path(directory, 'bridge.log')
+            log.touch()
+            ctx = SimpleNamespace(instance={'socket': socket, 'bridge_log': str(log), 'screenshot_target': 'screen'},
+                                  runner=SimpleNamespace(plan={}), on='p1', row_dir=directory,
+                                  check_stop=Mock(), gate=Mock(side_effect=AssertionError('visual gate')),
+                                  log=Mock(), shot=Mock(side_effect=AssertionError('still')))
+            replies = iter(samples)
+
+            def respond(_ctx, *commands):
+                self.assertEqual(commands, ('providers', 'state ssbu.ui'))
+                sample = next(replies, samples[-1])
+                with log.open('a') as dest:
+                    if sample is None:
+                        dest.write('[Bridge] req providers result=ok count=1 boot=0x0000000000000001\n'
+                                   '[Bridge] state name=ssbu.ui result=error reason=unknown-provider\n')
+                    else:
+                        dest.write(wire(sample))
+
+            with (patch.object(routes, 'bridge_v2', side_effect=respond),
+                  patch.object(routes, 'frame', side_effect=AssertionError('still')),
+                  patch.object(routes, 'play', side_effect=AssertionError('controller input'))):
+                result = routes.gate(ctx, name, cap=cap)
+            self.assertIsInstance(result, str)
+            ctx.log.assert_called_once()
+            return json.loads(Path(result).read_text())
+
+    def test_native_gates_use_fresh_screen_state_without_input_or_still(self):
+        for socket in ('switch://fixture', '/tmp/eden-fixture.sock'):
+            for name, screen in (('css', 'css.training'), ('css', 'css.smash'), ('stage', 'stage_select')):
+                with self.subTest(socket=socket, screen=screen):
+                    samples = [native(i, screen=screen, focus=screen) for i in (1, 2)]
+                    receipt = self.run_gate(socket, name, samples)
+                    self.assertEqual(receipt['screen'], screen)
+                    self.assertEqual(receipt['observation'], 2)
+
+    def test_unqualified_inputs_never_fall_back_to_images_or_probes(self):
+        for latest, reason in (
+            (None, 'unknown-provider'),
+            (native(2, screen='stage_select'), 'native screen'),
+            (native(2, **{'input.owner': 'unknown'}), 'native screen'),
+            (native(2, **{'focus.source': 'native'}), 'native screen'),
+            (native(2, **{'observation.active': 'no'}), 'inactive'),
+            (native(2, observation='1'), 'no newer active observation'),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    self.run_gate('switch://fixture', 'css', [native(1), latest], cap=.15)
+
+    def test_standalone_eden_keeps_image_gate_return_value(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        import routes
+
+        ctx = SimpleNamespace(instance={'socket': '/tmp/eden-fixture.sock'},
+                              runner=SimpleNamespace(plan={}), gate=Mock(return_value='standalone.png'))
+        with patch.object(routes, 'BridgePickerIO', side_effect=AssertionError('bridge query')):
+            self.assertEqual(routes.gate(ctx, 'css'), 'standalone.png')
+        ctx.gate.assert_called_once_with('routes.css')
+
 if __name__ == '__main__':
     unittest.main()
