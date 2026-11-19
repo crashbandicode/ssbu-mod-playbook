@@ -10,6 +10,7 @@ TILE = 'tile.cursor'
 UI = 'ssbu.ui'
 SCENES = {'css': {'css.training', 'css.smash'}, 'sss': {'stage_select'}}
 DIRECTIONS = {'up', 'down', 'left', 'right'}
+FORMS = {'css': {'default'}, 'sss': {'normal', 'battlefield', 'omega'}}
 ABSENT = {'', 'none', 'unknown'}
 
 
@@ -36,7 +37,9 @@ class Target:
     @classmethod
     def read(cls, state, prefix=''):
         parts = [state.values.get(prefix + key, 'unknown') for key in ('kind', 'name', 'form')]
-        if any(value in ABSENT for value in parts):
+        kind, name, form = parts
+        if (not re.fullmatch(r'[0-9]+', kind) or name in ABSENT
+                or form not in FORMS.get(state.values.get('screen'), ())):
             raise RuntimeError(f'{prefix}tile identity {parts!r} is incomplete')
         return cls(*parts)
 
@@ -104,11 +107,13 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False):
     raise RuntimeError(f'{provider}: no newer active observation')
 
 
-def native_owner(state, screen):
+def native_owner(state, screen, previous=None):
     values = state.values
     if (values.get('input.owner') != 'native' or values.get('screen') not in SCENES[screen]
             or values.get('focus.source') != TILE):
         raise RuntimeError(f'{screen}: native screen does not own tile input')
+    if previous is not None and values['screen'] != previous.values['screen']:
+        raise RuntimeError('native screen changed during tile selection')
 
 
 def context(state, screen):
@@ -145,13 +150,13 @@ def check_context(expected, current, screen):
         raise RuntimeError('tile layout, generation or local seat changed')
 
 
-def baseline(io, screen, tile=None, ui=None, cap=4):
+def baseline(io, screen, tile=None, previous_ui=None, cap=4):
     until = time.monotonic() + cap
     # The bridge maintains one watch per connection. Tile steps use that watch;
     # native ownership and transitions use separately fenced full queries.
     io.arm(TILE, cap)
-    ui = wait_sample(io, UI, until, ui)
-    native_owner(ui, screen)
+    ui = wait_sample(io, UI, until, previous_ui)
+    native_owner(ui, screen, previous_ui)
     fresh = wait_sample(io, TILE, until, tile)
     if fresh.connection != ui.connection or fresh.block['boot'] != ui.block['boot']:
         raise RuntimeError('tile and native owner are from different bridge connections')
@@ -190,7 +195,7 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap):
         if settled(latest) != dest or Target.read(latest) != expected_tile:
             raise RuntimeError('settled tile identity disagrees with the qualified topology')
         after_ui = wait_sample(io, UI, until, ui, in_flight=True)
-        native_owner(after_ui, screen)
+        native_owner(after_ui, screen, ui)
         io.log({'tile_step': direction, 'from': at, 'to': dest, 'ack': ack,
                 'applied': applied, 'settled_ack': number(latest, 'settled.ack'),
                 'kind': expected_tile.kind, 'boot': latest.block['boot'], 'rev': latest.block['rev']})
@@ -226,8 +231,8 @@ def hover(io, screen, target, topology=None, cap=4):
 def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transition_cap=60):
     previous, prior_ui, target = prepared
     before, ui = baseline(io, screen, previous, prior_ui, cap)
-    if Target.read(before) != target or ui.values['screen'] != prior_ui.values['screen']:
-        raise RuntimeError('pre-A native target identity or screen changed')
+    if Target.read(before) != target:
+        raise RuntimeError('pre-A native target identity changed')
     at = settled(before)
     io.log({'tile_confirm_before': at, 'kind': target.kind, 'name': target.name, 'form': target.form,
             'ack': number(before, 'ack'), 'applied': number(before, 'applied'),
@@ -253,7 +258,7 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
             if settled(latest) != at or Target.read(latest) != target:
                 raise RuntimeError('tile changed before local placement')
         after = wait_sample(io, UI, until, ui, in_flight=True)
-        native_owner(after, screen)
+        native_owner(after, screen, ui)
         result = {'seat': before.values['seat'], 'placed': True}
     else:
         until = time.monotonic() + transition_cap

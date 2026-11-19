@@ -727,8 +727,7 @@ def to_main(ctx, tries=8, look_s=6):
 
 
 def main_to_stage(ctx):
-    """Main menu -> Training's stage select (library main-stage, lr-03). Calls to_main first: never trust a gate
-    pinned to an earlier screen."""
+    """Enter Training stage select from the qualified menu or the standalone Eden route."""
     if _use_native_pick(ctx):
         return _native_main_to_stage(ctx)
     to_main(ctx)
@@ -879,12 +878,10 @@ def remember(ctx, **values):
 
 def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=None, form='normal',
                next_screen='css.training'):
-    """Stage select -> the named stage, by tile-cursor steps, then A -> the character select.
+    """Select the named native stage, then verify the expected scene transition.
 
-    The target tile comes from tables.json. A tile no run has proven is refused unless allow_derived is true; the
-    stage id is then confirmed from game state after the Training load (confirm_stage). The block re-checks the stage
-    select first (never a gate from an earlier screen), and ends on the CSS gate. The old library stage-css segment
-    is not used: its start gate is the Training name crop, which fails once the hand left tile 0 (class d).
+    Standalone Eden uses the tile-log route and its proven table entries.
+    A derived standalone entry needs an explicit post-load stage check.
     """
     entry = stage_entry(stage)
     if _use_native_pick(ctx):
@@ -918,12 +915,7 @@ def _probe_step(ctx, walker, direction='left', cap=2.5):
 
 
 def pick_fighters(ctx, p1, cpu=None, coin_route=False, *, topology=None, form='default'):
-    """CSS: P1's token onto `p1` by TrainingRooms' tile table, checked by `settled at=N hovered=N`, then placed.
-
-    The hand starts holding P1's token below the grid. The CPU's coin (`cpu` with coin_route=true) is NOT PROVEN: P1
-    is placed on Steve, coin-pick pushes the empty hand onto the coin, A, and an L3 step must log token=p2; the coin
-    is walked and dropped, B returns P1's token and P1 is walked. On the XPS the approach missed four times.
-    """
+    """Place the local fighter in CSS. Standalone Eden also exposes the experimental CPU route."""
     if _use_native_pick(ctx):
         if cpu is not None or coin_route:
             raise RuntimeError('native tile selection requires the locally owned token')
@@ -1062,8 +1054,11 @@ def read_state(ctx, cap=6.0):
 
 
 def enter_training(ctx, cap=90, *, stage_ids=None):
-    """CSS ready -> Training (Plus), proven by the game: fresh state lines for both bodies, then the HUD gate.
-    A fresh profile's fighter tip is closed with A while the HUD gate fails (remaining-2 boot_training)."""
+    """Press Plus from CSS and verify Training loaded.
+
+    The bridge route checks local placement and native Training state.
+    Standalone Eden uses diagnostic body lines and the HUD gate.
+    """
     if _use_native_pick(ctx):
         return _native_enter_training(ctx, cap, stage_ids)
     stage_cursor = LogCursor(instance_path(ctx, 'diag_log'))
