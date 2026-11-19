@@ -707,5 +707,146 @@ class MainMenuStepTests(unittest.TestCase):
                                     for frame in data['events']))
                 self.assertGreater(data['duration_frames'], 3)
 
+class TrainingSubmenuRouteTests(unittest.TestCase):
+    chain = ('games_and_more', 'classic_mode', 'mob_smash', 'training', 'stage_select')
+    actions = ('tap-a1', 'main-menu-down', 'main-menu-left', 'tap-a1')
+
+    @staticmethod
+    def checkpoint(rev, focus):
+        if focus == 'stage_select':
+            return native(rev, screen='stage_select', focus='stage_select', dialog='none',
+                          **{'screen.context': 'training'})
+        layer = 'top' if focus == 'games_and_more' else 'submenu'
+        return native(rev, screen='main_menu', focus=f'main_menu.{layer}.{focus}', dialog='none',
+                      **{'screen.tab': 'games_and_more', 'screen.layer': layer,
+                         'focus.id': focus, 'focus.source': 'native'})
+
+    def run_route(self, io, start, *, changes=(), tile_state=None):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+
+        focuses = self.chain[start:]
+        frames = [focuses[0]]
+        for source, target in zip(focuses, focuses[1:]):
+            frames.extend((source, target))
+        frames.append('stage_select')
+        samples = [self.checkpoint(i, focus) for i, focus in enumerate(frames, 1)]
+        for index, state in changes:
+            samples[index] = state
+        ui = iter(samples)
+        active_tile = snapshot('tile.cursor', 10, {'screen': 'sss', 'focus': 'sss'})
+        if tile_state is None:
+            tile_state = active_tile
+
+        def respond(provider, _cap):
+            if provider == 'ssbu.ui':
+                return next(ui)
+            self.assertEqual(provider, 'tile.cursor')
+            if isinstance(tile_state, RuntimeError):
+                raise tile_state
+            return tile_state
+
+        io.connection = 1
+        io.boot = samples[0].clock[0]
+        io.read.side_effect = respond
+        ctx = SimpleNamespace(instance={'bridge_log': 'fixture'})
+        with patch.object(routes, 'BridgePickerIO', return_value=io):
+            return routes.main_to_stage(ctx)
+
+    def test_cold_route_and_each_supported_submenu_checkpoint(self):
+        from unittest.mock import Mock, call
+
+        for start, focus in enumerate(self.chain[:-1]):
+            with self.subTest(focus=focus):
+                io = Mock()
+                self.assertEqual(self.run_route(io, start), {'screen': 'stage', 'proof': 'stage_select'})
+                self.assertEqual(io.send.call_args_list, [call(action) for action in self.actions[start:]])
+                expected = ['read']
+                for _ in self.actions[start:-1]:
+                    expected.extend(('arm', 'read', 'send', 'read', 'finish'))
+                expected.extend(('arm', 'read', 'send', 'read', 'read', 'read', 'finish'))
+                self.assertEqual([event[0] for event in io.mock_calls], expected)
+                self.assertTrue(all(watch.args[0] == 'ssbu.ui' for watch in io.arm.call_args_list))
+
+    def test_unknown_or_wrong_start_sends_no_input(self):
+        from unittest.mock import Mock
+
+        wrong = native(1, screen='main_menu', focus='main_menu.submenu.homerun',
+                       dialog='none', **{'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
+                                         'focus.id': 'homerun', 'focus.source': 'native'})
+        unknown = self.checkpoint(1, 'classic_mode')
+        unknown.values['input.owner'] = 'unknown'
+        for state in (wrong, unknown):
+            with self.subTest(values=state.values):
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, 'source'):
+                    self.run_route(io, 1, changes=((0, state),))
+                io.arm.assert_not_called()
+                io.send.assert_not_called()
+
+    def test_divergent_destination_stops_without_following_input(self):
+        from unittest.mock import Mock, call
+
+        for start, wrong, sent in ((0, 'mob_smash', 'tap-a1'), (1, 'training', 'main-menu-down'),
+                                   (2, 'classic_mode', 'main-menu-left'), (3, 'classic_mode', 'tap-a1')):
+            with self.subTest(start=self.chain[start], wrong=wrong):
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, f'unexpected.*{wrong}'):
+                    self.run_route(io, start, changes=((2, self.checkpoint(3, wrong)),))
+                self.assertEqual(io.send.call_args_list, [call(sent)])
+                io.finish.assert_not_called()
+                self.assertEqual(io.read.call_count, 3)
+
+    def test_failed_arm_or_reconnect_blocks_next_menu_input(self):
+        from unittest.mock import Mock
+
+        for mode in ('arm', 'connection'):
+            with self.subTest(mode=mode):
+                io = Mock()
+                if mode == 'arm':
+                    io.arm.side_effect = (None, RuntimeError('watch failed'))
+                else:
+                    def reconnect(_provider, _cap):
+                        if io.arm.call_count == 2:
+                            io.connection += 1
+
+                    io.arm.side_effect = reconnect
+                with self.assertRaisesRegex(RuntimeError, 'watch failed|connection'):
+                    self.run_route(io, 0)
+                io.send.assert_called_once_with('tap-a1')
+                io.finish.assert_called_once()
+
+    def test_stage_arrival_rejects_other_parent_or_owner_loss_during_tile_check(self):
+        from unittest.mock import Mock
+
+        wrong_parent = self.checkpoint(3, 'stage_select')
+        wrong_parent.values['screen.context'] = 'local_wireless'
+        lost_owner = self.checkpoint(4, 'stage_select')
+        lost_owner.values['input.owner'] = 'unknown'
+        for index, state in ((2, wrong_parent), (3, lost_owner)):
+            with self.subTest(phase=index):
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, 'unexpected|stage ownership changed'):
+                    self.run_route(io, 3, changes=((index, state),))
+                io.send.assert_called_once_with('tap-a1')
+                io.finish.assert_not_called()
+
+    def test_stage_arrival_stays_pending_without_matching_tile_provider(self):
+        from unittest.mock import Mock
+
+        for block, error in (
+            (RuntimeError('tile.cursor unavailable'), 'tile.cursor unavailable'),
+            (snapshot('tile.cursor', 10, {'screen': 'css'}), 'tile.cursor.*sss'),
+            (snapshot('tile.cursor', 10, {'screen': 'sss'}, epoch=2), 'connection'),
+        ):
+            with self.subTest(error=error):
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.run_route(io, 3, tile_state=block)
+                io.send.assert_called_once_with('tap-a1')
+                io.finish.assert_not_called()
+
 if __name__ == '__main__':
     unittest.main()
