@@ -385,5 +385,118 @@ class BridgeFramingTests(unittest.TestCase):
                                  [(0, 16), (1, 16 | bit), (3, 0)])
                 self.assertGreater(data['duration_frames'], 3)
 
+class TrainingStageProofTests(unittest.TestCase):
+    boot = '0x0000000000000001'
+
+    def run_training(self, replay, finish, *, expected=0, before_press=''):
+        import zlib
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+
+        def frame(sample):
+            block = sample.block
+            fields = {**sample.values}
+            keys = ('schema', 'rev', 'boot', 'ack', 'ack.result', 'focus')
+            fields.setdefault('ack', '0')
+            fields.setdefault('ack.result', 'unsupported')
+            order = (*keys, *(k for k in fields if k not in keys))
+            payload = [f'{k}={fields[k]}' for k in order]
+            crc = zlib.crc32('\n'.join(payload).encode())
+            begin = f'[Bridge] state begin name={block["name"]} schema={block["schema"]} rev={block["rev"]}'
+            begin += f' boot={self.boot} lines={len(payload)} filtered=0\n'
+            lines = ''.join(f'[Bridge] state.{i} {line}\n' for i, line in enumerate(payload))
+            return begin + lines + f'[Bridge] state end name={block["name"]} rev={block["rev"]} crc={crc:08x}\n'
+
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.write_text('[Bridge] stage id=0 ev=41 frame=680 wall=9900\n')
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None,
+                                  runner=SimpleNamespace(), on='sw', log=lambda evidence: None)
+            ui_samples = iter([
+                native(1, screen='css.training', focus='css.training'),
+                native(2, screen='css.training', focus='css.training'),
+                native(3, screen='training', focus='training'),
+            ])
+            placed = picker.Target('88', 'Steve', 'default')
+            tiles = iter(tile(i, at='78', target=placed, seat='0', token='placed', placed=placed)
+                         for i in (1, 2))
+            actions = []
+
+            def spool(_ctx, fence, request):
+                self.assertEqual(fence, 'providers')
+                if request == 'state ssbu.ui':
+                    response = frame(next(ui_samples))
+                elif request == 'state tile.cursor':
+                    response = frame(next(tiles))
+                elif request == 'events on':
+                    response = '[Bridge] req events result=ok on=1 latest=41 frame=700 wall=10000\n'
+                else:
+                    self.assertEqual(request, 'since 41')
+                    response = replay + finish + '\n'
+                with log.open('a') as dst:
+                    dst.write(f'[Bridge] req providers result=ok count=2 boot={self.boot} frame=700 wall=10000\n')
+                    dst.write(response)
+                    if request == 'events on':
+                        dst.write(before_press)
+
+            with (patch.object(routes, 'bridge_v2', spool),
+                  patch.object(routes, 'play', side_effect=lambda _ctx, name: actions.append(name)),
+                  patch.object(routes, 'native_state', return_value={'stage': expected}),
+                  patch.object(routes, 'expected', return_value={'stage_id': expected}),
+                  patch.object(routes, '_save', side_effect=lambda _ctx, _name, value: value)):
+                try:
+                    return routes.enter_training(ctx, cap=.05)
+                finally:
+                    self.assertEqual(actions, ['enter-training'])
+
+    def ending(self, last=41, *, boot=None):
+        return (f'[Bridge] since result=ok cursor=41 from=42 oldest=1 latest={last}'
+                f' count={last - 41} boot={boot or self.boot} frame=730 wall=10200')
+
+    def test_training_accepts_fresh_battlefield_event(self):
+        stage = '[Bridge] stage id=0 ev=42 frame=720 wall=10040\n'
+        result = self.run_training(stage, self.ending(42))
+        self.assertEqual(result['stage_id'], 0)
+        self.assertEqual(result['stage_event'], {'sequence': 42, 'frame': 720, 'wall_ms': 10040,
+                                                'boot': self.boot})
+
+    def test_repeated_training_stage_cannot_reuse_historical_id(self):
+        with self.assertRaisesRegex(RuntimeError, 'no fresh gameplay stage'):
+            self.run_training('', self.ending())
+
+    def test_buffered_stage_uses_native_timestamp_not_replay_order(self):
+        stage = '[Bridge] stage id=0 ev=42 frame=690 wall=9999\n'
+        with self.assertRaisesRegex(RuntimeError, 'no fresh gameplay stage'):
+            self.run_training(stage, self.ending(42))
+
+    def test_stage_seen_before_press_is_not_a_launch_result(self):
+        stage = '[Bridge] stage id=0 ev=42 frame=701 wall=10001\n'
+        with self.assertRaisesRegex(RuntimeError, 'no fresh gameplay stage'):
+            self.run_training(stage, self.ending(42), before_press=stage)
+
+    def test_different_fresh_stage_overrides_cached_matching_id(self):
+        stage = '[Bridge] stage id=347 ev=42 frame=720 wall=10040\n'
+        with self.assertRaisesRegex(RuntimeError, 'loaded stage 347'):
+            self.run_training(stage, self.ending(42))
+
+    def test_reconnect_or_wrong_boot_cannot_authorize_stage(self):
+        stage = '[Bridge] stage id=0 ev=42 frame=720 wall=10040\n'
+        with self.assertRaisesRegex(RuntimeError, 'wrong Training stage replay fence'):
+            self.run_training(stage, self.ending(42, boot='0x0000000000000002'))
+        with self.assertRaisesRegex(RuntimeError, 'connection or replay continuity'):
+            self.run_training(stage + '[Adapter] reconnect same_boot=1\n', self.ending(42))
+
+    def test_missing_event_or_transport_loss_stops(self):
+        stage = '[Bridge] stage id=0 ev=42 frame=720 wall=10040\n'
+        with self.assertRaisesRegex(RuntimeError, 'incomplete stage event replay'):
+            self.run_training(stage, self.ending(43))
+        with self.assertRaisesRegex(RuntimeError, 'event continuity'):
+            self.run_training(stage + '[Bridge] lost lines=1 reason=overrun frame=725 wall=10050\n',
+                              self.ending(42))
+
 if __name__ == '__main__':
     unittest.main()
