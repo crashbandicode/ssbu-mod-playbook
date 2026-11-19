@@ -8,10 +8,11 @@ import native_picker as picker
 def snapshot(provider, rev, fields, epoch=1):
     boot = '0x0000000000000001'
     schema = provider + '/1'
+    active = 'yes' if provider == 'ssbu.ui' else '1'
     return picker.Sample(
         {'name': provider, 'boot': boot, 'schema': schema, 'rev': rev, 'filtered': False,
          'values': {'schema': schema, 'boot': boot, 'rev': str(rev), 'observation': str(rev),
-                    'observation.active': '1', 'focus': provider, **fields}},
+                    'observation.active': active, 'focus': provider, **fields}},
         epoch,
     )
 
@@ -263,6 +264,12 @@ class JoinTests(unittest.TestCase):
                 routes.macro_file(name)
 
 class BridgeFramingTests(unittest.TestCase):
+    def test_reject_inactive_or_wrong_provider_activity_value(self):
+        for provider, values in {'ssbu.ui': ('no', '1'), 'tile.cursor': ('0', 'yes')}.items():
+            for value in values:
+                with self.subTest(provider=provider, value=value), self.assertRaisesRegex(RuntimeError, 'inactive'):
+                    picker.check_sample(snapshot(provider, 1, {'observation.active': value}), provider)
+
     def test_fresh_query_requires_full_block_after_reply_fence(self):
         import zlib
         from pathlib import Path
@@ -276,11 +283,12 @@ class BridgeFramingTests(unittest.TestCase):
         boot = '0x0000000000000001'
         provider = 'ssbu.ui'
         schema = provider + '/1'
+    active = 'yes' if provider == 'ssbu.ui' else '1'
 
         def wire(rev, *, filtered=False, torn=False):
             payload = [f'schema={schema}', f'rev={rev}', f'boot={boot}', 'ack=0',
                        'ack.result=unsupported', 'focus=main_menu/top/smash',
-                       f'observation={rev}', 'observation.active=1']
+                       f'observation={rev}', 'observation.active=yes']
             begin = (f'[Bridge] state begin name={provider} schema={schema} rev={rev} boot={boot} '
                      f'lines={len(payload)} filtered={int(filtered)}\n')
             body = ''.join(f'[Bridge] state.{i} {line}\n' for i, line in enumerate(payload))
@@ -325,6 +333,26 @@ class BridgeFramingTests(unittest.TestCase):
                 BridgePickerIO(ctx)
             bridge.finish()
             BridgePickerIO(ctx)
+
+    def test_exact_since_gap_blocks_pending_input(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+        from native_picker_io import BridgePickerIO
+
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.touch()
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, runner=SimpleNamespace(), on='sw')
+            bridge = BridgePickerIO(ctx)
+            with patch.object(routes, 'play'):
+                bridge.send('tile-left')
+            log.write_text('[Bridge] since result=gap cursor=4 oldest=8 latest=12 boot=0x0000000000000001\n')
+            with self.assertRaisesRegex(RuntimeError, 'replay continuity changed'):
+                bridge.read('tile.cursor', 1)
 
     def test_short_direction_macros_release_before_repeat(self):
         import json

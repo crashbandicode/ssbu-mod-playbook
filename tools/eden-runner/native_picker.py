@@ -8,6 +8,7 @@ import time
 
 TILE = 'tile.cursor'
 UI = 'ssbu.ui'
+ACTIVE = {TILE: '1', UI: 'yes'}
 SCENES = {'css': {'css.training', 'css.smash'}, 'sss': {'stage_select'}}
 DIRECTIONS = {'up', 'down', 'left', 'right'}
 FORMS = {'css': {'default'}, 'sss': {'normal', 'battlefield', 'omega'}}
@@ -81,7 +82,7 @@ def check_sample(state, provider):
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
             or any(values.get(key) != str(block[key]) for key in ('schema', 'boot', 'rev'))
-            or values.get('observation.active') != '1' or number(state, 'observation') <= 0
+            or values.get('observation.active') != ACTIVE[provider] or number(state, 'observation') <= 0
             or values.get('focus', 'unknown') in ABSENT):
         raise RuntimeError(f'{provider}: incomplete, inactive or wrong-schema observation')
     return state

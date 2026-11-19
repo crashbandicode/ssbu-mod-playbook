@@ -8,7 +8,7 @@ import state_gate
 
 
 PROVIDERS_FENCE = re.compile(r'\[Bridge\] req providers result=ok count=\d+ boot=(0x[0-9a-f]{16})(?: |$)')
-REPLAY = re.compile(r'\[Bridge\] (?:req )?events .*result=gap(?: |$)')
+REPLAY = re.compile(r'\[Bridge\] since result=gap(?: |$)')
 
 
 class BridgePickerIO:
