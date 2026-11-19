@@ -131,6 +131,32 @@ class PickerTests(unittest.TestCase):
             self.run_pick(replay)
         self.assertEqual(replay.actions, [])
 
+    def test_untyped_current_tile_does_not_authorize_a(self):
+        for target in (picker.Target('bad-kind', 'Link', 'default'),
+                       picker.Target('2', 'Link', 'normal')):
+            with self.subTest(target=target):
+                replay = Replay([
+                    tile(1, at='16', target=target),
+                    tile(2, at='16', target=target),
+                    tile(3, at='16', target=target, token='placed', placed=target),
+                ])
+                with self.assertRaisesRegex(RuntimeError, 'identity'):
+                    self.run_pick(replay, target=None)
+                self.assertEqual(replay.actions, [])
+
+    def test_owner_screen_change_stops_after_the_single_step(self):
+        replay = Replay([
+            tile(1), tile(2),
+            tile(3, at='12', ack=1, direction='down', source='7', dest='12'),
+            tile(4, at='12', ack=1, direction='down', source='7', dest='12'),
+            tile(5, at='16', ack=2, direction='right', source='12', dest='16', target=TARGET),
+            tile(6, at='16', ack=2, direction='right', source='12', dest='16', target=TARGET),
+            tile(7, at='16', ack=2, target=TARGET, token='placed'),
+        ], [native(1), native(2)] + [native(i, screen='css.training') for i in range(3, 8)])
+        with self.assertRaisesRegex(RuntimeError, 'native screen changed'):
+            self.run_pick(replay)
+        self.assertEqual(replay.actions, ['tile-down'])
+
     def test_wrong_placement_blocks_progress(self):
         replay = Replay([tile(1, at='16', target=TARGET), tile(2, at='16', target=TARGET),
                          tile(3, at='16', target=TARGET, token='placed', placed=OTHER)])
