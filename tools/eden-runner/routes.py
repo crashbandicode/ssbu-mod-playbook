@@ -1460,7 +1460,6 @@ def _native_main_to_stage(ctx):
         raise RuntimeError('Training entry needs Games & More → Training native focus')
     # The submenu is an idle checkpoint. Re-fence the exact selectable item
     # before sending the second input.
-    io.in_flight = False
     state = native_picker.wait_sample(io, provider, time.monotonic() + 5, state)
     if not _fields_match(state, training):
         raise RuntimeError('Training submenu focus changed before A')
@@ -1482,6 +1481,7 @@ def _wait_native_focus(io, before, criteria, cap=45):
         state = native_picker.wait_sample(io, native_picker.UI, until, previous, in_flight=True)
         previous = state
         if _fields_match(state, criteria) and state.values['focus'] != before.values['focus']:
+            io.finish()
             return state
         if state.values['focus'] != before.values['focus']:
             raise RuntimeError(f'unexpected native focus {state.values["focus"]!r}')

@@ -25,6 +25,10 @@ class BridgePickerIO:
         self.connection = 0
         self.boot = None
         self.in_flight = False
+        self.pending = getattr(ctx.runner, 'native_ui_pending', {})
+        ctx.runner.native_ui_pending = self.pending
+        if ctx.on in self.pending:
+            raise RuntimeError(f'native input {self.pending[ctx.on]!r} remains unconfirmed on {ctx.on}')
 
     def _receive(self):
         rotations = self.cursor.rotations
@@ -64,7 +68,6 @@ class BridgePickerIO:
         raise RuntimeError(f'no fenced bridge reply for {requests[-1]}')
 
     def arm(self, provider, cap):
-        self.in_flight = False
         watch = re.compile(r'\[Bridge\] req state_watch name=' + re.escape(provider) + r' result=(ok|error)(?: |$)')
         fence = None
 
@@ -121,7 +124,12 @@ class BridgePickerIO:
         # Process any boundary written after the query, before the one input.
         self.in_flight = True
         self._receive()
+        self.pending[self.ctx.on] = segment
         self.routes.play(self.ctx, segment)
+
+    def finish(self):
+        self.pending.pop(self.ctx.on, None)
+        self.in_flight = False
 
     def log(self, evidence):
         self.ctx.log(evidence)

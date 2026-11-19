@@ -68,6 +68,9 @@ class Replay:
     def send(self, segment):
         self.actions.append(segment)
 
+    def finish(self):
+        pass
+
     def log(self, evidence):
         self.evidence.append(evidence)
 
@@ -261,7 +264,8 @@ class BridgeFramingTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             log = Path(temp, 'bridge.log')
             log.write_text(wire(50))
-            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None)
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None,
+                                  runner=SimpleNamespace(), on='sw')
             bridge = BridgePickerIO(ctx)
 
             def spool(ctx, *requests):
@@ -274,6 +278,27 @@ class BridgeFramingTests(unittest.TestCase):
                 state = bridge.read(provider, 1)
             self.assertEqual(state.block['rev'], 55)
             self.assertEqual(state.connection, 1)
+
+    def test_new_route_cannot_overwrite_unconfirmed_input(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+        from native_picker_io import BridgePickerIO
+
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.touch()
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, runner=SimpleNamespace(), on='sw')
+            bridge = BridgePickerIO(ctx)
+            with patch.object(routes, 'play'):
+                bridge.send('tile-left')
+            with self.assertRaisesRegex(RuntimeError, 'remains unconfirmed'):
+                BridgePickerIO(ctx)
+            bridge.finish()
+            BridgePickerIO(ctx)
 
     def test_short_direction_macros_release_before_repeat(self):
         import json

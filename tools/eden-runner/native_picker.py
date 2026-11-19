@@ -194,6 +194,7 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap):
         io.log({'tile_step': direction, 'from': at, 'to': dest, 'ack': ack,
                 'applied': applied, 'settled_ack': number(latest, 'settled.ack'),
                 'kind': expected_tile.kind, 'boot': latest.block['boot'], 'rev': latest.block['rev']})
+        io.finish()
         return latest, after_ui
 
 
@@ -269,6 +270,7 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
         result = {'screen': next_screen}
     result.update({'tile': at, 'kind': target.kind, 'name': target.name, 'form': target.form})
     io.log({'tile_confirm_after': result, 'boot': after.block['boot'], 'rev': after.block['rev']})
+    io.finish()
     return result
 
 
@@ -323,6 +325,7 @@ def acquire_local_token(io, target, topology, cap=4):
             native_owner(wait_sample(io, UI, until, ui, in_flight=True), 'css')
             io.log({'local_token_taken_back': state.values['seat'], 'boot': state.block['boot'],
                     'rev': state.block['rev']})
+            io.finish()
             return None
         if state.values.get('local.token') != 'placed' or Target.read(state, 'placed.') != wanted:
             raise RuntimeError('local medal changed while taking it back')
