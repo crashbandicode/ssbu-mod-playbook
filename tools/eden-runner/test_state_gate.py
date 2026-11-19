@@ -1,4 +1,5 @@
 """state_gate: framed bridge state blocks and the gate's freshness/transition rules (no Eden, no console)."""
+import time
 import unittest
 import zlib
 
@@ -105,6 +106,38 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(link['cursor'], 41, 'the cursor survives a same-boot reconnect')
         self.assertIn(b'same_boot=0', switch_hw.link_line(link, hello.replace(b'0x00ab', b'0x00cd')))
         self.assertEqual(link['cursor'], 0, 'a new boot starts a new event sequence')
+
+    def test_a_silent_connection_gets_a_heartbeat_then_is_reconnected(self):
+        import socket
+        import tempfile
+        import switch_hw
+        sent, connects = [], []
+
+        class Silent:
+            def settimeout(self, _):
+                pass
+
+            def sendall(self, data):
+                sent.append(data)
+
+            def recv(self, _):
+                time.sleep(0.02)
+                raise socket.timeout()
+
+            def close(self):
+                pass
+
+        def connect(*_a, **_k):
+            connects.append(1)
+            return Silent()
+
+        with tempfile.TemporaryDirectory() as d:
+            switch_hw.capture_bridge(d, '127.0.0.1', 1, f'{d}/console.log', stop=lambda: len(connects) >= 3,
+                                     connect=connect, retry_s=0.01, heartbeat_s=0.1, idle_s=0.3)
+            log = open(f'{d}/bridge.log', 'rb').read()
+        self.assertGreaterEqual(len(connects), 3, 'reconnected after silence')
+        self.assertIn(b'providers\n', sent, 'a heartbeat before giving up')
+        self.assertIn(b'[Adapter] connection idle', log)
 
     def test_state_and_reconnect_verbs_pass_the_v2_spool(self):
         import switch_hw

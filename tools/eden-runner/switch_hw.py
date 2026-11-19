@@ -254,7 +254,8 @@ class BridgeMirror:
             log.flush()
 
 
-def capture_bridge(run, host, port, console, stop=None, connect=socket.create_connection, retry_s=0.5):
+def capture_bridge(run, host, port, console, stop=None, connect=socket.create_connection, retry_s=0.5,
+                   heartbeat_s=2.0, idle_s=6.0):
     """Hold the bridge's socket (reconnecting): its lines to bridge.log and the console log, the spool's requests out."""
     run = Path(run)
     spool = run / 'bridge'
@@ -283,6 +284,10 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             sock.settimeout(0.1)
             pending = b''
             link['connects'] += 1
+            # A connection that delivers nothing is dead even without an EOF (a dropped network or a peer that closed
+            # without a FIN reaching us: Eden after the bridge replaced this client): a heartbeat request after
+            # `heartbeat_s` of silence, a reconnect after `idle_s`.
+            last_rx, last_beat = time.monotonic(), 0.0
             try:
                 # The fixture backup (D-Q12) comes first: the bridge refuses fixture requests until it is open.
                 sock.sendall(b'backup\nfile settings.json\n')  # the bridge greets each new client by itself
@@ -297,9 +302,18 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                     try:
                         data = sock.recv(65536)
                     except socket.timeout:
+                        quiet = time.monotonic() - last_rx
+                        if quiet > idle_s:
+                            blog.write(b'[Adapter] connection idle %.1f s: reconnecting\n' % quiet)
+                            blog.flush()
+                            break
+                        if quiet > heartbeat_s and time.monotonic() - last_beat > heartbeat_s:
+                            sock.sendall(b'providers\n')
+                            last_beat = time.monotonic()
                         continue
                     if not data:
                         break
+                    last_rx = time.monotonic()
                     lines = (pending + data).split(b'\n')
                     pending = lines.pop()
                     for raw in lines:
