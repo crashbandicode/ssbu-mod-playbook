@@ -112,6 +112,25 @@ class PickerTests(unittest.TestCase):
             self.run_pick(replay)
         self.assertEqual(replay.actions, ['tile-down'])
 
+    def test_idle_native_hover_needs_no_step_ack(self):
+        idle = [tile(rev, at='16', target=TARGET, ack=5, applied=4) for rev in (1, 2)]
+        for observation in idle:
+            observation.values.update({
+                'settled.ack': 'unknown', 'ack.result': 'unknown', 'result': 'unknown',
+                'direction': 'unknown', 'from': 'unknown', 'to': 'unknown',
+            })
+        replay = Replay([*idle, tile(3, at='16', target=TARGET, ack=5, applied=4, token='placed')])
+        self.assertTrue(self.run_pick(replay)['placed'])
+        self.assertEqual(replay.actions, ['tap-a1'])
+
+    def test_native_rest_does_not_substitute_for_step_settlement(self):
+        moved = tile(3, at='12', ack=1, direction='down', source='7', dest='12')
+        moved.values['settled.ack'] = 'unknown'
+        replay = Replay([tile(1), tile(2), moved])
+        with self.assertRaises(RuntimeError):
+            self.run_pick(replay)
+        self.assertEqual(replay.actions, ['tile-down'])
+
     def test_missing_provider_blocks_input(self):
         replay = Replay()
         with self.assertRaisesRegex(RuntimeError, 'tile.cursor missing'):
