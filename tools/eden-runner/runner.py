@@ -142,14 +142,15 @@ import judge_queue  # noqa: E402
 import subprocess  # noqa: E402
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
-GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status')
+GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status', 'state')
 # Control methods a row may call directly with a {"call": ...} step. Input stays in recorded segments.
 CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.get', 'settings.set', 'settings.save',
                 # Guest tracing (Eden persistent-tracing builds, docs/GUEST_TRACEPOINT.md); never input.
                 'trace.arm', 'trace.read', 'trace.counters', 'trace.list', 'trace.disarm', 'modules.list',
                 'symbols.load', 'tracepoint.arm', 'tracepoint.status', 'tracepoint.cancel')
 # One verb per step. Runner.step_handlers maps each of these to a method; add a kind there, not a new if-chain.
-STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 'call', 'wait_ms', 'gif', 'library')
+STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 'call', 'wait_ms', 'gif', 'library',
+              'state_baseline')
 UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
 # Shared step-hook modules next to runner.py, named without ".py" in a run step: {"run": "routes:to_main"}.
 SHARED_HOOKS = ('routes', 'routes_online')
@@ -726,6 +727,13 @@ def dry_run(manifest_path):
             elif kind == 'json':
                 if not gate.get('expect'):
                     errors.append(f'gate {name}: empty expect')
+            elif kind == 'state':
+                # A plugin's state through the bridge (state_gate.py): a provider and the keys it must show.
+                if not isinstance(gate.get('provider'), str) or not isinstance(gate.get('where', {}), dict):
+                    errors.append(f'gate {name}: state needs "provider" and a "where" object')
+                if gate.get('transition') not in (None, 'focus') or not (gate.get('where') or gate.get('transition')
+                                                                         or gate.get('ack')):
+                    errors.append(f'gate {name}: state needs "where", "transition": "focus" or "ack"')
             elif kind == 'hook':
                 load_hook(base, gate)
         except Exception as error:  # report every broken gate, not just the first
@@ -1642,6 +1650,8 @@ class Runner:
                     self.log({'gate': name, 'on': on, 'pass': True})
                     return {k: status.get(k) for k in gate['expect']}
                 time.sleep(.5)
+        elif kind == 'state':
+            return self.state_gate(on, name, gate, until)
         elif kind == 'json':
             source = self.source(on, gate['source'])
             while time.monotonic() < until:
@@ -1875,6 +1885,61 @@ class Runner:
         if into is not None and result is not None:
             into.append(result)
         return result
+
+    # ---- plugin state through the bridge (state_gate.py, ssbu-hw-bridge docs/PLUGIN-STATE.md) -------------------------
+
+    def _state_log(self, on):
+        blog = (self.instances.get(on) or {}).get('bridge_log')
+        if not blog:
+            raise RuntimeError(f'state: instance {on} has no bridge_log (bring it up with the bridge)')
+        return Path(blog)
+
+    def _state_block(self, on, provider, cap, accept):
+        """Ask for fresh `state <provider>` blocks (the switch_hw spool, as for v2 reads) until one read after the
+        request satisfies `accept(block)` -> (ok, why); returns (block, why) or raises with the last reason."""
+        import state_gate
+        import switch_hw
+        log = self._state_log(on)
+        start, until, asked, why = log.stat().st_size if log.exists() else 0, time.monotonic() + cap, 0.0, 'no block'
+        while time.monotonic() < until:
+            self.check_stop()
+            if time.monotonic() - asked > 1.0:
+                switch_hw.bridge_v2(log.parent, f'state {provider}')
+                asked = time.monotonic()
+            with log.open('rb') as f:
+                f.seek(start)
+                text = f.read().decode(errors='replace')
+            for block in reversed(state_gate.blocks(text, provider)):
+                ok, why = accept(block)
+                if ok:
+                    return block, why
+                break  # only the newest complete block decides; an older one is never fresher
+            time.sleep(.2)
+        raise RuntimeError(f'state {provider} did not pass within {cap} s: {why}')
+
+    def _step_state_baseline(self, on, step):
+        """A complete state block taken before the row's input: the next `state` gate needs a newer one."""
+        provider = step['state_baseline']
+        block, _ = self._state_block(on, provider, step.get('cap', 10), lambda b: (True, 'baseline'))
+        if not hasattr(self, 'state_marks'):
+            self.state_marks = {}
+        self.state_marks[(on, provider)] = block
+        self.log({'state_baseline': provider, 'on': on, 'rev': block['rev'], 'boot': block['boot'],
+                  'focus': block['values'].get('focus'), 'ack': block['values'].get('ack')})
+        return {'state_baseline': provider, 'on': on, 'rev': block['rev'], 'focus': block['values'].get('focus')}
+
+    def state_gate(self, on, name, gate, until):
+        import state_gate
+        provider = gate['provider']
+        base = getattr(self, 'state_marks', {}).get((on, provider))
+        if base is None:
+            raise RuntimeError(f'gate {name}: no state_baseline for {provider} on {on} earlier in this row')
+        block, _ = self._state_block(on, provider, max(0.1, until - time.monotonic()), lambda b: state_gate.satisfies(
+            b, gate.get('where', {}), base, gate.get('transition'), gate.get('ack')))
+        self.state_marks[(on, provider)] = block  # the next gate in the row needs a still newer one
+        evidence = {k: block['values'].get(k) for k in ('focus', 'ack', 'ack.result', *gate.get('where', {}))}
+        self.log({'gate': name, 'on': on, 'pass': True, 'state': provider, 'rev': block['rev'], 'values': evidence})
+        return {'state': provider, 'rev': block['rev'], 'boot': block['boot'], 'values': evidence}
 
     def _step_play(self, on, step):
         self.play(on, step['play'])
@@ -2662,6 +2727,7 @@ Runner.step_handlers = {
     'wait_ms': Runner._step_wait,
     'gif': Runner._step_gif,
     'library': Runner._step_library,
+    'state_baseline': Runner._step_state_baseline,
 }
 step_kind.extra = tuple(Runner.step_handlers)
 

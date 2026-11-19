@@ -68,7 +68,9 @@ REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req'
                  'bridge-speed.req': 'speed', 'bridge-roster.req': 'roster', 'bridge-status.req': 'status_names'}
 SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 # Protocol v2 (bridge slice 3): written as `bridge-v2*.req` spool files, one request per line (`bridge_v2`).
-V2_VERBS = {'caps', 'scene', 'fighters', 'status_names', 'hid', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch'}
+V2_VERBS = {'caps', 'scene', 'fighters', 'status_names', 'hid', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch',
+            # plugin state and same-boot reconnect (ssbu-hw-bridge docs/PLUGIN-STATE.md)
+            'state', 'state_watch', 'providers', 'since', 'events'}
 
 
 def bridge_v2(run, *requests):
@@ -268,6 +270,10 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
     with lock, (run / 'bridge.log').open('ab') as blog, Path(console).open('ab') as clog, \
             (run / 'bridge.requests.jsonl').open('a') as sent:
         mirror = BridgeMirror(run, [blog, clog])
+        # Same-boot reconnect: the bridge's hello names its boot; ring lines carry ` ev=<seq>` once `events on` is
+        # sent, and after a reconnect `since <cursor>` replays what was missed (or answers `result=gap`). A request
+        # whose answer was lost is never sent again by the capture: the row's gate re-reads state instead.
+        link = {'boot': None, 'cursor': 0, 'connects': 0}
         while not (stop and stop()):
             try:
                 sock = connect((host, port), timeout=3)
@@ -276,9 +282,12 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                 continue
             sock.settimeout(0.1)
             pending = b''
+            link['connects'] += 1
             try:
                 # The fixture backup (D-Q12) comes first: the bridge refuses fixture requests until it is open.
                 sock.sendall(b'backup\nfile settings.json\n')  # the bridge greets each new client by itself
+                resume = b'events on\n' + (b'since %d\n' % link['cursor'] if link['cursor'] else b'')
+                sock.sendall(resume)
                 while not (stop and stop()):
                     for request in mirror.wanted + spool_requests(spool):
                         sock.sendall(request + b'\n')
@@ -294,6 +303,10 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                     lines = (pending + data).split(b'\n')
                     pending = lines.pop()
                     for raw in lines:
+                        note = link_line(link, raw)
+                        if note:
+                            blog.write(note + b'\n')
+                            blog.flush()
                         try:
                             mirror.line(raw)
                         except (OSError, ValueError) as error:  # one bad line never stops the capture
@@ -304,6 +317,32 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             finally:
                 sock.close()
             time.sleep(retry_s)
+
+
+HELLO_BOOT = re.compile(rb'\[Bridge\] hello .*?boot=(0x[0-9a-f]+) .*?reconnects=(\d+)')
+EV = re.compile(rb' ev=(\d+) frame=')
+
+
+def link_line(link, raw):
+    """Track the boot and the confirmed event cursor; returns an `[Adapter]` note for a reconnect, else None."""
+    m = EV.search(raw)
+    if m:
+        link['cursor'] = max(link['cursor'], int(m[1]))
+        return None
+    m = HELLO_BOOT.search(raw)
+    if not m:
+        return None
+    boot = m[1].decode()
+    note = None
+    if link['boot'] is None:
+        note = f'[Adapter] bridge connected boot={boot}'
+    elif link['boot'] == boot:
+        note = f'[Adapter] reconnect same_boot=1 boot={boot} connects={link["connects"]} cursor={link["cursor"]}'
+    else:
+        note = f'[Adapter] reconnect same_boot=0 boot={boot} was={link["boot"]} (the console restarted)'
+        link['cursor'] = 0
+    link['boot'] = boot
+    return note.encode()
 
 
 def capture_bridge_file(run, sd_dir, console, stop=None, poll_s=0.05):
@@ -617,9 +656,11 @@ def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None, log
             # prove it is the live one by its connection line, never by opening our own.
             log = Path(log_file)
             connected = external_log_connected(log)
-            if not connected:
+            if not connected and not bridge_host:
                 raise SystemExit(f'refused: {log} has no capture connection line: not a live capture')
-            journal.update(log=str(log), log_external=True, log_live=connected[:200])
+            # With the bridge, no gate depends on the one-client Skyline logger: a missing one is only a warning.
+            journal.update(log=str(log), log_external=True, log_live=(connected or '')[:200],
+                           **({} if connected else {'log_warning': 'no live external logger capture (bridge gates only)'}))
         else:
             host, _, port = log_host.rpartition(':')
             log = run / 'skyline.log'
@@ -629,11 +670,14 @@ def up(run, device, log_host, owner, allow_no_split=False, bridge_host=None, log
                                     stderr=open(run / 'capture-log.err', 'ab'), start_new_session=True)
             journal.update(capture_pid=proc.pid, log=str(log), log_host=log_host)
             live = wait_log_line(log, log_cap_s, start=log_start)
-            if live is None:
+            if live is None and not bridge_host:
                 proc.terminate()
                 raise SystemExit(f'refused: no Skyline log line in {log} within {log_cap_s:.0f} s (log gates would '
                                  f'be blind); is the console on the network and the plugin logging to {log_host}?')
             journal['log_live'] = live
+            if live is None:
+                # The bridge carries every gate: the logger capture keeps trying, but is not needed.
+                journal['log_warning'] = f'no Skyline log line within {log_cap_s:.0f} s (bridge gates only)'
         instances = {'sw': {'socket': f'usb://{device}', 'console_log': str(log), 'skyline_log': str(log),
                             'screenshot_target': 'switch', 'hardware': True}}
         if bridge_host:
