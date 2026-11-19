@@ -526,8 +526,8 @@ class FtpCard(Card):
             try:
                 ftp.voidcmd('RNTO /' + target)
             except ftplib.error_perm as error:
-                if not (allow_exists and str(error).startswith('550 ')
-                        and re.search(r'\b(?:file|destination)(?: already)? exists\b', str(error), re.I)):
+                parent, _, name = target.rpartition('/')
+                if not allow_exists or name not in self.names(ftp, parent):
                     raise
                 self.commands[-1]['overwrite_refused'] = str(error)
                 return False

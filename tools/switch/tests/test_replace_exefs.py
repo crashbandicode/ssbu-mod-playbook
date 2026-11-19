@@ -734,9 +734,51 @@ class TestFtpTransaction(Base):
         self.assertFalse({'DELE', 'RNTO'} & {cmd for _, cmd, _ in install})
         self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
 
-    def test_unrelated_rnto_refusal_never_deletes(self):
+    def test_retry_rename_after_generic_permanent_refusal_with_target_present(self):
         self.phase('preflight')
-        self.ftp.reply = lambda cmd, path: '550 permission denied' if cmd == 'RNTO' else None
+        target = self.card / SUBSDK9
+        refusal = '550 Rename failed'
+
+        def refuse_overwrite(cmd, path):
+            if (cmd, path) == ('RNTO', '/' + SUBSDK9) and target.exists():
+                return refusal
+            return None
+
+        self.ftp.reply = refuse_overwrite
+        install = [(cmd, arg) for _, cmd, arg in self.phase('install')]
+        first_rename = install.index(('RNTO', '/' + SUBSDK9))
+        delete = install.index(('DELE', '/' + SUBSDK9))
+        self.assertIn(('CWD', '/' + str(target.parent.relative_to(self.card))), install[first_rename + 1:delete])
+        self.assertIn(('NLST', ''), install[first_rename + 1:delete])
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.NEW))
+        self.assertEqual(self.tree()[self.backup], sha(self.OLD))
+        receipt = self.receipt('deployment.json')
+        self.assertEqual(receipt['state'], 'installed_verified')
+        self.assertEqual([entry['overwrite_refused'] for entry in receipt['commands']
+                          if 'overwrite_refused' in entry], [refusal])
+
+    def test_permanent_rnto_refusal_with_target_absent_never_deletes(self):
+        self.phase('preflight')
+        target = self.card / SUBSDK9
+
+        def refuse_rename(cmd, path):
+            if (cmd, path) == ('RNTO', '/' + SUBSDK9):
+                target.unlink()
+                return '550 File exists'
+            return None
+
+        self.ftp.reply = refuse_rename
+        install = [(cmd, arg) for _, cmd, arg in self.phase('install', expect=1)]
+        rename = install.index(('RNTO', '/' + SUBSDK9))
+        restore = install.index(('STOR', '/' + SUBSDK9))
+        self.assertIn(('NLST', ''), install[rename + 1:restore])
+        self.assertNotIn(('DELE', '/' + SUBSDK9), install)
+        self.assertEqual(self.receipt('deployment.json')['state'], 'rolled_back_verified')
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+
+    def test_temporary_rnto_refusal_never_deletes(self):
+        self.phase('preflight')
+        self.ftp.reply = lambda cmd, path: '450 Try later' if cmd == 'RNTO' else None
         install = self.phase('install', expect=1)
         self.assertNotIn('DELE', [cmd for _, cmd, _ in install])
         self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
