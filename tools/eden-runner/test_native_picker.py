@@ -283,7 +283,6 @@ class BridgeFramingTests(unittest.TestCase):
         boot = '0x0000000000000001'
         provider = 'ssbu.ui'
         schema = provider + '/1'
-    active = 'yes' if provider == 'ssbu.ui' else '1'
 
         def wire(rev, *, filtered=False, torn=False):
             payload = [f'schema={schema}', f'rev={rev}', f'boot={boot}', 'ack=0',
