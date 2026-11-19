@@ -1480,6 +1480,12 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
     initial = native_picker.wait_sample(io, native_picker.UI, until)
     if not _fields_match(initial, source):
         raise RuntimeError(f'Main Menu source must be native top-tab focus {from_focus!r}')
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError('Main Menu source deadline expired before arming ssbu.ui')
+    io.arm(native_picker.UI, remaining)
+    if io.connection != initial.connection or io.boot != initial.clock[0]:
+        raise RuntimeError('bridge connection or boot changed while arming Main Menu watch')
     before = native_picker.wait_sample(io, native_picker.UI, until, initial)
     if before.connection != initial.connection or not _fields_match(before, source):
         raise RuntimeError(f'Main Menu source changed before {direction!r} at {from_focus!r}')
@@ -1498,6 +1504,7 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
         if not _fields_match(state, source):
             raise RuntimeError(f'unexpected Main Menu focus {state.values["focus"]!r} after {direction!r}; '
                                f'expected {to_focus!r}')
+
 
 def _native_main_to_stage(ctx):
     """From the qualified Games & More hover or Training submenu focus to SSS."""
