@@ -231,8 +231,10 @@ def _gate_spec(name):
 
 
 def gate(ctx, name, cap=None):
-    """Check a route gate through the runner (receipts, screenshots, failure evidence all apply)."""
+    """Check a route gate and return its evidence path."""
     key = f'routes.{name}'
+    if name in ('css', 'stage') and _use_native_pick(ctx):
+        return _native_screen_gate(ctx, name, cap if cap is not None else ROUTE_GATES[name]['cap'])
     gates = ctx.runner.plan.setdefault('gates', {})
     if on_switch(ctx):
         if name not in SWITCH_REFS:
@@ -252,6 +254,26 @@ def gate(ctx, name, cap=None):
         return ctx.gate(key)
     finally:
         gates[key] = saved
+
+
+def _native_screen_gate(ctx, name, cap):
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + cap
+    before = native_picker.wait_sample(io, native_picker.UI, until)
+    state = native_picker.wait_sample(io, native_picker.UI, until, before)
+    if state.connection != before.connection:
+        raise RuntimeError('bridge connection changed during native screen check')
+    native_picker.native_owner(state, 'css' if name == 'css' else 'sss')
+    boot, revision, observation = state.clock
+    key = f'routes.{name}'
+    filename = f'gate-{key}'
+    receipt = _save(ctx, filename, {
+        'gate': key, 'on': ctx.on, 'pass': True, 'provider': native_picker.UI,
+        'screen': state.values['screen'], 'focus': state.values['focus'], 'boot': boot,
+        'revision': revision, 'observation': observation,
+    })
+    ctx.log(receipt)
+    return str(Path(ctx.row_dir) / f'{filename}.json')
 
 
 SWITCH_SCHEMES = ('usb://', 'pi://', 'switch://', 'autopilot://')
@@ -1172,7 +1194,7 @@ def select_screen(ctx, cap=2.5):
     try:
         cursor = LogCursor(instance_path(ctx, 'tile_log'))
     except KeyError:
-        return None  # no tile cursor (a real Switch: it isn't on the card)
+        return None  # This legacy probe requires a configured tile log.
     try:
         play(ctx, 'tile-up')
         return cursor.wait(r'step screen=(css|sss) ', cap, ctx).group(1)
