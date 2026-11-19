@@ -1460,6 +1460,45 @@ def preload_clear(ctx, cap=180, appear=10.0):
         time.sleep(0.3)
 
 
+def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
+    """Check caller-supplied native top-tab endpoints around exactly one D-pad tap."""
+    tabs = ('smash', 'spirits', 'games_and_more', 'vault', 'online')
+    if not isinstance(direction, str) or direction not in native_picker.DIRECTIONS:
+        raise RuntimeError(f'unsupported Main Menu direction {direction!r}')
+    if from_focus not in tabs or to_focus not in tabs or from_focus == to_focus:
+        raise RuntimeError('Main Menu step needs two distinct canonical top-tab focus IDs')
+
+    top = {'screen': 'main_menu', 'screen.layer': 'top', 'input.owner': 'native',
+           'dialog': 'none', 'focus.source': 'native'}
+    source = {**top, 'screen.tab': from_focus, 'focus.id': from_focus,
+              'focus': f'main_menu.top.{from_focus}'}
+    target = {**top, 'screen.tab': to_focus, 'focus.id': to_focus,
+              'focus': f'main_menu.top.{to_focus}'}
+
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + cap
+    initial = native_picker.wait_sample(io, native_picker.UI, until)
+    if not _fields_match(initial, source):
+        raise RuntimeError(f'Main Menu source must be native top-tab focus {from_focus!r}')
+    before = native_picker.wait_sample(io, native_picker.UI, until, initial)
+    if before.connection != initial.connection or not _fields_match(before, source):
+        raise RuntimeError(f'Main Menu source changed before {direction!r} at {from_focus!r}')
+
+    io.send(f'main-menu-{direction}')
+    state = before
+    while True:
+        state = native_picker.wait_sample(io, native_picker.UI, until, state, in_flight=True)
+        if _fields_match(state, target):
+            io.finish()
+            return _save(ctx, 'routes-main-menu-step', {
+                'direction': direction, 'from_focus': from_focus, 'to_focus': to_focus,
+                'boot': state.clock[0], 'from_observation': before.clock[2],
+                'to_observation': state.clock[2],
+            })
+        if not _fields_match(state, source):
+            raise RuntimeError(f'unexpected Main Menu focus {state.values["focus"]!r} after {direction!r}; '
+                               f'expected {to_focus!r}')
+
 def _native_main_to_stage(ctx):
     """From the qualified Games & More hover or Training submenu focus to SSS."""
     io = BridgePickerIO(ctx)

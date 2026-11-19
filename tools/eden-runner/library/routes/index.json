@@ -1,6 +1,38 @@
 {
  "about": "ROUTES macros (docs/ROUTES.md). Same-frame chords live in these files and are played with macro.play; never send a chord as separate presses. routes.play() checks each sha256 before playing. Status per entry: \"proven\" names the run that showed it working.",
  "macros": {
+  "main-menu-left": {
+   "file": "macros/main-menu-left.edenmacro.json",
+   "sha256": "0c0ed5acbecf8b42e5225f2e2f48855922e69bf9b5da7c47559d8671edd428a1",
+   "cap": 20,
+   "frames": 6,
+   "what": "One plain D-pad Left tap for a checked Main Menu top-tab step",
+   "source": "tap-a1 frame shape and the matching checked tile macro direction bit without L3"
+  },
+  "main-menu-up": {
+   "file": "macros/main-menu-up.edenmacro.json",
+   "sha256": "8f093143057bd5cf44d140a4a6307fefc063f6badcda50c1ee1ab180cd744a86",
+   "cap": 20,
+   "frames": 6,
+   "what": "One plain D-pad Up tap for a checked Main Menu top-tab step",
+   "source": "tap-a1 frame shape and the matching checked tile macro direction bit without L3"
+  },
+  "main-menu-right": {
+   "file": "macros/main-menu-right.edenmacro.json",
+   "sha256": "cf45ed4d27a1061eb7e5e55811e539d40517d5a34a851e58925a5d74aea0f36e",
+   "cap": 20,
+   "frames": 6,
+   "what": "One plain D-pad Right tap for a checked Main Menu top-tab step",
+   "source": "tap-a1 frame shape and the matching checked tile macro direction bit without L3"
+  },
+  "main-menu-down": {
+   "file": "macros/main-menu-down.edenmacro.json",
+   "sha256": "5d233cbcb1f89b33e9b488d72b8c634a15de4dc1ec8dc615ddf4737b3b0b9dc0",
+   "cap": 20,
+   "frames": 6,
+   "what": "One plain D-pad Down tap for a checked Main Menu top-tab step",
+   "source": "tap-a1 frame shape and the matching checked tile macro direction bit without L3"
+  },
   "tile-up": {
    "file": "macros/tile-up.edenmacro.json",
    "sha256": "90804c2ba02737ac71172160edf0a5f17d9835a00bc48832466cb94f16337df9",
