@@ -584,5 +584,106 @@ class NativeScreenGateTests(unittest.TestCase):
             self.assertEqual(routes.gate(ctx, 'css'), 'standalone.png')
         ctx.gate.assert_called_once_with('routes.css')
 
+class MainMenuStepTests(unittest.TestCase):
+    @staticmethod
+    def top(rev, focus, **changes):
+        fields = {'screen': 'main_menu', 'screen.layer': 'top', 'screen.tab': focus,
+                  'input.owner': 'native', 'dialog': 'none', 'focus.source': 'native',
+                  'focus.id': focus, 'focus': f'main_menu.top.{focus}'}
+        return native(rev, **{**fields, **changes})
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        import routes
+
+        self.ctx = SimpleNamespace()
+        self.io = Mock()
+        test_io = patch.object(routes, 'BridgePickerIO', return_value=self.io)
+        save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
+        self.addCleanup(test_io.stop)
+        self.addCleanup(save.stop)
+        test_io.start()
+        save.start()
+        self.routes = routes
+
+    def step(self, direction='right', from_focus='smash', to_focus='spirits'):
+        return self.routes.main_menu_step(self.ctx, direction, from_focus, to_focus, cap=.25)
+
+    def test_one_press_from_refreshed_focus_then_exact_destination(self):
+        # These endpoint IDs exercise the predicate without asserting stock adjacency.
+        self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'),
+                                    self.top(3, 'smash'), self.top(4, 'spirits')]
+        result = self.step()
+        self.assertEqual([call[0] for call in self.io.mock_calls],
+                         ['read', 'read', 'send', 'read', 'read', 'finish'])
+        self.io.send.assert_called_once_with('main-menu-right')
+        self.assertEqual((result['from_focus'], result['to_focus']), ('smash', 'spirits'))
+        self.assertEqual((result['from_observation'], result['to_observation']), (2, 4))
+
+    def test_wrong_committed_focus_stops_without_retry_or_finish(self):
+        self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'),
+                                    self.top(3, 'vault'), self.top(4, 'spirits')]
+        with self.assertRaisesRegex(RuntimeError, 'unexpected.*vault'):
+            self.step('down')
+        self.io.send.assert_called_once_with('main-menu-down')
+        self.io.finish.assert_not_called()
+        self.assertEqual(self.io.read.call_count, 3)
+
+    def test_source_gate_refuses_changed_tab_or_unqualified_context(self):
+        for snapshot in (
+            self.top(2, 'spirits'),
+            self.top(2, 'smash', **{'dialog': 'notice'}),
+            self.top(2, 'smash', **{'screen.layer': 'submenu'}),
+            self.top(2, 'smash', **{'input.owner': 'unknown'}),
+            self.top(2, 'smash', **{'focus.source': 'unknown'}),
+            self.top(2, 'smash', **{'screen.tab': 'online'}),
+        ):
+            with self.subTest(values=snapshot.values):
+                self.io.read.side_effect = [self.top(1, 'smash'), snapshot]
+                with self.assertRaisesRegex(RuntimeError, 'source'):
+                    self.step()
+                self.io.send.assert_not_called()
+
+    def test_post_press_context_change_reusing_source_focus_stops(self):
+        self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'),
+                                    self.top(3, 'smash', dialog='notice'), self.top(4, 'spirits')]
+        with self.assertRaisesRegex(RuntimeError, 'unexpected'):
+            self.step()
+        self.io.send.assert_called_once()
+        self.io.finish.assert_not_called()
+        self.assertEqual(self.io.read.call_count, 3)
+
+    def test_reconnect_cannot_confirm_step(self):
+        sample = self.top(3, 'spirits')
+        self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'),
+                                    picker.Sample(sample.block, connection=2)]
+        with self.assertRaisesRegex(RuntimeError, 'connection'):
+            self.step()
+        self.io.send.assert_called_once()
+        self.io.finish.assert_not_called()
+
+    def test_arguments_fail_before_bridge_or_input(self):
+        for args in (('a', 'smash', 'spirits'), ('up', 'unknown', 'spirits'), ('up', 'smash', 'smash')):
+            with self.subTest(args=args), self.assertRaisesRegex(RuntimeError, 'direction|focus'):
+                self.step(*args)
+        self.io.read.assert_not_called()
+        self.io.send.assert_not_called()
+
+    def test_macros_press_one_plain_dpad_direction_then_release(self):
+        import json
+
+        for direction, bit in {'left': 4096, 'up': 8192, 'right': 16384, 'down': 32768}.items():
+            with self.subTest(direction=direction):
+                path, _, _ = self.routes.macro_file(f'main-menu-{direction}')
+                data = json.loads(path.read_text())
+                self.assertEqual(data['player'], 0)
+                self.assertEqual([(frame['frame'], frame['buttons']) for frame in data['events']],
+                                 [(0, 0), (1, bit), (3, 0)])
+                self.assertTrue(all(frame['sticks'] == [0, 0, 0, 0] and frame['triggers'] == [0, 0]
+                                    for frame in data['events']))
+                self.assertGreater(data['duration_frames'], 3)
+
 if __name__ == '__main__':
     unittest.main()
