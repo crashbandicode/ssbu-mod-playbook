@@ -5,8 +5,9 @@ reads and writes the way it reads the real card.
   calls, same output format, same exit codes); fake_gio.py wraps it to inject faults.
 * Mounted-card transport: the same transaction on a plain directory; the mount checks are
   replaced in the test process, and faults are injected by wrapping a transport method.
-* Never reaches a real card: setUp refuses any URI that is not `file:///`, and the refusal
-  tests that run the script as `python3 -I` fail before the first card operation.
+* FTP transport: a loopback fake DBI server exercising the real ftplib client.
+* All tests use a local file tree or the loopback server. Entry-point refusal
+  tests fail before the first card operation.
 
 Run: python3 -I tools/switch/tests/test_replace_exefs.py"""
 import contextlib
@@ -17,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -440,7 +442,7 @@ class TestRefusalsBeforeCardAccess(MtpBase):
         self.refused('sha256')
 
     def test_unknown_transport_and_missing_mount(self):
-        self.approval['transport'] = 'ftp'
+        self.approval['transport'] = 'sftp'
         self.write_approval()
         self.refused('transport')
         self.approval['transport'] = 'ums'
@@ -559,6 +561,269 @@ class TestMountedCardTransaction(Base):
         card = module.UmsCard(module.Journal(self.tmp / 'j.json', {}), [], self.card)
         with self.assertRaises(module.Refused):
             card.check_mount()
+
+
+class TestFtpTransaction(Base):
+    WRITES = {'STOR', 'DELE', 'RNFR', 'RNTO', 'MKD'}
+
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location('fake_ftp', HERE / 'fake_ftp.py')
+        fake = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fake)
+        self.ftp = fake.FakeFtp(self.card)
+        self.addCleanup(self.ftp.stop)
+        self.module.URI = self.card.as_uri()
+        connect = socket.create_connection
+
+        def connect_loopback(address, *args, **kwargs):
+            self.assertEqual(address[0], '127.0.0.1', 'the FTP fixture uses loopback only')
+            return connect(address, *args, **kwargs)
+
+        patcher = mock.patch('socket.create_connection', side_effect=connect_loopback)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.root = f'ftp://127.0.0.1:{self.ftp.port}'
+        self.approval['transport'] = 'ftp'
+        self.write_approval()
+        self.backup = DATA + '/backups/pre-' + sha(self.NEW)[:16] + '.subsdk9'
+        self.stage = DATA + '/install/subsdk9-' + sha(self.NEW)[:16] + '.stage'
+
+    def main(self, mode, root=None):
+        out, err = io.StringIO(), io.StringIO()
+        args = [mode, str(self.dir), '--root', self.root if root is None else root]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.module.main(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def phase(self, mode, expect=0):
+        start = len(self.ftp.commands)
+        code, out, err = self.main(mode)
+        self.assertEqual(code, expect, f'{mode}: stdout={out}\nstderr={err}')
+        return self.ftp.commands[start:]
+
+    def assert_read_only(self, commands):
+        self.assertFalse(self.WRITES & {cmd for _, cmd, _ in commands})
+
+    def assert_two_reads(self, commands, path):
+        sessions = [sid for sid, cmd, arg in commands if cmd == 'RETR' and arg == '/' + path]
+        self.assertGreaterEqual(len(sessions), 2, path)
+        self.assertEqual(sessions, sorted(set(sessions)), path)
+
+    def test_success_preflight_install_verify_has_fresh_readbacks(self):
+        self.ftp.refuse_overwrite = False
+        self.ftp.support_size = True
+        before = self.tree()
+        pre = self.phase('preflight')
+        self.assert_read_only(pre)
+        self.assertEqual(self.tree(), before)
+        receipt = self.receipt('preflight.json')
+        self.assertEqual(receipt['state'], 'preflight_verified')
+        self.assertEqual(set(receipt['before']), set(before))
+        for relative, copied in receipt['before'].items():
+            self.assertEqual(sha(Path(copied['local']).read_bytes()), before[relative])
+            self.assert_two_reads(pre, relative)
+        self.assertTrue(all(not arg for _, cmd, arg in pre if cmd == 'NLST'))
+        for session in {sid for sid, _, _ in pre}:
+            commands = [(cmd, arg) for sid, cmd, arg in pre if sid == session]
+            self.assertEqual(commands[:3], [('USER', 'anonymous'), ('PASS', None), ('TYPE', 'I')])
+            if ('NLST', '') in commands:
+                self.assertIn('CWD', (cmd for cmd, _ in commands[:commands.index(('NLST', ''))]))
+        install = self.phase('install')
+        self.assertNotIn('DELE', [cmd for _, cmd, _ in install])
+        deployed = self.receipt('deployment.json')
+        self.assertEqual(deployed['state'], 'installed_verified')
+        self.assertTrue(deployed['stage_moved_into_place'])
+        self.assertFalse(deployed['stage_retained_outside_loader'])
+        self.assertEqual(deployed['exefs_names_after'], receipt['exefs_names_before'])
+        self.assertEqual(deployed['plugin_names_after'], receipt['plugin_names_before'])
+        after = before | {SUBSDK9: sha(self.NEW), self.backup: sha(self.OLD)}
+        self.assertEqual(self.tree(), after)
+        verify = self.phase('verify')
+        self.assert_read_only(verify)
+        for relative in before:
+            self.assert_two_reads(verify, relative)
+        self.assertEqual(self.receipt('verify.json')['state'], 'verified')
+        self.assertEqual(self.tree(), after)
+
+    def test_old_sha_mismatch_does_not_issue_any_card_write(self):
+        (self.card / SUBSDK9).write_bytes(blob('other-install', b'NSO0', len(self.OLD)))
+        before = self.tree()
+        self.assert_read_only(self.phase('preflight', expect=1))
+        self.assertIn('Unexpected installed build', self.receipt('preflight.json')['error'])
+        self.assert_read_only(self.phase('install', expect=1))
+        self.assertEqual(self.tree(), before)
+
+    def test_rename_over_existing_falls_back_only_after_verified_archive_and_stage(self):
+        self.phase('preflight')
+        install = self.phase('install')
+        writes = [(cmd, arg) for _, cmd, arg in install if cmd in self.WRITES and cmd != 'MKD']
+        self.assertEqual(writes, [
+            ('STOR', '/' + self.backup), ('STOR', '/' + self.stage),
+            ('RNFR', '/' + self.stage), ('RNTO', '/' + SUBSDK9),
+            ('DELE', '/' + SUBSDK9), ('RNFR', '/' + self.stage), ('RNTO', '/' + SUBSDK9),
+        ])
+        first_rename = next(i for i, (_, cmd, _) in enumerate(install) if cmd == 'RNFR')
+        self.assert_two_reads(install[:first_rename], self.backup)
+        self.assert_two_reads(install[:first_rename], self.stage)
+        self.assertEqual(self.tree()[self.backup], sha(self.OLD))
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.NEW))
+        self.assertNotIn(self.stage, self.tree())
+
+    def test_inconsistent_post_replace_reads_restore_and_verify_old(self):
+        self.phase('preflight')
+        target = self.card / SUBSDK9
+        corrupted = []
+
+        def read(path):
+            data = path.read_bytes()
+            if path == target and data == self.NEW and not corrupted:
+                corrupted.append(True)
+                return b'!' + data[1:]
+            return data
+
+        self.ftp.read = read
+        install = self.phase('install', expect=1)
+        self.assertTrue(corrupted)
+        receipt = self.receipt('deployment.json')
+        self.assertEqual(receipt['state'], 'rolled_back_verified')
+        self.assertIn('FTP readback mismatch', receipt['error'])
+        self.assertEqual(receipt['rollback_readback_after_failure']['sha256'], sha(self.OLD))
+        restore = next(i for i, (_, cmd, arg) in enumerate(install) if (cmd, arg) == ('STOR', '/' + SUBSDK9))
+        self.assert_two_reads(install[restore + 1:], SUBSDK9)
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+        self.assertEqual(self.tree()[self.backup], sha(self.OLD))
+
+    def test_wrong_backup_readback_refuses_before_target_operation(self):
+        self.phase('preflight')
+        archive = self.card / self.backup
+        self.ftp.read = lambda path: b'!' + path.read_bytes()[1:] if path == archive else path.read_bytes()
+        install = self.phase('install', expect=1)
+        receipt = self.receipt('deployment.json')
+        self.assertEqual(receipt['state'], 'failed')
+        self.assertIn('Rollback archive readback mismatch', receipt['error'])
+        self.assertFalse({'DELE', 'RNFR', 'RNTO'} & {cmd for _, cmd, _ in install})
+        self.assertNotIn(self.stage, self.tree())
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+
+    def test_denied_second_rename_after_delete_restores_and_verifies(self):
+        self.phase('preflight')
+        target = self.card / SUBSDK9
+        rejected = []
+
+        def refuse_second(cmd, path):
+            if (cmd, path) == ('RNTO', '/' + SUBSDK9) and not target.exists():
+                rejected.append(True)
+                return '451 injected rename failure after delete'
+            return None
+
+        self.ftp.reply = refuse_second
+        install = self.phase('install', expect=1)
+        self.assertTrue(rejected)
+        self.assertEqual([arg for _, cmd, arg in install if cmd == 'DELE'], ['/' + SUBSDK9])
+        receipt = self.receipt('deployment.json')
+        self.assertEqual(receipt['state'], 'rolled_back_verified')
+        self.assertEqual(receipt['rollback_readback_after_failure']['sha256'], sha(self.OLD))
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+        self.assertEqual(self.tree()[self.backup], sha(self.OLD))
+
+    def test_failed_rnfr_never_enters_delete_fallback(self):
+        self.phase('preflight')
+        self.ftp.reply = lambda cmd, path: '550 not found' if cmd == 'RNFR' else None
+        install = self.phase('install', expect=1)
+        self.assertFalse({'DELE', 'RNTO'} & {cmd for _, cmd, _ in install})
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+
+    def test_unrelated_rnto_refusal_never_deletes(self):
+        self.phase('preflight')
+        self.ftp.reply = lambda cmd, path: '550 permission denied' if cmd == 'RNTO' else None
+        install = self.phase('install', expect=1)
+        self.assertNotIn('DELE', [cmd for _, cmd, _ in install])
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+
+    def test_receipts_refuse_reruns_before_any_session(self):
+        for mode in ('preflight', 'install', 'verify'):
+            self.phase(mode)
+        snapshot = {name: (self.dir / name).read_bytes() for name in ('preflight.json', 'deployment.json', 'verify.json')}
+        sessions = self.ftp.sessions
+        for mode in ('preflight', 'install', 'verify'):
+            code, _, err = self.main(mode)
+            self.assertEqual(code, 1)
+            self.assertIn('Preserve completed/failed evidence', err)
+        self.assertEqual(self.ftp.sessions, sessions)
+        self.assertEqual(snapshot, {name: (self.dir / name).read_bytes() for name in snapshot})
+
+    def test_changed_plugin_size_stops_before_archive_or_stage(self):
+        self.phase('preflight')
+        (self.card / PLUGINS / PLUGIN_NAMES[0]).write_bytes(b'other size')
+        self.assert_read_only(self.phase('install', expect=1))
+        self.assertIn('Changed since preflight', self.receipt('deployment.json')['error'])
+
+    def test_nro_named_directory_is_rejected(self):
+        (self.card / PLUGINS / 'bogus.nro').mkdir()
+        self.assert_read_only(self.phase('preflight', expect=1))
+        self.assertIn('plugin folder holds more than NROs', self.receipt('preflight.json')['error'])
+
+    def test_unapproved_install_opens_no_ftp_session(self):
+        self.approval['operator_install_authorized'] = False
+        self.write_approval()
+        self.phase('preflight')
+        sessions = self.ftp.sessions
+        code, _, err = self.main('install')
+        self.assertEqual(code, 1)
+        self.assertIn('operator_install_authorized', err)
+        self.assertEqual(self.ftp.sessions, sessions)
+        self.assertFalse((self.dir / 'deployment.json').exists())
+
+    def test_restore_write_refusal_keeps_verified_archive_for_recovery(self):
+        self.phase('preflight')
+        target = self.card / SUBSDK9
+
+        def refuse(cmd, path):
+            if (cmd, path) == ('RNTO', '/' + SUBSDK9) and not target.exists():
+                return '451 injected rename failure after delete'
+            if (cmd, path) == ('STOR', '/' + SUBSDK9):
+                return '550 injected restore refusal'
+            return None
+
+        self.ftp.reply = refuse
+        self.phase('install', expect=1)
+        receipt = self.receipt('deployment.json')
+        self.assertEqual(receipt['state'], 'recovery_required')
+        self.assertIn('injected restore refusal', receipt['rollback_error'])
+        self.assertEqual(self.tree()[self.backup], sha(self.OLD))
+        self.assertEqual(sha(Path(receipt['before'][SUBSDK9]['local']).read_bytes()), sha(self.OLD))
+
+    def test_endpoint_is_bound_to_preflight(self):
+        self.phase('preflight')
+        # Both URLs name this test server. A changed endpoint must not authorize write.
+        alternate = self.root.replace('127.0.0.1', 'localhost')
+        code, _, err = self.main('install', root=alternate)
+        self.assertEqual(code, 1, err)
+        self.assertIn('approval changed since preflight', self.receipt('deployment.json')['error'])
+        self.assertEqual(self.tree()[SUBSDK9], sha(self.OLD))
+        self.assertNotIn(self.backup, self.tree())
+
+    def test_verify_mismatch_is_read_only(self):
+        self.phase('preflight')
+        self.phase('install')
+        (self.card / PLUGINS / PLUGIN_NAMES[0]).write_bytes(blob('other plugin', b'\0' * 16 + b'NRO0', 6000))
+        before_verify = self.tree()
+        verify = self.phase('verify', expect=1)
+        self.assert_read_only(verify)
+        self.assertIn('readback does not match the install', self.receipt('verify.json')['error'])
+        self.assertEqual(self.tree(), before_verify)
+
+    def test_missing_or_invalid_ftp_root_never_connects(self):
+        bad_roots = ('', 'ftp://127.0.0.1', 'http://127.0.0.1:1234', self.root + '/sd',
+                     self.root.replace('ftp://', 'ftp://user@'), self.root + '?card=1')
+        with mock.patch('socket.create_connection', side_effect=AssertionError('unexpected connection')):
+            for root in bad_roots:
+                with self.subTest(root=root):
+                    code, _, err = self.main('preflight', root=root)
+                    self.assertEqual(code, 1, err)
+                    self.assertIn('FTP root', err)
+        self.assertFalse((self.dir / 'preflight.json').exists())
 
 
 class TestToolRules(unittest.TestCase):

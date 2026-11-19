@@ -9,7 +9,8 @@ this tool exists for the two files they refuse:
 One transaction replaces one file; run it twice for both. It never mounts, unmounts
 or ejects anything and never starts or stops DBI or hekate UMS: the user connects
 and disconnects the Switch (playbook WORKFLOW, Switch) and exposes the card, over
-DBI MTP (default) or as a mounted USB disk ("transport": "ums").
+DBI MTP (default), DBI FTP ("transport": "ftp"), or a mounted USB disk
+("transport": "ums"). For FTP add --root ftp://<host>:<port> to every phase.
 
   python3 -I replace-exefs.py preflight <dir>   # read-only: list, keep local copies, check `old`
   python3 -I replace-exefs.py install   <dir>   # rollback copy, stage, replace, read everything back
@@ -21,7 +22,7 @@ operator-approval.json:
   operator_order, operator_install_authorized (install only), target (one of the two
   paths above), data (the folder for the rollback copy and the stage, `ultimate/<name>`;
   not exefs/ and not the plugin folder), old and new (sha256), and optionally
-  transport ("mtp" | "ums"), mount (ums: the card's mount point) and extra_protected
+  transport ("mtp" | "ums" | "ftp"), mount (ums: the card's mount point) and extra_protected
   (card files `ultimate/<folder>/<file>` that are read before and after like the
   protected configs, for example the Training Modpack's save_states.json).
 
@@ -38,9 +39,11 @@ verify.json); a phase whose receipt exists is not run again: inspect it first.
 
 Tests drive main() in a process with URI and GIO pointed at a local `file://` tree
 (tools/switch/tests/); the script itself reads no environment switch for that."""
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
 import fcntl
+import ftplib
 import hashlib
 import json
 import mmap
@@ -53,7 +56,7 @@ import subprocess
 import sys
 import time
 import traceback
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 URI = 'mtp://-_DBI_XAW10006803734/1%3A%20SD%20Card'
 GIO = '/usr/bin/gio'
@@ -375,9 +378,178 @@ class UmsCard(Card):
         receipt['all_operations_closed'] = all('finished' in entry for entry in self.commands)
 
 
+class FtpCard(Card):
+    """DBI FTP with fresh anonymous sessions and verified binary readbacks.
+
+    The operation pattern follows ssbu-switch-remote/tools/card/own_install.py
+    (MIT). The shared transaction owns all authorization and rollback ordering.
+    """
+    description = 'DBI FTP'
+    closing = 'Done. The FTP sessions are closed. Close DBI when you are ready.'
+
+    @staticmethod
+    def endpoint(root):
+        require(isinstance(root, str) and root.startswith('ftp://')
+                and not any(c.isspace() or c in '?#' or ord(c) < 32 or ord(c) == 127 for c in root),
+                'FTP root must be ftp://<host>:<port>')
+        try:
+            url = urlsplit(root)
+            host, port = url.hostname, url.port
+        except ValueError as error:
+            raise Refused('FTP root must be ftp://<host>:<port>') from error
+        require(host and port and url.username is None and url.password is None and url.path in ('', '/'),
+                'FTP root must be ftp://<host>:<port>')
+        return host, port
+
+    def __init__(self, journal, commands, host, port):
+        super().__init__(journal, commands)
+        self.host, self.port = host, port
+
+    @contextmanager
+    def operation(self, name, *args):
+        entry = {'op': name, 'args': list(args), 'started': now()}
+        self.commands.append(entry)
+        ftp = ftplib.FTP()
+        try:
+            ftp.connect(self.host, self.port, timeout=min(30, self.left()))
+            ftp.login()
+            ftp.voidcmd('TYPE I')
+            yield ftp
+            entry['ok'] = True
+            try:
+                ftp.quit()
+            except ftplib.all_errors as error:
+                entry['quit_error'] = repr(error)
+        except BaseException as error:
+            entry.update(ok=False, error=repr(error))
+            raise
+        finally:
+            ftp.close()
+            entry['finished'] = now()
+            self.journal.save()
+
+    def names(self, ftp, folder, missing_ok=False):
+        try:
+            ftp.cwd('/' + folder)
+        except ftplib.error_perm as error:
+            if not missing_ok or not folder or not str(error).startswith('550 '):
+                raise
+            parent, _, name = folder.rpartition('/')
+            names = self.names(ftp, parent, missing_ok=True)
+            if names is None or name not in names:
+                return None
+            raise
+        # DBI ignores an NLST argument and returns absolute paths.
+        prefix = '/' + (folder + '/' if folder else '')
+        result = set()
+        for line in ftp.nlst():
+            line = line.rstrip('/')
+            name = line.removeprefix(prefix)
+            require(name not in ('', '.', '..') and '/' not in name and name not in result,
+                    f'odd or duplicate FTP name in {folder}: {line!r}')
+            result.add(name)
+        return result
+
+    def exists(self, relative):
+        parent, _, name = relative.rpartition('/')
+        with self.operation('exists', relative) as ftp:
+            names = self.names(ftp, parent, missing_ok=True)
+            return names is not None and name in names
+
+    def mkdir_p(self, relative):
+        with self.operation('mkdir', relative) as ftp:
+            parent = ''
+            for name in relative.split('/'):
+                names = self.names(ftp, parent)
+                path = parent + '/' + name if parent else name
+                if name not in names:
+                    ftp.mkd('/' + path)
+                parent = path
+
+    def metadata(self, relative):
+        with self.operation('stat', relative) as ftp:
+            path = '/' + relative
+            try:
+                ftp.cwd(path)
+            except ftplib.error_perm as error:
+                if not str(error).startswith('550 '):
+                    raise
+            else:
+                return {'size': -1, 'kind': '(directory)'}
+            try:
+                size = ftp.size(path)
+            except ftplib.error_perm as error:
+                if str(error)[:3] not in ('500', '501', '502', '504', '550'):
+                    raise
+                size = None
+        # On DBI variants without SIZE, verify the file and measure its length
+        # using the same binary reads used for the copies.
+        if size is None:
+            size = len(self.checked_read(relative))
+        require(0 <= size <= MAX_BYTES, f'{relative}: invalid FTP file size {size}')
+        return {'size': size, 'kind': REGULAR}
+
+    def listing(self, relative):
+        with self.operation('list', relative) as ftp:
+            names = self.names(ftp, relative)
+        return {name: self.metadata(relative + '/' + name) for name in sorted(names)}
+
+    def read(self, relative):
+        data = bytearray()
+
+        def append(block):
+            self.left()
+            require(len(data) + len(block) <= MAX_BYTES, f'{relative}: FTP file exceeds {MAX_BYTES} bytes')
+            data.extend(block)
+
+        with self.operation('copy-from-card', relative) as ftp:
+            ftp.retrbinary('RETR /' + relative, append, blocksize=65536)
+            self.commands[-1].update(sha256=sha(data), bytes=len(data))
+        return data
+
+    def checked_read(self, relative):
+        data = self.read(relative)
+        require(sha(data) == sha(self.read(relative)), f'{relative}: FTP readback mismatch between connections')
+        return data
+
+    def fetch(self, relative, destination):
+        Path(destination).write_bytes(self.checked_read(relative))
+
+    def store(self, local, relative):
+        with self.operation('copy-to-card', relative) as ftp, open(local, 'rb') as source:
+            ftp.storbinary('STOR /' + relative, source, blocksize=65536, callback=lambda _: self.left())
+
+    def rename(self, stage, target, allow_exists=False):
+        with self.operation('rename-on-card', stage, target) as ftp:
+            reply = ftp.sendcmd('RNFR /' + stage)
+            require(reply.startswith('350 '), f'FTP did not accept rename source: {reply}')
+            try:
+                ftp.voidcmd('RNTO /' + target)
+            except ftplib.error_perm as error:
+                if not (allow_exists and str(error).startswith('550 ')
+                        and re.search(r'\b(?:file|destination)(?: already)? exists\b', str(error), re.I)):
+                    raise
+                self.commands[-1]['overwrite_refused'] = str(error)
+                return False
+        return True
+
+    def replace(self, staged_local, stage_relative, target_relative):
+        if self.rename(stage_relative, target_relative, allow_exists=True):
+            return
+        # Only the verified install reaches here, after backup and stage
+        # readback, with shared rollback armed even if the next rename fails.
+        with self.operation('delete-for-rename', target_relative) as ftp:
+            ftp.delete('/' + target_relative)
+        self.rename(stage_relative, target_relative)
+
+    def finish(self, receipt):
+        receipt['all_operations_closed'] = all('finished' in entry for entry in self.commands)
+
+
 class Transaction:
-    def __init__(self, mode, out):
+    def __init__(self, mode, out, root=None):
         self.mode, self.out = mode, out
+        self.root = root
         self.receipt_path = out / RECEIPTS[mode]
         require(not self.receipt_path.exists(), 'Preserve completed/failed evidence; inspect before a new operation')
         self.lock = (out / '.transaction.lock').open('a')
@@ -404,7 +576,8 @@ class Transaction:
         require(all(SHA256.fullmatch(h) for h in (self.old, self.new)) and self.old != self.new,
                 'old and new must be two different lower-case sha256 values')
         self.transport = approval.get('transport', 'mtp')
-        require(self.transport in ('mtp', 'ums'), f'transport {self.transport!r} is not mtp or ums')
+        require(self.transport in ('mtp', 'ums', 'ftp'), f'transport {self.transport!r} is not mtp, ums or ftp')
+        require(self.root is None or self.transport == 'ftp', '--root is only for FTP')
         self.extra = approval.get('extra_protected', [])
         require(isinstance(self.extra, list) and all(isinstance(p, str) and EXTRA.fullmatch(p) and p not in PROTECTED
                                                       and p.rsplit('/', 1)[1] not in ('.', '..') for p in self.extra)
@@ -416,6 +589,10 @@ class Transaction:
             require(isinstance(approval.get('mount'), str) and approval['mount'].startswith('/'),
                     'transport ums needs the card mount point in "mount"')
             self.summary['mount'] = approval['mount']
+        if self.transport == 'ftp':
+            host, port = FtpCard.endpoint(self.root)
+            authority = f'[{host}]' if ':' in host else host
+            self.summary['root'] = f'ftp://{authority}:{port}'
         self.backup = self.data + f'/backups/pre-{self.new[:16]}.{self.name}'
         self.stage = self.data + f'/install/{self.name}-{self.new[:16]}.stage'
         source_path = self.out / self.name
@@ -435,8 +612,10 @@ class Transaction:
         self.journal = Journal(self.receipt_path, self.receipt)
         if self.transport == 'mtp':
             self.card = MtpCard(self.journal, self.commands)
-        else:
+        elif self.transport == 'ums':
             self.card = UmsCard(self.journal, self.commands, self.summary['mount'])
+        else:
+            self.card = FtpCard(self.journal, self.commands, host, port)
         self.receipt.update(transport=self.card.description, **self.card.identity())
         self.receipt['commands'] = self.commands
         self.replaced = False
@@ -534,7 +713,7 @@ class Transaction:
         receipt['exefs_names_after'], receipt['plugin_names_after'] = sorted(exefs), sorted(plugins)
         require(receipt['exefs_names_after'] == preflight['exefs_names_before'], 'exefs/ lists other names after the install')
         require(receipt['plugin_names_after'] == preflight['plugin_names_before'], 'the plugin folder lists other names after the install')
-        receipt.update(other_files_unchanged=True, finished=now(), stage_moved_into_place=self.transport == 'ums',
+        receipt.update(other_files_unchanged=True, finished=now(), stage_moved_into_place=self.transport in ('ums', 'ftp'),
                        stage_retained_outside_loader=self.transport == 'mtp')
         self.state('installed_verified')
 
@@ -619,15 +798,17 @@ class Transaction:
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
-    if len(argv) != 2 or argv[0] not in RECEIPTS:
-        print('usage: replace-exefs.py preflight|install|verify <dir>', file=sys.stderr)
+    if (len(argv) not in (2, 4) or argv[0] not in RECEIPTS
+            or (len(argv) == 4 and argv[2] != '--root')):
+        print('usage: replace-exefs.py preflight|install|verify <dir> [--root ftp://<host>:<port>]', file=sys.stderr)
         return 2
+    root = argv[3] if len(argv) == 4 else None
     out = Path(argv[1]).resolve()
     if not out.is_dir():
         print(f'{out} is not a directory', file=sys.stderr)
         return 2
     try:
-        transaction = Transaction(argv[0], out)
+        transaction = Transaction(argv[0], out, root)
     except BlockingIOError:
         print(f'refused: another transaction holds the lock in {out}', file=sys.stderr)
         return 1
