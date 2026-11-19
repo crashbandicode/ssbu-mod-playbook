@@ -230,8 +230,8 @@ instance differs, and every input is a macro (no manual presses).
   - `pick_stage`, `pick_fighters` and `routes_online:ldn_pick_fighter` use the
     shared state-backed picker when the bridge supplies the native state.
     CSS form defaults to `default` and SSS form defaults to `normal`.
-  - A `topology` argument points at an independently qualified JSON capture for
-    the active layout. It contains `layout` (the exact live fingerprint),
+  - A `topology` argument pins an independently qualified JSON capture with
+    its `path` and `sha256`. The capture contains `layout` (the exact live fingerprint),
     `neighbors` (tile-to-direction-to-tile mappings) and `targets` (tile keys
     mapped to exact `kind`, `name` and `form`). Use decimal string tile keys
     and `none` as a source only for a verified position below the grid.

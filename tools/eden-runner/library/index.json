@@ -154,15 +154,6 @@
       "from_run": "p4r-shared",
       "row": "nav05-host-css"
     },
-    "host-fighter": {
-      "file": "segments/host-fighter.edenmacro.json",
-      "sha256": "bb02c4fb326e0e2249d4a9d3775d2847d6524b191df975d210d0f1096d92e68d",
-      "cap": 60,
-      "start_gate": "css",
-      "end_gate": "css-hovered",
-      "from_run": "p4r-shared",
-      "row": "nav06-host-waiting"
-    },
     "select-room": {
       "file": "segments/select-room.edenmacro.json",
       "sha256": "322708f02ad1091f044ea81ddddd712877852f4188b9f754d1f1d75b758ff9e0",
@@ -171,24 +162,6 @@
       "end_gate": "room-list",
       "from_run": "p4r-shared",
       "row": "nav06-host-waiting"
-    },
-    "guest-request": {
-      "file": "segments/guest-request.edenmacro.json",
-      "sha256": "39a0349eaf802c1b5fb321ac385793cea4537b11f50e3d47f6465559211ad51e",
-      "cap": 30,
-      "start_gate": "room-list",
-      "end_gate": "css",
-      "from_run": "p4r-shared",
-      "row": "01-online-prompt"
-    },
-    "host-approval": {
-      "file": "segments/host-approval.edenmacro.json",
-      "sha256": "bc55b896a6ed644c3337218f2f282fd2a5a990b0c52a81b6a0127777e9a64f0b",
-      "cap": 30,
-      "start_gate": "prompt",
-      "end_gate": "waiting",
-      "from_run": "p4r-shared",
-      "row": "01-online-prompt"
     },
     "native-down-b": {
       "file": "segments/native-down-b.edenmacro.json",
@@ -261,15 +234,6 @@
       "end_gate": "waiting",
       "from_run": "p4r-shared",
       "row": "06-waiting-reopen-retirement"
-    },
-    "peer-fighter": {
-      "file": "segments/peer-fighter.edenmacro.json",
-      "sha256": "084358f3b8b9741a80b142b4bce30680be8d05626d05c95514aef897b3ca0889",
-      "cap": 60,
-      "start_gate": "css",
-      "end_gate": "waiting",
-      "from_run": "p4r-shared",
-      "row": "07a-online-end-victory"
     },
     "ready-start": {
       "file": "segments/ready-start.edenmacro.json",

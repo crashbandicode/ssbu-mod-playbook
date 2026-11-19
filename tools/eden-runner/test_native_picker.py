@@ -150,6 +150,39 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(replay.actions, ['tap-a1'])
 
 
+    def test_stage_confirmation_requires_native_transition(self):
+        def stage_tile(rev):
+            return snapshot('tile.cursor', rev, {
+                'screen': 'sss', 'layout': 'stage-layout', 'generation': '3',
+                'controller': '0', 'seat': '0', 'carried': 'none',
+                'local.token': 'none', 'at': '8', 'hovered': '8', 'settled': '1',
+                'kind': '308', 'name': 'Training', 'form': 'normal', 'settled.ack': '0',
+                'ack': '0', 'applied': '0', 'focus': 'sss/8',
+            })
+
+        def stage_ui(rev):
+            return snapshot('ssbu.ui', rev, {'screen': 'stage_select', 'input.owner': 'native',
+                            'focus.source': 'tile.cursor', 'focus': 'stage_select/8'})
+
+        target = picker.Target('308', 'Training', 'normal')
+        replay = Replay([stage_tile(1), stage_tile(2)],
+                        [stage_ui(1), stage_ui(2), native(3, focus='css.smash/ready')])
+        result = picker.pick(replay, 'sss', target, next_screen='css.smash', cap=.1)
+        self.assertEqual(replay.actions, ['tap-a1'])
+        self.assertEqual(result['screen'], 'css.smash')
+
+        replay = Replay([stage_tile(1), stage_tile(2)],
+                        [stage_ui(1), stage_ui(2), native(3, screen='rules', focus='rules')])
+        with self.assertRaisesRegex(RuntimeError, 'unexpected native screen'):
+            picker.pick(replay, 'sss', target, next_screen='css.smash', cap=.1)
+        self.assertEqual(replay.actions, ['tap-a1'])
+
+    def test_remote_token_is_never_placed(self):
+        replay = Replay([tile(1, at='16', target=TARGET, seat='1', token='unknown')])
+        with self.assertRaisesRegex(RuntimeError, 'token ownership'):
+            self.run_pick(replay)
+        self.assertEqual(replay.actions, [])
+
 class JoinTests(unittest.TestCase):
     boot = '0x0000000000000001'
     bssid = 'eeddccbbaa99'
@@ -185,6 +218,20 @@ class JoinTests(unittest.TestCase):
         picker.verify_room_selection(current, (self.bssid, self.session), '17')
         self.assert_no_join(current, 'release trace')
 
+
+    def test_local_wireless_route_and_raw_library_entry_are_closed(self):
+        from types import SimpleNamespace
+
+        import routes
+        import routes_online
+
+        calls = []
+        with self.assertRaisesRegex(RuntimeError, 'release trace'):
+            routes_online.ldn_join(SimpleNamespace(call=calls.append))
+        self.assertEqual(calls, [])
+        for name in ('guest-request', 'host-approval', 'host-fighter', 'peer-fighter'):
+            with self.subTest(name=name), self.assertRaises(KeyError):
+                routes.macro_file(name)
 
 class BridgeFramingTests(unittest.TestCase):
     def test_fresh_query_requires_full_block_after_reply_fence(self):
@@ -243,4 +290,3 @@ class BridgeFramingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

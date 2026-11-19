@@ -1061,11 +1061,11 @@ def read_state(ctx, cap=6.0):
         cursor.close()
 
 
-def enter_training(ctx, cap=90):
+def enter_training(ctx, cap=90, *, stage_ids=None):
     """CSS ready -> Training (Plus), proven by the game: fresh state lines for both bodies, then the HUD gate.
     A fresh profile's fighter tip is closed with A while the HUD gate fails (remaining-2 boot_training)."""
     if _use_native_pick(ctx):
-        return _native_enter_training(ctx, cap)
+        return _native_enter_training(ctx, cap, stage_ids)
     stage_cursor = LogCursor(instance_path(ctx, 'diag_log'))
     play(ctx, 'enter-training')
     until = time.monotonic() + cap
@@ -1487,7 +1487,7 @@ def _wait_native_focus(io, before, criteria, cap=45):
             raise RuntimeError(f'unexpected native focus {state.values["focus"]!r}')
 
 
-def _native_enter_training(ctx, cap):
+def _native_enter_training(ctx, cap, stage_ids):
     io = BridgePickerIO(ctx)
     until = time.monotonic() + 5
     ui = native_picker.wait_sample(io, native_picker.UI, until)
@@ -1505,19 +1505,27 @@ def _native_enter_training(ctx, cap):
     io.send('enter-training')
     after = _wait_native_focus(io, ui, {'screen': 'training', 'input.owner': 'native'}, cap)
     stage_id = expected(ctx).get('stage_id')
-    actual_stage = native_state(ctx).get('stage')
-    if stage_id is not None and actual_stage != stage_id:
-        raise RuntimeError(f'Training loaded stage {actual_stage!r}; expected native kind {stage_id}')
+    if stage_ids is None and stage_id is not None:
+        stage_ids = {stage_id}
+    # A fresh body sample confirms the live Training frame ran its stage observation.
+    actual_stage = native_state(ctx, ('pos',)).get('stage')
+    if stage_ids is not None and actual_stage not in stage_ids:
+        raise RuntimeError(f'Training loaded stage {actual_stage!r}; expected one of {sorted(stage_ids)}')
     return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage})
 
 def _use_native_pick(ctx):
     return on_switch(ctx) or bool(ctx.instance.get('bridge_log'))
 
 
-def _tile_topology(path):
-    if path is None:
+def _tile_topology(pin):
+    if pin is None:
         return None
-    data = json.loads(Path(path).read_text())
+    if not isinstance(pin, dict) or set(pin) != {'path', 'sha256'}:
+        raise RuntimeError('native tile topology needs a path and SHA-256 pin')
+    artifact = Path(pin['path']).read_bytes()
+    if hashlib.sha256(artifact).hexdigest() != pin['sha256']:
+        raise RuntimeError('native tile topology SHA-256 changed')
+    data = json.loads(artifact)
     return native_picker.Topology(data['layout'], data['neighbors'],
                                   {index: native_picker.Target(**identity)
                                    for index, identity in data['targets'].items()})
@@ -1584,31 +1592,33 @@ def pick_local_fighter(ctx, fighter, *, topology=None, form='default', take_back
     return _finish_native_pick(ctx, io, 'css', prepared, entry, None, 60)
 
 
+def ensure_local_fighter_placed(ctx, fighter=None, *, topology=None):
+    """Verify a retained local medal or confirm the settled native choice."""
+    if fighter is not None:
+        return pick_local_fighter(ctx, fighter, topology=topology, take_back=True)
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + 5
+    ui = native_picker.wait_sample(io, native_picker.UI, until)
+    native_picker.native_owner(ui, 'css')
+    current = native_picker.wait_sample(io, native_picker.TILE, until)
+    native_picker.same_epoch(ui, current, in_flight=True)
+    native_picker.context(current, 'css')
+    if current.values.get('local.token') == 'placed' and current.values.get('carried') == 'none':
+        native_picker.number(current, 'placed.at')
+        identity = native_picker.Target.read(current, 'placed.')
+        return {'name': identity.name, 'kind': identity.kind, 'form': identity.form, 'placed': True}
+    prepared = native_picker.hover(io, 'css', None)
+    return native_picker.confirm(io, 'css', prepared)
+
 def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=None):
     """Games & More → Training through state-checked stage selection and local placement."""
     _need_switch(ctx, 'switch_to_training')
     out = {'stage': main_to_stage(ctx)}
     pick_stage_hw(ctx, 'Training', topology=stage_topology)
     confirm_pick(ctx, 'Training')
-    if p1 is not None:
-        out['fighter'] = pick_local_fighter(ctx, p1, topology=fighter_topology)
-    else:
-        # A retained, settled local medal can be reused. An off-grid hand
-        # needs an explicit target and qualified entry topology.
-        io = BridgePickerIO(ctx)
-        until = time.monotonic() + 5
-        ui = native_picker.wait_sample(io, native_picker.UI, until)
-        native_picker.native_owner(ui, 'css')
-        current = native_picker.wait_sample(io, native_picker.TILE, until)
-        native_picker.same_epoch(ui, current, in_flight=True)
-        native_picker.context(current, 'css')
-        if current.values.get('local.token') == 'placed' and current.values.get('carried') == 'none':
-            native_picker.number(current, 'placed.at')
-            identity = native_picker.Target.read(current, 'placed.')
-            out['fighter'] = {'name': identity.name, 'kind': identity.kind, 'form': identity.form, 'placed': True}
-        else:
-            prepared = native_picker.hover(io, 'css', None)
-            out['fighter'] = native_picker.confirm(io, 'css', prepared)
+    out['fighter'] = ensure_local_fighter_placed(
+        ctx, p1 or ctx.instance.get('native_training_fighter'),
+        topology=fighter_topology or ctx.instance.get('native_css_topology'))
     out['training'] = enter_training(ctx)
     out['preload'] = preload_clear(ctx)
     return _save(ctx, 'routes-switch-training', out)
