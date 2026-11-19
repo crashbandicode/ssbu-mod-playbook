@@ -1509,7 +1509,10 @@ def _native_enter_training(ctx, cap, stage_ids):
     return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage})
 
 def _use_native_pick(ctx):
-    return on_switch(ctx) or bool(ctx.instance.get('bridge_log'))
+    if on_switch(ctx):
+        return True
+    bridge_log = ctx.instance.get('bridge_log')
+    return isinstance(bridge_log, str) and bool(bridge_log)
 
 
 def _tile_topology(pin):
