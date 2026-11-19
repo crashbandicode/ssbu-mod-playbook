@@ -21,6 +21,8 @@ SUFFIX = re.compile(r'(?: ev=\d+)? frame=\d+ wall=\d+$')
 BEGIN = re.compile(r'\[Bridge\] state begin name=(\S+) schema=(\S+) rev=(\d+) boot=(\S+) lines=(\d+) filtered=([01])')
 LINE = re.compile(r'\[Bridge\] state\.(\d+)(?:\.part=(\d+)/(\d+))? (.*)$')
 END = re.compile(r'\[Bridge\] state end name=(\S+) rev=(\d+) crc=([0-9a-f]{8})')
+# A connection boundary: a block open across it is torn, whatever follows.
+BOUNDARY = re.compile(r'\[Bridge\] hello |\[Adapter\] (bridge connected|reconnect|connection idle)')
 
 
 def unquote(value):
@@ -43,6 +45,9 @@ def blocks(text, provider):
     out, cur = [], None
     for raw in text.splitlines():
         line = SUFFIX.sub('', raw)
+        if BOUNDARY.search(line):
+            cur = None
+            continue
         m = BEGIN.search(line)
         if m:
             cur = None
@@ -90,8 +95,19 @@ def latest(text, provider):
     return found[-1] if found else None
 
 
-def satisfies(block, where, baseline=None, transition=None, ack=None):
-    """(passes, why) for `block` against the gate's predicates and its baseline."""
+def satisfies(block, where, baseline=None, transition=None, ack=None, input_gate=None):
+    """(passes, why) for `block`.
+
+    A plain assertion (no transition, no ack) checks `where` on a complete block. An input gate (`transition`
+    "focus" or `ack`, or `input_gate=True`) needs this step's pre-input `baseline` and a newer block from the same boot
+    and schema, and either the expected focus transition (focus present and different from the baseline's) or exactly
+    one handled ack; a where-only match or a bare revision change (a notice) never passes it."""
+    input_gate = bool(input_gate or transition or ack is not None)
+    if input_gate:
+        if baseline is None:
+            return False, 'an input gate needs this step\'s pre-input baseline'
+        if transition is None and ack is None:
+            return False, 'an input gate needs "transition": "focus" or "ack": 1'
     if baseline is not None:
         if block['boot'] != baseline['boot']:
             return False, f'boot {block["boot"]} != baseline {baseline["boot"]}'
@@ -106,11 +122,12 @@ def satisfies(block, where, baseline=None, transition=None, ack=None):
         if values[key] != str(want):
             return False, f'{key}={values[key]!r} wants {want!r}'
     if transition == 'focus':
-        if baseline is None or values.get('focus') == baseline['values'].get('focus'):
+        now, was = values.get('focus'), baseline['values'].get('focus')
+        if now is None:
+            return False, 'focus missing from the new block'
+        if now == was:
             return False, 'focus did not change'
     if ack is not None:
-        if baseline is None:
-            return False, 'ack needs a baseline'
         try:
             advanced = int(values.get('ack', '')) - int(baseline['values'].get('ack', ''))
         except ValueError:

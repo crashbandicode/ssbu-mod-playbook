@@ -255,7 +255,7 @@ class BridgeMirror:
 
 
 def capture_bridge(run, host, port, console, stop=None, connect=socket.create_connection, retry_s=0.5,
-                   heartbeat_s=2.0, idle_s=6.0):
+                   heartbeat_s=2.0, idle_s=6.0, max_backoff_s=5.0):
     """Hold the bridge's socket (reconnecting): its lines to bridge.log and the console log, the spool's requests out."""
     run = Path(run)
     spool = run / 'bridge'
@@ -275,11 +275,13 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
         # sent, and after a reconnect `since <cursor>` replays what was missed (or answers `result=gap`). A request
         # whose answer was lost is never sent again by the capture: the row's gate re-reads state instead.
         link = {'boot': None, 'cursor': 0, 'connects': 0}
+        backoff = retry_s  # capped doubling 0.5 -> 5 s between attempts, reset by a hello
         while not (stop and stop()):
             try:
                 sock = connect((host, port), timeout=3)
             except OSError:
-                time.sleep(retry_s)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff_s)
                 continue
             sock.settimeout(0.1)
             pending = b''
@@ -291,8 +293,7 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             try:
                 # The fixture backup (D-Q12) comes first: the bridge refuses fixture requests until it is open.
                 sock.sendall(b'backup\nfile settings.json\n')  # the bridge greets each new client by itself
-                resume = b'events on\n' + (b'since %d\n' % link['cursor'] if link['cursor'] else b'')
-                sock.sendall(resume)
+                link['resumed'] = False  # `events on` + `since` wait for this connection's hello (link_line)
                 while not (stop and stop()):
                     for request in mirror.wanted + spool_requests(spool):
                         sock.sendall(request + b'\n')
@@ -321,6 +322,9 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                         if note:
                             blog.write(note + b'\n')
                             blog.flush()
+                        if link.get('resume') is not None:
+                            sock.sendall(link.pop('resume'))
+                            backoff = retry_s
                         try:
                             mirror.line(raw)
                         except (OSError, ValueError) as error:  # one bad line never stops the capture
@@ -338,7 +342,9 @@ EV = re.compile(rb' ev=(\d+) frame=')
 
 
 def link_line(link, raw):
-    """Track the boot and the confirmed event cursor; returns an `[Adapter]` note for a reconnect, else None."""
+    """Track the boot and the confirmed event cursor. On a hello it queues `link['resume']` for this connection:
+    `events on`, then for the same boot `since <last confirmed cursor>` (zero included); a new boot resets the cursor.
+    Returns an `[Adapter]` note for the hello, else None."""
     m = EV.search(raw)
     if m:
         link['cursor'] = max(link['cursor'], int(m[1]))
@@ -347,14 +353,15 @@ def link_line(link, raw):
     if not m:
         return None
     boot = m[1].decode()
-    note = None
+    same = link['boot'] == boot
     if link['boot'] is None:
         note = f'[Adapter] bridge connected boot={boot}'
-    elif link['boot'] == boot:
+    elif same:
         note = f'[Adapter] reconnect same_boot=1 boot={boot} connects={link["connects"]} cursor={link["cursor"]}'
     else:
         note = f'[Adapter] reconnect same_boot=0 boot={boot} was={link["boot"]} (the console restarted)'
         link['cursor'] = 0
+    link['resume'] = b'events on\n' + (b'since %d\n' % link['cursor'] if same else b'')
     link['boot'] = boot
     return note.encode()
 

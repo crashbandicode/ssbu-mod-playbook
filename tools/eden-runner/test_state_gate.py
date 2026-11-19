@@ -1,4 +1,5 @@
 """state_gate: framed bridge state blocks and the gate's freshness/transition rules (no Eden, no console)."""
+import re
 import time
 import unittest
 import zlib
@@ -142,6 +143,60 @@ class LinkTests(unittest.TestCase):
     def test_state_and_reconnect_verbs_pass_the_v2_spool(self):
         import switch_hw
         self.assertTrue({'state', 'state_watch', 'providers', 'since', 'events'} <= switch_hw.V2_VERBS)
+
+
+class ReviewNegativeTests(unittest.TestCase):
+    """tr-review-astra-3 18:10Z findings 1-3, through the production parser, matcher and capture handshake."""
+    base = sg.latest(block(5, MENU), 'tr.menu')
+
+    def test_a_where_only_match_on_a_notice_bump_fails_an_input_gate(self):
+        notice = sg.latest(block(6, MENU + ['notice.body="Eggs 1"']), 'tr.menu')
+        self.assertFalse(sg.satisfies(notice, {'page': 'fighters_stages'}, self.base, input_gate=True)[0])
+        self.assertFalse(sg.satisfies(notice, {'page': 'fighters_stages'}, None, transition='focus')[0], 'no baseline')
+        self.assertTrue(sg.satisfies(notice, {'page': 'fighters_stages'})[0], 'a plain assertion may pass')
+
+    def test_a_focus_gate_fails_when_the_new_block_has_no_focus(self):
+        nofocus = sg.latest(block(6, [l for l in MENU if not l.startswith('focus=')]), 'tr.menu')
+        ok, why = sg.satisfies(nofocus, {}, self.base, transition='focus')
+        self.assertFalse(ok)
+        self.assertIn('focus missing', why)
+
+    def test_a_new_boot_hello_between_begin_and_end_tears_the_block(self):
+        whole = block(6, menu(ack='4'))
+        head, tail = whole.split('[Bridge] state end')
+        hello = ('[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=x port=6970 guards=0x3fffff boot=0x00cd '
+                 'uptime_ms=5 reconnects=0 event_latest=0 state_api=1 frame=1 wall=2\n')
+        self.assertEqual(sg.blocks(head + hello + '[Bridge] state end' + tail, 'tr.menu'), [])
+
+    def test_a_multibyte_character_cut_at_a_part_boundary_reassembles(self):
+        row = 'rows="' + 'x' * 393 + '\u00b7' + 'y' * 50 + '"'
+        raw = row.encode()
+        cut = 400 if raw[399] & 0xC0 != 0x80 else 399
+        while raw[cut] & 0xC0 == 0x80:
+            cut -= 1
+        parts = [raw[:cut].decode(), raw[cut:].decode()]
+        lines = MENU + [row]
+        crc = f'{zlib.crc32(chr(10).join(lines).encode()):08x}'
+        text = block(9, MENU + ['rows=placeholder']).replace('[Bridge] state.6 rows=placeholder frame=10 wall=20\n',
+            f'[Bridge] state.6.part=1/2 {parts[0]} frame=10 wall=20\n[Bridge] state.6.part=2/2 {parts[1]} frame=10 wall=20\n')
+        text = re.sub(r'crc=[0-9a-f]{8}', f'crc={crc}', text)
+        b = sg.latest(text, 'tr.menu')
+        self.assertIsNotNone(b)
+        self.assertIn('\u00b7', b['values']['rows'])
+
+    def test_resume_waits_for_the_hello_and_uses_the_same_boot_cursor_including_zero(self):
+        import switch_hw
+        link = {'boot': None, 'cursor': 0, 'connects': 1}
+        hello = (b'[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=x port=6970 guards=0x3fffff boot=0x00ab '
+                 b'uptime_ms=5 reconnects=0 event_latest=0 state_api=1 frame=1 wall=2')
+        switch_hw.link_line(link, hello)
+        self.assertEqual(link.pop('resume'), b'events on\n', 'first connect: no since')
+        link['connects'] = 2
+        switch_hw.link_line(link, hello.replace(b'reconnects=0', b'reconnects=1'))
+        self.assertEqual(link.pop('resume'), b'events on\nsince 0\n', 'same boot, cursor zero is still resumed')
+        switch_hw.link_line(link, b'[TrainingRooms] x ev=7 frame=1 wall=2')
+        switch_hw.link_line(link, hello.replace(b'0x00ab', b'0x00cd'))
+        self.assertEqual(link.pop('resume'), b'events on\n', 'a new boot never replays the old cursor')
 
 
 if __name__ == '__main__':

@@ -1917,13 +1917,19 @@ class Runner:
             time.sleep(.2)
         raise RuntimeError(f'state {provider} did not pass within {cap} s: {why}')
 
+    def _row_key(self):
+        return (self.current_row or {}).get('id')
+
     def _step_state_baseline(self, on, step):
         """A complete state block taken before the row's input: the next `state` gate needs a newer one."""
         provider = step['state_baseline']
         block, _ = self._state_block(on, provider, step.get('cap', 10), lambda b: (True, 'baseline'))
         if not hasattr(self, 'state_marks'):
             self.state_marks = {}
-        self.state_marks[(on, provider)] = block
+        for stale in [k for k in self.state_marks if k[0] != self._row_key()]:
+            del self.state_marks[stale]
+        # Keyed by the row: a baseline never carries into another row.
+        self.state_marks[(self._row_key(), on, provider)] = block
         self.log({'state_baseline': provider, 'on': on, 'rev': block['rev'], 'boot': block['boot'],
                   'focus': block['values'].get('focus'), 'ack': block['values'].get('ack')})
         return {'state_baseline': provider, 'on': on, 'rev': block['rev'], 'focus': block['values'].get('focus')}
@@ -1931,12 +1937,15 @@ class Runner:
     def state_gate(self, on, name, gate, until):
         import state_gate
         provider = gate['provider']
-        base = getattr(self, 'state_marks', {}).get((on, provider))
-        if base is None:
-            raise RuntimeError(f'gate {name}: no state_baseline for {provider} on {on} earlier in this row')
+        key = (self._row_key(), on, provider)
+        input_gate = bool(gate.get('transition') or gate.get('ack') is not None or gate.get('input'))
+        base = getattr(self, 'state_marks', {}).get(key)
+        if input_gate and base is None:
+            raise RuntimeError(f'gate {name}: an input gate needs a state_baseline for {provider} on {on} earlier in this row')
         block, _ = self._state_block(on, provider, max(0.1, until - time.monotonic()), lambda b: state_gate.satisfies(
-            b, gate.get('where', {}), base, gate.get('transition'), gate.get('ack')))
-        self.state_marks[(on, provider)] = block  # the next gate in the row needs a still newer one
+            b, gate.get('where', {}), base if input_gate else None, gate.get('transition'), gate.get('ack'), input_gate))
+        if input_gate:
+            self.state_marks.pop(key, None)  # one input, one baseline: the next input takes its own
         evidence = {k: block['values'].get(k) for k in ('focus', 'ack', 'ack.result', *gate.get('where', {}))}
         self.log({'gate': name, 'on': on, 'pass': True, 'state': provider, 'rev': block['rev'], 'values': evidence})
         return {'state': provider, 'rev': block['rev'], 'boot': block['boot'], 'values': evidence}
