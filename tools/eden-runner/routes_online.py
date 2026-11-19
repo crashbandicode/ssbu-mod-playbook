@@ -5,8 +5,8 @@
                     and `member joined pid=P ... members=1`, before the joiner's game.load
   lan_pair          after the joiner's load: the leader's last `members=2`, its joined pid equal to the joiner's ready
                     pid, and no `leading` on the joiner (a second room fails closed; runtime-calibration-4)
-  ldn_join          Local Wireless: the guest's request and the host's approval macros start together, so the host's
-                    OK is armed before the request lands (the guest gives up after about 30 s)
+  ldn_join          Local Wireless Join release gate
+  ldn_pick_fighter  Local Wireless: select and verify the local controller's token
 
 Order for a LAN pair in one boot (lifecycle "defer_load": true): {"call": "game.load", "on": "a"},
 {"run": "routes_online:lan_leader", "on": "a"}, {"call": "game.load", "on": "b"},
@@ -89,30 +89,14 @@ def start_both(ctx, instances=('a', 'b')):
 
 
 def ldn_join(ctx, host='a', guest='b', guest_segment='guest-request', host_segment='host-approval', cap=25):
-    """Play the guest's request and the host's approval together (join-approved.py:51-68). Start contract: the host
-    waits in native Local Wireless with no prompt; the guest's room list has the intended room selected. The host
-    macro presses A about 240 frames in, inside the guest's ~30 s timeout. The caller's next gates judge the join."""
-    import routes  # noqa: PLC0415
-    runner = ctx.runner
-    for on in (guest, host):
-        status = runner.call(on, 'status') or {}
-        if not (status.get('running') and status.get('loading_complete')) or status.get('modal'):
-            raise RuntimeError(f'{on} is not running a loaded game: {status}')
-        runner.call(on, 'macro.stop')
-        runner.call(on, 'input.reset')
-    files = {guest: routes.macro_file(guest_segment)[0], host: routes.macro_file(host_segment)[0]}
-    for on in (guest, host):
-        runner.call(on, 'macro.play', {'path': str(files[on])})
-    until = time.monotonic() + cap
-    while True:
-        states = {on: runner.call(on, 'macro.status') or {} for on in (guest, host)}
-        if any(s.get('error') for s in states.values()):
-            raise RuntimeError(f'macro error: {states}')
-        if all(s.get('state') == 'finished' for s in states.values()):
-            break
-        if time.monotonic() > until:
-            raise RuntimeError(f'join macros not finished within {cap} s: {states}')
-        time.sleep(0.5)
-    for on in (guest, host):
-        runner.call(on, 'input.reset')
-    return {'guest': guest, 'host': host, 'shots': {on: str(runner.shot(on, 'ldn-join')) for on in (guest, host)}}
+    """Local Wireless Join stays closed pending exact-release room binding evidence."""
+    from native_picker import refuse_join
+
+    refuse_join()
+
+
+def ldn_pick_fighter(ctx, fighter, *, topology=None, form='default'):
+    """Place the local fighter after the native route reaches CSS."""
+    from routes import pick_local_fighter
+
+    return pick_local_fighter(ctx, fighter, topology=topology, form=form)

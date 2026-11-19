@@ -111,9 +111,12 @@ eden-ldn-coexistence runtime-12/13 (Local Wireless). They have not been booted a
 - **`lan_pair`:** after B's `game.load`, A's last `members=` is 2 with B's ready pid, and B has no `leading` line.
   If B leads its own room, the block fails, and both instances go Down before Quickplay.
 - **`start_both`:** runs `to_main` on each instance (Start in both windows).
-- **`ldn_join`:** plays the guest's `guest-request` and the host's `host-approval` together. The host's OK is
-  armed before the request lands; the guest gives up after about 30 s.
-  - Before boot, the guest's frontend joins the room before its `game.load` ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
+- **`ldn_join`** keeps native Join closed until an exact-release trace qualifies
+  the selected native list row, the associated scan key and refresh generation,
+  and the backing record consumed by Join. The pinned guest request and host
+  approval macros remain historical setup evidence.
+- **`ldn_pick_fighter`** selects a named fighter from a verified native CSS
+  belonging to the local host or guest. The later L+R Start is a distinct action.
 
 ## A real Switch (the same rows, the pad and OBS)
 
@@ -197,8 +200,10 @@ instance differs, and every input is a macro (no manual presses).
   (`~/.cache/switch-pad.claim`) exists. `down` sends RESET, stops the log capture and removes the claim.
 - **Hardware blocks:**
   - `switch_boot`: B, HOME, the SSBU tile gate, A, the profile A, then Start until the main menu.
-  - `switch_to_training`: Training on the stage select's first tile with whoever P1 is. The tile cursor isn't on
-    the card, so there's no stage or fighter by name. Ends with `preload_clear`.
+  - `switch_to_training` starts from the native Games & More hover or the Training
+    submenu item. It confirms the Training stage, verifies local fighter placement
+    and checks native Training and the loaded stage kind. Supply `p1` and
+    `fighter_topology` when a named pick needs movement from an off-grid hand.
   - `tr_menu`: `preload_clear`, B+Up, the menu gate, B and B, the HUD gate.
   - `preload_clear` (`{"run": "routes:preload_clear"}`, or `routes.preload_clear(ctx)` from a hook, on the
     Training HUD before any menu input):
@@ -218,19 +223,22 @@ instance differs, and every input is a macro (no manual presses).
       on synthetic frames, and checked against the session's real frames (Loading 3/7 and 4/7, Ready 8/8, a
       minigame notice, the HUD, the menu). It hasn't run live yet, and it's unproven on Eden.
   - `switch_close`: HOME, X, then A on the close dialog.
-  - `pick_stage_hw {stage}`, `pick_fighter_hw {p1}`, `confirm_pick {expect}` (2026-11-16, host-tested; not yet run on
-    the console):
-    - **Why:** the tile cursor on the card writes its `events.log` to the SD, which can't be read while SSBU runs, so
-      `TileWalker` can't run.
-    - **Walk:** a counted walk of single `tile-*` steps instead. The stage select opens on tile 0 (`sss` gate), then
-      Down/Right by `tables.json`. On the CSS, Up ×7 and Left ×12 reach the top-left tile from anywhere, then
-      Down/Right.
-    - **CSS grid:** read from the console save's own still (`CSS_HW_ROWS`, six rows of 13). That save has no Piranha
-      Plant or Mii Swordfighter tile, so `tables.json` tile numbers are wrong there from Joker on. The short last row
-      isn't mapped.
-    - **A only after review:** the walk ends on a still and `out/routes-review.json` with `approved: false`. The
-      reviewer looks and sets `approved: true`; only then does `confirm_pick` press A (then the `css` or `ready` gate).
-      The CPU is still set by TR's CPU Character, never the coin.
+  - `pick_stage_hw {stage}` and `pick_fighter_hw {p1}` prepare a verified hover.
+    `confirm_pick {expect}` rechecks the same idle checkpoint within the runner
+    instance and sends A. CSS confirms the local token placement. SSS confirms
+    the native destination screen, configured with `next_screen` when needed.
+  - `pick_stage`, `pick_fighters` and `routes_online:ldn_pick_fighter` use the
+    shared state-backed picker when the bridge supplies the native state.
+    CSS form defaults to `default` and SSS form defaults to `normal`.
+  - A `topology` argument points at an independently qualified JSON capture for
+    the active layout. It contains `layout` (the exact live fingerprint),
+    `neighbors` (tile-to-direction-to-tile mappings) and `targets` (tile keys
+    mapped to exact `kind`, `name` and `form`). Use decimal string tile keys
+    and `none` as a source only for a verified position below the grid.
+    A pick on the correct settled tile needs no movement map.
+  - Hardware and paired Eden release qualification remain open. See
+    [Native UI state and tile cursor providers](/home/intpa/ssbu-hw-bridge/docs/NATIVE-UI-STATE.md)
+    for the rollout gates.
 
 ### Hardware proof: `hw-run-1` (the real Switch, 2026-11-16 12:45–12:49Z)
 

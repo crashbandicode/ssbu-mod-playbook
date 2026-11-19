@@ -13,7 +13,6 @@ without L3, so it doesn't change what you are testing.
   Eden-unproven NRO; do not rebuild that into the accepted pin.
 - **Log:** `<sdmc>/ultimate/ssbu-tile-cursor/events.log`. It is written every
   100 ms, so the host copy is current.
-- **Not on the Switch card.** It is an Eden tool.
 
 ## Accepted frame-repeat pin (2026-11-16)
 
@@ -36,6 +35,27 @@ Down returned 0: all 2016 profile entries matched the snapshot, cleanup failures
 was released and copies were pruned. No owned process remained, and the console had no panic/abort/crash/Unmapped
 matches. The terminal `game.stop` timeout required a forced stop; the receipts retain that shutdown detail.
 
+
+### Native selection and accepted card build
+
+The Switch card carries the accepted frame-repeat NRO from `8f830a2`, SHA-256
+`66f00442eb7a93de3196714aebba85807e106663e4e9d5dbb3894d7c5e071ecd`.
+Its SD event log is available after the session. A bridge-enabled Tile Cursor
+candidate adds live `tile.cursor/1` observations and has its own release and
+card qualification.
+
+The provider-backed runner checks `ssbu.ui/1` native focus and the local
+controller's tile state. Each short macro uses player 0, L3 on frame 0,
+direction on frames 1–2, and neutral from frame 3. The runner waits for exactly
+one handled ACK and target write with the expected direction, source and
+destination. It then waits for native settled hover before continuing.
+
+A named pick checks the exact stock kind, name and form. Movement requires
+directed neighbors for the active layout fingerprint, including a verified
+off-grid entry when needed. A fresh native observation of the intended target
+authorizes the A for selection. CSS confirms the local placement separately,
+including a Local Wireless guest's native P2 token. Stage select confirms the
+requested next native screen.
 
 ## Stepping
 

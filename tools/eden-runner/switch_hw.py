@@ -14,8 +14,8 @@
   console_log     the live Skyline TCP log, captured into <run dir>/skyline.log one COMPLETE line at a time (no
   skyline_log     headers between chunks), so the runner's log gates and routes.LogCursor read it like an Eden log
   screenshot_target "switch"
-There is no diag_log, tile_log or settings: on hardware the release NRO prints no diag lines, the tile cursor isn't
-on the card, and SD files are read over FTP after the session, not live.
+The accepted Tile Cursor frame-repeat NRO is on the card. Its SD event log is read after the session.
+A bridge-enabled Tile Cursor publishes live tile selection state through the bridge's plugin-state interface.
 
 With `--bridge-host` (the test-only ssbu-hw-bridge NRO installed beside TrainingRooms, which serves TR's oracle lines and
 native reads on its own port) the instance also gets, as on Eden:

@@ -17,9 +17,9 @@ Blocks (docs/ROUTES.md has what each guarantees on exit):
   chord            play a same-frame chord macro (reset L+R+A, TR save/load, tile steps) by name
   fixture          read fighters, stage, damage and positions from game state, assert them, reset, settle
   back_to_main     Training -> main menu, proven by the main gate
-  pick_stage_hw    real Switch: stage select -> the named stage by a counted tile-* walk, a still for review, no A
-  pick_fighter_hw  real Switch: CSS -> P1's token on the named fighter the same way, a still for review, no A
-  confirm_pick     real Switch: A only on a pick whose still was reviewed and approved (out/routes-review.json)
+  pick_stage_hw    Switch: prepare the named verified stage tile for confirmation
+  pick_fighter_hw  Switch: prepare the named verified fighter tile for confirmation
+  confirm_pick     Switch: recheck the native tile and confirm local placement or stage transition
 Online pair blocks are in routes_online.py.
 
 Library files: library/routes/index.json (macros with sha256 and provenance) and library/routes/tables.json
@@ -32,6 +32,9 @@ import re
 import socket
 import time
 from pathlib import Path
+
+import native_picker
+from native_picker_io import BridgePickerIO
 
 HERE = Path(__file__).resolve().parent
 ROUTES = HERE / 'library' / 'routes'
@@ -726,6 +729,8 @@ def to_main(ctx, tries=8, look_s=6):
 def main_to_stage(ctx):
     """Main menu -> Training's stage select (library main-stage, lr-03). Calls to_main first: never trust a gate
     pinned to an earlier screen."""
+    if _use_native_pick(ctx):
+        return _native_main_to_stage(ctx)
     to_main(ctx)
     play(ctx, 'main-stage')
     how = wait_sss(ctx)
@@ -872,7 +877,8 @@ def remember(ctx, **values):
     return merged
 
 
-def pick_stage(ctx, stage, allow_derived=False, transition_cap=60):
+def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=None, form='normal',
+               next_screen='css.training'):
     """Stage select -> the named stage, by tile-cursor steps, then A -> the character select.
 
     The target tile comes from tables.json. A tile no run has proven is refused unless allow_derived is true; the
@@ -881,6 +887,10 @@ def pick_stage(ctx, stage, allow_derived=False, transition_cap=60):
     is not used: its start gate is the Training name crop, which fails once the hand left tile 0 (class d).
     """
     entry = stage_entry(stage)
+    if _use_native_pick(ctx):
+        io = BridgePickerIO(ctx)
+        prepared = native_picker.hover(io, 'sss', _native_target(entry, form), _tile_topology(topology))
+        return _finish_native_pick(ctx, io, 'sss', prepared, entry, next_screen, transition_cap)
     if not entry.get('proven') and not allow_derived:
         raise RuntimeError(f'stage {entry["name"]} tile {entry["tile"]} is derived, not proven; pass allow_derived '
                            'and confirm the id after the load')
@@ -907,13 +917,17 @@ def _probe_step(ctx, walker, direction='left', cap=2.5):
     return {'from': found.group(1), 'to': found.group(2), 'token': found.group(3)}
 
 
-def pick_fighters(ctx, p1, cpu=None, coin_route=False):
+def pick_fighters(ctx, p1, cpu=None, coin_route=False, *, topology=None, form='default'):
     """CSS: P1's token onto `p1` by TrainingRooms' tile table, checked by `settled at=N hovered=N`, then placed.
 
     The hand starts holding P1's token below the grid. The CPU's coin (`cpu` with coin_route=true) is NOT PROVEN: P1
     is placed on Steve, coin-pick pushes the empty hand onto the coin, A, and an L3 step must log token=p2; the coin
     is walked and dropped, B returns P1's token and P1 is walked. On the XPS the approach missed four times.
     """
+    if _use_native_pick(ctx):
+        if cpu is not None or coin_route:
+            raise RuntimeError('native tile selection requires the locally owned token')
+        return pick_local_fighter(ctx, p1, topology=topology, form=form)
     gate(ctx, 'css')
     p1_entry = fighter_entry(p1)
     cpu_entry = fighter_entry(cpu) if cpu is not None else None
@@ -1050,16 +1064,8 @@ def read_state(ctx, cap=6.0):
 def enter_training(ctx, cap=90):
     """CSS ready -> Training (Plus), proven by the game: fresh state lines for both bodies, then the HUD gate.
     A fresh profile's fighter tip is closed with A while the HUD gate fails (remaining-2 boot_training)."""
-    if on_switch(ctx):
-        # The release NRO prints no state lines: the Training HUD gate is the proof (A closes a first-run tip).
-        play(ctx, 'enter-training')
-        for _ in range(4):
-            if passes(ctx, 'training', 20):
-                break
-            play(ctx, 'tap-a1')
-        else:
-            gate(ctx, 'training')
-        return _save(ctx, 'routes-enter-training', {'shot': str(ctx.shot('routes-training'))})
+    if _use_native_pick(ctx):
+        return _native_enter_training(ctx, cap)
     stage_cursor = LogCursor(instance_path(ctx, 'diag_log'))
     play(ctx, 'enter-training')
     until = time.monotonic() + cap
@@ -1437,164 +1443,175 @@ def preload_clear(ctx, cap=180, appear=10.0):
         time.sleep(0.3)
 
 
-def switch_to_training(ctx):
-    """Main menu -> Training on the stage select's first tile (the Training stage) with whoever P1 is.
-
-    The tile cursor isn't on the card, so there is no stage or fighter by name here. The stage select opens on the
-    Training stage; A picks it. On the character select a READY banner means css_preserve kept the fighters;
-    otherwise the hand (on P1's panel) goes up onto the grid and A places P1 (the hardware ledger's P2d). Then Plus,
-    and the Training HUD gate (A closes a first-run tip).
-    """
-    _need_switch(ctx, 'switch_to_training')
-    out = {'stage': main_to_stage(ctx)}
-    play(ctx, 'tap-a1')
-    gate(ctx, 'css')
-    if not passes(ctx, 'ready', 4):
-        play(ctx, 'hand-up-21')
-        play(ctx, 'tap-a1')
-        gate(ctx, 'ready')
-        out['placed'] = True
-    out['ready'] = str(ctx.shot('routes-switch-ready'))
-    out['training'] = enter_training(ctx)
-    # The HUD comes up before the preloader starts (T-01, 15:03:27 HUD, 15:03:30 "Loading 3/7"): gate on its end.
-    out['preload'] = preload_clear(ctx)
-    return _save(ctx, 'routes-switch-training', out)
-
-
-# --- stage and fighter by name on a real Switch: the tile cursor without a live tile log -----------------------------
-# The tile cursor (ssbu-tile-cursor, frame-repeat build 8f830a2) runs on the card too, but its events.log sits on the
-# SD card and can't be read while SSBU runs, so TileWalker (which waits on its step/settled lines) can't run here.
-# These blocks walk a fixed plan of single tile-* steps instead: steps don't wrap, so enough Up and Left steps always
-# reach tile 0, and Down/Right then count rows and columns. The row width is not in tables.json; it is pinned from
-# the console's own character select (switch-hw-feature-ledger nav/css2-css.png, 2026-11-16 19:13Z: 13 tiles a row in
-# rows 0-5, Mario..Jigglypuff first; the last row, Sephiroth..Random, is shorter and offset, so it is refused).
-# Nothing is placed without an image check: the walk ends on a still and writes out/routes-review.json with
-# approved=false. The reviewer looks at the still and sets approved=true; only then does confirm_pick press A.
-
-SSS_HW_COLUMNS = 11   # Training's stage select (TILE-CURSOR "On the stage select")
-TILE_GAP_S = 0.6      # the hand eases over about 8 frames (TILE-CURSOR "Stepping"); no line marks the end here
-# The console save's own CSS grid, read off nav/css2-css.png (2026-11-16 19:13Z). It differs from tables.json
-# (TrainingRooms' roster_grid, which has Piranha Plant and Mii Swordfighter tiles this save doesn't show), so the
-# table's tile numbers are wrong here from Joker on; a pick goes by name through this grid. The short last row is
-# drawn from the fourth column and is not mapped (its Down/Up neighbours aren't known without the tile log).
-CSS_HW_ROWS = (
-    ('Mario', 'Donkey Kong', 'Link', 'Samus', 'Dark Samus', 'Yoshi', 'Kirby', 'Fox', 'Pikachu', 'Luigi', 'Ness',
-     'Captain Falcon', 'Jigglypuff'),
-    ('Peach', 'Daisy', 'Bowser', 'Ice Climbers', 'Sheik', 'Zelda', 'Dr. Mario', 'Pichu', 'Falco', 'Marth', 'Lucina',
-     'Young Link', 'Ganondorf'),
-    ('Mewtwo', 'Roy', 'Chrom', 'Mr. Game & Watch', 'Meta Knight', 'Pit', 'Dark Pit', 'Zero Suit Samus', 'Wario',
-     'Snake', 'Ike', 'Pokemon Trainer', 'Diddy Kong'),
-    ('Lucas', 'Sonic', 'King Dedede', 'Olimar', 'Lucario', 'R.O.B.', 'Toon Link', 'Wolf', 'Villager', 'Mega Man',
-     'Wii Fit Trainer', 'Rosalina & Luma', 'Little Mac'),
-    ('Greninja', 'Palutena', 'PAC-MAN', 'Robin', 'Shulk', 'Bowser Jr.', 'Duck Hunt', 'Ryu', 'Ken', 'Cloud', 'Corrin',
-     'Bayonetta', 'Inkling'),
-    ('Ridley', 'Simon', 'Richter', 'King K. Rool', 'Isabelle', 'Incineroar', 'Joker', 'Hero', 'Banjo & Kazooie',
-     'Terry', 'Byleth', 'Min Min', 'Steve'),
-)
+def _native_main_to_stage(ctx):
+    """From the qualified Games & More hover or Training submenu focus to SSS."""
+    io = BridgePickerIO(ctx)
+    provider = native_picker.UI
+    until = time.monotonic() + 5
+    state = native_picker.wait_sample(io, provider, until)
+    state = native_picker.wait_sample(io, provider, until, state)
+    top = {'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'top',
+           'focus.id': 'games_and_more', 'input.owner': 'native', 'dialog': 'none'}
+    training = {**top, 'screen.layer': 'submenu', 'focus.id': 'training'}
+    if _fields_match(state, top):
+        io.send('tap-a1')
+        state = _wait_native_focus(io, state, training)
+    if not _fields_match(state, training):
+        raise RuntimeError('Training entry needs Games & More → Training native focus')
+    # The submenu is an idle checkpoint. Re-fence the exact selectable item
+    # before sending the second input.
+    io.in_flight = False
+    state = native_picker.wait_sample(io, provider, time.monotonic() + 5, state)
+    if not _fields_match(state, training):
+        raise RuntimeError('Training submenu focus changed before A')
+    io.send('tap-a1')
+    selected = _wait_native_focus(io, state,
+                                  {'screen': 'stage_select', 'input.owner': 'native',
+                                   'focus.source': native_picker.TILE})
+    return {'screen': 'stage', 'proof': selected.values['focus']}
 
 
-def css_hw_cell(name):
-    """(row, column) of a fighter on this console's CSS grid, by name."""
-    for r, row in enumerate(CSS_HW_ROWS):
-        for c, cell in enumerate(row):
-            if _norm(cell) == _norm(name):
-                return r, c
-    raise KeyError(f'{name!r} is not in the console grid rows 0-5 (CSS_HW_ROWS); the short last row is not mapped')
+def _fields_match(state, criteria):
+    return all(state.values.get(key) == value for key, value in criteria.items())
 
 
-def hw_walk_plan(screen, target):
-    """[(direction, count), ...] of tile-* steps from where the walk starts to `target`.
+def _wait_native_focus(io, before, criteria, cap=45):
+    until = time.monotonic() + cap
+    previous = before
+    while True:
+        state = native_picker.wait_sample(io, native_picker.UI, until, previous, in_flight=True)
+        previous = state
+        if _fields_match(state, criteria) and state.values['focus'] != before.values['focus']:
+            return state
+        if state.values['focus'] != before.values['focus']:
+            raise RuntimeError(f'unexpected native focus {state.values["focus"]!r}')
 
-    sss: `target` is the tile; the select opens with tile 0 hovered (checked by the stage gate first), so only Down
-    then Right. css: `target` is the fighter's name. The hand holds P1's token below the grid; the first Up puts it
-    on some tile, six more Ups and twelve Lefts reach the top-left tile from anywhere, then Down and Right count the
-    row and column.
-    """
+
+def _native_enter_training(ctx, cap):
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + 5
+    ui = native_picker.wait_sample(io, native_picker.UI, until)
+    tile = native_picker.wait_sample(io, native_picker.TILE, until)
+    ui = native_picker.wait_sample(io, native_picker.UI, until, ui)
+    native_picker.native_owner(ui, 'css')
+    native_picker.same_epoch(ui, tile, in_flight=True)
+    tile = native_picker.wait_sample(io, native_picker.TILE, until, tile)
+    native_picker.same_epoch(ui, tile, in_flight=True)
+    native_picker.context(tile, 'css')
+    if ui.values['screen'] != 'css.training' or tile.values.get('local.token') != 'placed' or tile.values.get('carried') != 'none':
+        raise RuntimeError('Training entry needs a verified, placed local fighter')
+    native_picker.number(tile, 'placed.at')
+    native_picker.Target.read(tile, 'placed.')
+    io.send('enter-training')
+    after = _wait_native_focus(io, ui, {'screen': 'training', 'input.owner': 'native'}, cap)
+    stage_id = expected(ctx).get('stage_id')
+    actual_stage = native_state(ctx).get('stage')
+    if stage_id is not None and actual_stage != stage_id:
+        raise RuntimeError(f'Training loaded stage {actual_stage!r}; expected native kind {stage_id}')
+    return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage})
+
+def _use_native_pick(ctx):
+    return on_switch(ctx) or bool(ctx.instance.get('bridge_log'))
+
+
+def _tile_topology(path):
+    if path is None:
+        return None
+    data = json.loads(Path(path).read_text())
+    return native_picker.Topology(data['layout'], data['neighbors'],
+                                  {index: native_picker.Target(**identity)
+                                   for index, identity in data['targets'].items()})
+
+
+def _native_target(entry, form):
+    return native_picker.Target(str(entry.get('kind', entry.get('id'))), entry['name'], form)
+
+
+def _native_prepare(ctx, screen, entry, topology, form, next_screen):
+    # The checkpoint lives only in the current runner and console instance.
+    pending = getattr(ctx.runner, 'native_picks', {})
+    pending.pop(ctx.on, None)
+    ctx.runner.native_picks = pending
+    io = BridgePickerIO(ctx)
+    prepared = native_picker.hover(io, screen, _native_target(entry, form), _tile_topology(topology))
+    pending[ctx.on] = (io, screen, prepared, entry, next_screen)
+    return {'expect': entry['name'], 'kind': prepared[2].kind, 'tile': prepared[0].values['at']}
+
+
+def _finish_native_pick(ctx, io, screen, prepared, entry, next_screen, transition_cap):
+    result = native_picker.confirm(io, screen, prepared, next_screen=next_screen, transition_cap=transition_cap)
     if screen == 'sss':
-        row, col = divmod(int(target), SSS_HW_COLUMNS)
-        plan = []
-    elif screen == 'css':
-        row, col = css_hw_cell(target)
-        plan = [('up', len(CSS_HW_ROWS) + 1), ('left', len(CSS_HW_ROWS[0]) - 1)]
-    else:
-        raise ValueError(f'unknown screen {screen!r}')
-    plan += [('down', row), ('right', col)]
-    return [(d, n) for d, n in plan if n]
+        remember(ctx, stage_id=entry['id'], stage=entry['name'], tile=int(result['tile']))
+    elif result['seat'] == '0':
+        remember(ctx, p1_kind=entry['kind'], p1=entry['name'])
+    return _save(ctx, 'routes-confirm-pick', result)
 
 
-def _walk_hw(ctx, plan, gap=TILE_GAP_S):
-    steps = 0
-    for direction, count in plan:
-        for _ in range(count):
-            ctx.check_stop()
-            play(ctx, f'tile-{direction}')
-            time.sleep(gap)
-            steps += 1
-    return steps
-
-
-def _review_file(ctx):
-    out = getattr(ctx.runner, 'out', None)
-    if not out:
-        raise RuntimeError('the hardware pick blocks need the runner out folder for routes-review.json')
-    return Path(out) / 'routes-review.json'
-
-
-def _ask_review(ctx, kind, expect, still, extra):
-    record = {'kind': kind, 'expect': expect, 'still': still, 'approved': False,
-              'asked': time.strftime('%H:%M:%SZ', time.gmtime()), **extra}
-    _review_file(ctx).write_text(json.dumps(record) + '\n')
-    return record
-
-
-def pick_stage_hw(ctx, stage, allow_derived=False):
-    """Real Switch: Training's stage select -> the named stage hovered, ending on a still for review (no A)."""
+def pick_stage_hw(ctx, stage, allow_derived=False, *, topology=None, form='normal', next_screen='css.training'):
+    """Prepare a state-checked stage hover. confirm_pick rechecks it before A."""
     _need_switch(ctx, 'pick_stage_hw')
-    entry = stage_entry(stage)
-    if not entry.get('proven') and not allow_derived:
-        raise RuntimeError(f'stage {entry["name"]} tile {entry["tile"]} is derived, not proven; pass allow_derived')
-    gate(ctx, 'sss')  # hw-sss: the Training name panel, so tile 0 is hovered
-    plan = hw_walk_plan('sss', entry['tile'])
-    steps = _walk_hw(ctx, plan)
-    still = str(ctx.shot(f'routes-sss-hw-{_norm(entry["name"])}'))
-    return _ask_review(ctx, 'stage', entry['name'], still, {'tile': entry['tile'], 'plan': plan, 'steps': steps})
+    return _native_prepare(ctx, 'sss', stage_entry(stage), topology, form, next_screen)
 
 
-def pick_fighter_hw(ctx, p1):
-    """Real Switch: the character select -> P1's token on `p1`, ending on a still for review (no A). The CPU is set
-    by the lane's own fixture (TR's CPU Character), never the coin (ROUTES "The CPU's coin: not proven")."""
+def pick_fighter_hw(ctx, p1, *, topology=None, form='default'):
+    """Prepare a state-checked local fighter hover. confirm_pick places the local token."""
     _need_switch(ctx, 'pick_fighter_hw')
-    row, col = css_hw_cell(p1)
-    name = CSS_HW_ROWS[row][col]
-    gate(ctx, 'css')
-    plan = hw_walk_plan('css', name)
-    steps = _walk_hw(ctx, plan)
-    still = str(ctx.shot(f'routes-css-hw-{_norm(name)}'))
-    return _ask_review(ctx, 'fighter', name, still, {'cell': [row, col], 'plan': plan, 'steps': steps})
+    return _native_prepare(ctx, 'css', fighter_entry(p1), topology, form, None)
 
 
 def confirm_pick(ctx, expect, transition_cap=60):
-    """A on the reviewed pick: refuses unless routes-review.json names `expect` and approved is true. A stage pick
-    then waits for the character select, a fighter pick for the READY banner."""
+    """Confirm the named tile prepared on this runner instance, from a fresh owner observation."""
     _need_switch(ctx, 'confirm_pick')
-    path = _review_file(ctx)
-    if not path.is_file():
-        raise RuntimeError('confirm_pick: no routes-review.json; run pick_stage_hw or pick_fighter_hw first')
-    record = json.loads(path.read_text())
-    if _norm(record.get('expect')) != _norm(expect):
-        raise RuntimeError(f'confirm_pick: the review is for {record.get("expect")!r}, not {expect!r}')
-    if record.get('approved') is not True:
-        raise RuntimeError(f'confirm_pick: {record.get("still")} is not approved; look at it, then set approved=true')
-    play(ctx, 'tap-a1')
-    if record['kind'] == 'stage':
-        gate(ctx, 'css', transition_cap)
-        remember(ctx, stage=record['expect'], tile=record['tile'])
-    else:
-        gate(ctx, 'ready')
-        remember(ctx, p1=record['expect'])
-    path.write_text(json.dumps({**record, 'used': time.strftime('%H:%M:%SZ', time.gmtime())}) + '\n')
-    return _save(ctx, 'routes-confirm-pick', {**record, 'after': str(ctx.shot(f'routes-confirmed-{_norm(expect)}'))})
+    pending = getattr(ctx.runner, 'native_picks', {}).pop(ctx.on, None)
+    if pending is None or _norm(pending[3]['name']) != _norm(expect):
+        raise RuntimeError(f'no pending native pick for {expect!r} on this instance')
+    return _finish_native_pick(ctx, *pending, transition_cap)
 
+
+def pick_local_fighter(ctx, fighter, *, topology=None, form='default', take_back=False):
+    """Pick and verify the local controller's fighter, including a Local Wireless guest's native P2."""
+    entry = fighter_entry(fighter)
+    io = BridgePickerIO(ctx)
+    target = _native_target(entry, form)
+    topology = _tile_topology(topology)
+    if take_back:
+        result = native_picker.acquire_local_token(io, target, topology)
+        if result is not None:
+            if result['seat'] == '0':
+                remember(ctx, p1_kind=entry['kind'], p1=entry['name'])
+            return _save(ctx, 'routes-confirm-pick', result)
+    prepared = native_picker.hover(io, 'css', target, topology)
+    return _finish_native_pick(ctx, io, 'css', prepared, entry, None, 60)
+
+
+def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=None):
+    """Games & More → Training through state-checked stage selection and local placement."""
+    _need_switch(ctx, 'switch_to_training')
+    out = {'stage': main_to_stage(ctx)}
+    pick_stage_hw(ctx, 'Training', topology=stage_topology)
+    confirm_pick(ctx, 'Training')
+    if p1 is not None:
+        out['fighter'] = pick_local_fighter(ctx, p1, topology=fighter_topology)
+    else:
+        # A retained, settled local medal can be reused. An off-grid hand
+        # needs an explicit target and qualified entry topology.
+        io = BridgePickerIO(ctx)
+        until = time.monotonic() + 5
+        ui = native_picker.wait_sample(io, native_picker.UI, until)
+        native_picker.native_owner(ui, 'css')
+        current = native_picker.wait_sample(io, native_picker.TILE, until)
+        native_picker.same_epoch(ui, current, in_flight=True)
+        native_picker.context(current, 'css')
+        if current.values.get('local.token') == 'placed' and current.values.get('carried') == 'none':
+            native_picker.number(current, 'placed.at')
+            identity = native_picker.Target.read(current, 'placed.')
+            out['fighter'] = {'name': identity.name, 'kind': identity.kind, 'form': identity.form, 'placed': True}
+        else:
+            prepared = native_picker.hover(io, 'css', None)
+            out['fighter'] = native_picker.confirm(io, 'css', prepared)
+    out['training'] = enter_training(ctx)
+    out['preload'] = preload_clear(ctx)
+    return _save(ctx, 'routes-switch-training', out)
 
 def tr_menu(ctx):
     """Training HUD -> the TrainingRooms menu (B+Up in one frame) -> closed again (B, B), each proven by a gate.

@@ -169,7 +169,12 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_stale_identical_row_has_no_join(self):
-        self.assert_no_join(self.room(bssid='feddccbbaa99'), 'room key')
+        previous = self.room()
+        replaced = self.room(bssid='feddccbbaa99')
+        self.assertEqual(previous.values['focus.index'], replaced.values['focus.index'])
+        self.assertEqual(previous.values['focus.label'], replaced.values['focus.label'])
+        picker.verify_room_selection(previous, (self.bssid, self.session), '17')
+        self.assert_no_join(replaced, 'room key')
 
     def test_room_recreated_or_generation_changed(self):
         self.assert_no_join(self.room(session='a' * 32), 'room key')
@@ -180,6 +185,61 @@ class JoinTests(unittest.TestCase):
         picker.verify_room_selection(current, (self.bssid, self.session), '17')
         self.assert_no_join(current, 'release trace')
 
+
+class BridgeFramingTests(unittest.TestCase):
+    def test_fresh_query_requires_full_block_after_reply_fence(self):
+        import zlib
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+        from native_picker_io import BridgePickerIO
+
+        boot = '0x0000000000000001'
+        provider = 'ssbu.ui'
+        schema = provider + '/1'
+
+        def wire(rev, *, filtered=False, torn=False):
+            payload = [f'schema={schema}', f'rev={rev}', f'boot={boot}', 'ack=0',
+                       'ack.result=unsupported', 'focus=main_menu/top/smash',
+                       f'observation={rev}', 'observation.active=1']
+            begin = (f'[Bridge] state begin name={provider} schema={schema} rev={rev} boot={boot} '
+                     f'lines={len(payload)} filtered={int(filtered)}\n')
+            body = ''.join(f'[Bridge] state.{i} {line}\n' for i, line in enumerate(payload))
+            end = f'[Bridge] state end name={provider} rev={rev} crc={zlib.crc32(chr(10).join(payload).encode()):08x}\n'
+            return begin + body + ('[Adapter] reconnect same_boot=1\n' if torn else '') + end
+
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.write_text(wire(50))
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None)
+            bridge = BridgePickerIO(ctx)
+
+            def spool(ctx, *requests):
+                self.assertEqual(requests, ('providers', 'state ssbu.ui'))
+                fence = f'[Bridge] req providers result=ok count=2 boot={boot}\n'
+                with log.open('a') as dest:
+                    dest.write(wire(51) + fence + wire(52, torn=True) + wire(53)
+                               + fence + wire(54, filtered=True) + wire(55))
+            with patch.object(routes, 'bridge_v2', spool):
+                state = bridge.read(provider, 1)
+            self.assertEqual(state.block['rev'], 55)
+            self.assertEqual(state.connection, 1)
+
+    def test_short_direction_macros_release_before_repeat(self):
+        import json
+        import routes
+
+        for direction, bit in {'left': 4096, 'up': 8192, 'right': 16384, 'down': 32768}.items():
+            with self.subTest(direction=direction):
+                macro, _, _ = routes.macro_file(f'tile-{direction}')
+                data = json.loads(macro.read_text())
+                self.assertEqual(data['player'], 0)
+                self.assertEqual([(e['frame'], e['buttons']) for e in data['events']],
+                                 [(0, 16), (1, 16 | bit), (3, 0)])
+                self.assertGreater(data['duration_frames'], 3)
 
 if __name__ == '__main__':
     unittest.main()
