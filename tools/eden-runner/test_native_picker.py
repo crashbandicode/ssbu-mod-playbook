@@ -825,10 +825,13 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         wrong_parent.values['screen.context'] = 'local_wireless'
         lost_owner = self.checkpoint(4, 'stage_select')
         lost_owner.values['input.owner'] = 'unknown'
-        for index, state in ((2, wrong_parent), (3, lost_owner)):
+        for index, state, reason in (
+            (2, wrong_parent, 'unexpected Main Menu focus'),
+            (3, lost_owner, 'Stage Select ownership changed'),
+        ):
             with self.subTest(phase=index):
                 io = Mock()
-                with self.assertRaisesRegex(RuntimeError, 'unexpected|stage ownership changed'):
+                with self.assertRaisesRegex(RuntimeError, reason):
                     self.run_route(io, 3, changes=((index, state),))
                 io.send.assert_called_once_with('tap-a1')
                 io.finish.assert_not_called()
