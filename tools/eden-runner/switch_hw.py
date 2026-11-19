@@ -68,7 +68,7 @@ REQUEST_FILES = {'diag-pos.req': 'pos', 'diag-save.req': 'save', 'diag-load.req'
                  'bridge-speed.req': 'speed', 'bridge-roster.req': 'roster', 'bridge-status.req': 'status_names'}
 SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 # Protocol v2 (bridge slice 3): written as `bridge-v2*.req` spool files, one request per line (`bridge_v2`).
-V2_VERBS = {'caps', 'scene', 'fighters', 'status_names', 'hid', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch',
+V2_VERBS = {'caps', 'mem', 'scene', 'fighters', 'status_names', 'hid', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch',
             # plugin state and same-boot reconnect (ssbu-hw-bridge docs/PLUGIN-STATE.md)
             'state', 'state_watch', 'providers', 'since', 'events'}
 
