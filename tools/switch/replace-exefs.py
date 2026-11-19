@@ -472,7 +472,8 @@ class FtpCard(Card):
             try:
                 ftp.cwd(path)
             except ftplib.error_perm as error:
-                if not str(error).startswith('550 '):
+                # DBI 912 rejects CWD on a file with 553. Confirm it through SIZE or readback.
+                if not str(error).startswith(('550 ', '553 ')):
                     raise
             else:
                 return {'size': -1, 'kind': '(directory)'}

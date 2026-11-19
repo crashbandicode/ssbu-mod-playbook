@@ -610,6 +610,19 @@ class TestFtpTransaction(Base):
         self.assertGreaterEqual(len(sessions), 2, path)
         self.assertEqual(sessions, sorted(set(sessions)), path)
 
+    def test_dbi_912_preflight_uses_size_after_cwd_file_refusal(self):
+        self.ftp.support_size = True
+        before = self.tree()
+        commands = self.phase('preflight')
+        self.assert_read_only(commands)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(self.receipt('preflight.json')['state'], 'preflight_verified')
+        path = '/' + SUBSDK9.rsplit('/', 1)[0] + '/main.npdm'
+        sessions = {sid for sid, cmd, arg in commands if (cmd, arg) == ('CWD', path)}
+        self.assertEqual(len(sessions), 1)
+        commands_on_path = [(cmd, arg) for sid, cmd, arg in commands if sid in sessions and arg == path]
+        self.assertEqual(commands_on_path, [('CWD', path), ('SIZE', path)])
+
     def test_success_preflight_install_verify_has_fresh_readbacks(self):
         self.ftp.refuse_overwrite = False
         self.ftp.support_size = True

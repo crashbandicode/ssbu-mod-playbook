@@ -116,9 +116,11 @@ class FakeFtp:
                 vpath, lp = local(arg)
                 if lp.is_dir():
                     cwd = vpath
-                    say('250 ok')
+                    say('250 Directory changed.')
+                elif lp.is_file():
+                    say('553 Requested action not taken. Not a directory.')
                 else:
-                    say('550 no such directory')
+                    say('550 Requested action not taken. File not available.')
             elif cmd == 'MKD':
                 _, lp = local(arg)
                 if lp.exists():
@@ -149,7 +151,7 @@ class FakeFtp:
                 elif lp.is_file():
                     say(f'213 {lp.stat().st_size}')
                 else:
-                    say('550 not found')
+                    say('550 Requested action not taken. Could not get file size.')
             elif cmd == 'RETR':
                 _, lp = local(arg)
                 if not lp.is_file():
