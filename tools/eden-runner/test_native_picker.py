@@ -599,7 +599,7 @@ class MainMenuStepTests(unittest.TestCase):
         import routes
 
         self.ctx = SimpleNamespace()
-        self.io = Mock()
+        self.io = Mock(connection=1, boot=self.top(1, 'smash').clock[0])
         test_io = patch.object(routes, 'BridgePickerIO', return_value=self.io)
         save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
         self.addCleanup(test_io.stop)
@@ -617,10 +617,32 @@ class MainMenuStepTests(unittest.TestCase):
                                     self.top(3, 'smash'), self.top(4, 'spirits')]
         result = self.step()
         self.assertEqual([call[0] for call in self.io.mock_calls],
-                         ['read', 'read', 'send', 'read', 'read', 'finish'])
+                         ['read', 'arm', 'read', 'send', 'read', 'read', 'finish'])
+        self.io.arm.assert_called_once()
+        self.assertEqual(self.io.arm.call_args.args[0], 'ssbu.ui')
+        self.assertGreater(self.io.arm.call_args.args[1], 0)
         self.io.send.assert_called_once_with('main-menu-right')
         self.assertEqual((result['from_focus'], result['to_focus']), ('smash', 'spirits'))
         self.assertEqual((result['from_observation'], result['to_observation']), (2, 4))
+
+    def test_failed_arm_blocks_before_input_or_baseline_read(self):
+        self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'), self.top(3, 'spirits')]
+        self.io.arm.side_effect = RuntimeError('watch failed')
+        with self.assertRaisesRegex(RuntimeError, 'watch failed'):
+            self.step()
+        self.assertEqual([call[0] for call in self.io.mock_calls], ['read', 'arm'])
+
+    def test_connection_or_boot_change_during_arm_blocks_before_input(self):
+        for field, value in (('connection', 2), ('boot', '0x0000000000000002')):
+            with self.subTest(field=field):
+                self.io.reset_mock()
+                self.io.connection = 1
+                self.io.boot = self.top(1, 'smash').clock[0]
+                self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'), self.top(3, 'spirits')]
+                self.io.arm.side_effect = lambda *_: setattr(self.io, field, value)
+                with self.assertRaisesRegex(RuntimeError, 'connection or boot'):
+                    self.step()
+                self.assertEqual([call[0] for call in self.io.mock_calls], ['read', 'arm'])
 
     def test_wrong_committed_focus_stops_without_retry_or_finish(self):
         self.io.read.side_effect = [self.top(1, 'smash'), self.top(2, 'smash'),
