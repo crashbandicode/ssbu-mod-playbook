@@ -1478,8 +1478,18 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
     io = BridgePickerIO(ctx)
     until = time.monotonic() + cap
     initial = native_picker.wait_sample(io, native_picker.UI, until)
+    before, state = _watched_menu_input(io, initial, source, target, f'main-menu-{direction}', until)
+    io.finish()
+    return _save(ctx, 'routes-main-menu-step', {
+        'direction': direction, 'from_focus': from_focus, 'to_focus': to_focus,
+        'boot': state.clock[0], 'from_observation': before.clock[2],
+        'to_observation': state.clock[2],
+    })
+
+
+def _watched_menu_input(io, initial, source, target, macro, until):
     if not _fields_match(initial, source):
-        raise RuntimeError(f'Main Menu source must be native top-tab focus {from_focus!r}')
+        raise RuntimeError(f'Main Menu source must be native focus {source["focus"]!r}')
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise RuntimeError('Main Menu source deadline expired before arming ssbu.ui')
@@ -1488,49 +1498,59 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
         raise RuntimeError('bridge connection or boot changed while arming Main Menu watch')
     before = native_picker.wait_sample(io, native_picker.UI, until, initial)
     if before.connection != initial.connection or not _fields_match(before, source):
-        raise RuntimeError(f'Main Menu source changed before {direction!r} at {from_focus!r}')
+        raise RuntimeError(f'Main Menu source changed before {macro!r} at {source["focus"]!r}')
 
-    io.send(f'main-menu-{direction}')
+    io.send(macro)
     state = before
     while True:
         state = native_picker.wait_sample(io, native_picker.UI, until, state, in_flight=True)
-        if _fields_match(state, target):
-            io.finish()
-            return _save(ctx, 'routes-main-menu-step', {
-                'direction': direction, 'from_focus': from_focus, 'to_focus': to_focus,
-                'boot': state.clock[0], 'from_observation': before.clock[2],
-                'to_observation': state.clock[2],
-            })
+        if _fields_match(state, target) and state.values['focus'] != before.values['focus']:
+            return before, state
         if not _fields_match(state, source):
-            raise RuntimeError(f'unexpected Main Menu focus {state.values["focus"]!r} after {direction!r}; '
-                               f'expected {to_focus!r}')
+            expected = target.get('focus', target['screen'])
+            raise RuntimeError(f'unexpected Main Menu focus {state.values["focus"]!r} after {macro!r}; '
+                               f'expected {expected!r} with qualified owner')
 
 
 def _native_main_to_stage(ctx):
-    """From the qualified Games & More hover or Training submenu focus to SSS."""
+    """Enter Training Stage Select through the verified Games & More checkpoints."""
+    menu = {'screen': 'main_menu', 'screen.tab': 'games_and_more', 'input.owner': 'native',
+            'dialog': 'none', 'focus.source': 'native'}
+    checkpoints = [
+        ({**menu, 'screen.layer': layer, 'focus.id': focus, 'focus': f'main_menu.{layer}.{focus}'}, macro)
+        for layer, focus, macro in (
+            ('top', 'games_and_more', 'tap-a1'),
+            ('submenu', 'classic_mode', 'main-menu-down'),
+            ('submenu', 'mob_smash', 'main-menu-left'),
+            ('submenu', 'training', 'tap-a1'),
+        )
+    ]
     io = BridgePickerIO(ctx)
-    provider = native_picker.UI
-    until = time.monotonic() + 5
-    state = native_picker.wait_sample(io, provider, until)
-    state = native_picker.wait_sample(io, provider, until, state)
-    top = {'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'top',
-           'focus.id': 'games_and_more', 'input.owner': 'native', 'dialog': 'none'}
-    training = {**top, 'screen.layer': 'submenu', 'focus.id': 'training'}
-    if _fields_match(state, top):
-        io.send('tap-a1')
-        state = _wait_native_focus(io, state, training)
-    if not _fields_match(state, training):
-        raise RuntimeError('Training entry needs Games & More → Training native focus')
-    # The submenu is an idle checkpoint. Re-fence the exact selectable item
-    # before sending the second input.
-    state = native_picker.wait_sample(io, provider, time.monotonic() + 5, state)
-    if not _fields_match(state, training):
-        raise RuntimeError('Training submenu focus changed before A')
-    io.send('tap-a1')
-    selected = _wait_native_focus(io, state,
-                                  {'screen': 'stage_select', 'input.owner': 'native',
-                                   'focus.source': native_picker.TILE})
-    return {'screen': 'stage', 'proof': selected.values['focus']}
+    state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 5)
+    for index, (source, _) in enumerate(checkpoints):
+        if _fields_match(state, source):
+            break
+    else:
+        raise RuntimeError('Training entry needs a native Games & More source or supported submenu focus')
+
+    for (source, macro), (target, _) in zip(checkpoints[index:], checkpoints[index + 1:]):
+        _, state = _watched_menu_input(io, state, source, target, macro, time.monotonic() + 5)
+        io.finish()
+
+    stage = {'screen': 'stage_select', 'screen.context': 'training', 'input.owner': 'native',
+             'dialog': 'none', 'focus.source': native_picker.TILE}
+    source, macro = checkpoints[-1]
+    until = time.monotonic() + 45
+    _, selected = _watched_menu_input(io, state, source, stage, macro, until)
+    tile = native_picker.wait_sample(io, native_picker.TILE, until)
+    native_picker.same_epoch(selected, tile, in_flight=True)
+    if tile.values.get('screen') != 'sss':
+        raise RuntimeError('tile.cursor did not confirm the sss screen')
+    active = native_picker.wait_sample(io, native_picker.UI, until, selected, in_flight=True)
+    if not _fields_match(active, stage):
+        raise RuntimeError('native Training Stage Select ownership changed during tile.cursor check')
+    io.finish()
+    return {'screen': 'stage', 'proof': active.values['focus']}
 
 
 def _fields_match(state, criteria):
