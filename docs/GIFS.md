@@ -33,8 +33,9 @@ detail. MP4 is suitable for both. Keep the original recordings out of git.
 ## GIFs for image previews
 
 Use a GIF only where an image is required, such as a README preview.
-Use at least 12 fps for gameplay and 10 fps for menus. Never use keyframe-only
-clips or drop frames to meet a size budget. Trim to the action, crop to the
+Use at least 12 fps for gameplay and 10 fps for menus, or keep the actual
+source rate if it is lower. Never use keyframe-only clips or drop frames to
+meet a size budget. Trim to the action, crop to the
 useful region where the preview permits it, turn off dithering and try 128
 colors if text stays readable. If the GIF is still over budget, report its
 size for review. A README GIF is 1280 pixels wide and under 10 seconds.
@@ -108,8 +109,8 @@ in the session recording for offline cutting.
 | --- | --- | ---: | ---: | ---: |
 | `preview` | Gameplay image preview | 1280 | 12 | 10 s |
 | `preview-menu` | Menu image preview | 1280 | 10 | 10 s |
-| `docs` | Existing GIF recipes | 1280 | 10 | 10 s |
-| `evidence` | Existing GIF recipes | 640 | 10 | 10 s |
+| `docs` | Legacy image preview recipe | 1280 | 12 | 10 s |
+| `evidence` | Internal review GIF | 640 | 10 | 10 s |
 
 The legacy `evidence` GIF preset also has a 10 MiB cap. Retain the 1080p
 clip and zoom crop for test evidence. Use the original 1080p recording
@@ -118,10 +119,16 @@ for documentation and tutorial MP4s.
 A plan or row may define more `gif_presets`. A step may override `width`,
 `fps`, `length` (`duration_s` or `duration_ms`) and `size` (`max_bytes`
 or `max_mb`). Overrides outside the full-frame or legacy evidence
-capture limits need a `"reason"`, which the receipt records. The 12 and
-10 fps minimums for the preview presets and Eden's own limits (fps
-1–30, width 160–1280, duration 100–120,000 ms) still apply. The dry run
-checks the preset, the reason, the `out` path and any `recover` list.
+capture limits need a `"reason"`, which the receipt records. Request at
+least 12 fps for gameplay or 10 fps for menus. Set `"scene": "menu"` to
+identify a menu clip when using a legacy or custom preset. The runner and
+offline cutter enforce these minimums for published GIFs across all preset
+names. They accept a lower cadence when independently measured from the
+source. Automatic row review GIFs and `evidence` GIFs kept in the row folder
+without `out` use the internal review settings.
+
+Eden's capture limits are 1–30 fps, 160–1280 pixels wide and 100–120,000 ms.
+The dry run checks the preset, the reason, the `out` path and any `recover` list.
 
 The receipt holds the frame count, duration, size, SHA-256 and output
 path. If the file still breaks its preset, the receipt gives the reason

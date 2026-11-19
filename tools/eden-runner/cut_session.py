@@ -163,15 +163,24 @@ def span_ns(start_ms, end_ms, offset_ms=0.0):
     return (max(0, round((start_ms + offset_ms) * 1_000_000)), max(0, round((end_ms + offset_ms) * 1_000_000)))
 
 
+def gif_preview_minimum(spec):
+    if spec.get('preset') == 'evidence' and not spec.get('out'):
+        return None
+    scene = spec.get('scene', 'menu' if spec.get('preset') == 'preview-menu' else 'gameplay')
+    if scene not in ('gameplay', 'menu'):
+        raise ValueError('GIF scene must be gameplay or menu')
+    return 10 if scene == 'menu' else 12
+
+
 def clip_plan(kind, spec, start_ms, end_ms):
     """Width, fps, byte limit and duration cap for a clip: the label's values within the preset's limits."""
     preset_name = spec.get('preset') if spec.get('preset') in PRESETS else 'evidence'
     preset = PRESETS[preset_name]
     width = spec.get('width') if isinstance(spec.get('width'), int) and spec['width'] > 0 else preset['width']
     fps = spec.get('fps') if isinstance(spec.get('fps'), (int, float)) and spec['fps'] > 0 else preset['fps']
-    preview_minimum = GIF_PREVIEW_FPS.get(preset_name)
+    preview_minimum = gif_preview_minimum(spec) if kind == 'gifs' else None
     if preview_minimum is not None and fps < preview_minimum:
-        raise ValueError(f'GIF {preset_name} needs at least {preview_minimum} fps')
+        raise ValueError(f'GIF {spec.get("preset", preset_name)} needs at least {preview_minimum} fps')
     fps = float(min(fps, MAX_FPS if preview_minimum is not None else preset['fps']))
     max_s = spec.get('max_duration_s') if isinstance(spec.get('max_duration_s'), (int, float)) \
         and spec['max_duration_s'] > 0 else preset['max_s']
@@ -187,10 +196,13 @@ def clip_plan(kind, spec, start_ms, end_ms):
         duration, truncated = max_s, True
     if duration > FRAME_CAP:                      # even 1 fps would exceed the frame budget
         duration, truncated = float(FRAME_CAP), True
-    if duration * fps > FRAME_CAP:                # long span: lower the frame rate to stay in memory
-        fps = max(1.0, FRAME_CAP / max(duration, 1e-9))
-    return {'preset': preset_name, 'width': width, 'fps': fps, 'max_bytes': max_bytes, 'duration_s': duration,
-            'truncated': truncated}
+    if duration * fps > FRAME_CAP:
+        if preview_minimum is not None:
+            duration, truncated = FRAME_CAP / fps, True
+        else:                                    # Long internal review spans may use a lower rate.
+            fps = max(1.0, FRAME_CAP / max(duration, 1e-9))
+    return {'preset': preset_name, 'width': width, 'fps': fps, 'max_bytes': max_bytes,
+            'duration_s': duration, 'truncated': truncated, 'preview_minimum': preview_minimum}
 
 
 class SlotPicker:
@@ -413,7 +425,7 @@ def cut_clip(recording, start_ns, plan):
 # --------------------------------------------------------------------------------------------------------------
 # Cutting
 
-def write_gif(images, out, fps, max_bytes, receipt_extra):
+def write_gif(images, out, fps, max_bytes, receipt_extra, minimum=None):
     """Write the GIF and its `<out>.json` receipt; returns the receipt."""
     data, info = encode_fitting(images, fps, max_bytes)
     out = Path(out)
@@ -425,9 +437,8 @@ def write_gif(images, out, fps, max_bytes, receipt_extra):
         for i in range(stored):
             written.seek(i)
             total_ms += written.info.get('duration', 0)
-    minimum = GIF_PREVIEW_FPS.get(receipt_extra.get('preset'))
-    if minimum and (fps < minimum or stored < 2):
-        raise ValueError(f'preview needs at least {minimum} fps and more than one distinct image')
+    if minimum is not None and (fps < minimum or stored < 2):
+        raise ValueError(f'preview needs at least {minimum:g} fps and more than one distinct image')
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(data)
     receipt = {'path': str(out), 'frames': stored, 'frames_sampled': info['frames'], 'fps': info['fps'],
@@ -457,15 +468,21 @@ def cut_span(span, recording, out_path, offset_ms, partial):
                         'offset_ms': offset_ms},
              'preset': plan['preset'], 'row': span['row'], 'truncated': plan['truncated'],
              'attempts': span['attempts'], 'short_ms': round(short_ms) if short_ms > 3 * FRAME_NS / 1e6 else 0}
-    minimum = GIF_PREVIEW_FPS.get(plan['preset'])
+    minimum = plan['preview_minimum']
+    fps = plan['fps']
     if minimum is not None:
-        # Filled slots preserve time through a gap but do not add decoded source samples.
-        if source_fps < minimum:
-            raise ValueError(f'preview needs at least {minimum} fps; decoded source averaged {source_fps:g} fps')
+        # Measured source timestamps can lower the floor. Filled slots cannot.
+        if source_fps <= 0:
+            raise ValueError('preview needs at least two source frames with distinct timestamps')
         extra['source_fps'] = source_fps
+        if source_fps < minimum:
+            fps = minimum = source_fps
+            images, _, _ = cut_clip(recording, start_ns, plan | {'fps': fps})
+            if len(images) < 2:
+                raise ValueError('preview needs at least two sampled source frames')
     if span['kind'] == 'gifs':
         extra['gif'] = span['name']
-    return write_gif(images, out_path, plan['fps'], plan['max_bytes'], extra), None
+    return write_gif(images, out_path, fps, plan['max_bytes'], extra, minimum), None
 
 
 def gif_out_path(out_dir, span):

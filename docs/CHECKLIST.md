@@ -211,8 +211,8 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   `<video src="..." autoplay muted loop playsinline controls>`.
   Use GIF only where an image is required. Keep README GIF previews 1280
   pixels wide and under 10 s, with at least 12 fps for gameplay and 10 fps
-  for menus. Never use keyframe-only clips. For test evidence, keep the
-  1080p clip and a 2–3× zoom crop ([GIFS](GIFS.md)).
+  for menus, or the actual source rate if lower. Never use keyframe-only
+  clips. For test evidence, keep the 1080p clip and a 2–3× zoom crop ([GIFS](GIFS.md)).
 - **M** A dated evidence doc: run labels, the build (commit or NRO sha256),
   what was done, what the log showed. For Eden test runs, each run's short
   `RESULTS.md` plus the runner receipts are that doc; the phase's

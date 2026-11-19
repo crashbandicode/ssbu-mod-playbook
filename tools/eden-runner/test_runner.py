@@ -757,9 +757,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_gif_presets_record_and_a_breaking_file_is_refused(self):
         class GifEden(FakeEden):
-            def __init__(self, screens, frames=4, frame_ms=100):
+            def __init__(self, screens, frames=4, frame_ms=80, source=None):
                 super().__init__(screens)
                 self.frames, self.frame_ms, self.gif, self.params = frames, frame_ms, None, []
+                self.source = source
 
             def request(self, method, params):
                 self.params.append((method, dict(params or {})))
@@ -770,11 +771,14 @@ class RunnerTests(unittest.TestCase):
                     spec = self.gif or {}
                     width = spec.get('width', 640)
                     height = max(1, round(width * 9 / 16))
-                    images = [Image.new('RGB', (width, height), RED) for _ in range(self.frames)]
+                    colors = (RED, BLUE, (100, 100, 100))
+                    images = [Image.new('RGB', (width, height), colors[i % len(colors)]) for i in range(self.frames)]
                     images[0].save(spec['path'], save_all=True, append_images=images[1:],
                                    duration=self.frame_ms, loop=0)
                     self.gif = None
                     return {'ok': True, 'result': {'state': 'finished'}}
+                if method == 'status' and self.source is not None:
+                    return {'ok': True, 'result': self.source}
                 if method == 'recording.status':
                     return {'ok': True, 'result': {'state': 'finished', 'frames': self.frames,
                                                    'dropped_frames': 0, 'error': None}}
@@ -788,7 +792,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.make(eden).run(), 'DONE')
         started = next(params for method, params in eden.params if method == 'recording.start')
         self.assertEqual(started['width'], 1280)
-        self.assertEqual(started['fps'], 10)
+        self.assertEqual(started['fps'], 12)
         self.assertEqual(started['duration_ms'], 10000)
         info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
         self.assertEqual(set(info) & {'frames', 'duration', 'size', 'sha256', 'path'},
@@ -823,15 +827,41 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('size', refused['gif_refused']['why'])
         self.assertFalse((self.dir / 'out' / 'g1' / 'huge.gif').exists())
 
-        long = GifEden({}, frames=12, frame_ms=1000)
-        self.plan['rows'][0]['steps'] = [
-            {'gif': {'name': 'long', 'preset': 'docs', 'steps': [{'shot': 'mid'}]}}]
+        long = GifEden({}, frames=130)
+        gif = {'name': 'long', 'preset': 'docs', 'width': 160, 'reason': 'duration fixture',
+               'steps': [{'shot': 'mid'}]}
+        self.plan['rows'][0]['steps'] = [{'gif': gif}]
         self.manifest.write_text(json.dumps(self.plan))
         (self.dir / 'out' / 'g1.json').unlink()
         (self.dir / 'out' / 'STOP-INPUT').unlink()
         self.make(long).run()
         info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
-        self.assertLessEqual(info['duration'], 10)
+        self.assertEqual(info['duration'], 10.0)
+
+        source = {'game_fps': 5, 'stats_age_ms': 50, 'running': True, 'loading_complete': True}
+        (self.dir / 'out' / 'g1.json').unlink()
+        self.assertEqual(self.make(GifEden({}, frame_ms=200, source=source)).run(), 'DONE')
+        info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
+        self.assertEqual((info['sampled_fps'], info['source_fps']), (5, 5))
+        (self.dir / 'out' / 'g1.json').unlink()
+        with self.assertRaisesRegex(RuntimeError, r'at least 12 fps'):
+            self.make(GifEden({}, frame_ms=200, source=source | {'stats_age_ms': 5000})).run()
+
+    def test_legacy_and_custom_publication_cannot_request_keyframe_only(self):
+        published = {"name": "published", "preset": "docs", "fps": 1}
+        presets = {"gif_presets": {"custom": {"width": 1280, "fps": 12, "max_duration_s": 10}}}
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [{'gif': published}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('at least 12 fps', ' | '.join(runner.dry_run(self.manifest)['errors']))
+        for gif in (published, published | {"preset": "custom", "reason": "smaller file"},
+                    published | {"preset": "evidence", "out": "docs/media/published.gif"}):
+            with self.subTest(gif=gif):
+                spec = runner.resolve_gif_spec(presets, {}, gif)
+                self.assertRegex(runner.gif_policy_error(spec) or "", r"at least 12 fps")
+        menu = published | {"scene": "menu", "fps": 10}
+        self.assertIsNone(runner.gif_policy_error(runner.resolve_gif_spec(presets, {}, menu)))
+        spec = runner.resolve_gif_spec(presets, {}, menu | {"fps": 9})
+        self.assertRegex(runner.gif_policy_error(spec) or "", r"at least 10 fps")
 
     def test_dry_run_checks_preview_frame_rate_even_with_a_reason(self):
         gif = {'name': 'hover', 'preset': 'preview', 'steps': []}
@@ -918,7 +948,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('out', errors)
 
         self.plan['rows'][0]['steps'][0]['gif'].pop('out')
-        self.plan['gif_presets'] = {'lobby': {'width': 800, 'fps': 8, 'max_duration_s': 4, 'max_bytes': 2_000_000}}
+        self.plan['gif_presets'] = {'lobby': {'width': 800, 'fps': 12, 'max_duration_s': 4, 'max_bytes': 2_000_000}}
         self.manifest.write_text(json.dumps(self.plan))
         self.assertIn('reason', ' | '.join(runner.dry_run(self.manifest)['errors']))
         self.plan['gif_presets']['lobby']['reason'] = 'lobby art is drawn for 800'
@@ -946,13 +976,15 @@ class RunnerTests(unittest.TestCase):
                     self.gif = dict(params)
                     return {'ok': True, 'result': {'state': 'recording'}}
                 if method == 'recording.stop':
-                    Image.new('RGB', (self.gif['width'], 32), BLUE).save(self.gif['path'])
+                    size = (self.gif['width'], 32)
+                    blue, red = (Image.new('RGB', size, color) for color in (BLUE, RED))
+                    blue.save(self.gif['path'], save_all=True, append_images=[red], duration=[80, 80])
                     return {'ok': True, 'result': {}}
                 if method == 'recording.status':
                     return {'ok': True, 'result': {'state': 'finished', 'frames': 1, 'error': None}}
                 return super().request(method, params)
 
-        # A one-frame PNG is not a multi-frame gif; ImageSequence still yields one frame. Width follows the preset.
+        # The custom preset's width and reason are preserved.
         self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
             {'gif': {'name': 'lobby', 'preset': 'lobby', 'steps': [{'shot': 'mid'}]}}]}]
         self.manifest.write_text(json.dumps(self.plan))

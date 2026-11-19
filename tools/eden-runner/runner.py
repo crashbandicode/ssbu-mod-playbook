@@ -128,6 +128,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -159,7 +160,7 @@ SHARED_HOOKS = ('routes', 'routes_online')
 GIF_PREVIEW_FPS = {'preview': 12, 'preview-menu': 10}
 BUILTIN_GIF_PRESETS = {
     **{name: {'width': 1280, 'fps': fps, 'max_duration_s': 10} for name, fps in GIF_PREVIEW_FPS.items()},
-    'docs': {'width': 1280, 'fps': 10, 'max_duration_s': 10},
+    'docs': {'width': 1280, 'fps': 12, 'max_duration_s': 10},
     'evidence': {'width': 640, 'fps': 10, 'max_duration_s': 10, 'max_bytes': 10 * 1024 * 1024},
 }
 EVIDENCE_MAX_BYTES = 10 * 1024 * 1024
@@ -351,6 +352,10 @@ def resolve_gif_spec(plan, row, gif):
     if spec.get('max_bytes') is not None:
         spec['max_bytes'] = int(spec['max_bytes'])
     spec['preset'] = gif['preset']
+    spec['out'] = gif.get('out')
+    spec['scene'] = gif.get('scene', spec.get('scene', 'menu' if gif['preset'] == 'preview-menu' else 'gameplay'))
+    if spec['scene'] not in ('gameplay', 'menu'):
+        raise ValueError('GIF scene must be gameplay or menu')
     spec['reason'] = gif.get('reason') or spec.get('reason')
     return spec
 
@@ -367,10 +372,27 @@ def gif_api_error(spec):
     return None
 
 
+def gif_preview_minimum(spec):
+    if spec.get('preset') == 'evidence' and not spec.get('out'):
+        return None
+    return 10 if spec.get('scene', 'menu' if spec.get('preset') == 'preview-menu' else 'gameplay') == 'menu' else 12
+
+
 def gif_preview_error(spec):
-    minimum = GIF_PREVIEW_FPS.get(spec['preset'])
+    minimum = gif_preview_minimum(spec)
     if minimum is not None and spec['fps'] < minimum:
         return f'GIF {spec["preset"]} needs at least {minimum} fps'
+    return None
+
+
+def eden_source_fps(status):
+    """Fresh game telemetry, independent of the GIF recorder's requested rate."""
+    if not isinstance(status, dict) or not status.get('running') or not status.get('loading_complete'):
+        return None
+    rate, age = status.get('game_fps'), status.get('stats_age_ms')
+    if (isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0
+            and isinstance(age, (int, float)) and 0 <= age <= 1000):
+        return rate
     return None
 
 
@@ -571,7 +593,7 @@ def check_plan_policies(plan, base, errors):
     harness.validate_declarations(plan, errors)
 
 
-def publish_gif(raw_path, dest, spec):
+def publish_gif(raw_path, dest, spec, source_fps=None):
     """Trim to the preset duration, scale the full frame to its width, and palette-encode.
 
     Returns the encoded frame count, duration, size, SHA-256 and path. Raises GifRefused and deletes dest
@@ -624,7 +646,9 @@ def publish_gif(raw_path, dest, spec):
         count = written.n_frames
         total_ms = sum(frame.info.get('duration', 0) for frame in ImageSequence.Iterator(written))
     duration_s = round(total_ms / 1000, 3)
-    preview_minimum = GIF_PREVIEW_FPS.get(spec.get('preset'))
+    preview_minimum = gif_preview_minimum(spec)
+    if preview_minimum is not None and source_fps is not None:
+        preview_minimum = min(preview_minimum, source_fps)
     why = None
     if dimensions[0] != width:
         why = f'width is {dimensions[0]}, preset wants {width}'
@@ -636,9 +660,9 @@ def publish_gif(raw_path, dest, spec):
         # Eden's GifWriter emits one descriptor per successful sample, even for identical images.
         # Pillow may merge a sampled hold when re-encoding. Check raw cadence with one GIF tick of tolerance.
         if len(frames) * 1000 < preview_minimum * (total - 10):
-            why = f'preview needs at least {preview_minimum} fps; sampled {len(frames)} frames in {total / 1000:g} s'
+            why = f'preview needs at least {preview_minimum:g} fps; sampled {len(frames)} frames in {total / 1000:g} s'
         elif count < 2:
-            why = f'preview needs at least {preview_minimum} fps and more than one distinct image'
+            why = f'preview needs at least {preview_minimum:g} fps and more than one distinct image'
     if why:
         dest.unlink(missing_ok=True)
         raise GifRefused(f'gif breaks preset {spec.get("preset")}: {why}', {
@@ -647,6 +671,8 @@ def publish_gif(raw_path, dest, spec):
                'width': dimensions[0], 'fps': spec['fps']}
     if preview_minimum:
         receipt.update(frames_sampled=len(frames), sampled_fps=round(len(frames) * 1000 / total, 3))
+        if source_fps is not None:
+            receipt['source_fps'] = source_fps
     return receipt
 
 
@@ -2000,6 +2026,8 @@ class Runner:
             raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': str(error), 'preset': spec.get('preset')}) from error
         slug = re.sub(r'[^A-Za-z0-9._-]+', '-', gif['name']).strip('-') or 'clip'
         raw = self.row_dir / f'{slug}.{time.time_ns()}.capture.gif'
+        minimum = gif_preview_minimum(spec)
+        source_before = eden_source_fps(self.call(on, 'status', {})) if minimum is not None else None
         self.call(on, 'recording.start', {'path': str(raw), 'fps': spec['fps'], 'width': spec['width'],
                                           'duration_ms': int(spec['max_duration_s'] * 1000)})
         nested = []
@@ -2018,7 +2046,13 @@ class Runner:
         if not raw.is_file():
             why = 'Eden wrote no gif'
             raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
-        info = publish_gif(raw, dest, spec)
+        source_fps = None
+        if (source_before is not None and source_before < minimum
+                and isinstance(status, dict) and status.get('dropped_frames') == 0):
+            source_after = eden_source_fps(self.call(on, 'status', {}))
+            if source_after is not None and source_after < minimum:
+                source_fps = max(source_before, source_after)
+        info = publish_gif(raw, dest, spec, source_fps)
         info['steps'] = nested
         info['preset'] = spec['preset']
         if spec.get('reason'):
@@ -2046,7 +2080,7 @@ class Runner:
                                                               'preset': spec.get('preset')})
         label = json.dumps({'gif': gif.get('name'), 'preset': spec['preset'], 'out': gif.get('out'),
                             'width': spec['width'], 'fps': spec['fps'], 'max_duration_s': spec['max_duration_s'],
-                            'max_bytes': spec.get('max_bytes')}, separators=(',', ':'))
+                            'max_bytes': spec.get('max_bytes'), 'scene': spec['scene']}, separators=(',', ':'))
         start = self.session_mark('gif-start', row.get('id'), label=label, force=True)
         nested = []
         try:
