@@ -766,6 +766,11 @@ _TRAINING_CSS_SETTLING = {**_UNOWNED_FOCUS, 'screen': 'css.training', 'focus': '
 GAMES_TRAINING = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'submenu',
                   'screen.tab': 'games_and_more', 'focus.source': 'native', 'focus.id': 'training',
                   'focus': 'main_menu.submenu.training'}
+_GAMES_TRAINING_SETTLING = {
+    **_UNOWNED_FOCUS,
+    'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
+    'focus': 'main_menu.submenu', 'screen.context': 'unknown',
+}
 
 
 def _main_tab(tab):
@@ -1191,22 +1196,25 @@ def back_to_main(ctx, presses=10):
         native_picker.same_epoch(state, next_state, in_flight=True)
         state = next_state
 
+    # With Instant Back the CSS hold can return directly to Games & More.
+    # Its unowned shell grants no further input until the Training row qualifies.
     return_edges = (
-        (TRAINING_CSS, TRAINING_SSS, 'leave-css', 'css'),
-        (TRAINING_SSS, GAMES_TRAINING, 'tap-b1', 'sss'),
-        (GAMES_TRAINING, MAIN_TOP, 'tap-b1', 'games_and_more'),
+        (TRAINING_CSS, TRAINING_SSS, 'leave-css', 'css',
+         (*_TRAINING_SSS_SETTLING, _GAMES_TRAINING_SETTLING), (GAMES_TRAINING,)),
+        (TRAINING_SSS, GAMES_TRAINING, 'tap-b1', 'sss', (_GAMES_TRAINING_SETTLING,), ()),
+        (GAMES_TRAINING, MAIN_TOP, 'tap-b1', 'games_and_more', (), ()),
     )
     for _ in range(presses):
         if _main_top(state):
             return _save(ctx, 'routes-back-to-main', {'looks': looks, **_navigation_receipt(state)})
-        for source, target, macro, label in return_edges:
+        for source, target, macro, label, pending, additional_targets in return_edges:
             if _fields_match(state, source):
                 break
         else:
             raise _missing_navigation_state('back_to_main', state, 'qualified Training return owner')
         _, state = _watched_native_input(io, state, source, target, macro, time.monotonic() + 9,
                                          route='Training return', scene_change=True,
-                                         pending_destinations=_TRAINING_SSS_SETTLING if target is TRAINING_SSS else ())
+                                         pending_destinations=pending, additional_targets=additional_targets)
         looks.append(label)
         io.finish()
     if _main_top(state):
@@ -1411,7 +1419,7 @@ def _armed_native_sample(io, initial, until, route, *, settling=False):
 
 
 def _watched_native_input(io, initial, source, target, macro, until, *, route='Main Menu', scene_change=False,
-                          settling=False, pending_destinations=()):
+                          settling=False, pending_destinations=(), additional_targets=()):
     source_focus = source.get('focus', source.get('focus.id', source['screen']))
     if not _fields_match(initial, source):
         raise RuntimeError(f'{route} source must be native focus {source_focus!r}')
@@ -1423,6 +1431,7 @@ def _watched_native_input(io, initial, source, target, macro, until, *, route='M
     if scene_change:
         return before, native_picker.wait_scene_transition(
             io, before, until, source, target, label=route, pending_destinations=pending_destinations,
+            additional_targets=additional_targets,
         )
     state = before
     while True:

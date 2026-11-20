@@ -203,6 +203,23 @@ class BridgeNavigationTests(unittest.TestCase):
         self.assertEqual(self.last_ui, MAIN)
         self.assert_no_images()
 
+    def test_instant_back_can_skip_stage_select_on_training_css_exit(self):
+        self.scene = CSS
+        self.transition_samples['leave-css'] = ui(
+            'main_menu', tab='games_and_more', layer='submenu',
+            owner='unknown', dialog='unknown')
+        self.edges = [
+            (CSS, ('leave-css',), TRAINING_ITEM),
+            (TRAINING_ITEM, ('tap-b1',), MAIN),
+        ]
+
+        result = routes.back_to_main(self.ctx)
+
+        self.assertEqual(result['looks'], ['css', 'games_and_more'])
+        self.assertFalse(self.edges)
+        self.assertEqual(self.last_ui, MAIN)
+        self.assert_no_images()
+
     def test_unknown_boot_returns_without_input(self):
         self.scene = UNKNOWN
         self.ctx.gate.side_effect = RuntimeError('old visual gate found no Main menu')

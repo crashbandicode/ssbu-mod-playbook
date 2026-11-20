@@ -133,9 +133,13 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=
     raise RuntimeError(f'{provider}: no newer active observation')
 
 
-def wait_scene_transition(io, before, until, source, target, *, label, pending_destinations=()):
+def wait_scene_transition(io, before, until, source, target, *, label, pending_destinations=(),
+                          additional_targets=()):
     """Wait for one already-sent scene-changing input, on the fenced connection."""
-    destination = {key: value for key, value in target.items() if key not in ('dialog', 'input.owner')}
+    destinations = [
+        (candidate, {key: value for key, value in candidate.items() if key not in ('dialog', 'input.owner')})
+        for candidate in (target, *additional_targets)
+    ]
     passive_source = {**source, 'dialog': 'unknown', 'input.owner': 'unknown'}
     previous = before
     departed = False
@@ -168,11 +172,12 @@ def wait_scene_transition(io, before, until, source, target, *, label, pending_d
                for pending in pending_destinations):
             departed = True
             continue
-        if (all(values.get(key) == value for key, value in destination.items())
-                and values['input.owner'] in ('native', 'unknown')
+        matched = next((candidate for candidate, destination in destinations
+                        if all(values.get(key) == value for key, value in destination.items())), None)
+        if (matched is not None and values['input.owner'] in ('native', 'unknown')
                 and values['dialog'] in ('none', 'unknown')
                 and values['focus'] != before.values['focus']):
-            if observation > prior_observation and all(values[key] == value for key, value in target.items()):
+            if observation > prior_observation and all(values[key] == value for key, value in matched.items()):
                 return state
             departed = True
             continue
