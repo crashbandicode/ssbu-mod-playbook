@@ -176,7 +176,10 @@ def wait_scene_transition(io, before, until, source, target, *, label, pending_d
             departed = True
             continue
         expected = target.get('focus', target.get('focus.id', target['screen']))
-        raise RuntimeError(f'unexpected {label} focus {values["focus"]!r}; expected {expected!r}')
+        details = ', '.join(f'{key}={values.get(key, "missing")}' for key in (
+            'screen', 'screen.context', 'input.owner', 'dialog', 'focus.source', 'focus.id'))
+        raise RuntimeError(f'unexpected {label} focus {values["focus"]!r}; expected {expected!r}. '
+                           f'Last {UI}: {details}')
     raise RuntimeError(f'{UI}: no newer qualified {label} scene transition')
 
 

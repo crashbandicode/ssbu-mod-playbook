@@ -198,6 +198,21 @@ class BridgeNavigationTests(unittest.TestCase):
         self.assertFalse(self.actions)
         self.assert_no_images()
 
+    def test_switch_training_route_ends_on_qualified_training_without_an_image_gate(self):
+        ctx = self.ctx
+        self.enterContext(patch.object(routes, 'on_switch', return_value=True))
+        self.enterContext(patch.object(routes, 'main_to_stage', return_value={'screen': 'stage'}))
+        self.enterContext(patch.object(routes, 'pick_stage_hw'))
+        self.enterContext(patch.object(routes, 'confirm_pick'))
+        self.enterContext(patch.object(routes, 'ensure_local_fighter_placed', return_value={'kind': 78}))
+        entered = {'screen': 'training'}
+        self.enterContext(patch.object(routes, 'enter_training', return_value=entered))
+
+        result = routes.switch_to_training(ctx, p1='Steve')
+
+        self.assertEqual(result['training'], entered)
+        self.assert_no_images()
+
     def test_training_overlay_refuses_return_input(self):
         self.scene = TR_OVERLAY
         self.ctx.gate.side_effect = RuntimeError('old visual gate found no matching screen')

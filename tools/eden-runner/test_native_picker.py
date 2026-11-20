@@ -926,6 +926,12 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         if focus == 'stage_select':
             return native(rev, screen='stage_select', focus='stage_select', dialog='none',
                           **{'screen.context': 'training'})
+        if focus.startswith('stage_pending:'):
+            context = focus.partition(':')[2]
+            return native(rev, screen='stage_select', focus='stage_select', dialog='unknown', **{
+                'screen.context': context, 'input.owner': 'unknown',
+                **dict.fromkeys(('focus.id', 'focus.index', 'focus.label'), 'unknown'),
+            })
         if focus == 'submenu_pending':
             # v9 rev 3361 confirmed the new layer before it had any item focus.
             return native(rev, screen='main_menu', focus='main_menu.submenu', **{
@@ -939,7 +945,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                          'focus.id': focus, 'focus.source': 'native'})
 
     def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None, submenu_loading=False,
-                  submenu_rearm=False, submenu_pending=False, tile_samples=None):
+                  submenu_rearm=False, submenu_pending=False, tile_samples=None, stage_pending=None):
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -950,6 +956,8 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         for source, target in zip(focuses, focuses[1:]):
             frames.extend((source, target))
         frames.append('stage_select')
+        if stage_pending is not None:
+            frames.insert(-2, f'stage_pending:{stage_pending}')
         if submenu_pending:
             frames[2:2] = [None, 'submenu_pending', None, 'submenu_pending']
         if submenu_loading:
@@ -1011,6 +1019,22 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                          {'screen': 'stage', 'proof': 'stage_select'})
         self.assertEqual([c.args[0] for c in io.read.call_args_list][-4:],
                          ['tile.cursor', 'tile.cursor', 'tile.cursor', 'ssbu.ui'])
+        io.send.assert_called_once_with('tap-a1')
+
+    def test_stage_shell_waits_for_training_context_and_owner_with_no_more_input(self):
+        from unittest.mock import Mock
+
+        io = Mock()
+        self.assertEqual(self.run_route(io, 3, stage_pending='unknown'),
+                         {'screen': 'stage', 'proof': 'stage_select'})
+        io.send.assert_called_once_with('tap-a1')
+
+    def test_stage_shell_refuses_conflicting_smash_context(self):
+        from unittest.mock import Mock
+
+        io = Mock()
+        with self.assertRaisesRegex(RuntimeError, 'expected'):
+            self.run_route(io, 3, stage_pending='smash')
         io.send.assert_called_once_with('tap-a1')
 
     def test_stage_arrival_refuses_changed_connection_or_stale_tile_while_waiting(self):
@@ -1162,7 +1186,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         lost_owner = self.checkpoint(4, 'stage_select')
         lost_owner.values['input.owner'] = 'unknown'
         for index, state, reason in (
-            (2, wrong_parent, 'unexpected Main Menu focus'),
+            (2, wrong_parent, 'screen.context=local_wireless'),
             (3, lost_owner, 'Stage Select ownership changed'),
         ):
             with self.subTest(phase=index):

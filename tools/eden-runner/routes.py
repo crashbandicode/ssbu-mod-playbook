@@ -1473,7 +1473,14 @@ def _native_main_to_stage(ctx):
              'dialog': 'none', 'focus.source': native_picker.TILE}
     source, macro = checkpoints[-1]
     until = time.monotonic() + 45
-    _, selected = _watched_native_input(io, state, source, stage, macro, until, scene_change=True)
+    pending_stage = {
+        'screen': 'stage_select', 'focus': 'stage_select',
+        **dict.fromkeys(('screen.context', 'input.owner', 'dialog',
+                         'focus.id', 'focus.index', 'focus.label'), 'unknown'),
+    }
+    _, selected = _watched_native_input(io, state, source, stage, macro, until,
+                                        route='Training Stage Select', scene_change=True,
+                                        pending_destination=pending_stage)
     native_picker.wait_stage_tile(io, selected, until)
     active = native_picker.wait_sample(io, native_picker.UI, until, selected, in_flight=True)
     if not _fields_match(active, stage):
@@ -1657,7 +1664,6 @@ def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=No
         ctx, p1 or ctx.instance.get('native_training_fighter'),
         topology=fighter_topology or ctx.instance.get('native_css_topology'), expected_context='training')
     out['training'] = enter_training(ctx)
-    out['preload'] = preload_clear(ctx)
     return _save(ctx, 'routes-switch-training', out)
 
 def _wait_tr_menu(io, until, opened, after=None):
