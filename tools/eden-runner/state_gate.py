@@ -41,12 +41,14 @@ def unquote(value):
 
 
 def blocks(text, provider):
-    """Every complete, valid block of `provider` in `text`, oldest first: dicts with rev, boot, schema and values."""
+    """Every complete, valid block of `provider` in `text` after its last connection boundary, oldest first: dicts with
+    rev, boot, schema and values. A hello or reconnect drops everything before it, complete blocks included, so no
+    pre-reconnect result can satisfy a gate (review-bridge-astra 23:32Z)."""
     out, cur = [], None
     for raw in text.splitlines():
         line = SUFFIX.sub('', raw)
         if BOUNDARY.search(line):
-            cur = None
+            out, cur = [], None
             continue
         m = BEGIN.search(line)
         if m:

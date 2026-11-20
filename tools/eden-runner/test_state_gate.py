@@ -168,6 +168,14 @@ class ReviewNegativeTests(unittest.TestCase):
                  'uptime_ms=5 reconnects=0 event_latest=0 state_api=1 frame=1 wall=2\n')
         self.assertEqual(sg.blocks(head + hello + '[Bridge] state end' + tail, 'tr.menu'), [])
 
+    def test_a_complete_block_then_a_new_hello_leaves_nothing(self):
+        before = block(6, menu(ack='4'))
+        hello = ('[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=x port=6970 guards=0x3fffff boot=0x00cd '
+                 'uptime_ms=5 reconnects=0 event_latest=0 state_api=1 frame=1 wall=2\n')
+        self.assertEqual(sg.blocks(before + hello, 'tr.menu'), [], 'a pre-hello block never answers')
+        after = block(1, menu(ack='0'), boot='0x00cd')
+        self.assertEqual([b['rev'] for b in sg.blocks(before + hello + after, 'tr.menu')], [1])
+
     def test_a_multibyte_character_cut_at_a_part_boundary_reassembles(self):
         row = 'rows="' + 'x' * 393 + '\u00b7' + 'y' * 50 + '"'
         raw = row.encode()
@@ -197,6 +205,78 @@ class ReviewNegativeTests(unittest.TestCase):
         switch_hw.link_line(link, b'[TrainingRooms] x ev=7 frame=1 wall=2')
         switch_hw.link_line(link, hello.replace(b'0x00ab', b'0x00cd'))
         self.assertEqual(link.pop('resume'), b'events on\n', 'a new boot never replays the old cursor')
+
+
+HELLO = ('[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=x port=6970 guards=0x3fffff boot=0x00000000000000ab '
+         'uptime_ms=5 reconnects=1 event_latest=0 state_api=1 frame=1 wall=2\n')
+
+
+class RunnerEntryTests(unittest.TestCase):
+    """The runner's own state_baseline step and state gate (runner.py), on a bridge log the fake capture appends to."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        import runner
+        import switch_hw
+        self.dir = tempfile.TemporaryDirectory()
+        self.log = Path(self.dir.name) / 'bridge.log'
+        self.log.write_text('')
+        self.replies = []
+
+        def answer(run, request):  # the capture's reply to `state tr.menu`: the next scripted text, once
+            if self.replies:
+                with self.log.open('a') as f:
+                    f.write(self.replies.pop(0))
+        patcher = mock.patch.object(switch_hw, 'bridge_v2', side_effect=answer)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.dir.cleanup)
+        r = runner.Runner.__new__(runner.Runner)
+        r.instances = {'tr': {'bridge_log': str(self.log)}}
+        r.current_row = {'id': 'row-a'}
+        r.log = lambda record: None
+        r.check_stop = lambda: None
+        self.r = r
+
+    def baseline(self, text):
+        self.replies.append(text)
+        return self.r._step_state_baseline('tr', {'state_baseline': 'tr.menu', 'cap': 2})
+
+    def gate(self, text, **spec):
+        self.replies.append(text)
+        gate = {'kind': 'state', 'provider': 'tr.menu', **spec}
+        return self.r.state_gate('tr', 'g', gate, time.monotonic() + 1.5)
+
+    def test_a_focus_change_after_the_baseline_passes(self):
+        self.baseline(block(5, MENU))
+        out = self.gate(block(6, menu(focus='fighters_stages/-/23/game.2')), where={'open': 1}, transition='focus')
+        self.assertEqual(out['rev'], 6)
+
+    def test_a_complete_block_before_a_new_hello_never_satisfies_the_gate(self):
+        self.baseline(block(5, MENU))
+        good = block(6, menu(focus='fighters_stages/-/23/game.2'))
+        with self.assertRaisesRegex(RuntimeError, 'did not pass'):
+            self.gate(good + HELLO, where={'open': 1}, transition='focus')
+
+    def test_a_notice_only_rev_bump_fails_an_input_gate(self):
+        self.baseline(block(5, MENU))
+        with self.assertRaisesRegex(RuntimeError, 'focus did not change'):
+            self.gate(block(6, MENU + ['notice.body="Eggs 1"']), where={'open': 1}, transition='focus')
+
+    def test_a_where_only_input_gate_fails_and_needs_a_baseline(self):
+        with self.assertRaisesRegex(RuntimeError, 'needs a state_baseline'):
+            self.gate(block(6, MENU), where={'open': 1}, input=True)
+        self.baseline(block(5, MENU))
+        with self.assertRaisesRegex(RuntimeError, 'did not pass'):
+            self.gate(block(6, menu(focus='x/-/1/y')), where={'open': 1}, input=True)
+
+    def test_a_baseline_never_carries_into_another_row(self):
+        self.baseline(block(5, MENU))
+        self.r.current_row = {'id': 'row-b'}
+        with self.assertRaisesRegex(RuntimeError, 'needs a state_baseline'):
+            self.gate(block(6, menu(focus='fighters_stages/-/23/game.2')), where={'open': 1}, transition='focus')
 
 
 if __name__ == '__main__':
