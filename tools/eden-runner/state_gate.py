@@ -135,7 +135,16 @@ def satisfies(block, where, baseline=None, transition=None, ack=None, input_gate
     except ValueError:
         delta = None
     one_ack = delta == 1 and values.get('ack.result') == 'handled'
-    if focus_moved or one_ack:
+    if delta is not None and delta > 1:
+        return False, f'the ack moved {delta}: more than the one press this gate confirms'
+    if transition == 'focus':
+        # A focus-gated move: the focus must move (pin its destination in `where`); an ack alone never confirms it.
+        if focus_moved:
+            return True, 'focus moved'
+    elif ack is not None:
+        if one_ack:
+            return True, 'one handled ack'
+    elif focus_moved or one_ack:
         return True, 'focus moved' if focus_moved else 'one handled ack'
     if not was:
         return False, 'baseline focus missing and no single handled ack'
