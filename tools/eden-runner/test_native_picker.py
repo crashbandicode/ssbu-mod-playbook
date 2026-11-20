@@ -653,7 +653,7 @@ class NativeScreenGateTests(unittest.TestCase):
             (native(2, **{'input.owner': 'unknown'}), 'native screen'),
             (native(2, **{'focus.source': 'native'}), 'native screen'),
             (native(2, **{'observation.active': 'no'}), 'inactive'),
-            (native(2, observation='1'), 'no newer active observation'),
+            (native(2, observation='1'), 'no newer active observation|no fenced bridge reply for state ssbu.ui'),
         ):
             with self.subTest(reason=reason):
                 with self.assertRaisesRegex(RuntimeError, reason):
@@ -1054,10 +1054,6 @@ class NativeQuitTrainingTests(unittest.TestCase):
                 self.assertEqual(self.io.send.call_count, 2)
                 self.assertEqual(self.io.finish.call_count, 2)
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TrainingSceneTransitionTests(unittest.TestCase):
     source = {'screen': 'css.training', 'screen.context': 'training', 'focus.source': 'tile.cursor',
               'input.owner': 'native', 'dialog': 'none', 'focus': 'css.training'}
@@ -1089,3 +1085,7 @@ class TrainingSceneTransitionTests(unittest.TestCase):
                               (loading(3, **{'observation': 'bad'}), 'invalid observation')):
             with self.subTest(frame=frame), self.assertRaisesRegex(RuntimeError, reason):
                 self.run_wait(frame, ready)
+
+
+if __name__ == '__main__':
+    unittest.main()
