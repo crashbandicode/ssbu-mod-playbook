@@ -861,7 +861,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                          'focus.id': focus, 'focus.source': 'native'})
 
     def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None, submenu_loading=False,
-                  submenu_rearm=False):
+                  submenu_rearm=False, tile_samples=None):
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -882,7 +882,8 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
             samples[index] = state
         samples[-2:-2] = loading_frames
         ui = iter(samples)
-        active_tile = snapshot('tile.cursor', 10, {'screen': 'sss', 'focus': 'sss'})
+        active_tile = self.stage_tile(10)
+        tiles = iter(tile_samples) if tile_samples is not None else None
         if tile_state is None:
             tile_state = active_tile
 
@@ -892,7 +893,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
             self.assertEqual(provider, 'tile.cursor')
             if isinstance(tile_state, RuntimeError):
                 raise tile_state
-            return tile_state
+            return next(tiles) if tiles is not None else tile_state
 
         io.connection = 1
         io.boot = samples[0].clock[0]
@@ -900,6 +901,53 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         ctx = SimpleNamespace(instance={'bridge_log': 'fixture'})
         with patch.object(routes, 'BridgePickerIO', return_value=io):
             return routes.main_to_stage(ctx)
+
+    @staticmethod
+    def stage_tile(rev, epoch=1, **overrides):
+        grid = 'sss.9892b3a32e5c0164'
+        return snapshot('tile.cursor', rev, {
+            'screen': 'sss', 'focus': 'sss.grid.normal', 'layout': grid, 'grid': grid,
+            'at': '0', 'hovered': '0', 'settled': '1', 'generation': '2', 'ack': '0',
+            'applied': '0', 'controller': '0', 'seat': '0', 'carried': '0', 'local.token': 'held',
+            'kind': '308', 'name': 'Training', 'form': 'normal',
+            **dict.fromkeys(('ack.result', 'result', 'direction', 'from', 'to', 'settled.ack'), 'unknown'),
+            **overrides,
+        }, epoch)
+
+    @classmethod
+    def entering_tile(cls, rev=4, **overrides):
+        # Final XPS reply at frame 1364 followed native Stage Select ownership.
+        unknown = dict.fromkeys(('focus', 'layout', 'hovered', 'kind', 'name', 'form',
+                                 'controller', 'seat', 'carried', 'local.token'), 'unknown')
+        return cls.stage_tile(rev, **{**unknown, 'settled': '0', 'observation': '18', **overrides})
+
+    def test_stage_arrival_waits_for_qualified_tile_with_no_more_input(self):
+        from unittest.mock import Mock
+
+        io = Mock()
+        pending = self.entering_tile()
+        ready = self.stage_tile(5, observation='20')
+        self.assertEqual(self.run_route(io, 3, tile_samples=(pending, pending, ready)),
+                         {'screen': 'stage', 'proof': 'stage_select'})
+        self.assertEqual([c.args[0] for c in io.read.call_args_list][-4:],
+                         ['tile.cursor', 'tile.cursor', 'tile.cursor', 'ssbu.ui'])
+        io.send.assert_called_once_with('tap-a1')
+
+    def test_stage_arrival_refuses_changed_connection_or_stale_tile_while_waiting(self):
+        from unittest.mock import Mock
+
+        pending = self.entering_tile()
+        for sample, error in (
+            (self.stage_tile(5, epoch=2, observation='20'), 'connection'),
+            (self.stage_tile(5, observation='17'), 'stale'),
+            (self.stage_tile(5, observation='20', layout='unknown'), 'no qualified active tile layout'),
+        ):
+            with self.subTest(error=error):
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.run_route(io, 3, tile_samples=(pending, sample))
+                io.send.assert_called_once_with('tap-a1')
+                io.finish.assert_not_called()
 
     def test_cold_route_and_each_supported_submenu_checkpoint(self):
         from unittest.mock import Mock, call
