@@ -908,7 +908,8 @@ def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=N
     entry = stage_entry(stage)
     if _use_native_pick(ctx):
         io = BridgePickerIO(ctx)
-        prepared = native_picker.hover(io, 'sss', _native_target(entry, form), _tile_topology(topology))
+        prepared = native_picker.hover(io, 'sss', _native_target(entry, form), _tile_topology(topology),
+                                       expected_context=_stage_pick_context(next_screen))
         return _finish_native_pick(ctx, io, 'sss', prepared, entry, next_screen, transition_cap)
     if not entry.get('proven') and not allow_derived:
         raise RuntimeError(f'stage {entry["name"]} tile {entry["tile"]} is derived, not proven; pass allow_derived '
@@ -1478,7 +1479,7 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
     io = BridgePickerIO(ctx)
     until = time.monotonic() + cap
     initial = native_picker.wait_sample(io, native_picker.UI, until)
-    before, state = _watched_menu_input(io, initial, source, target, f'main-menu-{direction}', until)
+    before, state = _watched_native_input(io, initial, source, target, f'main-menu-{direction}', until)
     io.finish()
     return _save(ctx, 'routes-main-menu-step', {
         'direction': direction, 'from_focus': from_focus, 'to_focus': to_focus,
@@ -1487,29 +1488,39 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
     })
 
 
-def _watched_menu_input(io, initial, source, target, macro, until):
-    if not _fields_match(initial, source):
-        raise RuntimeError(f'Main Menu source must be native focus {source["focus"]!r}')
+def _armed_native_sample(io, initial, until, route):
     remaining = until - time.monotonic()
     if remaining <= 0:
-        raise RuntimeError('Main Menu source deadline expired before arming ssbu.ui')
+        raise RuntimeError(f'{route} source deadline expired before arming ssbu.ui')
     io.arm(native_picker.UI, remaining)
     if io.connection != initial.connection or io.boot != initial.clock[0]:
-        raise RuntimeError('bridge connection or boot changed while arming Main Menu watch')
+        raise RuntimeError(f'bridge connection or boot changed while arming {route} watch')
     before = native_picker.wait_sample(io, native_picker.UI, until, initial)
-    if before.connection != initial.connection or not _fields_match(before, source):
-        raise RuntimeError(f'Main Menu source changed before {macro!r} at {source["focus"]!r}')
+    if before.connection != initial.connection:
+        raise RuntimeError(f'bridge connection changed before {route} input')
+    return before
+
+
+def _watched_native_input(io, initial, source, target, macro, until, *, route='Main Menu', scene_change=False):
+    source_focus = source.get('focus', source.get('focus.id', source['screen']))
+    if not _fields_match(initial, source):
+        raise RuntimeError(f'{route} source must be native focus {source_focus!r}')
+    before = _armed_native_sample(io, initial, until, route)
+    if not _fields_match(before, source):
+        raise RuntimeError(f'{route} source changed before {macro!r} at {source_focus!r}')
 
     io.send(macro)
+    if scene_change:
+        return before, native_picker.wait_scene_transition(io, before, until, source, target, label=route)
     state = before
     while True:
         state = native_picker.wait_sample(io, native_picker.UI, until, state, in_flight=True)
         if _fields_match(state, target) and state.values['focus'] != before.values['focus']:
             return before, state
         if not _fields_match(state, source):
-            expected = target.get('focus', target['screen'])
-            raise RuntimeError(f'unexpected Main Menu focus {state.values["focus"]!r} after {macro!r}; '
-                               f'expected {expected!r} with qualified owner')
+            expected = target.get('focus', target.get('focus.id', target['screen']))
+            raise RuntimeError(f'unexpected {route} focus {state.values["focus"]!r} after {macro!r}; '
+                               f'expected {expected!r}')
 
 
 def _native_main_to_stage(ctx):
@@ -1534,14 +1545,14 @@ def _native_main_to_stage(ctx):
         raise RuntimeError('Training entry needs a native Games & More source or supported submenu focus')
 
     for (source, macro), (target, _) in zip(checkpoints[index:], checkpoints[index + 1:]):
-        _, state = _watched_menu_input(io, state, source, target, macro, time.monotonic() + 5)
+        _, state = _watched_native_input(io, state, source, target, macro, time.monotonic() + 5)
         io.finish()
 
     stage = {'screen': 'stage_select', 'screen.context': 'training', 'input.owner': 'native',
              'dialog': 'none', 'focus.source': native_picker.TILE}
     source, macro = checkpoints[-1]
     until = time.monotonic() + 45
-    _, selected = _watched_menu_input(io, state, source, stage, macro, until)
+    _, selected = _watched_native_input(io, state, source, stage, macro, until, scene_change=True)
     tile = native_picker.wait_sample(io, native_picker.TILE, until)
     native_picker.same_epoch(selected, tile, in_flight=True)
     if tile.values.get('screen') != 'sss':
@@ -1553,42 +1564,59 @@ def _native_main_to_stage(ctx):
     return {'screen': 'stage', 'proof': active.values['focus']}
 
 
+def quit_training(ctx, cap=45):
+    """Open native Training Pause, focus Quit, and prove the return to Training CSS."""
+    owner = {'screen.context': 'training', 'input.owner': 'native', 'dialog': 'none'}
+    training = {**owner, 'screen': 'training'}
+    pause = {**owner, 'screen': 'pause', 'focus.source': 'native'}
+    cpu = {**pause, 'focus.id': 'cpu_count'}
+    quit_focus = {**pause, 'focus.id': 'quit_training'}
+    css = {'screen': 'css.training', 'screen.context': 'training', 'focus.source': native_picker.TILE}
+    transitions = (
+        (training, cpu, 'pause-open'),
+        (cpu, quit_focus, 'focus-native-quit-frames'),
+        (quit_focus, css, 'confirm-native-quit-frames'),
+    )
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + cap
+    state = native_picker.wait_sample(io, native_picker.UI, until)
+    for source, target, macro in transitions:
+        _, state = _watched_native_input(io, state, source, target, macro, until, route='Training',
+                                         scene_change=target is css)
+        io.finish()
+    boot, revision, observation = state.clock
+    return _save(ctx, 'routes-quit-training', {
+        'screen': state.values['screen'], 'proof': state.values['focus'],
+        'boot': boot, 'revision': revision, 'observation': observation,
+    })
+
+
 def _fields_match(state, criteria):
     return all(state.values.get(key) == value for key, value in criteria.items())
-
-
-def _wait_native_focus(io, before, criteria, cap=45, *, finish=True):
-    until = time.monotonic() + cap
-    previous = before
-    while True:
-        state = native_picker.wait_sample(io, native_picker.UI, until, previous, in_flight=True)
-        previous = state
-        if _fields_match(state, criteria) and state.values['focus'] != before.values['focus']:
-            if finish:
-                io.finish()
-            return state
-        if state.values['focus'] != before.values['focus']:
-            raise RuntimeError(f'unexpected native focus {state.values["focus"]!r}')
 
 
 def _native_enter_training(ctx, cap, stage_ids):
     io = BridgePickerIO(ctx)
     until = time.monotonic() + 5
     ui = native_picker.wait_sample(io, native_picker.UI, until)
+    native_picker.native_input_owner(ui, 'css', expected_context='training')
     tile = native_picker.wait_sample(io, native_picker.TILE, until)
-    ui = native_picker.wait_sample(io, native_picker.UI, until, ui)
-    native_picker.native_owner(ui, 'css')
     native_picker.same_epoch(ui, tile, in_flight=True)
+    ui = _armed_native_sample(io, ui, until, 'Training')
+    native_picker.native_input_owner(ui, 'css', expected_context='training')
     tile = native_picker.wait_sample(io, native_picker.TILE, until, tile)
     native_picker.same_epoch(ui, tile, in_flight=True)
     native_picker.context(tile, 'css')
-    if ui.values['screen'] != 'css.training' or tile.values.get('local.token') != 'placed' or tile.values.get('carried') != 'none':
+    if tile.values.get('local.token') != 'placed' or tile.values.get('carried') != 'none':
         raise RuntimeError('Training entry needs a verified, placed local fighter')
     native_picker.number(tile, 'placed.at')
     native_picker.Target.read(tile, 'placed.')
+    owner = {'screen.context': 'training', 'input.owner': 'native', 'dialog': 'none'}
+    source = {**owner, 'screen': 'css.training', 'focus.source': native_picker.TILE, 'focus': ui.values['focus']}
+    live = {**owner, 'screen': 'training'}
     io.mark_training_stage(ui, 5)
     io.send('enter-training')
-    after = _wait_native_focus(io, ui, {'screen': 'training', 'input.owner': 'native'}, cap, finish=False)
+    after = native_picker.wait_scene_transition(io, ui, time.monotonic() + cap, source, live, label='native')
     stage_id = expected(ctx).get('stage_id')
     if stage_ids is None and stage_id is not None:
         stage_ids = {stage_id}
@@ -1624,19 +1652,27 @@ def _native_target(entry, form):
     return native_picker.Target(str(entry.get('kind', entry.get('id'))), entry['name'], form)
 
 
+def _stage_pick_context(next_screen):
+    return 'training' if next_screen == 'css.training' else None
+
+
 def _native_prepare(ctx, screen, entry, topology, form, next_screen):
     # The checkpoint lives only in the current runner and console instance.
     pending = getattr(ctx.runner, 'native_picks', {})
     pending.pop(ctx.on, None)
     ctx.runner.native_picks = pending
     io = BridgePickerIO(ctx)
-    prepared = native_picker.hover(io, screen, _native_target(entry, form), _tile_topology(topology))
+    prepared = native_picker.hover(io, screen, _native_target(entry, form), _tile_topology(topology),
+                                   expected_context=_stage_pick_context(next_screen))
     pending[ctx.on] = (io, screen, prepared, entry, next_screen)
     return {'expect': entry['name'], 'kind': prepared[2].kind, 'tile': prepared[0].values['at']}
 
 
-def _finish_native_pick(ctx, io, screen, prepared, entry, next_screen, transition_cap):
-    result = native_picker.confirm(io, screen, prepared, next_screen=next_screen, transition_cap=transition_cap)
+def _finish_native_pick(ctx, io, screen, prepared, entry, next_screen, transition_cap, *, expected_context=None):
+    if screen == 'sss':
+        expected_context = _stage_pick_context(next_screen)
+    result = native_picker.confirm(io, screen, prepared, next_screen=next_screen, transition_cap=transition_cap,
+                                   expected_context=expected_context)
     if screen == 'sss':
         remember(ctx, stage_id=entry['id'], stage=entry['name'], tile=int(result['tile']))
     elif result['seat'] == '0':
@@ -1665,30 +1701,31 @@ def confirm_pick(ctx, expect, transition_cap=60):
     return _finish_native_pick(ctx, *pending, transition_cap)
 
 
-def pick_local_fighter(ctx, fighter, *, topology=None, form='default', take_back=False):
+def pick_local_fighter(ctx, fighter, *, topology=None, form='default', take_back=False, expected_context=None):
     """Pick and verify the local controller's fighter, including a Local Wireless guest's native P2."""
     entry = fighter_entry(fighter)
     io = BridgePickerIO(ctx)
     target = _native_target(entry, form)
     topology = _tile_topology(topology)
     if take_back:
-        result = native_picker.acquire_local_token(io, target, topology)
+        result = native_picker.acquire_local_token(io, target, topology, expected_context=expected_context)
         if result is not None:
             if result['seat'] == '0':
                 remember(ctx, p1_kind=entry['kind'], p1=entry['name'])
             return _save(ctx, 'routes-confirm-pick', result)
-    prepared = native_picker.hover(io, 'css', target, topology)
-    return _finish_native_pick(ctx, io, 'css', prepared, entry, None, 60)
+    prepared = native_picker.hover(io, 'css', target, topology, expected_context=expected_context)
+    return _finish_native_pick(ctx, io, 'css', prepared, entry, None, 60, expected_context=expected_context)
 
 
-def ensure_local_fighter_placed(ctx, fighter=None, *, topology=None):
+def ensure_local_fighter_placed(ctx, fighter=None, *, topology=None, expected_context=None):
     """Verify a retained local medal or confirm the settled native choice."""
     if fighter is not None:
-        return pick_local_fighter(ctx, fighter, topology=topology, take_back=True)
+        return pick_local_fighter(ctx, fighter, topology=topology, take_back=True,
+                                  expected_context=expected_context)
     io = BridgePickerIO(ctx)
     until = time.monotonic() + 5
     ui = native_picker.wait_sample(io, native_picker.UI, until)
-    native_picker.native_owner(ui, 'css')
+    native_picker.native_input_owner(ui, 'css', expected_context=expected_context)
     current = native_picker.wait_sample(io, native_picker.TILE, until)
     native_picker.same_epoch(ui, current, in_flight=True)
     native_picker.context(current, 'css')
@@ -1696,8 +1733,8 @@ def ensure_local_fighter_placed(ctx, fighter=None, *, topology=None):
         native_picker.number(current, 'placed.at')
         identity = native_picker.Target.read(current, 'placed.')
         return {'name': identity.name, 'kind': identity.kind, 'form': identity.form, 'placed': True}
-    prepared = native_picker.hover(io, 'css', None)
-    return native_picker.confirm(io, 'css', prepared)
+    prepared = native_picker.hover(io, 'css', None, expected_context=expected_context)
+    return native_picker.confirm(io, 'css', prepared, expected_context=expected_context)
 
 def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=None):
     """Games & More → Training through state-checked stage selection and local placement."""
@@ -1707,7 +1744,7 @@ def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=No
     confirm_pick(ctx, 'Training')
     out['fighter'] = ensure_local_fighter_placed(
         ctx, p1 or ctx.instance.get('native_training_fighter'),
-        topology=fighter_topology or ctx.instance.get('native_css_topology'))
+        topology=fighter_topology or ctx.instance.get('native_css_topology'), expected_context='training')
     out['training'] = enter_training(ctx)
     out['preload'] = preload_clear(ctx)
     return _save(ctx, 'routes-switch-training', out)

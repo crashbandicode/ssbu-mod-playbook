@@ -76,14 +76,16 @@ def number(state, key):
     return int(text)
 
 
-def check_sample(state, provider):
+def check_sample(state, provider, *, loading_ui=False):
     block, values = state.block, state.values
+    active = values.get('observation.active') == ACTIVE[provider]
+    loading = loading_ui and provider == UI and values.get('observation.active') == 'no'
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
             or any(values.get(key) != str(block[key]) for key in ('schema', 'boot', 'rev'))
-            or values.get('observation.active') != ACTIVE[provider] or number(state, 'observation') <= 0
-            or values.get('focus', 'unknown') in ABSENT):
+            or number(state, 'observation') <= 0
+            or not (loading or (active and values.get('focus', 'unknown') not in ABSENT))):
         raise RuntimeError(f'{provider}: incomplete, inactive or wrong-schema observation')
     return state
 
@@ -108,6 +110,47 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False):
     raise RuntimeError(f'{provider}: no newer active observation')
 
 
+def wait_scene_transition(io, before, until, source, target, *, label):
+    """Wait for one already-sent scene-changing input, on the fenced connection."""
+    fields = ('screen', 'screen.context', 'focus', 'focus.source', 'input.owner', 'dialog')
+    destination = {key: value for key, value in target.items() if key not in ('dialog', 'input.owner')}
+    previous = before
+    departed = False
+    while time.monotonic() < until:
+        state = check_sample(io.read(UI, until - time.monotonic()), UI, loading_ui=True)
+        same_epoch(previous, state, in_flight=True)
+        values = state.values
+        if (any(not values.get(key) for key in fields)
+                or values.get('ack') != '0' or values.get('ack.result') != 'unsupported'):
+            raise RuntimeError(f'{UI}: incomplete {label} scene observation')
+        _, revision, observation = state.clock
+        _, prior_revision, prior_observation = previous.clock
+        if (revision < prior_revision or observation < prior_observation
+                or (revision == prior_revision and values != previous.values)):
+            raise RuntimeError(f'{UI}: stale or contradictory {label} scene observation')
+        if revision == prior_revision:
+            continue
+        previous = state
+        if values['observation.active'] == 'no':
+            if any(values[key] != 'unknown' for key in fields):
+                raise RuntimeError(f'{UI}: contradictory inactive {label} scene observation')
+            departed = True
+            continue
+        if not departed and all(values.get(key) == value for key, value in source.items()):
+            continue
+        if (all(values.get(key) == value for key, value in destination.items())
+                and values['input.owner'] in ('native', 'unknown')
+                and values['dialog'] in ('none', 'unknown')
+                and values['focus'] != before.values['focus']):
+            if observation > prior_observation and all(values[key] == value for key, value in target.items()):
+                return state
+            departed = True
+            continue
+        expected = target.get('focus', target.get('focus.id', target['screen']))
+        raise RuntimeError(f'unexpected {label} focus {values["focus"]!r}; expected {expected!r}')
+    raise RuntimeError(f'{UI}: no newer qualified {label} scene transition')
+
+
 def native_owner(state, screen, previous=None):
     values = state.values
     if (values.get('input.owner') != 'native' or values.get('screen') not in SCENES[screen]
@@ -115,6 +158,17 @@ def native_owner(state, screen, previous=None):
         raise RuntimeError(f'{screen}: native screen does not own tile input')
     if previous is not None and values['screen'] != previous.values['screen']:
         raise RuntimeError('native screen changed during tile selection')
+
+
+def native_input_owner(state, screen, previous=None, *, expected_context=None):
+    native_owner(state, screen, previous)
+    if state.values.get('dialog') != 'none':
+        raise RuntimeError(f'{screen}: native dialog is not positively clear')
+    if expected_context is not None and (
+        state.values.get('screen.context') != expected_context
+        or (screen == 'css' and expected_context == 'training' and state.values['screen'] != 'css.training')
+    ):
+        raise RuntimeError(f'{screen}: expected native {expected_context} context')
 
 
 def context(state, screen):
@@ -154,13 +208,13 @@ def check_context(expected, current, screen):
         raise RuntimeError('tile layout, generation or local seat changed')
 
 
-def baseline(io, screen, tile=None, previous_ui=None, cap=4):
+def baseline(io, screen, tile=None, previous_ui=None, cap=4, *, expected_context=None):
     until = time.monotonic() + cap
     # The bridge maintains one watch per connection. Tile steps use that watch;
     # native ownership and transitions use separately fenced full queries.
     io.arm(TILE, cap)
     ui = wait_sample(io, UI, until, previous_ui)
-    native_owner(ui, screen, previous_ui)
+    native_input_owner(ui, screen, previous_ui, expected_context=expected_context)
     fresh = wait_sample(io, TILE, until, tile)
     if fresh.connection != ui.connection or fresh.block['boot'] != ui.block['boot']:
         raise RuntimeError('tile and native owner are from different bridge connections')
@@ -175,7 +229,7 @@ def baseline(io, screen, tile=None, previous_ui=None, cap=4):
     return fresh, ui
 
 
-def move(io, screen, before, ui, at, direction, dest, expected_tile, cap):
+def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, expected_context=None):
     until = time.monotonic() + cap
     io.send('tile-' + direction)
     prior_ack = number(before, 'ack')
@@ -199,7 +253,7 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap):
         if settled(latest, after_step=True) != dest or Target.read(latest) != expected_tile:
             raise RuntimeError('settled tile identity disagrees with the qualified topology')
         after_ui = wait_sample(io, UI, until, ui, in_flight=True)
-        native_owner(after_ui, screen, ui)
+        native_input_owner(after_ui, screen, ui, expected_context=expected_context)
         io.log({'tile_step': direction, 'from': at, 'to': dest, 'ack': ack,
                 'applied': applied, 'settled_ack': number(latest, 'settled.ack'),
                 'kind': expected_tile.kind, 'boot': latest.block['boot'], 'rev': latest.block['rev']})
@@ -207,8 +261,8 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap):
         return latest, after_ui
 
 
-def hover(io, screen, target, topology=None, cap=4):
-    current, ui = baseline(io, screen, cap=cap)
+def hover(io, screen, target, topology=None, cap=4, *, expected_context=None):
+    current, ui = baseline(io, screen, cap=cap, expected_context=expected_context)
     at = settled(current)
     if target is None or (at != 'none' and Target.read(current) == target):
         if at == 'none':
@@ -224,17 +278,20 @@ def hover(io, screen, target, topology=None, cap=4):
         raise RuntimeError('current tile identity disagrees with the qualified topology')
     while at != goal:
         direction, dest = topology.step(at, goal)
-        current, ui = baseline(io, screen, current, ui, cap)
+        current, ui = baseline(io, screen, current, ui, cap, expected_context=expected_context)
         if at != 'none' and topology.targets[at] != Target.read(current):
             raise RuntimeError('tile identity changed before input')
-        current, ui = move(io, screen, current, ui, at, direction, dest, topology.targets[dest], cap)
+        current, ui = move(io, screen, current, ui, at, direction, dest, topology.targets[dest], cap,
+                           expected_context=expected_context)
         at = dest
     return current, ui, target
 
 
-def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transition_cap=60):
+def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transition_cap=60, expected_context=None):
     previous, prior_ui, target = prepared
-    before, ui = baseline(io, screen, previous, prior_ui, cap)
+    if screen == 'sss' and next_screen == 'css.training':
+        expected_context = 'training'
+    before, ui = baseline(io, screen, previous, prior_ui, cap, expected_context=expected_context)
     if Target.read(before) != target:
         raise RuntimeError('pre-A native target identity changed')
     at = settled(before)
@@ -262,8 +319,15 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
             if settled(latest) != at or Target.read(latest) != target:
                 raise RuntimeError('tile changed before local placement')
         after = wait_sample(io, UI, until, ui, in_flight=True)
-        native_owner(after, screen, ui)
+        native_input_owner(after, screen, ui, expected_context=expected_context)
         result = {'seat': before.values['seat'], 'placed': True}
+    elif next_screen == 'css.training':
+        source = {key: ui.values[key] for key in
+                  ('screen', 'screen.context', 'input.owner', 'dialog', 'focus', 'focus.source')}
+        destination = {'screen': next_screen, 'screen.context': 'training', 'input.owner': 'native',
+                       'dialog': 'none', 'focus.source': TILE}
+        after = wait_scene_transition(io, ui, time.monotonic() + transition_cap, source, destination, label='stage')
+        result = {'screen': next_screen}
     else:
         until = time.monotonic() + transition_cap
         after = ui
@@ -283,19 +347,20 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
     return result
 
 
-def pick(io, screen, target, *, topology=None, next_screen='css.training', cap=4, transition_cap=60):
-    return confirm(io, screen, hover(io, screen, target, topology, cap),
-                   next_screen=next_screen, cap=cap, transition_cap=transition_cap)
+def pick(io, screen, target, *, topology=None, next_screen='css.training', cap=4, transition_cap=60,
+         expected_context=None):
+    return confirm(io, screen, hover(io, screen, target, topology, cap, expected_context=expected_context),
+                   next_screen=next_screen, cap=cap, transition_cap=transition_cap, expected_context=expected_context)
 
 
-def acquire_local_token(io, target, topology, cap=4):
+def acquire_local_token(io, target, topology, cap=4, *, expected_context=None):
     """Keep a qualified held token or take back this controller's placed medal with one B."""
     until = time.monotonic() + cap
     io.arm(TILE, cap)
     ui = wait_sample(io, UI, until)
     current = wait_sample(io, TILE, until)
     context(current, 'css')
-    native_owner(ui, 'css')
+    native_input_owner(ui, 'css', expected_context=expected_context)
     same_epoch(ui, current, in_flight=True)
     if current.values.get('local.token') == 'held':
         token_held(current, 'css')
@@ -310,7 +375,7 @@ def acquire_local_token(io, target, topology, cap=4):
             or list(topology.targets.values()).count(target) != 1):
         raise RuntimeError('local token takeback needs the qualified target in the active layout')
     ui = wait_sample(io, UI, until, ui)
-    native_owner(ui, 'css')
+    native_input_owner(ui, 'css', expected_context=expected_context)
     before = wait_sample(io, TILE, until, current)
     same_epoch(ui, before, in_flight=True)
     check_context(current, before, 'css')
@@ -331,7 +396,8 @@ def acquire_local_token(io, target, topology, cap=4):
             token_held(state, 'css')
             if state.values['focus'] == before.values['focus']:
                 raise RuntimeError('local token takeback did not change native focus')
-            native_owner(wait_sample(io, UI, until, ui, in_flight=True), 'css')
+            native_input_owner(wait_sample(io, UI, until, ui, in_flight=True), 'css',
+                               expected_context=expected_context)
             io.log({'local_token_taken_back': state.values['seat'], 'boot': state.block['boot'],
                     'rev': state.block['rev']})
             io.finish()

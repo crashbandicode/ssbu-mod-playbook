@@ -129,13 +129,16 @@ class BridgePickerIO:
     def read(self, provider, cap):
         fence = None
         frame = []
+        pending_reply = False
 
         def consume(line, boundary):
-            nonlocal fence
+            nonlocal fence, pending_reply
             if boundary:
                 fence = None
                 frame.clear()
             if matched := PROVIDERS_FENCE.search(line):
+                if pending_reply:
+                    raise RuntimeError(f'{provider}: overlapping fence for unfinished state reply')
                 fence = matched[1]
                 frame.clear()
                 return None
@@ -143,14 +146,24 @@ class BridgePickerIO:
                 return None
             if f'[Bridge] state name={provider} result=error ' in line:
                 raise RuntimeError(f'{provider}: {line}')
-            if state_gate.BEGIN.search(line):
+            begin = state_gate.BEGIN.search(line)
+            if begin:
+                if pending_reply:
+                    raise RuntimeError(f'{provider}: overlapping explicit state reply')
+                pending_reply = self.in_flight and begin[1] == provider and begin[6] == '0'
+                if pending_reply and begin[4] != fence:
+                    raise RuntimeError(f'{provider}: explicit state reply boot disagrees with its fence')
                 frame.clear()
-            if state_gate.BEGIN.search(line) or frame:
+            if begin or frame:
                 frame.append(line)
             if not state_gate.END.search(line):
                 return None
             found = state_gate.latest('\n'.join(frame), provider)
             frame.clear()
+            if pending_reply:
+                pending_reply = False
+                if found is None:
+                    raise RuntimeError(f'{provider}: malformed explicit state reply')
             if found and not found['filtered'] and found['boot'] == fence:
                 if self.boot is not None and fence != self.boot:
                     raise RuntimeError('native picker bridge boot changed')
