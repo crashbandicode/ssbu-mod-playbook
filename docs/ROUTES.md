@@ -49,7 +49,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
 | `wait_lines` `{lines: [[source, regex]]}` | any | each boot line is present, for example TrainingRooms' `result=installed`. Use it instead of a fixed post-load sleep. A source may be `sdmc:<path>` |
-| `to_main` | title, opening, attract demo, How to Play, or main | the main menu (library `main` gate). Start is pressed at once when the gate misses, up to 8 times |
+| `to_main` | qualified Title opening, Title prompt, How to Play skip prompt, or Main | a fresh bridge observation of native Main Menu top-tab focus |
 | `main_to_stage` | anywhere `to_main` handles | Training's stage select (`stage` gate) |
 | `pick_stage` `{stage, allow_derived}` | stage select | the named stage's tile settled (`at` equals `to`), A pressed, the character select (`css` gate). An unproven tile needs `allow_derived` and the stage-id check after the load |
 | `pick_fighters` `{p1}` | character select, P1's token in the hand | P1's token on its tile (`hovered` equals `at`) and placed. The CPU stays as it was; see "The CPU's coin" |
@@ -57,6 +57,12 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `chord` `{name}` | Training | the chord pressed in one frame, and for `tr-save`/`tr-load` TrainingRooms' `state saved`/`state placed` line after it |
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
+
+`to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
+within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.
+The unchanged navigation cap starts when the next qualified prompt or Main appears. The opening grants no input.
+The route then sends Plus immediately after freshly fencing the native Title prompt, once. A qualified How to Play
+skip remains a separate single-shot recovery within the navigation deadline.
 
 `pick_stage` and `pick_fighters` step the tile cursor ([TILE-CURSOR](TILE-CURSOR.md)) with the `tile-*` macros,
 never a plain D-pad. Each step must log `step … to=N`, then `settled … at=N`. Row widths come from the log, not

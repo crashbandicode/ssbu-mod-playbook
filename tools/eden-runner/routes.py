@@ -749,6 +749,10 @@ MAIN_TOP = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'top', 'focus
 MAIN_TABS = ('smash', 'spirits', 'games_and_more', 'vault', 'online')
 TITLE_PROMPT = {**NATIVE_INPUT, 'screen': 'title', 'focus.source': 'native',
                 'focus.id': 'press_any', 'focus.index': '0', 'focus': 'title.press_any'}
+TITLE_OPENING = {**NATIVE_INPUT, 'screen': 'title', 'screen.context': 'opening',
+                 'focus.source': 'native', 'focus.id': 'opening_playback', 'focus': 'title.opening_playback'}
+# The measured cold stock opening took 129.874 s, with playback visible 5.5 s into the route.
+TITLE_OPENING_READY_S = 180
 HOW_TO_PLAY_SKIP = {**NATIVE_INPUT, 'screen': 'attract', 'screen.context': 'how_to_play',
                     'focus.source': 'native', 'focus.id': 'skip_how_to_play', 'focus.index': '0',
                     'focus': 'attract.skip_how_to_play'}
@@ -802,26 +806,50 @@ def _missing_navigation_state(route, state, expected):
 
 
 def to_main(ctx, tries=8, look_s=6, *, cap=None):
-    """Reach qualified Main with at most one Plus at each stock prompt."""
+    """Wait for one qualified cold opening, then run the bounded native prompt route."""
     io = BridgePickerIO(ctx)
-    until = time.monotonic() + ((tries + 1) * look_s if cap is None else cap)
+    started = time.monotonic()
+    navigation_cap = (tries + 1) * look_s if cap is None else cap
+    until = started + navigation_cap
     main_targets = tuple(_main_tab(tab) for tab in MAIN_TABS)
     state = None
     presses = 0
+    opening_seen = waiting_for_opening = False
     while (remaining := until - time.monotonic()) > 0:
         sample = native_picker.check_sample(io.read(native_picker.UI, min(remaining, look_s)),
                                             native_picker.UI, loading_ui=True)
         fresh = _check_title_sample(sample, state)
         state = sample
-        if fresh and state.values['observation.active'] == 'yes' and (
-            _main_top(state) or (tries > 0 and any(
-                _fields_match(state, source) for source in (TITLE_PROMPT, HOW_TO_PLAY_SKIP)
-            ))
-        ):
-            break
+        now = time.monotonic()
+        if now >= until:
+            continue
+        if fresh and state.values['observation.active'] == 'yes':
+            main = _main_top(state)
+            prompt = _fields_match(state, TITLE_PROMPT) or _fields_match(state, HOW_TO_PLAY_SKIP)
+            if waiting_for_opening and (main or prompt):
+                waiting_for_opening = False
+                until = now + navigation_cap
+                ctx.log({'route': 'to_main', 'phase': 'navigation', 'elapsed_s': now - started,
+                         'navigation_cap_s': navigation_cap, **_navigation_receipt(state)})
+            if main or (tries > 0 and prompt):
+                break
+            playback = _fields_match(state, TITLE_OPENING)
+            if playback and not opening_seen:
+                opening_seen = waiting_for_opening = True
+                until = started + TITLE_OPENING_READY_S
+                ctx.log({'route': 'to_main', 'phase': 'opening_readiness', 'elapsed_s': now - started,
+                         'opening_readiness_cap_s': TITLE_OPENING_READY_S, 'navigation_cap_s': navigation_cap,
+                         **_navigation_receipt(state)})
+            if waiting_for_opening and not (
+                playback or _fields_match(state, _TITLE_WITHOUT_PROMPT)
+            ):
+                raise _missing_navigation_state('Title opening', state, 'qualified opening or its Title handoff')
         ctx.check_stop()
         time.sleep(min(.05, max(0, until - time.monotonic())))
     else:
+        if waiting_for_opening:
+            raise _missing_navigation_state('Title opening', state,
+                                            f'a qualified destination within {TITLE_OPENING_READY_S} s of route entry')
         raise _missing_navigation_state('to_main', state, 'qualified Main, Title or How to Play focus')
 
     for source, route, destinations, pending in (

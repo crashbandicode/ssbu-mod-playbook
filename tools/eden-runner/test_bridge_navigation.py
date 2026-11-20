@@ -4,8 +4,10 @@ import unittest
 import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import native_picker_io
 import routes
 import test_native_picker as state_fixtures
 from test_routes import FakeCtx, FakeRunner
@@ -25,6 +27,7 @@ def ui(screen, focus=None, *, context='unknown', source='unknown', tab='unknown'
 
 
 IDLE_TITLE = ui('title', 'press_any', source='native', index='0', label='"Press Any Button"')
+TITLE_OPENING = ui('title', 'opening_playback', context='opening', source='native')
 HOW_TO_PLAY = ui('attract', 'skip_how_to_play', context='how_to_play', source='native', index='0')
 UNOWNED_HOW_TO_PLAY = ui('attract', context='how_to_play', owner='unknown', dialog='unknown')
 MAIN = ui('main_menu', 'smash', source='native', tab='smash', layer='top', index='1', label='"Smash"')
@@ -141,6 +144,120 @@ class BridgeNavigationTests(unittest.TestCase):
         self.assertEqual(len(self.actions), 1)
         self.assertEqual(self.last_ui, MAIN)
         self.assertFalse(self.edges)
+        self.assert_no_images()
+
+    def fake_clock(self, timeline):
+        elapsed = 0
+        states = iter(timeline)
+        next_state = next(states, None)
+        input_times = []
+
+        def sleep(seconds):
+            nonlocal elapsed, next_state
+            elapsed += seconds
+            while next_state is not None and elapsed >= next_state[0]:
+                self.scene = next_state[1]
+                next_state = next(states, None)
+
+        def press(ctx, macro):
+            input_times.append(elapsed)
+            self.press(ctx, macro)
+
+        def reply(ctx, fence, request):
+            sleep(.01)
+            self.reply(ctx, fence, request)
+
+        clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep)
+        for module in (routes, routes.native_picker, native_picker_io):
+            self.enterContext(patch.object(module, 'time', clock))
+        self.enterContext(patch.object(routes, 'play', side_effect=press))
+        self.enterContext(patch.object(routes, 'bridge_v2', side_effect=reply))
+        return clock, input_times
+
+    def test_cold_opening_outlives_navigation_cap_and_presses_prompt_immediately(self):
+        self.scene = ui('title', owner='unknown', dialog='unknown')
+        self.edges = [(IDLE_TITLE, ('attract-cancel',), MAIN)]
+        _, input_times = self.fake_clock([(5.5, TITLE_OPENING), (135.374, IDLE_TITLE)])
+        self.ctx.log = Mock()
+
+        result = routes.to_main(self.ctx)
+
+        self.assertEqual(result['start_presses'], 1)
+        self.assertEqual(len(input_times), 1)
+        self.assertGreaterEqual(input_times[0], 135.374)
+        self.assertLess(input_times[0], 135.474)
+        self.assertEqual(self.last_ui, MAIN)
+        readiness, navigation, _ = (call.args[0] for call in self.ctx.log.call_args_list)
+        self.assertEqual(readiness['phase'], 'opening_readiness')
+        self.assertEqual(readiness['opening_readiness_cap_s'], 180)
+        self.assertEqual(navigation['phase'], 'navigation')
+        self.assertEqual(navigation['navigation_cap_s'], 54)
+        self.assertLessEqual(navigation['elapsed_s'], input_times[0])
+        self.assert_no_images()
+
+    def test_unqualified_opening_does_not_extend_54_second_wait(self):
+        shell = ui('title', context='opening', owner='unknown', dialog='unknown')
+        for unqualified in (shell, {**TITLE_OPENING, 'dialog': 'popup'},
+                            {**TITLE_OPENING, 'focus.source': 'unknown'}):
+            with self.subTest(unqualified=unqualified):
+                self.scene = unqualified
+                clock, input_times = self.fake_clock([(60, IDLE_TITLE)])
+
+                with self.assertRaises(RuntimeError):
+                    routes.to_main(self.ctx)
+
+                self.assertAlmostEqual(clock.monotonic(), 54, delta=.01)
+                self.assertFalse(input_times)
+        self.assert_no_images()
+
+    def test_opening_reacquisition_keeps_one_entry_anchored_deadline(self):
+        self.scene = ui('title', owner='unknown', dialog='unknown')
+        clock, input_times = self.fake_clock([(5.5, TITLE_OPENING), (165, self.scene),
+                                              (175, TITLE_OPENING), (181, IDLE_TITLE)])
+
+        with self.assertRaises(RuntimeError):
+            routes.to_main(self.ctx)
+
+        self.assertAlmostEqual(clock.monotonic(), 180, delta=.01)
+        self.assertFalse(input_times)
+        self.assert_no_images()
+
+    def test_opening_does_not_admit_an_input_from_a_foreign_scene(self):
+        self.scene = TITLE_OPENING
+        clock, input_times = self.fake_clock([(1.5, TRAINING), (2, IDLE_TITLE)])
+
+        with self.assertRaisesRegex(RuntimeError, 'Title opening'):
+            routes.to_main(self.ctx)
+
+        self.assertLess(clock.monotonic(), 2)
+        self.assertFalse(input_times)
+        self.assert_no_images()
+
+    def test_title_handoff_after_opening_uses_the_original_navigation_cap(self):
+        self.scene = TITLE_OPENING
+        self.edges = [(IDLE_TITLE, ('attract-cancel',), IDLE_TITLE)]
+        self.transition_samples['attract-cancel'] = IDLE_TITLE
+        shell = ui('title', owner='unknown', dialog='unknown')
+        clock, input_times = self.fake_clock([(129.874, shell), (135, IDLE_TITLE)])
+
+        with self.assertRaises(RuntimeError):
+            routes.to_main(self.ctx, cap=2)
+
+        self.assertEqual(len(input_times), 1)
+        self.assertGreaterEqual(input_times[0], 135)
+        self.assertLess(input_times[0], 135.1)
+        self.assertAlmostEqual(clock.monotonic(), 137, delta=.1)
+        self.assert_no_images()
+
+    def test_opening_does_not_reset_clock_from_a_replayed_observation(self):
+        self.scene = {**TITLE_OPENING, 'observation': '9000'}
+        clock, input_times = self.fake_clock([(1.5, TITLE_OPENING), (2, IDLE_TITLE)])
+
+        with self.assertRaisesRegex(RuntimeError, 'stale or contradictory'):
+            routes.to_main(self.ctx)
+
+        self.assertLess(clock.monotonic(), 2)
+        self.assertFalse(input_times)
         self.assert_no_images()
 
     def test_title_confirm_can_retire_the_prompt_before_main_owns_input(self):
