@@ -851,5 +851,95 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                 io.send.assert_called_once_with('tap-a1')
                 io.finish.assert_not_called()
 
+class NativeQuitTrainingTests(unittest.TestCase):
+    actions = ('pause-open', 'focus-native-quit-frames', 'confirm-native-quit-frames')
+
+    @staticmethod
+    def state(rev, screen, focus=None, **changes):
+        values = {'screen': screen, 'screen.context': 'training', 'input.owner': 'native',
+                  'dialog': 'none', 'focus': screen if focus is None else f'{screen}.{focus}'}
+        if focus is not None:
+            values.update({'focus.id': focus, 'focus.source': 'native'})
+        if screen == 'css.training':
+            values.update({'focus.source': 'tile.cursor', 'input.owner': 'unknown', 'dialog': 'unknown'})
+        return native(rev, **{**values, **changes})
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        import routes
+
+        self.ctx = SimpleNamespace()
+        self.io = Mock(connection=1, boot=self.state(1, 'training').clock[0])
+        adapter = patch.object(routes, 'BridgePickerIO', return_value=self.io)
+        save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
+        self.addCleanup(adapter.stop)
+        self.addCleanup(save.stop)
+        adapter.start()
+        save.start()
+        self.routes = routes
+
+    def run_quit(self, *, changes=()):
+        samples = [self.state(rev, screen, focus) for rev, (screen, focus) in enumerate(
+            [('training', None), ('training', None), ('pause', 'cpu_count'),
+             ('pause', 'cpu_count'), ('pause', 'quit_training'), ('pause', 'quit_training'),
+             ('css.training', None)], 1)]
+        for index, state in changes:
+            samples[index] = state
+        self.io.read.side_effect = samples
+        return self.routes.quit_training(self.ctx, cap=.25)
+
+    def test_exact_three_watched_edges_end_at_fresh_native_training_css(self):
+        from unittest.mock import call
+
+        result = self.run_quit()
+        self.assertEqual(self.io.send.call_args_list, [call(action) for action in self.actions])
+        self.assertEqual([event[0] for event in self.io.mock_calls],
+                         ['read'] + ['arm', 'read', 'send', 'read', 'finish'] * 3)
+        self.assertTrue(all(call.args[0] == 'ssbu.ui' for call in self.io.arm.call_args_list))
+        self.assertEqual((result['screen'], result['observation']), ('css.training', 7))
+
+    def test_unknown_start_sends_no_input_or_watch(self):
+        with self.assertRaisesRegex(RuntimeError, 'source'):
+            self.run_quit(changes=((0, self.state(1, 'training', **{'input.owner': 'unknown'})),))
+        self.io.arm.assert_not_called()
+        self.io.send.assert_not_called()
+
+    def test_unexpected_pause_focus_stops_before_up_or_a(self):
+        from unittest.mock import call
+
+        for index, state in ((2, self.state(3, 'pause', 'quit_training')),
+                             (4, self.state(5, 'pause', 'stage_hazards'))):
+            with self.subTest(index=index):
+                self.io.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, 'unexpected'):
+                    self.run_quit(changes=((index, state),))
+                self.assertEqual(self.io.send.call_args_list,
+                                 [call(action) for action in self.actions[:index // 2]])
+
+    def test_quit_requires_committed_training_css_with_the_tile_provider(self):
+        for state in (self.state(7, 'main_menu'), self.state(7, 'css.smash'),
+                      self.state(7, 'css.training', **{'screen.context': 'unknown'}),
+                      self.state(7, 'css.training', **{'focus.source': 'native'})):
+            with self.subTest(values=state.values):
+                self.io.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, 'unexpected'):
+                    self.run_quit(changes=((6, state),))
+                self.assertEqual(self.io.send.call_count, 3)
+                self.assertEqual(self.io.finish.call_count, 2)
+
+    def test_modal_or_reconnect_before_quit_blocks_a(self):
+        modal = self.state(6, 'pause', 'quit_training', dialog='notice')
+        source = self.state(6, 'pause', 'quit_training')
+        reconnected = picker.Sample(source.block, connection=2)
+        for state in (modal, reconnected):
+            with self.subTest(state=state):
+                self.io.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, 'source|connection'):
+                    self.run_quit(changes=((5, state),))
+                self.assertEqual(self.io.send.call_count, 2)
+                self.assertEqual(self.io.finish.call_count, 2)
+
 if __name__ == '__main__':
     unittest.main()
