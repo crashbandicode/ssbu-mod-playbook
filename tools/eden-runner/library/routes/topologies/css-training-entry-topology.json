@@ -1,6 +1,9 @@
 {
   "layout": "css.9f1fb03bf7c98fb9",
   "neighbors": {
+    "none": {
+      "up": "78"
+    },
     "0": {
       "down": "13",
       "right": "1"
