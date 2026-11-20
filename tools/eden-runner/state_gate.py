@@ -97,19 +97,22 @@ def latest(text, provider):
     return found[-1] if found else None
 
 
-def satisfies(block, where, baseline=None, transition=None, ack=None, input_gate=None):
+def satisfies(block, where, baseline=None, transition=None, ack=None, input_gate=False):
     """(passes, why) for `block`.
 
-    A plain assertion (no transition, no ack) checks `where` on a complete block. An input gate (`transition`
-    "focus" or `ack`, or `input_gate=True`) needs this step's pre-input `baseline` and a newer block from the same boot
-    and schema, and either the expected focus transition (focus present and different from the baseline's) or exactly
-    one handled ack; a where-only match or a bare revision change (a notice) never passes it."""
-    input_gate = bool(input_gate or transition or ack is not None)
+    A plain assertion checks `where` on a complete block. An input gate (the runner makes one for the gate after a press
+    that followed this row's `state_baseline`) also needs that baseline and a newer block from the same boot and schema,
+    and then the press's own confirmation: both focus identities present and different, or exactly one handled ACK.
+    Any other ACK delta, an ignored ACK, a missing baseline focus, or a where-only / notice-only change does not pass."""
     if input_gate:
         if baseline is None:
-            return False, 'an input gate needs this step\'s pre-input baseline'
-        if transition is None and ack is None:
-            return False, 'an input gate needs "transition": "focus" or "ack": 1'
+            return False, 'an input gate needs this row\'s pre-input baseline'
+        if ack is not None and int(ack) != 1:
+            return False, f'only exactly one handled ack confirms an input (gate asks ack={ack})'
+        if transition not in (None, 'focus'):
+            return False, f'unknown transition {transition!r}'
+    elif transition is not None or ack is not None:
+        return False, 'a transition or ack gate confirms a press: none since this row\'s state_baseline'
     if baseline is not None:
         if block['boot'] != baseline['boot']:
             return False, f'boot {block["boot"]} != baseline {baseline["boot"]}'
@@ -123,17 +126,19 @@ def satisfies(block, where, baseline=None, transition=None, ack=None, input_gate
             return False, f'{key} missing'
         if values[key] != str(want):
             return False, f'{key}={values[key]!r} wants {want!r}'
-    if transition == 'focus':
-        now, was = values.get('focus'), baseline['values'].get('focus')
-        if now is None:
-            return False, 'focus missing from the new block'
-        if now == was:
-            return False, 'focus did not change'
-    if ack is not None:
-        try:
-            advanced = int(values.get('ack', '')) - int(baseline['values'].get('ack', ''))
-        except ValueError:
-            return False, 'ack missing'
-        if advanced != int(ack) or values.get('ack.result') != 'handled':
-            return False, f'ack advanced {advanced} result {values.get("ack.result")!r}'
-    return True, 'ok'
+    if not input_gate:
+        return True, 'ok'
+    was, now = baseline['values'].get('focus'), values.get('focus')
+    focus_moved = bool(was) and bool(now) and was != now
+    try:
+        delta = int(values.get('ack', '')) - int(baseline['values'].get('ack', ''))
+    except ValueError:
+        delta = None
+    one_ack = delta == 1 and values.get('ack.result') == 'handled'
+    if focus_moved or one_ack:
+        return True, 'focus moved' if focus_moved else 'one handled ack'
+    if not was:
+        return False, 'baseline focus missing and no single handled ack'
+    if not now:
+        return False, 'focus missing from the new block and no single handled ack'
+    return False, f'focus did not change and the ack moved {delta} ({values.get("ack.result")!r}), not one handled'

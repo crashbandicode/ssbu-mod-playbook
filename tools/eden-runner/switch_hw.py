@@ -334,7 +334,9 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                 pass
             finally:
                 sock.close()
-            time.sleep(retry_s)
+            # A connection that ended before a valid hello (accept then EOF) backs off like a refused connect.
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff_s)
 
 
 HELLO_BOOT = re.compile(rb'\[Bridge\] hello .*?boot=(0x[0-9a-f]+) .*?reconnects=(\d+)')

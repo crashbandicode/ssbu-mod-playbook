@@ -1928,30 +1928,46 @@ class Runner:
             self.state_marks = {}
         for stale in [k for k in self.state_marks if k[0] != self._row_key()]:
             del self.state_marks[stale]
-        # Keyed by the row: a baseline never carries into another row.
+        for stale in [k for k in getattr(self, 'state_pending', {}) if k[0] != self._row_key()]:
+            del self.state_pending[stale]
+        # Keyed by the row: a baseline never carries into another row. A new baseline starts a new press.
         self.state_marks[(self._row_key(), on, provider)] = block
+        getattr(self, 'state_pending', {}).pop((self._row_key(), on), None)
         self.log({'state_baseline': provider, 'on': on, 'rev': block['rev'], 'boot': block['boot'],
                   'focus': block['values'].get('focus'), 'ack': block['values'].get('ack')})
         return {'state_baseline': provider, 'on': on, 'rev': block['rev'], 'focus': block['values'].get('focus')}
 
     def state_gate(self, on, name, gate, until):
+        """A `state` gate. After a press that followed this row's `state_baseline` it is that press's input gate (bound
+        to the baseline and the press; consumed by a pass); otherwise a plain state assertion."""
         import state_gate
         provider = gate['provider']
-        key = (self._row_key(), on, provider)
-        input_gate = bool(gate.get('transition') or gate.get('ack') is not None or gate.get('input'))
+        row = self._row_key()
+        key = (row, on, provider)
+        pending = getattr(self, 'state_pending', {}).get((row, on))
         base = getattr(self, 'state_marks', {}).get(key)
-        if input_gate and base is None:
-            raise RuntimeError(f'gate {name}: an input gate needs a state_baseline for {provider} on {on} earlier in this row')
-        block, _ = self._state_block(on, provider, max(0.1, until - time.monotonic()), lambda b: state_gate.satisfies(
+        if pending is not None and base is None:
+            raise RuntimeError(f'gate {name}: press {pending!r} has no state_baseline for {provider} on {on} in this row')
+        input_gate = pending is not None
+        block, why = self._state_block(on, provider, max(0.1, until - time.monotonic()), lambda b: state_gate.satisfies(
             b, gate.get('where', {}), base if input_gate else None, gate.get('transition'), gate.get('ack'), input_gate))
         if input_gate:
-            self.state_marks.pop(key, None)  # one input, one baseline: the next input takes its own
+            self.state_marks.pop(key, None)  # one press, one baseline, one confirmation
+            self.state_pending.pop((row, on), None)
         evidence = {k: block['values'].get(k) for k in ('focus', 'ack', 'ack.result', *gate.get('where', {}))}
+        if input_gate:
+            evidence.update(press=pending, confirmed=why)
         self.log({'gate': name, 'on': on, 'pass': True, 'state': provider, 'rev': block['rev'], 'values': evidence})
         return {'state': provider, 'rev': block['rev'], 'boot': block['boot'], 'values': evidence}
 
     def _step_play(self, on, step):
         self.play(on, step['play'])
+        row = self._row_key()
+        if any(k[0] == row and k[1] == on for k in getattr(self, 'state_marks', {})):
+            # A press after this row's state_baseline: the next state gate confirms it (state_gate).
+            if not hasattr(self, 'state_pending'):
+                self.state_pending = {}
+            self.state_pending[(row, on)] = step['play']
         return {'play': step['play'], 'on': on}
 
     def _step_gate(self, on, step):
