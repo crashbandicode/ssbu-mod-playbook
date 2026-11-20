@@ -233,8 +233,13 @@ def _gate_spec(name):
 def gate(ctx, name, cap=None):
     """Check a route gate and return its evidence path."""
     key = f'routes.{name}'
-    if name in ('css', 'stage') and _use_native_pick(ctx):
-        return _native_screen_gate(ctx, name, cap if cap is not None else ROUTE_GATES[name]['cap'])
+    if name in ('main', 'css', 'stage', 'training', 'native-pause', 'quit-focus'):
+        default = SWITCH_CAPS.get(name, 30) if on_switch(ctx) else ROUTE_GATES[name]['cap']
+        return _native_screen_gate(ctx, name, default if cap is None else cap)
+    if name == 'tr-menu':
+        return _tr_menu_gate(ctx, cap=10 if cap is None else cap)
+    if name == 'ready':
+        raise RuntimeError('CSS Ready gate needs a bridge field for the aggregate Ready banner')
     gates = ctx.runner.plan.setdefault('gates', {})
     if on_switch(ctx):
         if name not in SWITCH_REFS:
@@ -263,14 +268,25 @@ def _native_screen_gate(ctx, name, cap):
     state = native_picker.wait_sample(io, native_picker.UI, until, before)
     if state.connection != before.connection:
         raise RuntimeError('bridge connection changed during native screen check')
-    native_picker.native_owner(state, 'css' if name == 'css' else 'sss')
-    boot, revision, observation = state.clock
+    if name in ('css', 'stage'):
+        native_picker.native_input_owner(state, 'css' if name == 'css' else 'sss')
+    elif name == 'main':
+        if not _main_top(state):
+            raise _missing_navigation_state('Main Menu', state, 'qualified Main top focus')
+    else:
+        pause = {**TRAINING_OWNER, 'screen': 'pause', 'focus.source': 'native'}
+        expected = {
+            'training': TRAINING_SCREEN,
+            'native-pause': {**pause, 'focus.id': 'cpu_count'},
+            'quit-focus': {**pause, 'focus.id': 'quit_training'},
+        }[name]
+        if not _fields_match(state, expected):
+            raise _missing_navigation_state(name, state, str(expected))
     key = f'routes.{name}'
     filename = f'gate-{key}'
     receipt = _save(ctx, filename, {
         'gate': key, 'on': ctx.on, 'pass': True, 'provider': native_picker.UI,
-        'screen': state.values['screen'], 'focus': state.values['focus'], 'boot': boot,
-        'revision': revision, 'observation': observation,
+        **_navigation_receipt(state),
     })
     ctx.log(receipt)
     return str(Path(ctx.row_dir) / f'{filename}.json')
@@ -728,47 +744,78 @@ def wait_lines(ctx, lines, cap=60):
 
 # --- menus ----------------------------------------------------------------------------------------------------------
 
-def to_main(ctx, tries=8, look_s=6):
-    """Title, opening movie, attract demo or How-to-Play video -> the main menu, with no idle gap.
+NATIVE_INPUT = {'input.owner': 'native', 'dialog': 'none'}
+MAIN_TOP = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'top', 'focus.source': 'native'}
+MAIN_TABS = ('smash', 'spirits', 'games_and_more', 'vault', 'online')
+TITLE_PROMPT = {**NATIVE_INPUT, 'screen': 'title', 'focus.source': 'native',
+                'focus.id': 'press_any', 'focus.index': '0', 'focus': 'title.press_any'}
+TRAINING_OWNER = {**NATIVE_INPUT, 'screen.context': 'training'}
+TRAINING_SCREEN = {**TRAINING_OWNER, 'screen': 'training'}
+TRAINING_CSS = {**TRAINING_OWNER, 'screen': 'css.training', 'focus.source': native_picker.TILE}
+TRAINING_SSS = {**TRAINING_OWNER, 'screen': 'stage_select', 'focus.source': native_picker.TILE}
+GAMES_TRAINING = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'submenu',
+                  'screen.tab': 'games_and_more', 'focus.source': 'native', 'focus.id': 'training',
+                  'focus': 'main_menu.submenu.training'}
 
-    Looks for the main menu for look_s; when it isn't there, presses Start (the library's attract-cancel, one Plus)
-    at once and looks again, up to `tries` times. Start does nothing on the main menu itself, so a press that lands
-    there is harmless. The main menu falls back to the attract demo after about a minute idle (HARNESS-LESSONS), so
-    every route block that starts on the main menu calls this first instead of trusting an older gate.
-    """
+
+def _main_tab(tab):
+    return {**MAIN_TOP, 'screen.tab': tab, 'focus.id': tab, 'focus': f'main_menu.top.{tab}'}
+
+
+def _main_top(state):
+    tab = state.values.get('screen.tab')
+    return tab in MAIN_TABS and _fields_match(state, _main_tab(tab))
+
+
+def _navigation_receipt(state):
+    boot, revision, observation = state.clock
+    return {'screen': state.values['screen'], 'focus': state.values['focus'], 'boot': boot,
+            'revision': revision, 'observation': observation}
+
+
+def _missing_navigation_state(route, state, expected):
+    fields = ('screen', 'screen.context', 'screen.layer', 'input.owner', 'dialog', 'focus.source', 'focus.id')
+    observed = ', '.join(f'{field}={state.values.get(field, "missing")}' for field in fields) if state else 'no reply'
+    return RuntimeError(f'{route}: requires {expected}; last ssbu.ui: {observed}')
+
+
+def to_main(ctx, tries=8, look_s=6, *, cap=None):
+    """Wait for qualified Main or activate the stock Title prompt once."""
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + ((tries + 1) * look_s if cap is None else cap)
+    state = None
     presses = 0
-    for attempt in range(tries + 1):
-        if passes(ctx, 'main', look_s):
-            out = {'main': True, 'start_presses': presses, 'shot': str(ctx.shot('routes-main'))}
-            ctx.log({'route': 'to_main', **out})
-            return out
-        if attempt < tries:
-            play(ctx, 'attract-cancel')
-            presses += 1
-    raise RuntimeError(f'main menu not reached after {presses} Start presses')
+    while (remaining := until - time.monotonic()) > 0:
+        state = native_picker.check_sample(io.read(native_picker.UI, min(remaining, look_s)),
+                                           native_picker.UI, loading_ui=True)
+        if _main_top(state):
+            break
+        if tries > 0 and _fields_match(state, TITLE_PROMPT):
+            _, state = _watched_native_input(io, state, TITLE_PROMPT, MAIN_TOP, 'attract-cancel',
+                                             until, route='Title', scene_change=True)
+            if not _main_top(state):
+                raise _missing_navigation_state('Title', state, 'qualified Main top focus')
+            io.finish()
+            presses = 1
+            break
+        ctx.check_stop()
+        time.sleep(min(.05, max(0, until - time.monotonic())))
+    else:
+        raise _missing_navigation_state('to_main', state, 'qualified Main top or Title press_any')
+    out = {'main': True, 'start_presses': presses, **_navigation_receipt(state)}
+    ctx.log({'route': 'to_main', **out})
+    return out
+
 
 
 def main_to_stage(ctx):
-    """Enter Training stage select from the qualified menu or the standalone Eden route."""
-    if _use_native_pick(ctx):
-        return _native_main_to_stage(ctx)
-    to_main(ctx)
-    play(ctx, 'main-stage')
-    how = wait_sss(ctx)
-    return {'screen': 'stage', 'proof': how, 'shot': str(ctx.shot('routes-stage'))}
+    """Enter Training Stage Select from a qualified Main Menu owner."""
+    return _native_main_to_stage(ctx)
 
 
 def wait_sss(ctx, cap=45):
-    """The stage select, by the library `stage` gate (the Training name, shown while tile 0 is hovered) or, when
-    another stage is hovered, by a tile-cursor step logged with screen=sss."""
-    until = time.monotonic() + cap
-    while True:
-        if passes(ctx, 'stage', 3):
-            return 'stage-gate'
-        if select_screen(ctx) == 'sss':
-            return 'tile-cursor screen=sss'
-        if time.monotonic() > until:
-            raise RuntimeError(f'the stage select did not appear within {cap} s')
+    """Wait for the bridge to confirm Stage Select owns input."""
+    return _native_screen_gate(ctx, 'stage', cap)
 
 
 # --- the tile cursor ------------------------------------------------------------------------------------------------
@@ -898,32 +945,15 @@ def remember(ctx, **values):
     return merged
 
 
+
 def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=None, form='normal',
                next_screen='css.training'):
-    """Select the named native stage, then verify the expected scene transition.
-
-    Standalone Eden uses the tile-log route and its proven table entries.
-    A derived standalone entry needs an explicit post-load stage check.
-    """
+    """Select the typed native stage and verify the expected CSS transition."""
     entry = stage_entry(stage)
-    if _use_native_pick(ctx):
-        io = BridgePickerIO(ctx)
-        prepared = native_picker.hover(io, 'sss', _native_target(entry, form), _tile_topology(topology),
-                                       expected_context=_stage_pick_context(next_screen))
-        return _finish_native_pick(ctx, io, 'sss', prepared, entry, next_screen, transition_cap)
-    if not entry.get('proven') and not allow_derived:
-        raise RuntimeError(f'stage {entry["name"]} tile {entry["tile"]} is derived, not proven; pass allow_derived '
-                           'and confirm the id after the load')
-    wait_sss(ctx)
-    walker = TileWalker(ctx, 'sss')
-    walk = walker.walk_to(entry['tile'])
-    still = str(ctx.shot(f'routes-sss-{_norm(entry["name"])}'))
-    play(ctx, 'tap-a1')
-    gate(ctx, 'css', transition_cap)
-    expected = {'stage_id': entry['id'], 'stage': entry['name'], 'tile': entry['tile']}
-    remember(ctx, **expected)
-    return _save(ctx, 'routes-pick-stage', {**expected, 'walk': walk, 'still': still,
-                                            'derived': not entry.get('proven')})
+    io = BridgePickerIO(ctx)
+    prepared = native_picker.hover(io, 'sss', _native_target(entry, form), _tile_topology(topology),
+                                   expected_context=_stage_pick_context(next_screen))
+    return _finish_native_pick(ctx, io, 'sss', prepared, entry, next_screen, transition_cap)
 
 
 def _probe_step(ctx, walker, direction='left', cap=2.5):
@@ -937,54 +967,12 @@ def _probe_step(ctx, walker, direction='left', cap=2.5):
     return {'from': found.group(1), 'to': found.group(2), 'token': found.group(3)}
 
 
+
 def pick_fighters(ctx, p1, cpu=None, coin_route=False, *, topology=None, form='default'):
-    """Place the local fighter in CSS. Standalone Eden also exposes the experimental CPU route."""
-    if _use_native_pick(ctx):
-        if cpu is not None or coin_route:
-            raise RuntimeError('native tile selection requires the locally owned token')
-        return pick_local_fighter(ctx, p1, topology=topology, form=form)
-    gate(ctx, 'css')
-    p1_entry = fighter_entry(p1)
-    cpu_entry = fighter_entry(cpu) if cpu is not None else None
-    if cpu_entry is not None and not coin_route:
-        # NOT PROVEN (harness-lib-xps-1, 2026-11-16 02:52-03:09Z): four analog approaches to the CPU's coin either
-        # missed it or pressed A where the READY banner took it and started Training with a random CPU. Until a
-        # route is proven, set the CPU with the lane's own fixture and assert it with routes:fixture.
-        raise RuntimeError('pick_fighters: the CSS coin route for the CPU is not proven; pass coin_route=true only to '
-                           'test it, or set the CPU by fixture and assert it with routes:fixture {"cpu": ...}')
-    random_tile = next(e['tile'] for e in tables()['css_tiles'] if e.get('random'))
-    walker = TileWalker(ctx, 'css')
-    out = {'p1': p1_entry, 'cpu': cpu_entry}
-    if cpu_entry is not None:
-        # lr-04's proven coin route starts from P1's token placed on the first tile of the last row (Steve, 78):
-        # lr04-cpu-approach and lr04-cpu-pick push the empty hand right and down onto the coin, press A, then one
-        # L3+Left step that must log token=p2. A stray A with P1 placed and the CPU on Random starts the match
-        # (harness-lib-xps-1 r05, 02:52Z: short hops from tile 85 started Training as Mii Gunner vs Daisy), so no
-        # other A is pressed until the coin is proven in the hand.
-        park = next(e['tile'] for e in tables()['css_tiles'] if e.get('name') == 'Steve')
-        out['park'] = walker.walk_to(park)
-        play(ctx, 'tap-a1')
-        walker.cursor.mark()
-        play(ctx, 'coin-pick')  # lr-04's right pushes without its down pushes (they left the hand on the panel)
-        found = walker.cursor.wait(r'step screen=css dir=left from=(\S+) to=(\S+) token=p2', 4, ctx)
-        picked = {'from': found.group(1), 'to': found.group(2), 'token': 'p2'}
-        out['coin'] = picked
-        walker.at = None if picked['to'] == 'none' else int(picked['to'])
-        out['cpu_walk'] = walker.walk_to(cpu_entry['tile'])
-        out['cpu_still'] = str(ctx.shot(f'routes-css-cpu-{_norm(cpu_entry["name"])}'))
-        play(ctx, 'tap-a1')
-        play(ctx, 'tap-b1')
-        back = _probe_step(ctx, walker, 'up')
-        if not back or back['token'] not in (None, 'p1'):
-            raise RuntimeError(f'B did not return P1\'s token to the hand: {back}')
-        out['p1_back'] = back
-        walker.at = None if back['to'] == 'none' else int(back['to'])
-    out['p1_walk'] = walker.walk_to(p1_entry['tile'])
-    out['p1_still'] = str(ctx.shot(f'routes-css-p1-{_norm(p1_entry["name"])}'))
-    play(ctx, 'tap-a1')
-    remember(ctx, p1_kind=p1_entry['kind'], **({'cpu_kind': cpu_entry['kind']} if cpu_entry else {}))
-    out['ready_still'] = str(ctx.shot('routes-css-ready'))
-    return _save(ctx, 'routes-pick-fighters', out)
+    """Place the verified local fighter token in CSS."""
+    if cpu is not None or coin_route:
+        raise RuntimeError('CSS CPU placement needs a qualified tile.cursor CPU seat and token')
+    return pick_local_fighter(ctx, p1, topology=topology, form=form)
 
 
 # --- Training: game state ---------------------------------------------------------------------------------------------
@@ -1076,35 +1064,10 @@ def read_state(ctx, cap=6.0):
         cursor.close()
 
 
-def enter_training(ctx, cap=90, *, stage_ids=None):
-    """Press Plus from CSS and verify Training loaded.
 
-    The bridge route checks local placement and native Training state.
-    Standalone Eden uses diagnostic body lines and the HUD gate.
-    """
-    if _use_native_pick(ctx):
-        return _native_enter_training(ctx, cap, stage_ids)
-    stage_cursor = LogCursor(instance_path(ctx, 'diag_log'))
-    play(ctx, 'enter-training')
-    until = time.monotonic() + cap
-    state = None
-    while state is None:
-        try:
-            state = read_state(ctx, cap=4.0)
-        except RuntimeError:
-            if time.monotonic() > until:
-                raise
-    for _ in range(4):
-        if passes(ctx, 'training', 8):
-            break
-        play(ctx, 'tap-a1')
-    else:
-        gate(ctx, 'training')
-    lines = [line for line in stage_cursor.read() if re.search(STAGE_LINE, line)]
-    stage_cursor.close()
-    ctx.runner.routes_stage_lines = lines[-4:]
-    return _save(ctx, 'routes-enter-training', {'state': state, 'stage_lines': lines[-4:],
-                                                'shot': str(ctx.shot('routes-training'))})
+def enter_training(ctx, cap=90, *, stage_ids=None):
+    """Activate a placed local fighter and confirm native Training loaded."""
+    return _native_enter_training(ctx, cap, stage_ids)
 
 
 def stage_now(ctx):
@@ -1206,47 +1169,40 @@ def select_screen(ctx, cap=2.5):
 
 
 def back_to_main(ctx, presses=10):
-    """Training -> main menu: native pause, Quit Training, confirm (library frames from lr-03), then back out of the
-    character and stage selects until the main gate passes. Each look is a gate; nothing waits on a fixed sleep."""
+    """Return through the fenced native Training, CSS and Stage Select owners."""
     looks = []
-    if passes(ctx, 'training', 4):
-        play(ctx, 'pause-open')
-        gate(ctx, 'native-pause')
-        play(ctx, 'focus-native-quit-frames')
-        gate(ctx, 'quit-focus')
-        play(ctx, 'confirm-native-quit-frames')
+    io = BridgePickerIO(ctx)
+    state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 4)
+    if _fields_match(state, TRAINING_SCREEN):
+        quit_training(ctx)
         looks.append('training-quit')
-    for n in range(presses):
-        # 6 s, not 3: a B pressed while the main menu is still drawing opens its sidebar, and the main gate (the
-        # highlighted Smash tile) then fails until another B closes it (harness-lib-xps-1 r08, 03:16Z).
-        if passes(ctx, 'main', 6):
-            return _save(ctx, 'routes-back-to-main', {'looks': looks, 'shot': str(ctx.shot('routes-main-back'))})
-        # The character and stage selects go back only on a held B (a 4-frame tap does nothing there:
-        # harness-lib-xps-1 r05 retry, 02:56Z, eight taps left the stage select up). leave-css holds B 90 frames.
-        if passes(ctx, 'css', 3):
-            looks.append('css')
-            play(ctx, 'leave-css')
-        elif select_screen(ctx) == 'sss':
-            # The library `stage` gate is the Training name crop: it fails once another stage is hovered, so the
-            # stage select is recognised by the tile cursor's own screen name instead.
-            looks.append('sss')
-            play(ctx, 'leave-css')
-        elif looks.count('other') >= 3:
-            # Three B presses past the selects and still no main menu: one B too many reaches the title screen
-            # (harness-lib-ally-1 r08). to_main presses Start until the main menu shows.
-            looks.append('to_main')
-            out = to_main(ctx)
-            return _save(ctx, 'routes-back-to-main', {'looks': looks, 'to_main': out})
+        next_state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 9)
+        native_picker.same_epoch(state, next_state, in_flight=True)
+        state = next_state
+
+    return_edges = (
+        (TRAINING_CSS, TRAINING_SSS, 'leave-css', 'css'),
+        (TRAINING_SSS, GAMES_TRAINING, 'tap-b1', 'sss'),
+        (GAMES_TRAINING, MAIN_TOP, 'tap-b1', 'games_and_more'),
+    )
+    for _ in range(presses):
+        if _main_top(state):
+            return _save(ctx, 'routes-back-to-main', {'looks': looks, **_navigation_receipt(state)})
+        for source, target, macro, label in return_edges:
+            if _fields_match(state, source):
+                break
         else:
-            looks.append('other')
-            play(ctx, 'tap-b1')
-    raise RuntimeError(f'not back on the main menu after {presses} looks: {looks}')
+            raise _missing_navigation_state('back_to_main', state, 'qualified Training return owner')
+        _, state = _watched_native_input(io, state, source, target, macro, time.monotonic() + 9,
+                                         route='Training return', scene_change=True)
+        looks.append(label)
+        io.finish()
+    if _main_top(state):
+        return _save(ctx, 'routes-back-to-main', {'looks': looks, **_navigation_receipt(state)})
+    raise _missing_navigation_state('back_to_main', state, f'qualified Main top within {presses} return moves')
 
 
 # --- a real Switch (switch_hw.py up; the pad plays the same macros, OBS stills feed the image gates) ----------------
-
-TR_INSTALL = r'plugin=training_rooms/\S+ game=13\.0\.5 .*result=installed'
-
 
 def _need_switch(ctx, block):
     if not on_switch(ctx):
@@ -1254,69 +1210,16 @@ def _need_switch(ctx, block):
 
 
 def switch_boot(ctx, cap=420):
-    """HOME (SSBU first tile) -> SSBU -> the main menu, unattended.
-
-    Starts with one harmless B (the first input after an idle console can be swallowed while the pad re-registers,
-    and B undims HOME). Then switch-remote's `switch.launch`: HOME, the SSBU-tile image gate, A. Then, until the
-    main gate passes: A on "Who is using the software?" (the pre-selected first profile), else Start, which skips the
-    opening movie and leaves the title. Proven only on the ledger stills' screens; nothing is pressed on a screen
-    no gate recognises except Start. Returns the TrainingRooms install line from the live Skyline log when present.
-    """
+    """Finish an already launched Switch game at qualified Main."""
     _need_switch(ctx, 'switch_boot')
-    if passes(ctx, 'main', 4):
-        return {'already': 'main'}
-    log = LogCursor(instance_path(ctx, 'console_log'))
-    play(ctx, 'tap-b1')
-    launched = [ctx.call('switch.launch', {}, job_cap=30)]
-    looks, notes = [], []
-    until = time.monotonic() + cap
-    install = None
-    homes = 0
-    while True:
-        ctx.check_stop()
-        for line in log.read():
-            if install is None and re.search(TR_INSTALL, line):
-                install = line[:200]
-        if passes(ctx, 'main', 4):
-            looks.append('main')
-            break
-        # The system's "Corrupted data has been detected" dialog over HOME (2026-11-18 02:16Z): its focus is Check, so
-        # nothing is pressed there; the check needs the operator's rule. Before this gate the loop pressed Start on it
-        # for the whole cap.
-        if passes(ctx, 'corrupt', 2):
-            looks.append('corrupt')
-            raise RuntimeError('switch_boot: system dialog "Corrupted data has been detected" (focus on Check); '
-                               f'stopped with no input on it; looks {looks[-6:]}')
-        if passes(ctx, 'profile', 2):
-            looks.append('profile')
-            play(ctx, 'tap-a1')
-            continue
-        if passes(ctx, 'launch-error', 2):
-            # "Unable to start software" (switch-hw-ledger launch 1, 12:14Z: erpt 2009-0005, loader InvalidNso at
-            # process creation; a relaunch 8 s after the Close booted). The transient rule: OK, then ONE relaunch.
-            looks.append('launch-error')
-            if len(launched) > 1:
-                raise RuntimeError('switch_boot: "Unable to start software" again after one relaunch; erpt 2009-0005 '
-                                   'suspected, FTP-verify the card before another try')
-            notes.append('launch error dismissed and relaunched once; erpt 2009-0005 suspected; FTP-verify')
-            ctx.call('switch.dismiss', {}, job_cap=30)
-            launched.append(ctx.call('switch.launch', {}, job_cap=30))
-            continue
-        # Plain HOME three looks running: the launch did not take (Start there opens the tile's Options).
-        if passes(ctx, 'home', 2):
-            looks.append('home')
-            homes += 1
-            if homes >= 3:
-                raise RuntimeError(f'switch_boot: back on HOME after the launch; looks {looks[-6:]}')
-            time.sleep(2)
-            continue
-        looks.append('start')
-        play(ctx, 'attract-cancel')
-        if time.monotonic() > until:
-            raise RuntimeError(f'switch_boot: no main menu within {cap} s; looks {looks[-6:]}')
-    log.close()
-    return _save(ctx, 'routes-switch-boot', {'launch': launched, 'looks': looks, 'notes': notes, 'tr_install': install,
-                                            'shot': str(ctx.shot('routes-switch-main'))})
+    try:
+        result = to_main(ctx, cap=cap)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f'Switch boot needs qualified Title or Main from ssbu.ui. '
+            f'Switch HOME and system applets have no bridge owner or focus. {exc}'
+        ) from exc
+    return _save(ctx, 'routes-switch-boot', result)
 
 
 # --- TrainingRooms' preloader ("Fighters" notice): no menu input until it is done ---------------------------------
@@ -1463,18 +1366,12 @@ def preload_clear(ctx, cap=180, appear=10.0):
 
 def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
     """Check caller-supplied native top-tab endpoints around exactly one D-pad tap."""
-    tabs = ('smash', 'spirits', 'games_and_more', 'vault', 'online')
     if not isinstance(direction, str) or direction not in native_picker.DIRECTIONS:
         raise RuntimeError(f'unsupported Main Menu direction {direction!r}')
-    if from_focus not in tabs or to_focus not in tabs or from_focus == to_focus:
+    if from_focus not in MAIN_TABS or to_focus not in MAIN_TABS or from_focus == to_focus:
         raise RuntimeError('Main Menu step needs two distinct canonical top-tab focus IDs')
 
-    top = {'screen': 'main_menu', 'screen.layer': 'top', 'input.owner': 'native',
-           'dialog': 'none', 'focus.source': 'native'}
-    source = {**top, 'screen.tab': from_focus, 'focus.id': from_focus,
-              'focus': f'main_menu.top.{from_focus}'}
-    target = {**top, 'screen.tab': to_focus, 'focus.id': to_focus,
-              'focus': f'main_menu.top.{to_focus}'}
+    source, target = _main_tab(from_focus), _main_tab(to_focus)
 
     io = BridgePickerIO(ctx)
     until = time.monotonic() + cap
@@ -1541,11 +1438,16 @@ def _native_main_to_stage(ctx):
     ]
     io = BridgePickerIO(ctx)
     state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 5)
+    for source, direction, target in (('smash', 'right', 'vault'), ('vault', 'up', 'games_and_more')):
+        if _fields_match(state, _main_tab(source)):
+            _, state = _watched_native_input(io, state, _main_tab(source), _main_tab(target),
+                                             f'main-menu-{direction}', time.monotonic() + 5)
+            io.finish()
     for index, (source, _) in enumerate(checkpoints):
         if _fields_match(state, source):
             break
     else:
-        raise RuntimeError('Training entry needs a native Games & More source or supported submenu focus')
+        raise _missing_navigation_state('Training entry', state, 'qualified route to Games & More or Training')
 
     settling = False
     for (source, macro), (target, _) in zip(checkpoints[index:], checkpoints[index + 1:]):
@@ -1587,7 +1489,7 @@ def quit_training(ctx, cap=45):
     pause = {**owner, 'screen': 'pause', 'focus.source': 'native'}
     cpu = {**pause, 'focus.id': 'cpu_count'}
     quit_focus = {**pause, 'focus.id': 'quit_training'}
-    css = {'screen': 'css.training', 'screen.context': 'training', 'focus.source': native_picker.TILE}
+    css = TRAINING_CSS
     transitions = (
         (training, cpu, 'pause-open'),
         (cpu, quit_focus, 'focus-native-quit-frames'),
@@ -1642,13 +1544,6 @@ def _native_enter_training(ctx, cap, stage_ids):
     io.finish()
     return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage,
                                                 'stage_event': stage_event})
-
-def _use_native_pick(ctx):
-    if on_switch(ctx):
-        return True
-    bridge_log = ctx.instance.get('bridge_log')
-    return isinstance(bridge_log, str) and bool(bridge_log)
-
 
 def _tile_topology(pin):
     if pin is None:
@@ -1765,18 +1660,66 @@ def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=No
     out['preload'] = preload_clear(ctx)
     return _save(ctx, 'routes-switch-training', out)
 
+def _wait_tr_menu(io, until, opened, after=None):
+    while (remaining := until - time.monotonic()) > 0:
+        state = io.read('tr.menu', remaining)
+        block = state.block
+        if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
+            raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
+        if after is not None:
+            native_picker.same_epoch(after, state, in_flight=True)
+            if block['rev'] <= after.block['rev']:
+                continue
+        if _fields_match(state, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
+            return state
+    raise RuntimeError(f'Training Mod menu needs tr.menu scene=training, keyboard=0, open={int(opened)}')
+
+
+def _tr_menu_gate(ctx, cap):
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + cap
+    menu = _wait_tr_menu(io, until, opened=True)
+    _wait_training_owner(io, menu, until, 'tr.menu')
+    _save(ctx, 'gate-routes.tr-menu', {'gate': 'routes.tr-menu', 'pass': True, 'provider': 'tr.menu',
+                                     'boot': menu.block['boot'], 'revision': menu.block['rev'],
+                                     'focus': menu.values['focus']})
+    return str(Path(ctx.row_dir) / 'gate-routes.tr-menu.json')
+
+
+def _wait_training_owner(io, menu, until, owner):
+    expected = {**TRAINING_SCREEN, 'input.owner': owner}
+    ui = None
+    while time.monotonic() < until:
+        ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+        native_picker.same_epoch(menu, ui, in_flight=True)
+        if _fields_match(ui, expected):
+            return ui
+    raise _missing_navigation_state('Training Mod menu', ui, str(expected))
+
+
 def tr_menu(ctx):
-    """Training HUD -> the TrainingRooms menu (B+Up in one frame) -> closed again (B, B), each proven by a gate.
-    On a real Switch it waits for TR's preloader first (preload_clear): input sent while it builds is lost. (The
-    notice references are hardware frames; on Eden a row calls routes:preload_clear itself once that is proven.)"""
-    gate(ctx, 'training')
-    if on_switch(ctx):
-        preload_clear(ctx)
-    play(ctx, 'tr-menu-open')
-    opened = gate(ctx, 'tr-menu')
-    play(ctx, 'tr-menu-close')
-    closed = gate(ctx, 'training')
-    return {'opened': str(opened), 'closed': str(closed)}
+    """Open and close the Training Mod menu using fenced native and TR state."""
+    io = BridgePickerIO(ctx)
+    cap = SWITCH_CAPS['training'] if on_switch(ctx) else ROUTE_GATES['training']['cap']
+    for opened, macro in ((False, 'tr-menu-open'), (True, 'tr-menu-close')):
+        until = time.monotonic() + (10 if opened else cap)
+        owner = 'tr.menu' if opened else 'native'
+        source = {**TRAINING_SCREEN, 'input.owner': owner}
+        current = _wait_tr_menu(io, until, opened=opened)
+        ui = _wait_training_owner(io, current, until, owner)
+        before = _armed_native_sample(io, ui, until, 'Training Mod menu')
+        if not _fields_match(before, source):
+            raise _missing_navigation_state('Training Mod menu', before, str(source))
+        native_picker.same_epoch(before, current, in_flight=True)
+        io.send(macro)
+        until = time.monotonic() + (cap if opened else 10)
+        confirmed = _wait_tr_menu(io, until, not opened, current)
+        _wait_training_owner(io, confirmed, until, 'native' if opened else 'tr.menu')
+        io.finish()
+        if not opened:
+            opened_revision = confirmed.block['rev']
+    return _save(ctx, 'routes-tr-menu', {'opened': opened_revision, 'closed': confirmed.block['rev'],
+                                         'boot': confirmed.block['boot']})
 
 
 def switch_close(ctx):

@@ -247,16 +247,20 @@ class StageTransitionTests(unittest.TestCase):
         from unittest.mock import Mock, patch
         ctx = Mock()
         for cap in (60, 180):
-            with patch.multiple(routes, wait_sss=Mock(), TileWalker=Mock(), play=Mock(),
-                                gate=Mock(), remember=Mock(), _save=Mock()):
+            with patch.multiple(routes, BridgePickerIO=Mock(), _tile_topology=Mock(),
+                                _finish_native_pick=Mock(), gate=Mock()), \
+                    patch.object(routes.native_picker, 'hover') as hover:
                 if cap == 60:
                     routes.pick_stage(ctx, "Battlefield")
                 else:
                     routes.pick_stage(ctx, "Battlefield", transition_cap=cap)
-                routes.gate.assert_called_once_with(ctx, "css", cap)
-                routes.wait_sss.assert_called_once_with(ctx)
-                routes.TileWalker.return_value.walk_to.assert_called_once_with(1)
-                routes.play.assert_called_once_with(ctx, "tap-a1")
+                io = routes.BridgePickerIO.return_value
+                hover.assert_called_once_with(
+                    io, 'sss', routes._native_target(routes.stage_entry('Battlefield'), 'normal'),
+                    routes._tile_topology.return_value, expected_context='training')
+                routes._finish_native_pick.assert_called_once_with(
+                    ctx, io, 'sss', hover.return_value, routes.stage_entry('Battlefield'), 'css.training', cap)
+                routes.gate.assert_not_called()
 
 
 class TableTests(unittest.TestCase):
@@ -950,7 +954,7 @@ class SwitchHwTests(unittest.TestCase):
 
 
 class SwitchGateTests(unittest.TestCase):
-    def test_hw_gates_read_stills(self):
+    def test_recorder_evidence_stills(self):
         from PIL import Image
         folder = Path(tempfile.mkdtemp())
         spec = routes._switch_spec('tr-menu')
@@ -980,22 +984,25 @@ class SwitchGateTests(unittest.TestCase):
             return str(path)
         ctx.shot = shot
         self.assertTrue(routes.on_switch(ctx))
+        def evidence(cap):
+            return routes._frame_gate(ctx, 'tr-menu-evidence', spec, cap)
+
         shots[:] = [str(blank), str(good)]
-        passed = routes.gate(ctx, 'tr-menu', cap=5)
+        passed = evidence(5)
         self.assertEqual(Path(passed).read_bytes(), good.read_bytes())
         shots[:] = [str(blank)] * 50
-        self.assertFalse(routes.passes(ctx, 'tr-menu', 0.5))
         with self.assertRaises(RuntimeError):
-            routes.gate(ctx, 'native-pause', cap=1)
+            evidence(0.5)
         # The console's auto-dim (about 1/3 the luminance) still passes; a dark unrelated frame doesn't.
         dim = folder / 'dim.png'
         frame.point(lambda v: int(v * 0.33)).save(dim)
         shots[:] = [str(dim)]
-        self.assertTrue(routes.passes(ctx, 'tr-menu', 1))
+        self.assertEqual(Path(evidence(1)).read_bytes(), dim.read_bytes())
         gray = folder / 'gray.png'
         Image.new('RGB', (1280, 720), (20, 20, 20)).save(gray)
         shots[:] = [str(gray)] * 50
-        self.assertFalse(routes.passes(ctx, 'tr-menu', 0.5))
+        with self.assertRaises(RuntimeError):
+            evidence(0.5)
 
 
 class SwitchDiscriminationTests(unittest.TestCase):
@@ -1449,45 +1456,26 @@ class SessionRecordingTests(unittest.TestCase):
 
 
 class SwitchBootTests(unittest.TestCase):
-    def run_boot(self, screens):
-        """screens: what each look sees, in order ('main', 'profile', 'launch-error' or None)."""
-        folder = Path(tempfile.mkdtemp())
-        log = folder / 'skyline.log'
-        log.write_text('')
-        calls, played = [], []
-        seq = list(screens)
-        state = {'now': None}
+    def test_launched_switch_uses_the_same_title_gate_and_deadline(self):
+        from unittest.mock import Mock, patch
 
-        def passes(ctx, name, cap):
-            if name == 'main':  # every look starts with main: take the next screen
-                state['now'] = seq.pop(0) if seq else None
-            return state['now'] == name
+        ctx = Mock(instance={'socket': 'usb:///dev/ttyACM0'})
+        with patch.object(routes, 'to_main', return_value={'main': True}) as to_main, \
+                patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result):
+            self.assertEqual(routes.switch_boot(ctx, cap=5), {'main': True})
+        to_main.assert_called_once_with(ctx, cap=5)
+        ctx.call.assert_not_called()
+        ctx.shot.assert_not_called()
 
-        ctx = FakeCtx.__new__(FakeCtx)
-        ctx.runner, ctx.on, ctx.row_dir = type('R', (), {'plan': {'gates': {}}})(), 'sw', folder
-        ctx.instance = {'socket': 'usb:///dev/ttyACM0', 'console_log': str(log)}
-        ctx.call = lambda method, params=None, job_cap=15: calls.append(method) or {'ok': True}
-        ctx.check_stop = lambda: None
-        ctx.shot = lambda name: str(folder / f'{name}.png')
-        old_passes, old_play = routes.passes, routes.play
-        routes.passes, routes.play = passes, lambda c, name: played.append(name)
-        try:
-            return routes.switch_boot(ctx, cap=5), calls, played
-        finally:
-            routes.passes, routes.play = old_passes, old_play
+    def test_system_applet_needs_owner_and_focus(self):
+        from unittest.mock import Mock, patch
 
-    def test_profile_then_start_then_main(self):
-        out, calls, played = self.run_boot([None, 'profile', None, 'main'])
-        self.assertEqual(calls, ['switch.launch'])
-        self.assertEqual(played, ['tap-b1', 'tap-a1', 'attract-cancel'])
-        self.assertEqual(out['looks'][-1], 'main')
-
-    def test_launch_error_relaunches_once_then_fails(self):
-        out, calls, _ = self.run_boot([None, 'launch-error', 'main'])
-        self.assertEqual(calls, ['switch.launch', 'switch.dismiss', 'switch.launch'])
-        self.assertIn('erpt 2009-0005', out['notes'][0])
-        with self.assertRaises(RuntimeError):
-            self.run_boot([None, 'launch-error', 'launch-error'])
+        ctx = Mock(instance={'socket': 'usb:///dev/ttyACM0'})
+        with patch.object(routes, 'to_main', side_effect=RuntimeError('ssbu.ui unavailable')), \
+                self.assertRaisesRegex(RuntimeError, 'system applets have no bridge owner or focus'):
+            routes.switch_boot(ctx, cap=5)
+        ctx.call.assert_not_called()
+        ctx.shot.assert_not_called()
 
 
 class ExpectTests(unittest.TestCase):

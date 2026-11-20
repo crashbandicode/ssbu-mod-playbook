@@ -782,17 +782,17 @@ class NativeScreenGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, reason):
                     self.run_gate('switch://fixture', 'css', [native(1), latest], cap=.15)
 
-    def test_standalone_eden_keeps_image_gate_return_value(self):
+    def test_eden_navigation_gate_requires_a_bridge_endpoint(self):
         from types import SimpleNamespace
-        from unittest.mock import Mock, patch
+        from unittest.mock import Mock
 
         import routes
 
         ctx = SimpleNamespace(instance={'socket': '/tmp/eden-fixture.sock'},
                               runner=SimpleNamespace(plan={}), gate=Mock(return_value='standalone.png'))
-        with patch.object(routes, 'BridgePickerIO', side_effect=AssertionError('bridge query')):
-            self.assertEqual(routes.gate(ctx, 'css'), 'standalone.png')
-        ctx.gate.assert_called_once_with('routes.css')
+        with self.assertRaisesRegex(RuntimeError, 'bridge_log'):
+            routes.gate(ctx, 'css')
+        ctx.gate.assert_not_called()
 
 class MainMenuStepTests(unittest.TestCase):
     @staticmethod
@@ -1210,7 +1210,7 @@ class NativeQuitTrainingTests(unittest.TestCase):
         if focus is not None:
             values.update({'focus.id': focus, 'focus.source': 'native'})
         if screen == 'css.training':
-            values.update({'focus.source': 'tile.cursor', 'input.owner': 'unknown', 'dialog': 'unknown'})
+            values['focus.source'] = 'tile.cursor'
         return native(rev, **{**values, **changes})
 
     def setUp(self):
