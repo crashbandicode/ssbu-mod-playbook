@@ -439,6 +439,39 @@ class BridgeFramingTests(unittest.TestCase):
                         finally:
                             bridge.finish()
 
+    def test_arm_requires_a_one_block_watch(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+        from native_picker_io import BridgePickerIO
+
+        boot = '0x0000000000000001'
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.touch()
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None,
+                                  runner=SimpleNamespace(), on='sw')
+            for provider in ('ssbu.ui', 'tile.cursor'):
+                for maximum in (1, 4294967295):
+                    with self.subTest(provider=provider, maximum=maximum):
+                        def spool(_ctx, *requests):
+                            self.assertEqual(requests, ('providers', f'state_watch {provider} keys=observation max=1'))
+                            with log.open('a') as dest:
+                                dest.write(f'[Bridge] req providers result=ok count=2 boot={boot}\n'
+                                           f'[Bridge] req state_watch name={provider} result=ok keys=1 max={maximum}\n')
+
+                        bridge = BridgePickerIO(ctx)
+                        with patch.object(routes, 'bridge_v2', spool):
+                            if maximum == 1:
+                                bridge.arm(provider, 1)
+                                self.assertEqual(bridge.boot, boot)
+                            else:
+                                with self.assertRaisesRegex(RuntimeError, 'watch limit'):
+                                    bridge.arm(provider, 1)
+
     def test_new_route_cannot_overwrite_unconfirmed_input(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory
@@ -549,8 +582,8 @@ class TrainingStageProofTests(unittest.TestCase):
                     response = frame(next(ui_samples))
                 elif request == 'state tile.cursor':
                     response = frame(next(tiles))
-                elif request == 'state_watch ssbu.ui keys=observation':
-                    response = '[Bridge] req state_watch name=ssbu.ui result=ok\n'
+                elif request == 'state_watch ssbu.ui keys=observation max=1':
+                    response = '[Bridge] req state_watch name=ssbu.ui result=ok keys=1 max=1\n'
                 elif request == 'events on':
                     response = '[Bridge] req events result=ok on=1 latest=41 frame=700 wall=10000\n'
                 else:
@@ -565,7 +598,7 @@ class TrainingStageProofTests(unittest.TestCase):
             def start(_ctx, name):
                 actions.append(name)
                 self.assertEqual(requests, [
-                    'state ssbu.ui', 'state tile.cursor', 'state_watch ssbu.ui keys=observation',
+                    'state ssbu.ui', 'state tile.cursor', 'state_watch ssbu.ui keys=observation max=1',
                     'state ssbu.ui', 'state tile.cursor', 'events on',
                 ])
 
@@ -855,13 +888,20 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         if focus == 'stage_select':
             return native(rev, screen='stage_select', focus='stage_select', dialog='none',
                           **{'screen.context': 'training'})
+        if focus == 'submenu_pending':
+            # v9 rev 3361 confirmed the new layer before it had any item focus.
+            return native(rev, screen='main_menu', focus='main_menu.submenu', **{
+                'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
+                **dict.fromkeys(('focus.source', 'focus.id', 'focus.index', 'focus.label',
+                                 'input.owner', 'dialog'), 'unknown'),
+            })
         layer = 'top' if focus == 'games_and_more' else 'submenu'
         return native(rev, screen='main_menu', focus=f'main_menu.{layer}.{focus}', dialog='none',
                       **{'screen.tab': 'games_and_more', 'screen.layer': layer,
                          'focus.id': focus, 'focus.source': 'native'})
 
     def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None, submenu_loading=False,
-                  submenu_rearm=False, tile_samples=None):
+                  submenu_rearm=False, submenu_pending=False, tile_samples=None):
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -872,6 +912,8 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         for source, target in zip(focuses, focuses[1:]):
             frames.extend((source, target))
         frames.append('stage_select')
+        if submenu_pending:
+            frames[2:2] = [None, 'submenu_pending', None, 'submenu_pending']
         if submenu_loading:
             frames.insert(2, None)
         if submenu_rearm:
@@ -973,6 +1015,31 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         self.assertEqual(self.run_route(io, 0, submenu_loading=True),
                          {'screen': 'stage', 'proof': 'stage_select'})
         self.assertEqual(io.send.call_args_list, [call(action) for action in self.actions])
+
+    def test_games_more_submenu_shell_waits_for_fresh_classic_mode(self):
+        from unittest.mock import Mock, call
+
+        io = Mock()
+        self.assertEqual(self.run_route(io, 0, submenu_pending=True),
+                         {'screen': 'stage', 'proof': 'stage_select'})
+        self.assertEqual(io.send.call_args_list, [call(action) for action in self.actions])
+        first, second = [i for i, event in enumerate(io.mock_calls) if event[0] == 'send'][:2]
+        self.assertEqual([event[0] for event in io.mock_calls[first+1:second]],
+                         ['read', 'read', 'read', 'read', 'read', 'finish', 'arm', 'read'])
+
+    def test_games_more_does_not_wait_through_conflicting_submenu_state(self):
+        from unittest.mock import Mock
+
+        for key, value in (('screen.tab', 'smash'), ('screen.layer', 'top'),
+                           ('focus.id', 'training'), ('focus.index', '2'), ('dialog', 'notice')):
+            with self.subTest(key=key):
+                shell = self.checkpoint(4, 'submenu_pending')
+                shell.values[key] = value
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, 'unexpected Main Menu focus'):
+                    self.run_route(io, 0, submenu_pending=True, changes=((3, shell),))
+                io.send.assert_called_once_with('tap-a1')
+                io.finish.assert_not_called()
 
     def test_submenu_rearm_requires_fresh_classic_mode_after_inactivity(self):
         from unittest.mock import Mock, call
