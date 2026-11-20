@@ -59,6 +59,7 @@ class BridgeNavigationTests(unittest.TestCase):
         self.checked_source = False
         self.change_on_watch = None
         self.loading_next = False
+        self.initial_empty = False
         self.last_ui = None
 
     def assert_no_images(self):
@@ -96,11 +97,14 @@ class BridgeNavigationTests(unittest.TestCase):
         else:
             self.revision += 1
             if request == 'state ssbu.ui':
-                self.last_ui = UNKNOWN if self.loading_next else self.scene
+                self.last_ui = UNKNOWN if self.loading_next or self.initial_empty else self.scene
                 self.loading_next = False
                 if self.watch_armed:
                     self.checked_source = True
                 sample = state_fixtures.native(self.revision, **self.last_ui)
+                if self.initial_empty:
+                    sample = state_fixtures.native(self.revision, **{**self.last_ui, 'observation': '0'})
+                    self.initial_empty = False
             else:
                 self.assertEqual(request, 'state tile.cursor')
                 if self.scene is STAGE:
@@ -142,6 +146,16 @@ class BridgeNavigationTests(unittest.TestCase):
 
         self.assertFalse(self.actions)
         self.assertEqual(self.last_ui, MAIN)
+
+    def test_empty_first_boot_sample_grants_no_input_and_can_settle(self):
+        self.scene = MAIN
+        self.initial_empty = True
+
+        routes.to_main(self.ctx, tries=0, look_s=.35)
+
+        self.assertFalse(self.actions)
+        self.assertEqual(self.last_ui, MAIN)
+        self.assert_no_images()
         self.assert_no_images()
 
     def test_title_source_must_remain_qualified_after_arming(self):

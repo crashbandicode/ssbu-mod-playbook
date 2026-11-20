@@ -81,6 +81,8 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
     block, values = state.block, state.values
     active = values.get('observation.active') == ACTIVE[provider]
     loading = loading_ui and provider == UI and values.get('observation.active') == 'no'
+    empty_boot = (loading and all(values.get(key) == 'unknown' for key in UI_FOCUS_FIELDS)
+                  and values.get('ack') == '0' and values.get('ack.result') == 'unsupported')
     focus = values.get('focus', '')
     placing = (pending_placement and provider == TILE and focus == 'unknown'
                and values.get('local.token') == 'placed')
@@ -91,7 +93,7 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
             or any(values.get(key) != str(block[key]) for key in ('schema', 'boot', 'rev'))
-            or number(state, 'observation') <= 0
+            or (number(state, 'observation') == 0 and not empty_boot)
             or not (loading or (active and (focus not in ABSENT or placing or entering)))):
         raise RuntimeError(f'{provider}: incomplete, inactive or wrong-schema observation')
     return state
