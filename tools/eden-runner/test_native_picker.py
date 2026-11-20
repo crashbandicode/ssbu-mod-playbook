@@ -46,7 +46,14 @@ def tile(rev, *, at='7', target=OTHER, ack=0, applied=None, settled=True, direct
 
 def native(rev, epoch=1, **extra):
     return snapshot('ssbu.ui', rev, {'screen': 'css.smash', 'input.owner': 'native',
-                                    'dialog': 'none', 'focus.source': 'tile.cursor', **extra}, epoch)
+                                    'dialog': 'none', 'focus.source': 'tile.cursor',
+                                    'screen.context': 'unknown', 'ack': '0', 'ack.result': 'unsupported',
+                                    **extra}, epoch)
+
+
+def loading(rev, *, epoch=1, **extra):
+    fields = dict.fromkeys(('screen', 'focus', 'input.owner', 'dialog', 'focus.source', 'screen.context'), 'unknown')
+    return native(rev, epoch, **{**fields, 'observation.active': 'no', **extra})
 
 
 class Replay:
@@ -218,6 +225,15 @@ class PickerTests(unittest.TestCase):
         result = picker.pick(replay, 'sss', target, next_screen='css.smash', cap=.1)
         self.assertEqual(replay.actions, ['tap-a1'])
         self.assertEqual(result['screen'], 'css.smash')
+
+        source = [native(i, screen='stage_select', focus='stage_select/8',
+                         **{'screen.context': 'training'}) for i in (1, 2)]
+        css = {'screen': 'css.training', 'focus': 'css.training', 'screen.context': 'training'}
+        passive = native(4, **{**css, 'input.owner': 'unknown', 'dialog': 'unknown'})
+        replay = Replay([stage_tile(1), stage_tile(2)], [*source, loading(3), passive, native(5, **css)])
+        result = picker.pick(replay, 'sss', target, expected_context='training', cap=.1)
+        self.assertEqual(replay.actions, ['tap-a1'])
+        self.assertEqual(result['screen'], 'css.training')
 
         replay = Replay([stage_tile(1), stage_tile(2)],
                         [stage_ui(1), stage_ui(2), native(3, screen='rules', focus='rules')])
@@ -409,7 +425,8 @@ class TrainingStageProofTests(unittest.TestCase):
     boot = '0x0000000000000001'
 
     def run_training(self, replay, finish, *, expected=0, before_press='',
-                     refreshed_context='training', after_owner='native', after_dialog='none', press=True):
+                     refreshed_context='training', after_owner='native', after_dialog='none',
+                     scene_loading=False, press=True):
         import zlib
         from pathlib import Path
         from tempfile import TemporaryDirectory
@@ -441,7 +458,10 @@ class TrainingStageProofTests(unittest.TestCase):
                 native(1, screen='css.training', focus='css.training', **{'screen.context': 'training'}),
                 native(2, screen='css.training', focus='css.training',
                        **{'screen.context': refreshed_context}),
-                native(3, screen='training', focus='training', dialog=after_dialog,
+                *([loading(3), native(4, screen='training', focus='training', dialog='unknown',
+                                       **{'screen.context': 'training', 'input.owner': 'unknown'})]
+                  if scene_loading else []),
+                native(5 if scene_loading else 3, screen='training', focus='training', dialog=after_dialog,
                        **{'screen.context': 'training', 'input.owner': after_owner}),
             ])
             placed = picker.Target('88', 'Steve', 'default')
@@ -502,8 +522,12 @@ class TrainingStageProofTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'training context'):
             self.run_training('', self.ending(), refreshed_context='unknown', press=False)
 
-    def test_training_plus_refuses_gameplay_without_native_owner_or_with_modal(self):
-        for fields in ({'after_owner': 'unknown'}, {'after_dialog': 'notice'}):
+    def test_training_plus_accepts_the_loaded_scene_and_independent_stage_event(self):
+        stage = '[Bridge] stage id=0 ev=42 frame=720 wall=10040\n'
+        self.assertEqual(self.run_training(stage, self.ending(42), scene_loading=True)['stage_id'], 0)
+
+    def test_training_plus_refuses_gameplay_with_non_native_owner_or_with_modal(self):
+        for fields in ({'after_owner': 'overlay'}, {'after_dialog': 'notice'}):
             with self.subTest(fields=fields), self.assertRaisesRegex(RuntimeError, 'unexpected native focus'):
                 self.run_training('', self.ending(), **fields)
 
@@ -764,7 +788,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                       **{'screen.tab': 'games_and_more', 'screen.layer': layer,
                          'focus.id': focus, 'focus.source': 'native'})
 
-    def run_route(self, io, start, *, changes=(), tile_state=None):
+    def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None):
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -778,6 +802,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         samples = [self.checkpoint(i, focus) for i, focus in enumerate(frames, 1)]
         for index, state in changes:
             samples[index] = state
+        samples[-2:-2] = loading_frames
         ui = iter(samples)
         active_tile = snapshot('tile.cursor', 10, {'screen': 'sss', 'focus': 'sss'})
         if tile_state is None:
@@ -879,6 +904,19 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                 io.send.assert_called_once_with('tap-a1')
                 io.finish.assert_not_called()
 
+    def test_submenu_confirm_waits_for_inactive_then_passive_stage(self):
+        from unittest.mock import Mock
+
+        io = Mock()
+        selected = self.checkpoint(5, 'stage_select')
+        renewed = self.checkpoint(6, 'stage_select')
+        passive = native(4, screen='stage_select', focus='stage_select', dialog='unknown',
+                         **{'screen.context': 'training', 'input.owner': 'unknown'})
+        result = self.run_route(io, 3, changes=((2, selected), (3, renewed)),
+                                loading_frames=(loading(3), passive))
+        self.assertEqual(result['proof'], 'stage_select')
+        io.send.assert_called_once_with('tap-a1')
+
     def test_stage_arrival_stays_pending_without_matching_tile_provider(self):
         from unittest.mock import Mock
 
@@ -923,13 +961,14 @@ class NativeQuitTrainingTests(unittest.TestCase):
         save.start()
         self.routes = routes
 
-    def run_quit(self, *, changes=()):
+    def run_quit(self, *, changes=(), loading_frames=()):
         samples = [self.state(rev, screen, focus) for rev, (screen, focus) in enumerate(
             [('training', None), ('training', None), ('pause', 'cpu_count'),
              ('pause', 'cpu_count'), ('pause', 'quit_training'), ('pause', 'quit_training'),
              ('css.training', None)], 1)]
         for index, state in changes:
             samples[index] = state
+        samples[-1:-1] = loading_frames
         self.io.read.side_effect = samples
         return self.routes.quit_training(self.ctx, cap=.25)
 
@@ -942,6 +981,17 @@ class NativeQuitTrainingTests(unittest.TestCase):
                          ['read'] + ['arm', 'read', 'send', 'read', 'finish'] * 3)
         self.assertTrue(all(call.args[0] == 'ssbu.ui' for call in self.io.arm.call_args_list))
         self.assertEqual((result['screen'], result['observation']), ('css.training', 7))
+
+    def test_quit_waits_through_a_fenced_inactive_interval(self):
+        result = self.run_quit(changes=((6, self.state(8, 'css.training')),), loading_frames=(loading(7),))
+        self.assertEqual((result['screen'], result['observation']), ('css.training', 8))
+        self.assertEqual(self.io.send.call_count, 3)
+
+    def test_same_screen_pause_move_never_tolerates_inactive_owner(self):
+        with self.assertRaisesRegex(RuntimeError, 'inactive'):
+            self.run_quit(changes=((4, loading(5)),))
+        self.assertEqual(self.io.send.call_count, 2)
+        self.assertEqual(self.io.finish.call_count, 1)
 
     def test_unknown_start_sends_no_input_or_watch(self):
         with self.assertRaisesRegex(RuntimeError, 'source'):
@@ -986,3 +1036,36 @@ class NativeQuitTrainingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TrainingSceneTransitionTests(unittest.TestCase):
+    source = {'screen': 'css.training', 'screen.context': 'training', 'focus.source': 'tile.cursor',
+              'input.owner': 'native', 'dialog': 'none', 'focus': 'css.training'}
+    target = {'screen': 'training', 'screen.context': 'training', 'input.owner': 'native', 'dialog': 'none'}
+
+    def run_wait(self, *frames):
+        import time
+
+        replay = Replay(native_blocks=frames)
+        return picker.wait_scene_transition(replay, native(2, **self.source), time.monotonic() + .1,
+                                            self.source, self.target, label='native')
+
+    def test_wrong_active_screen_or_modal_stops_even_with_ready_frame_available(self):
+        ready = native(5, focus='training', **self.target)
+        for fields in ({'screen': 'rules'}, {'screen.context': 'smash'},
+                       {'input.owner': 'overlay'}, {'dialog': 'notice'}):
+            with self.subTest(fields=fields), self.assertRaisesRegex(RuntimeError, 'unexpected'):
+                self.run_wait(loading(3), native(4, focus='training', **{**self.target, **fields}), ready)
+
+    def test_inactive_owner_requires_complete_explicit_sentinels_and_continuity(self):
+        ready = native(5, focus='training', **self.target)
+        missing = loading(3)
+        missing.values.pop('input.owner')
+        different_boot = loading(3)
+        different_boot.block['boot'] = different_boot.values['boot'] = '0x0000000000000002'
+        for frame, reason in ((missing, 'incomplete'), (loading(3, dialog='none'), 'inactive'),
+                              (loading(3, epoch=2), 'connection'), (different_boot, 'boot'),
+                              (loading(1), 'stale'),
+                              (loading(3, **{'observation': 'bad'}), 'invalid observation')):
+            with self.subTest(frame=frame), self.assertRaisesRegex(RuntimeError, reason):
+                self.run_wait(frame, ready)
