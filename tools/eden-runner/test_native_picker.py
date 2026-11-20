@@ -339,14 +339,17 @@ class BridgeFramingTests(unittest.TestCase):
         provider = 'ssbu.ui'
         schema = provider + '/1'
 
-        def wire(rev, *, filtered=False, torn=False):
+        def wire(rev, *, filtered=False, torn=False, crc_valid=True, include_end=True, frame_boot=boot):
             payload = [f'schema={schema}', f'rev={rev}', f'boot={boot}', 'ack=0',
                        'ack.result=unsupported', 'focus=main_menu/top/smash',
                        f'observation={rev}', 'observation.active=yes']
-            begin = (f'[Bridge] state begin name={provider} schema={schema} rev={rev} boot={boot} '
+            begin = (f'[Bridge] state begin name={provider} schema={schema} rev={rev} boot={frame_boot} '
                      f'lines={len(payload)} filtered={int(filtered)}\n')
             body = ''.join(f'[Bridge] state.{i} {line}\n' for i, line in enumerate(payload))
-            end = f'[Bridge] state end name={provider} rev={rev} crc={zlib.crc32(chr(10).join(payload).encode()):08x}\n'
+            crc = zlib.crc32(chr(10).join(payload).encode())
+            if not crc_valid:
+                crc ^= 1
+            end = f'[Bridge] state end name={provider} rev={rev} crc={crc:08x}\n' if include_end else ''
             return begin + body + ('[Adapter] reconnect same_boot=1\n' if torn else '') + end
 
         with TemporaryDirectory() as temp:
@@ -366,6 +369,23 @@ class BridgeFramingTests(unittest.TestCase):
                 state = bridge.read(provider, 1)
             self.assertEqual(state.block['rev'], 55)
             self.assertEqual(state.connection, 1)
+
+            fence = f'[Bridge] req providers result=ok count=2 boot={boot}\n'
+            for bad_reply, reason in ((wire(56, crc_valid=False), 'malformed'),
+                                      (wire(56, include_end=False), 'overlapping'),
+                                      (wire(56, frame_boot='0x0000000000000002'), 'boot')):
+                with self.subTest(reason=reason):
+                    def after_press(_ctx, *_requests):
+                        with log.open('a') as dest:
+                            dest.write(fence + wire(55, filtered=True) + bad_reply + wire(57))
+
+                    with (patch.object(routes, 'play'), patch.object(routes, 'bridge_v2', after_press)):
+                        bridge.send('tap-a1')
+                        try:
+                            with self.assertRaisesRegex(RuntimeError, reason):
+                                bridge.read(provider, 1)
+                        finally:
+                            bridge.finish()
 
     def test_new_route_cannot_overwrite_unconfirmed_input(self):
         from pathlib import Path
