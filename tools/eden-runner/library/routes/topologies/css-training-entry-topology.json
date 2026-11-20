@@ -1,0 +1,887 @@
+{
+  "layout": "css.9f1fb03bf7c98fb9",
+  "neighbors": {
+    "0": {
+      "down": "13",
+      "right": "1"
+    },
+    "1": {
+      "down": "14",
+      "left": "0",
+      "right": "2"
+    },
+    "2": {
+      "down": "15",
+      "left": "1",
+      "right": "3"
+    },
+    "3": {
+      "down": "16",
+      "left": "2",
+      "right": "4"
+    },
+    "4": {
+      "down": "17",
+      "left": "3",
+      "right": "5"
+    },
+    "5": {
+      "down": "18",
+      "left": "4",
+      "right": "6"
+    },
+    "6": {
+      "down": "19",
+      "left": "5",
+      "right": "7"
+    },
+    "7": {
+      "down": "20",
+      "left": "6",
+      "right": "8"
+    },
+    "8": {
+      "down": "21",
+      "left": "7",
+      "right": "9"
+    },
+    "9": {
+      "down": "22",
+      "left": "8",
+      "right": "10"
+    },
+    "10": {
+      "down": "23",
+      "left": "9",
+      "right": "11"
+    },
+    "11": {
+      "down": "24",
+      "left": "10",
+      "right": "12"
+    },
+    "12": {
+      "down": "25",
+      "left": "11"
+    },
+    "13": {
+      "up": "0",
+      "down": "26",
+      "right": "14"
+    },
+    "14": {
+      "up": "1",
+      "down": "27",
+      "left": "13",
+      "right": "15"
+    },
+    "15": {
+      "up": "2",
+      "down": "28",
+      "left": "14",
+      "right": "16"
+    },
+    "16": {
+      "up": "3",
+      "down": "29",
+      "left": "15",
+      "right": "17"
+    },
+    "17": {
+      "up": "4",
+      "down": "30",
+      "left": "16",
+      "right": "18"
+    },
+    "18": {
+      "up": "5",
+      "down": "31",
+      "left": "17",
+      "right": "19"
+    },
+    "19": {
+      "up": "6",
+      "down": "32",
+      "left": "18",
+      "right": "20"
+    },
+    "20": {
+      "up": "7",
+      "down": "33",
+      "left": "19",
+      "right": "21"
+    },
+    "21": {
+      "up": "8",
+      "down": "34",
+      "left": "20",
+      "right": "22"
+    },
+    "22": {
+      "up": "9",
+      "down": "35",
+      "left": "21",
+      "right": "23"
+    },
+    "23": {
+      "up": "10",
+      "down": "36",
+      "left": "22",
+      "right": "24"
+    },
+    "24": {
+      "up": "11",
+      "left": "23",
+      "right": "25"
+    },
+    "25": {
+      "up": "12",
+      "down": "38",
+      "left": "24"
+    },
+    "26": {
+      "up": "13",
+      "down": "39",
+      "right": "27"
+    },
+    "27": {
+      "up": "14",
+      "down": "40",
+      "left": "26",
+      "right": "28"
+    },
+    "28": {
+      "up": "15",
+      "down": "41",
+      "left": "27",
+      "right": "29"
+    },
+    "29": {
+      "up": "16",
+      "down": "42",
+      "left": "28",
+      "right": "30"
+    },
+    "30": {
+      "up": "17",
+      "down": "43",
+      "left": "29",
+      "right": "31"
+    },
+    "31": {
+      "up": "18",
+      "down": "44",
+      "left": "30",
+      "right": "32"
+    },
+    "32": {
+      "up": "19",
+      "down": "45",
+      "left": "31",
+      "right": "33"
+    },
+    "33": {
+      "up": "20",
+      "down": "46",
+      "left": "32",
+      "right": "34"
+    },
+    "34": {
+      "up": "21",
+      "down": "47",
+      "left": "33",
+      "right": "35"
+    },
+    "35": {
+      "up": "22",
+      "down": "48",
+      "left": "34",
+      "right": "36"
+    },
+    "36": {
+      "up": "23",
+      "down": "49",
+      "left": "35"
+    },
+    "38": {
+      "up": "25",
+      "down": "51"
+    },
+    "39": {
+      "up": "26",
+      "down": "52",
+      "right": "40"
+    },
+    "40": {
+      "up": "27",
+      "down": "53",
+      "left": "39",
+      "right": "41"
+    },
+    "41": {
+      "up": "28",
+      "down": "54",
+      "left": "40",
+      "right": "42"
+    },
+    "42": {
+      "up": "29",
+      "down": "55",
+      "left": "41",
+      "right": "43"
+    },
+    "43": {
+      "up": "30",
+      "down": "56",
+      "left": "42",
+      "right": "44"
+    },
+    "44": {
+      "up": "31",
+      "down": "57",
+      "left": "43",
+      "right": "45"
+    },
+    "45": {
+      "up": "32",
+      "down": "58",
+      "left": "44",
+      "right": "46"
+    },
+    "46": {
+      "up": "33",
+      "down": "59",
+      "left": "45",
+      "right": "47"
+    },
+    "47": {
+      "up": "34",
+      "down": "60",
+      "left": "46",
+      "right": "48"
+    },
+    "48": {
+      "up": "35",
+      "down": "61",
+      "left": "47",
+      "right": "49"
+    },
+    "49": {
+      "up": "36",
+      "down": "62",
+      "left": "48",
+      "right": "50"
+    },
+    "50": {
+      "down": "63",
+      "left": "49",
+      "right": "51"
+    },
+    "51": {
+      "up": "38",
+      "down": "64",
+      "left": "50"
+    },
+    "52": {
+      "up": "39",
+      "down": "65",
+      "right": "53"
+    },
+    "53": {
+      "up": "40",
+      "down": "66",
+      "left": "52",
+      "right": "54"
+    },
+    "54": {
+      "up": "41",
+      "down": "67",
+      "left": "53",
+      "right": "55"
+    },
+    "55": {
+      "up": "42",
+      "down": "68",
+      "left": "54",
+      "right": "56"
+    },
+    "56": {
+      "up": "43",
+      "down": "69",
+      "left": "55",
+      "right": "57"
+    },
+    "57": {
+      "up": "44",
+      "down": "70",
+      "left": "56",
+      "right": "58"
+    },
+    "58": {
+      "up": "45",
+      "down": "71",
+      "left": "57",
+      "right": "59"
+    },
+    "59": {
+      "up": "46",
+      "down": "72",
+      "left": "58",
+      "right": "60"
+    },
+    "60": {
+      "up": "47",
+      "down": "73",
+      "left": "59",
+      "right": "61"
+    },
+    "61": {
+      "up": "48",
+      "down": "74",
+      "left": "60",
+      "right": "62"
+    },
+    "62": {
+      "up": "49",
+      "down": "75",
+      "left": "61",
+      "right": "63"
+    },
+    "63": {
+      "up": "50",
+      "down": "76",
+      "left": "62",
+      "right": "64"
+    },
+    "64": {
+      "up": "51",
+      "down": "77",
+      "left": "63"
+    },
+    "65": {
+      "up": "52",
+      "down": "78",
+      "right": "66"
+    },
+    "66": {
+      "up": "53",
+      "down": "78",
+      "left": "65",
+      "right": "67"
+    },
+    "67": {
+      "up": "54",
+      "down": "78",
+      "left": "66",
+      "right": "68"
+    },
+    "68": {
+      "up": "55",
+      "down": "79",
+      "left": "67",
+      "right": "69"
+    },
+    "69": {
+      "up": "56",
+      "left": "68",
+      "right": "70"
+    },
+    "70": {
+      "up": "57",
+      "down": "81",
+      "left": "69",
+      "right": "71"
+    },
+    "71": {
+      "up": "58",
+      "down": "82",
+      "left": "70",
+      "right": "72"
+    },
+    "72": {
+      "up": "59",
+      "down": "83",
+      "left": "71",
+      "right": "73"
+    },
+    "73": {
+      "up": "60",
+      "down": "84",
+      "left": "72",
+      "right": "74"
+    },
+    "74": {
+      "up": "61",
+      "down": "85",
+      "left": "73",
+      "right": "75"
+    },
+    "75": {
+      "up": "62",
+      "left": "74",
+      "right": "76"
+    },
+    "76": {
+      "up": "63",
+      "left": "75",
+      "right": "77"
+    },
+    "77": {
+      "up": "64",
+      "left": "76"
+    },
+    "78": {
+      "up": "67",
+      "right": "79"
+    },
+    "79": {
+      "up": "68",
+      "left": "78"
+    },
+    "81": {
+      "up": "70",
+      "right": "82"
+    },
+    "82": {
+      "up": "71",
+      "left": "81",
+      "right": "83"
+    },
+    "83": {
+      "up": "72",
+      "left": "82",
+      "right": "84"
+    },
+    "84": {
+      "up": "73",
+      "left": "83",
+      "right": "85"
+    },
+    "85": {
+      "up": "74",
+      "left": "84"
+    }
+  },
+  "targets": {
+    "0": {
+      "kind": "0",
+      "name": "Mario",
+      "form": "default"
+    },
+    "1": {
+      "kind": "1",
+      "name": "Donkey Kong",
+      "form": "default"
+    },
+    "2": {
+      "kind": "2",
+      "name": "Link",
+      "form": "default"
+    },
+    "3": {
+      "kind": "3",
+      "name": "Samus",
+      "form": "default"
+    },
+    "4": {
+      "kind": "4",
+      "name": "Dark Samus",
+      "form": "default"
+    },
+    "5": {
+      "kind": "5",
+      "name": "Yoshi",
+      "form": "default"
+    },
+    "6": {
+      "kind": "6",
+      "name": "Kirby",
+      "form": "default"
+    },
+    "7": {
+      "kind": "7",
+      "name": "Fox",
+      "form": "default"
+    },
+    "8": {
+      "kind": "8",
+      "name": "Pikachu",
+      "form": "default"
+    },
+    "9": {
+      "kind": "9",
+      "name": "Luigi",
+      "form": "default"
+    },
+    "10": {
+      "kind": "10",
+      "name": "Ness",
+      "form": "default"
+    },
+    "11": {
+      "kind": "11",
+      "name": "Captain Falcon",
+      "form": "default"
+    },
+    "12": {
+      "kind": "12",
+      "name": "Jigglypuff",
+      "form": "default"
+    },
+    "13": {
+      "kind": "13",
+      "name": "Peach",
+      "form": "default"
+    },
+    "14": {
+      "kind": "14",
+      "name": "Daisy",
+      "form": "default"
+    },
+    "15": {
+      "kind": "15",
+      "name": "Bowser",
+      "form": "default"
+    },
+    "16": {
+      "kind": "75",
+      "name": "Ice Climbers",
+      "form": "default"
+    },
+    "17": {
+      "kind": "16",
+      "name": "Sheik",
+      "form": "default"
+    },
+    "18": {
+      "kind": "17",
+      "name": "Zelda",
+      "form": "default"
+    },
+    "19": {
+      "kind": "18",
+      "name": "Dr. Mario",
+      "form": "default"
+    },
+    "20": {
+      "kind": "19",
+      "name": "Pichu",
+      "form": "default"
+    },
+    "21": {
+      "kind": "20",
+      "name": "Falco",
+      "form": "default"
+    },
+    "22": {
+      "kind": "21",
+      "name": "Marth",
+      "form": "default"
+    },
+    "23": {
+      "kind": "22",
+      "name": "Lucina",
+      "form": "default"
+    },
+    "24": {
+      "kind": "23",
+      "name": "Young Link",
+      "form": "default"
+    },
+    "25": {
+      "kind": "24",
+      "name": "Ganondorf",
+      "form": "default"
+    },
+    "26": {
+      "kind": "25",
+      "name": "Mewtwo",
+      "form": "default"
+    },
+    "27": {
+      "kind": "26",
+      "name": "Roy",
+      "form": "default"
+    },
+    "28": {
+      "kind": "27",
+      "name": "Chrom",
+      "form": "default"
+    },
+    "29": {
+      "kind": "28",
+      "name": "Mr. Game & Watch",
+      "form": "default"
+    },
+    "30": {
+      "kind": "29",
+      "name": "Meta Knight",
+      "form": "default"
+    },
+    "31": {
+      "kind": "30",
+      "name": "Pit",
+      "form": "default"
+    },
+    "32": {
+      "kind": "31",
+      "name": "Dark Pit",
+      "form": "default"
+    },
+    "33": {
+      "kind": "32",
+      "name": "Zero Suit Samus",
+      "form": "default"
+    },
+    "34": {
+      "kind": "33",
+      "name": "Wario",
+      "form": "default"
+    },
+    "35": {
+      "kind": "34",
+      "name": "Snake",
+      "form": "default"
+    },
+    "36": {
+      "kind": "35",
+      "name": "Ike",
+      "form": "default"
+    },
+    "38": {
+      "kind": "39",
+      "name": "Diddy Kong",
+      "form": "default"
+    },
+    "39": {
+      "kind": "40",
+      "name": "Lucas",
+      "form": "default"
+    },
+    "40": {
+      "kind": "41",
+      "name": "Sonic",
+      "form": "default"
+    },
+    "41": {
+      "kind": "42",
+      "name": "King Dedede",
+      "form": "default"
+    },
+    "42": {
+      "kind": "43",
+      "name": "Olimar",
+      "form": "default"
+    },
+    "43": {
+      "kind": "44",
+      "name": "Lucario",
+      "form": "default"
+    },
+    "44": {
+      "kind": "45",
+      "name": "R.O.B.",
+      "form": "default"
+    },
+    "45": {
+      "kind": "46",
+      "name": "Toon Link",
+      "form": "default"
+    },
+    "46": {
+      "kind": "47",
+      "name": "Wolf",
+      "form": "default"
+    },
+    "47": {
+      "kind": "48",
+      "name": "Villager",
+      "form": "default"
+    },
+    "48": {
+      "kind": "49",
+      "name": "Mega Man",
+      "form": "default"
+    },
+    "49": {
+      "kind": "50",
+      "name": "Wii Fit Trainer",
+      "form": "default"
+    },
+    "50": {
+      "kind": "51",
+      "name": "Rosalina & Luma",
+      "form": "default"
+    },
+    "51": {
+      "kind": "52",
+      "name": "Little Mac",
+      "form": "default"
+    },
+    "52": {
+      "kind": "53",
+      "name": "Greninja",
+      "form": "default"
+    },
+    "53": {
+      "kind": "54",
+      "name": "Palutena",
+      "form": "default"
+    },
+    "54": {
+      "kind": "55",
+      "name": "PAC-MAN",
+      "form": "default"
+    },
+    "55": {
+      "kind": "56",
+      "name": "Robin",
+      "form": "default"
+    },
+    "56": {
+      "kind": "57",
+      "name": "Shulk",
+      "form": "default"
+    },
+    "57": {
+      "kind": "58",
+      "name": "Bowser Jr.",
+      "form": "default"
+    },
+    "58": {
+      "kind": "59",
+      "name": "Duck Hunt",
+      "form": "default"
+    },
+    "59": {
+      "kind": "60",
+      "name": "Ryu",
+      "form": "default"
+    },
+    "60": {
+      "kind": "61",
+      "name": "Ken",
+      "form": "default"
+    },
+    "61": {
+      "kind": "62",
+      "name": "Cloud",
+      "form": "default"
+    },
+    "62": {
+      "kind": "63",
+      "name": "Corrin",
+      "form": "default"
+    },
+    "63": {
+      "kind": "64",
+      "name": "Bayonetta",
+      "form": "default"
+    },
+    "64": {
+      "kind": "65",
+      "name": "Inkling",
+      "form": "default"
+    },
+    "65": {
+      "kind": "66",
+      "name": "Ridley",
+      "form": "default"
+    },
+    "66": {
+      "kind": "67",
+      "name": "Simon",
+      "form": "default"
+    },
+    "67": {
+      "kind": "68",
+      "name": "Richter",
+      "form": "default"
+    },
+    "68": {
+      "kind": "69",
+      "name": "King K. Rool",
+      "form": "default"
+    },
+    "69": {
+      "kind": "70",
+      "name": "Isabelle",
+      "form": "default"
+    },
+    "70": {
+      "kind": "71",
+      "name": "Incineroar",
+      "form": "default"
+    },
+    "71": {
+      "kind": "81",
+      "name": "Piranha Plant",
+      "form": "default"
+    },
+    "72": {
+      "kind": "82",
+      "name": "Joker",
+      "form": "default"
+    },
+    "73": {
+      "kind": "83",
+      "name": "Hero",
+      "form": "default"
+    },
+    "74": {
+      "kind": "84",
+      "name": "Banjo & Kazooie",
+      "form": "default"
+    },
+    "75": {
+      "kind": "85",
+      "name": "Terry",
+      "form": "default"
+    },
+    "76": {
+      "kind": "86",
+      "name": "Byleth",
+      "form": "default"
+    },
+    "77": {
+      "kind": "87",
+      "name": "Min Min",
+      "form": "default"
+    },
+    "78": {
+      "kind": "88",
+      "name": "Steve",
+      "form": "default"
+    },
+    "79": {
+      "kind": "89",
+      "name": "Sephiroth",
+      "form": "default"
+    },
+    "81": {
+      "kind": "92",
+      "name": "Kazuya",
+      "form": "default"
+    },
+    "82": {
+      "kind": "93",
+      "name": "Sora",
+      "form": "default"
+    },
+    "83": {
+      "kind": "72",
+      "name": "Mii Brawler",
+      "form": "default"
+    },
+    "84": {
+      "kind": "73",
+      "name": "Mii Swordfighter",
+      "form": "default"
+    },
+    "85": {
+      "kind": "74",
+      "name": "Mii Gunner",
+      "form": "default"
+    }
+  }
+}

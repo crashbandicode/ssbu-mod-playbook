@@ -101,6 +101,44 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(replay.actions, ['tile-down', 'tile-right', 'tap-a1'])
         self.assertEqual(replay.evidence[0]['to'], '12')
 
+    def test_stock_training_css_entry_uses_recorded_steve_step(self):
+        import hashlib
+
+        import routes
+
+        path = routes.ROUTES / 'topologies/css-training-entry-topology.json'
+        pin = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        topology = routes._tile_topology(pin)
+        steve = picker.Target('88', 'Steve', 'default')
+        self.assertEqual(topology.step('none', '0'), ('up', '78'))
+        self.assertEqual(topology.targets['78'], steve)
+
+        # Replay the off-grid local token and the measured Steve settlement and placement.
+        unknown = picker.Target('unknown', 'unknown', 'unknown')
+        entry = [tile(rev, at='none', target=unknown, ack=4, seat='0') for rev in (1, 2)]
+        for state in entry:
+            state.values.update(dict.fromkeys(
+                ('ack.result', 'result', 'direction', 'from', 'to', 'settled.ack'), 'unknown'))
+            state.values['focus'] = 'css.grid.entry'
+        settled = [tile(rev, at='78', target=steve, ack=5, seat='0',
+                        direction='up', source='none', dest='78') for rev in (3, 4)]
+        for state in settled:
+            state.values['focus'] = 'css.grid.steve'
+        placed = tile(5, at='78', target=steve, ack=5, seat='0', token='placed', placed=steve)
+        placed.values['focus'] = 'css.medal.steve'
+        states = [*entry, *settled, placed]
+        for state in states:
+            state.values['layout'] = topology.layout
+
+        ui = (native(rev, screen='css.training', focus='css.training',
+                     **{'screen.context': 'training'}) for rev in range(1, 10))
+        replay = Replay(states, ui)
+        result = picker.pick(replay, 'css', steve, topology=topology, cap=.05, expected_context='training')
+        self.assertEqual(replay.actions, ['tile-up', 'tap-a1'])
+        self.assertEqual({key: replay.evidence[0][key] for key in ('from', 'to', 'kind', 'settled_ack')},
+                         {'from': 'none', 'to': '78', 'kind': '88', 'settled_ack': 5})
+        self.assertEqual((result['tile'], result['name'], result['placed']), ('78', 'Steve', True))
+
     def test_wrong_step_stops_before_a(self):
         replay = Replay([tile(1), tile(2), tile(3, at='12', ack=1, direction='right', source='7', dest='12')])
         with self.assertRaisesRegex(RuntimeError, 'wrong step'):
