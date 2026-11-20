@@ -836,7 +836,8 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                       **{'screen.tab': 'games_and_more', 'screen.layer': layer,
                          'focus.id': focus, 'focus.source': 'native'})
 
-    def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None, submenu_loading=False):
+    def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None, submenu_loading=False,
+                  submenu_rearm=False):
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -847,12 +848,12 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         for source, target in zip(focuses, focuses[1:]):
             frames.extend((source, target))
         frames.append('stage_select')
-        samples = [
-            self.checkpoint(i + int(submenu_loading and i >= 3), focus)
-            for i, focus in enumerate(frames, 1)
-        ]
         if submenu_loading:
-            samples.insert(2, loading(3))
+            frames.insert(2, None)
+        if submenu_rearm:
+            frames.insert(3 + int(submenu_loading), None)
+        samples = [self.checkpoint(i, focus) if focus else loading(i)
+                   for i, focus in enumerate(frames, 1)]
         for index, state in changes:
             samples[index] = state
         samples[-2:-2] = loading_frames
@@ -900,6 +901,33 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         self.assertEqual(self.run_route(io, 0, submenu_loading=True),
                          {'screen': 'stage', 'proof': 'stage_select'})
         self.assertEqual(io.send.call_args_list, [call(action) for action in self.actions])
+
+    def test_submenu_rearm_requires_fresh_classic_mode_after_inactivity(self):
+        from unittest.mock import Mock, call
+
+        # XPS r5: inactive rev 176 -> Classic Mode rev 177 after A.
+        # The next watch's source read reached inactive rev 179, then the
+        # same native Classic Mode focus recovered at rev 180.
+        io = Mock()
+        self.assertEqual(self.run_route(io, 0, submenu_loading=True, submenu_rearm=True),
+                         {'screen': 'stage', 'proof': 'stage_select'})
+        self.assertEqual(io.send.call_args_list, [call(action) for action in self.actions])
+        first, second = [i for i, event in enumerate(io.mock_calls) if event[0] == 'send'][:2]
+        self.assertEqual([item[0] for item in io.mock_calls[first+1:second]],
+                         ['read', 'read', 'finish', 'arm', 'read', 'read'])
+
+        contradictory = loading(5)
+        contradictory.values['dialog'] = 'settings'
+        for replacement, error in (
+            ((4, contradictory), 'inactive'),
+            ((5, self.checkpoint(6, 'training')), 'source changed'),
+        ):
+            with self.subTest(error=error):
+                io = Mock()
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.run_route(io, 0, submenu_loading=True, submenu_rearm=True,
+                                   changes=(replacement,))
+                io.send.assert_called_once_with('tap-a1')
 
     def test_unknown_or_wrong_start_sends_no_input(self):
         from unittest.mock import Mock
