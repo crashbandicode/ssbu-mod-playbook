@@ -241,6 +241,34 @@ class PickerTests(unittest.TestCase):
             picker.pick(replay, 'sss', target, next_screen='css.smash', cap=.1)
         self.assertEqual(replay.actions, ['tap-a1'])
 
+    def test_stage_to_training_css_waits_through_passive_stage_owner(self):
+        import time
+
+        # Native provider rev 2971 after the single stage-confirm A kept the
+        # exact Training Stage Select identity but withdrew input ownership.
+        source = {'screen': 'stage_select', 'focus': 'stage_select', 'screen.context': 'training',
+                  'focus.source': 'tile.cursor', 'dialog': 'none', 'input.owner': 'native'}
+        target = {**source, 'screen': 'css.training', 'focus': 'css.training'}
+        before = native(2969, **source)
+        passive = {**source, 'dialog': 'unknown', 'input.owner': 'unknown'}
+        observed = native(2973, **target)
+        replay = Replay(native_blocks=[native(2971, **passive), native(2972, **passive), observed])
+
+        self.assertEqual(
+            picker.wait_scene_transition(replay, before, time.monotonic() + 1, source, target, label='stage'),
+            observed,
+        )
+        self.assertEqual(replay.actions, [])
+        for bad in ({'dialog': 'notice'}, {'input.owner': 'tr.menu'},
+                    {'screen.context': 'local_wireless'}, {'focus.source': 'native'}):
+            with self.subTest(fields=bad):
+                replay = Replay(native_blocks=[native(2971, **{**passive, **bad}), observed])
+                with self.assertRaisesRegex(RuntimeError, 'unexpected stage focus'):
+                    picker.wait_scene_transition(
+                        replay, before, time.monotonic() + 1, source, target, label='stage',
+                    )
+                self.assertEqual(replay.actions, [])
+
     def test_remote_token_is_never_placed(self):
         replay = Replay([tile(1, at='16', target=TARGET, seat='1', token='unknown')])
         with self.assertRaisesRegex(RuntimeError, 'token ownership'):
