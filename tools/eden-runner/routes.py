@@ -1561,10 +1561,7 @@ def _native_main_to_stage(ctx):
     source, macro = checkpoints[-1]
     until = time.monotonic() + 45
     _, selected = _watched_native_input(io, state, source, stage, macro, until, scene_change=True)
-    tile = native_picker.wait_sample(io, native_picker.TILE, until)
-    native_picker.same_epoch(selected, tile, in_flight=True)
-    if tile.values.get('screen') != 'sss':
-        raise RuntimeError('tile.cursor did not confirm the sss screen')
+    native_picker.wait_stage_tile(io, selected, until)
     active = native_picker.wait_sample(io, native_picker.UI, until, selected, in_flight=True)
     if not _fields_match(active, stage):
         raise RuntimeError('native Training Stage Select ownership changed during tile.cursor check')

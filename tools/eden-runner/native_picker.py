@@ -77,19 +77,22 @@ def number(state, key):
     return int(text)
 
 
-def check_sample(state, provider, *, loading_ui=False, pending_placement=False):
+def check_sample(state, provider, *, loading_ui=False, pending_placement=False, entering_stage=False):
     block, values = state.block, state.values
     active = values.get('observation.active') == ACTIVE[provider]
     loading = loading_ui and provider == UI and values.get('observation.active') == 'no'
     focus = values.get('focus', '')
     placing = (pending_placement and provider == TILE and focus == 'unknown'
                and values.get('local.token') == 'placed')
+    entering = (entering_stage and provider == TILE and focus == 'unknown'
+                and values.get('screen') == 'sss' and values.get('settled') == '0'
+                and values.get('layout') == values.get('hovered') == 'unknown')
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
             or any(values.get(key) != str(block[key]) for key in ('schema', 'boot', 'rev'))
             or number(state, 'observation') <= 0
-            or not (loading or (active and (focus not in ABSENT or placing)))):
+            or not (loading or (active and (focus not in ABSENT or placing or entering)))):
         raise RuntimeError(f'{provider}: incomplete, inactive or wrong-schema observation')
     return state
 
@@ -222,6 +225,31 @@ def settled(state, *, after_step=False):
     if (after_step or not idle) and number(state, 'settled.ack') != number(state, 'ack'):
         raise RuntimeError('tile hover has not settled natively')
     return at
+
+
+def wait_stage_tile(io, selected, until):
+    """Wait for the active Stage Select provider after the native scene transition."""
+    previous = None
+    while (remaining := until - time.monotonic()) > 0:
+        state = check_sample(io.read(TILE, remaining), TILE, entering_stage=True)
+        same_epoch(selected, state, in_flight=True)
+        if state.values.get('screen') != 'sss':
+            raise RuntimeError('tile.cursor did not confirm the sss screen')
+        if previous is not None:
+            _, revision, observation = state.clock
+            _, prior_revision, prior_observation = previous.clock
+            if (revision < prior_revision or observation < prior_observation
+                    or ((revision == prior_revision or observation == prior_observation)
+                        and state.values != previous.values)):
+                raise RuntimeError('tile.cursor: stale or contradictory Stage Select observation')
+        if state.values['focus'] != 'unknown':
+            context(state, 'sss')
+            token_held(state, 'sss')
+            settled(state)
+            Target.read(state)
+            return state
+        previous = state
+    raise RuntimeError('tile.cursor: no qualified Training Stage Select observation before the route deadline')
 
 
 def check_context(expected, current, screen):
