@@ -477,6 +477,136 @@ class BridgeFramingTests(unittest.TestCase):
                         finally:
                             bridge.finish()
 
+    stale_ui_fence = (
+        '[Bridge] provider name=ssbu.ui schema_id=2 version=1 rev=4 dropped=0 toggle_gen=1 frame=24 wall=198155737\n'
+        '[Bridge] req providers result=ok count=4 boot=0xc60856d64562c887 frame=24 wall=198155738\n'
+    )
+    stale_ui_reply = (
+        '[Bridge] state name=ssbu.ui result=empty reason=stale_toggle '
+        'boot=0xc60856d64562c887 frame=24 wall=198155750\n'
+    )
+
+    def test_captured_stale_ui_reply_requests_a_fresh_read(self):
+        import zlib
+
+        payload = 'focus=title.press_any_button'
+        next_reply = (
+            '[Bridge] state begin name=ssbu.ui schema=ssbu.ui/1 rev=5 boot=0xc60856d64562c887 lines=1 filtered=0\n'
+            f'[Bridge] state.0 {payload}\n'
+            f'[Bridge] state end name=ssbu.ui rev=5 crc={zlib.crc32(payload.encode()):08x}\n'
+        )
+
+        def check(bridge, clock):
+            result = bridge.read('ssbu.ui', .24)
+            self.assertEqual(result.block['rev'], 5)
+            self.assertEqual(result.block['values']['focus'], 'title.press_any_button')
+            self.assertEqual(result.connection, 0)
+            self.assertLess(clock.monotonic(), .24)
+
+        self.assertEqual(self.replay_ui_exchange(
+            check, lambda count: self.stale_ui_fence + (self.stale_ui_reply if count == 1 else next_reply),
+        ), [0, .1])
+        replayed = self.stale_ui_fence + next_reply.replace('rev=5', 'rev=4')
+        self.assertEqual(self.replay_ui_exchange(
+            check, lambda count: self.stale_ui_fence + (
+                self.stale_ui_reply + replayed if count == 1 else next_reply
+            ),
+        ), [0, .1])
+
+    def test_stale_ui_retries_share_the_absolute_deadline(self):
+        def check(bridge, clock):
+            with self.assertRaisesRegex(RuntimeError, 'no fenced bridge reply for state ssbu.ui'):
+                bridge.read('ssbu.ui', .24)
+            self.assertAlmostEqual(clock.monotonic(), .24)
+
+        self.assertEqual(self.replay_ui_exchange(
+            check, lambda _: self.stale_ui_fence + self.stale_ui_reply,
+        ), [0, .1, .2])
+
+    def test_unfenced_malformed_or_other_provider_empty_is_not_retried(self):
+        other_boot = self.stale_ui_reply.replace('0xc60856d64562c887', '0x0000000000000002')
+        for provider, reply in (
+            ('ssbu.ui', self.stale_ui_reply),
+            ('ssbu.ui', self.stale_ui_fence + other_boot),
+            ('ssbu.ui', self.stale_ui_fence + self.stale_ui_reply.replace('stale_toggle', 'unknown')),
+            ('ssbu.ui', self.stale_ui_fence + self.stale_ui_reply.replace('result=empty', 'result=refused')),
+            ('ssbu.ui', self.stale_ui_fence + self.stale_ui_reply.replace('frame=24', 'extra=1 frame=24')),
+            ('tile.cursor', self.stale_ui_fence + self.stale_ui_reply.replace('ssbu.ui', 'tile.cursor')),
+        ):
+            with self.subTest(provider=provider, reply=reply):
+                def check(bridge, _clock):
+                    with self.assertRaisesRegex(RuntimeError, f'no fenced bridge reply for state {provider}'):
+                        bridge.read(provider, .24)
+
+                self.assertEqual(self.replay_ui_exchange(check, lambda _: reply, provider=provider), [0])
+
+    def test_stale_ui_retry_rejects_epoch_changes(self):
+        reconnect = '[Adapter] reconnect same_boot=1\n'
+        gap = '[Bridge] since result=gap cursor=4 oldest=8 latest=12 boot=0xc60856d64562c887\n'
+        changed_boot = self.stale_ui_fence.replace('0xc60856d64562c887', '0x0000000000000002')
+        changed_gen = self.stale_ui_fence.replace('toggle_gen=1', 'toggle_gen=2')
+        no_generation = self.stale_ui_fence.splitlines(keepends=True)[1]
+        stale = self.stale_ui_fence + self.stale_ui_reply
+
+        for first, second, between, reason, expected in (
+            (stale + reconnect, '', '', 'connection or replay continuity', [0]),
+            (stale, '', gap, 'connection or replay continuity', [0]),
+            (stale, changed_boot, '', 'bridge boot changed', [0, .1]),
+            (stale, changed_gen, '', 'bridge toggle generation changed', [0, .1]),
+            (stale, no_generation, '', 'bridge toggle generation changed', [0, .1]),
+        ):
+            with self.subTest(reason=reason, retry_after_send=len(expected) > 1):
+                def check(bridge, _clock):
+                    with self.assertRaisesRegex(RuntimeError, reason):
+                        bridge.read('ssbu.ui', .24)
+
+                def during_sleep(log, _elapsed):
+                    if between:
+                        with log.open('a') as dest:
+                            dest.write(between)
+
+                self.assertEqual(self.replay_ui_exchange(
+                    check, lambda count: first if count == 1 else second, during_sleep=during_sleep,
+                ), expected)
+
+    def replay_ui_exchange(self, check, response, *, provider='ssbu.ui', during_sleep=None):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import native_picker_io
+        import routes
+
+        elapsed = 0.0
+        sent = []
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.touch()
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None,
+                                  runner=SimpleNamespace(), on='sw')
+            bridge = native_picker_io.BridgePickerIO(ctx)
+
+            def sleep(seconds):
+                nonlocal elapsed
+                elapsed += seconds
+                if during_sleep:
+                    during_sleep(log, elapsed)
+
+            def spool(_ctx, *requests):
+                self.assertEqual(requests, ('providers', f'state {provider}'))
+                sent.append(elapsed)
+                with log.open('a') as dest:
+                    dest.write(response(len(sent)))
+
+            clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep)
+            with (patch.object(native_picker_io, 'time', clock),
+                  patch.object(routes, 'bridge_v2', spool),
+                  patch.object(routes, 'play') as play):
+                check(bridge, clock)
+                play.assert_not_called()
+        return sent
+
     def test_arm_requires_a_one_block_watch(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory

@@ -9,6 +9,10 @@ import state_gate
 
 
 PROVIDERS_FENCE = re.compile(r'\[Bridge\] req providers result=ok count=\d+ boot=(0x[0-9a-f]{16})(?: |$)')
+UI_PROVIDER_GEN = re.compile(r'\[Bridge\] provider name=ssbu\.ui schema_id=\d+ version=\d+ rev=\d+ dropped=\d+ toggle_gen=(\d+)')
+STALE_UI_REPLY = re.compile(r'\[Bridge\] state name=ssbu\.ui result=empty reason=stale_toggle boot=(0x[0-9a-f]{16})')
+STALE_UI = object()
+STALE_UI_RETRY_S = .1
 REPLAY = re.compile(r'\[Bridge\] since result=gap(?: |$)')
 EVENT_CLOCK = re.compile(r' ev=(\d+) frame=(\d+) wall=(\d+)$')
 EVENTS_ON = re.compile(r'\[Bridge\] req events result=ok on=1 latest=(\d+) frame=(\d+) wall=(\d+)$')
@@ -85,13 +89,17 @@ class BridgePickerIO:
             return True
         return False
 
-    def _request(self, requests, cap, consume):
+    def _request(self, requests, cap, consume, *, until=None, connection=None):
         # Discard observations logged before this command, but keep connection
         # changes. The in-band reply fence excludes unsolicited/replayed state.
         for line in self._receive():
             self._boundary(line)
-        until = time.monotonic() + cap
-        self.routes.bridge_v2(self.ctx, *requests)
+        if connection is not None and self.connection != connection:
+            raise RuntimeError('bridge connection or replay continuity changed during native UI read')
+        if until is None:
+            until = time.monotonic() + cap
+        if time.monotonic() < until:
+            self.routes.bridge_v2(self.ctx, *requests)
         while time.monotonic() < until:
             self.ctx.check_stop()
             answer = None
@@ -104,7 +112,7 @@ class BridgePickerIO:
                     answer = None
             if answer is not None:
                 return answer
-            time.sleep(.05)
+            time.sleep(min(.05, max(0, until - time.monotonic())))
         raise RuntimeError(f'no fenced bridge reply for {requests[-1]}')
 
     def arm(self, provider, cap):
@@ -134,24 +142,52 @@ class BridgePickerIO:
 
     def read(self, provider, cap):
         fence = None
+        catalog_generation = fence_generation = None
         frame = []
         pending_reply = False
+        retry_epoch = None
+        awaiting_retry = False
+        native_ui = provider == native_picker.UI
 
         def consume(line, boundary):
-            nonlocal fence, pending_reply
+            nonlocal fence, catalog_generation, fence_generation, pending_reply, retry_epoch, awaiting_retry
             if boundary:
+                if retry_epoch is not None:
+                    raise RuntimeError('bridge connection or replay continuity changed during native UI read')
                 fence = None
+                catalog_generation = fence_generation = None
                 frame.clear()
+            if awaiting_retry:
+                return None
+            payload = state_gate.SUFFIX.sub('', line) if native_ui else line
+            if native_ui and (matched := UI_PROVIDER_GEN.fullmatch(payload)):
+                catalog_generation = matched[1]
             if matched := PROVIDERS_FENCE.search(line):
                 if pending_reply:
                     raise RuntimeError(f'{provider}: overlapping fence for unfinished state reply')
                 fence = matched[1]
+                fence_generation, catalog_generation = catalog_generation, None
+                if retry_epoch is not None:
+                    boot, _, generation = retry_epoch
+                    if fence != boot:
+                        raise RuntimeError('native picker bridge boot changed during native UI read')
+                    if generation is not None and fence_generation != generation:
+                        raise RuntimeError('bridge toggle generation changed during native UI read')
                 frame.clear()
                 return None
             if not fence:
                 return None
             if f'[Bridge] state name={provider} result=error ' in line:
                 raise RuntimeError(f'{provider}: {line}')
+            if native_ui and (matched := STALE_UI_REPLY.fullmatch(payload)):
+                if pending_reply:
+                    raise RuntimeError(f'{provider}: overlapping explicit state reply')
+                if not frame and matched[1] == fence:
+                    if self.boot is not None and fence != self.boot:
+                        raise RuntimeError('native picker bridge boot changed')
+                    retry_epoch = (fence, self.connection, fence_generation)
+                    awaiting_retry = True
+                    return STALE_UI
             begin = state_gate.BEGIN.search(line)
             if begin:
                 if pending_reply:
@@ -177,7 +213,21 @@ class BridgePickerIO:
                 return native_picker.Sample(found, self.connection)
             return None
 
-        return self._request(('providers', f'state {provider}'), cap, consume)
+        requests = ('providers', f'state {provider}')
+        if not native_ui:
+            return self._request(requests, cap, consume)
+
+        until = time.monotonic() + cap
+        while True:
+            connection = None if retry_epoch is None else retry_epoch[1]
+            answer = self._request(requests, cap, consume, until=until, connection=connection)
+            if answer is not STALE_UI:
+                return answer
+            time.sleep(min(STALE_UI_RETRY_S, max(0, until - time.monotonic())))
+            self.ctx.check_stop()
+            awaiting_retry = False
+            fence = None
+            catalog_generation = fence_generation = None
 
     def mark_training_stage(self, before, cap):
         """Fence the bridge event history while the checked native CSS still owns the route."""
