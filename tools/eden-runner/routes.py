@@ -1545,7 +1545,12 @@ def _native_main_to_stage(ctx):
         raise RuntimeError('Training entry needs a native Games & More source or supported submenu focus')
 
     for (source, macro), (target, _) in zip(checkpoints[index:], checkpoints[index + 1:]):
-        _, state = _watched_native_input(io, state, source, target, macro, time.monotonic() + 5)
+        # Opening the submenu invalidates the previous Lua focus until the
+        # new layer activates. Send nothing while that transition settles.
+        layer_change = source['screen.layer'] != target['screen.layer']
+        _, state = _watched_native_input(
+            io, state, source, target, macro, time.monotonic() + 5, scene_change=layer_change,
+        )
         io.finish()
 
     stage = {'screen': 'stage_select', 'screen.context': 'training', 'input.owner': 'native',
