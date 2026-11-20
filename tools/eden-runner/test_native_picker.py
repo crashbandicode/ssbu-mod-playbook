@@ -808,7 +808,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                       **{'screen.tab': 'games_and_more', 'screen.layer': layer,
                          'focus.id': focus, 'focus.source': 'native'})
 
-    def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None):
+    def run_route(self, io, start, *, changes=(), loading_frames=(), tile_state=None, submenu_loading=False):
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -819,7 +819,12 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
         for source, target in zip(focuses, focuses[1:]):
             frames.extend((source, target))
         frames.append('stage_select')
-        samples = [self.checkpoint(i, focus) for i, focus in enumerate(frames, 1)]
+        samples = [
+            self.checkpoint(i + int(submenu_loading and i >= 3), focus)
+            for i, focus in enumerate(frames, 1)
+        ]
+        if submenu_loading:
+            samples.insert(2, loading(3))
         for index, state in changes:
             samples[index] = state
         samples[-2:-2] = loading_frames
@@ -857,6 +862,16 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
                 expected.extend(('arm', 'read', 'send', 'read', 'read', 'read', 'finish'))
                 self.assertEqual([event[0] for event in io.mock_calls], expected)
                 self.assertTrue(all(watch.args[0] == 'ssbu.ui' for watch in io.arm.call_args_list))
+
+    def test_games_more_open_waits_for_inactive_then_fresh_classic_mode(self):
+        from unittest.mock import Mock, call
+
+        # Exact v3 release rev 220 was fully inactive after the one A press.
+        # The same boot later published native Classic Mode focus.
+        io = Mock()
+        self.assertEqual(self.run_route(io, 0, submenu_loading=True),
+                         {'screen': 'stage', 'proof': 'stage_select'})
+        self.assertEqual(io.send.call_args_list, [call(action) for action in self.actions])
 
     def test_unknown_or_wrong_start_sends_no_input(self):
         from unittest.mock import Mock
