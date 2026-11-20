@@ -15,7 +15,6 @@ FAILED; judge FAIL -> FAILED, unless a deterministic effect gate passed (a disag
 PASS; UNSURE -> RAN-UNVERIFIED. Without a judge: PASS needs a passed effect gate when the plan has require_effect.
 RAN-UNVERIFIED rows carry "review": true and a reason; FAILING.md lists them with the failures.
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -38,6 +37,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import still_fresh  # noqa: E402
+from portable_lock import lock_exclusive  # noqa: E402
 
 
 def effect_evidence(value):
@@ -467,8 +467,8 @@ def merge_receipt(receipt_path, update):
     """Read-modify-write the receipt under an exclusive lock; atomic replace."""
     receipt_path = Path(receipt_path)
     lock = receipt_path.with_suffix('.json.lock')
-    with open(lock, 'w') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with lock.open('a+b') as handle:
+        lock_exclusive(handle)
         receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
         update(receipt)
         tmp = receipt_path.with_suffix('.json.tmp')
