@@ -108,7 +108,9 @@ class BridgePickerIO:
         raise RuntimeError(f'no fenced bridge reply for {requests[-1]}')
 
     def arm(self, provider, cap):
-        watch = re.compile(r'\[Bridge\] req state_watch name=' + re.escape(provider) + r' result=(ok|error)(?: |$)')
+        watch = re.compile(
+            r'\[Bridge\] req state_watch name=' + re.escape(provider) + r' result=(ok|error)(?: |$)'
+        )
         fence = None
 
         def consume(line, boundary):
@@ -120,11 +122,15 @@ class BridgePickerIO:
             if fence and (matched := watch.search(line)):
                 if matched[1] == 'error':
                     raise RuntimeError(f'{provider}: {line}')
+                if not re.search(r' keys=1 max=1(?: |$)', line):
+                    raise RuntimeError(f'{provider}: unexpected watch limit: {line}')
                 self.boot = fence
                 return True
             return None
 
-        self._request(('providers', f'state_watch {provider} keys=observation'), cap, consume)
+        # Route decisions use explicit full reads. Let the arming watch expire
+        # after one block even if an input or its confirmation fails.
+        self._request(('providers', f'state_watch {provider} keys=observation max=1'), cap, consume)
 
     def read(self, provider, cap):
         fence = None

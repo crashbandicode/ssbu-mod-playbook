@@ -1502,7 +1502,7 @@ def _armed_native_sample(io, initial, until, route, *, settling=False):
 
 
 def _watched_native_input(io, initial, source, target, macro, until, *, route='Main Menu', scene_change=False,
-                          settling=False):
+                          settling=False, pending_destination=None):
     source_focus = source.get('focus', source.get('focus.id', source['screen']))
     if not _fields_match(initial, source):
         raise RuntimeError(f'{route} source must be native focus {source_focus!r}')
@@ -1512,7 +1512,9 @@ def _watched_native_input(io, initial, source, target, macro, until, *, route='M
 
     io.send(macro)
     if scene_change:
-        return before, native_picker.wait_scene_transition(io, before, until, source, target, label=route)
+        return before, native_picker.wait_scene_transition(
+            io, before, until, source, target, label=route, pending_destination=pending_destination,
+        )
     state = before
     while True:
         state = native_picker.wait_sample(io, native_picker.UI, until, state, in_flight=True)
@@ -1550,8 +1552,17 @@ def _native_main_to_stage(ctx):
         # Opening the submenu invalidates the previous Lua focus until the
         # new layer activates. Send nothing while that transition settles.
         layer_change = source['screen.layer'] != target['screen.layer']
+        pending_submenu = None
+        if layer_change:
+            pending_submenu = {
+                'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
+                'focus': 'main_menu.submenu', 'screen.context': 'unknown',
+                **dict.fromkeys(('focus.source', 'focus.id', 'focus.index', 'focus.label',
+                                 'input.owner', 'dialog'), 'unknown'),
+            }
         _, state = _watched_native_input(
-            io, state, source, target, macro, time.monotonic() + 5, scene_change=layer_change, settling=settling,
+            io, state, source, target, macro, time.monotonic() + 5, scene_change=layer_change,
+            settling=settling, pending_destination=pending_submenu,
         )
         io.finish()
         settling = layer_change

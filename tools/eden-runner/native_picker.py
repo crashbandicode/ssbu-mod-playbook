@@ -131,7 +131,7 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=
     raise RuntimeError(f'{provider}: no newer active observation')
 
 
-def wait_scene_transition(io, before, until, source, target, *, label):
+def wait_scene_transition(io, before, until, source, target, *, label, pending_destination=None):
     """Wait for one already-sent scene-changing input, on the fenced connection."""
     destination = {key: value for key, value in target.items() if key not in ('dialog', 'input.owner')}
     passive_source = {**source, 'dialog': 'unknown', 'input.owner': 'unknown'}
@@ -161,6 +161,9 @@ def wait_scene_transition(io, before, until, source, target, *, label):
             all(values.get(key) == value for key, value in candidate.items())
             for candidate in (source, passive_source)
         ):
+            continue
+        if pending_destination and all(values.get(key) == value for key, value in pending_destination.items()):
+            departed = True
             continue
         if (all(values.get(key) == value for key, value in destination.items())
                 and values['input.owner'] in ('native', 'unknown')
