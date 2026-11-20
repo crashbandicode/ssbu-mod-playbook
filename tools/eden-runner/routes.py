@@ -749,10 +749,20 @@ MAIN_TOP = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'top', 'focus
 MAIN_TABS = ('smash', 'spirits', 'games_and_more', 'vault', 'online')
 TITLE_PROMPT = {**NATIVE_INPUT, 'screen': 'title', 'focus.source': 'native',
                 'focus.id': 'press_any', 'focus.index': '0', 'focus': 'title.press_any'}
+_UNOWNED_FOCUS = dict.fromkeys(('focus.source', 'focus.id', 'focus.index', 'focus.label',
+                               'input.owner', 'dialog'), 'unknown')
+_TITLE_WITHOUT_PROMPT = {**_UNOWNED_FOCUS, 'screen': 'title', 'focus': 'title',
+                         'screen.context': 'unknown'}
 TRAINING_OWNER = {**NATIVE_INPUT, 'screen.context': 'training'}
 TRAINING_SCREEN = {**TRAINING_OWNER, 'screen': 'training'}
 TRAINING_CSS = {**TRAINING_OWNER, 'screen': 'css.training', 'focus.source': native_picker.TILE}
 TRAINING_SSS = {**TRAINING_OWNER, 'screen': 'stage_select', 'focus.source': native_picker.TILE}
+_TRAINING_SSS_SETTLING = tuple(
+    {**_UNOWNED_FOCUS, 'screen': 'stage_select', 'focus': 'stage_select', 'screen.context': context}
+    for context in ('unknown', 'training')
+)
+_TRAINING_CSS_SETTLING = {**_UNOWNED_FOCUS, 'screen': 'css.training', 'focus': 'css.training',
+                         'screen.context': 'training'}
 GAMES_TRAINING = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'submenu',
                   'screen.tab': 'games_and_more', 'focus.source': 'native', 'focus.id': 'training',
                   'focus': 'main_menu.submenu.training'}
@@ -792,7 +802,8 @@ def to_main(ctx, tries=8, look_s=6, *, cap=None):
             break
         if tries > 0 and _fields_match(state, TITLE_PROMPT):
             _, state = _watched_native_input(io, state, TITLE_PROMPT, MAIN_TOP, 'attract-cancel',
-                                             until, route='Title', scene_change=True)
+                                             until, route='Title', scene_change=True,
+                                             pending_destinations=(_TITLE_WITHOUT_PROMPT,))
             if not _main_top(state):
                 raise _missing_navigation_state('Title', state, 'qualified Main top focus')
             io.finish()
@@ -1194,7 +1205,8 @@ def back_to_main(ctx, presses=10):
         else:
             raise _missing_navigation_state('back_to_main', state, 'qualified Training return owner')
         _, state = _watched_native_input(io, state, source, target, macro, time.monotonic() + 9,
-                                         route='Training return', scene_change=True)
+                                         route='Training return', scene_change=True,
+                                         pending_destinations=_TRAINING_SSS_SETTLING if target is TRAINING_SSS else ())
         looks.append(label)
         io.finish()
     if _main_top(state):
@@ -1399,7 +1411,7 @@ def _armed_native_sample(io, initial, until, route, *, settling=False):
 
 
 def _watched_native_input(io, initial, source, target, macro, until, *, route='Main Menu', scene_change=False,
-                          settling=False, pending_destination=None):
+                          settling=False, pending_destinations=()):
     source_focus = source.get('focus', source.get('focus.id', source['screen']))
     if not _fields_match(initial, source):
         raise RuntimeError(f'{route} source must be native focus {source_focus!r}')
@@ -1410,7 +1422,7 @@ def _watched_native_input(io, initial, source, target, macro, until, *, route='M
     io.send(macro)
     if scene_change:
         return before, native_picker.wait_scene_transition(
-            io, before, until, source, target, label=route, pending_destination=pending_destination,
+            io, before, until, source, target, label=route, pending_destinations=pending_destinations,
         )
     state = before
     while True:
@@ -1454,17 +1466,16 @@ def _native_main_to_stage(ctx):
         # Opening the submenu invalidates the previous Lua focus until the
         # new layer activates. Send nothing while that transition settles.
         layer_change = source['screen.layer'] != target['screen.layer']
-        pending_submenu = None
+        pending = ()
         if layer_change:
-            pending_submenu = {
+            pending = ({
+                **_UNOWNED_FOCUS,
                 'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
                 'focus': 'main_menu.submenu', 'screen.context': 'unknown',
-                **dict.fromkeys(('focus.source', 'focus.id', 'focus.index', 'focus.label',
-                                 'input.owner', 'dialog'), 'unknown'),
-            }
+            },)
         _, state = _watched_native_input(
             io, state, source, target, macro, time.monotonic() + 5, scene_change=layer_change,
-            settling=settling, pending_destination=pending_submenu,
+            settling=settling, pending_destinations=pending,
         )
         io.finish()
         settling = layer_change
@@ -1473,14 +1484,9 @@ def _native_main_to_stage(ctx):
              'dialog': 'none', 'focus.source': native_picker.TILE}
     source, macro = checkpoints[-1]
     until = time.monotonic() + 45
-    pending_stage = {
-        'screen': 'stage_select', 'focus': 'stage_select',
-        **dict.fromkeys(('screen.context', 'input.owner', 'dialog',
-                         'focus.id', 'focus.index', 'focus.label'), 'unknown'),
-    }
     _, selected = _watched_native_input(io, state, source, stage, macro, until,
                                         route='Training Stage Select', scene_change=True,
-                                        pending_destination=pending_stage)
+                                        pending_destinations=_TRAINING_SSS_SETTLING)
     native_picker.wait_stage_tile(io, selected, until)
     active = native_picker.wait_sample(io, native_picker.UI, until, selected, in_flight=True)
     if not _fields_match(active, stage):
@@ -1507,7 +1513,8 @@ def quit_training(ctx, cap=45):
     state = native_picker.wait_sample(io, native_picker.UI, until)
     for source, target, macro in transitions:
         _, state = _watched_native_input(io, state, source, target, macro, until, route='Training',
-                                         scene_change=target is css)
+                                         scene_change=target is css,
+                                         pending_destinations=(_TRAINING_CSS_SETTLING,) if target is css else ())
         io.finish()
     boot, revision, observation = state.clock
     return _save(ctx, 'routes-quit-training', {

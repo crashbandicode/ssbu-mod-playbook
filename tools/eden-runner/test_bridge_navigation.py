@@ -58,7 +58,8 @@ class BridgeNavigationTests(unittest.TestCase):
         self.watch_armed = False
         self.checked_source = False
         self.change_on_watch = None
-        self.loading_next = False
+        self.loading_next = None
+        self.transition_samples = {}
         self.initial_empty = False
         self.last_ui = None
 
@@ -97,8 +98,8 @@ class BridgeNavigationTests(unittest.TestCase):
         else:
             self.revision += 1
             if request == 'state ssbu.ui':
-                self.last_ui = UNKNOWN if self.loading_next or self.initial_empty else self.scene
-                self.loading_next = False
+                self.last_ui = UNKNOWN if self.initial_empty else (self.loading_next or self.scene)
+                self.loading_next = None
                 if self.watch_armed:
                     self.checked_source = True
                 sample = state_fixtures.native(self.revision, **self.last_ui)
@@ -125,7 +126,7 @@ class BridgeNavigationTests(unittest.TestCase):
         self.assertEqual(self.last_ui, source)
         self.assertIn(macro, macros)
         self.scene = destination
-        self.loading_next = source is IDLE_TITLE
+        self.loading_next = self.transition_samples.get(macro, UNKNOWN if source is IDLE_TITLE else None)
         self.checked_source = self.watch_armed = False
 
     def test_title_press_any_reaches_main_without_a_visual_gate(self):
@@ -137,6 +138,17 @@ class BridgeNavigationTests(unittest.TestCase):
         self.assertEqual(len(self.actions), 1)
         self.assertEqual(self.last_ui, MAIN)
         self.assertFalse(self.edges)
+        self.assert_no_images()
+
+    def test_title_confirm_can_retire_the_prompt_before_main_owns_input(self):
+        self.scene = IDLE_TITLE
+        self.edges = [(IDLE_TITLE, ('attract-cancel',), MAIN)]
+        self.transition_samples['attract-cancel'] = ui('title', owner='unknown', dialog='unknown')
+
+        routes.to_main(self.ctx, tries=1, look_s=.2)
+
+        self.assertEqual(self.actions, ['attract-cancel'])
+        self.assertEqual(self.last_ui, MAIN)
         self.assert_no_images()
 
     def test_ready_main_needs_no_input(self):
@@ -172,6 +184,10 @@ class BridgeNavigationTests(unittest.TestCase):
 
     def test_return_routes_only_through_qualified_owners(self):
         self.scene = TRAINING
+        self.transition_samples['confirm-native-quit-frames'] = ui(
+            'css.training', context='training', owner='unknown', dialog='unknown')
+        self.transition_samples['leave-css'] = ui(
+            'stage_select', context='training', owner='unknown', dialog='unknown')
         self.edges = [
             (TRAINING, ('pause-open',), PAUSE),
             (PAUSE, ('focus-native-quit-frames',), QUIT),

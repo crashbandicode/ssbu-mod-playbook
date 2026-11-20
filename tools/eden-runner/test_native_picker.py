@@ -930,7 +930,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
             context = focus.partition(':')[2]
             return native(rev, screen='stage_select', focus='stage_select', dialog='unknown', **{
                 'screen.context': context, 'input.owner': 'unknown',
-                **dict.fromkeys(('focus.id', 'focus.index', 'focus.label'), 'unknown'),
+                **dict.fromkeys(('focus.source', 'focus.id', 'focus.index', 'focus.label'), 'unknown'),
             })
         if focus == 'submenu_pending':
             # v9 rev 3361 confirmed the new layer before it had any item focus.
@@ -1024,10 +1024,12 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
     def test_stage_shell_waits_for_training_context_and_owner_with_no_more_input(self):
         from unittest.mock import Mock
 
-        io = Mock()
-        self.assertEqual(self.run_route(io, 3, stage_pending='unknown'),
-                         {'screen': 'stage', 'proof': 'stage_select'})
-        io.send.assert_called_once_with('tap-a1')
+        for context in ('unknown', 'training'):
+            with self.subTest(context=context):
+                io = Mock()
+                self.assertEqual(self.run_route(io, 3, stage_pending=context),
+                                 {'screen': 'stage', 'proof': 'stage_select'})
+                io.send.assert_called_once_with('tap-a1')
 
     def test_stage_shell_refuses_conflicting_smash_context(self):
         from unittest.mock import Mock
