@@ -152,6 +152,30 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(result['seat'], '1')
         self.assertEqual(result['kind'], TARGET.kind)
 
+    def test_css_confirm_waits_for_focus_after_the_local_medal_is_placed(self):
+        # Exact r6: CSS keeps its active layout and ACK 2. Steve is already
+        # placed at 78 in rev 60, while focus is still unknown. Rev 61 shows
+        # the placed medal owns focus.
+        steve = picker.Target('88', 'Steve', 'default')
+        before = [tile(rev, at='78', target=steve, seat='0', ack=2) for rev in (58, 59)]
+        pending = tile(60, at='78', target=steve, seat='0', token='placed', placed=steve, ack=2)
+        pending.values['focus'] = 'unknown'
+        active = tile(61, at='78', target=steve, seat='0', token='placed', placed=steve, ack=2)
+        active.values['focus'] = 'css.medal.steve'
+        replay = Replay([*before, pending, active])
+        self.assertTrue(self.run_pick(replay, target=steve, topology=None)['placed'])
+        self.assertEqual(replay.actions, ['tap-a1'])
+
+        wrong_medal = tile(60, at='78', target=steve, seat='0', token='placed', placed=OTHER, ack=2)
+        wrong_medal.values['focus'] = 'unknown'
+        for samples, error in (([pending], 'tile.cursor missing'),
+                               ([wrong_medal, active], 'does not match the chosen fighter')):
+            with self.subTest(error=error):
+                replay = Replay([*before, *samples])
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.run_pick(replay, target=steve, topology=None)
+                self.assertEqual(replay.actions, ['tap-a1'])
+
     def test_wrong_kind_blocks_a(self):
         replay = Replay([tile(1, at='16', target=picker.Target('99', 'Link', 'default'))])
         with self.assertRaisesRegex(RuntimeError, 'identity'):
