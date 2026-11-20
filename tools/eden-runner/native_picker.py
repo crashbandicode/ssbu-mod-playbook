@@ -77,16 +77,19 @@ def number(state, key):
     return int(text)
 
 
-def check_sample(state, provider, *, loading_ui=False):
+def check_sample(state, provider, *, loading_ui=False, pending_placement=False):
     block, values = state.block, state.values
     active = values.get('observation.active') == ACTIVE[provider]
     loading = loading_ui and provider == UI and values.get('observation.active') == 'no'
+    focus = values.get('focus', '')
+    placing = (pending_placement and provider == TILE and focus == 'unknown'
+               and values.get('local.token') == 'placed')
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
             or any(values.get(key) != str(block[key]) for key in ('schema', 'boot', 'rev'))
             or number(state, 'observation') <= 0
-            or not (loading or (active and values.get('focus', 'unknown') not in ABSENT))):
+            or not (loading or (active and (focus not in ABSENT or placing)))):
         raise RuntimeError(f'{provider}: incomplete, inactive or wrong-schema observation')
     return state
 
@@ -98,10 +101,12 @@ def same_epoch(previous, current, *, in_flight):
         raise RuntimeError('bridge connection changed while input was unconfirmed')
 
 
-def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=False):
+def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=False,
+                pending_placement=False):
     settling = loading_ui and provider == UI and after is not None
     while time.monotonic() < until:
-        state = check_sample(io.read(provider, until - time.monotonic()), provider, loading_ui=settling)
+        state = check_sample(io.read(provider, until - time.monotonic()), provider,
+                             loading_ui=settling, pending_placement=pending_placement)
         if after is None:
             return state
         same_epoch(after, state, in_flight=in_flight or settling)
@@ -319,7 +324,7 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
         until = time.monotonic() + cap
         latest = before
         while True:
-            latest = wait_sample(io, TILE, until, latest, in_flight=True)
+            latest = wait_sample(io, TILE, until, latest, in_flight=True, pending_placement=True)
             check_context(before, latest, screen)
             if (number(latest, 'ack') != number(before, 'ack')
                     or number(latest, 'applied') != number(before, 'applied')):
@@ -330,6 +335,9 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
                         or Target.read(latest, 'placed.') != target
                         or values['focus'] == before.values['focus']):
                     raise RuntimeError('local placement does not match the chosen fighter')
+                # The placed identity can settle before the medal owns focus.
+                if values['focus'] == 'unknown':
+                    continue
                 break
             token_held(latest, screen)
             if settled(latest) != at or Target.read(latest) != target:
