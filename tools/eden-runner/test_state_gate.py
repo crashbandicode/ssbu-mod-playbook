@@ -286,6 +286,31 @@ class RunnerEntryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'only exactly one handled ack'):
             self.gate(block(10, menu(ack='5')), where={'open': 1}, ack=2)
 
+    def test_a_one_step_focus_gate_fails_a_two_step_move(self):
+        # The review's replay: cursor 1 -> 26 with ACK 3 -> 5 after one `up-1` press (a repeated input before the read).
+        self.baseline(block(5, menu(focus='fighters_stages/-/1/trio_practice')))
+        self.press('tap-up')
+        two = block(6, menu(focus='fighters_stages/-/26/game.5', ack='5'))
+        with self.assertRaisesRegex(RuntimeError, 'did not pass'):
+            self.gate(two, where={'open': 1, 'focus': 'fighters_stages/-/27/row'}, transition='focus')
+        # Without the pin, the two handled acks alone still fail it.
+        self.baseline(block(9, menu(focus='fighters_stages/-/1/trio_practice')))
+        self.press('tap-up')
+        with self.assertRaisesRegex(RuntimeError, 'ack moved 2'):
+            self.gate(block(10, menu(focus='fighters_stages/-/26/game.5', ack='5')), where={'open': 1}, transition='focus')
+        # Pinned destination alone also catches a skipped row with a single ack.
+        self.baseline(block(7, menu(focus='fighters_stages/-/1/trio_practice')))
+        self.press('tap-up')
+        with self.assertRaisesRegex(RuntimeError, 'focus='):
+            self.gate(block(8, menu(focus='fighters_stages/-/26/game.5', ack='4')),
+                      where={'open': 1, 'focus': 'fighters_stages/-/27/row'}, transition='focus')
+
+    def test_a_focus_gate_never_passes_on_an_ack_alone(self):
+        self.baseline(block(5, MENU))
+        self.press('tap-up')
+        with self.assertRaisesRegex(RuntimeError, 'did not change'):
+            self.gate(block(6, menu(ack='4')), where={'open': 1}, transition='focus')
+
     def test_a_missing_baseline_focus_never_counts_as_a_transition(self):
         self.baseline(block(5, [l for l in MENU if not l.startswith('focus=')]))
         self.press()
