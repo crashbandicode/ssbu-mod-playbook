@@ -46,7 +46,7 @@ def tile(rev, *, at='7', target=OTHER, ack=0, applied=None, settled=True, direct
 
 def native(rev, epoch=1, **extra):
     return snapshot('ssbu.ui', rev, {'screen': 'css.smash', 'input.owner': 'native',
-                                    'focus.source': 'tile.cursor', **extra}, epoch)
+                                    'dialog': 'none', 'focus.source': 'tile.cursor', **extra}, epoch)
 
 
 class Replay:
@@ -210,8 +210,7 @@ class PickerTests(unittest.TestCase):
             })
 
         def stage_ui(rev):
-            return snapshot('ssbu.ui', rev, {'screen': 'stage_select', 'input.owner': 'native',
-                            'focus.source': 'tile.cursor', 'focus': 'stage_select/8'})
+            return native(rev, screen='stage_select', focus='stage_select/8')
 
         target = picker.Target('308', 'Training', 'normal')
         replay = Replay([stage_tile(1), stage_tile(2)],
@@ -231,6 +230,27 @@ class PickerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'token ownership'):
             self.run_pick(replay)
         self.assertEqual(replay.actions, [])
+
+    def test_nonempty_or_missing_native_dialog_sends_no_tile_input(self):
+        for values in ({'dialog': 'notice'}, {'dialog': 'unknown'}, {}):
+            with self.subTest(values=values):
+                focus = native(1, **values)
+                if not values:
+                    focus.values.pop('dialog')
+                replay = Replay([tile(1)], [focus])
+                with self.assertRaisesRegex(RuntimeError, 'dialog'):
+                    self.run_pick(replay)
+                self.assertEqual(replay.actions, [])
+
+    def test_training_context_is_required_for_a_pinned_training_picker(self):
+        for screen, context in (('css.training', 'unknown'), ('css.smash', 'training')):
+            with self.subTest(screen=screen, context=context):
+                focus = native(1, screen=screen, **{'screen.context': context})
+                replay = Replay([tile(1)], [focus])
+                with self.assertRaisesRegex(RuntimeError, 'training context'):
+                    picker.hover(replay, 'css', TARGET, GRAPH, expected_context='training')
+                self.assertEqual(replay.actions, [])
+
 
 class JoinTests(unittest.TestCase):
     boot = '0x0000000000000001'
@@ -388,7 +408,8 @@ class BridgeFramingTests(unittest.TestCase):
 class TrainingStageProofTests(unittest.TestCase):
     boot = '0x0000000000000001'
 
-    def run_training(self, replay, finish, *, expected=0, before_press=''):
+    def run_training(self, replay, finish, *, expected=0, before_press='',
+                     refreshed_context='training', after_owner='native', after_dialog='none', press=True):
         import zlib
         from pathlib import Path
         from tempfile import TemporaryDirectory
@@ -417,21 +438,27 @@ class TrainingStageProofTests(unittest.TestCase):
             ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None,
                                   runner=SimpleNamespace(), on='sw', log=lambda evidence: None)
             ui_samples = iter([
-                native(1, screen='css.training', focus='css.training'),
-                native(2, screen='css.training', focus='css.training'),
-                native(3, screen='training', focus='training'),
+                native(1, screen='css.training', focus='css.training', **{'screen.context': 'training'}),
+                native(2, screen='css.training', focus='css.training',
+                       **{'screen.context': refreshed_context}),
+                native(3, screen='training', focus='training', dialog=after_dialog,
+                       **{'screen.context': 'training', 'input.owner': after_owner}),
             ])
             placed = picker.Target('88', 'Steve', 'default')
             tiles = iter(tile(i, at='78', target=placed, seat='0', token='placed', placed=placed)
                          for i in (1, 2))
             actions = []
+            requests = []
 
             def spool(_ctx, fence, request):
                 self.assertEqual(fence, 'providers')
+                requests.append(request)
                 if request == 'state ssbu.ui':
                     response = frame(next(ui_samples))
                 elif request == 'state tile.cursor':
                     response = frame(next(tiles))
+                elif request == 'state_watch ssbu.ui keys=observation':
+                    response = '[Bridge] req state_watch name=ssbu.ui result=ok\n'
                 elif request == 'events on':
                     response = '[Bridge] req events result=ok on=1 latest=41 frame=700 wall=10000\n'
                 else:
@@ -443,15 +470,22 @@ class TrainingStageProofTests(unittest.TestCase):
                     if request == 'events on':
                         dst.write(before_press)
 
+            def start(_ctx, name):
+                actions.append(name)
+                self.assertEqual(requests, [
+                    'state ssbu.ui', 'state tile.cursor', 'state_watch ssbu.ui keys=observation',
+                    'state ssbu.ui', 'state tile.cursor', 'events on',
+                ])
+
             with (patch.object(routes, 'bridge_v2', spool),
-                  patch.object(routes, 'play', side_effect=lambda _ctx, name: actions.append(name)),
+                  patch.object(routes, 'play', side_effect=start),
                   patch.object(routes, 'native_state', return_value={'stage': expected}),
                   patch.object(routes, 'expected', return_value={'stage_id': expected}),
                   patch.object(routes, '_save', side_effect=lambda _ctx, _name, value: value)):
                 try:
                     return routes.enter_training(ctx, cap=.05)
                 finally:
-                    self.assertEqual(actions, ['enter-training'])
+                    self.assertEqual(actions, ['enter-training'] if press else [])
 
     def ending(self, last=41, *, boot=None):
         return (f'[Bridge] since result=ok cursor=41 from=42 oldest=1 latest={last}'
@@ -463,6 +497,15 @@ class TrainingStageProofTests(unittest.TestCase):
         self.assertEqual(result['stage_id'], 0)
         self.assertEqual(result['stage_event'], {'sequence': 42, 'frame': 720, 'wall_ms': 10040,
                                                 'boot': self.boot})
+
+    def test_training_plus_requires_the_refreshed_training_context(self):
+        with self.assertRaisesRegex(RuntimeError, 'training context'):
+            self.run_training('', self.ending(), refreshed_context='unknown', press=False)
+
+    def test_training_plus_refuses_gameplay_without_native_owner_or_with_modal(self):
+        for fields in ({'after_owner': 'unknown'}, {'after_dialog': 'notice'}):
+            with self.subTest(fields=fields), self.assertRaisesRegex(RuntimeError, 'unexpected native focus'):
+                self.run_training('', self.ending(), **fields)
 
     def test_repeated_training_stage_cannot_reuse_historical_id(self):
         with self.assertRaisesRegex(RuntimeError, 'no fresh gameplay stage'):
