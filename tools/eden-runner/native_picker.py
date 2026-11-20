@@ -114,6 +114,7 @@ def wait_scene_transition(io, before, until, source, target, *, label):
     """Wait for one already-sent scene-changing input, on the fenced connection."""
     fields = ('screen', 'screen.context', 'focus', 'focus.source', 'input.owner', 'dialog')
     destination = {key: value for key, value in target.items() if key not in ('dialog', 'input.owner')}
+    passive_source = {**source, 'dialog': 'unknown', 'input.owner': 'unknown'}
     previous = before
     departed = False
     while time.monotonic() < until:
@@ -136,7 +137,10 @@ def wait_scene_transition(io, before, until, source, target, *, label):
                 raise RuntimeError(f'{UI}: contradictory inactive {label} scene observation')
             departed = True
             continue
-        if not departed and all(values.get(key) == value for key, value in source.items()):
+        if not departed and any(
+            all(values.get(key) == value for key, value in candidate.items())
+            for candidate in (source, passive_source)
+        ):
             continue
         if (all(values.get(key) == value for key, value in destination.items())
                 and values['input.owner'] in ('native', 'unknown')
