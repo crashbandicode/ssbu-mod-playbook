@@ -9,7 +9,7 @@ Blocks (docs/ROUTES.md has what each guarantees on exit):
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
   load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
   wait_lines       the boot lines the plugins print (instead of a fixed post-load sleep)
-  to_main          title or attract demo or How-to-Play video -> main menu (Start promptly, image gate, capped)
+  to_main          Title or How to Play -> Main Menu (native ownership gate, capped)
   main_to_stage    main menu -> Training's stage select
   pick_stage       stage select -> the named stage's tile (tile cursor L3+D-pad macros, at == to) -> A -> CSS
   pick_fighter     CSS: P1 token onto the named fighter's tile (hovered == to) and placed
@@ -749,10 +749,17 @@ MAIN_TOP = {**NATIVE_INPUT, 'screen': 'main_menu', 'screen.layer': 'top', 'focus
 MAIN_TABS = ('smash', 'spirits', 'games_and_more', 'vault', 'online')
 TITLE_PROMPT = {**NATIVE_INPUT, 'screen': 'title', 'focus.source': 'native',
                 'focus.id': 'press_any', 'focus.index': '0', 'focus': 'title.press_any'}
+HOW_TO_PLAY_SKIP = {**NATIVE_INPUT, 'screen': 'attract', 'screen.context': 'how_to_play',
+                    'focus.source': 'native', 'focus.id': 'skip_how_to_play', 'focus.index': '0',
+                    'focus': 'attract.skip_how_to_play'}
 _UNOWNED_FOCUS = dict.fromkeys(('focus.source', 'focus.id', 'focus.index', 'focus.label',
                                'input.owner', 'dialog'), 'unknown')
 _TITLE_WITHOUT_PROMPT = {**_UNOWNED_FOCUS, 'screen': 'title', 'focus': 'title',
                          'screen.context': 'unknown'}
+_HOW_TO_PLAY_WITHOUT_PROMPT = {**_UNOWNED_FOCUS, 'screen': 'attract', 'focus': 'attract',
+                               'screen.context': 'how_to_play'}
+_MAIN_WITHOUT_FOCUS = {**_UNOWNED_FOCUS, 'screen': 'main_menu', 'screen.layer': 'top',
+                       'focus': 'main_menu.top', 'screen.context': 'unknown'}
 TRAINING_OWNER = {**NATIVE_INPUT, 'screen.context': 'training'}
 TRAINING_SCREEN = {**TRAINING_OWNER, 'screen': 'training'}
 TRAINING_CSS = {**TRAINING_OWNER, 'screen': 'css.training', 'focus.source': native_picker.TILE}
@@ -795,33 +802,77 @@ def _missing_navigation_state(route, state, expected):
 
 
 def to_main(ctx, tries=8, look_s=6, *, cap=None):
-    """Wait for qualified Main or activate the stock Title prompt once."""
+    """Reach qualified Main with at most one Plus at each stock prompt."""
     io = BridgePickerIO(ctx)
     until = time.monotonic() + ((tries + 1) * look_s if cap is None else cap)
+    main_targets = tuple(_main_tab(tab) for tab in MAIN_TABS)
     state = None
     presses = 0
     while (remaining := until - time.monotonic()) > 0:
-        state = native_picker.check_sample(io.read(native_picker.UI, min(remaining, look_s)),
-                                           native_picker.UI, loading_ui=True)
-        if _main_top(state):
-            break
-        if tries > 0 and _fields_match(state, TITLE_PROMPT):
-            _, state = _watched_native_input(io, state, TITLE_PROMPT, MAIN_TOP, 'attract-cancel',
-                                             until, route='Title', scene_change=True,
-                                             pending_destinations=(_TITLE_WITHOUT_PROMPT,))
-            if not _main_top(state):
-                raise _missing_navigation_state('Title', state, 'qualified Main top focus')
-            io.finish()
-            presses = 1
+        sample = native_picker.check_sample(io.read(native_picker.UI, min(remaining, look_s)),
+                                            native_picker.UI, loading_ui=True)
+        fresh = _check_title_sample(sample, state)
+        state = sample
+        if fresh and state.values['observation.active'] == 'yes' and (
+            _main_top(state) or (tries > 0 and any(
+                _fields_match(state, source) for source in (TITLE_PROMPT, HOW_TO_PLAY_SKIP)
+            ))
+        ):
             break
         ctx.check_stop()
         time.sleep(min(.05, max(0, until - time.monotonic())))
     else:
-        raise _missing_navigation_state('to_main', state, 'qualified Main top or Title press_any')
+        raise _missing_navigation_state('to_main', state, 'qualified Main, Title or How to Play focus')
+
+    for source, route, destinations, pending in (
+        (TITLE_PROMPT, 'Title', (*main_targets, HOW_TO_PLAY_SKIP),
+         (_TITLE_WITHOUT_PROMPT, _HOW_TO_PLAY_WITHOUT_PROMPT, _MAIN_WITHOUT_FOCUS)),
+        (HOW_TO_PLAY_SKIP, 'How to Play', main_targets, (_HOW_TO_PLAY_WITHOUT_PROMPT, _MAIN_WITHOUT_FOCUS)),
+    ):
+        if not _fields_match(state, source):
+            continue
+        before = _armed_native_sample(io, state, until, route, settling=True)
+        while any(_fields_match(before, passive) for passive in pending):
+            _check_title_sample(before)
+            before = native_picker.wait_sample(io, native_picker.UI, until, before, loading_ui=True)
+        _check_title_sample(before)
+        if any(_fields_match(before, target) for target in destinations):
+            state = before
+            continue
+        if not _fields_match(before, source):
+            raise _missing_navigation_state(route, before, f'qualified {route} source after arming')
+        if time.monotonic() >= until:
+            raise RuntimeError(f'{route} source deadline expired before Plus')
+        io.send('attract-cancel')
+        presses += 1
+        state = native_picker.wait_scene_transition(
+            io, before, until, source, destinations[0], label=route,
+            pending_destinations=pending, additional_targets=destinations[1:],
+        )
+        io.finish()
+
     out = {'main': True, 'start_presses': presses, **_navigation_receipt(state)}
     ctx.log({'route': 'to_main', **out})
     return out
 
+
+
+def _check_title_sample(state, previous=None):
+    values = state.values
+    incomplete = any(not values.get(key) for key in native_picker.UI_FOCUS_FIELDS)
+    contradicts_inactive = values['observation.active'] == 'no' and any(
+        values.get(key) != 'unknown' for key in native_picker.UI_FOCUS_FIELDS)
+    if incomplete or contradicts_inactive or values.get('ack') != '0' or values.get('ack.result') != 'unsupported':
+        raise RuntimeError('ssbu.ui: incomplete or contradictory Title observation')
+    if previous is None:
+        return True
+    native_picker.same_epoch(previous, state, in_flight=True)
+    _, revision, observation = state.clock
+    _, prior_revision, prior_observation = previous.clock
+    if (revision < prior_revision or observation < prior_observation
+            or (revision == prior_revision and values != previous.values)):
+        raise RuntimeError('ssbu.ui: stale or contradictory Title observation')
+    return revision > prior_revision and observation > prior_observation
 
 
 def main_to_stage(ctx):

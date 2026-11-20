@@ -25,7 +25,10 @@ def ui(screen, focus=None, *, context='unknown', source='unknown', tab='unknown'
 
 
 IDLE_TITLE = ui('title', 'press_any', source='native', index='0', label='"Press Any Button"')
+HOW_TO_PLAY = ui('attract', 'skip_how_to_play', context='how_to_play', source='native', index='0')
+UNOWNED_HOW_TO_PLAY = ui('attract', context='how_to_play', owner='unknown', dialog='unknown')
 MAIN = ui('main_menu', 'smash', source='native', tab='smash', layer='top', index='1', label='"Smash"')
+UNOWNED_MAIN = ui('main_menu', tab='smash', layer='top', owner='unknown', dialog='unknown')
 TRAINING = ui('training', context='training')
 PAUSE = ui('pause', 'cpu_count', source='native', context='training', index='0', label='"No. of CPUs"')
 QUIT = ui('pause', 'quit_training', source='native', context='training', index='0', label='"Quit Training"')
@@ -149,6 +152,81 @@ class BridgeNavigationTests(unittest.TestCase):
 
         self.assertEqual(self.actions, ['attract-cancel'])
         self.assertEqual(self.last_ui, MAIN)
+        self.assert_no_images()
+
+    def test_title_confirm_waits_for_owned_how_to_play_before_its_one_skip(self):
+        self.scene = IDLE_TITLE
+        self.transition_samples['attract-cancel'] = UNOWNED_HOW_TO_PLAY
+        self.edges = [(IDLE_TITLE, ('attract-cancel',), HOW_TO_PLAY),
+                      (HOW_TO_PLAY, ('attract-cancel',), MAIN)]
+
+        result = routes.to_main(self.ctx, tries=1, look_s=.2)
+
+        self.assertEqual(self.actions, ['attract-cancel', 'attract-cancel'])
+        self.assertEqual(result['start_presses'], 2)
+        self.assertEqual(self.last_ui, MAIN)
+        self.assertFalse(self.edges)
+        self.assert_no_images()
+
+    def test_starting_at_how_to_play_waits_for_main_ownership_after_one_skip(self):
+        self.scene = HOW_TO_PLAY
+        self.transition_samples['attract-cancel'] = UNOWNED_MAIN
+        self.edges = [(HOW_TO_PLAY, ('attract-cancel',), MAIN)]
+
+        result = routes.to_main(self.ctx, tries=1, look_s=.2)
+
+        self.assertEqual(self.actions, ['attract-cancel'])
+        self.assertEqual(result['start_presses'], 1)
+        self.assertEqual(self.last_ui, MAIN)
+        self.assert_no_images()
+
+    def test_stock_main_after_how_to_play_arming_needs_no_plus(self):
+        self.scene = HOW_TO_PLAY
+        self.change_on_watch = MAIN
+
+        result = routes.to_main(self.ctx, tries=1, look_s=.2)
+
+        self.assertFalse(self.actions)
+        self.assertEqual(result['start_presses'], 0)
+        self.assertEqual(self.last_ui, MAIN)
+        self.assert_no_images()
+
+    def test_identity_only_how_to_play_after_title_needs_no_second_plus(self):
+        self.scene = IDLE_TITLE
+        self.edges = [(IDLE_TITLE, ('attract-cancel',), MAIN)]
+        self.transition_samples['attract-cancel'] = UNOWNED_HOW_TO_PLAY
+
+        result = routes.to_main(self.ctx, tries=1, look_s=.2)
+
+        self.assertEqual(self.actions, ['attract-cancel'])
+        self.assertEqual(result['start_presses'], 1)
+        self.assertEqual(self.last_ui, MAIN)
+        self.assert_no_images()
+
+    def test_how_to_play_arming_refuses_stale_or_unauthenticated_source(self):
+        for change, error in (({'observation': '1'}, 'stale or contradictory'),
+                              ({'ack': '1'}, 'contradictory Title'),
+                              ({'screen.context': 'demo'}, 'source after arming')):
+            with self.subTest(change=change):
+                self.scene = {**HOW_TO_PLAY, 'observation': '2'} if 'observation' in change else HOW_TO_PLAY
+                self.change_on_watch = {**HOW_TO_PLAY, **change}
+
+                with self.assertRaisesRegex(RuntimeError, error):
+                    routes.to_main(self.ctx, tries=1, look_s=.2)
+
+                self.assertFalse(self.actions)
+        self.assert_no_images()
+
+    def test_unconfirmed_how_to_play_skip_stays_single_shot(self):
+        self.scene = HOW_TO_PLAY
+        self.edges = [(HOW_TO_PLAY, ('attract-cancel',), HOW_TO_PLAY)]
+
+        with self.assertRaises(RuntimeError):
+            routes.to_main(self.ctx, tries=1, look_s=.2)
+        with self.assertRaisesRegex(RuntimeError, 'remains unconfirmed'):
+            routes.to_main(self.ctx, tries=1, look_s=.2)
+
+        self.assertEqual(self.actions, ['attract-cancel'])
         self.assert_no_images()
 
     def test_ready_main_needs_no_input(self):
