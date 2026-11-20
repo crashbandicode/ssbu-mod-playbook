@@ -1488,24 +1488,25 @@ def main_menu_step(ctx, direction, from_focus, to_focus, cap=5):
     })
 
 
-def _armed_native_sample(io, initial, until, route):
+def _armed_native_sample(io, initial, until, route, *, settling=False):
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise RuntimeError(f'{route} source deadline expired before arming ssbu.ui')
     io.arm(native_picker.UI, remaining)
     if io.connection != initial.connection or io.boot != initial.clock[0]:
         raise RuntimeError(f'bridge connection or boot changed while arming {route} watch')
-    before = native_picker.wait_sample(io, native_picker.UI, until, initial)
+    before = native_picker.wait_sample(io, native_picker.UI, until, initial, loading_ui=settling)
     if before.connection != initial.connection:
         raise RuntimeError(f'bridge connection changed before {route} input')
     return before
 
 
-def _watched_native_input(io, initial, source, target, macro, until, *, route='Main Menu', scene_change=False):
+def _watched_native_input(io, initial, source, target, macro, until, *, route='Main Menu', scene_change=False,
+                          settling=False):
     source_focus = source.get('focus', source.get('focus.id', source['screen']))
     if not _fields_match(initial, source):
         raise RuntimeError(f'{route} source must be native focus {source_focus!r}')
-    before = _armed_native_sample(io, initial, until, route)
+    before = _armed_native_sample(io, initial, until, route, settling=settling)
     if not _fields_match(before, source):
         raise RuntimeError(f'{route} source changed before {macro!r} at {source_focus!r}')
 
@@ -1544,14 +1545,16 @@ def _native_main_to_stage(ctx):
     else:
         raise RuntimeError('Training entry needs a native Games & More source or supported submenu focus')
 
+    settling = False
     for (source, macro), (target, _) in zip(checkpoints[index:], checkpoints[index + 1:]):
         # Opening the submenu invalidates the previous Lua focus until the
         # new layer activates. Send nothing while that transition settles.
         layer_change = source['screen.layer'] != target['screen.layer']
         _, state = _watched_native_input(
-            io, state, source, target, macro, time.monotonic() + 5, scene_change=layer_change,
+            io, state, source, target, macro, time.monotonic() + 5, scene_change=layer_change, settling=settling,
         )
         io.finish()
+        settling = layer_change
 
     stage = {'screen': 'stage_select', 'screen.context': 'training', 'input.owner': 'native',
              'dialog': 'none', 'focus.source': native_picker.TILE}

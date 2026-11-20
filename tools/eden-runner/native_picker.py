@@ -13,6 +13,7 @@ SCENES = {'css': {'css.training', 'css.smash'}, 'sss': {'stage_select'}}
 DIRECTIONS = {'up', 'down', 'left', 'right'}
 FORMS = {'css': {'default'}, 'sss': {'normal', 'battlefield', 'omega'}}
 ABSENT = {'', 'none', 'unknown'}
+UI_FOCUS_FIELDS = ('screen', 'screen.context', 'focus', 'focus.source', 'input.owner', 'dialog')
 
 
 @dataclass(frozen=True)
@@ -97,14 +98,26 @@ def same_epoch(previous, current, *, in_flight):
         raise RuntimeError('bridge connection changed while input was unconfirmed')
 
 
-def wait_sample(io, provider, until, after=None, *, in_flight=False):
+def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=False):
+    settling = loading_ui and provider == UI and after is not None
     while time.monotonic() < until:
-        state = check_sample(io.read(provider, until - time.monotonic()), provider)
+        state = check_sample(io.read(provider, until - time.monotonic()), provider, loading_ui=settling)
         if after is None:
             return state
-        same_epoch(after, state, in_flight=in_flight)
+        same_epoch(after, state, in_flight=in_flight or settling)
         _, revision, observation = state.clock
         _, prev_revision, prev_observation = after.clock
+        if settling:
+            values = state.values
+            if (revision < prev_revision or observation < prev_observation
+                    or (revision == prev_revision and values != after.values)):
+                raise RuntimeError(f'{UI}: stale or contradictory settling observation')
+            if values['observation.active'] == 'no':
+                if (any(values.get(key) != 'unknown' for key in UI_FOCUS_FIELDS)
+                        or values.get('ack') != '0' or values.get('ack.result') != 'unsupported'):
+                    raise RuntimeError(f'{UI}: contradictory inactive settling observation')
+                after = state
+                continue
         if revision > prev_revision and observation > prev_observation:
             return state
     raise RuntimeError(f'{provider}: no newer active observation')
@@ -112,7 +125,6 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False):
 
 def wait_scene_transition(io, before, until, source, target, *, label):
     """Wait for one already-sent scene-changing input, on the fenced connection."""
-    fields = ('screen', 'screen.context', 'focus', 'focus.source', 'input.owner', 'dialog')
     destination = {key: value for key, value in target.items() if key not in ('dialog', 'input.owner')}
     passive_source = {**source, 'dialog': 'unknown', 'input.owner': 'unknown'}
     previous = before
@@ -121,7 +133,7 @@ def wait_scene_transition(io, before, until, source, target, *, label):
         state = check_sample(io.read(UI, until - time.monotonic()), UI, loading_ui=True)
         same_epoch(previous, state, in_flight=True)
         values = state.values
-        if (any(not values.get(key) for key in fields)
+        if (any(not values.get(key) for key in UI_FOCUS_FIELDS)
                 or values.get('ack') != '0' or values.get('ack.result') != 'unsupported'):
             raise RuntimeError(f'{UI}: incomplete {label} scene observation')
         _, revision, observation = state.clock
@@ -133,7 +145,7 @@ def wait_scene_transition(io, before, until, source, target, *, label):
             continue
         previous = state
         if values['observation.active'] == 'no':
-            if any(values[key] != 'unknown' for key in fields):
+            if any(values[key] != 'unknown' for key in UI_FOCUS_FIELDS):
                 raise RuntimeError(f'{UI}: contradictory inactive {label} scene observation')
             departed = True
             continue
