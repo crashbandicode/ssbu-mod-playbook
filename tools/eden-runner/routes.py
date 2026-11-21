@@ -1263,8 +1263,31 @@ def select_screen(ctx, cap=2.5):
         cursor.close()
 
 
+def _take_back_training_token(io, state):
+    tile = native_picker.wait_sample(io, native_picker.TILE, time.monotonic() + 4)
+    if tile.values.get('local.token') != 'placed':
+        return None
+    native_picker.same_epoch(state, tile, in_flight=True)
+    io.send('leave-css')
+    until = time.monotonic() + 6
+    while time.monotonic() < until:
+        try:
+            tile = native_picker.wait_sample(io, native_picker.TILE, until, tile, in_flight=True)
+        except RuntimeError as exc:
+            if (str(exc) == f'{native_picker.TILE}: no newer active observation'
+                    or (time.monotonic() >= until
+                        and str(exc) == f'no fenced bridge reply for state {native_picker.TILE}')):
+                break
+            raise
+        if tile.values.get('local.token') != 'placed':
+            state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 4, state, in_flight=True)
+            io.finish()
+            return state
+    raise RuntimeError('Training CSS: the placed token was not taken back by leave-css')
+
+
 def back_to_main(ctx, presses=10):
-    """Return through the fenced native Training, CSS and Stage Select owners."""
+    """Return through fenced Training owners, taking back a placed CSS token first."""
     looks = []
     io = BridgePickerIO(ctx)
     state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 4)
@@ -1286,6 +1309,12 @@ def back_to_main(ctx, presses=10):
     for _ in range(presses):
         if _main_top(state):
             return _save(ctx, 'routes-back-to-main', {'looks': looks, **_navigation_receipt(state)})
+        if _fields_match(state, TRAINING_CSS):
+            after_token = _take_back_training_token(io, state)
+            if after_token is not None:
+                looks.append('css-token-back')
+                state = after_token
+                continue
         for source, target, macro, label, pending, additional_targets in return_edges:
             if _fields_match(state, source):
                 break

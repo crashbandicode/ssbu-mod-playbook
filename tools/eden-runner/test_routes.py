@@ -1455,6 +1455,116 @@ class SessionRecordingTests(unittest.TestCase):
         self.assertTrue(any('log' in e for e in errors), errors)
 
 
+class TrainingReturnTests(unittest.TestCase):
+    class IO:
+        def __init__(self, token):
+            self.token = token
+            self.screen = 0
+            self.revision = 0
+            self.actions = []
+            self.connection = 1
+            self.boot = '0x0000000000000001'
+
+        def read(self, provider, cap):
+            import test_native_picker as fixtures
+
+            self.revision += 1
+            if provider == routes.native_picker.TILE:
+                return fixtures.tile(self.revision, seat='0', token=self.token)
+            states = [
+                {**routes.TRAINING_CSS, 'focus': 'css.training'},
+                {**routes.TRAINING_SSS, 'focus': 'stage_select'},
+                routes.GAMES_TRAINING,
+                routes._main_tab('smash'),
+            ]
+            return fixtures.native(self.revision, **states[self.screen])
+
+        def arm(self, provider, cap):
+            pass
+
+        def send(self, macro):
+            self.actions.append(macro)
+            if self.screen == 0 and self.token == 'placed':
+                self.token = 'held'
+            else:
+                self.screen += 1
+
+        def finish(self):
+            pass
+
+    def run_return(self, token):
+        from itertools import count
+        from unittest.mock import patch
+
+        io = self.IO(token)
+        clock = count(step=.01)
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+                patch.object(routes.time, 'monotonic', side_effect=lambda: next(clock)), \
+                patch.object(routes, '_save', side_effect=lambda _ctx, _name, data: data):
+            result = routes.back_to_main(object())
+        return io, result
+
+    def test_placed_training_token_returns_before_leaving_css(self):
+        io, result = self.run_return('placed')
+        self.assertEqual(io.actions, ['leave-css', 'leave-css', 'tap-b1', 'tap-b1'])
+        self.assertEqual(result['looks'][0], 'css-token-back')
+
+    def test_held_training_token_needs_only_one_css_return(self):
+        io, result = self.run_return('held')
+        self.assertEqual(io.actions, ['leave-css', 'tap-b1', 'tap-b1'])
+        self.assertEqual(result['looks'], ['css', 'sss', 'games_and_more'])
+
+    def test_reconnected_tile_cannot_authorize_token_back(self):
+        from unittest.mock import patch
+
+        io = self.IO('placed')
+        read = io.read
+
+        def reconnect_on_tile(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE:
+                io.connection = 2
+                return routes.native_picker.Sample(sample.block, 2)
+            return sample
+
+        io.read = reconnect_on_tile
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+                self.assertRaisesRegex(RuntimeError, 'bridge connection changed'):
+            routes.back_to_main(object())
+        self.assertEqual(io.actions, [])
+
+    def test_token_return_can_already_leave_css(self):
+        from unittest.mock import patch
+
+        io = self.IO('placed')
+        send = io.send
+
+        def send_and_leave(macro):
+            send(macro)
+            if len(io.actions) == 1:
+                io.screen = 1
+
+        io.send = send_and_leave
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+                patch.object(routes, '_save', side_effect=lambda _ctx, _name, data: data):
+            result = routes.back_to_main(object())
+        self.assertEqual(io.actions, ['leave-css', 'tap-b1', 'tap-b1'])
+        self.assertEqual(result['looks'], ['css-token-back', 'sss', 'games_and_more'])
+
+    def test_placed_token_timeout_names_the_failed_operation(self):
+        from itertools import count
+        from unittest.mock import patch
+
+        io = self.IO('placed')
+        io.send = io.actions.append
+        clock = count(step=.25)
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+                patch.object(routes.time, 'monotonic', side_effect=lambda: next(clock)), \
+                self.assertRaisesRegex(RuntimeError, 'Training CSS: the placed token was not taken back by leave-css'):
+            routes.back_to_main(object())
+        self.assertEqual(io.actions, ['leave-css'])
+
+
 class SwitchBootTests(unittest.TestCase):
     def test_launched_switch_uses_the_same_title_gate_and_deadline(self):
         from unittest.mock import Mock, patch
