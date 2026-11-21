@@ -21,6 +21,30 @@ lifecycle, playbook gv/prep/launch/stop and the shared runner. That draft left t
 runner.py untouched. Phase2 was then paused at product commit4814381,
 with no-default/review/native acceptance pending and no owned host claim/job.
 
+## Approved reservations
+
+For an approved Linux run with a prepared lifecycle config, reserve the host
+from its normal executor:
+
+```text
+python3 -B -I lifecycle.py reserve config.json --approver tr-primary-2 --execute
+```
+
+Use the same `host`, `owner` and `label` for preflight and Up. The command
+appends one reservation to the configured authoritative ledger, using
+`ledger_ssh` when present. The approver name records the approval already
+granted. A host can have one live reservation. It can be left for an existing
+run to finish and expires 20 minutes after issuance if still unclaimed.
+
+Preflight is read-only. It ignores an exact matching reservation and refuses a
+different owner or label while the reservation is open. Up still checks
+ordinary claims, resources and pins, then converts the reservation to its
+normal lifecycle claim in the locked ledger append. Down releases the normal
+claim. An elapsed reservation stays in ledger history, and the next
+successful reservation or claim on that host records its release. For new reserve,
+preflight and Up operations use the current shared lifecycle on the executor.
+Existing runtime owners can Down with their already-pinned tools.
+
 ## CLI and integration
 
 ```text

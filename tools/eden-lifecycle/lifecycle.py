@@ -4,6 +4,7 @@
   lifecycle.py up        config.json --execute [--ssh memento-claw-yoga-ubuntu]
   lifecycle.py down      config.json --execute [--ssh memento-claw-yoga-ubuntu] [--evidence-dir DIR] [--keep-state]
   lifecycle.py status    config.json           [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py reserve   config.json --approver NAME --execute
   lifecycle.py preflight config.json           [--ssh memento-claw-yoga-ubuntu]
   lifecycle.py watchdog  config.json --execute [--ssh memento-claw-yoga-ubuntu] [--rounds N] [--pause S]
 
@@ -363,13 +364,46 @@ def validate_stale_claim_hours(value):
             'stale_claim_hours must be a finite positive number')
 
 
-def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, now=None):
+RESERVATION_TTL_MINUTES = 20
+RESERVATION = re.compile(
+    r'(?P<at>\S+) CLAIMED: (?P<owner>(?:OpenCode|Codex|Claude|Cursor)[ \t]+\S+) '
+    r'host=(?P<host>surface|yoga|xps) lifecycle=(?P<token>[0-9a-f]{32}) '
+    r'Eden reservation run (?P<label>[A-Za-z0-9][A-Za-z0-9_-]{1,63}) '
+    r'approver=(?P<approver>[A-Za-z0-9][A-Za-z0-9_./@-]*)')
+
+
+def reservation_expired(record, now):
+    try:
+        created = datetime.fromisoformat(record['at'])
+        return (now - created).total_seconds() >= RESERVATION_TTL_MINUTES * 60
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, now=None, *, label=None):
     """Opt-in admission policy only; never reconcile or release foreign claims.
 
     Keep active_claims' release pairing authoritative. Ambiguous ownership,
     scope or time stays blocking, even when the opt-in policy is enabled.
     """
-    opened = active_claims(text, host)
+    opened = []
+    reservations, matching = [], []
+    now = now if now is not None else datetime.now(timezone.utc)
+    for line in active_claims(text, host):
+        record = RESERVATION.fullmatch(line)
+        if not record:
+            opened.append(line)
+            continue
+        expired = reservation_expired(record, now)
+        if expired:
+            continue
+        if expired is False and (record['host'], record['owner'], record['label']) == (host, owner, label):
+            matching.append(record)
+        else:
+            reservations.append(line)
+    # One matching reservation can be converted; an ambiguous duplicate stays blocking.
+    if len(matching) > 1:
+        reservations.extend(record[0] for record in matching)
     # Operator 2026-11-04: the Surface and the Yoga run two emulators. A claim this tool wrote for another run on the
     # same host (`host=<host> lifecycle=<token> Eden lifecycle admitted`; each run has its own profile copy) is a
     # concurrent instance, not a block, while fewer than the host's `max_eden` are open. Admission's process, memory
@@ -383,14 +417,15 @@ def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, n
     else:
         concurrent = []
     extra = {'concurrent_claims': concurrent} if concurrent else {}
+    if len(matching) == 1:
+        extra['reservation'] = matching[0]['token']
     if stale_claim_hours is None:
-        return {'blocking': opened, 'stale_claim_skipped': [], **extra}
+        return {'blocking': reservations + opened, 'stale_claim_skipped': [], **extra}
     validate_stale_claim_hours(stale_claim_hours)
     clean = isinstance(admission, dict) and admission.get('foreign_processes') == []
-    now = now if now is not None else datetime.now(timezone.utc)
     current_owner = re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s*(\S+)', owner, re.I)
     current_owner = (current_owner[1].lower(), current_owner[2]) if current_owner else None
-    blocking, skipped = [], []
+    blocking, skipped = reservations, []
     for line in opened:
         # Require an entire, timezone-aware timestamp before the CLAIMED event.
         event = re.fullmatch(r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?'
@@ -422,18 +457,31 @@ def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, n
     return {'blocking': blocking, 'stale_claim_skipped': skipped, **extra}
 
 
-class Ledger:
-    def __init__(self, path, host, owner, token, remote=None):
-        self.path, self.host, self.owner, self.token = str(path), host, owner, token
-        self.remote = remote
+def append_ledger(stream, lines):
+    stream.seek(0, os.SEEK_END)
+    stream.write('\n' + '\n\n'.join(lines) + '\n')
+    stream.flush()
+    os.fsync(stream.fileno())
 
-    def operate(self, operation, stale_claim_hours=None, admission=None):
+
+def reservation_release(record, reason):
+    return (f"{stamp()} RELEASED: {record['owner']} host={record['host']} lifecycle={record['token']} "
+            f"Eden reservation {reason}")
+
+
+class Ledger:
+    def __init__(self, path, host, owner, token, remote=None, *, label=None):
+        self.path, self.host, self.owner, self.token = str(path), host, owner, token
+        self.remote, self.label = remote, label
+
+    def operate(self, operation, stale_claim_hours=None, admission=None, *, approver=None):
         if globals().get('_LEDGER_BRIDGE'):
             return _LEDGER_BRIDGE(operation, self.token, stale_claim_hours, admission)
         if self.remote:
             return forward(self.remote, 'ledger-' + operation,
                            {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
-                            'stale_claim_hours': stale_claim_hours, 'admission': admission}, True)
+                            'stale_claim_hours': stale_claim_hours, 'admission': admission,
+                            'label': self.label, 'approver': approver}, True)
         path = safe_absolute(self.path)
         require(path.is_file(), 'Authoritative ledger must already exist')
         # Never replace/truncate the shared ledger or normalize it on disk.
@@ -447,12 +495,29 @@ class Ledger:
                 return {'open': opened, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
                         'owned_claim': any(exact(line) for line in opened),
                         'owned_release': any('RELEASED:' in line and exact(line) for line in text.splitlines())}
-            require(operation in ('claim', 'release'), 'Unknown ledger operation')
+            require(operation in ('claim', 'release', 'reserve'), 'Unknown ledger operation')
+            now = datetime.now(timezone.utc)
+            reservations = []
+            if operation != 'release':
+                reservations = [match for line in active_claims(text, self.host)
+                                if (match := RESERVATION.fullmatch(line))]
+            expired = [record for record in reservations if reservation_expired(record, now)]
+            if operation == 'reserve':
+                line = (f'{now.isoformat()} CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
+                        f'Eden reservation run {self.label} approver={approver}')
+                require(approver is not None and self.label is not None and RESERVATION.fullmatch(line),
+                        'Reservation requires a valid Linux host, owner, run label and approver')
+                require(len(reservations) == len(expired), 'Host already has an open Eden reservation')
+                append_ledger(stream, [line, *(reservation_release(old, 'expired') for old in expired)])
+                return {'line': line, 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60}
             skipped = []
+            reservation = None
             if operation == 'claim':
-                policy = claim_admission(text, self.host, self.owner, stale_claim_hours, admission)
+                policy = claim_admission(text, self.host, self.owner, stale_claim_hours, admission, now,
+                                         label=self.label)
                 require(not policy['blocking'], 'Open host claim; no profile changes permitted')
                 skipped = policy['stale_claim_skipped']
+                reservation = policy.get('reservation')
             else:
                 own = [line for line in active_claims(text, self.host)
                        if f'lifecycle={self.token} ' in line and f'{self.owner} ' in line]
@@ -460,11 +525,19 @@ class Ledger:
             kind = 'CLAIMED' if operation == 'claim' else 'RELEASED'
             line = f'{stamp()} {kind}: {self.owner} host={self.host} lifecycle={self.token} '
             line += 'Eden lifecycle admitted' if operation == 'claim' else 'Eden stopped; full profile restored and separately verified'
-            stream.seek(0, os.SEEK_END)
-            stream.write('\n' + line + '\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-            return {'line': line, 'stale_claim_skipped': skipped}
+            lines = [line]
+            if reservation:
+                record = next(item for item in reservations
+                              if (item['token'], item['owner'], item['label']) ==
+                              (reservation, self.owner, self.label)
+                              and not reservation_expired(item, now))
+                lines.append(reservation_release(record, 'converted to lifecycle claim'))
+            lines.extend(reservation_release(old, 'expired') for old in expired)
+            append_ledger(stream, lines)
+            receipt = {'line': line, 'stale_claim_skipped': skipped}
+            if reservation:
+                receipt['consumed_reservation'] = reservation
+            return receipt
 
     def claim(self, stale_claim_hours=None, admission=None):
         return self.operate('claim', stale_claim_hours, admission)
@@ -1374,7 +1447,8 @@ class Lifecycle:
 
     def ledger(self):
         return self.injected_ledger if self.injected_ledger is not None else Ledger(
-            self.c['ledger'], self.c['host'], self.c['owner'], self.state['token'], self.c.get('ledger_ssh'))
+            self.c['ledger'], self.c['host'], self.c['owner'], self.state['token'], self.c.get('ledger_ssh'),
+            label=self.c['label'])
 
     @contextmanager
     def lock(self):
@@ -1647,7 +1721,8 @@ class Lifecycle:
         problems, lines, checks = self.resource_report(value)
         try:
             text = self.ledger_text()
-            policy = claim_admission(text, self.c['host'], self.c['owner'], self.c.get('stale_claim_hours'), value)
+            policy = claim_admission(text, self.c['host'], self.c['owner'], self.c.get('stale_claim_hours'), value,
+                                     label=self.c['label'])
         except Exception as error:  # noqa: BLE001
             detail = f'Ledger unreadable: {error}'
             problems.append(detail)
@@ -2371,8 +2446,9 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
 def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
     require(mode in ('status', 'preflight') or execute, 'Runtime mutation needs explicit --execute; tests inject fakes')
     if mode.startswith('ledger-'):
-        return Ledger(config['ledger'], config['host'], config['owner'], config['token']).operate(
-            mode[7:], config.get('stale_claim_hours'), config.get('admission'))
+        return Ledger(config['ledger'], config['host'], config['owner'], config['token'],
+                      label=config.get('label')).operate(
+            mode[7:], config.get('stale_claim_hours'), config.get('admission'), approver=config.get('approver'))
     tool = Lifecycle(config)
     if mode == 'watchdog':
         return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
@@ -2524,7 +2600,7 @@ def main(argv=None):
         windows_launch(actual[1])
         return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'watchdog', 'watchdog-serve'))
+    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'reserve', 'watchdog', 'watchdog-serve'))
     parser.add_argument('config', type=Path)
     parser.add_argument('--execute', action='store_true', help='explicit runtime authorization; NEVER used by offline tests')
     parser.add_argument('--ssh', help='executor host (remote login shell PowerShell 7)')
@@ -2534,12 +2610,21 @@ def main(argv=None):
                         help='down: keep the run\'s copies (work_root, state snapshots) for debugging; only when asked')
     parser.add_argument('--evidence-dir', help='down: where the files the run wrote are copied before the prune '
                         '(default <state_dir>/evidence; eden_test.py passes the run\'s out/)')
+    parser.add_argument('--approver', help='reserve: name of the person who approved this reservation')
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text())
         require(args.mode in ('status', 'preflight') or args.execute, 'up/down require explicit --execute')
         require(args.mode == 'down' or not (args.keep_state or args.evidence_dir),
                 '--keep-state and --evidence-dir are down options')
+        require(args.mode == 'reserve' or args.approver is None, '--approver is a reserve option')
+        if args.mode == 'reserve':
+            require(args.approver, 'reserve requires --approver')
+            validate(config)
+            ledger = Ledger(config['ledger'], config['host'], config['owner'], uuid.uuid4().hex,
+                            config.get('ledger_ssh') or args.ssh, label=config['label'])
+            print(json.dumps(ledger.operate('reserve', approver=args.approver), indent=2))
+            return 0
         options = {'keep_state': args.keep_state, 'evidence_dir': args.evidence_dir}
         value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause,
                          **options)
