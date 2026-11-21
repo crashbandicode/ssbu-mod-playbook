@@ -109,11 +109,9 @@ def same_epoch(previous, current, *, in_flight):
 def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=False,
                 pending_placement=False):
     settling = loading_ui and provider == UI and after is not None
-    moving_tile = provider == TILE and in_flight and after is not None
     while time.monotonic() < until:
         state = check_sample(io.read(provider, until - time.monotonic()), provider,
-                             loading_ui=settling, pending_placement=pending_placement,
-                             entering_stage=moving_tile)
+                             loading_ui=settling, pending_placement=pending_placement)
         if after is None:
             return state
         same_epoch(after, state, in_flight=in_flight or settling)
@@ -130,12 +128,6 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=
                     raise RuntimeError(f'{UI}: contradictory inactive settling observation')
                 after = state
                 continue
-        # Between stage tiles the native hand has no qualified focus until it settles.
-        if (moving_tile and state.values.get('focus') == 'unknown' and state.values.get('settled') == '0'
-                and state.values.get('screen') == 'sss'
-                and state.values.get('layout') == state.values.get('hovered') == 'unknown'
-                and not (pending_placement and state.values.get('local.token') == 'placed')):
-            continue
         if revision > prev_revision and observation > prev_observation:
             return state
     raise RuntimeError(f'{provider}: no newer active observation')
