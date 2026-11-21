@@ -83,6 +83,58 @@ class Replay:
         self.evidence.append(evidence)
 
 
+class MovingTileSampleTests(unittest.TestCase):
+    @staticmethod
+    def moving(rev, epoch=1):
+        return snapshot('tile.cursor', rev, {
+            'screen': 'sss', 'focus': 'unknown', 'layout': 'unknown', 'hovered': 'unknown',
+            'at': '1', 'settled': '0', 'ack': '6', 'ack.result': 'handled',
+            'direction': 'right', 'from': '0', 'to': '1', 'result': 'handled',
+        }, epoch)
+
+    @staticmethod
+    def settled(rev, epoch=1):
+        return snapshot('tile.cursor', rev, {
+            'screen': 'sss', 'focus': 'sss.grid.normal', 'layout': 'sss.grid',
+            'hovered': '1', 'at': '1', 'settled': '1', 'ack': '6',
+        }, epoch)
+
+    def test_in_flight_moving_tile_waits_for_settlement(self):
+        before, moving, settled = self.settled(1), self.moving(2), self.settled(3)
+        self.assertIs(picker.wait_sample(Replay([moving, settled]), picker.TILE,
+                                         picker.time.monotonic() + 1, before, in_flight=True), settled)
+
+    def test_moving_tile_without_in_flight_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema'):
+            picker.wait_sample(Replay([self.moving(2)]), picker.TILE,
+                               picker.time.monotonic() + 1, self.settled(1))
+
+    def test_moving_tile_without_an_after_sample_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema'):
+            picker.wait_sample(Replay([self.moving(2)]), picker.TILE,
+                               picker.time.monotonic() + 1, in_flight=True)
+
+    def test_moving_tile_with_a_new_connection_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'connection changed'):
+            picker.wait_sample(Replay([self.moving(2, epoch=2)]), picker.TILE,
+                               picker.time.monotonic() + 1, self.settled(1), in_flight=True)
+
+    def test_unknown_ui_is_not_tolerated_in_flight(self):
+        unknown = native(2, focus='unknown')
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema'):
+            picker.wait_sample(Replay(native_blocks=[unknown]), picker.UI,
+                               picker.time.monotonic() + 1, native(1), in_flight=True)
+
+    def test_moving_tile_times_out_without_a_settled_sample(self):
+        from unittest.mock import patch
+
+        moving = self.moving(2)
+        clock = iter([0, 0, 2])
+        with patch.object(picker.time, 'monotonic', side_effect=lambda: next(clock)):
+            with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
+                picker.wait_sample(Replay([moving]), picker.TILE, 1, self.settled(1), in_flight=True)
+
+
 class PickerTests(unittest.TestCase):
     def run_pick(self, replay, *, target=TARGET, topology=GRAPH):
         return picker.pick(replay, 'css', target, topology=topology, cap=.01)
