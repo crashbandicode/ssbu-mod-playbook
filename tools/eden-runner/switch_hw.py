@@ -70,7 +70,9 @@ SETTINGS_WRITTEN = b'[TrainingRooms] settings.json written by the writer thread'
 # Protocol v2 (bridge slice 3): written as `bridge-v2*.req` spool files, one request per line (`bridge_v2`).
 V2_VERBS = {'caps', 'mem', 'scene', 'fighters', 'status_names', 'hid', 'input_watch', 'inject', 'inject_start', 'inject_stop', 'peek', 'chain', 'watch',
             # plugin state and same-boot reconnect (ssbu-hw-bridge docs/PLUGIN-STATE.md)
-            'state', 'state_watch', 'providers', 'since', 'events'}
+            'state', 'state_watch', 'providers', 'since', 'events',
+            # Runtime toggle requests: bridge status and bridge off.
+            'bridge'}
 
 
 def bridge_v2(run, *requests):

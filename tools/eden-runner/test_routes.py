@@ -404,6 +404,14 @@ class SwitchHwTests(unittest.TestCase):
         self.assertEqual(lines, [b'scene', b'inject 0 AAAA', b'inject_start 0 at=next', b'watch main+0x53050f0 4 count=5'])
         self.assertEqual(list(spool.iterdir()), [])
 
+    def test_v2_spool_forwards_bridge_toggle_verbs_but_not_restore(self):
+        import switch_hw
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spool = Path(tmp)
+            (spool / 'bridge-v2-toggle.req').write_bytes(b'bridge status\nbridge off\nrestore\n')
+            self.assertEqual(switch_hw.spool_requests(spool), [b'bridge status', b'bridge off'])
+
     def test_file_capture_mirrors_the_stream_and_hands_requests_over_whole(self):
         import threading
         import switch_hw
