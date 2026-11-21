@@ -365,11 +365,13 @@ def validate_stale_claim_hours(value):
 
 
 RESERVATION_TTL_MINUTES = 20
+EXCLUSIVE_HOST_MARKER = ' exclusive_host=true'
 RESERVATION = re.compile(
     r'(?P<at>\S+) CLAIMED: (?P<owner>(?:OpenCode|Codex|Claude|Cursor)[ \t]+\S+) '
     r'host=(?P<host>surface|yoga|xps) lifecycle=(?P<token>[0-9a-f]{32}) '
     r'Eden reservation run (?P<label>[A-Za-z0-9][A-Za-z0-9_-]{1,63}) '
-    r'approver=(?P<approver>[A-Za-z0-9][A-Za-z0-9_./@-]*)')
+    r'approver=(?P<approver>[A-Za-z0-9][A-Za-z0-9_./@-]*)'
+    r'(?P<exclusive>' + re.escape(EXCLUSIVE_HOST_MARKER) + r')?')
 
 
 def reservation_expired(record, now):
@@ -380,7 +382,8 @@ def reservation_expired(record, now):
         return None
 
 
-def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, now=None, *, label=None):
+def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, now=None, *,
+                    label=None, exclusive_host=False):
     """Opt-in admission policy only; never reconcile or release foreign claims.
 
     Keep active_claims' release pairing authoritative. Ambiguous ownership,
@@ -392,18 +395,22 @@ def claim_admission(text, host, owner, stale_claim_hours=None, admission=None, n
     for line in active_claims(text, host):
         record = RESERVATION.fullmatch(line)
         if not record:
-            opened.append(line)
+            (reservations if line.endswith(EXCLUSIVE_HOST_MARKER) else opened).append(line)
             continue
         expired = reservation_expired(record, now)
         if expired:
             continue
-        if expired is False and (record['host'], record['owner'], record['label']) == (host, owner, label):
+        if (expired is False and bool(record['exclusive']) == exclusive_host
+                and (record['host'], record['owner'], record['label']) == (host, owner, label)):
             matching.append(record)
         else:
             reservations.append(line)
     # One matching reservation can be converted; an ambiguous duplicate stays blocking.
     if len(matching) > 1:
         reservations.extend(record[0] for record in matching)
+    if exclusive_host:
+        return {'blocking': reservations + opened, 'stale_claim_skipped': [],
+                **({'reservation': matching[0]['token']} if len(matching) == 1 else {'reservation_required': True})}
     # Operator 2026-11-04: the Surface and the Yoga run two emulators. A claim this tool wrote for another run on the
     # same host (`host=<host> lifecycle=<token> Eden lifecycle admitted`; each run has its own profile copy) is a
     # concurrent instance, not a block, while fewer than the host's `max_eden` are open. Admission's process, memory
@@ -469,10 +476,15 @@ def reservation_release(record, reason):
             f"Eden reservation {reason}")
 
 
+def foreign_edens(admission):
+    return [p for p in admission['foreign_processes'] if str(p.get('name', '')).lower() in EDEN_INSTANCE_NAMES]
+
+
 class Ledger:
-    def __init__(self, path, host, owner, token, remote=None, *, label=None):
+    def __init__(self, path, host, owner, token, remote=None, *, label=None, exclusive_host=False):
         self.path, self.host, self.owner, self.token = str(path), host, owner, token
         self.remote, self.label = remote, label
+        self.exclusive_host = exclusive_host
 
     def operate(self, operation, stale_claim_hours=None, admission=None, *, approver=None):
         if globals().get('_LEDGER_BRIDGE'):
@@ -481,7 +493,7 @@ class Ledger:
             return forward(self.remote, 'ledger-' + operation,
                            {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
                             'stale_claim_hours': stale_claim_hours, 'admission': admission,
-                            'label': self.label, 'approver': approver}, True)
+                            'label': self.label, 'approver': approver, 'exclusive_host': self.exclusive_host}, True)
         path = safe_absolute(self.path)
         require(path.is_file(), 'Authoritative ledger must already exist')
         # Never replace/truncate the shared ledger or normalize it on disk.
@@ -499,23 +511,33 @@ class Ledger:
             now = datetime.now(timezone.utc)
             reservations = []
             if operation != 'release':
-                reservations = [match for line in active_claims(text, self.host)
-                                if (match := RESERVATION.fullmatch(line))]
+                opened = active_claims(text, self.host)
+                reservations = [match for line in opened if (match := RESERVATION.fullmatch(line))]
             expired = [record for record in reservations if reservation_expired(record, now)]
             if operation == 'reserve':
                 line = (f'{now.isoformat()} CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
                         f'Eden reservation run {self.label} approver={approver}')
+                if self.exclusive_host:
+                    line += EXCLUSIVE_HOST_MARKER
                 require(approver is not None and self.label is not None and RESERVATION.fullmatch(line),
                         'Reservation requires a valid Linux host, owner, run label and approver')
                 require(len(reservations) == len(expired), 'Host already has an open Eden reservation')
+                claims = [entry for entry in opened if not RESERVATION.fullmatch(entry)]
+                require(not any(entry.endswith(EXCLUSIVE_HOST_MARKER) for entry in claims),
+                        'Host already has an exclusive Eden claim')
+                if self.exclusive_host:
+                    require(not claims, 'Exclusive host reservation requires no open Eden claim')
+                    require(isinstance(admission, dict) and isinstance(admission.get('foreign_processes'), list)
+                            and not foreign_edens(admission), 'Exclusive host reservation requires no running Eden')
                 append_ledger(stream, [line, *(reservation_release(old, 'expired') for old in expired)])
                 return {'line': line, 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60}
             skipped = []
             reservation = None
             if operation == 'claim':
                 policy = claim_admission(text, self.host, self.owner, stale_claim_hours, admission, now,
-                                         label=self.label)
+                                         label=self.label, exclusive_host=self.exclusive_host)
                 require(not policy['blocking'], 'Open host claim; no profile changes permitted')
+                require(not policy.get('reservation_required'), 'Exclusive host requires a matching approved reservation')
                 skipped = policy['stale_claim_skipped']
                 reservation = policy.get('reservation')
             else:
@@ -525,6 +547,8 @@ class Ledger:
             kind = 'CLAIMED' if operation == 'claim' else 'RELEASED'
             line = f'{stamp()} {kind}: {self.owner} host={self.host} lifecycle={self.token} '
             line += 'Eden lifecycle admitted' if operation == 'claim' else 'Eden stopped; full profile restored and separately verified'
+            if operation == 'claim' and self.exclusive_host:
+                line += EXCLUSIVE_HOST_MARKER
             lines = [line]
             if reservation:
                 record = next(item for item in reservations
@@ -616,6 +640,10 @@ def validate(config):
         require(re.fullmatch(r'[0-9a-f]{64}', config['display_helper'].get('sha256', '')), 'Display helper SHA256 required')
     require(1 <= len(config['instances']) <= 2, 'One or an explicitly authorized pair only')
     require(len(config['instances']) == 1 or config.get('pair_authorized') is True, 'Pair exception needs pair_authorized=true')
+    if 'exclusive_host' in config:
+        require(type(config['exclusive_host']) is bool, 'exclusive_host must be true or false')
+        require(not config['exclusive_host'] or (not windows and len(config['instances']) == 1),
+                'exclusive_host requires a single Eden on a Linux host')
     if 'eden_settings' in config:
         validate_eden_settings(config['eden_settings'], 'run')
     displays, keys = set(), set()
@@ -1463,10 +1491,17 @@ class Lifecycle:
         if watched:
             require(watched == f'eden-life-{token}-watchdog.service', 'Foreign watchdog unit refused')
 
-    def ledger(self):
+    def ledger(self, token=None):
         return self.injected_ledger if self.injected_ledger is not None else Ledger(
-            self.c['ledger'], self.c['host'], self.c['owner'], self.state['token'], self.c.get('ledger_ssh'),
-            label=self.c['label'])
+            self.c['ledger'], self.c['host'], self.c['owner'], token or self.state['token'], self.c.get('ledger_ssh'),
+            label=self.c['label'], exclusive_host=self.c.get('exclusive_host', False))
+
+    def reserve_exclusive(self, approver):
+        require(self.c.get('exclusive_host'), 'Exclusive reservation requires exclusive_host=true')
+        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname')
+        # Process scan is on the executor. The authoritative ledger checks open claims under the append lock.
+        admission = self.host.resources(Path(Path(self.c['work_root']).anchor))
+        return self.ledger(uuid.uuid4().hex).operate('reserve', admission=admission, approver=approver)
 
     @contextmanager
     def lock(self):
@@ -1511,7 +1546,7 @@ class Lifecycle:
             lines.append(f'OK disk: {value["disk_free"]} bytes free')
             checks.append({'name': 'disk', 'ok': True, 'free': value['disk_free']})
         foreign = value['foreign_processes']
-        edens = [p for p in foreign if str(p.get('name', '')).lower() in EDEN_INSTANCE_NAMES]
+        edens = foreign_edens(value)
         others = [p for p in foreign if not str(p.get('name', '')).lower().startswith(('eden', 'yuzu'))]
         reserve = 0
         if others:
@@ -1547,7 +1582,12 @@ class Lifecycle:
         if type(owned_running) is not int or owned_running < 0:
             owned_running = 0
         running = len(edens) + owned_running
-        if running >= limit:
+        if self.c.get('exclusive_host') and edens:
+            detail = 'Exclusive host requires no other running Eden'
+            problems.append(detail)
+            lines.append('FAIL eden slots: ' + detail)
+            slot = {'name': 'eden-slots', 'ok': False, 'running': running, 'limit': limit}
+        elif running >= limit:
             detail = f'{running} Eden instance(s) already active on host (limit {limit})'
             problems.append(detail)
             lines.append('FAIL eden slots: ' + detail)
@@ -1761,7 +1801,7 @@ class Lifecycle:
         try:
             text = self.ledger_text()
             policy = claim_admission(text, self.c['host'], self.c['owner'], self.c.get('stale_claim_hours'), value,
-                                     label=self.c['label'])
+                                     label=self.c['label'], exclusive_host=self.c.get('exclusive_host', False))
         except Exception as error:  # noqa: BLE001
             detail = f'Ledger unreadable: {error}'
             problems.append(detail)
@@ -1769,8 +1809,9 @@ class Lifecycle:
             checks.append({'name': 'ledger', 'ok': False, 'detail': detail})
             return problems, lines, checks
         blocking = policy.get('blocking') or []
-        if blocking:
-            detail = 'Open host claim; no profile changes permitted'
+        if blocking or policy.get('reservation_required'):
+            detail = ('Open host claim; no profile changes permitted' if blocking else
+                      'Exclusive host requires a matching approved reservation')
             problems.append(detail)
             lines.append('FAIL ledger: ' + detail)
             checks.append({'name': 'ledger', 'ok': False, 'blocking': len(blocking)})
@@ -2486,8 +2527,12 @@ def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=N
     require(mode in ('status', 'preflight') or execute, 'Runtime mutation needs explicit --execute; tests inject fakes')
     if mode.startswith('ledger-'):
         return Ledger(config['ledger'], config['host'], config['owner'], config['token'],
-                      label=config.get('label')).operate(
+                      label=config.get('label'), exclusive_host=config.get('exclusive_host', False)).operate(
             mode[7:], config.get('stale_claim_hours'), config.get('admission'), approver=config.get('approver'))
+    if mode == 'reserve-exclusive':
+        config = dict(config)
+        approver = config.pop('reservation_approver')
+        return Lifecycle(config).reserve_exclusive(approver)
     tool = Lifecycle(config)
     if mode == 'watchdog':
         return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
@@ -2660,9 +2705,15 @@ def main(argv=None):
         if args.mode == 'reserve':
             require(args.approver, 'reserve requires --approver')
             validate(config)
-            ledger = Ledger(config['ledger'], config['host'], config['owner'], uuid.uuid4().hex,
-                            config.get('ledger_ssh') or args.ssh, label=config['label'])
-            print(json.dumps(ledger.operate('reserve', approver=args.approver), indent=2))
+            if config.get('exclusive_host'):
+                packet = dict(config, reservation_approver=args.approver)
+                receipt = (forward(args.ssh, 'reserve-exclusive', packet, True) if args.ssh else
+                           dispatch('reserve-exclusive', packet, True))
+            else:
+                ledger = Ledger(config['ledger'], config['host'], config['owner'], uuid.uuid4().hex,
+                                config.get('ledger_ssh') or args.ssh, label=config['label'])
+                receipt = ledger.operate('reserve', approver=args.approver)
+            print(json.dumps(receipt, indent=2))
             return 0
         options = {'keep_state': args.keep_state, 'evidence_dir': args.evidence_dir}
         value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause,

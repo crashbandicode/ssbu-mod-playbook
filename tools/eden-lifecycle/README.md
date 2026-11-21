@@ -45,6 +45,21 @@ successful reservation or claim on that host records its release. For new reserv
 preflight and Up operations use the current shared lifecycle on the executor.
 Existing runtime owners can Down with their already-pinned tools.
 
+### Whole-host hold
+
+For an approved single-Eden run on Surface, Yoga or XPS, set
+`"exclusive_host": true` in its lifecycle config. Use the same config for
+reserve, preflight, Up and Down. Run the reserve command above on the executor
+or pass `--ssh <executor>` so it can check for running Edens on that host.
+The ledger refuses the reservation if any claims are open. The process check
+also refuses a running Eden without a claim. No process is stopped.
+
+The owner's Up requires the matching exclusive reservation and converts it in
+one locked append. Other runs cannot reserve or claim that host until verified
+Down releases the active claim. The 20-minute TTL applies only before Up.
+Run all new reserve, preflight and Up operations with the current lifecycle
+version on the relevant hosts so they recognize the exclusive claim.
+
 ## CLI and integration
 
 ```text
