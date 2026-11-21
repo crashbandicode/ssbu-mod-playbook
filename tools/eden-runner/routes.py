@@ -1264,26 +1264,75 @@ def select_screen(ctx, cap=2.5):
 
 
 def _take_back_training_token(io, state):
-    tile = native_picker.wait_sample(io, native_picker.TILE, time.monotonic() + 4)
-    if tile.values.get('local.token') != 'placed':
-        return None
+    until = time.monotonic() + 9
+    tile = native_picker.wait_sample(io, native_picker.TILE, until)
     native_picker.same_epoch(state, tile, in_flight=True)
+    native_picker.context(tile, 'css')
+    native_picker.native_input_owner(state, 'css', expected_context='training')
+    if tile.values.get('local.token') == 'held':
+        native_picker.token_held(tile, 'css')
+        return None
+    if tile.values.get('local.token') != 'placed' or tile.values.get('carried') != 'none':
+        raise RuntimeError('Training CSS: local token ownership is not a placed local medal')
+    placed_at = native_picker.number(tile, 'placed.at')
+    before = _armed_native_sample(io, state, until, 'Training return')
+    if not _fields_match(before, TRAINING_CSS):
+        raise _missing_navigation_state('Training return', before, 'qualified Training CSS before the token input')
+    native_picker.native_input_owner(before, 'css', expected_context='training')
+    tile_before = native_picker.wait_sample(io, native_picker.TILE, until, tile)
+    native_picker.same_epoch(before, tile_before, in_flight=True)
+    try:
+        native_picker.check_context(tile, tile_before, 'css')
+        unchanged = (tile_before.values.get('local.token') == 'placed'
+                     and tile_before.values.get('carried') == 'none'
+                     and native_picker.number(tile_before, 'placed.at') == placed_at)
+        before_ack = native_picker.number(tile_before, 'ack')
+        before_applied = native_picker.number(tile_before, 'applied')
+    except (RuntimeError, TypeError) as exc:
+        raise RuntimeError('local medal placement changed before B') from exc
+    if not unchanged:
+        raise RuntimeError('local medal placement changed before B')
+    if time.monotonic() >= until:
+        raise RuntimeError('Training return source deadline expired before leave-css')
     io.send('leave-css')
-    until = time.monotonic() + 6
+    current = tile_before
     while time.monotonic() < until:
         try:
-            tile = native_picker.wait_sample(io, native_picker.TILE, until, tile, in_flight=True)
+            current = native_picker.wait_sample(io, native_picker.TILE, until, current, in_flight=True)
         except RuntimeError as exc:
-            if (str(exc) == f'{native_picker.TILE}: no newer active observation'
-                    or (time.monotonic() >= until
-                        and str(exc) == f'no fenced bridge reply for state {native_picker.TILE}')):
+            if str(exc) in (f'{native_picker.TILE}: incomplete, inactive or wrong-schema observation',
+                            f'{native_picker.TILE}: no newer active observation'):
                 break
             raise
-        if tile.values.get('local.token') != 'placed':
-            state = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 4, state, in_flight=True)
+        if current.values.get('screen') != 'css':
+            break
+        native_picker.check_context(tile_before, current, 'css')
+        try:
+            counters_unchanged = (native_picker.number(current, 'ack') == before_ack
+                                  and native_picker.number(current, 'applied') == before_applied)
+        except (RuntimeError, TypeError):
+            counters_unchanged = False
+        if not counters_unchanged:
+            raise RuntimeError('a tile step arrived while taking back the local token')
+        if current.values.get('local.token') == 'held':
+            native_picker.token_held(current, 'css')
+            ui = native_picker.wait_sample(io, native_picker.UI, until, before, in_flight=True)
+            if not _fields_match(ui, TRAINING_CSS):
+                raise _missing_navigation_state('Training return', ui,
+                                                'qualified Training CSS after the token came back')
             io.finish()
-            return state
-    raise RuntimeError('Training CSS: the placed token was not taken back by leave-css')
+            return 'css-token-back', ui
+        if (current.values.get('local.token') != 'placed'
+                or any(current.values.get(key) != tile_before.values.get(key)
+                       for key in ('placed.at', 'placed.kind', 'placed.name', 'placed.form'))):
+            raise RuntimeError('local medal changed while taking it back')
+    ui = native_picker.wait_scene_transition(
+        io, before, until, TRAINING_CSS, TRAINING_SSS, label='Training return',
+        pending_destinations=(*_TRAINING_SSS_SETTLING, _GAMES_TRAINING_SETTLING),
+        additional_targets=(GAMES_TRAINING,),
+    )
+    io.finish()
+    return 'css', ui
 
 
 def back_to_main(ctx, presses=10):
@@ -1312,8 +1361,8 @@ def back_to_main(ctx, presses=10):
         if _fields_match(state, TRAINING_CSS):
             after_token = _take_back_training_token(io, state)
             if after_token is not None:
-                looks.append('css-token-back')
-                state = after_token
+                label, state = after_token
+                looks.append(label)
                 continue
         for source, target, macro, label, pending, additional_targets in return_edges:
             if _fields_match(state, source):

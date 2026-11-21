@@ -1470,7 +1470,16 @@ class TrainingReturnTests(unittest.TestCase):
 
             self.revision += 1
             if provider == routes.native_picker.TILE:
-                return fixtures.tile(self.revision, seat='0', token=self.token)
+                if self.screen == 0:
+                    return fixtures.tile(self.revision, seat='0', token=self.token)
+                if self.screen == 1:
+                    return fixtures.snapshot(provider, self.revision, {
+                        'screen': 'sss', 'focus': 'sss.grid.normal', 'layout': 'sss.grid',
+                        'grid': 'normal', 'generation': '1',
+                    })
+                return fixtures.snapshot(provider, self.revision, {
+                    'screen': 'unknown', 'focus': 'unknown', 'observation.active': '0',
+                })
             states = [
                 {**routes.TRAINING_CSS, 'focus': 'css.training'},
                 {**routes.TRAINING_SSS, 'focus': 'stage_select'},
@@ -1492,17 +1501,19 @@ class TrainingReturnTests(unittest.TestCase):
         def finish(self):
             pass
 
-    def run_return(self, token):
+    def execute(self, io):
         from itertools import count
         from unittest.mock import patch
 
-        io = self.IO(token)
         clock = count(step=.01)
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
                 patch.object(routes.time, 'monotonic', side_effect=lambda: next(clock)), \
                 patch.object(routes, '_save', side_effect=lambda _ctx, _name, data: data):
-            result = routes.back_to_main(object())
-        return io, result
+            return routes.back_to_main(object())
+
+    def run_return(self, token):
+        io = self.IO(token)
+        return io, self.execute(io)
 
     def test_placed_training_token_returns_before_leaving_css(self):
         io, result = self.run_return('placed')
@@ -1533,6 +1544,177 @@ class TrainingReturnTests(unittest.TestCase):
             routes.back_to_main(object())
         self.assertEqual(io.actions, [])
 
+    def test_foreign_sss_tile_cannot_authorize_css_token_back(self):
+        io = self.IO('placed')
+        read = io.read
+
+        def foreign_tile(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE:
+                sample.values.update(screen='sss', controller='7', seat='7')
+            return sample
+
+        io.read = foreign_tile
+        with self.assertRaisesRegex(RuntimeError, 'css: no qualified active tile layout'):
+            self.execute(io)
+        self.assertEqual(io.actions, [])
+
+    def test_missing_local_token_after_b_is_not_success(self):
+        io = self.IO('placed')
+        read = io.read
+
+        def missing_after_b(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE and io.actions:
+                sample.values.pop('local.token')
+            return sample
+
+        io.read = missing_after_b
+        with self.assertRaisesRegex(RuntimeError, 'local medal changed while taking it back'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
+    def test_changed_placed_target_after_b_is_rejected(self):
+        io = self.IO('placed')
+        io.send = io.actions.append
+        read = io.read
+
+        def changed_target(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE and io.actions:
+                sample.values['placed.name'] = 'Other'
+            return sample
+
+        io.read = changed_target
+        with self.assertRaisesRegex(RuntimeError, 'local medal changed while taking it back'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
+    def test_unowned_held_token_rejects_input(self):
+        io = self.IO('held')
+        read = io.read
+
+        def wrong_carried(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE:
+                sample.values['carried'] = '7'
+            return sample
+
+        io.read = wrong_carried
+        with self.assertRaisesRegex(RuntimeError, 'local token ownership'):
+            self.execute(io)
+        self.assertEqual(io.actions, [])
+
+    def test_inactive_tile_can_fence_direct_return_to_games_and_more(self):
+        io = self.IO('placed')
+        send = io.send
+
+        def return_directly(macro):
+            if not io.actions:
+                io.actions.append(macro)
+                io.screen = 2
+            else:
+                send(macro)
+
+        io.send = return_directly
+        result = self.execute(io)
+        self.assertEqual(result['looks'], ['css', 'games_and_more'])
+        self.assertEqual(io.actions, ['leave-css', 'tap-b1'])
+
+    def test_sss_tile_then_foreign_main_dialog_is_rejected(self):
+        io = self.IO('placed')
+        send, read = io.send, io.read
+
+        def return_to_stage(macro):
+            send(macro)
+            if len(io.actions) == 1:
+                io.screen = 1
+
+        def foreign_main(provider, cap):
+            sample = read(provider, cap)
+            if io.actions and provider == routes.native_picker.UI:
+                sample.values.update(**routes._main_tab('smash'))
+                sample.values.update({'input.owner': 'foreign', 'dialog': 'confirmation'})
+            return sample
+
+        io.send, io.read = return_to_stage, foreign_main
+        with self.assertRaisesRegex(RuntimeError, 'unexpected Training return focus'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
+    def test_pre_input_placement_change_rejects_b(self):
+        io = self.IO('placed')
+        read = io.read
+        tile_reads = 0
+
+        def changing_tile(provider, cap):
+            nonlocal tile_reads
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE:
+                tile_reads += 1
+                if tile_reads == 2:
+                    sample.values['placed.at'] = '8'
+            return sample
+
+        io.read = changing_tile
+        with self.assertRaisesRegex(RuntimeError, 'local medal placement changed before B'):
+            self.execute(io)
+        self.assertEqual(io.actions, [])
+
+    def test_token_back_does_not_send_after_source_deadline(self):
+        from unittest.mock import patch
+
+        io = self.IO('placed')
+        read = io.read
+        now, tile_reads = [0], [0]
+
+        def late_second_tile(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE:
+                tile_reads[0] += 1
+                if tile_reads[0] == 2:
+                    now[0] = 10
+            return sample
+
+        io.read = late_second_tile
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+                patch.object(routes.time, 'monotonic', side_effect=lambda: now[0]), \
+                self.assertRaisesRegex(RuntimeError, 'Training return source deadline expired before leave-css'):
+            routes.back_to_main(object())
+        self.assertEqual(io.actions, [])
+
+    def test_tile_step_during_token_back_is_rejected(self):
+        for field, value in (('ack', '1'), ('applied', '1'), ('ack', 'unknown'), ('applied', 'unknown')):
+            with self.subTest(field=field, value=value):
+                io = self.IO('placed')
+                read = io.read
+
+                def stepped_tile(provider, cap):
+                    sample = read(provider, cap)
+                    if provider == routes.native_picker.TILE and io.actions:
+                        sample.values[field] = value
+                    return sample
+
+                io.read = stepped_tile
+                with self.assertRaisesRegex(RuntimeError, 'a tile step arrived while taking back the local token'):
+                    self.execute(io)
+                self.assertEqual(io.actions, ['leave-css'])
+
+    def test_css_token_back_requires_a_fresh_qualified_css_ui(self):
+        io = self.IO('placed')
+        read = io.read
+
+        def changed_owner(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.UI and io.actions:
+                sample.values['dialog'] = 'confirmation'
+            return sample
+
+        io.read = changed_owner
+        with self.assertRaisesRegex(RuntimeError, 'qualified Training CSS after the token came back'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
     def test_token_return_can_already_leave_css(self):
         from unittest.mock import patch
 
@@ -1549,9 +1731,9 @@ class TrainingReturnTests(unittest.TestCase):
                 patch.object(routes, '_save', side_effect=lambda _ctx, _name, data: data):
             result = routes.back_to_main(object())
         self.assertEqual(io.actions, ['leave-css', 'tap-b1', 'tap-b1'])
-        self.assertEqual(result['looks'], ['css-token-back', 'sss', 'games_and_more'])
+        self.assertEqual(result['looks'], ['css', 'sss', 'games_and_more'])
 
-    def test_placed_token_timeout_names_the_failed_operation(self):
+    def test_placed_token_timeout_does_not_claim_a_return(self):
         from itertools import count
         from unittest.mock import patch
 
@@ -1560,7 +1742,7 @@ class TrainingReturnTests(unittest.TestCase):
         clock = count(step=.25)
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
                 patch.object(routes.time, 'monotonic', side_effect=lambda: next(clock)), \
-                self.assertRaisesRegex(RuntimeError, 'Training CSS: the placed token was not taken back by leave-css'):
+                self.assertRaisesRegex(RuntimeError, 'ssbu.ui: no newer qualified Training return scene transition'):
             routes.back_to_main(object())
         self.assertEqual(io.actions, ['leave-css'])
 
