@@ -2362,6 +2362,17 @@ def _bridge_on_cold_enable(ctx, trace):
     raise RuntimeError("No fresh pad-chord On event within 10 seconds")
 
 
+def free_port(first=6980, last=7079, host='0.0.0.0'):
+    for port in range(first, last + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
+                candidate.bind((host, port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(f'no free TCP port on {host} in range {first}-{last}')
+
+
 def bridge_on(ctx, port=None, cap=60):
     """Turn the bridge on at the title screen and start its detached playbook capture."""
     try:
@@ -2377,6 +2388,22 @@ def bridge_on(ctx, port=None, cap=60):
         except (KeyError, OSError, ValueError):
             raise RuntimeError('bridge_on needs a port argument or an integer in profile port.txt') from None
     chord = _bridge_on_cold_enable(ctx, trace)
+    until = time.monotonic() + 5
+    listening = last_listen = None
+    pattern = re.compile(r'\[Bridge\] listening port=' + re.escape(str(port)) + r'\b')
+    while time.monotonic() < until:
+        ctx.check_stop()
+        events = _bridge_on_events(ctx)
+        last_listen = next((line for line in reversed(events) if '[Bridge] listen' in line), None)
+        listening = next((line for line in reversed(events) if pattern.search(line)), None)
+        if listening is not None:
+            break
+        time.sleep(0.05)
+    if listening is None:
+        raise RuntimeError(f'bridge_on: this Eden\'s bridge is not listening on port {port}; '
+                           f'expected "[Bridge] listening port={port}" in its own events log, '
+                           f'saw: {last_listen or "no listen line"}. Another process holds the port: '
+                           'give the run its own free port (port.txt) and boot again. No capture was started.')
     run = Path(ctx.row_dir).parent / 'bridge-run'
     (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
     log = run / 'bridge.log'
@@ -2435,7 +2462,7 @@ def bridge_on(ctx, port=None, cap=60):
             break
         time.sleep(0.1)
     return _save(ctx, 'routes-bridge-on', {
-        'block': 'bridge_on', 'chord': chord, 'hello': hello, 'install': install, 'backup': backup,
+        'block': 'bridge_on', 'chord': chord, 'listening': listening, 'hello': hello, 'install': install, 'backup': backup,
         'backup_open': bool(backup and re.search(r'\[Bridge\] req backup result=ok(?: |$)', backup)),
         'capture': {'pid': pid, 'port': port, 'bridge_log': str(log)}, 'reused': reused,
     })
