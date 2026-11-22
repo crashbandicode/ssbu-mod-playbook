@@ -450,14 +450,16 @@ prevent a no-op from silently accepting a wrong kind. `practice_cpu` takes `figh
 not prove the live fighter was switched or text visibly rendered. Settings read-back rejects duplicate
 keys and values other than arrays of integer 0/1 bits. A toggle also accepts boolean or case-insensitive
 `on`/`off`; a list also accepts a stored slot index. The receipt retains the original argument and
-`value_stored`.
+`value_stored`. Toggle, list and checklist widths are pinned to the product schema in
+`library/routes/tr-setting-widths.json`; the pre-read must have that exact width, which the receipt records.
 
-`routes:wizard_place(game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0, tolerance=0)` reaches the
+`routes:wizard_place(game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0)` reaches the
 Guard the Edge Preview using page bodies and bridged notice headers, independent of the page count. An
-`area` request needs an Area page; CPU and P1 targets are shown whole units, with allowed axis difference
-`tolerance`. The block sends fixed library stick pulses and leaves Preview unconfirmed. `pulse_cap` is a
+`area` request needs an Area page; CPU and P1 targets must equal the shown whole units.
+The block sends fixed library stick pulses and leaves Preview unconfirmed. `pulse_cap` is a
 harness publication-wait bound, not a product tolerance. Receipts list pages, observed owners, each pulse's
-publication status and the number of unconfirmed pulses. An unpublished pulse may have moved the point by
+publication status and the number of unconfirmed pulses; scope is published coordinates only, not input
+readiness, and any observed `native.pause` page is listed as a limitation. An unpublished pulse may have moved the point by
 less than a shown unit; only shown coordinates are verified. Exact position words are available from the
 release marker. Notice text is a request, not proof it was visibly rendered.
 
@@ -465,16 +467,17 @@ release marker. Notice text is a request, not proof it was visibly rendered.
 the Guard the Edge Start row, presses A, requires a same-epoch `game.running=0`, and closes the menu. The
 published row title is static Start even when the UI draws Stop; it is not used as a stop witness.
 
-`routes:drill_start(game, expect=None, cap=60)` accepts only Guard the Edge. In Preview it requires the wizard
-heading to disappear; otherwise it starts from the menu and requires the stopped-to-running transition.
+`routes:drill_start(game, expect=None, cap=60)` accepts only Guard the Edge. After input, and again before
+the receipt, it requires the menu closed and the requested game running; on the wizard path the wizard
+heading must also have disappeared.
 With trace enabled it records the `trace.list` sequence fence taken immediately before the start input,
 the observed state used for it, the first release after that fence, pre-fence markers and post-fence
 terminals preceding the first release. Without trace it can only run when `expect` is omitted.
 Expect keys are `cpu_kind`, `stage_form`, `stage_id`, `perfect`, `juggler`, `damage`, `cpu`, `cpu_words`,
-`p1`, `p1_words`, `plan` and `tolerance`. Positions compare whole-unit shown strings by default or world
-units within the supplied tolerance; damage allows 0.05 and words compare exactly.
+`p1`, `p1_words` and `plan`. Positions compare whole-unit shown strings; damage and words compare exactly.
 A `plan` check needs the armed symbolic `planner_chose` point and holds the block until the first attempt's
-matching-ordinal terminal. `'none'` requires no plan in the attempt and zero planner hits; a hit without
+terminal matching the release's ordinal, game and Perfect bits. The release must match the requested game;
+CPU kind is not bound across the attempt. `'none'` requires no plan in the attempt and zero planner hits; a hit without
 a record is reported as not observed. The sequence fence assumes no recorded point has been removed
 from `trace.list`. It excludes stale queued records but does not itself prove the input/record ordering.
 `plan='any'` records the observed plan or its absence without asserting a particular value.
@@ -487,6 +490,9 @@ change and are reported as a set. It needs an armed records point targeting the
 `edge_juggle_attempt` symbol and a trace file on the instance. It rejects trace loss, unreadable records,
 point changes and bridge epoch changes. File-loss and point-drop counters are recorded at entry and exit and
 must remain unchanged, and every attempt-point hit must have been recorded; nonzero initial counts are allowed.
+The first `trace.list` sequence fences out earlier recorded markers even if appended later; excluded markers
+are reported compactly, counted markers supply the sequence/frame range, and closing counters must account
+for the highest file sequence read.
 Zoom arms emit neither release nor terminal markers on this probe and need a separate packet step.
 A stopped game fails unless `allow_stopped` is true. The block performs no inputs;
 marker counts do not by themselves prove correct gameplay or a visibly rendered notice.
