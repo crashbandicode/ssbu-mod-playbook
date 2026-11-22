@@ -1102,6 +1102,23 @@ class RunnerTests(unittest.TestCase):
     def make(self, eden, pace=15):
         return runner.Runner(self.manifest, self.instances, self.dir / 'out', pace, client_factory=lambda s: eden)
 
+    def test_fresh_runner_restores_captured_bridge_log_without_overwriting(self):
+        run = self.dir / 'out' / 'bridge-run'
+        run.mkdir(parents=True)
+        (run / 'capture.json').write_text(json.dumps({
+            'pid': 123, 'port': 6979, 'instance': 'a', 'bridge_log': str(run / 'bridge.log'), 'started': 1,
+        }))
+        self.make(FakeEden({}))
+        self.assertEqual(self.instances['a']['bridge_log'], str(run / 'bridge.log'))
+        self.instances['a']['bridge_log'] = 'existing.log'
+        self.make(FakeEden({}))
+        self.assertEqual(self.instances['a']['bridge_log'], 'existing.log')
+
+    def test_dry_run_accepts_disabled_early_stop(self):
+        self.plan['early_stop'] = False
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+
     def test_gates_comes_from_instances_not_a_hardcoded_filename(self):
         self.instances['a']['diag_log'] = str(self.dir / 'practice-diagnostics.log')
         self.assertEqual(self.make(FakeEden({})).source('a', 'gates'), Path('gates'))
