@@ -650,6 +650,48 @@ class StartTests(ObserveTests):
         self.assertEqual(result['verified']['plan'], 'none')
         self.assertEqual(result['verified']['plan_terminal']['sequence'], 312685)
 
+    def test_any_plan_reports_recorded_route_and_row(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        self.pending = [contiguous([release, plan, terminal])]
+        result = self.invoke_start(expect={'plan': 'any'})
+        self.assertEqual((result['verified']['plan']['route'], result['verified']['plan']['row']), (0, 38))
+        self.assertEqual(result['verified']['plan_terminal']['sequence'], 44870)
+        self.assertEqual(result['verified']['planner']['recorded'], 1)
+
+    def test_any_plan_reports_none_when_there_are_no_planner_hits(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, terminal = excerpt('cp1b-hero-level9-none.jsonl')
+        self.pending = [contiguous([release, terminal])]
+        result = self.invoke_start(expect={'plan': 'any'})
+        self.assertEqual(result['verified']['plan'], 'none')
+        self.assertEqual(result['verified']['planner']['hits'], 0)
+
+    def test_any_plan_reports_filtered_planner_hit_as_not_observed(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, terminal = excerpt('cp1b-hero-level9-none.jsonl')
+        self.pending = [contiguous([release, terminal])]
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            if self.path.stat().st_size:
+                next(point for point in result['points'] if point['id'] == '5')['hits'] = '1'
+            return result
+
+        self.ctx.call = call
+        result = self.invoke_start(expect={'plan': 'any'})
+        self.assertEqual(result['verified']['plan'], 'not observed (planner hit 1 times, recorded 0)')
+
+    def test_any_plan_still_requires_the_planner_point(self):
+        self.io = StartIO(self.ctx)
+        with self.assertRaisesRegex(RuntimeError, 'planner'):
+            self.invoke_start(expect={'plan': 'any'})
+        self.assertEqual(self.io.actions, [])
+
     def test_mismatch_of_each_expect_key_saves_receipt_before_failure(self):
         cases = {'cpu_kind': 0, 'stage_form': 1, 'stage_id': 65535, 'perfect': False,
                  'juggler': True, 'damage': 0, 'cpu': [0, 0], 'cpu_words': ['0x00000000'] * 2,
