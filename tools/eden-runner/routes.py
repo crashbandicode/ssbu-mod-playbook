@@ -3312,6 +3312,18 @@ def _drill_start(ctx, game, expect, cap, metrics):
     initial = _tr_current(io, until)
     wizard = _edge_wizard(initial)
     skipped = []
+
+    def running(state):
+        return (state.values.get('open') == '0' and state.values.get('game') == game
+                and state.values.get('game.running') == '1'
+                and (not wizard or not _edge_wizard(state)))
+
+    def fail_running(values):
+        observed.update({'game': values.get('game'), 'running': values.get('game.running'),
+                         'header': values.get('notice.header')})
+        raise RuntimeError(f'expected {game} running after start; saw game={values.get("game")!r} '
+                           f'running={values.get("game.running")!r} header={values.get("notice.header")!r}')
+
     if wizard:
         page = _wizard_body(initial, game)
         if page['kind'] != 'Preview':
@@ -3338,12 +3350,11 @@ def _drill_start(ctx, game, expect, cap, metrics):
         if stream is not None:
             fence = _trace_snapshot(ctx, path, needs_plan, expected=preflight)
         menu = _tr_input(io, menu, 'tap-a1', until, opened=False)
-        if menu.values.get('game') != game or menu.values.get('game.running') != '1':
-            menu = _wait_tr_condition(io, menu, until,
-                                      lambda state: state.values.get('open') == '0'
-                                      and state.values.get('game') == game
-                                      and state.values.get('game.running') == '1',
-                                      'game running=1')
+    if not running(menu):
+        changed = _try_tr_condition(io, menu, until, running)
+        if changed is None:
+            fail_running(metrics['last_seen'])
+        menu = changed
     release = None
     selected_plan = None
     terminal = None
@@ -3397,6 +3408,11 @@ def _drill_start(ctx, game, expect, cap, metrics):
     if needs_plan and selected_plan is None and delta['planner']['hits']:
         planner = delta['planner']
         plan_value = f'not observed (planner hit {planner["hits"]} times, recorded {planner["recorded"]})'
+    final = _tr_current(io, until)
+    native_picker.same_epoch(menu, final, in_flight=True)
+    menu = final
+    if not running(menu):
+        fail_running(menu.values)
     verified = {'game': menu.values.get('game'), 'running': menu.values.get('game.running'),
                 'first_release': release if release is not None else 'not checked: no trace in this boot',
                 'markers_before_start': observed['markers_before_start'],
