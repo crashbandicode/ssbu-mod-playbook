@@ -9,7 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import chdir, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -802,9 +802,39 @@ class EdenTestTests(unittest.TestCase):
     def args(self, *extra):
         return ['--from', str(self.previous), '--label', 'lr-14', '--rows', str(self.rows), *extra]
 
-    def go_args(self, label='go-1', rows=None, nro=None, host='yoga'):
+    def go_args(self, label='go-1', rows=None, nro=None, host='yoga', owner='Claude devin-test/go-1'):
         return ['go', '--host', host, '--label', label, '--nro', str(nro or self.dir / 'plugin.nro'),
-                '--rows', str(rows or self.rows), '--from', str(self.previous)]
+                '--rows', str(rows or self.rows), *(['--owner', owner] if owner is not None else []),
+                '--from', str(self.previous)]
+
+    def test_go_requires_owner_before_dispatch(self):
+        error = io.StringIO()
+        with mock.patch.object(eden_test, 'cmd_go') as go, redirect_stderr(error):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args(owner=None))
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('--owner', error.getvalue())
+        go.assert_not_called()
+
+    def test_go_rejects_bad_owner_before_local_or_remote_staging(self):
+        for host in ('yoga', 'xps'):
+            for owner in ('eden-test/go-1', 'Claude', 'Claude multiple words', ''):
+                with self.subTest(host=host, owner=owner), \
+                     mock.patch.object(eden_test, 'go_new', side_effect=SystemExit('go_new called')) as new, \
+                     mock.patch.object(eden_test, '_go_remote', side_effect=SystemExit('remote called')) as remote, \
+                     mock.patch.object(eden_test, 'sh') as sh, \
+                     mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+                    with self.assertRaises(SystemExit) as caught:
+                        eden_test.main(self.go_args(host=host, owner=owner))
+                    self.assertEqual(
+                        str(caught.exception),
+                        '--owner must be "<Engine> <session>/<stream>" (OpenCode|Codex|Claude|Cursor), '
+                        f'e.g. "Claude devin-<lane>/<label>"; got: {owner!r}')
+                    new.assert_not_called()
+                    remote.assert_not_called()
+                    sh.assert_not_called()
+                    lifecycle.assert_not_called()
+                    self.assertFalse((self.dir / 'runs/go-1').exists())
 
     def test_go_local_copies_pins_port_trace_and_reports_without_down(self):
         source = self.dir / 'profile/user/config'
@@ -841,7 +871,7 @@ class EdenTestTests(unittest.TestCase):
         run = self.dir / 'runs/go-1'
         config = json.loads((run / 'config.json').read_text())
         self.assertEqual((config['owner'], config['label'], config['defer_load']),
-                         ('eden-test/go-1', 'go-1', True))
+                         ('Claude devin-test/go-1', 'go-1', True))
         self.assertNotIn('authorization', config)
         self.assertEqual(config['state_dir'], str(run / 'state'))
         self.assertEqual(config['work_root'], str(run / 'work'))
@@ -874,12 +904,12 @@ class EdenTestTests(unittest.TestCase):
         rowfile = self.rows / 'rows.json'
         rowfile.write_text(json.dumps({'rows': [{'id': 'r1', 'steps': []}, {'id': 'r2', 'steps': []}]}))
         with mock.patch.object(eden_test, 'cmd_down') as down:
-            code = eden_test.main(self.go_args(rows=rowfile) + ['--owner', 'test/owner'])
+            code = eden_test.main(self.go_args(rows=rowfile) + ['--owner', 'Claude test/owner'])
         self.assertEqual(code, 0)
         down.assert_not_called()
         run = self.dir / 'runs/go-1'
         config = json.loads((run / 'config.json').read_text())
-        self.assertEqual(config['owner'], 'test/owner')
+        self.assertEqual(config['owner'], 'Claude test/owner')
         self.assertEqual(config['stub_rule'], 'no trace section: stub left to the rows (routes:configure_boot)')
         self.assertEqual((run / 'rows/rows.json').read_bytes(), rowfile.read_bytes())
         self.assertNotIn('bridge_port', config)
@@ -997,7 +1027,7 @@ class EdenTestTests(unittest.TestCase):
         stage = f'/home/intpa/eden-runs/_eden-test/stage/{label}'
         argv = self.go_args(label=label, nro=nro, host='xps') + [
             '--nro', str(second), '--elf', str(elf), '--trace-point', 'plugin.nro!attempt',
-            '--owner', 'test-owner', '--ssh', host]
+            '--owner', 'Claude devin-test/remote-1', '--ssh', host]
         output = io.StringIO()
         token = 'a' * 32
         def fake_sh(command, log=None):
@@ -1025,7 +1055,7 @@ class EdenTestTests(unittest.TestCase):
              f'{stage}/tools/eden-test/eden_test.py', 'go', '--host', 'xps', '--label', label,
              '--nro', f'{stage}/nro/plugin.nro', '--nro', f'{stage}/nro/extra.nro',
              '--rows', f'{stage}/rows', '--elf', f'{stage}/elf/plugin.so',
-             '--trace-point', 'plugin.nro!attempt', '--owner', 'test-owner', '--token', token],
+             '--trace-point', 'plugin.nro!attempt', '--owner', "'Claude devin-test/remote-1'", '--token', token],
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/go-result.json', mock.ANY],
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/REPORT.md', f'./REPORT-{label}.md'],
         ]
