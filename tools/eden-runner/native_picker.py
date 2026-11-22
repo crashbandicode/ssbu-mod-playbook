@@ -89,8 +89,16 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
     entering = (entering_stage and provider == TILE and focus == 'unknown'
                 and values.get('screen') == 'sss' and values.get('settled') == '0'
                 and values.get('layout') == values.get('hovered') == 'unknown')
+    at = values.get('at')
     step = (stepping and provider == TILE and focus == 'unknown'
-            and values.get('kind') == 'unknown' and values.get('name') == 'unknown')
+            and values.get('kind') == 'unknown' and values.get('name') == 'unknown'
+            and values.get('form') == 'unknown'
+            and ((values.get('settled') == '0' and values.get('hovered') == 'unknown'
+                  and values.get('settled.ack') == 'unknown')
+                 or (values.get('settled') == '1' and values.get('hovered') == at
+                     and isinstance(at, str) and re.fullmatch(r'[0-9]+', at)
+                     and values.get('settled.ack') is not None
+                     and values.get('settled.ack') == values.get('ack'))))
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
@@ -319,6 +327,8 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, exp
         step = tuple(values.get(key) for key in ('direction', 'from', 'to', 'ack.result', 'result'))
         if step != (direction, at, dest, 'handled', 'handled'):
             raise RuntimeError(f'wrong step: expected {direction} {at}->{dest}, observed {step!r}')
+        if pending and values.get('at') != dest:
+            raise RuntimeError('pending tile coordinate disagrees with the outstanding step')
         if values.get('settled') != '1':
             continue
         if pending:
@@ -414,10 +424,16 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
             values = after.values
             if values.get('screen') == next_screen:
                 owner, dialog = values.get('input.owner'), values.get('dialog')
+                destination = (values.get('focus') == next_screen and values.get('focus.source') == TILE
+                               and (expected_context is None or values.get('screen.context') == expected_context))
                 if owner == 'unknown' and dialog == 'unknown':
+                    if not destination:
+                        raise RuntimeError(f'after stage confirmation, unexpected pending {next_screen} observation')
                     continue
                 if owner != 'native' or dialog != 'none':
                     raise RuntimeError(f'after stage confirmation, {next_screen} is owned by {owner!r} with dialog {dialog!r}')
+                if not destination:
+                    raise RuntimeError(f'after stage confirmation, unexpected {next_screen} observation')
                 if values['focus'] == ui.values['focus']:
                     raise RuntimeError('stage confirmation did not change native focus')
                 break

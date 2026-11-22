@@ -57,40 +57,59 @@ def loading(rev, *, epoch=1, **extra):
 
 
 def recorded_training_tile(rev):
-    observation, generation, ack, settled, complete = {
-        543: (3316, 21, 11, False, False),
-        551: (3365, 21, 11, True, True),
-        809: (4785, 28, 24, True, False),
-        816: (4813, 28, 24, True, True),
+    observation, generation, ack, phase = {
+        540: (3300, 21, 10, 'before'),
+        543: (3316, 21, 11, 'unsettled'),
+        551: (3365, 21, 11, 'complete'),
+        805: (4768, 28, 23, 'before'),
+        809: (4785, 28, 24, 'pending'),
+        816: (4813, 28, 24, 'complete'),
+        1081: (6141, 35, 36, 'before'),
+        1085: (6155, 35, 37, 'unsettled'),
     }[rev]
     boot = '0x3d1b9bf2497aaa1f'
+    before, complete, settled = phase == 'before', phase == 'complete', phase != 'unsettled'
+    at = '78' if before else '67'
     values = {
         'schema': 'tile.cursor/1', 'rev': str(rev), 'boot': boot, 'ack': str(ack),
-        'ack.result': 'handled', 'focus': 'css.grid.richter' if complete else 'unknown',
+        'ack.result': 'handled', 'focus': 'css.grid.pickel' if before else 'css.grid.richter' if complete else 'unknown',
         'observation': str(observation), 'observation.active': '1', 'screen': 'css',
         'generation': str(generation), 'layout': 'css.9f1fb03bf7c98fb9', 'grid': 'css.9f1fb03bf7c98fb9',
-        'at': '67', 'hovered': '67' if settled else 'unknown', 'kind': '68' if complete else 'unknown',
-        'name': 'Richter' if complete else 'unknown', 'form': 'default' if complete else 'unknown',
+        'at': at, 'hovered': at if settled else 'unknown', 'kind': '88' if before else '68' if complete else 'unknown',
+        'name': 'Steve' if before else 'Richter' if complete else 'unknown', 'form': 'default' if before or complete else 'unknown',
         'controller': '0', 'seat': '0', 'carried': '0', 'p1.carried': '0', 'p1.token': 'held',
         'p1.placed.at': 'unknown', 'p1.placed.kind': 'unknown', 'p1.placed.name': 'unknown',
         'p1.placed.form': 'unknown', 'local.token': 'held', 'placed.at': 'unknown',
         'placed.kind': 'unknown', 'placed.name': 'unknown', 'placed.form': 'unknown',
         'settled': '1' if settled else '0', 'applied': str(ack), 'direction': 'up',
-        'from': '78', 'to': '67', 'result': 'handled', 'settled.ack': str(ack) if settled else 'unknown',
+        'from': 'none' if before else '78', 'to': at, 'result': 'handled',
+        'settled.ack': str(ack) if settled else 'unknown',
     }
     return picker.Sample({'name': 'tile.cursor', 'schema': 'tile.cursor/1', 'rev': rev,
                           'boot': boot, 'filtered': False, 'values': values}, 1)
 
 
 def recorded_before(rev):
-    state = recorded_training_tile(rev)
-    ack = str(int(state.values['ack']) - 1)
-    state.block['rev'] -= 1
-    state.values.update({'rev': str(state.block['rev']), 'observation': str(int(state.values['observation']) - 1),
-                         'ack': ack, 'applied': ack, 'settled.ack': ack, 'at': '78', 'hovered': '78',
-                         'settled': '1', 'focus': 'css.grid.pickel', 'kind': '88', 'name': 'Steve',
-                         'form': 'default'})
-    return state
+    return recorded_training_tile({543: 540, 809: 805, 1085: 1081}[rev])
+
+
+def recorded_smash_ui(rev):
+    observation = {844: 5010, 847: 5023, 870: 5172}[rev]
+    boot, schema = '0x3d1b9bf2497aaa1f', 'ssbu.ui/1'
+    screen = 'stage_select' if rev == 844 else 'css.smash'
+    values = {
+        'schema': schema, 'rev': str(rev), 'boot': boot, 'ack': '0', 'ack.result': 'unsupported',
+        'focus': screen, 'observation': str(observation), 'observation.active': 'yes', 'screen': screen,
+        'screen.tab': 'unknown', 'screen.layer': 'unknown', 'screen.context': 'smash',
+        'focus.source': 'tile.cursor', 'focus.id': 'unknown', 'focus.index': 'unknown', 'focus.label': 'unknown',
+        'dialog': 'none' if rev == 870 else 'unknown', 'input.owner': 'native' if rev == 870 else 'unknown',
+        'ldn.role': 'unknown', 'ldn.members': 'unknown', 'ldn.request_pending': 'unknown',
+        'ldn.prompt': 'unknown', 'ldn.scan.generation': 'unknown', 'ldn.room.bssid': 'unknown',
+        'ldn.room.session': 'unknown', 'ldn.room.ready': 'unknown',
+        'menu.admission': 'qualified_offline' if rev == 870 else 'unknown',
+    }
+    return picker.Sample({'name': 'ssbu.ui', 'schema': schema, 'rev': rev, 'boot': boot,
+                          'filtered': False, 'values': values}, 1)
 
 
 def recorded_native(rev):
@@ -226,10 +245,42 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(latest.values, recorded_training_tile(551).values)
         self.assertEqual(replay.actions, ['tile-up'])
 
+    def test_tile_mario_unsettled_replay_finishes_with_modeled_completion(self):
+        complete = recorded_training_tile(551)
+        complete.block['rev'] = 1090
+        complete.values.update({'rev': '1090', 'observation': '6200', 'generation': '35',
+                                'ack': '37', 'applied': '37', 'settled.ack': '37'})
+        replay, (latest, _) = self.captured_move([recorded_training_tile(1085), complete], 1085)
+        self.assertEqual(latest.values, complete.values)
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_contradictory_pending_tuples_fail_even_when_completion_follows(self):
+        mutations = (
+            (809, {'form': 'omega'}, 'incomplete, inactive or wrong-schema observation'),
+            (809, {'settled': '2'}, 'incomplete, inactive or wrong-schema observation'),
+            (543, {'at': '66'}, '^pending tile coordinate disagrees with the outstanding step$'),
+            (809, {'hovered': '66'}, 'incomplete, inactive or wrong-schema observation'),
+            (809, {'settled.ack': '23'}, 'incomplete, inactive or wrong-schema observation'),
+            (543, {'hovered': '67'}, 'incomplete, inactive or wrong-schema observation'),
+            (543, {'settled.ack': '11'}, 'incomplete, inactive or wrong-schema observation'),
+            (809, {'name': 'Richter'}, 'incomplete, inactive or wrong-schema observation'),
+            (809, {'at': 'none', 'hovered': 'none'}, 'incomplete, inactive or wrong-schema observation'),
+        )
+        for rev, fields, message in mutations:
+            with self.subTest(rev=rev, fields=fields):
+                pending = recorded_training_tile(rev)
+                pending.values.update(fields)
+                replay = Replay([pending, recorded_training_tile(551 if rev == 543 else 816)],
+                                [recorded_native(2)])
+                with self.assertRaisesRegex(RuntimeError, message):
+                    picker.move(replay, 'css', recorded_before(rev), recorded_native(1), '78', 'up', '67',
+                                picker.Target('68', 'Richter', 'default'), .02, expected_context='training')
+                self.assertEqual(replay.actions, ['tile-up'])
+
     def test_pending_identity_wrong_settled_coordinate_rejected(self):
         pending = recorded_training_tile(809)
         pending.values.update({'at': '68', 'hovered': '68'})
-        with self.assertRaisesRegex(RuntimeError, '^settled tile coordinate disagrees with the outstanding step$'):
+        with self.assertRaisesRegex(RuntimeError, '^pending tile coordinate disagrees with the outstanding step$'):
             self.captured_move([pending])
 
     def test_pending_identity_wrong_step_rejected(self):
@@ -496,41 +547,64 @@ class PickerTests(unittest.TestCase):
         target = picker.Target('308', 'Training', 'normal')
 
         def stage_tile(rev):
-            return snapshot('tile.cursor', rev, {
+            state = snapshot('tile.cursor', rev, {
                 'screen': 'sss', 'layout': 'stage-layout', 'generation': '3',
                 'controller': '0', 'seat': '0', 'carried': 'none',
                 'local.token': 'none', 'at': '8', 'hovered': '8', 'settled': '1',
                 'kind': target.kind, 'name': target.name, 'form': target.form, 'settled.ack': '0',
                 'ack': '0', 'applied': '0', 'focus': 'sss/8',
             })
+            state.block['boot'] = state.values['boot'] = '0x3d1b9bf2497aaa1f'
+            return state
 
-        source = [native(rev, screen='stage_select', focus='stage_select') for rev in (842, 843)]
-        source_pending = native(844, screen='stage_select', focus='stage_select',
-                                **{'input.owner': 'unknown', 'dialog': 'unknown'})
-        css_pending = native(847, screen='css.smash', focus='css.smash',
-                             **{'input.owner': 'unknown', 'dialog': 'unknown'})
-        css_ready = native(870, screen='css.smash', focus='css.smash')
+        def source_ui(rev):
+            state = recorded_smash_ui(844)
+            state.block['rev'] = rev
+            state.values.update({'rev': str(rev), 'observation': str(5008 + rev - 842),
+                                 'input.owner': 'native', 'dialog': 'none'})
+            return state
 
         def replay(*tail):
-            return Replay([stage_tile(841), stage_tile(842)], [*source, *tail])
+            return Replay([stage_tile(841), stage_tile(842)], [source_ui(842), source_ui(843), *tail])
 
-        io = replay(source_pending, css_pending, css_ready)
-        result = picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1)
+        io = replay(recorded_smash_ui(844), recorded_smash_ui(847), recorded_smash_ui(870))
+        result = picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1, expected_context='smash')
         self.assertEqual(result['screen'], 'css.smash')
         self.assertEqual(io.actions, ['tap-a1'])
+
+        for fields in ({'focus.source': 'native'}, {'screen.context': 'training'}, {'focus': 'stage_select'}):
+            with self.subTest(pending=fields):
+                pending = recorded_smash_ui(847)
+                pending.values.update(fields)
+                io = replay(recorded_smash_ui(844), pending, recorded_smash_ui(870))
+                with self.assertRaisesRegex(RuntimeError, '^after stage confirmation, unexpected pending css.smash observation$'):
+                    picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1, expected_context='smash')
+                self.assertEqual(io.actions, ['tap-a1'])
+
+        for fields in ({'focus.source': 'native'}, {'screen.context': 'training'}, {'focus': 'css.training'}):
+            with self.subTest(final=fields):
+                ready = recorded_smash_ui(870)
+                ready.values.update(fields)
+                io = replay(recorded_smash_ui(847), ready)
+                with self.assertRaisesRegex(RuntimeError, '^after stage confirmation, unexpected css.smash observation$'):
+                    picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1, expected_context='smash')
+                self.assertEqual(io.actions, ['tap-a1'])
 
         for owner, dialog in (('foreign', 'unknown'), ('native', 'confirmation'),
                               ('unknown', 'none'), ('native', 'unknown')):
             with self.subTest(owner=owner, dialog=dialog):
-                io = replay(native(847, screen='css.smash', focus='css.smash',
-                                   **{'input.owner': owner, 'dialog': dialog}))
+                state = recorded_smash_ui(847)
+                state.values.update({'input.owner': owner, 'dialog': dialog})
+                io = replay(state)
                 with self.assertRaisesRegex(RuntimeError, f'css.smash is owned by {owner!r} with dialog {dialog!r}'):
-                    picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1)
+                    picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1, expected_context='smash')
                 self.assertEqual(io.actions, ['tap-a1'])
 
-        io = replay(native(847, screen='rules', focus='rules'))
+        unexpected = recorded_smash_ui(847)
+        unexpected.values.update({'screen': 'rules', 'focus': 'rules'})
+        io = replay(unexpected)
         with self.assertRaisesRegex(RuntimeError, "after stage confirmation, unexpected native screen 'rules'"):
-            picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1)
+            picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1, expected_context='smash')
         self.assertEqual(io.actions, ['tap-a1'])
 
     def test_stage_confirmation_requires_native_transition(self):
@@ -548,7 +622,7 @@ class PickerTests(unittest.TestCase):
 
         target = picker.Target('308', 'Training', 'normal')
         replay = Replay([stage_tile(1), stage_tile(2)],
-                        [stage_ui(1), stage_ui(2), native(3, focus='css.smash/ready')])
+                        [stage_ui(1), stage_ui(2), native(3, focus='css.smash')])
         result = picker.pick(replay, 'sss', target, next_screen='css.smash', cap=.1)
         self.assertEqual(replay.actions, ['tap-a1'])
         self.assertEqual(result['screen'], 'css.smash')
