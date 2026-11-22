@@ -670,6 +670,7 @@ def results_md(run, config):
     split = timing.get('split')
     if not isinstance(split, dict) or 'unclassified' not in split:
         split = time_split(run)
+    unclassified = '?' if split['unclassified'] is None else f'{split["unclassified"]:.0f} s'
     rows_now = sha256(run / 'rows' / 'rows.json')
     rows_note = rows_now[:12] + '…' + ('' if rows_now == config['rows']['sha256'] else
                                        f' (changed during the boot; Up had {config["rows"]["sha256"][:12]}…)')
@@ -691,8 +692,7 @@ def results_md(run, config):
               f'- Timing: up {up_seconds:.0f} s, rows {rows_seconds:.0f} s over '
               f'{max(len(runs), 1)} run call(s), down {down_seconds:.0f} s; '
               f'classified: up+setup+down {split["up"] + split["setup"] + split["down"]:.0f} s, '
-              f'test {split["test"]:.0f} s, unclassified '
-              f'{f"{split["unclassified"]:.0f} s" if split["unclassified"] is not None else "?"}'
+              f'test {split["test"]:.0f} s, unclassified {unclassified}'
               + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
     (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
