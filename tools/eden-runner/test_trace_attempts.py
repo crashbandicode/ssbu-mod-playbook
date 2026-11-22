@@ -17,11 +17,18 @@ import test_setup_blocks as fake
 # SHA-256 bb83adcca818425248239fbe6fe575d0c382cb50fcb9be9b57cb5ff1e573a9df
 # Source: /home/intpa/smash-training-lobby/artifacts/phase23/edge-juggle/evidence/cp1b-hero32-3/trace/edge-juggle-p0-83eecc32.trace.jsonl
 # SHA-256 a1966f89197ed537e24864e9502f2b9399b4ba186a15b4118efc24f24a6a3103
+# Level 9 release 312411 through terminal 312685 has no point-5 planner entry in that source.
 DATA = Path(__file__).parent / 'test-data'
 
 
 def excerpt(name):
     return [json.loads(line) for line in (DATA / name).read_text().splitlines()]
+
+
+def contiguous(rows):
+    ordered = {int(row['sequence']): row for row in rows}
+    return ''.join(json.dumps(ordered.get(seq, {'sequence': str(seq), 'point_id': 'other', 'event': 'entry'}))
+                   + '\n' for seq in range(min(ordered), max(ordered) + 1))
 
 
 class AttemptDecodeTests(unittest.TestCase):
@@ -297,6 +304,133 @@ class ObserveTests(unittest.TestCase):
             self.invoke(attempts=1, cap=.02, count='releases')
         with self.assertRaisesRegex(RuntimeError, 'count'):
             self.invoke(attempts=1, cap=.1, count='unknown')
+
+
+class StartIO(fake.RowsIO):
+    def __init__(self, ctx, *, wizard=True, fault=None):
+        super().__init__(ctx, fault=fault)
+        self.wizard = wizard
+        self.menu.update({'open': '0' if wizard else '1', 'game': 'Guard the Edge' if wizard else '',
+                          'game.running': '1' if wizard else '0',
+                          'notice.header': 'Edge · 4/4' if wizard else '', 'notice.body': ''})
+
+    def send(self, segment):
+        if segment == 'tap-a1' and (self.wizard or self.menu['depth'] == '1'):
+            self.actions.append(segment)
+            if self.ctx.runner.setup_metrics is not None:
+                self.ctx.runner.setup_metrics['inputs'] += 1
+            if self.wizard:
+                if self.fault != 'wizard_stuck':
+                    self.menu['notice.header'] = ''
+            else:
+                if self.fault != 'no_ack':
+                    self.menu['ack'] = str(int(self.menu['ack']) + 1)
+                if self.fault != 'start_stuck':
+                    self.menu.update({'open': '0', 'game': 'Guard the Edge', 'game.running': '1'})
+        else:
+            super().send(segment)
+
+
+class StartTests(ObserveTests):
+    def invoke_start(self, *, expect=None, cap=.5):
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io):
+            return routes.drill_start(self.ctx, game='Guard the Edge', expect=expect, cap=cap)
+
+    def enable_planner(self):
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            result['points'].append({'id': '5', 'state': 'armed', 'mode': 'records',
+                                     'target': 'libtraining_rooms.nro!planner_chose', 'dropped': '0',
+                                     'process_id': '81', 'address': '0x5678'})
+            return result
+
+        self.ctx.call = call
+
+    def test_wizard_bridge_only_without_trace(self):
+        del self.ctx.instance['trace_jsonl']
+        self.io = StartIO(self.ctx)
+        result = self.invoke_start()
+        self.assertEqual(self.io.actions, ['tap-a1'])
+        self.assertEqual(result['verified']['first_release'], 'not checked: no trace in this boot')
+
+    def test_expect_without_trace_and_missing_planner_refuse_before_input(self):
+        self.io = StartIO(self.ctx)
+        del self.ctx.instance['trace_jsonl']
+        with self.assertRaisesRegex(RuntimeError, 'trace'):
+            self.invoke_start(expect={'cpu_kind': 0x5a})
+        self.assertEqual(self.io.actions, [])
+        self.ctx.instance['trace_jsonl'] = str(self.path)
+        with self.assertRaisesRegex(RuntimeError, 'planner'):
+            self.invoke_start(expect={'plan': [0, 38]})
+        self.assertEqual(self.io.actions, [])
+
+    def test_pyra_release_and_plan_wait_for_ledge_terminal(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        self.pending = [contiguous([release, plan, terminal])]
+        result = self.invoke_start(expect={'cpu_kind': 0x5a, 'stage_form': 0, 'perfect': True,
+                                           'cpu': [-184, -50], 'plan': [0, 38]})
+        self.assertEqual(result['verified']['first_release']['sequence'], 44362)
+        self.assertEqual(result['verified']['plan']['sequence'], 44368)
+        self.assertEqual(result['verified']['plan_terminal']['sequence'], 44870)
+
+    def test_level9_none_plan_uses_reviewed_attempt(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, terminal = excerpt('cp1b-hero-level9-none.jsonl')
+        self.pending = [contiguous([release, terminal])]
+        result = self.invoke_start(expect={'perfect': False, 'plan': 'none'})
+        self.assertEqual(result['verified']['first_release']['sequence'], 312411)
+        self.assertEqual(result['verified']['plan'], 'none')
+        self.assertEqual(result['verified']['plan_terminal']['sequence'], 312685)
+
+    def test_mismatch_of_each_expect_key_saves_receipt_before_failure(self):
+        cases = {'cpu_kind': 0, 'stage_form': 1, 'stage_id': 65535, 'perfect': False,
+                 'juggler': True, 'damage': 0, 'cpu': [0, 0], 'cpu_words': ['0x00000000'] * 2,
+                 'p1': [0, 0], 'p1_words': ['0x00000000'] * 2, 'plan': [1, 38]}
+        for key, value in cases.items():
+            with self.subTest(key=key):
+                self.path.write_text('')
+                self.io = StartIO(self.ctx)
+                release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+                self.pending = [contiguous([release, plan, terminal])]
+                original = self.ctx.call
+                if key == 'plan':
+                    self.enable_planner()
+                with self.assertRaisesRegex(RuntimeError, 'mismatch'):
+                    self.invoke_start(expect={key: value})
+                receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+                self.assertEqual(receipt['verified']['first_release']['sequence'], 44362)
+                self.ctx.call = original
+
+    def test_menu_start_requires_a_running_transition_and_no_existing_game(self):
+        self.io = StartIO(self.ctx, wizard=False)
+        del self.ctx.instance['trace_jsonl']
+        result = self.invoke_start()
+        self.assertEqual(result['verified']['running'], '1')
+        self.assertEqual(self.io.menu['open'], '0')
+        self.io = StartIO(self.ctx, wizard=False)
+        self.io.menu['game.running'] = '1'
+        with self.assertRaisesRegex(RuntimeError, 'already running'):
+            self.invoke_start()
+        self.assertEqual(self.io.actions, [])
+
+    def test_header_stuck_trace_loss_and_epoch_change_fail(self):
+        self.io = StartIO(self.ctx, fault='wizard_stuck')
+        del self.ctx.instance['trace_jsonl']
+        with self.assertRaisesRegex(RuntimeError, 'wizard'):
+            self.invoke_start(cap=.02)
+        self.ctx.instance['trace_jsonl'] = str(self.path)
+        self.io = StartIO(self.ctx)
+        self.pending = ['{"event":"loss","records":"1"}\n']
+        with self.assertRaisesRegex(RuntimeError, 'loss'):
+            self.invoke_start()
+        self.io = StartIO(self.ctx, fault='epoch')
+        with self.assertRaisesRegex(RuntimeError, 'connection'):
+            self.invoke_start()
 
 
 if __name__ == '__main__':
