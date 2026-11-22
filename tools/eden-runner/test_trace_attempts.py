@@ -354,6 +354,36 @@ class StartTests(ObserveTests):
         result = self.invoke_start()
         self.assertEqual(self.io.actions, ['tap-a1'])
         self.assertEqual(result['verified']['first_release'], 'not checked: no trace in this boot')
+        self.assertEqual(result['verified']['markers_before_release'], [])
+
+    def test_records_prior_terminal_markers_before_first_release(self):
+        self.io = StartIO(self.ctx)
+        release, _, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        first = dict(terminal, sequence='44360', frame='33040')
+        second = dict(terminal, sequence='44361', frame='33041')
+        second['registers'] = dict(terminal['registers'])
+        meta = int(second['registers']['x0'], 16)
+        second['registers']['x0'] = hex((meta & ~(255 << 16)) | (3 << 16))
+        self.pending = [json.dumps(first) + '\n', contiguous([second, release])]
+        result = self.invoke_start(expect={'cpu_kind': 0x5a})
+        self.assertEqual(result['verified']['markers_before_release'], [
+            {'sequence': 44360, 'frame': 33040, 'event': 2, 'terminal': 'ledge'},
+            {'sequence': 44361, 'frame': 33041, 'event': 3, 'terminal': 'ground'},
+        ])
+        self.assertEqual(result['verified']['first_release']['sequence'], 44362)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+        self.assertEqual(receipt['verified']['markers_before_release'], result['verified']['markers_before_release'])
+
+    def test_prior_terminal_is_saved_even_when_release_expect_mismatches(self):
+        self.io = StartIO(self.ctx)
+        release, _, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        earlier = dict(terminal, sequence='44361', frame='33041')
+        self.pending = [contiguous([earlier, release])]
+        with self.assertRaisesRegex(RuntimeError, 'mismatch'):
+            self.invoke_start(expect={'cpu_kind': 0})
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+        self.assertEqual(receipt['verified']['markers_before_release'],
+                         [{'sequence': 44361, 'frame': 33041, 'event': 2, 'terminal': 'ledge'}])
 
     def test_expect_without_trace_and_missing_planner_refuse_before_input(self):
         self.io = StartIO(self.ctx)
