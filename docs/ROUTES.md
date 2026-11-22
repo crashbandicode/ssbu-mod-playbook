@@ -36,6 +36,12 @@ A block is a runner step hook. A row names it with `routes:` and no path:
   block never stops for a live review (the game would idle into its attract demo).
 - Every block fails closed: a missing state raises with what was seen, and nothing guesses.
 
+### Own steps
+
+Any setup item or step may include a one-line `reason`. A reason does not make a library step private.
+Dry-run reports private entries with their reasons and lists `missing_reasons` by location; missing reasons
+do not change readiness. Private steps remain allowed and require full review.
+
 The data the blocks use is in `tools/eden-runner/library/routes/`:
 
 - `index.json`: the macros, each with its sha256 and source. `routes.play()` refuses a file whose hash differs.
@@ -61,10 +67,10 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
 | `tr_set` `{page, path, kind, value, cap}` | Training, settings file available through bridge | stored value reread, with a writer line for changes |
-| `wizard_place` `{game, area, cpu, p1, cap, pulse_cap}` | Guard the Edge wizard or Training menu | shown positions checked at unconfirmed Preview |
-| `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release when tracing |
+| `wizard_place` `{game, area, cpu, p1, cap, pulse_cap, tolerance}` | Guard the Edge wizard or Training menu | shown positions checked at unconfirmed Preview |
+| `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release after the fence when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
-| `drill_observe` `{attempts, cap, allow_stopped, count}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |
+| `drill_observe` `{attempts, cap, game, perfect, allow_stopped, count}` | named practice game with an armed attempt tracepoint | matching markers, CPU kinds, sequence/frame bounds, and running state |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
 | `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded |
@@ -420,11 +426,17 @@ These paths require independent runtime proof.
 
 `routes:tr_open(page=None, cap=20)` opens the Training Mod menu and optionally returns to its page ring
 and reaches the named page. `routes:tr_close(cap=20)` backs out through each depth and closes it; it does
-not read settings. Both check the bridge owner and each handled menu input and report skipped work. These
+not read settings. Both check the bridge owner after their last input, record the observed owner from a
+same-epoch `ssbu.ui` sample, check each handled menu input and report skipped work. These
 blocks and the bridge-based navigation and drill blocks below are host-tested only, not yet proof-booted.
+Each of these eight blocks writes `ok: true` on success. Failure receipts have `ok: false`, the error,
+the last values read without a further bridge request, and any partial observations, never `verified`.
+Repeated calls in the same row retain earlier receipts with numbered suffixes. When an input has no
+observed effect for three seconds, the block retries once; receipt metrics count retries.
 
 `routes:tr_goto(page, path, cap=30)` opens the menu and walks action IDs, or objects containing `action` and/or
-the static `row` title, into nested Rows screens. It stops before activating the last row. At page depth a
+the static `row` title, into nested Rows screens. Titles match after NFKC normalization, case folding and
+whitespace collapse; action IDs remain exact. It stops before activating the last row. At page depth a
 Down must move the published cursor; in a Rows screen it must change the published `(action,row,row_id)` identity
 with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed. This does
 not read or establish the focused row's stored value.
@@ -435,14 +447,19 @@ closes the menu and compares a fresh file read. Changed values require a fresh w
 values skip both the change and writer and must match again on the final read. Source-pinned row kinds
 prevent a no-op from silently accepting a wrong kind. `practice_cpu` takes `fighter`, `mode` and optional
 `level`; popup mode is witnessed while changing, while a no-op proves only the stored encoding. It does
-not prove the live fighter was switched or text visibly rendered.
+not prove the live fighter was switched or text visibly rendered. Settings read-back rejects duplicate
+keys and values other than arrays of integer 0/1 bits. A toggle also accepts boolean or case-insensitive
+`on`/`off`; a list also accepts a stored slot index. The receipt retains the original argument and
+`value_stored`.
 
-`routes:wizard_place(game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0)` reaches the Guard the
-Edge Preview using bridged notice headers and shown coordinates. It sends fixed library stick pulses, follows
-the shown text after each pulse, and leaves Preview unconfirmed. `pulse_cap` is a harness publication-wait
-bound, not a product tolerance. A null is inferred from no publication and cannot be distinguished from a
-late publication; the bounded loop fails closed on consecutive nulls. Shown positions are whole units, not
-exact position words, and notice text is a request, not proof it was visibly rendered.
+`routes:wizard_place(game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0, tolerance=0)` reaches the
+Guard the Edge Preview using page bodies and bridged notice headers, independent of the page count. An
+`area` request needs an Area page; CPU and P1 targets are shown whole units, with allowed axis difference
+`tolerance`. The block sends fixed library stick pulses and leaves Preview unconfirmed. `pulse_cap` is a
+harness publication-wait bound, not a product tolerance. Receipts list pages, observed owners, each pulse's
+publication status and the number of unconfirmed pulses. An unpublished pulse may have moved the point by
+less than a shown unit; only shown coordinates are verified. Exact position words are available from the
+release marker. Notice text is a request, not proof it was visibly rendered.
 
 `routes:drill_stop(game, cap=30)` refuses a visible wizard and a different or stopped practice game. It opens
 the Guard the Edge Start row, presses A, requires a same-epoch `game.running=0`, and closes the menu. The
@@ -450,18 +467,25 @@ published row title is static Start even when the UI draws Stop; it is not used 
 
 `routes:drill_start(game, expect=None, cap=60)` accepts only Guard the Edge. In Preview it requires the wizard
 heading to disappear; otherwise it starts from the menu and requires the stopped-to-running transition.
-With trace enabled it reads the first release and records preceding terminal markers in
-`markers_before_release` (they may end an earlier arm); without trace it can only run when `expect` is omitted.
+With trace enabled it records the `trace.list` sequence fence taken immediately before the start input,
+the observed state used for it, the first release after that fence, pre-fence markers and post-fence
+terminals preceding the first release. Without trace it can only run when `expect` is omitted.
 Expect keys are `cpu_kind`, `stage_form`, `stage_id`, `perfect`, `juggler`, `damage`, `cpu`, `cpu_words`,
-`p1`, `p1_words` and `plan`. Positions compare whole-unit shown strings; words compare exactly.
+`p1`, `p1_words`, `plan` and `tolerance`. Positions compare whole-unit shown strings by default or world
+units within the supplied tolerance; damage allows 0.05 and words compare exactly.
 A `plan` check needs the armed symbolic `planner_chose` point and holds the block until the first attempt's
-terminal. `'none'` requires no plan before that terminal. The trace and bridge witnesses do not prove
-that the requested on-screen text was visibly rendered.
+matching-ordinal terminal. `'none'` requires no plan in the attempt and zero planner hits; a hit without
+a record is reported as not observed. The sequence fence assumes no recorded point has been removed
+from `trace.list`. It excludes stale queued records but does not itself prove the input/record ordering.
+The trace and bridge witnesses do not prove that the requested on-screen text was visibly rendered.
 
-`routes:drill_observe(attempts, cap, allow_stopped=False, count='terminals')` counts Guard Edge release and terminal markers from
-the trace, then checks `tr.menu.game.running`. It needs an armed records point targeting the
+`routes:drill_observe(attempts, cap, game='Guard the Edge', perfect=None, allow_stopped=False,
+count='terminals')` counts matching release or terminal markers and checks the named game at both ends.
+Markers must match the game and have a consistent Perfect bit, optionally as requested; CPU kinds can
+change and are reported as a set. It needs an armed records point targeting the
 `edge_juggle_attempt` symbol and a trace file on the instance. It rejects trace loss, unreadable records,
 point changes and bridge epoch changes. File-loss and point-drop counters are recorded at entry and exit and
-must remain unchanged; nonzero initial counts are allowed. Zoom results have no terminal marker: use
-`count='releases'` for Zoom. A stopped game fails unless `allow_stopped` is true. The block performs no inputs;
+must remain unchanged, and every attempt-point hit must have been recorded; nonzero initial counts are allowed.
+Zoom arms emit neither release nor terminal markers on this probe and need a separate packet step.
+A stopped game fails unless `allow_stopped` is true. The block performs no inputs;
 marker counts do not by themselves prove correct gameplay or a visibly rendered notice.

@@ -1645,7 +1645,7 @@ def _armed_native_sample(io, initial, until, route, *, settling=False):
     io.arm(native_picker.UI, remaining)
     if io.connection != initial.connection or io.boot != initial.clock[0]:
         raise RuntimeError(f'bridge connection or boot changed while arming {route} watch')
-    before = native_picker.wait_sample(io, native_picker.UI, until, initial, loading_ui=settling)
+    before = _remember(io, native_picker.wait_sample(io, native_picker.UI, until, initial, loading_ui=settling))
     if before.connection != initial.connection:
         raise RuntimeError(f'bridge connection changed before {route} input')
     return before
@@ -2061,7 +2061,7 @@ def _wait_tr_menu(io, until, opened, after=None, *, strict=False):
         state = _remember(io, io.read('tr.menu', remaining))
         block = state.block
         if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
-            raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
+            raise RuntimeError(f'expected complete tr.menu/1 reply; saw {block!r}')
         if after is not None:
             native_picker.same_epoch(after, state, in_flight=True)
             if block['rev'] <= after.block['rev']:
@@ -2069,8 +2069,8 @@ def _wait_tr_menu(io, until, opened, after=None, *, strict=False):
         if _fields_match(state, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
             return state
         if strict:
-            raise RuntimeError('Training Mod menu changed scene, keyboard, or open state')
-    raise RuntimeError(f'Training Mod menu needs tr.menu scene=training, keyboard=0, open={int(opened)}')
+            raise RuntimeError(f'expected Training Mod scene, keyboard and open state; saw {state.values!r}')
+    raise RuntimeError(f'expected tr.menu scene=training, keyboard=0, open={int(opened)}; saw no matching menu')
 
 
 def _tr_menu_gate(ctx, cap):
@@ -2231,7 +2231,7 @@ def _tr_input(io, before, macro, until, *, opened=True):
             after = _remember(io, io.read('tr.menu', remaining))
             block = after.block
             if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
-                raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
+                raise RuntimeError(f'expected complete tr.menu/1 reply; saw {block!r}')
             native_picker.same_epoch(latest, after, in_flight=True)
             if block['rev'] <= latest.block['rev']:
                 continue
@@ -2289,7 +2289,7 @@ def _with_setup_metrics(ctx, action):
 
 
 def _remember(io, state):
-    metrics = getattr(io.ctx.runner, 'setup_metrics', None)
+    metrics = getattr(getattr(getattr(io, 'ctx', None), 'runner', None), 'setup_metrics', None)
     if metrics is not None and 'last_seen' in metrics:
         fields = ('open', 'page', 'depth', 'focus', 'action', 'row', 'game', 'game.running',
                   'notice.header', 'notice.body', 'editor', 'editor.sel')
@@ -2353,7 +2353,7 @@ def _tr_current(io, until):
     if (menu.block['schema'] != 'tr.menu/1' or menu.block['rev'] <= 0 or menu.block['filtered']
             or menu.values.get('scene') != 'training' or menu.values.get('keyboard') != '0'
             or menu.values.get('open') not in ('0', '1')):
-        raise RuntimeError('Training Mod needs a complete menu observation in Training without a keyboard')
+        raise RuntimeError(f'expected complete menu observation in Training without a keyboard; saw {menu.values!r}')
     return menu
 
 
@@ -2531,7 +2531,7 @@ def _navigate_menu(io, menu, page, path, until):
             if after.values.get('page') != page or _tr_depth(after) != depth + 1:
                 raise RuntimeError('Training Mod page or depth did not enter the requested sub-screen')
             if not isinstance(after.values.get('group'), str) or not after.values['group'].isdigit():
-                raise RuntimeError('Training Mod Rows group was not published after A')
+                raise RuntimeError('Training Mod Rows group was not published after activation')
             _tr_identity(after)
             menu = after
     return menu
@@ -2587,15 +2587,15 @@ def _settings_menu(data):
         if not isinstance(root, Pairs):
             raise ValueError('top-level settings is not an object')
         top = unique(root, '')
-        menu = top['menu']
         for name in ('menu', 'defaults_menu'):
             if isinstance(top.get(name), Pairs):
-                unique(top[name], name + '.')
+                top[name] = unique(top[name], name + '.')
+        menu = top['menu']
     except (ValueError, KeyError, TypeError) as error:
         raise RuntimeError(f'settings menu is missing or malformed: {error}') from error
-    if not isinstance(menu, Pairs):
+    if not isinstance(menu, dict):
         raise RuntimeError('settings menu is not an object')
-    return unique(menu, 'menu.')
+    return menu
 
 
 def _settings_row(menu, key):
@@ -2643,8 +2643,7 @@ def _practice_target(row_id, value, before):
     if mode == 'Zoom' and entry['kind'] != 0x53:
         raise RuntimeError('practice Zoom is available only for Hero')
     old_level = before.get(level_key)
-    if (not isinstance(old_level, list) or len(old_level) != 9
-            or any(type(item) is not int or item not in (0, 1) for item in old_level) or sum(old_level) != 1):
+    if len(old_level) != 9 or sum(old_level) != 1:
         raise RuntimeError(f'settings menu.{level_key} is not a one-hot level')
     level = value.get('level', int(match[1]) if match else old_level.index(1) + 1)
     if type(level) is not int or not 1 <= level <= 9 or match and int(match[1]) != level:
@@ -2708,8 +2707,8 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
             raise RuntimeError(f'expected a 0/1 integer array for value; saw {value!r}')
         if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
             raise RuntimeError(f'invalid {kind} value encoding')
-        if not isinstance(before, list) or len(before) != len(value):
-            raise RuntimeError(f'settings menu.{row_id} has a missing or incompatible array')
+        if len(before) != len(value):
+            raise RuntimeError(f'expected settings menu.{row_id} array of length {len(value)}; saw {before!r}')
         wanted = {row_id: value}
     if time.monotonic() >= until:
         raise RuntimeError('Training Mod setting deadline expired before applying')
@@ -2857,7 +2856,7 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
 def _edge_wizard(menu):
     header = menu.values.get('notice.header')
     if not isinstance(header, str):
-        raise RuntimeError('practice wizard notice header is missing')
+        raise RuntimeError(f'expected practice wizard notice header; saw {header!r}')
     match = re.fullmatch(r'Edge · (\d+)/(\d+)', header)
     return bool(match and 1 <= int(match[1]) <= int(match[2]))
 
@@ -2921,7 +2920,7 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
     while (remaining := deadline - time.monotonic()) > 0:
         state = _remember(io, io.read('tr.menu', remaining))
         if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
-            raise RuntimeError('wizard needs a complete tr.menu/1 reply')
+            raise RuntimeError(f'expected complete wizard tr.menu/1 reply; saw {state.block!r}')
         native_picker.same_epoch(menu, state, in_flight=True)
         current = _wizard_body(state, game)
         if current['header'] != page['header'] or current['kind'] != page['kind']:
@@ -2934,7 +2933,7 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
         raise RuntimeError(f'wizard deadline after pulse; last shown {page["body"]!r}')
     state = _remember(io, io.read('tr.menu', min(pulse_cap, until - time.monotonic())))
     if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
-        raise RuntimeError('wizard needs a complete tr.menu/1 reply')
+        raise RuntimeError(f'expected complete wizard tr.menu/1 reply; saw {state.block!r}')
     native_picker.same_epoch(menu, state, in_flight=True)
     current = _wizard_body(state, game)
     if current['header'] != page['header'] or current['kind'] != page['kind']:
@@ -2945,7 +2944,7 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
     if state.block['rev'] > menu.block['rev']:
         io.finish()
         return state, True
-    raise RuntimeError('wizard pulse reread contradicted its prior notice')
+    raise RuntimeError(f'expected unchanged or newer wizard notice; saw {current!r}')
 
 
 def _shown_matches(shown, target, tolerance):
@@ -3090,13 +3089,13 @@ def _try_tr_condition(io, before, until, predicate):
     while (remaining := until - time.monotonic()) > 0:
         state = _remember(io, io.read('tr.menu', remaining))
         if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
-            raise RuntimeError('practice witness needs a complete tr.menu/1 reply')
+            raise RuntimeError(f'expected complete practice tr.menu/1 reply; saw {state.block!r}')
         native_picker.same_epoch(latest, state, in_flight=True)
         if state.block['rev'] <= latest.block['rev']:
             continue
         latest = state
         if state.values.get('scene') != 'training' or state.values.get('keyboard') != '0':
-            raise RuntimeError('practice witness changed scene or opened a keyboard')
+            raise RuntimeError(f'expected Training scene without keyboard; saw {state.values!r}')
         if predicate(state):
             return state
     return None
@@ -3106,7 +3105,8 @@ def _wait_tr_condition(io, before, until, predicate, label):
     state = _try_tr_condition(io, before, until, predicate)
     if state is not None:
         return state
-    raise RuntimeError(f'practice {label} not observed before deadline')
+    metrics = getattr(io.ctx.runner, 'setup_metrics', None) or {}
+    raise RuntimeError(f'expected practice {label}; saw {metrics.get("last_seen", {})!r}')
 
 
 def drill_stop(ctx, game, cap=30):
@@ -3170,11 +3170,12 @@ def drill_observe(ctx, attempts, cap, game='Guard the Edge', perfect=None, allow
     return _block(ctx, 'drill_observe', 'routes-drill-observe', args, action)
 
 
-def _trace_snapshot(ctx, path, needs_plan=False):
+def _trace_snapshot(ctx, path, needs_plan=False, *, expected=None):
     status = ctx.call('trace.list', {})
     if (status.get('output_error') or status.get('boot_error') or status.get('output') != path
             or 'file_lost' not in status):
-        raise RuntimeError('attempt trace output is unavailable or mismatched')
+        actual = {key: status.get(key) for key in ('output', 'output_error', 'boot_error', 'file_lost')}
+        raise RuntimeError(f'expected available attempt trace output {path!r}; saw {actual!r}')
     try:
         points = status['points']
         sequence = sum(trace_attempts._decimal(point['recorded']) for point in points)
@@ -3193,7 +3194,10 @@ def _trace_snapshot(ctx, path, needs_plan=False):
         planner = selected('planner_chose') if needs_plan else None
         if planner and planner['identity'][0] != attempt['identity'][0]:
             raise RuntimeError('planner and attempt trace processes differ')
-        return {'sequence': sequence, 'file_lost': loss, 'attempt': attempt, 'planner': planner}
+        snapshot = {'sequence': sequence, 'file_lost': loss, 'attempt': attempt, 'planner': planner}
+        if expected is not None:
+            _same_trace_points(expected, snapshot)
+        return snapshot
     except (KeyError, TypeError, ValueError, StopIteration) as error:
         raise RuntimeError(f'attempt trace counter or point identity is unavailable: {error}') from error
 
@@ -3315,8 +3319,7 @@ def _drill_start(ctx, game, expect, cap, metrics):
         if time.monotonic() >= until:
             raise RuntimeError('practice start deadline expired before wizard input')
         if stream is not None:
-            fence = _trace_snapshot(ctx, path, needs_plan)
-            _same_trace_points(preflight, fence)
+            fence = _trace_snapshot(ctx, path, needs_plan, expected=preflight)
         menu = _send_with_retry(io, 'tap-a1', until,
                                 lambda deadline: _try_tr_condition(
                                     io, initial, deadline,
@@ -3327,14 +3330,13 @@ def _drill_start(ctx, game, expect, cap, metrics):
         if initial.values.get('game.running') == '1':
             raise RuntimeError('a practice game is already running; call drill_stop')
         if initial.values.get('game.running') != '0':
-            raise RuntimeError('practice running state is missing before start')
+            raise RuntimeError(f'expected practice running=0 before start; saw {initial.values.get("game.running")!r}')
         menu, skipped = _open_menu(io, until, 'fighters_stages', after=initial)
         menu = _navigate_menu(io, menu, 'fighters_stages', _tr_path(['game.6', 'start.6']), until)
         if _edge_wizard(menu) or menu.values.get('game.running') != '0':
-            raise RuntimeError('practice running or wizard state changed before start')
+            raise RuntimeError(f'expected stopped practice without wizard before start; saw {menu.values!r}')
         if stream is not None:
-            fence = _trace_snapshot(ctx, path, needs_plan)
-            _same_trace_points(preflight, fence)
+            fence = _trace_snapshot(ctx, path, needs_plan, expected=preflight)
         menu = _tr_input(io, menu, 'tap-a1', until, opened=False)
         if menu.values.get('game') != game or menu.values.get('game.running') != '1':
             menu = _wait_tr_condition(io, menu, until,
@@ -3346,7 +3348,8 @@ def _drill_start(ctx, game, expect, cap, metrics):
     selected_plan = None
     terminal = None
     if stream is not None:
-        observed['fence'] = fence['sequence']
+        observed['fence'] = {'sequence': fence['sequence'], 'taken': 'immediately before the start input',
+                             'state': 'wizard Preview' if wizard else 'not running'}
         while time.monotonic() < until:
             ctx.check_stop()
             for mark in stream.read(until):
@@ -3401,7 +3404,7 @@ def _drill_start(ctx, game, expect, cap, metrics):
     if needs_plan:
         verified.update({'plan': plan_value, 'plan_terminal': terminal, 'planner': delta['planner']})
     if fence:
-        verified['fence'] = fence['sequence']
+        verified['fence'] = observed['fence']
         verified['trace_loss_start'] = {'file_lost': fence['file_lost'],
                                         'point_dropped': fence['attempt']['counters']['dropped']}
         verified['trace_loss_end'] = {'file_lost': end['file_lost'],
@@ -3498,7 +3501,7 @@ def _drill_observe(ctx, args, metrics):
     if final.values.get('game') != args['game']:
         raise RuntimeError(f'expected game {args["game"]}; saw {final.values.get("game")!r}')
     if running not in ('0', '1'):
-        raise RuntimeError('drill running state is missing')
+        raise RuntimeError(f'expected drill running state 0 or 1; saw {running!r}')
     collect()
     trace_end = _trace_snapshot(ctx, path)
     _trace_delta(trace_start, trace_end)

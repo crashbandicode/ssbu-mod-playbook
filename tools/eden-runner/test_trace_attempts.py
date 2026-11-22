@@ -494,7 +494,8 @@ class StartTests(ObserveTests):
 
         self.ctx.call = call
         result = self.invoke_start(expect={'cpu_kind': 0x5a})
-        self.assertEqual(result['verified']['fence'], 44870)
+        self.assertEqual(result['verified']['fence'], {'sequence': 44870,
+                         'taken': 'immediately before the start input', 'state': 'wizard Preview'})
         self.assertEqual(result['verified']['first_release']['sequence'], 44871)
         self.assertEqual([mark['sequence'] for mark in result['verified']['markers_before_start']],
                          [44362, 44870])
@@ -523,6 +524,14 @@ class StartTests(ObserveTests):
         result = self.invoke_start(expect={'cpu': [-120, 20], 'tolerance': .02,
                                            'damage': decoded['damage'] + .04})
         self.assertEqual(result['verified']['first_release']['sequence'], int(release['sequence']))
+
+    def test_menu_start_fence_records_not_running_precondition(self):
+        self.io = StartIO(self.ctx, wizard=False)
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
+        result = self.invoke_start(expect={'cpu_kind': 0x53})
+        self.assertEqual(result['verified']['fence'], {'sequence': 0,
+                         'taken': 'immediately before the start input', 'state': 'not running'})
 
     def test_terminal_must_close_same_release_ordinal(self):
         self.io = StartIO(self.ctx)
