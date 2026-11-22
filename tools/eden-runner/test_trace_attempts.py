@@ -240,17 +240,63 @@ class ObserveTests(unittest.TestCase):
         result = self.invoke(attempts=1, cap=.5)
         self.assertEqual(result['verified']['last_sequence'], 58100)
 
-    def test_nonzero_initial_drop_counter_fails_closed(self):
+    def test_nonzero_initial_counters_are_recorded_and_allowed(self):
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
         original = self.ctx.call
 
         def call(method, params):
             result = original(method, params)
-            result['points'][0]['dropped'] = '1'
+            result['points'][0]['dropped'] = '3'
+            result['file_lost'] = '5'
+            return result
+
+        self.ctx.call = call
+        result = self.invoke(attempts=1, cap=.5, count='releases')
+        self.assertEqual(result['verified']['releases'], 1)
+        self.assertEqual(result['verified']['terminals'], {})
+        self.assertEqual(result['verified']['trace_loss_start'], {'file_lost': 5, 'point_dropped': 3})
+        self.assertEqual(result['verified']['trace_loss_end'], {'file_lost': 5, 'point_dropped': 3})
+
+    def test_nonzero_baseline_with_increased_file_loss_fails(self):
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
+        original = self.ctx.call
+        calls = 0
+
+        def call(method, params):
+            nonlocal calls
+            calls += 1
+            result = original(method, params)
+            result['file_lost'] = '9' if calls >= 3 else '8'
             return result
 
         self.ctx.call = call
         with self.assertRaisesRegex(RuntimeError, 'loss'):
-            self.invoke(attempts=1, cap=.2)
+            self.invoke(attempts=1, cap=.5, count='releases')
+
+    def test_counter_reset_is_not_a_valid_delta_fence(self):
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
+        original = self.ctx.call
+        calls = 0
+
+        def call(method, params):
+            nonlocal calls
+            calls += 1
+            result = original(method, params)
+            result['points'][0]['dropped'] = '0' if calls >= 3 else '2'
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'loss'):
+            self.invoke(attempts=1, cap=.5, count='releases')
+
+    def test_releases_expiry_and_unknown_count_fail(self):
+        with self.assertRaisesRegex(RuntimeError, '0.*release'):
+            self.invoke(attempts=1, cap=.02, count='releases')
+        with self.assertRaisesRegex(RuntimeError, 'count'):
+            self.invoke(attempts=1, cap=.1, count='unknown')
 
 
 if __name__ == '__main__':
