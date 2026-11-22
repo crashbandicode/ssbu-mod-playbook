@@ -60,6 +60,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
+| `tr_set` `{page, path, kind, value, cap}` | Training, settings file available through bridge | stored value reread, with a writer line for changes |
+| `wizard_place` `{game, area, cpu, p1, cap, pulse_cap}` | Guard the Edge wizard or Training menu | shown positions checked at unconfirmed Preview |
 | `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, allow_stopped, count}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |

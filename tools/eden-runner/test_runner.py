@@ -212,7 +212,7 @@ class ReviewAdmissionTests(unittest.TestCase):
         plan = copy.deepcopy(self.plan)
         plan['setup'] = [{'state': 'training', 'via': 'hook', 'ref': 'routes:reach_training'}]
         names = ('reach_training', 'set_cpu', 'set_player', 'tr_settings', 'setup_state', 'tr_open',
-                 'tr_goto', 'tr_close', 'drill_start', 'drill_observe', 'drill_stop')
+                 'tr_goto', 'tr_set', 'tr_close', 'wizard_place', 'drill_start', 'drill_observe', 'drill_stop')
         for name in names:
             self.assertTrue(callable(getattr(routes, name, None)), name)
         plan['rows'][0].update(role='setup', steps=[{'run': f'routes:{name}'} for name in names]

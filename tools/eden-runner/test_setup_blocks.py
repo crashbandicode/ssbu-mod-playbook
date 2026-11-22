@@ -405,6 +405,12 @@ class WizardTests(OpenCloseTests):
         with self.assertRaisesRegex(RuntimeError, 'unreachable|deadline'):
             self.invoke('wizard_place', io, game='Guard the Edge', cpu=[40, 1], cap=.001, pulse_cap=.002)
 
+    def test_player_floor_ray_failure_reports_unadvanced_body(self):
+        io = WizardIO(self.ctx, step=3, fault='header_stuck')
+        with self.assertRaisesRegex(RuntimeError, r'P1 \(0, 0\)'):
+            self.invoke('wizard_place', io, game='Guard the Edge', cap=.02, pulse_cap=.002)
+        self.assertEqual(io.actions, ['tap-a1'])
+
     def test_minus_zero_is_distinct_and_other_axis_is_rechecked(self):
         io = WizardIO(self.ctx, step=2, fault='null')
         io.cpu = [0.0, 1.0]
