@@ -581,6 +581,41 @@ class RunnerTests(unittest.TestCase):
         self.make(FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)).run()
         self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
 
+    def test_attempt_journal_preserves_failure_retry_and_skips_passed_rows(self):
+        self.plan['rows'] = [self.plan['rows'][0]]
+        self.plan['rows'][0]['role'] = 'test'
+        self.plan['gates']['red']['cap'] = .1
+        self.manifest.write_text(json.dumps(self.plan))
+        with self.assertRaises(RuntimeError):
+            self.make(FakeEden({'to-red': BLUE})).run()
+        (self.dir / 'out' / 'STOP-INPUT').unlink()
+        self.make(FakeEden({'to-red': RED})).run()
+        journal = self.dir / 'out' / 'attempts.jsonl'
+        before = journal.read_bytes()
+        self.make(FakeEden({'to-red': RED})).run()
+        self.assertEqual(journal.read_bytes(), before)
+        attempts = [json.loads(line) for line in before.splitlines()]
+        self.assertEqual([(a['id'], a['role'], a['status']) for a in attempts],
+                         [('r1', 'test', 'FAILED'), ('r1', 'test', 'PASS')])
+        self.assertTrue(all(set(a) == {'id', 'role', 'started', 'ended', 'status'} for a in attempts))
+        self.assertLessEqual(attempts[0]['started'], attempts[0]['ended'])
+        self.assertLess(attempts[0]['started'], attempts[1]['started'])
+        self.assertLessEqual(attempts[1]['started'], attempts[1]['ended'])
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual((receipt['status'], receipt['started'], receipt['ended']),
+                         ('PASS', attempts[1]['started'], attempts[1]['ended']))
+
+    def test_attempt_journal_includes_refused_unexecuted_row(self):
+        r = self.make(FakeEden({}))
+        with mock.patch.object(r, 'session_start', side_effect=runner.StopRun('recording unavailable')):
+            with self.assertRaises(runner.StopRun):
+                r.run()
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        attempts = [json.loads(line) for line in (self.dir / 'out' / 'attempts.jsonl').read_text().splitlines()]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0], {key: receipt[key] for key in
+                                      ('id', 'role', 'started', 'ended', 'status', 'not_executed')})
+
     def two_instances(self):
         logs = {}
         for side in ('a', 'b'):

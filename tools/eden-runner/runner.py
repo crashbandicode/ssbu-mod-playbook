@@ -2057,6 +2057,13 @@ class Runner:
                 item[key] = value
         self.outcomes[row_id] = item
 
+    def record_attempt(self, receipt):
+        attempt = {key: receipt[key] for key in ('id', 'role', 'started', 'ended', 'status')}
+        if receipt.get('not_executed'):
+            attempt['not_executed'] = True
+        with (self.out / 'attempts.jsonl').open('a') as f:
+            f.write(json.dumps(attempt) + '\n')
+
     def stop_input(self, row, text):
         (self.out / 'STOP-INPUT').write_text(text if str(text).endswith('\n') else f'{text}\n')
 
@@ -2749,6 +2756,7 @@ class Runner:
             except StopRun as error:  # never run a row unrecorded: stopped before any of its input
                 receipt.update(status='FAILED', error=repr(error), ended=time.time(), not_executed=True)
                 receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                self.record_attempt(receipt)
                 self.note(row['id'], 'fail', receipt='FAILED')
                 print(json.dumps({'row': row['id'], 'status': 'FAILED', 'error': repr(error)[:300],
                                   'receipt': str(receipt_path)}), flush=True)
@@ -2829,6 +2837,7 @@ class Runner:
                 if self.acquired:
                     receipt['acquired_references'] = self.acquired
                 receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                self.record_attempt(receipt)
                 for key in self.clients:
                     try:
                         self.call(key, 'input.reset')

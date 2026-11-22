@@ -25,7 +25,9 @@ fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 import argparse
 import copy
 import hashlib
+import heapq
 import json
+import math
 import os
 import posixpath
 import re
@@ -551,29 +553,110 @@ def prune_summary(run, journal):
 def time_split(run):
     timing_path = run / 'timing.json'
     timing = json.loads(timing_path.read_text()) if timing_path.exists() else {}
-    runs = [(start, end) for start, end in timing.get('runs', []) if end]
-    rows_seconds = sum(end - start for start, end in runs) if runs else timing.get('run_end', 0) - timing.get('run_start', 0)
     rows_path = run / 'rows' / 'rows.json'
     spec = json.loads(rows_path.read_text()) if rows_path.exists() else []
     rows = spec.get('rows', []) if isinstance(spec, dict) else spec
-    durations = {'setup': 0, 'test': 0}
-    for row in rows:
-        path = run / 'out' / f'{row["id"]}.json'
-        if not path.exists():
+    rows_by_id = {row['id']: row for row in rows}
+    out = run / 'out'
+    candidates = []
+    journal = out / 'attempts.jsonl'
+    if journal.is_file():
+        for line in journal.read_text().splitlines():
+            try:
+                attempt = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(attempt, dict) and isinstance(attempt.get('id'), str) and attempt['id'] in rows_by_id:
+                candidates.append(attempt)
+    paths = list(out.iterdir()) if out.is_dir() else []
+    for row_id in rows_by_id:
+        for path in paths:
+            if (path.name != f'{row_id}.json' and
+                    not (path.name.startswith(f'{row_id}.FAILED.') and path.name.endswith('.json'))):
+                continue
+            try:
+                receipt = json.loads(path.read_text())
+            except (OSError, ValueError):
+                receipt = {}
+            if isinstance(receipt, dict) and receipt.get('id', row_id) == row_id:
+                candidates.append({'id': row_id, **receipt})
+
+    def numeric(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
+    def valid_interval(attempt):
+        start, end = attempt.get('started'), attempt.get('ended')
+        return numeric(start) and numeric(end) and end >= start
+
+    attempts_by_start, skipped = {}, 0
+    for attempt in candidates:
+        start = attempt.get('started')
+        start_key = ('numeric', start) if numeric(start) else ('invalid', json.dumps(start, sort_keys=True))
+        key = (attempt['id'], start_key)
+        prior = attempts_by_start.get(key)
+        if prior is None or (not valid_interval(prior) and valid_interval(attempt)):
+            attempts_by_start[key] = attempt
+
+    intervals = []
+    for kind in ('up', 'down'):
+        start, end = timing.get(kind + '_start'), timing.get(kind + '_done')
+        if numeric(start) and numeric(end) and end >= start:
+            intervals.append((start, end, kind))
+    attempts, roles_defaulted = 0, 0
+    for attempt in attempts_by_start.values():
+        if not valid_interval(attempt):
+            skipped += 1
             continue
-        receipt = json.loads(path.read_text())
-        if receipt.get('started') is None or receipt.get('ended') is None:
+        start, end = attempt['started'], attempt['ended']
+        role = attempt.get('role')
+        if role is None:
+            row = rows_by_id[attempt['id']]
+            role = 'setup' if row.get('start') != row.get('end') else 'test'
+            roles_defaulted += 1
+        if role not in ('setup', 'test'):
+            skipped += 1
             continue
-        role = receipt.get('role', 'setup' if row.get('start') != row.get('end') else 'test')
-        if role in durations:
-            durations[role] += receipt['ended'] - receipt['started']
-    up = timing['up_done'] - timing['up_start'] if 'up_done' in timing and 'up_start' in timing else 0
-    down = timing['down_done'] - timing['down_start'] if 'down_done' in timing and 'down_start' in timing else 0
-    between = max(0, rows_seconds - durations['setup'] - durations['test'])
-    harness = up + durations['setup'] + between + down
-    total = harness + durations['test']
-    return {'up': up, 'setup': durations['setup'], 'test': durations['test'], 'between_rows': between,
-            'down': down, 'harness': harness, 'test_share': round(durations['test'] / total, 3) if total else 0}
+        attempts += 1
+        intervals.append((start, end, role))
+
+    first, last = timing.get('up_start'), timing.get('down_done')
+    window = last - first if numeric(first) and numeric(last) and last >= first else None
+    durations = {'up': 0, 'setup': 0, 'test': 0, 'down': 0}
+    if window is None:
+        for start, end, kind in intervals:
+            durations[kind] += end - start
+    events = []
+    if window is not None:
+        events.extend([(first, 0, None), (last, 0, None)])
+    for i, (start, end, _) in enumerate(intervals):
+        begin, finish = (max(start, first), min(end, last)) if window is not None else (start, end)
+        if finish > begin:
+            events.extend([(begin, 1, i), (finish, -1, i)])
+    events.sort()
+    active, earliest = set(), []
+    overlap, unclassified, previous = 0, 0, None
+    for at, change, i in events:
+        if previous is not None and at > previous:
+            duration = at - previous
+            if active:
+                while earliest[0][1] not in active:
+                    heapq.heappop(earliest)
+                if window is not None:
+                    durations[intervals[earliest[0][1]][2]] += duration
+                if len(active) > 1:
+                    overlap += duration
+            elif window is not None:
+                unclassified += duration
+        if change == 1:
+            active.add(i)
+            heapq.heappush(earliest, (intervals[i][0], i))
+        elif change == -1:
+            active.remove(i)
+        previous = at
+    total = sum(durations.values())
+    return {'window': window, **durations, 'unclassified': unclassified if window is not None else None,
+            'overlap': overlap, 'attempts': attempts, 'attempts_skipped': skipped, 'roles_defaulted': roles_defaulted,
+            'test_share': round(durations['test'] / total, 3) if total else 0}
 
 
 def results_md(run, config):
@@ -582,7 +665,11 @@ def results_md(run, config):
     timing = json.loads((run / 'timing.json').read_text())
     runs = [(start, end) for start, end in timing.get('runs', []) if end]
     rows_seconds = sum(end - start for start, end in runs) if runs else timing.get('run_end', 0) - timing.get('run_start', 0)
-    split = timing.get('split') or time_split(run)
+    up_seconds = timing['up_done'] - timing['up_start'] if 'up_done' in timing and 'up_start' in timing else 0
+    down_seconds = timing['down_done'] - timing['down_start'] if 'down_done' in timing and 'down_start' in timing else 0
+    split = timing.get('split')
+    if not isinstance(split, dict) or 'unclassified' not in split:
+        split = time_split(run)
     rows_now = sha256(run / 'rows' / 'rows.json')
     rows_note = rows_now[:12] + '…' + ('' if rows_now == config['rows']['sha256'] else
                                        f' (changed during the boot; Up had {config["rows"]["sha256"][:12]}…)')
@@ -601,9 +688,12 @@ def results_md(run, config):
                        + '; '.join(unit_results(run)), 240),
               one_line(f'- Prune: {prune_summary(run, journal)}', 240),
               f'- Harvest: {harvest_summary(run)}',
-              f'- Timing: up {timing.get("up_done", 0) - timing.get("up_start", 0):.0f} s, rows {rows_seconds:.0f} s over '
-              f'{max(len(runs), 1)} run call(s), down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s; '
-              f'harness {split["harness"]:.0f} s, test {split["test"]:.0f} s ({split["test_share"] * 100:.1f} %)',
+              f'- Timing: up {up_seconds:.0f} s, rows {rows_seconds:.0f} s over '
+              f'{max(len(runs), 1)} run call(s), down {down_seconds:.0f} s; '
+              f'classified: up+setup+down {split["up"] + split["setup"] + split["down"]:.0f} s, '
+              f'test {split["test"]:.0f} s, unclassified '
+              f'{f"{split["unclassified"]:.0f} s" if split["unclassified"] is not None else "?"}'
+              + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
     (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
     print('\n'.join(lines[:20]))

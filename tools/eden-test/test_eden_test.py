@@ -247,6 +247,105 @@ class PinnedFixtureTests(unittest.TestCase):
         self.assertEqual(self.check('--skip-setup-plan'), 2)
 
 
+class IntervalAccountingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        (self.run / 'rows').mkdir()
+        (self.run / 'out').mkdir()
+        self.rows = [{'id': 'r1', 'start': 'training', 'end': 'training'}]
+        self.set_rows()
+        self.set_timing(up_start=0, up_done=5, down_start=25, down_done=30)
+
+    def set_rows(self):
+        (self.run / 'rows/rows.json').write_text(json.dumps({'rows': self.rows}))
+
+    def set_timing(self, **timing):
+        (self.run / 'timing.json').write_text(json.dumps(timing))
+
+    def receipt(self, name, value):
+        (self.run / 'out' / name).write_text(json.dumps(value))
+
+    def journal(self, values):
+        (self.run / 'out/attempts.jsonl').write_text(''.join(json.dumps(value) + '\n' for value in values))
+
+    def test_two_journal_attempts_and_latest_receipt_deduplicate(self):
+        failed = {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15, 'status': 'FAILED'}
+        passed = {'id': 'r1', 'role': 'test', 'started': 15, 'ended': 25, 'status': 'PASS'}
+        self.journal([failed, passed])
+        self.receipt('r1.json', passed)
+        split = eden_test.time_split(self.run)
+        self.assertEqual(split, {'window': 30, 'up': 5, 'setup': 0, 'test': 20, 'down': 5,
+                                 'unclassified': 0, 'overlap': 0, 'attempts': 2, 'attempts_skipped': 0,
+                                 'roles_defaulted': 0, 'test_share': 0.667})
+
+    def test_externally_retained_attempt_is_counted(self):
+        self.receipt('r1.FAILED.before-fix.json',
+                     {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15, 'status': 'FAILED'})
+        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'started': 15, 'ended': 25, 'status': 'PASS'})
+        self.receipt('other.FAILED.outside.json', {'id': 'other', 'role': 'test', 'started': 5, 'ended': 25})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['test'], split['attempts'], split['unclassified']), (20, 2, 0))
+
+    def test_runner_window_gap_is_unclassified(self):
+        self.set_timing(up_start=0, up_done=5, down_start=55, down_done=60, runs=[[10, 15], [45, 50]])
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 10, 'ended': 15},
+                      {'id': 'r1', 'role': 'test', 'started': 45, 'ended': 50}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['test'], split['unclassified']), (60, 10, 40))
+
+    def test_overlap_goes_to_the_interval_that_started_first(self):
+        self.set_timing(up_start=0, up_done=5, down_start=20, down_done=25)
+        self.rows.append({'id': 'r2', 'start': 'menu', 'end': 'training'})
+        self.set_rows()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15},
+                      {'id': 'r2', 'role': 'setup', 'started': 10, 'ended': 20}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['up'], split['test'], split['setup'], split['down'], split['overlap'],
+                          split['unclassified']), (5, 10, 5, 5, 5, 0))
+
+    def test_clipping_and_three_way_overlap_count_wall_time_once(self):
+        self.set_timing(up_start=10, up_done=12, down_start=25, down_done=30)
+        self.rows.extend([{'id': 'r2', 'start': 'menu', 'end': 'training'},
+                          {'id': 'r3', 'start': 'menu', 'end': 'training'}])
+        self.set_rows()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15},
+                      {'id': 'r2', 'role': 'setup', 'started': 11, 'ended': 20},
+                      {'id': 'r3', 'role': 'setup', 'started': 12, 'ended': 14}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['up'], split['test'], split['setup'], split['down'],
+                          split['overlap'], split['unclassified']), (20, 0, 5, 5, 5, 5, 5))
+
+    def test_missing_window_defaults_role_and_skips_unfinished_attempt(self):
+        self.set_timing(up_start=0, up_done=5, down_start=20)
+        self.journal([{'id': 'r1', 'started': 5, 'ended': 15}, {'id': 'r1', 'started': 20}])
+        self.receipt('r1.json', {'id': 'r1', 'started': 5, 'ended': 15})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['unclassified'], split['up'], split['test'], split['down']),
+                         (None, None, 5, 10, 0))
+        self.assertEqual((split['attempts'], split['attempts_skipped'], split['roles_defaulted']), (1, 1, 1))
+        config = {'label': 'fake', 'rows': {'sha256': sha(self.run / 'rows/rows.json')},
+                  'instances': [{'app': {'path': '/fake', 'sha256': '0' * 64}}]}
+        eden_test.results_md(self.run, config)
+        line = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
+        self.assertIn('down 0 s;', line)
+        self.assertIn('; classified: up+setup+down 5 s, test 10 s, unclassified ? (1 roles defaulted)', line)
+
+    def test_invalid_duplicate_is_skipped_once(self):
+        invalid = {'id': 'r1', 'started': 'bad', 'ended': 15}
+        self.journal([invalid])
+        self.receipt('r1.json', invalid)
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['attempts'], split['attempts_skipped']), (0, 1))
+
+    def test_valid_duplicate_can_replace_incomplete_attempt(self):
+        self.journal([{'id': 'r1', 'started': 5, 'ended': 4}])
+        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['attempts'], split['attempts_skipped'], split['test']), (1, 0, 10))
+
+
 class TimeSplitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -271,15 +370,17 @@ class TimeSplitTests(unittest.TestCase):
 
     def test_split_uses_receipts_fallback_and_skips_unfinished(self):
         self.assertEqual(eden_test.time_split(self.run),
-                         {'up': 10, 'setup': 8, 'test': 20, 'between_rows': 22,
-                          'down': 5, 'harness': 45, 'test_share': 0.308})
+                         {'window': 74, 'up': 10, 'setup': 7, 'test': 20, 'down': 5,
+                          'unclassified': 32, 'overlap': 1, 'attempts': 2, 'attempts_skipped': 1,
+                          'roles_defaulted': 1, 'test_share': 0.476})
 
     def test_missing_timing_and_receipts_are_zero(self):
         (self.run / 'timing.json').write_text('{}')
         (self.run / 'rows/rows.json').write_text('[]')
         self.assertEqual(eden_test.time_split(self.run),
-                         {'up': 0, 'setup': 0, 'test': 0, 'between_rows': 0,
-                          'down': 0, 'harness': 0, 'test_share': 0})
+                         {'window': None, 'up': 0, 'setup': 0, 'test': 0, 'down': 0,
+                          'unclassified': None, 'overlap': 0, 'attempts': 0, 'attempts_skipped': 0,
+                          'roles_defaulted': 0, 'test_share': 0})
 
     def test_receipt_role_overrides_the_row_default(self):
         path = self.run / 'out/setup.json'
@@ -287,21 +388,21 @@ class TimeSplitTests(unittest.TestCase):
         receipt['role'] = 'test'
         path.write_text(json.dumps(receipt))
         split = eden_test.time_split(self.run)
-        self.assertEqual((split['setup'], split['test'], split['harness'], split['test_share']), (0, 28, 37, 0.431))
+        self.assertEqual((split['setup'], split['test'], split['unclassified'], split['test_share']), (0, 27, 32, 0.643))
 
-    def test_partial_timing_and_between_rows_floor(self):
+    def test_partial_timing_leaves_uncovered_time_unclassified(self):
         (self.run / 'timing.json').write_text(json.dumps(
             {'up_start': 10, 'runs': [[30, 35]], 'down_done': 70}))
         split = eden_test.time_split(self.run)
-        self.assertEqual((split['up'], split['down'], split['between_rows'], split['harness'], split['test_share']),
-                         (0, 0, 0, 8, 0.714))
+        self.assertEqual((split['up'], split['down'], split['unclassified'], split['setup'], split['test_share']),
+                         (0, 0, 32, 8, 0.714))
 
     def test_results_timing_line_includes_the_split(self):
         config = {'label': 'fake', 'rows': {'sha256': sha(self.run / 'rows/rows.json')},
                   'instances': [{'app': {'path': '/fake', 'sha256': '0' * 64}}]}
         eden_test.results_md(self.run, config)
         timing = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
-        self.assertIn('harness 45 s, test 20 s (30.8 %)', timing)
+        self.assertIn('classified: up+setup+down 22 s, test 20 s, unclassified 32 s (1 roles defaulted)', timing)
 
 
 class VolatilePinsTests(unittest.TestCase):

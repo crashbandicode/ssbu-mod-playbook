@@ -288,8 +288,9 @@ The rules:
       of 20 lines or fewer (build, plugins, rows, the unit's exit result,
       prune, harvest, timing) and `timing.json`.
       A row may set `"role": "setup"` or `"test"`; otherwise a screen-changing
-      row is setup and a same-screen row is test. The Timing line and
-      `timing.json` split harness and test seconds.
+      row is setup and a same-screen row is test. Set the role explicitly
+      when that default is wrong. The Timing line and `timing.json` report
+      time not covered by Up, a row attempt or Down as unclassified.
     - `all` does new, up, run and down in one go, for a batch you don't
       expect to fix mid-boot.
     - `--plugin <new build>` on `new` swaps the pinned plugin with that file
