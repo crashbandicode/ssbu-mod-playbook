@@ -71,6 +71,30 @@ class AttemptDecodeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'point'):
             decode.point_id(points, 'edge_juggle_attempt')
 
+    def test_partial_line_appended_between_stat_and_sample_is_skipped(self):
+        decode = self.decoder()
+        first, second = excerpt('cp1b-hero-attempt.jsonl')
+        first_line = (json.dumps(first) + '\n').encode()
+        second_line = (json.dumps(second) + '\n').encode()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'trace.jsonl'
+            path.write_bytes(first_line[:130])
+            open_file = Path.open
+            appended = False
+
+            def open_after_append(target, *args, **kwargs):
+                nonlocal appended
+                if target == path and not appended:
+                    appended = True
+                    with open_file(target, 'ab') as output:
+                        output.write(first_line[130:] + second_line)
+                return open_file(target, *args, **kwargs)
+
+            with patch.object(Path, 'open', new=open_after_append):
+                stream = decode.Stream(path, '8')
+            marks = stream.read()
+            self.assertEqual([mark['sequence'] for mark in marks], [int(second['sequence'])])
+
 
 class ObserveTests(unittest.TestCase):
     def setUp(self):
