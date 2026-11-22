@@ -147,7 +147,7 @@ Full provenance and source patch: `smash-training-lobby/artifacts/harness-lib/{t
 temporary library (5 host tests); `2eb13ee5204f28cc`.
 
 2026-11-22: `eden-runner/trace_text.py` and `test_trace_text.py` port the read side of compact-strip's
-`strip_trace.py` and notice-ui's `notice_steps.py`; `ba363d466d5ccbfc` and `e7a0b806434c0d91`.
+`strip_trace.py` and notice-ui's `notice_steps.py`; `a2d0569842225f10` and `0e99d55d56f3aedb`.
 The 15-line real trace fixture is `eden-runner/fixtures/trace-text/set-text-excerpt.jsonl` (`418ecc8cb4c813ce`);
-its source and sequences are in `eden-runner/fixtures/trace-text/PROVENANCE.md`. Ten reader host tests; no live boot
+its source and sequences are in `eden-runner/fixtures/trace-text/PROVENANCE.md`. Fourteen reader host tests; no live boot
 proof yet.

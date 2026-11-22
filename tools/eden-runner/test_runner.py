@@ -222,10 +222,10 @@ class TextGateTests(unittest.TestCase):
         lines = self.trace.read_bytes().splitlines(keepends=True)
         self.trace.write_bytes(lines[1])
         self.plan['gates']['pane']['cap'] = .5
-        read = runner.trace_text.current
+        read = runner.trace_text.scan
         appended = []
 
-        def current(*args, **kwargs):
+        def scan(*args, **kwargs):
             result = read(*args, **kwargs)
             if not appended:
                 with self.trace.open('ab') as f:
@@ -233,7 +233,7 @@ class TextGateTests(unittest.TestCase):
                 appended.append(True)
             return result
 
-        with mock.patch.object(runner.trace_text, 'current', side_effect=current):
+        with mock.patch.object(runner.trace_text, 'scan', side_effect=scan):
             self.make().run()
         result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
         self.assertEqual(result['sequence'], '1730')
@@ -276,6 +276,67 @@ class TextGateTests(unittest.TestCase):
         self.make().run()
         result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
         self.assertEqual((result['pane'], result['sequence']), ('tr_crumb', '1730'))
+
+    def test_point_id_dry_run_validation(self):
+        for point_id, valid in (('1', True), (1, True), (None, False), (True, False), (1.5, False), ([], False)):
+            with self.subTest(point_id=point_id):
+                self.plan['gates']['pane']['point_id'] = point_id
+                self.manifest.write_text(json.dumps(self.plan))
+                report = runner.dry_run(self.manifest)
+                self.assertEqual(report['result'] == 'READY', valid)
+                if not valid:
+                    self.assertIn('point_id', ' '.join(report['errors']))
+
+    def test_point_bound_gate_ignores_a_newer_other_point(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        other = json.loads(lines[10])
+        text = 'other point'
+        other['registers']['x2'] = hex(len(text))
+        other['captures'][1]['hex'] = text.encode('utf-16-le').hex()
+        self.trace.write_bytes(lines[9] + (json.dumps(other) + '\n').encode())
+        self.plan['gates']['pane']['point_id'] = 1
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], str(evidence['point_id'])), ('1730', '1'))
+
+    def test_nonexistent_point_fails_at_cap(self):
+        self.plan['gates']['pane'].update(point_id='not-a-point', cap=.08)
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+
+    def test_gate_does_not_reparse_old_lines_on_the_next_poll(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[1] + lines[3])
+        self.plan['gates']['pane']['cap'] = 1
+        appended = []
+        with mock.patch.object(runner.trace_text, 'parse', wraps=runner.trace_text.parse) as parse:
+            def sleep(_delay):
+                if not appended:
+                    self.assertEqual(parse.call_count, 1)
+                    with self.trace.open('ab') as f:
+                        f.write(lines[9])
+                    appended.append(True)
+
+            with mock.patch.object(runner.time, 'sleep', side_effect=sleep):
+                self.make().run()
+        self.assertEqual([json.loads(call.args[0])['sequence'] for call in parse.call_args_list], ['82', '1730'])
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']['sequence'], '1730')
+
+    def test_gate_rescans_a_replaced_trace(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[1])
+        replaced = []
+
+        def sleep(_delay):
+            if not replaced:
+                target = self.dir / 'new-trace.jsonl'
+                target.write_bytes(lines[9])
+                target.replace(self.trace)
+                replaced.append(True)
+
+        with mock.patch.object(runner.time, 'sleep', side_effect=sleep):
+            self.make().run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']['sequence'], '1730')
 
 
 class RunnerTests(unittest.TestCase):

@@ -808,6 +808,8 @@ def dry_run(manifest_path):
             elif kind == 'text':
                 if not isinstance(gate.get('pane'), str) or not gate['pane']:
                     errors.append(f'gate {name}: text needs a non-empty "pane"')
+                if 'point_id' in gate and not (isinstance(gate['point_id'], str) or type(gate['point_id']) is int):
+                    errors.append(f'gate {name}: point_id must be a string or integer')
                 re.compile(gate['pattern'])
             elif kind == 'change':
                 if len(gate['roi']) != 4 or not gate.get('mark'):
@@ -1682,12 +1684,28 @@ class Runner:
         if kind == 'text':
             source = self.trace_source(on)
             pattern = re.compile(gate['pattern'])
+            offset, identity, record = 0, None, None
             while time.monotonic() < until:
                 self.check_stop()
-                record = trace_text.current(source, gate['pane'], name_at=gate.get('name_at', trace_text.NAME_AT))
+                try:
+                    stat = source.stat()
+                except FileNotFoundError:
+                    offset, identity, record = 0, None, None
+                else:
+                    current_identity = (stat.st_dev, stat.st_ino)
+                    if identity is not None and (identity != current_identity or stat.st_size < offset):
+                        offset, record = 0, None
+                    identity = current_identity
+                    found, offset = trace_text.scan(source, gate['pane'], since=offset,
+                                                    name_at=gate.get('name_at', trace_text.NAME_AT),
+                                                    point_id=gate.get('point_id'))
+                    if found:
+                        record = found[-1]
                 if record and pattern.search(record['text']) and time.monotonic() <= until:
                     evidence = {'pane': gate['pane'], 'text': record['text'],
                                 'sequence': record['sequence'], 'frame': record['frame']}
+                    if 'point_id' in gate:
+                        evidence['point_id'] = record['point_id']
                     self.log({'gate': name, 'on': on, 'pass': True, **evidence})
                     return evidence
                 time.sleep(max(0, min(.1, until - time.monotonic())))

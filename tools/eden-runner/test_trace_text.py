@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import trace_text  # noqa: E402
@@ -172,6 +173,57 @@ class TraceTextTests(unittest.TestCase):
                                 sleep=lambda delay: now.__setitem__(0, now[0] + delay))
         self.assertIn('pane', str(caught.exception))
         self.assertIn('no record', str(caught.exception))
+
+
+class TraceScanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'trace.jsonl'
+        self.lines = FIXTURE.read_bytes().splitlines(keepends=True)
+
+    def test_scan_continues_after_complete_lines_and_waits_for_partial(self):
+        partial = len(self.lines[9]) // 2
+        first = self.lines[0] + self.lines[1]
+        self.path.write_bytes(first + self.lines[9][:partial])
+        records, offset = trace_text.scan(self.path, 'tr_crumb')
+        self.assertEqual([r['sequence'] for r in records], ['82'])
+        self.assertEqual(offset, len(first))
+        self.assertEqual(trace_text.scan(self.path, 'tr_crumb', since=offset), ([], offset))
+        with self.path.open('ab') as f:
+            f.write(self.lines[9][partial:])
+        records, next_offset = trace_text.scan(self.path, 'tr_crumb', since=offset)
+        self.assertEqual([r['sequence'] for r in records], ['1730'])
+        self.assertEqual(next_offset, self.path.stat().st_size)
+        self.assertEqual(trace_text.scan(self.path, 'tr_crumb', since=next_offset), ([], next_offset))
+
+    def test_midline_offset_and_missing_file(self):
+        self.assertEqual(trace_text.scan(self.path, since=25), ([], 0))
+        self.path.write_bytes(self.lines[1][:80])
+        self.assertEqual(trace_text.scan(self.path, since=10), ([], 10))
+        with self.path.open('ab') as f:
+            f.write(self.lines[1][80:] + self.lines[9])
+        found, offset = trace_text.scan(self.path, 'tr_crumb', since=10)
+        self.assertEqual([r['sequence'] for r in found], ['1730'])
+        self.assertEqual(offset, self.path.stat().st_size)
+        self.assertEqual(trace_text.scan(self.path, since=offset + 10), ([], offset + 10))
+
+    def test_name_prefilter_does_not_parse_other_panes(self):
+        with mock.patch.object(trace_text, 'parse', wraps=trace_text.parse) as parse:
+            found, offset = trace_text.scan(FIXTURE, 'tr_crumb')
+        self.assertEqual([r['sequence'] for r in found], ['82', '311', '1730', '1731'])
+        self.assertEqual([json.loads(call.args[0])['sequence'] for call in parse.call_args_list],
+                         ['82', '311', '1730', '1731'])
+        self.assertEqual(offset, FIXTURE.stat().st_size)
+
+    def test_point_id_uses_real_request_and_write_ids(self):
+        request, _ = trace_text.scan(FIXTURE, 'tr_crumb', point_id=1)
+        write, _ = trace_text.scan(FIXTURE, 'tr_crumb', point_id='2')
+        self.assertEqual([r['sequence'] for r in request], ['82', '311', '1730'])
+        self.assertEqual([r['sequence'] for r in write], ['1731'])
+        self.assertEqual({str(r['point_id']) for r in request}, {'1'})
+        self.assertEqual(str(write[0]['point_id']), '2')
+        self.assertEqual(trace_text.current(FIXTURE, 'tr_crumb', point_id='1')['sequence'], '1730')
 
 
 if __name__ == '__main__':

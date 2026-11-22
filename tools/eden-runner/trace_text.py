@@ -38,39 +38,49 @@ def parse(raw, name_at=NAME_AT):
             return None
         return {'name': name.decode('ascii'), 'text': data[:2 * units].decode('utf-16-le', 'replace'),
                 'sequence': record.get('sequence'), 'frame': record.get('frame'),
-                'wall_time_ns': record.get('wall_time_ns'), 'pane': regs['x0'], 'pc': regs.get('pc')}
+                'wall_time_ns': record.get('wall_time_ns'), 'pane': regs['x0'], 'pc': regs.get('pc'),
+                'point_id': record.get('point_id')}
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
         return None
 
 
-def _records(path, name, since, name_at):
+def scan(path, name=None, since=0, name_at=NAME_AT, point_id=None):
     try:
         stream = Path(path).open('rb')
     except FileNotFoundError:
-        return []
+        return [], 0
     found = []
+    offset = since
+    needle = name.encode().hex().encode() if name is not None else None
     with stream:
         if since:
             stream.seek(since - 1)
             if stream.read(1) != b'\n':
-                stream.readline()
+                if not stream.readline().endswith(b'\n'):
+                    return [], since
+                offset = stream.tell()
         while True:
             at = stream.tell()
             raw = stream.readline()
             if not raw or not raw.endswith(b'\n'):
                 break
+            offset = stream.tell()
+            if needle is not None and needle not in raw:
+                continue
             record = parse(raw, name_at)
-            if record and (name is None or record['name'] == name):
+            if (record and (name is None or record['name'] == name) and
+                    (point_id is None or (record['point_id'] is not None
+                                          and str(record['point_id']) == str(point_id)))):
                 found.append(dict(record, at=at))
-    return found
+    return found, offset
 
 
 def records(path, name=None, since=0):
-    return _records(path, name, since, NAME_AT)
+    return scan(path, name, since)[0]
 
 
-def current(path, name, *, name_at=NAME_AT):
-    found = _records(path, name, 0, name_at)
+def current(path, name, *, name_at=NAME_AT, point_id=None):
+    found = scan(path, name, name_at=name_at, point_id=point_id)[0]
     return found[-1] if found else None
 
 
