@@ -192,7 +192,7 @@ def go_new(args):
     run = RUNS / args.label
     if run.exists():
         raise SystemExit(f'{run} exists; pick a new label')
-    config.update(label=args.label, owner=args.owner or f'eden-test/{args.label}',
+    config.update(label=args.label, owner=args.owner,
                   state_dir=str(run / 'state'), work_root=str(run / 'work'), defer_load=True)
     for key in ('rows', 'runner', 'authorization'):
         config.pop(key, None)
@@ -1114,8 +1114,7 @@ def _go_remote(args):
         remote.extend(('--elf', f'{stage}/elf/{Path(args.elf).name}'))
     for point in args.trace_point:
         remote.extend(('--trace-point', point))
-    if args.owner:
-        remote.extend(('--owner', args.owner))
+    remote.extend(('--owner', args.owner))
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
     ssh_code = _go_sh(['ssh', '-o', 'BatchMode=yes', host, *(_pwsh_arg(arg) for arg in remote)])
@@ -1144,6 +1143,10 @@ def _go_remote(args):
 
 
 def cmd_go(args):
+    # Match the owner rule in eden-lifecycle/lifecycle.py:624.
+    if not re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', args.owner):
+        raise SystemExit('--owner must be "<Engine> <session>/<stream>" (OpenCode|Codex|Claude|Cursor), '
+                         f'e.g. "Claude devin-<lane>/<label>"; got: {args.owner!r}')
     _go_trace(args)
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
@@ -1253,7 +1256,9 @@ def main(argv=None):
     p.add_argument('--rows', required=True, help='rows.json or a folder containing rows.json')
     p.add_argument('--elf')
     p.add_argument('--trace-point', action='append', default=[])
-    p.add_argument('--owner')
+    p.add_argument('--owner', required=True,
+                   help='ledger owner, "<Engine> <session>/<stream>" with Engine one of OpenCode, Codex, '
+                        'Claude, Cursor — e.g. "Claude devin-<lane>/<label>"')
     p.add_argument('--from', dest='from_config')
     p.add_argument('--ssh')
     p.add_argument('--token', help=argparse.SUPPRESS)

@@ -1,11 +1,11 @@
 # Eden test: one command
 
 From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ssh`:
-`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --nro /path/libtraining_rooms.nro --rows tools/eden-test/example`
+`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --rows tools/eden-test/example`
 
 On the Eden host, run the same command with its local host name:
-`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --nro /path/libtraining_rooms.nro --rows tools/eden-test/example`
-Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga has one, XPS does not yet.
+`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --rows tools/eden-test/example`
+Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 
 What it does:
 1. Copies and pins the NROs and rows.
