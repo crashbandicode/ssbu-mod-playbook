@@ -1119,10 +1119,32 @@ class ReportTests(unittest.TestCase):
 
     @unittest.skipUnless((FLOWN / 'proof-tss-blocks-83ee-1/yoga/out').is_dir(), 'flown run -1 not on this machine')
     def test_flown_run_1_whose_runner_crashed_never_shows_r01_as_pass(self):
-        rows = self.rows_of(eden_test.report_md(FLOWN / 'proof-tss-blocks-83ee-1/yoga'))
+        text = eden_test.report_md(FLOWN / 'proof-tss-blocks-83ee-1/yoga')
+        rows = self.rows_of(text)
         self.assertIn('| PASS |', rows['r00'])
-        self.assertIn('| NOT RUN |', rows['r01'])  # its blocks ran, but the runner crashed before the row receipt
+        self.assertIn('| FAIL |', rows['r01'])  # its blocks ran, the runner crashed before the row receipt
+        self.assertIn('attempted without a verdict', rows['r01'])
+        self.assertIn('out/r01/routes-reach-training.json', rows['r01'])
         self.assertEqual([r for r, line in rows.items() if 'PASS' in line], ['r00'])
+        self.assertIn('1 PASS, 1 FAIL, 17 NOT RUN of 19', text)
+        top = text.split('| Row |')[0]
+        self.assertIn('Runner: 1 call(s) ended: FAILED', top)  # the crash is said, not hidden
+        self.assertIn('Object of type set is not JSON serializable', top)
+
+    def test_a_row_whose_steps_ran_without_a_row_receipt_is_a_fail_and_the_runner_end_is_shown(self):
+        (self.run / 'out/r2').mkdir()
+        (self.run / 'out/r2/routes-block2.json').write_text('{}')
+        (self.run / 'runner.log').write_text(
+            '$ runner run\n{"row": "r1", "status": "FAILED", "seconds": 1.0}\n'
+            '{"status": "FAILED", "error": "TypeError(\'boom\')", "stop_input": "x"}\n\n'
+            '$ runner run --rows r0\n{"status": "DONE", "out": "x", "failed": 0}\n')
+        text = eden_test.report_md(self.run)
+        row = self.rows_of(text)['r2']
+        self.assertIn('| FAIL |', row)
+        self.assertIn('attempted without a verdict', row)
+        self.assertIn('out/r2/routes-block2.json', row)
+        self.assertIn("Runner: 2 call(s) ended: FAILED `TypeError('boom')`; DONE", text)
+        self.assertIn('1 PASS, 3 FAIL, 0 NOT RUN of 4', text)
 
     @unittest.skipUnless((FLOWN / 'proof-tss-blocks-83ee-2/yoga/out').is_dir(), 'flown run -2 not on this machine')
     def test_flown_run_2_shows_three_passes_the_refusal_and_fifteen_unrun(self):

@@ -834,7 +834,12 @@ def row_report(run, row, history):
     earlier = history.get(row_id, [])
     asides = sorted(path.name for path in out.glob(f'{row_id}.rerun-*.json'))
     if not receipt_path.exists():
+        wrote = sorted(path for path in (out / row_id).rglob('*') if path.is_file()) if (out / row_id).is_dir() else []
         note = f'no receipt out/{row_id}.json' + (f'; attempts on record: {", ".join(earlier)}' if earlier else '')
+        if wrote:  # its steps ran, the runner ended before the row's verdict: attempted, never a pass and never unrun
+            return ('FAIL', f'attempted without a verdict: its steps wrote {len(wrote)} file(s) but the runner ended '
+                    f'before the row receipt ({note}); see the runner line above the table',
+                    [f'out/{path.relative_to(out)}' for path in wrote[:4]] + [f'out/{name}' for name in asides])
         return 'NOT RUN', note, [f'out/{name}' for name in asides]
     receipt = json.loads(receipt_path.read_text())
     status = receipt.get('status')
@@ -903,8 +908,19 @@ def report_md(run):
         blocks = ', '.join(str(step.get('run', next(iter(step), '?'))).split(':')[-1] for step in row.get('steps', []))
         table.append(f'| {row["id"]} | {cell(blocks, 60)} | {result} | {cell(reason, 420)} | {"<br>".join(proof)} |')
     split = time_split(run)
+    ends = []  # how each runner call ended: its last status line that is not a row's
+    runner_log = run / 'runner.log'
+    for line in runner_log.read_text(errors='replace').splitlines() if runner_log.exists() else []:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and 'status' in event and 'row' not in event:
+            detail = event.get('error') or event.get('reason') or event.get('result') or ''
+            ends.append(f'{event["status"]}' + (f' `{cell(detail, 300)}`' if detail else ''))
     lines = [f'# {config.get("label", run.name)}: test report',
              f'- State: {state}',
+             f'- Runner: {len(ends)} call(s) ended: ' + ('; '.join(ends) if ends else 'no end line in runner.log'),
              '- NROs:', *nro_lines(run, config),
              f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)} '
              f'(proof paths are relative to `{run}`)',
