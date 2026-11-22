@@ -241,9 +241,10 @@ The rules:
      `out/summary.json` lists every row as pass, fail, skipped or not run,
      with each failure's reason and evidence paths. `--rows failed` reruns
      only the rows whose receipt is FAILED, after a fix; passed rows are
-     skipped. If recovery fails but the game is still running, the runner
-     records the error and runs the next row anyway. It writes `STOP-INPUT`
-     and stops when the game is no longer running (`running` false, or a crash).
+     skipped. If a row's recovery fails but the game is still running, that
+     row is FAILED without running its steps; the runner tries to recover the
+     next row. It writes `STOP-INPUT` and stops when the game is no longer
+     running (`running` false, or a crash).
      It does not reboot Eden. A `rows.json` with no `recover` still stops at
      the first failure. `on_failure` is `continue` or `stop`, set on the
      plan, overridden on a row, or passed as `--on-failure`. If a row can't

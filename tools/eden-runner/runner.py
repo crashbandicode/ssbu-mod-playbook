@@ -106,8 +106,9 @@ trace.counters plus trace.read when that instance is tracing). It then follows o
 The default is continue when the next row has a start gate and a recover list, and stop otherwise, so a rows.json
 with no recover still stops at the first failure (STOP-INPUT) as before. continue plays that next row's recover
 (or the plan's recover list) and checks its start gate; the list may hold segments, a library route, a run hook,
-or a ui or call step. If recovery fails but the game is still running, the failure is recorded and the next row
-runs anyway. If status says the game is not running (running false, or a crash), it writes STOP-INPUT and stops.
+or a ui or call step. If recovery fails but the game is still running, that row is FAILED without running its steps;
+the runner then tries to recover the next row. If status says the game is not running (running false, or a crash),
+it writes STOP-INPUT and stops.
 The runner never reboots Eden.
 Each failure is tagged harness-suspect (the screen never changed, recovery or the start
 state failed, or evidence is missing), product-suspect (a screen gate passed and a later
@@ -1236,7 +1237,13 @@ def default_client_factory():
 
 
 class RecoveryFailed(RuntimeError):
-    """Getting the next row back to its start gate failed. The run stops; Eden is not rebooted."""
+    """Getting a row back to its start gate failed; Eden is not rebooted."""
+
+
+class UnmetRecovery(RecoveryFailed):
+    def __init__(self, failure):
+        self.failure = failure
+        super().__init__(str(failure))
 
 
 class Runner:
@@ -2448,8 +2455,12 @@ class Runner:
         on = row.get('on', self.default)
         saved_row = self.current_row
         saved_on = self.current_on
+        saved_dir = self.row_dir
+        recovery_dir = self.out / row['id'] / 'recovery'
+        recovery_dir.mkdir(parents=True, exist_ok=True)
         self.current_row = row
         self.current_on = on
+        self.row_dir = recovery_dir
         try:
             for step in steps:
                 self.execute_step(harness.bind_step(step, on))
@@ -2463,6 +2474,7 @@ class Runner:
         finally:
             self.current_row = saved_row
             self.current_on = saved_on
+            self.row_dir = saved_dir
 
     def _gate_names(self, row):
         def walk(steps):
@@ -2854,7 +2866,7 @@ class Runner:
 
     def _run_rows(self, only):
         previous_end = self.plan['start']
-        unrecovered_to = None
+        pending_recovery = None
         rows = self.plan['rows']
         review = None
         for index, row in enumerate(rows):
@@ -2870,18 +2882,19 @@ class Runner:
                 # a RAN-UNVERIFIED row is listed for review (FAILING.md), and reruns only when named (--rows)
                 self.note(row['id'], 'pass' if prior_status == 'PASS' else 'unverified')
                 previous_end = row['end']
+                if pending_recovery and pending_recovery[0] == row['id']:
+                    pending_recovery = None
                 continue
             if only is not None and row['id'] not in only:
                 self.note(row['id'], 'skipped', receipt=prior_status)
                 continue
             if (only is None and row['start'] != previous_end and self.recovered_to != row['id']
-                    and unrecovered_to != row['id']):
+                    and not (pending_recovery and pending_recovery[0] == row['id'])):
                 mismatch = StopRun(f'row {row["id"]} starts on {row["start"]}, but the game is on {previous_end}')
                 early = self.apply_failure(row, None, mismatch)
                 if early:
                     raise harness.EarlyStop(early['result'])
                 raise mismatch
-            unrecovered_to = None
             late = self.verdict_stop()  # judge FAILs land a row or two late: the stop rule counts them in row order
             if late:
                 self.stop_input(row, late['result'])
@@ -2913,6 +2926,11 @@ class Runner:
                                   'receipt': str(receipt_path)}), flush=True)
                 raise
             try:
+                if pending_recovery and pending_recovery[0] == row['id']:
+                    recovered = pending_recovery[1]
+                    pending_recovery = None
+                    receipt['recovery'] = {'ok': False, 'error': repr(recovered)}
+                    raise UnmetRecovery(recovered)
                 if (self.recovered_to != row['id'] and prior_status == 'FAILED'
                         and start_gate_of(self.plan, row) and recover_steps_of(self.plan, row) is not None):
                     self.recovered_to = None
@@ -2921,9 +2939,8 @@ class Runner:
                     except StopRun:
                         raise
                     except Exception as recovered:
-                        receipt['recovery'] = {'to': row['id'], 'ok': False, 'error': repr(recovered)}
-                        if not self.game_running(row.get('on') or self.default):
-                            raise
+                        receipt['recovery'] = {'ok': False, 'error': repr(recovered)}
+                        raise UnmetRecovery(recovered) from recovered
                 for step in row['steps']:
                     self.execute_step(step, receipt['results'])
                 status = self.passed_status(receipt)
@@ -2946,51 +2963,59 @@ class Runner:
                     raise harness.EarlyStop(early['result'])
                 raise
             except Exception as error:
-                receipt.update(status='FAILED', error=repr(error))
+                prerequisite = isinstance(error, UnmetRecovery)
+                if prerequisite:
+                    receipt.update(status='FAILED', not_executed=True,
+                                   error=f'not run: recovery to its start failed: {error.failure!r}')
+                else:
+                    receipt.update(status='FAILED', error=repr(error))
                 if isinstance(error, GifRefused):
                     receipt['gif_refused'] = error.detail
                 evidence = []
-                try:
-                    evidence = self.collect_failure_evidence(row, error)
-                except StopRun:
-                    raise
-                except Exception as evidence_error:  # noqa: BLE001
-                    self.log({'failure_evidence_error': repr(evidence_error)})
+                if not prerequisite:
+                    try:
+                        evidence = self.collect_failure_evidence(row, error)
+                    except StopRun:
+                        raise
+                    except Exception as evidence_error:  # noqa: BLE001
+                        self.log({'failure_evidence_error': repr(evidence_error)})
                 receipt['evidence_paths'] = evidence
                 early = self.apply_failure(row, receipt, error, evidence=evidence)
                 if early:
                     self.stop_input(row, early['result'])
                     raise harness.EarlyStop(early['result'])
                 successor = rows[index + 1] if index + 1 < len(rows) else None
+                if prerequisite and only is not None:
+                    successor = next((candidate for candidate in rows[index + 1:] if candidate['id'] in only), None)
                 policy = failure_policy_of(self.plan, row, successor, self.on_failure_cli)
-                if isinstance(error, RecoveryFailed) or policy != 'continue' or successor is None:
+                if not prerequisite and (isinstance(error, RecoveryFailed) or policy != 'continue' or successor is None):
                     self.stop_input(row, f'{row["id"]}: {error!r}')
                     raise
-                if not self.game_running(self.current_on or self.default):
-                    receipt['recovery'] = {'ok': False, 'error': 'game is not running'}
+                on = (row.get('on') or self.default) if prerequisite else (self.current_on or self.default)
+                if not self.game_running(on):
+                    if not prerequisite:
+                        receipt['recovery'] = {'ok': False, 'error': 'game is not running'}
                     self.stop_input(row, f'{row["id"]}: {error!r}')
                     raise
-                saved_dir = self.row_dir
-                self.row_dir = self.out / successor['id']
-                self.row_dir.mkdir(exist_ok=True)
+                if successor is None:
+                    continue
                 self.recovered_to = None
+                recovery_key = 'next_recovery' if prerequisite else 'recovery'
                 try:
                     self.recover_to(successor)
                 except StopRun as recovered:
-                    receipt['recovery'] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
+                    receipt[recovery_key] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
                     self.stop_input(row, f'{row["id"]}: {error!r}; recovery to {successor["id"]} failed: {recovered!r}')
                     raise
                 except Exception as recovered:
-                    receipt['recovery'] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
+                    receipt[recovery_key] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
                     if not self.game_running(successor.get('on') or self.default):
                         self.stop_input(row, f'{row["id"]}: {error!r}; recovery to {successor["id"]} failed: {recovered!r}')
                         raise
-                    unrecovered_to = successor['id']
+                    pending_recovery = (successor['id'], recovered)
                 else:
-                    receipt['recovery'] = {'to': successor['id'], 'ok': True}
+                    receipt[recovery_key] = {'to': successor['id'], 'ok': True}
                     self.recovered_to = successor['id']
-                finally:
-                    self.row_dir = saved_dir
             except BaseException as error:
                 receipt.update(status='FAILED', error=repr(error))
                 self.stop_input(row, f'{row["id"]}: {error!r}')

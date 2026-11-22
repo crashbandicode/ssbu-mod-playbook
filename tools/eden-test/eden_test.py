@@ -39,7 +39,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 PLAYBOOK = Path(__file__).resolve().parents[2]
@@ -942,8 +944,15 @@ def row_report(run, row, history):
     earlier = history.get(row_id, [])
     asides = sorted(path.name for path in out.glob(f'{row_id}.rerun-*.json'))
     if not receipt_path.exists():
-        wrote = sorted(path for path in (out / row_id).rglob('*') if path.is_file()) if (out / row_id).is_dir() else []
-        note = f'no receipt out/{row_id}.json' + (f'; attempts on record: {", ".join(earlier)}' if earlier else '')
+        folder = out / row_id
+        recovery = folder / 'recovery'
+        files = sorted(path for path in folder.rglob('*') if path.is_file()) if folder.is_dir() else []
+        wrote = [path for path in files if not path.is_relative_to(recovery)]
+        note = f'no receipt out/{row_id}.json'
+        if not wrote and any(path.is_relative_to(recovery) for path in files):
+            note += f'; a recovery to this row ran (out/{row_id}/recovery/)'
+        if earlier:
+            note += f'; attempts on record: {", ".join(earlier)}'
         if wrote:  # its steps ran, the runner ended before the row's verdict: attempted, never a pass and never unrun
             return ('FAIL', f'attempted without a verdict: its steps wrote {len(wrote)} file(s) but the runner ended '
                     f'before the row receipt ({note}); see the runner line above the table',
@@ -1107,28 +1116,27 @@ def _go_remote(args):
         remote.extend(('--trace-point', point))
     if args.owner:
         remote.extend(('--owner', args.owner))
+    token = uuid.uuid4().hex
+    remote.extend(('--token', token))
     ssh_code = _go_sh(['ssh', '-o', 'BatchMode=yes', host, *(_pwsh_arg(arg) for arg in remote)])
     run = f'/home/intpa/eden-runs/{args.label}'
     prefix = f'ssh -o BatchMode=yes {host} /usr/bin/python3 -I -B {script}'
-    result_file = f'./go-result-{args.label}.json'
+    with tempfile.TemporaryDirectory(prefix='eden-go-') as directory:
+        result_file = Path(directory) / 'go-result.json'
+        result_error = _go_sh(['scp', f'{host}:{run}/go-result.json', str(result_file)])
+        try:
+            result = json.loads(result_file.read_text()) if not result_error else {}
+            code = result['code']
+            if (result.get('token') != token or type(code) is not int or code not in (0, 3)
+                    or not isinstance(result['counts'], dict)):
+                raise ValueError('invalid or mismatched result')
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise SystemExit(f'remote go produced no result for this call (ssh exit {ssh_code}); '
+                             'nothing was copied; see the output above') from error
     report = f'./REPORT-{args.label}.md'
-    result_error = _go_sh(['scp', f'{host}:{run}/go-result.json', result_file])
-    report_error = _go_sh(['scp', f'{host}:{run}/REPORT.md', report])
-    if result_error:
-        if not report_error:
-            print(f'Down: {prefix} down {run}')
-        raise SystemExit(f'remote go did not produce a result (ssh exit {ssh_code}); see the output above')
-    if report_error:
+    if report_error := _go_sh(['scp', f'{host}:{run}/REPORT.md', report]):
         print(f'Down: {prefix} down {run}')
         raise SystemExit(f'copying remote report failed ({report_error})')
-    try:
-        result = json.loads(Path(result_file).read_text())
-        code = result['code']
-        if type(code) is not int or code not in (0, 3) or not isinstance(result['counts'], dict):
-            raise ValueError('invalid result')
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f'Down: {prefix} down {run}')
-        raise SystemExit(f'invalid remote go result: {error}') from error
     print(f'Report: {Path(report).resolve()}')
     print(f'Re-run: {prefix} run {run} --rows <id>; then {prefix} report {run}')
     print(f'Down: {prefix} down {run}')
@@ -1158,7 +1166,7 @@ def cmd_go(args):
         print(f'Report: {run / "REPORT.md"}')
     counts = report_counts(run)
     code = 0 if code == 0 and not counts['FAIL'] and not counts['NOT RUN'] else 3
-    (run / 'go-result.json').write_text(json.dumps({'code': code, 'counts': counts}, indent=2) + '\n')
+    (run / 'go-result.json').write_text(json.dumps({'token': args.token, 'code': code, 'counts': counts}, indent=2) + '\n')
     return code
 
 
@@ -1248,6 +1256,7 @@ def main(argv=None):
     p.add_argument('--owner')
     p.add_argument('--from', dest='from_config')
     p.add_argument('--ssh')
+    p.add_argument('--token', help=argparse.SUPPRESS)
     sub.add_parser('pace').add_argument('run', type=Path)
     sub.add_parser('report').add_argument('run', type=Path)
     p = sub.add_parser('down')

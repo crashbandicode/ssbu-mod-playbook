@@ -1828,6 +1828,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(blocked['not_executed'])
         self.assertTrue(blocked['error'].startswith('not run: recovery to its start failed: '))
         self.assertFalse(blocked['recovery']['ok'])
+        self.assertEqual(blocked['next_recovery'], {'to': 'r3', 'ok': True})
         self.assertEqual(blocked['results'], [])
         self.assertFalse(list((self.dir / 'out/r2').glob('*ok*')))
         self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
