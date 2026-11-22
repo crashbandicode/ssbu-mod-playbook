@@ -32,6 +32,7 @@ import os
 import posixpath
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -380,13 +381,32 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
         raise SystemExit(f'lifecycle up failed ({code}); see {run / "lifecycle-up.log"}')
 
 
-def cmd_run(run, retry=False):
+def set_aside(run, rows):
+    """Keep a row's earlier receipt and files as out/<id>.rerun-<n>.json and out/<id>.rerun-<n>/, so the runner runs
+    the row again (it skips a row whose receipt passed) and the report still shows the earlier attempt."""
+    out = run / 'out'
+    for row in rows:
+        receipt = out / f'{row}.json'
+        if not receipt.exists():
+            continue
+        n = 1
+        while (out / f'{row}.rerun-{n}.json').exists():
+            n += 1
+        receipt.rename(out / f'{row}.rerun-{n}.json')
+        if (out / row).is_dir():
+            (out / row).rename(out / f'{row}.rerun-{n}')
+
+
+def cmd_run(run, retry=False, rows=None):
     stop = run / 'out' / 'STOP-INPUT'
-    if retry and stop.exists():
+    if (retry or rows) and stop.exists():
         stop.rename(run / 'out' / f'STOP-INPUT.{int(time.time())}')
+    if rows:
+        set_aside(run, rows.split(','))
     stamp(run, 'run_start')
     code = sh([sys.executable, '-B', '-I', str(RUNNER), 'run', str(run / 'rows' / 'rows.json'),
-               '--instances', str(run / 'state' / 'instances.json'), '--out', str(run / 'out')], run / 'runner.log')
+               '--instances', str(run / 'state' / 'instances.json'), '--out', str(run / 'out'),
+               *(['--rows', rows] if rows else [])], run / 'runner.log')
     stamp(run, 'run_end')
     cmd_pace(run)  # informational after every run call; `pace` alone exits 2 when over budget
     return code
@@ -764,6 +784,163 @@ def results_md(run, config):
     print('\n'.join(lines[:20]))
 
 
+PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'  # lifecycle.py PLUGINS
+RAW_LINE = re.compile(r'\[(?:Bridge|TrainingRooms|Ui|Adapter)\] ')
+MEDIA = ('.png', '.jpg', '.gif', '.mp4', '.webm', '.mkv')
+
+
+def cell(text, limit):
+    text = one_line(text, 10 ** 6)
+    return (text if len(text) <= limit else text[:limit - 1] + '…').replace('|', '\\|')
+
+
+def raw_lines(node):
+    """The raw log lines a receipt carries (any string holding a `[Bridge] ` / `[TrainingRooms] ` / `[Ui] ` line)."""
+    if isinstance(node, str):
+        return [node] if RAW_LINE.search(node) else []
+    children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()
+    return [line for child in children for line in raw_lines(child)]
+
+
+def nro_lines(run, config):
+    """One line per plugin: the sha256 of the file in the Eden profile (what the game loads), checked against the
+    config pin; the pins themselves, said as pins, once the profile is gone."""
+    instances_path = run / 'state' / 'instances.json'
+    instances = json.loads(instances_path.read_text()) if instances_path.exists() else {}
+    lines = []
+    for item in config.get('instances', []):
+        pins = {pin.get('name', Path(pin['path']).name): pin['sha256'] for pin in item.get('plugins', [])}
+        profile = (instances.get(item.get('key')) or {}).get('profile')
+        folder = Path(profile) / PLUGINS if profile else None
+        if folder is None or not folder.is_dir():
+            lines += [f'  - {name} `{digest}` as pinned in config.json (the profile is gone or not on this machine, '
+                      'so the loaded file was not re-hashed)' for name, digest in pins.items()]
+            continue
+        for path in sorted(folder.glob('*.nro')):
+            digest = sha256(path)
+            verdict = ('NOT in the config' if path.name not in pins else 'matches the config pin'
+                       if pins[path.name] == digest else f'DIFFERS from the config pin {pins[path.name]}')
+            lines.append(f'  - {path.name} `{digest}` in the profile; {verdict}')
+        lines += [f'  - {name}: pinned `{digest}` but MISSING from the profile' for name, digest in pins.items()
+                  if not (folder / name).exists()]
+    return lines
+
+
+def row_report(run, row, history):
+    """(result, reason, proof) for one row from its receipt: PASS only for a receipt whose status is PASS."""
+    out = run / 'out'
+    row_id = row['id']
+    receipt_path = out / f'{row_id}.json'
+    earlier = history.get(row_id, [])
+    asides = sorted(path.name for path in out.glob(f'{row_id}.rerun-*.json'))
+    if not receipt_path.exists():
+        note = f'no receipt out/{row_id}.json' + (f'; attempts on record: {", ".join(earlier)}' if earlier else '')
+        return 'NOT RUN', note, [f'out/{name}' for name in asides]
+    receipt = json.loads(receipt_path.read_text())
+    status = receipt.get('status')
+    proof = [f'out/{row_id}.json']
+    if status == 'PASS':
+        result, parts = 'PASS', []
+        for step in receipt.get('results', []):
+            name = str(step.get('run') or step.get('gate') or step.get('library') or next(iter(step), '?'))
+            value = step.get('value')
+            if isinstance(value, dict) and 'verified' in value:
+                value = {'verified': value['verified']}
+            parts.append(name.split(':')[-1] + ('' if value is None else ' ' + cell(json.dumps(value, default=str), 110)))
+        reason = '; '.join(parts) or 'every step ran'
+    else:
+        result = 'FAIL'
+        reason = one_line(receipt.get('error') or '', 400) or f'status {status}'
+        if status != 'FAILED':
+            reason = f'{status}: ' + reason if receipt.get('error') else f'status {status} (ran, not verified)'
+    if len(earlier) > 1:
+        reason += f' (earlier attempts: {", ".join(earlier[:-1])})'
+    proof += [f'`{cell(line, 230)}`' for line in dict.fromkeys(raw_lines(receipt))][:3]
+    files = [Path(path) for path in receipt.get('evidence_paths', [])]
+    files = [out / str(path).split('/out/', 1)[1] if '/out/' in str(path) else path for path in files]
+    if (out / row_id).is_dir():
+        files += [path for path in sorted((out / row_id).rglob('*')) if path.suffix.lower() in MEDIA]
+    for path in dict.fromkeys(files):
+        shown = f'out/{path.relative_to(out)}' if path.is_relative_to(out) else str(path)
+        proof.append(f'{shown} ({path.stat().st_size} bytes)' if path.is_file() else f'{shown} (missing here)')
+    return result, reason, proof + [f'out/{name}' for name in asides]
+
+
+def report_md(run):
+    """The run's report: the NRO hashes, then every row as PASS, FAIL or NOT RUN with the reason and the proof, read
+    from the run folder alone. Works while Eden is still up and again after Down."""
+    run = Path(run)
+    config = json.loads((run / 'config.json').read_text())
+    spec = json.loads((run / 'rows' / 'rows.json').read_text())
+    rows = spec['rows'] if isinstance(spec, dict) else spec
+    timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
+    history = {}
+    attempts = run / 'out' / 'attempts.jsonl'
+    for line in attempts.read_text().splitlines() if attempts.exists() else []:
+        try:
+            attempt = json.loads(line)
+        except ValueError:
+            continue
+        history.setdefault(attempt.get('id'), []).append(str(attempt.get('status')))
+
+    def utc(key):
+        return time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(timing[key])) if key in timing else '?'
+
+    host, me = config.get('host', '?'), f'/usr/bin/python3 -I -B {Path(__file__).resolve()}'
+    if 'down_done' in timing:
+        journal_path = run / 'state' / 'lifecycle.json'
+        journal = json.loads(journal_path.read_text()) if journal_path.exists() else {}
+        state = (f'DOWN on {host} at {utc("down_done")} (released={journal.get("released")}, '
+                 f'cleanup_failures={journal.get("cleanup_failures")})')
+    elif 'up_done' in timing:
+        state = f'EDEN UP on {host} since {utc("up_done")}; no Down recorded'
+    else:
+        state = f'no Up recorded on {host}'
+    table, counts = [], {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}
+    for row in rows:
+        result, reason, proof = row_report(run, row, history)
+        counts[result] += 1
+        blocks = ', '.join(str(step.get('run', next(iter(step), '?'))).split(':')[-1] for step in row.get('steps', []))
+        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {result} | {cell(reason, 420)} | {"<br>".join(proof)} |')
+    split = time_split(run)
+    lines = [f'# {config.get("label", run.name)}: test report',
+             f'- State: {state}',
+             '- NROs:', *nro_lines(run, config),
+             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)} '
+             f'(proof paths are relative to `{run}`)',
+             '', '| Row | Steps | Result | Reason | Proof |', '| --- | --- | --- | --- | --- |', *table, '',
+             f'- Times: Up {utc("up_start")} to {utc("up_done")}; rows {utc("run_start")} to {utc("run_end")} over '
+             f'{len(timing.get("runs", [])) or 1} runner call(s); setup rows {split["setup"]:.0f} s, test rows '
+             f'{split["test"]:.0f} s']
+    if 'down_done' not in timing:
+        lines += [f'- Re-run rows in this boot: `{me} run {run} --rows <id>[,<id>]` then `{me} report {run}`',
+                  f'- Down: `{me} down {run}`']
+    return '\n'.join(lines) + '\n'
+
+
+def cmd_report(run):
+    text = report_md(run)
+    (run / 'REPORT.md').write_text(text)
+    print(text, end='')
+    return 0
+
+
+def stop_capture(run):
+    """End the detached bridge capture `routes:bridge_on` started for this run (out/bridge-run/capture.json)."""
+    folder = run / 'out' / 'bridge-run'
+    if not (folder / 'capture.json').is_file():
+        return None
+    pid = json.loads((folder / 'capture.json').read_text()).get('pid')
+    try:
+        command = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    except OSError:
+        return {'pid': pid, 'stopped': False, 'why': 'not running'}
+    if b'capture-bridge' not in command or str(folder).encode() not in command:
+        return {'pid': pid, 'stopped': False, 'why': 'that pid is not this run\'s capture'}
+    os.kill(pid, signal.SIGTERM)
+    return {'pid': pid, 'stopped': True}
+
+
 def restore_up_config(run):
     """Down cleans up what Up created, so it uses the Up-time config the lifecycle journal recorded. A config.json
     edited after Up (it shouldn't be: rows.json and hooks are what change mid-boot) is kept aside, never merged into
@@ -785,6 +962,9 @@ def restore_up_config(run):
 def cmd_down(run, keep_state=False):
     restore_up_config(run)
     config = json.loads((run / 'config.json').read_text())
+    capture = stop_capture(run)  # before Eden stops: the capture would otherwise keep reconnecting to a dead port
+    if capture:
+        print('bridge capture: ' + json.dumps(capture))
     stamp(run, 'down_start')
     # A clean Down copies the files the run wrote to out/post-run-<key>/, then prunes work/ and the state snapshots.
     code = lifecycle(run, 'down', '--evidence-dir', str(run / 'out'), *(['--keep-state'] if keep_state else []))
@@ -797,6 +977,7 @@ def cmd_down(run, keep_state=False):
     timing['split'] = time_split(run)
     timing_path.write_text(json.dumps(timing, indent=2) + '\n')
     results_md(run, config)
+    (run / 'REPORT.md').write_text(report_md(run))
     if code != 0:
         raise SystemExit(f'lifecycle down failed ({code}); the claim stays held; see {run / "lifecycle-down.log"}')
 
@@ -821,6 +1002,7 @@ def main(argv=None):
             p.add_argument('--allow-volatile-pins', action='store_true',
                            help='allow pins inside another run folder')
     sub.add_parser('pace').add_argument('run', type=Path)
+    sub.add_parser('report').add_argument('run', type=Path)
     p = sub.add_parser('down')
     p.add_argument('run', type=Path)
     p.add_argument('--keep-state', action='store_true',
@@ -835,6 +1017,8 @@ def main(argv=None):
     p = sub.add_parser('run')
     p.add_argument('run', type=Path)
     p.add_argument('--retry', action='store_true')
+    p.add_argument('--rows', help='comma-separated row ids to run again in this boot, passed or failed; the earlier '
+                                  'receipt is kept as out/<id>.rerun-<n>.json')
     args = parser.parse_args(argv)
     if args.mode == 'new':
         cmd_new(args)
@@ -843,7 +1027,9 @@ def main(argv=None):
     elif args.mode == 'up':
         cmd_up(args.run.resolve(), args.skip_setup_plan, args.allow_volatile_pins)
     elif args.mode == 'run':
-        return cmd_run(args.run.resolve(), args.retry)
+        return cmd_run(args.run.resolve(), args.retry, args.rows)
+    elif args.mode == 'report':
+        return cmd_report(args.run.resolve())
     elif args.mode == 'down':
         cmd_down(args.run.resolve(), args.keep_state)
     elif args.mode == 'pace':
