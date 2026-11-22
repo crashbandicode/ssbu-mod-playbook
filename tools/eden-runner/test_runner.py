@@ -843,13 +843,27 @@ class RunnerTests(unittest.TestCase):
         attempts = [json.loads(line) for line in before.splitlines()]
         self.assertEqual([(a['id'], a['role'], a['status']) for a in attempts],
                          [('r1', 'test', 'FAILED'), ('r1', 'test', 'PASS')])
-        self.assertTrue(all(set(a) == {'id', 'role', 'started', 'ended', 'status'} for a in attempts))
+        self.assertTrue(all(set(a) == {'id', 'role', 'role_source', 'started', 'ended', 'status'} for a in attempts))
+        self.assertTrue(all(a['role_source'] == 'explicit' for a in attempts))
         self.assertLessEqual(attempts[0]['started'], attempts[0]['ended'])
         self.assertLess(attempts[0]['started'], attempts[1]['started'])
         self.assertLessEqual(attempts[1]['started'], attempts[1]['ended'])
         receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
         self.assertEqual((receipt['status'], receipt['started'], receipt['ended']),
                          ('PASS', attempts[1]['started'], attempts[1]['ended']))
+
+    def test_receipts_and_journal_record_explicit_and_default_role_sources(self):
+        self.plan['rows'] = [
+            {'id': 'explicit', 'start': 'blue', 'end': 'blue', 'role': 'setup', 'steps': [{'shot': 'one'}]},
+            {'id': 'default', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'two'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.make(FakeEden({})).run()
+        attempts = [json.loads(line) for line in (self.dir / 'out' / 'attempts.jsonl').read_text().splitlines()]
+        self.assertEqual([(a['id'], a['role'], a['role_source']) for a in attempts],
+                         [('explicit', 'setup', 'explicit'), ('default', 'test', 'default')])
+        for attempt in attempts:
+            receipt = json.loads((self.dir / 'out' / (attempt['id'] + '.json')).read_text())
+            self.assertEqual((receipt['role'], receipt['role_source']), (attempt['role'], attempt['role_source']))
 
     def test_attempt_journal_includes_refused_unexecuted_row(self):
         r = self.make(FakeEden({}))
@@ -860,7 +874,8 @@ class RunnerTests(unittest.TestCase):
         attempts = [json.loads(line) for line in (self.dir / 'out' / 'attempts.jsonl').read_text().splitlines()]
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0], {key: receipt[key] for key in
-                                      ('id', 'role', 'started', 'ended', 'status', 'not_executed')})
+                                      ('id', 'role', 'role_source', 'started', 'ended', 'status', 'not_executed')})
+        self.assertEqual(attempts[0]['role_source'], 'default')
 
     def two_instances(self):
         logs = {}

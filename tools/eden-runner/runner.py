@@ -2063,7 +2063,7 @@ class Runner:
         self.outcomes[row_id] = item
 
     def record_attempt(self, receipt):
-        attempt = {key: receipt[key] for key in ('id', 'role', 'started', 'ended', 'status')}
+        attempt = {key: receipt[key] for key in ('id', 'role', 'role_source', 'started', 'ended', 'status')}
         if receipt.get('not_executed'):
             attempt['not_executed'] = True
         with (self.out / 'attempts.jsonl').open('a') as f:
@@ -2753,7 +2753,8 @@ class Runner:
             self.last_gate_outcome = None
             self.effects_passed = []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
-                       'role': row_role(row), 'manifest_sha256': self.snapshot_manifest(),
+                       'role': row_role(row), 'role_source': 'explicit' if 'role' in row else 'default',
+                       'manifest_sha256': self.snapshot_manifest(),
                        'started': time.time(), 'results': []}
             try:
                 self.session_start()

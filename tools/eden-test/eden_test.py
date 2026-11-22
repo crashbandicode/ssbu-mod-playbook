@@ -580,7 +580,7 @@ def time_split(run):
                 attempt = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(attempt, dict) and isinstance(attempt.get('id'), str) and attempt['id'] in rows_by_id:
+            if isinstance(attempt, dict) and isinstance(attempt.get('id'), str):
                 candidates.append(attempt)
     paths = list(out.iterdir()) if out.is_dir() else []
     for row_id in rows_by_id:
@@ -610,35 +610,45 @@ def time_split(run):
         prior = attempts_by_start.get(key)
         if prior is None or (not valid_interval(prior) and valid_interval(attempt)):
             attempts_by_start[key] = attempt
+        elif valid_interval(prior) and valid_interval(attempt):
+            for field in ('role', 'role_source'):
+                if prior.get(field) is None and attempt.get(field) is not None:
+                    prior[field] = attempt[field]
 
     intervals = []
     for kind in ('up', 'down'):
         start, end = timing.get(kind + '_start'), timing.get(kind + '_done')
         if numeric(start) and numeric(end) and end >= start:
             intervals.append((start, end, kind))
-    attempts, roles_defaulted = 0, 0
+    attempts, attempts_unroled, roles_defaulted = 0, 0, 0
     for attempt in attempts_by_start.values():
         if not valid_interval(attempt):
             skipped += 1
             continue
         start, end = attempt['started'], attempt['ended']
         role = attempt.get('role')
+        inferred = False
         if role is None:
-            row = rows_by_id[attempt['id']]
-            role = 'setup' if row.get('start') != row.get('end') else 'test'
-            roles_defaulted += 1
-        if role not in ('setup', 'test'):
+            row = rows_by_id.get(attempt['id'])
+            if row is None:
+                role = 'unroled'
+            elif 'role' in row:
+                role = row['role']
+            else:
+                role = 'setup' if row.get('start') != row.get('end') else 'test'
+                inferred = True
+        if role not in ('setup', 'test', 'unroled'):
             skipped += 1
             continue
+        if inferred or attempt.get('role_source') == 'default':
+            roles_defaulted += 1
         attempts += 1
+        attempts_unroled += role == 'unroled'
         intervals.append((start, end, role))
 
     first, last = timing.get('up_start'), timing.get('down_done')
     window = last - first if numeric(first) and numeric(last) and last >= first else None
-    durations = {'up': 0, 'setup': 0, 'test': 0, 'down': 0}
-    if window is None:
-        for start, end, kind in intervals:
-            durations[kind] += end - start
+    durations = {'up': 0, 'setup': 0, 'test': 0, 'unroled': 0, 'down': 0}
     events = []
     if window is not None:
         events.extend([(first, 0, None), (last, 0, None)])
@@ -655,8 +665,7 @@ def time_split(run):
             if active:
                 while earliest[0][1] not in active:
                     heapq.heappop(earliest)
-                if window is not None:
-                    durations[intervals[earliest[0][1]][2]] += duration
+                durations[intervals[earliest[0][1]][2]] += duration
                 if len(active) > 1:
                     overlap += duration
             elif window is not None:
@@ -669,7 +678,8 @@ def time_split(run):
         previous = at
     total = sum(durations.values())
     return {'window': window, **durations, 'unclassified': unclassified if window is not None else None,
-            'overlap': overlap, 'attempts': attempts, 'attempts_skipped': skipped, 'roles_defaulted': roles_defaulted,
+            'incomplete': window is None, 'overlap': overlap, 'attempts': attempts, 'attempts_skipped': skipped,
+            'attempts_unroled': attempts_unroled, 'roles_defaulted': roles_defaulted,
             'test_share': round(durations['test'] / total, 3) if total else 0}
 
 
@@ -682,7 +692,7 @@ def results_md(run, config):
     up_seconds = timing['up_done'] - timing['up_start'] if 'up_done' in timing and 'up_start' in timing else 0
     down_seconds = timing['down_done'] - timing['down_start'] if 'down_done' in timing and 'down_start' in timing else 0
     split = timing.get('split')
-    if not isinstance(split, dict) or 'unclassified' not in split:
+    if not isinstance(split, dict) or not {'unclassified', 'incomplete', 'unroled'} <= split.keys():
         split = time_split(run)
     unclassified = '?' if split['unclassified'] is None else f'{split["unclassified"]:.0f} s'
     rows_now = sha256(run / 'rows' / 'rows.json')
@@ -706,7 +716,10 @@ def results_md(run, config):
               f'- Timing: up {up_seconds:.0f} s, rows {rows_seconds:.0f} s over '
               f'{max(len(runs), 1)} run call(s), down {down_seconds:.0f} s; '
               f'classified: up+setup+down {split["up"] + split["setup"] + split["down"]:.0f} s, '
-              f'test {split["test"]:.0f} s, unclassified {unclassified}'
+              f'test {split["test"]:.0f} s'
+              + (f', unroled {split["unroled"]:.0f} s' if split['unroled'] else '')
+              + f', unclassified {unclassified}'
+              + (' (incomplete timing)' if split['incomplete'] else '')
               + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
     (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
