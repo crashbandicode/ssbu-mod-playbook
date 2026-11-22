@@ -450,7 +450,8 @@ published row title is static Start even when the UI draws Stop; it is not used 
 
 `routes:drill_start(game, expect=None, cap=60)` accepts only Guard the Edge. In Preview it requires the wizard
 heading to disappear; otherwise it starts from the menu and requires the stopped-to-running transition.
-With trace enabled it reads the first release; without trace it can only run when `expect` is omitted.
+With trace enabled it reads the first release and records preceding terminal markers in
+`markers_before_release` (they may end an earlier arm); without trace it can only run when `expect` is omitted.
 Expect keys are `cpu_kind`, `stage_form`, `stage_id`, `perfect`, `juggler`, `damage`, `cpu`, `cpu_words`,
 `p1`, `p1_words` and `plan`. Positions compare whole-unit shown strings; words compare exactly.
 A `plan` check needs the armed symbolic `planner_chose` point and holds the block until the first attempt's

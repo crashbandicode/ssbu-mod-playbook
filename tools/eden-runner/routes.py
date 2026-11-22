@@ -3098,6 +3098,7 @@ def _drill_start(ctx, game, expect, cap, metrics):
                                       and state.values.get('game.running') == '1',
                                       'game running=1')
     release = None
+    markers_before_release = []
     selected_plan = None
     terminal = None
     if stream is not None:
@@ -3112,6 +3113,9 @@ def _drill_start(ctx, game, expect, cap, metrics):
                 elif release is None:
                     if mark['event'] == 0:
                         release = mark
+                    else:
+                        markers_before_release.append({key: mark[key]
+                                                       for key in ('sequence', 'frame', 'event', 'terminal')})
                 elif mark['event'] == 0:
                     raise RuntimeError('next release arrived before first-attempt terminal')
                 else:
@@ -3131,7 +3135,8 @@ def _drill_start(ctx, game, expect, cap, metrics):
             raise RuntimeError('practice start deadline expired during trace fence')
     plan_value = selected_plan if selected_plan is not None else 'none'
     verified = {'game': menu.values.get('game'), 'running': menu.values.get('game.running'),
-                'first_release': release if release is not None else 'not checked: no trace in this boot'}
+                'first_release': release if release is not None else 'not checked: no trace in this boot',
+                'markers_before_release': markers_before_release}
     if needs_plan:
         verified.update({'plan': plan_value, 'plan_terminal': terminal})
     if attempt_status:
