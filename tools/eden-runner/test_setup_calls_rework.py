@@ -120,17 +120,18 @@ class SetupReworkTests(unittest.TestCase):
                                    check_stop=lambda: None)
 
     def roster_response(self, text):
-        written = False
+        """`bridge_state` on a stepped clock: its first wait appends `text` to the log, every wait takes 0.1 s."""
+        clock = [0.0]
 
-        def respond(_):
-            nonlocal written
-            if not written:
+        def wait(seconds):
+            if clock[0] == 0.0:
                 with self.log.open('a') as stream:
                     stream.write(text)
-                written = True
+            clock[0] += seconds
 
-        with patch.object(switch_hw.time, 'sleep', side_effect=respond):
-            return switch_hw.bridge_state(self.root, fresh=('roster',), cap=.01, roster_entries=(0, 1))
+        with patch.object(switch_hw.time, 'sleep', side_effect=wait), \
+             patch.object(switch_hw.time, 'monotonic', side_effect=lambda: clock[0]):
+            return switch_hw.bridge_state(self.root, fresh=('roster',), cap=1, roster_entries=(0, 1))
 
     def test_a_replayed_roster_is_not_a_fresh_answer(self):
         with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
