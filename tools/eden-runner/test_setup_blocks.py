@@ -460,6 +460,26 @@ class WizardTests(OpenCloseTests):
             self.invoke('wizard_place', io, game='Guard the Edge', area='Upper left', cap=.1, pulse_cap=.002)
         self.assertEqual(io.actions, [])
 
+    def test_unrecognized_wizard_body_fails_without_input(self):
+        io = WizardIO(self.ctx)
+        io.menu['notice.body'] = 'An unfamiliar future wizard page'
+        with self.assertRaisesRegex(RuntimeError, 'expected an Area, CPU, P1 or Preview page'):
+            self.invoke('wizard_place', io, game='Guard the Edge', cap=.1, pulse_cap=.002)
+        self.assertEqual(io.actions, [])
+
+    def test_wizard_rejects_double_page_advance(self):
+        io = WizardIO(self.ctx)
+        send = io.send
+
+        def double_advance(segment):
+            send(segment)
+            if segment == 'tap-a1':
+                send(segment)
+
+        io.send = double_advance
+        with self.assertRaisesRegex(RuntimeError, 'expected wizard header Edge · 2/4; saw'):
+            self.invoke('wizard_place', io, game='Guard the Edge', cap=.1, pulse_cap=.002)
+
     def test_unpublished_pulse_then_reached_target_records_uncertainty(self):
         io = WizardIO(self.ctx, step=2, fault='unpublished_once')
         io.cpu = [0.0, 1.0]

@@ -32,6 +32,7 @@ import os
 import re
 import socket
 import time
+import unicodedata
 from collections import deque
 from pathlib import Path
 
@@ -2201,31 +2202,56 @@ def _apply_settings(ctx, data, cap=30):
     return _fetch_settings(ctx, cap=max(.01, until - time.monotonic())), reply
 
 
+INPUT_LAG_S = 3.0
+
+
+def _send_with_retry(io, macro, until, wait):
+    io.send(macro)
+    result = wait(min(until, time.monotonic() + INPUT_LAG_S))
+    if result is None and time.monotonic() < until:
+        io.send(macro)
+        metrics = getattr(io.ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics['retries'] = metrics.get('retries', 0) + 1
+        result = wait(until)
+    if result is not None:
+        io.finish()
+    return result
+
+
 def _tr_input(io, before, macro, until, *, opened=True):
     old_ack = native_picker.number(before, 'ack')
     if time.monotonic() >= until:
         raise RuntimeError(f'Training Mod deadline expired before {macro}')
-    io.send(macro)
     latest = before
-    while (remaining := until - time.monotonic()) > 0:
-        after = _remember(io, io.read('tr.menu', remaining))
-        block = after.block
-        if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
-            raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
-        native_picker.same_epoch(latest, after, in_flight=True)
-        if block['rev'] <= latest.block['rev']:
-            continue
-        latest = after
-        ack = native_picker.number(after, 'ack')
-        if ack == old_ack:
-            continue
-        if ack != old_ack + 1 or after.values.get('ack.result') != 'handled':
-            raise RuntimeError(f'Training Mod input {macro} did not advance exactly one handled ACK')
-        if not _fields_match(after, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
-            raise RuntimeError('Training Mod menu changed scene, keyboard, or open state')
-        io.finish()
-        return after
-    raise RuntimeError(f'Training Mod input {macro} was not handled')
+
+    def wait(deadline):
+        nonlocal latest
+        while (remaining := deadline - time.monotonic()) > 0:
+            after = _remember(io, io.read('tr.menu', remaining))
+            block = after.block
+            if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
+                raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
+            native_picker.same_epoch(latest, after, in_flight=True)
+            if block['rev'] <= latest.block['rev']:
+                continue
+            latest = after
+            ack = native_picker.number(after, 'ack')
+            if ack == old_ack:
+                continue
+            if ack > old_ack + 1:
+                raise RuntimeError(f'input handled twice: expected ACK {old_ack + 1}; saw {ack}')
+            if ack != old_ack + 1 or after.values.get('ack.result') != 'handled':
+                raise RuntimeError(f'expected one handled ACK {old_ack + 1}; saw {ack} {after.values.get("ack.result")}')
+            if not _fields_match(after, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
+                raise RuntimeError(f'expected Training Mod open={int(opened)}; saw {after.values}')
+            return after
+        return None
+
+    after = _send_with_retry(io, macro, until, wait)
+    if after is None:
+        raise RuntimeError(f'expected {macro} handled ACK; saw not handled')
+    return after
 
 
 def _roster_value(settings, key, kind):
@@ -2357,10 +2383,14 @@ def _open_menu(io, until, page, *, after=None):
         native_picker.same_epoch(before, menu, in_flight=True)
         if time.monotonic() >= until:
             raise RuntimeError('Training Mod deadline expired before opening the menu')
-        io.send('tr-menu-open')
-        menu = _wait_tr_menu(io, until, opened=True, after=menu)
+        before = menu
+        menu = _send_with_retry(io, 'tr-menu-open', until,
+                                lambda deadline: _try_tr_condition(
+                                    io, before, deadline,
+                                    lambda state: _fields_match(state, {'scene': 'training', 'keyboard': '0', 'open': '1'})))
+        if menu is None:
+            raise RuntimeError('expected open Training Mod menu; saw no new open menu')
         _wait_training_owner(io, menu, until, 'tr.menu')
-        io.finish()
     skipped = ['open'] if opened else []
     if page is not None:
         menu = _tr_back_to_page(io, menu, until)
@@ -2467,7 +2497,14 @@ def _navigate_menu(io, menu, page, path, until):
         if nested and (not isinstance(group, str) or not group.isdigit()):
             raise RuntimeError('Training Mod Rows group is missing')
         seen = set()
-        while not all(menu.values.get(key) == value for key, value in target.items()):
+        def matches(key, value):
+            observed = menu.values.get(key)
+            if key == 'row' and isinstance(observed, str):
+                normalize = lambda text: ' '.join(unicodedata.normalize('NFKC', text).casefold().split())
+                return normalize(observed) == normalize(value)
+            return observed == value
+
+        while not all(matches(key, value) for key, value in target.items()):
             before = _tr_identity(menu) if nested else native_picker.number(menu, 'cursor')
             if before in seen:
                 raise RuntimeError(f'Training Mod row not found before wrapping: {target!r}')
@@ -2820,87 +2857,111 @@ def _edge_wizard(menu):
     header = menu.values.get('notice.header')
     if not isinstance(header, str):
         raise RuntimeError('practice wizard notice header is missing')
-    return bool(re.fullmatch(r'Edge · [1-4]/4', header))
+    match = re.fullmatch(r'Edge · (\d+)/(\d+)', header)
+    return bool(match and 1 <= int(match[1]) <= int(match[2]))
 
 
-def _wizard_body(menu, step):
-    header = f'Edge · {step}/4'
+def _wizard_body(menu, game):
+    header = menu.values.get('notice.header')
     body = menu.values.get('notice.body')
-    if menu.values.get('open') != '0' or menu.values.get('notice.header') != header or not isinstance(body, str):
-        raise RuntimeError(f'wizard needs closed menu and {header}: {body!r}')
-    return body
-
-
-def _wizard_position(body, label):
-    match = re.fullmatch(rf'{label} \((-?\d+), (-?\d+)\) · Stick move · A next', body)
-    if not match:
-        raise RuntimeError(f'wizard {label} coordinate text is missing or malformed: {body!r}')
-    return list(match.groups())
+    if (menu.values.get('open') != '0' or menu.values.get('game') != game
+            or menu.values.get('game.running') != '1' or not _edge_wizard(menu)):
+        raise RuntimeError(f'expected {game} running wizard; saw game={menu.values.get("game")!r} '
+                           f'running={menu.values.get("game.running")!r} header={header!r} body={body!r}')
+    if isinstance(body, str):
+        pair = r'\((-?\d+),\s*(-?\d+)\)'
+        preview = re.search(rf'CPU\s*{pair}.*?(\d+)%.*?P1\s*{pair}', body)
+        if preview:
+            return {'header': header, 'body': body, 'kind': 'Preview',
+                    'cpu': list(preview.group(1, 2)), 'percent': int(preview.group(3)),
+                    'p1': list(preview.group(4, 5))}
+        cpu = re.match(rf'CPU\s*{pair}', body)
+        if cpu and not re.search(r'P1\s*\(', body):
+            return {'header': header, 'body': body, 'kind': 'CPU', 'cpu': list(cpu.groups())}
+        p1 = re.match(rf'P1\s*{pair}', body)
+        if p1:
+            return {'header': header, 'body': body, 'kind': 'P1', 'p1': list(p1.groups())}
+        area = re.match(rf'(Lower left|Lower right|Upper left|Upper right)\s*{pair}', body)
+        if area:
+            return {'header': header, 'body': body, 'kind': 'Area', 'area': area.group(1)}
+    raise RuntimeError(f'expected an Area, CPU, P1 or Preview page; saw header={header!r} body={body!r}')
 
 
 def _wizard_owner(io, menu, until):
-    state = io.read(native_picker.UI, max(.001, until - time.monotonic()))
+    state = _remember(io, io.read(native_picker.UI, max(.001, until - time.monotonic())))
     native_picker.same_epoch(menu, state, in_flight=True)
     return state.values.get('input.owner', 'unknown')
 
 
-def _wizard_next(io, menu, step, until):
-    before = _wizard_body(menu, step)
+def _wizard_next(io, menu, game, until):
+    before = _wizard_body(menu, game)
+    match = re.fullmatch(r'Edge · (\d+)/(\d+)', before['header'])
+    wanted = f'Edge · {int(match[1]) + 1}/{match[2]}'
     if time.monotonic() >= until:
         raise RuntimeError(f'wizard deadline before advancing: {before}')
-    io.send('tap-a1')
-    try:
-        after = _wait_tr_condition(io, menu, until,
-                                    lambda state: state.values.get('open') == '0'
-                                    and state.values.get('notice.header') == f'Edge · {step + 1}/4',
-                                    f'wizard header Edge · {step + 1}/4')
-    except RuntimeError as error:
-        raise RuntimeError(f'wizard header did not advance from {before!r}: {error}') from error
-    io.finish()
-    _wizard_body(after, step + 1)
+
+    def changed(state):
+        page = _wizard_body(state, game)
+        if page['header'] not in (before['header'], wanted):
+            raise RuntimeError(f'expected wizard header {wanted}; saw {page["header"]!r} body={page["body"]!r}')
+        return page['header'] == wanted
+
+    after = _send_with_retry(io, 'tap-a1', until,
+                             lambda deadline: _try_tr_condition(io, menu, deadline, changed))
+    if after is None:
+        raise RuntimeError(f'expected wizard header {wanted}; saw {before["header"]!r} body={before["body"]!r}')
     return after
 
 
-def _wizard_pulse(io, menu, step, macro, until, pulse_cap):
-    body = _wizard_body(menu, step)
+def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
+    page = _wizard_body(menu, game)
     io.send(macro)
     deadline = min(until, time.monotonic() + pulse_cap)
     while (remaining := deadline - time.monotonic()) > 0:
-        state = io.read('tr.menu', remaining)
+        state = _remember(io, io.read('tr.menu', remaining))
         if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
             raise RuntimeError('wizard needs a complete tr.menu/1 reply')
         native_picker.same_epoch(menu, state, in_flight=True)
-        _wizard_body(state, step)
+        current = _wizard_body(state, game)
+        if current['header'] != page['header'] or current['kind'] != page['kind']:
+            raise RuntimeError(f'expected wizard page {page["header"]}; saw {current!r}')
         if state.block['rev'] > menu.block['rev']:
             io.finish()
-            return state, False
+            return state, True
         time.sleep(min(.01, max(0, deadline - time.monotonic())))
     if time.monotonic() >= until:
-        raise RuntimeError(f'wizard deadline after pulse; last shown {body!r}')
-    state = io.read('tr.menu', min(pulse_cap, until - time.monotonic()))
+        raise RuntimeError(f'wizard deadline after pulse; last shown {page["body"]!r}')
+    state = _remember(io, io.read('tr.menu', min(pulse_cap, until - time.monotonic())))
     if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
         raise RuntimeError('wizard needs a complete tr.menu/1 reply')
     native_picker.same_epoch(menu, state, in_flight=True)
-    new_body = _wizard_body(state, step)
-    if state.block['rev'] == menu.block['rev'] and new_body == body:
-        io.finish()
-        return state, True
-    if state.block['rev'] > menu.block['rev']:
+    current = _wizard_body(state, game)
+    if current['header'] != page['header'] or current['kind'] != page['kind']:
+        raise RuntimeError(f'expected wizard page {page["header"]}; saw {current!r}')
+    if state.block['rev'] == menu.block['rev'] and current['body'] == page['body']:
         io.finish()
         return state, False
+    if state.block['rev'] > menu.block['rev']:
+        io.finish()
+        return state, True
     raise RuntimeError('wizard pulse reread contradicted its prior notice')
 
 
-def _wizard_move(io, menu, step, target, until, pulse_cap):
-    label = 'CPU' if step == 2 else 'P1'
+def _shown_matches(shown, target, tolerance):
+    if tolerance == 0:
+        return shown == target
+    return all(abs(int(actual) - int(wanted)) <= tolerance for actual, wanted in zip(shown, target))
+
+
+def _wizard_move(io, menu, game, label, target, until, pulse_cap, tolerance):
     pulses = []
     nulls = 0
     last_size = None
     for _ in range(60):
-        shown = _wizard_position(_wizard_body(menu, step), label)
-        if shown == target:
+        shown = _wizard_body(menu, game)[label.lower()]
+        if _shown_matches(shown, target, tolerance):
             return menu, shown, pulses
-        axis = 0 if shown[0] != target[0] else 1
+        axis = 0 if not _shown_matches(shown[:1], target[:1], tolerance) else 1
         distance = int(target[axis]) - int(shown[axis])
         if distance == 0:
             distance = -1 if target[axis] == '-0' else 1
@@ -2909,43 +2970,50 @@ def _wizard_move(io, menu, step, target, until, pulse_cap):
                      else ('down' if distance < 0 else 'up'))
         macro = f'wizard-{direction}-{size}'
         try:
-            menu, null = _wizard_pulse(io, menu, step, macro, until, pulse_cap)
+            menu, published = _wizard_pulse(io, menu, game, macro, until, pulse_cap)
         except RuntimeError as error:
             raise RuntimeError(f'wizard {label} unreachable: last {shown}, target {target}, '
                                f'pulses {pulses + [macro]}: {error}') from error
-        pulses.append({'axis': 'x' if axis == 0 else 'y', 'macro': macro, 'null': null})
-        nulls = nulls + 1 if null and last_size == size else int(null)
+        pulses.append({'axis': 'x' if axis == 0 else 'y', 'macro': macro, 'published': published})
+        nulls = nulls + 1 if not published and last_size == size else int(not published)
         last_size = size
         if nulls >= (4 if size == 'fine' else 2):
-            shown = _wizard_position(_wizard_body(menu, step), label)
+            shown = _wizard_body(menu, game)[label.lower()]
             raise RuntimeError(f'wizard {label} unreachable: last {shown}, target {target}, pulses {pulses}')
-    shown = _wizard_position(_wizard_body(menu, step), label)
+    shown = _wizard_body(menu, game)[label.lower()]
     raise RuntimeError(f'wizard {label} unreachable after 60 pulses: last {shown}, target {target}, pulses {pulses}')
 
 
-def wizard_place(ctx, game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0):
-    if game != 'Guard the Edge':
-        raise RuntimeError(f'unsupported wizard game {game!r}')
-    areas = ('Lower left', 'Lower right', 'Upper left', 'Upper right')
-    if area is not None and area not in areas:
-        raise RuntimeError(f'unknown wizard area {area!r}')
-    targets = []
-    for label, point in (('cpu', cpu), ('p1', p1)):
-        if point is None:
-            targets.append(None)
-        elif isinstance(point, list) and len(point) == 2:
-            targets.append([_shown_coordinate(value) for value in point])
-        else:
-            raise RuntimeError(f'wizard {label} requires two shown coordinates')
-    if any(type(value) not in (int, float) or not 0 < value < float('inf') for value in (cap, pulse_cap)):
-        raise RuntimeError('wizard caps must be positive')
-    return _with_setup_metrics(ctx, lambda metrics: _wizard_place(ctx, game, area, cpu, p1, targets,
-                                                                 cap, pulse_cap, metrics))
+def wizard_place(ctx, game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0, tolerance=0):
+    args = {'game': game, 'area': area, 'cpu': cpu, 'p1': p1, 'cap': cap,
+            'pulse_cap': pulse_cap, 'tolerance': tolerance}
+
+    def action(metrics):
+        if game != 'Guard the Edge':
+            raise RuntimeError(f'unsupported wizard game {game!r}')
+        if area is not None and area not in ('Lower left', 'Lower right', 'Upper left', 'Upper right'):
+            raise RuntimeError(f'unknown wizard area {area!r}')
+        targets = []
+        for label, point in (('cpu', cpu), ('p1', p1)):
+            if point is None:
+                targets.append(None)
+            elif isinstance(point, list) and len(point) == 2:
+                targets.append([_shown_coordinate(value) for value in point])
+            else:
+                raise RuntimeError(f'wizard {label} requires two shown coordinates')
+        if any(type(value) not in (int, float) or not 0 < value < float('inf') for value in (cap, pulse_cap)):
+            raise RuntimeError('wizard caps must be positive')
+        if type(tolerance) not in (int, float) or not 0 <= tolerance < float('inf'):
+            raise RuntimeError(f'expected nonnegative finite tolerance; saw {tolerance!r}')
+        return _wizard_place(ctx, args, targets, metrics)
+
+    return _block(ctx, 'wizard_place', 'routes-wizard-place', args, action)
 
 
-def _wizard_place(ctx, game, area, cpu, p1, targets, cap, pulse_cap, metrics):
+def _wizard_place(ctx, args, targets, metrics):
     started = time.monotonic()
-    until = started + cap
+    game, area = args['game'], args['area']
+    until = started + args['cap']
     io = BridgePickerIO(ctx)
     menu = _tr_current(io, until)
     skipped = []
@@ -2954,78 +3022,67 @@ def _wizard_place(ctx, game, area, cpu, p1, targets, cap, pulse_cap, metrics):
         menu = _navigate_menu(io, menu, 'fighters_stages',
                               _tr_path(['game.6', {'action': 'row', 'row': 'Set up…'}]), until)
         menu = _tr_input(io, menu, 'tap-a1', until, opened=False)
-        if menu.values.get('notice.header') != 'Edge · 1/4':
+        if not _edge_wizard(menu):
             menu = _wait_tr_condition(io, menu, until,
                                       lambda state: state.values.get('open') == '0'
-                                      and state.values.get('notice.header') == 'Edge · 1/4',
-                                      'wizard header Edge · 1/4')
-    step = int(menu.values['notice.header'][-3])
-    owners = {str(step): _wizard_owner(io, menu, until)}
+                                      and _edge_wizard(state), 'wizard header')
+    owners = {}
+    pages = []
     area_body = None
     moves = {'cpu': [], 'p1': []}
-    if step > 1 and area is not None:
-        raise RuntimeError('wizard area cannot be verified after leaving the Area step')
-    if step == 1:
-        area_body = _wizard_body(menu, 1)
-        for _ in range(4):
-            if not re.fullmatch(r'(?:Lower left|Lower right|Upper left|Upper right) '
-                                r'\(-?\d+, -?\d+\) · D-pad choose · A next', area_body):
-                raise RuntimeError(f'wizard Area text is malformed: {area_body!r}')
-            if area is None or area_body.startswith(area + ' ('):
-                break
-            before = area_body
-            io.send('main-menu-right')
-            menu = _wait_tr_condition(io, menu, until,
-                                      lambda state: state.values.get('open') == '0'
-                                      and state.values.get('notice.header') == 'Edge · 1/4'
-                                      and state.values.get('notice.body') != before, 'wizard area change')
-            io.finish()
-            area_body = _wizard_body(menu, 1)
+    area_seen = False
+    while True:
+        page = _wizard_body(menu, game)
+        pages.append({'header': page['header'], 'kind': page['kind']})
+        owners[page['header']] = _wizard_owner(io, menu, until)
+        if area is not None and not area_seen and page['kind'] != 'Area':
+            raise RuntimeError(f'expected an Area page to choose {area}; saw header={page["header"]!r} body={page["body"]!r}')
+        if page['kind'] == 'Area':
+            area_seen = True
+            for _ in range(4):
+                page = _wizard_body(menu, game)
+                area_body = page['body']
+                if area is None or page['area'] == area:
+                    break
+                before = menu
+                menu = _send_with_retry(io, 'main-menu-right', until,
+                                        lambda deadline: _try_tr_condition(
+                                            io, before, deadline,
+                                            lambda state: _wizard_body(state, game)['body'] != page['body']))
+                if menu is None:
+                    raise RuntimeError(f'expected wizard area change; saw {page["body"]!r}')
+            else:
+                raise RuntimeError(f'expected wizard area {area!r}; saw {page["body"]!r}')
+        elif page['kind'] in ('CPU', 'P1'):
+            index = 0 if page['kind'] == 'CPU' else 1
+            if targets[index] is not None:
+                menu, _, moves[page['kind'].lower()] = _wizard_move(
+                    io, menu, game, page['kind'], targets[index], until, args['pulse_cap'], args['tolerance'])
         else:
-            raise RuntimeError(f'wizard area {area!r} not found before wrapping')
-        menu = _wizard_next(io, menu, 1, until)
-        owners['2'] = _wizard_owner(io, menu, until)
-        step = 2
-    if step == 2:
-        if targets[0] is not None:
-            menu, _, moves['cpu'] = _wizard_move(io, menu, 2, targets[0], until, pulse_cap)
-        else:
-            _wizard_position(_wizard_body(menu, 2), 'CPU')
-        menu = _wizard_next(io, menu, 2, until)
-        owners['3'] = _wizard_owner(io, menu, until)
-        step = 3
-    if step == 3:
-        if targets[1] is not None:
-            menu, _, moves['p1'] = _wizard_move(io, menu, 3, targets[1], until, pulse_cap)
-        else:
-            _wizard_position(_wizard_body(menu, 3), 'P1')
-        menu = _wizard_next(io, menu, 3, until)
-        owners['4'] = _wizard_owner(io, menu, until)
-    body = _wizard_body(menu, 4)
-    match = re.fullmatch(r'CPU \((-?\d+), (-?\d+)\) · (\d+)% · P1 \((-?\d+), (-?\d+)\) · A/\+ start', body)
-    if not match:
-        raise RuntimeError(f'wizard Preview text is malformed: {body!r}')
-    cpu_shown = list(match.group(1, 2))
-    p1_shown = list(match.group(4, 5))
-    if targets[0] is not None and cpu_shown != targets[0] or targets[1] is not None and p1_shown != targets[1]:
-        raise RuntimeError(f'wizard Preview mismatch: {body!r}, requested {targets!r}, pulses {moves!r}')
+            break
+        menu = _wizard_next(io, menu, game, until)
+    cpu_shown, p1_shown = page['cpu'], page['p1']
+    if (targets[0] is not None and not _shown_matches(cpu_shown, targets[0], args['tolerance'])
+            or targets[1] is not None and not _shown_matches(p1_shown, targets[1], args['tolerance'])):
+        raise RuntimeError(f'expected Preview coordinates {targets!r}; saw {page["body"]!r}, pulses {moves!r}')
     elapsed = round((time.monotonic() - started) * 1000)
-    return _save(ctx, 'routes-wizard-place', {
-        'block': 'wizard_place', 'args': {'game': game, 'area': area, 'cpu': cpu, 'p1': p1,
-                                         'cap': cap, 'pulse_cap': pulse_cap},
+    return {
+        'block': 'wizard_place', 'args': args,
         'verified': {'area_body': area_body, 'cpu_shown': cpu_shown, 'p1_shown': p1_shown,
-                     'percent': int(match.group(3)), 'preview_body': body, 'pulses': moves, 'owners': owners,
-                     'note': 'shown values are whole units; exact position words are checked by drill_start',
-                     'null_note': 'null is inferred from no publication within pulse_cap and cannot be told '
-                                  'from a late publication; either way the block fails closed'},
+                     'percent': page['percent'], 'preview_body': page['body'], 'pulses': moves,
+                     'pages': pages, 'owners': owners,
+                     'unconfirmed_pulses': sum(not pulse['published'] for group in moves.values() for pulse in group),
+                     'note': 'an unpublished pulse may have moved the point by less than a shown unit; '
+                             "only the shown coordinates are verified here; exact position words are checked by "
+                             "drill_start's first release"},
         **metrics, 'ms': {'wizard': elapsed, 'total': elapsed}, 'skipped': skipped,
-    })
+    }
 
 
-def _wait_tr_condition(io, before, until, predicate, label):
+def _try_tr_condition(io, before, until, predicate):
     latest = before
     while (remaining := until - time.monotonic()) > 0:
-        state = io.read('tr.menu', remaining)
+        state = _remember(io, io.read('tr.menu', remaining))
         if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
             raise RuntimeError('practice witness needs a complete tr.menu/1 reply')
         native_picker.same_epoch(latest, state, in_flight=True)
@@ -3036,6 +3093,13 @@ def _wait_tr_condition(io, before, until, predicate, label):
             raise RuntimeError('practice witness changed scene or opened a keyboard')
         if predicate(state):
             return state
+    return None
+
+
+def _wait_tr_condition(io, before, until, predicate, label):
+    state = _try_tr_condition(io, before, until, predicate)
+    if state is not None:
+        return state
     raise RuntimeError(f'practice {label} not observed before deadline')
 
 
