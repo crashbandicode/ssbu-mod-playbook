@@ -188,7 +188,7 @@ class ProducerReplayTests(unittest.TestCase):
         self.ctx.runner.routes_expect['stage_id'] = 3
         replay = ProducerReplay()
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, '_fetch_settings', return_value=b'{}'), \
+             patch.object(routes, '_current_settings_observation', return_value=({}, 'file', b'{}')), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             receipt = routes.setup_state(self.ctx)
         self.assertEqual(receipt['verified']['stage_id'], 'unknown')
@@ -203,7 +203,7 @@ class ProducerReplayTests(unittest.TestCase):
 
         with patch.object(routes, 'BridgePickerIO', return_value=TrainingReplay()), \
              patch.object(routes, 'native_state', return_value={'stage': 5, 'roster': {}}), \
-             patch.object(routes, '_fetch_settings', return_value=b'{}'), \
+             patch.object(routes, '_current_settings_observation', return_value=({}, 'file', b'{}')), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             receipt = routes.setup_state(self.ctx)
         self.assertEqual(receipt['verified']['stage_id'], 5)
