@@ -85,7 +85,9 @@ class OpenCloseTests(unittest.TestCase):
 
     def invoke(self, name, io, **kwargs):
         with patch.object(routes, 'BridgePickerIO', return_value=io):
-            return getattr(routes, name)(self.ctx, **kwargs)
+            result = getattr(routes, name)(self.ctx, **kwargs)
+        json.dumps(result)
+        return result
 
     def test_open_and_go_to_page_with_one_fenced_input_per_edge(self):
         io = MenuIO(self.ctx)
@@ -728,6 +730,7 @@ class SetTests(OpenCloseTests):
               patch.object(routes, 'LogCursor', return_value=object()) as cursor):
             result = routes.tr_set(self.ctx, page=io.menu['page'], path=path or [io.menu['row_id']],
                                    kind=kind, value=value, cap=1)
+        json.dumps(result)
         return result, waited.call_count, cursor.call_count, reads
 
     def test_oversized_sdi_settings_cannot_certify_product_index(self):

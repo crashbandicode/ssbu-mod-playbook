@@ -254,6 +254,7 @@ class SetupReworkTests(unittest.TestCase):
                      patch.object(routes, 'wait_native', return_value={'roster': {0: {'kind': 0}, 1: {'kind': 0}}}), \
                      patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
                     result = routes.set_cpu(self.ctx, 'Mario', cap=.1)
+                json.dumps(result)
                 self.assertEqual(io.actions[0], 'tap-a1' if initially_open else 'tr-menu-open')
                 self.assertEqual(result['verified']['kind'], 0)
 
@@ -274,6 +275,7 @@ class SetupReworkTests(unittest.TestCase):
              patch.object(routes, '_apply_settings', side_effect=[(good, 'ok'), (bad, 'ok'), (missing, 'ok')]), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.tr_settings(self.ctx, file=path)
+            json.dumps(result)
             self.assertEqual(result['verified']['keys'], ['menu', 'version'])
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, r'menu\.cpu_level'):
@@ -283,7 +285,7 @@ class SetupReworkTests(unittest.TestCase):
         topology = {'path': 'modelled', 'sha256': 'modelled'}
         with patch.object(routes, 'pick_local_fighter', return_value={'placed': True}) as local, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-            routes.pick_fighters(self.ctx, 'Mario', topology=topology)
+            json.dumps(routes.pick_fighters(self.ctx, 'Mario', topology=topology))
         local.assert_called_once_with(self.ctx, 'Mario', topology=topology, form='default')
 
     def test_pick_fighters_take_back_and_cpu_use_their_intended_paths(self):
@@ -291,11 +293,11 @@ class SetupReworkTests(unittest.TestCase):
         with patch.object(routes, 'pick_local_fighter', return_value={'placed': True}) as local, \
              patch.object(routes, 'pick_cpu', return_value={'placed': True}) as cpu, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-            routes.pick_fighters(self.ctx, 'Mario', topology=topology, take_back=True)
+            json.dumps(routes.pick_fighters(self.ctx, 'Mario', topology=topology, take_back=True))
             local.assert_called_once_with(self.ctx, 'Mario', topology=topology, form='default', take_back=True)
             cpu.assert_not_called()
             local.reset_mock()
-            routes.pick_fighters(self.ctx, 'Mario', cpu='Fox', topology=topology)
+            json.dumps(routes.pick_fighters(self.ctx, 'Mario', cpu='Fox', topology=topology))
             local.assert_called_once_with(self.ctx, 'Mario', topology=topology, form='default',
                                           take_back=True, expected_context='training')
             cpu.assert_called_once_with(self.ctx, 'Fox', topology=topology, form='default')
@@ -307,10 +309,11 @@ class SetupReworkTests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training'), patch.object(routes, 'enter_training'), \
-             patch.object(routes, 'pick_fighters') as fighters, \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'enter_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}) as fighters, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-            routes.reach_training(self.ctx, 'Mario', cpu='Fox')
+            json.dumps(routes.reach_training(self.ctx, 'Mario', cpu='Fox'))
         self.assertIs(fighters.call_args.kwargs['take_back'], True)
 
     def test_set_player_requests_take_back_at_training_character_select(self):
@@ -321,7 +324,7 @@ class SetupReworkTests(unittest.TestCase):
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(routes, 'pick_local_fighter', return_value={'placed': True}) as local, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-            routes.set_player(self.ctx, 'Mario')
+            json.dumps(routes.set_player(self.ctx, 'Mario'))
         self.assertIs(local.call_args.kwargs['take_back'], True)
 
 

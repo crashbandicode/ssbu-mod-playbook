@@ -1168,6 +1168,26 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(inside, 2)
         self.assertEqual(runner.dry_run(self.manifest)['result'], 'READY')
 
+    def test_non_json_step_value_writes_receipt_and_runs_next_row(self):
+        (self.dir / 'steps.py').write_text(
+            'def return_set(ctx):\n'
+            '    return {"stage_ids": {3}}\n')
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue',
+             'steps': [{'run': 'steps.py:return_set'}]},
+            {'id': 'r2', 'start': 'blue', 'end': 'blue',
+             'steps': [{'shot': 'next'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.make(FakeEden({})).run()
+        first = json.loads((self.dir / 'out/r1.json').read_text())
+        second = json.loads((self.dir / 'out/r2.json').read_text())
+        attempts = [json.loads(line) for line in (self.dir / 'out/attempts.jsonl').read_text().splitlines()]
+        self.assertEqual(first['status'], 'PASS')
+        self.assertEqual(first['results'][0]['value']['stage_ids'], '{3}')
+        self.assertEqual(second['status'], 'PASS')
+        self.assertEqual([(row['id'], row['status']) for row in attempts], [('r1', 'PASS'), ('r2', 'PASS')])
+
     def test_log_source_names_with_or_without_log_suffix(self):
         self.instances = {'a': {'socket': 'fake', 'console': str(self.log)}}  # gate says console_log
         eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)

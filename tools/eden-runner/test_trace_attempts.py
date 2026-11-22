@@ -155,7 +155,9 @@ class ObserveTests(unittest.TestCase):
 
     def invoke(self, **kwargs):
         with patch.object(routes, 'BridgePickerIO', return_value=self.io):
-            return routes.drill_observe(self.ctx, **kwargs)
+            result = routes.drill_observe(self.ctx, **kwargs)
+        json.dumps(result)
+        return result
 
     def test_counts_new_terminal_and_saves_receipt(self):
         release, terminal = excerpt('cp1b-hero-attempt.jsonl')
@@ -503,7 +505,9 @@ class StartIO(fake.RowsIO):
 class StartTests(ObserveTests):
     def invoke_start(self, *, expect=None, cap=.5):
         with patch.object(routes, 'BridgePickerIO', return_value=self.io):
-            return routes.drill_start(self.ctx, game='Guard the Edge', expect=expect, cap=cap)
+            result = routes.drill_start(self.ctx, game='Guard the Edge', expect=expect, cap=cap)
+        json.dumps(result)
+        return result
 
     def enable_planner(self):
         original = self.ctx.call
