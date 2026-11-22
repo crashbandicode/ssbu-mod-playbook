@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -275,6 +276,157 @@ class SetupCallsR1Tests(unittest.TestCase):
         result = self.pick_cpu()
         self.assertTrue(result['already'])
         self.assertEqual(self.io.actions, [])
+
+
+class MenuReplay:
+    """Modelled TR menu blocks with explicit input-to-ACK transitions."""
+
+    def __init__(self, *, depth=0, wrong_cell=False):
+        self.rev = 1
+        self.actions = []
+        self.watches = []
+        self.evidence = []
+        self.picked = False
+        self.wrong_cell = wrong_cell
+        self.menu = {'scene': 'training', 'keyboard': '0', 'open': '1', 'page': 'fighters_stages',
+                     'cursor': '4', 'action': 'cpu_character', 'depth': str(depth),
+                     'editor.sel': '1' if wrong_cell else '0', 'grid': 'cpu_character',
+                     'ack': '0', 'ack.result': 'handled', 'focus': 'fighters_stages'}
+
+    def arm(self, provider, cap):
+        self.watches.append(provider)
+
+    def read(self, provider, cap):
+        self.rev += 1
+        if provider == 'tr.menu':
+            return recorded.snapshot(provider, self.rev, self.menu)
+        owner = 'tr.menu' if self.menu['open'] == '1' else 'native'
+        return recorded.native(self.rev, screen='training', focus='training',
+                               **{'screen.context': 'training', 'input.owner': owner})
+
+    def log(self, evidence):
+        self.evidence.append(evidence)
+
+    def finish(self):
+        pass
+
+    def send(self, segment):
+        self.actions.append(segment)
+        values = self.menu
+        values['ack'] = str(int(values['ack']) + 1)
+        values['ack.result'] = 'handled'
+        if segment == 'tap-b1':
+            if values['depth'] != '0':
+                values['depth'] = '0'
+            else:
+                values['open'] = '0'
+        elif segment == 'tap-a1':
+            if values['depth'] == '0':
+                values['depth'] = '1'
+                values['editor.sel'] = '1' if self.wrong_cell else '0'
+            else:
+                self.picked = True
+        elif segment.startswith('main-menu-'):
+            if self.wrong_cell:
+                values['editor.sel'] = '2'
+            else:
+                raise AssertionError('unexpected grid step')
+        elif segment == 'tr-menu-open':
+            values['open'] = '1'
+        else:
+            raise AssertionError(segment)
+
+
+class SetupCallsR2Tests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.ctx = SimpleNamespace(
+            runner=SimpleNamespace(routes_expect={'p1_kind': 0, 'cpu_kind': 7}), on='s',
+            instance={}, row_dir=self.dir.name, check_stop=lambda: None,
+        )
+
+    def test_enter_training_refuses_a_roster_that_differs_from_the_picks(self):
+        state = {'roster': {0: {'kind': 0}, 1: {'kind': 3}}, 'stage': 3}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'Training loaded fighters P1 kind 0, CPU kind 3; expected'):
+                routes.enter_training(self.ctx, cap=1)
+
+    def test_tr_grid_path_matches_trainingrooms_step_rule(self):
+        vectors = ((0, 'left', 12), (12, 'right', 0), (0, 'up', 78), (12, 'up', 86),
+                   (78, 'down', 2), (86, 'down', 10), (65, 'down', 78),
+                   (78, 'left', 86), (86, 'right', 78), (13, 'up', 0))
+        for start, direction, goal in vectors:
+            with self.subTest(start=start, direction=direction):
+                self.assertEqual(routes.tr_grid_step(start, direction), goal)
+        for start, goal, distance in ((0, 12, 1), (0, 78, 1), (0, 86, 2), (78, 0, 3)):
+            path = routes.tr_grid_path(start, goal)
+            self.assertEqual(len(path), distance)
+            cell = start
+            for direction in path:
+                cell = routes.tr_grid_step(cell, direction)
+            self.assertEqual(cell, goal)
+
+    def set_cpu(self, replay, roster, settings):
+        tables = routes.tables()
+        tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}, {'kind': 7, 'name': 'Fox'}]
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'tables', return_value=tables), \
+             patch.object(routes, '_fetch_settings', return_value=json.dumps(settings).encode(), create=True), \
+             patch.object(routes, 'wait_native', return_value={'roster': roster, 'stage': 3}), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            return routes.set_cpu(self.ctx, 'Mario')
+
+    def test_set_cpu_stops_before_a_on_an_unexpected_cell(self):
+        replay = MenuReplay(wrong_cell=True)
+        with self.assertRaisesRegex(RuntimeError, '(?i)(cell|editor.sel)'):
+            self.set_cpu(replay, {0: {'kind': 0}, 1: {'kind': 0}},
+                         {'menu': {'cpu_character': [1, 0]}})
+        self.assertEqual(replay.actions, ['tap-a1', 'main-menu-left'])
+
+    def test_set_cpu_backs_out_of_an_open_grid_first(self):
+        replay = MenuReplay(depth=1)
+        result = self.set_cpu(replay, {0: {'kind': 0}, 1: {'kind': 0}},
+                              {'menu': {'cpu_character': [1, 0]}})
+        self.assertEqual(replay.actions, ['tap-b1', 'tap-a1', 'tap-a1', 'tap-b1', 'tap-b1'])
+        self.assertTrue(result['grid_named'])
+
+    def test_tr_settings_refuses_a_refused_set_and_a_readback_difference(self):
+        initial = b'{"menu":{"stage_hazards":[1,0]}}'
+        changed = {'stage_hazards': [0, 1]}
+        cases = ((RuntimeError('[Bridge] req set result=refused reason=busy'), 'refused'),
+                 ((b'{"menu":{"stage_hazards":[1,0]}}', '[Bridge] req set result=ok'), 'stage_hazards'))
+        for outcome, message in cases:
+            with self.subTest(message=message):
+                apply = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
+                with patch.object(routes, '_fetch_settings', return_value=initial, create=True), \
+                     patch.object(routes, '_apply_settings', create=True, **apply), \
+                     patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        routes.tr_settings(self.ctx, values=changed)
+
+    def test_reach_training_skips_what_already_holds_and_writes_one_receipt(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        state = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        saved = []
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: saved.append(name) or value):
+            receipt = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+        self.assertEqual(saved, ['routes-reach-training'])
+        self.assertEqual(replay.actions, [])
+        self.assertTrue({'to_main', 'main_to_stage', 'pick_stage', 'pick_fighters', 'enter_training'}
+                        <= set(receipt['skipped']))
+
+    def test_set_cpu_needs_the_live_roster_not_only_the_file(self):
+        replay = MenuReplay()
+        with self.assertRaisesRegex(RuntimeError, '(?i)roster'):
+            self.set_cpu(replay, {0: {'kind': 0}, 1: {'kind': 7}},
+                         {'menu': {'cpu_character': [1, 0]}})
+        self.assertEqual(replay.actions, ['tap-a1', 'tap-a1', 'tap-b1', 'tap-b1'])
 
 
 if __name__ == '__main__':
