@@ -2,11 +2,14 @@
 """Offline tests for eden_test.py: fake lifecycle/runner/harvest scripts, temp run folders, no Eden."""
 import hashlib
 import importlib.util
+import io
 import json
 import shutil
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -798,6 +801,198 @@ class EdenTestTests(unittest.TestCase):
 
     def args(self, *extra):
         return ['--from', str(self.previous), '--label', 'lr-14', '--rows', str(self.rows), *extra]
+
+    def go_args(self, label='go-1', rows=None, nro=None, host='yoga'):
+        return ['go', '--host', host, '--label', label, '--nro', str(nro or self.dir / 'plugin.nro'),
+                '--rows', str(rows or self.rows), '--from', str(self.previous)]
+
+    def test_go_local_copies_pins_port_trace_and_reports_without_down(self):
+        source = self.dir / 'profile/user/config'
+        source.mkdir(parents=True)
+        (source / 'qt-config.ini').write_text('[Debug]\nuse_gdbstub=false\n')
+        port = self.dir / 'old-port.txt'
+        port.write_text('6979\n')
+        base = json.loads(self.previous.read_text())
+        base.update(rows={'path': 'old'}, authorization='old')
+        item = base['instances'][0]
+        item.update(source=str(source.parent.parent), trace={'unmapped_access': 'log'},
+                    files=[{'path': str(port), 'sha256': sha(port),
+                            'to': 'user/sdmc/ultimate/ssbu-hw-bridge/port.txt'}])
+        self.previous.write_text(json.dumps(base))
+        build = self.dir / 'new-build'
+        build.mkdir()
+        new = build / 'plugin.nro'
+        new.write_bytes(b'new plugin build')
+        extra = build / 'extra.nro'
+        extra.write_bytes(b'an additional plugin')
+        elf = build / 'plugin.so'
+        elf.write_bytes(b'symbols')
+        (self.rows / 'rows.json').write_text(json.dumps({'rows': [
+            {'id': 'r1', 'steps': []}, {'id': 'r2', 'steps': []}]}))
+        (self.rows / 'relative-link').symlink_to('rows.json')
+        output = io.StringIO()
+        fake_routes = types.SimpleNamespace(free_port=lambda: 6987)
+        argv = self.go_args(nro=new) + ['--nro', str(extra), '--elf', str(elf),
+                                      '--trace-point', 'plugin.nro!attempt']
+        with mock.patch.dict(sys.modules, {'routes': fake_routes}), \
+             mock.patch.object(eden_test, 'cmd_down') as down, redirect_stdout(output):
+            self.assertEqual(eden_test.main(argv), 0)
+        down.assert_not_called()
+        run = self.dir / 'runs/go-1'
+        config = json.loads((run / 'config.json').read_text())
+        self.assertEqual((config['owner'], config['label'], config['defer_load']),
+                         ('eden-test/go-1', 'go-1', True))
+        self.assertNotIn('authorization', config)
+        self.assertEqual(config['state_dir'], str(run / 'state'))
+        self.assertEqual(config['work_root'], str(run / 'work'))
+        pins = config['instances'][0]['plugins']
+        self.assertEqual((pins[0]['path'], pins[0]['sha256']), (str(run / 'inputs/plugin.nro'), sha(new)))
+        self.assertEqual(pins[1], {'name': 'extra.nro', 'path': str(run / 'inputs/extra.nro'),
+                                   'sha256': sha(extra)})
+        self.assertEqual(config['plugin_swaps'], [{'from': str(self.dir / 'plugin.nro'),
+                                                   'from_sha256': sha(self.dir / 'plugin.nro'),
+                                                   'to': str(run / 'inputs/plugin.nro')}])
+        self.assertEqual((run / 'inputs/port.txt').read_text(), '6987\n')
+        pin = config['instances'][0]['files'][0]
+        self.assertEqual((pin['path'], pin['sha256']), (str(run / 'inputs/port.txt'), sha(run / 'inputs/port.txt')))
+        self.assertEqual(config['bridge_port'], 6987)
+        self.assertIn('GDB stub off', config['stub_rule'])
+        self.assertEqual(config['instances'][0]['trace']['symbols'],
+                         [{'module': 'plugin.nro', 'elf': str(run / 'inputs/plugin.so')}])
+        self.assertEqual(config['instances'][0]['trace']['points'], [
+            {'target': 'plugin.nro!attempt', 'mode': 'records', 'registers': ['x0', 'x1', 'x2', 'x3']}])
+        self.assertEqual(config['rows']['sha256'], sha(run / 'rows/rows.json'))
+        self.assertEqual(config['runner']['sha256'], sha(eden_test.RUNNER))
+        self.assertTrue((run / 'rows/relative-link').is_symlink())
+        self.assertIn('2 PASS, 0 FAIL, 0 NOT RUN', (run / 'REPORT.md').read_text())
+        self.assertIn('2 PASS, 0 FAIL, 0 NOT RUN', output.getvalue())
+        self.assertFalse((run / 'lifecycle-down.log').exists())
+
+    def test_go_file_rows_owner_and_no_trace_rule(self):
+        rowfile = self.rows / 'rows.json'
+        rowfile.write_text(json.dumps({'rows': [{'id': 'r1', 'steps': []}, {'id': 'r2', 'steps': []}]}))
+        with mock.patch.object(eden_test, 'cmd_down') as down:
+            code = eden_test.main(self.go_args(rows=rowfile) + ['--owner', 'test/owner'])
+        self.assertEqual(code, 0)
+        down.assert_not_called()
+        run = self.dir / 'runs/go-1'
+        config = json.loads((run / 'config.json').read_text())
+        self.assertEqual(config['owner'], 'test/owner')
+        self.assertEqual(config['stub_rule'], 'no trace section: stub left to the rows (routes:configure_boot)')
+        self.assertEqual((run / 'rows/rows.json').read_bytes(), rowfile.read_bytes())
+        self.assertNotIn('bridge_port', config)
+
+    def test_go_row_failure_and_not_run_return_three(self):
+        for label, spec, expected in (
+            ('failed', {'rows': [{'id': 'r1'}, {'id': 'r2'}], 'note': 'fail-once'}, '1 FAIL, 0 NOT RUN'),
+            ('unrun', {'rows': [{'id': 'r1'}, {'id': 'r2'}, {'id': 'r3'}]}, '0 FAIL, 1 NOT RUN'),
+        ):
+            with self.subTest(label=label):
+                (self.rows / 'rows.json').write_text(json.dumps(spec))
+                with mock.patch.object(eden_test, 'cmd_down') as down:
+                    self.assertEqual(eden_test.main(self.go_args(label=label)), 3)
+                down.assert_not_called()
+                self.assertIn(expected, (self.dir / f'runs/{label}/REPORT.md').read_text())
+
+    def test_go_trace_stub_refusal_precedes_lifecycle(self):
+        source = self.dir / 'source/user/config'
+        source.mkdir(parents=True)
+        (source / 'qt-config.ini').write_text('use_gdbstub=true\n')
+        base = json.loads(self.previous.read_text())
+        base['instances'][0].update(source=str(source.parent.parent), trace={'unmapped_access': 'log'})
+        self.previous.write_text(json.dumps(base))
+        with mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args())
+        lifecycle.assert_not_called()
+        self.assertIn(f'the source profile {source / "qt-config.ini"} has use_gdbstub=true', str(caught.exception))
+
+    def test_go_trace_point_requires_elf_and_elf_requires_matching_nro(self):
+        elf = self.dir / 'other.so'
+        elf.write_bytes(b'elf')
+        with mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+            with self.assertRaisesRegex(SystemExit, '--trace-point.*--elf'):
+                eden_test.main(self.go_args() + ['--trace-point', 'plugin.nro!attempt'])
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args() + ['--elf', str(elf)])
+        self.assertIn('other.so', str(caught.exception))
+        self.assertIn('plugin.nro', str(caught.exception))
+        lifecycle.assert_not_called()
+
+    def test_go_reports_even_when_runner_raises(self):
+        (self.rows / 'rows.json').write_text('{"rows":[{"id":"r1"}]}')
+        output = io.StringIO()
+        with mock.patch.object(eden_test, 'cmd_up'), \
+             mock.patch.object(eden_test, 'cmd_run', side_effect=RuntimeError('runner broke')), \
+             mock.patch.object(eden_test, 'cmd_down') as down, redirect_stdout(output):
+            self.assertEqual(eden_test.main(self.go_args()), 3)
+        down.assert_not_called()
+        self.assertTrue((self.dir / 'runs/go-1/REPORT.md').is_file())
+        self.assertIn('runner broke', output.getvalue())
+
+    def test_go_failed_up_after_start_prints_down_without_calling_it(self):
+        def fail_up(run, **kwargs):
+            eden_test.stamp(run, 'up_start')
+            raise SystemExit('lifecycle failed')
+
+        output = io.StringIO()
+        with mock.patch.object(eden_test, 'cmd_up', side_effect=fail_up), \
+             mock.patch.object(eden_test, 'cmd_down') as down, redirect_stdout(output):
+            with self.assertRaisesRegex(SystemExit, 'lifecycle failed'):
+                eden_test.main(self.go_args())
+        down.assert_not_called()
+        self.assertIn(f'down {self.dir / "runs/go-1"}', output.getvalue())
+
+    def test_go_host_mismatch_without_remote_mapping_names_host_and_map(self):
+        with self.assertRaises(SystemExit) as caught:
+            eden_test.main(self.go_args(host='xps'))
+        self.assertIn('xps', str(caught.exception))
+        self.assertIn('hosts.json', str(caught.exception))
+
+    def test_go_remote_stages_exact_commands_and_copies_report_on_exit_three(self):
+        build = self.dir / 'build'
+        build.mkdir()
+        nro, second, elf = build / 'plugin.nro', build / 'extra.nro', build / 'plugin.so'
+        for path in (nro, second, elf):
+            path.write_bytes(b'fixture')
+        host, label = 'xps-host', 'remote-1'
+        stage = f'/home/intpa/eden-runs/_eden-test/stage/{label}'
+        argv = self.go_args(label=label, nro=nro, host='xps') + [
+            '--nro', str(second), '--elf', str(elf), '--trace-point', 'plugin.nro!attempt',
+            '--owner', 'test-owner', '--ssh', host]
+        output = io.StringIO()
+        with mock.patch.object(eden_test, 'sh', side_effect=[0, 0, 0, 0, 0, 3, 0]) as sh, \
+             redirect_stdout(output):
+            self.assertEqual(eden_test.main(argv), 3)
+        expected = [
+            ['rsync', '-a', '--delete', '--mkpath', str(eden_test.PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
+            ['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'],
+            ['rsync', '-a', '--mkpath', str(second), f'{host}:{stage}/nro/'],
+            ['rsync', '-a', '--mkpath', str(elf), f'{host}:{stage}/elf/'],
+            ['rsync', '-a', '--mkpath', str(self.rows) + '/', f'{host}:{stage}/rows/'],
+            ['ssh', '-o', 'BatchMode=yes', host, '/usr/bin/python3', '-I', '-B',
+             f'{stage}/tools/eden-test/eden_test.py', 'go', '--host', 'xps', '--label', label,
+             '--nro', f'{stage}/nro/plugin.nro', '--nro', f'{stage}/nro/extra.nro',
+             '--rows', f'{stage}/rows', '--elf', f'{stage}/elf/plugin.so',
+             '--trace-point', 'plugin.nro!attempt', '--owner', 'test-owner'],
+            ['scp', f'{host}:/home/intpa/eden-runs/{label}/REPORT.md', f'./REPORT-{label}.md'],
+        ]
+        self.assertEqual([call.args[0] for call in sh.call_args_list], expected)
+        self.assertIn(f'REPORT-{label}.md', output.getvalue())
+        self.assertIn(f'run /home/intpa/eden-runs/{label} --rows <id>', output.getvalue())
+        self.assertIn(f'down /home/intpa/eden-runs/{label}', output.getvalue())
+
+    def test_go_remote_uses_host_map_and_file_rows(self):
+        hosts = eden_test.RUNS / '_eden-test/hosts.json'
+        hosts.parent.mkdir(parents=True)
+        hosts.write_text(json.dumps({'xps': 'mapped-xps'}))
+        rowfile = self.rows / 'rows.json'
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh:
+            self.assertEqual(eden_test.main(self.go_args(host='xps', rows=rowfile)), 0)
+        commands = [call.args[0] for call in sh.call_args_list]
+        self.assertIn(['rsync', '-a', '--mkpath', str(rowfile),
+                       'mapped-xps:/home/intpa/eden-runs/_eden-test/stage/go-1/rows/rows.json'], commands)
+        self.assertEqual(commands[-2][0:4], ['ssh', '-o', 'BatchMode=yes', 'mapped-xps'])
 
     def test_new_makes_fresh_paths_and_keeps_pins(self):
         eden_test.main(['new', *self.args()])
