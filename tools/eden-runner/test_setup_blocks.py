@@ -228,5 +228,61 @@ class GotoTests(OpenCloseTests):
                 self.assertEqual(io.actions, [])
 
 
+class StopIO(RowsIO):
+    def __init__(self, ctx, *, fault=None):
+        super().__init__(ctx, fault=fault)
+        self.menu.update({'game': 'Guard the Edge', 'game.running': '1',
+                          'notice.header': '', 'notice.body': ''})
+
+    def send(self, segment):
+        if segment == 'tap-a1' and self.menu['depth'] == '1':
+            self.actions.append(segment)
+            if self.ctx.runner.setup_metrics is not None:
+                self.ctx.runner.setup_metrics['inputs'] += 1
+            if self.fault != 'no_ack':
+                self.menu['ack'] = str(int(self.menu['ack']) + 1)
+            if self.fault == 'ignored':
+                self.menu['ack.result'] = 'ignored'
+            if self.fault != 'stop_stuck':
+                self.menu['game.running'] = '0'
+        else:
+            super().send(segment)
+            if segment == 'tap-b1':
+                self.update_focus()
+
+
+class StopTests(OpenCloseTests):
+    def test_stop_uses_running_transition_and_closes_the_menu(self):
+        io = StopIO(self.ctx)
+        result = self.invoke('drill_stop', io, game='Guard the Edge', cap=1)
+        self.assertEqual(io.actions, ['main-menu-down', 'tap-a1', 'tap-a1', 'tap-b1', 'tap-b1'])
+        self.assertEqual(result['verified'], {'game': 'Guard the Edge', 'running': '0'})
+        self.assertEqual(io.menu['row'], 'Guard the Edge')
+        self.assertTrue((Path(self.ctx.row_dir) / 'routes-drill-stop.json').is_file())
+
+    def test_wizard_wrong_game_and_stopped_are_refused_before_input(self):
+        for field, value, message in (('notice.header', 'Edge · 2/4', 'wizard'),
+                                      ('game.running', '0', 'running'),
+                                      ('game', 'Juggler', 'game')):
+            with self.subTest(field=field):
+                io = StopIO(self.ctx)
+                io.menu[field] = value
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.invoke('drill_stop', io, game='Guard the Edge', cap=.1)
+                self.assertEqual(io.actions, [])
+        io = StopIO(self.ctx)
+        with self.assertRaisesRegex(RuntimeError, 'game'):
+            self.invoke('drill_stop', io, game='Juggler', cap=.1)
+        self.assertEqual(io.actions, [])
+
+    def test_stop_requires_ack_epoch_and_running_change(self):
+        for fault, message in (('no_ack', 'not handled'), ('epoch', 'connection'),
+                               ('ignored', 'handled ACK'), ('stop_stuck', 'running')):
+            with self.subTest(fault=fault):
+                io = StopIO(self.ctx, fault=fault)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.invoke('drill_stop', io, game='Guard the Edge', cap=.03)
+
+
 if __name__ == '__main__':
     unittest.main()
