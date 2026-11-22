@@ -168,3 +168,8 @@ proof yet.
 `evidence/tools/attempt_boundaries.py` and plan registers from `compare_attempts.py`. The Pyra and Hero excerpts
 in `eden-runner/test-data/` are identified with their full source paths and SHA-256 in `test_trace_attempts.py`.
 The marker's form field is the stage form, not the CPU form. No live acceptance is claimed.
+
+2026-11-22: `eden-runner/trace_attempts.py` also reads the separately armed `planner_chose` point in trace
+order. `test-data/cp1b-hero-level9-none.jsonl` is an exact release/terminal excerpt from the Hero trace named
+in `test_trace_attempts.py`; its source interval 312411–312685 contains no planner entry. These are host
+decoder and control-flow probes, not runtime acceptance.

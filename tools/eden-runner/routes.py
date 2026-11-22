@@ -27,6 +27,7 @@ Library files: library/routes/index.json (macros with sha256 and provenance) and
 """
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -2532,9 +2533,9 @@ def drill_observe(ctx, attempts, cap, allow_stopped=False, count='terminals'):
     return _with_setup_metrics(ctx, lambda metrics: _drill_observe(ctx, attempts, cap, allow_stopped, count, metrics))
 
 
-def _attempt_trace_status(ctx, path):
+def _attempt_trace_status(ctx, path, symbol='edge_juggle_attempt'):
     status = ctx.call('trace.list', {})
-    point = trace_attempts.point_id(status, 'edge_juggle_attempt')
+    point = trace_attempts.point_id(status, symbol)
     if (status.get('output_error') or status.get('boot_error') or status.get('output') != path
             or 'file_lost' not in status):
         raise RuntimeError('attempt trace output is unavailable or mismatched')
@@ -2552,6 +2553,172 @@ def _attempt_trace_status(ctx, path):
     except (TypeError, ValueError):
         raise RuntimeError('attempt trace point lacks a live process and address') from None
     return point, baseline_loss, identity
+
+
+def _shown_coordinate(value):
+    if isinstance(value, str) and re.fullmatch(r'-?\d+', value):
+        return value
+    if type(value) is int:
+        return str(value)
+    if type(value) is float and math.isfinite(value):
+        return format(value, '.0f')
+    raise RuntimeError(f'invalid shown coordinate {value!r}')
+
+
+def _start_expect(expect):
+    if expect is None:
+        return None
+    keys = {'cpu_kind', 'stage_form', 'stage_id', 'perfect', 'juggler', 'damage',
+            'cpu', 'cpu_words', 'p1', 'p1_words', 'plan'}
+    if not isinstance(expect, dict) or not set(expect) <= keys:
+        raise RuntimeError('invalid first-release expect keys')
+    for key, value in expect.items():
+        if key in ('perfect', 'juggler'):
+            valid = type(value) is bool
+        elif key in ('cpu_kind', 'stage_form', 'stage_id'):
+            valid = type(value) is int and value >= 0
+        elif key == 'damage':
+            valid = type(value) is int or type(value) is float and math.isfinite(value)
+        elif key in ('cpu', 'p1'):
+            valid = isinstance(value, list) and len(value) == 2
+            if valid:
+                for coordinate in value:
+                    _shown_coordinate(coordinate)
+        elif key in ('cpu_words', 'p1_words'):
+            valid = (isinstance(value, list) and len(value) == 2
+                     and all(isinstance(word, str) and re.fullmatch(r'0x[0-9a-f]{8}', word) for word in value))
+        else:
+            valid = (value == 'none' or (isinstance(value, list) and len(value) == 2
+                                         and all(type(item) is int and item >= 0 for item in value)))
+        if not valid:
+            raise RuntimeError(f'invalid first-release expect {key}')
+    return expect
+
+
+def drill_start(ctx, game, expect=None, cap=60):
+    if game != 'Guard the Edge':
+        raise RuntimeError(f'unsupported practice game {game!r}')
+    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+        raise RuntimeError('practice start needs a positive cap')
+    _start_expect(expect)
+    return _with_setup_metrics(ctx, lambda metrics: _drill_start(ctx, game, expect, cap, metrics))
+
+
+def _drill_start(ctx, game, expect, cap, metrics):
+    started = time.monotonic()
+    until = started + cap
+    path = ctx.instance.get('trace_jsonl')
+    if path is not None and (not isinstance(path, str) or not path):
+        raise RuntimeError('practice trace path is invalid')
+    if path is None and expect is not None:
+        raise RuntimeError('first-release expect requires a trace in this boot')
+    stream = None
+    attempt_status = planner_status = None
+    needs_plan = expect is not None and 'plan' in expect
+    if path is not None:
+        stream = trace_attempts.Stream(path, '')
+        attempt_status = _attempt_trace_status(ctx, path)
+        stream.point = attempt_status[0]
+        if needs_plan:
+            planner_status = _attempt_trace_status(ctx, path, 'planner_chose')
+            if (planner_status[2][0] != attempt_status[2][0]
+                    or planner_status[1][0] != attempt_status[1][0]):
+                raise RuntimeError('planner and attempt trace identities or loss counters differ')
+            stream.planner = planner_status[0]
+        if (_attempt_trace_status(ctx, path) != attempt_status
+                or needs_plan and _attempt_trace_status(ctx, path, 'planner_chose') != planner_status):
+            raise RuntimeError('practice trace loss or point changed during preflight')
+    io = BridgePickerIO(ctx)
+    initial = _tr_current(io, until)
+    wizard = _edge_wizard(initial)
+    skipped = []
+    if wizard:
+        if initial.values.get('notice.header') != 'Edge · 4/4' or initial.values.get('open') != '0':
+            raise RuntimeError('practice wizard is not at the closed-menu Preview step')
+        if time.monotonic() >= until:
+            raise RuntimeError('practice start deadline expired before wizard input')
+        io.send('tap-a1')
+        menu = _wait_tr_condition(io, initial, until,
+                                  lambda state: state.values.get('open') == '0' and not _edge_wizard(state),
+                                  'wizard Preview dismissal')
+        io.finish()
+    else:
+        if initial.values.get('game.running') == '1':
+            raise RuntimeError('a practice game is already running; call drill_stop')
+        if initial.values.get('game.running') != '0':
+            raise RuntimeError('practice running state is missing before start')
+        menu, skipped = _open_menu(io, until, 'fighters_stages', after=initial)
+        menu = _navigate_menu(io, menu, 'fighters_stages', _tr_path(['game.6', 'start.6']), until)
+        if _edge_wizard(menu) or menu.values.get('game.running') != '0':
+            raise RuntimeError('practice running or wizard state changed before start')
+        menu = _tr_input(io, menu, 'tap-a1', until, opened=False)
+        if menu.values.get('game') != game or menu.values.get('game.running') != '1':
+            menu = _wait_tr_condition(io, menu, until,
+                                      lambda state: state.values.get('open') == '0'
+                                      and state.values.get('game') == game
+                                      and state.values.get('game.running') == '1',
+                                      'game running=1')
+    release = None
+    selected_plan = None
+    terminal = None
+    if stream is not None:
+        while time.monotonic() < until:
+            ctx.check_stop()
+            for mark in stream.read(until):
+                if mark['process'] != str(attempt_status[2][0]):
+                    raise RuntimeError('practice trace record came from a different process')
+                if mark['record'] == 'plan':
+                    if release is not None and selected_plan is None:
+                        selected_plan = mark
+                elif release is None:
+                    if mark['event'] == 0:
+                        release = mark
+                elif mark['event'] == 0:
+                    raise RuntimeError('next release arrived before first-attempt terminal')
+                else:
+                    terminal = mark
+                    break
+                if release is not None and not needs_plan:
+                    break
+            if release is not None and (not needs_plan or terminal is not None):
+                break
+            time.sleep(min(.05, max(0, until - time.monotonic())))
+        if release is None or needs_plan and terminal is None:
+            raise RuntimeError('first release or first-attempt terminal not observed before deadline')
+        if (_attempt_trace_status(ctx, path) != attempt_status
+                or needs_plan and _attempt_trace_status(ctx, path, 'planner_chose') != planner_status):
+            raise RuntimeError('practice trace loss or point changed')
+        if time.monotonic() >= until:
+            raise RuntimeError('practice start deadline expired during trace fence')
+    plan_value = selected_plan if selected_plan is not None else 'none'
+    verified = {'game': menu.values.get('game'), 'running': menu.values.get('game.running'),
+                'first_release': release if release is not None else 'not checked: no trace in this boot'}
+    if needs_plan:
+        verified.update({'plan': plan_value, 'plan_terminal': terminal})
+    if attempt_status:
+        verified['trace_loss_start'] = {'file_lost': attempt_status[1][0],
+                                        'point_dropped': attempt_status[1][1]}
+        verified['trace_loss_end'] = dict(verified['trace_loss_start'])
+        if planner_status:
+            verified['trace_loss_start']['planner_dropped'] = planner_status[1][1]
+            verified['trace_loss_end']['planner_dropped'] = planner_status[1][1]
+    elapsed = round((time.monotonic() - started) * 1000)
+    receipt = {'block': 'drill_start', 'args': {'game': game, 'expect': expect, 'cap': cap},
+               'verified': verified, **metrics, 'ms': {'start': elapsed, 'total': elapsed}, 'skipped': skipped}
+    if expect is not None:
+        for key, wanted in expect.items():
+            if key == 'plan':
+                actual = ([selected_plan['route'], selected_plan['row']] if selected_plan is not None else 'none')
+            elif key in ('cpu', 'p1'):
+                actual = [_shown_coordinate(value) for value in release[key]]
+                wanted = [_shown_coordinate(value) for value in wanted]
+            else:
+                actual = release['stage' if key == 'stage_id' else key]
+            if actual != wanted:
+                receipt['error'] = f'first-release mismatch for {key}: expected {wanted!r}, got {actual!r}'
+                _save(ctx, 'routes-drill-start', receipt)
+                raise RuntimeError(f'{receipt["error"]}; decoded release {release!r}')
+    return _save(ctx, 'routes-drill-start', receipt)
 
 
 def _drill_observe(ctx, attempts, cap, allow_stopped, count, metrics):

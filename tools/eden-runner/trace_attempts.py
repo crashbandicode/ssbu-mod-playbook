@@ -53,7 +53,7 @@ def attempt(row):
             'event': event, 'terminal': TERMINALS.get(event),
             'juggler': bool(meta & (1 << 24)), 'perfect': bool(meta & (1 << 25)),
             'stage_form': (meta >> 28) & 15, 'cpu_kind': (meta >> 32) & 0xffff,
-            'stage': meta >> 48, 'elapsed_frames': clock_damage >> 32,
+            'stage': meta >> 48, 'stage_id': meta >> 48, 'elapsed_frames': clock_damage >> 32,
             'damage': damage, 'cpu': cpu, 'cpu_words': cpu_words, 'p1': p1, 'p1_words': p1_words,
         }
     except (KeyError, TypeError, ValueError, OverflowError, struct.error) as exc:
@@ -86,9 +86,10 @@ def point_id(status, symbol):
 
 
 class Stream:
-    def __init__(self, path, point):
+    def __init__(self, path, point, planner=None):
         self.path = Path(path)
         self.point = str(point)
+        self.planner = None if planner is None else str(planner)
         try:
             info = self.path.stat()
             self.identity = (info.st_dev, info.st_ino)
@@ -138,11 +139,13 @@ class Stream:
                         if self.sequence is not None and seq != self.sequence + 1:
                             raise RuntimeError('trace sequence gap')
                         self.sequence = seq
-                        if str(row.get('point_id')) == self.point:
+                        point = str(row.get('point_id'))
+                        if point == self.point or point == self.planner:
                             if row.get('event') not in ('entry', 'return'):
-                                raise RuntimeError('unreadable attempt marker event')
+                                raise RuntimeError('unreadable attempt or plan marker event')
                             if row['event'] == 'entry':
-                                mark = attempt(row)
+                                mark = plan(row) if point == self.planner else attempt(row)
+                                mark['record'] = 'plan' if point == self.planner else 'attempt'
                                 if self.process is not None and mark['process'] != self.process:
                                     raise RuntimeError('attempt trace process changed')
                                 self.process = mark['process']

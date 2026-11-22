@@ -432,6 +432,31 @@ class StartTests(ObserveTests):
         with self.assertRaisesRegex(RuntimeError, 'connection'):
             self.invoke_start()
 
+    def test_plan_requires_terminal_and_planner_counter_stays_constant(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        self.pending = [contiguous([release, plan])]
+        with self.assertRaisesRegex(RuntimeError, 'terminal'):
+            self.invoke_start(expect={'plan': [0, 38]}, cap=.02)
+        self.path.write_text('')
+        self.io = StartIO(self.ctx)
+        self.pending = [contiguous([release, plan, terminal])]
+        original = self.ctx.call
+        calls = 0
+
+        def call(method, params):
+            nonlocal calls
+            calls += 1
+            result = original(method, params)
+            if calls >= 6:
+                result['points'][1]['dropped'] = '1'
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'loss'):
+            self.invoke_start(expect={'plan': [0, 38]})
+
 
 if __name__ == '__main__':
     unittest.main()

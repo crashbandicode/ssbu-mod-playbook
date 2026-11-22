@@ -60,6 +60,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
+| `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, allow_stopped, count}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
@@ -427,6 +428,15 @@ with a handled ACK, because the outer cursor does not move there. A repeated ide
 `routes:drill_stop(game, cap=30)` refuses a visible wizard and a different or stopped practice game. It opens
 the Guard the Edge Start row, presses A, requires a same-epoch `game.running=0`, and closes the menu. The
 published row title is static Start even when the UI draws Stop; it is not used as a stop witness.
+
+`routes:drill_start(game, expect=None, cap=60)` accepts only Guard the Edge. In Preview it requires the wizard
+heading to disappear; otherwise it starts from the menu and requires the stopped-to-running transition.
+With trace enabled it reads the first release; without trace it can only run when `expect` is omitted.
+Expect keys are `cpu_kind`, `stage_form`, `stage_id`, `perfect`, `juggler`, `damage`, `cpu`, `cpu_words`,
+`p1`, `p1_words` and `plan`. Positions compare whole-unit shown strings; words compare exactly.
+A `plan` check needs the armed symbolic `planner_chose` point and holds the block until the first attempt's
+terminal. `'none'` requires no plan before that terminal. The trace and bridge witnesses do not prove
+that the requested on-screen text was visibly rendered.
 
 `routes:drill_observe(attempts, cap, allow_stopped=False, count='terminals')` counts Guard Edge release and terminal markers from
 the trace, then checks `tr.menu.game.running`. It needs an armed records point targeting the
