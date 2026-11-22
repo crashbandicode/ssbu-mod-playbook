@@ -150,10 +150,54 @@ class OpenCloseTests(unittest.TestCase):
 
     def test_idle_wizard_no_change_clears_pending_without_retry(self):
         io = BackWizardIO(self.ctx, stuck=True)
-        with patch.object(routes, 'INPUT_LAG_S', .003):
+        clock = [0.0]
+        read = io.read
+
+        def delayed_read(provider, cap):
+            if provider == 'tr.menu' and io.pending_input:
+                clock[0] += min(.25, cap)
+            return read(provider, cap)
+
+        io.read = delayed_read
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: clock[0]):
             with self.assertRaisesRegex(RuntimeError, 'tr_idle: expected the wizard page to change after B; saw'):
-                self.invoke('tr_idle', io, cap=.1)
+                self.invoke('tr_idle', io, cap=5)
         self.assertEqual(io.actions, ['tap-b1'])
+        self.assertIsNone(io.pending_input)
+        self.assertEqual(clock[0], 5.0)
+
+    def test_idle_wizard_cancel_publication_after_four_seconds(self):
+        io = BackWizardIO(self.ctx, ending='menu')
+        clock = [0.0]
+        release = [None]
+        read, send = io.read, io.send
+
+        def delayed_send(segment):
+            if segment == 'tap-b1' and io.menu['open'] == '0' and io.step == 1:
+                io.actions.append(segment)
+                io.ctx.runner.setup_metrics['inputs'] += 1
+                io.pending_input = segment
+                release[0] = clock[0] + 4.0
+                return
+            send(segment)
+
+        def delayed_read(provider, cap):
+            if provider == 'tr.menu' and io.pending_input:
+                clock[0] += min(.25, cap)
+                if release[0] is not None and clock[0] >= release[0]:
+                    io.menu.update({'open': '1', 'depth': '0', 'game.running': '0',
+                                    'notice.header': '', 'notice.body': ''})
+                    release[0] = None
+            return read(provider, cap)
+
+        io.send, io.read = delayed_send, delayed_read
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: clock[0]):
+            result = self.invoke('tr_idle', io, cap=8)
+        self.assertEqual(result['steps'], ['B out of wizard page Edge · 2/4',
+                                          'B out of wizard page Edge · 1/4', 'close menu'])
+        self.assertEqual(io.actions, ['tap-b1', 'tap-b1', 'tap-b1'])
+        self.assertGreaterEqual(clock[0], 4.0)
+        self.assertLess(clock[0], 8.0)
         self.assertIsNone(io.pending_input)
 
     def test_idle_stops_running_guard_edge_with_existing_helper(self):

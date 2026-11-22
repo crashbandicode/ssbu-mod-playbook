@@ -2828,7 +2828,7 @@ def _tr_idle(ctx, cap, metrics):
             try:
                 io.send('tap-b1')
                 after = _try_tr_condition(
-                    io, menu, min(until, time.monotonic() + INPUT_LAG_S),
+                    io, menu, until,
                     lambda state: any(state.values.get(key) != menu.values.get(key)
                                       for key in ('notice.header', 'open', 'game.running')))
             except RuntimeError as error:
