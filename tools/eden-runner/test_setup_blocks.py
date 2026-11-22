@@ -138,5 +138,95 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual(io.actions, [])
 
 
+class RowsIO(MenuIO):
+    def __init__(self, ctx, *, fault=None):
+        super().__init__(ctx, opened=True, page='fighters_stages', fault=fault)
+        self.page_index = 0
+        self.row_index = 0
+        self.page_rows = [('other', 'Other', 'other'), ('game.6', 'Guard the Edge', '')]
+        self.game_rows = [('start.6', 'Start', ''), ('edge_difficulty', 'CPU fighter and mode', 'edge_difficulty'),
+                          ('row', 'Set up…', '')]
+        self.update_focus()
+
+    def update_focus(self):
+        nested = self.menu['depth'] != '0'
+        action, row, row_id = (self.game_rows[self.row_index] if nested else self.page_rows[self.page_index])
+        self.menu.update({'cursor': str(self.page_index), 'group': '26' if nested else '-1',
+                          'action': action, 'row': row, 'row_id': row_id,
+                          'focus': f'fighters_stages/{26 if nested else -1}/{self.page_index}/{action}'})
+
+    def send(self, segment):
+        if segment not in ('main-menu-down', 'tap-a1'):
+            return super().send(segment)
+        self.actions.append(segment)
+        if self.ctx.runner.setup_metrics is not None:
+            self.ctx.runner.setup_metrics['inputs'] += 1
+        if self.fault != 'no_ack':
+            self.menu['ack'] = str(int(self.menu['ack']) + 1)
+        if self.fault == 'ignored':
+            self.menu['ack.result'] = 'ignored'
+        if segment == 'tap-a1':
+            if self.fault != 'no_depth':
+                self.menu['depth'] = '1'
+                self.row_index = 0
+        elif self.fault != 'stuck':
+            if self.menu['depth'] == '0':
+                self.page_index = (self.page_index + 1) % len(self.page_rows)
+            else:
+                self.row_index = (self.row_index + 1) % len(self.game_rows)
+        self.update_focus()
+        if self.fault == 'no_group' and self.menu['depth'] != '0':
+            self.menu['group'] = '-1'
+        if self.fault == 'wrong_page':
+            self.menu['page'] = 'saves'
+
+
+class GotoTests(OpenCloseTests):
+    def test_nested_path_uses_focused_identity_not_outer_cursor(self):
+        io = RowsIO(self.ctx)
+        result = self.invoke('tr_goto', io, page='fighters_stages',
+                             path=['game.6', {'action': 'row', 'row': 'Set up…'}], cap=1)
+        self.assertEqual(io.actions, ['main-menu-down', 'tap-a1', 'main-menu-down', 'main-menu-down'])
+        self.assertEqual((result['verified']['cursor'], result['verified']['group']), ('1', '26'))
+        self.assertEqual(result['verified']['row'], 'Set up…')
+        self.assertEqual(io.menu['open'], '1')
+        self.assertTrue((Path(self.ctx.row_dir) / 'routes-tr-goto.json').is_file())
+
+    def test_root_and_nested_wrap_refuse_missing_rows(self):
+        for path in (['not-found'], ['game.6', 'not-found']):
+            with self.subTest(path=path):
+                io = RowsIO(self.ctx)
+                with self.assertRaisesRegex(RuntimeError, 'row not found before wrapping'):
+                    self.invoke('tr_goto', io, page='fighters_stages', path=path, cap=1)
+
+    def test_unacknowledged_epoch_and_unchanged_identity_fail(self):
+        for fault, message in (('no_ack', 'not handled'), ('ignored', 'handled ACK'),
+                               ('epoch', 'connection'), ('no_depth', 'depth'),
+                               ('no_group', 'group'), ('wrong_page', 'page')):
+            with self.subTest(fault=fault):
+                io = RowsIO(self.ctx, fault=fault)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.invoke('tr_goto', io, page='fighters_stages', path=['game.6', 'row'], cap=.05)
+        io = RowsIO(self.ctx)
+        original = io.send
+
+        def send(segment):
+            if segment == 'main-menu-down' and io.menu['depth'] != '0':
+                io.fault = 'stuck'
+            original(segment)
+
+        io.send = send
+        with self.assertRaisesRegex(RuntimeError, 'focus identity did not change'):
+            self.invoke('tr_goto', io, page='fighters_stages', path=['game.6', 'row'], cap=.1)
+
+    def test_invalid_path_is_refused_before_input(self):
+        for path in ([], [''], [{'row': 'x', 'extra': 'y'}], [42]):
+            with self.subTest(path=path):
+                io = RowsIO(self.ctx)
+                with self.assertRaisesRegex(RuntimeError, 'path'):
+                    self.invoke('tr_goto', io, page='fighters_stages', path=path, cap=.1)
+                self.assertEqual(io.actions, [])
+
+
 if __name__ == '__main__':
     unittest.main()
