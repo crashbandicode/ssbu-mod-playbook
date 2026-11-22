@@ -148,3 +148,9 @@ Full provenance and source patch: `smash-training-lobby/artifacts/harness-lib/{t
 byte copy of bridge load 9's settled SSS topology, SHA-256
 `b2823df6e24a55f0fe8dc13c54a26299ba50b475b74ea57038de9cbd59c9e3a2`. The four existing tile macros hold their
 direction for six frames as approved by the operator; no runtime acceptance is claimed here.
+
+2026-11-22 (fusion-g4), Training setup calls: `test_setup_calls.py` uses modelled `tr.menu/1` input/ACK
+transitions; `library/routes/build_tables.py --catalog-only` derives `roster_catalog` from TrainingRooms'
+`src/model/swap/choices.rs`, with source checkout, commit and SHA-256 recorded in `tables.json`. The authored
+`tap-l1` and `tap-r1` macros use the existing `tap-a1` frame shape and plain L/R masks. No runtime acceptance is claimed.
+`test_setup_calls_rework.py` adds modelled race, timeout, settings and compatibility probes following lead review.

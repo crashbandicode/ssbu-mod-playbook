@@ -1291,7 +1291,9 @@ class TrainingStageProofTests(unittest.TestCase):
 
             with (patch.object(routes, 'bridge_v2', spool),
                   patch.object(routes, 'play', side_effect=start),
-                  patch.object(routes, 'native_state', return_value={'stage': expected}),
+                  patch.object(routes, 'native_state', return_value={
+                      'stage': expected, 'roster': {0: {'kind': 0}, 1: {'kind': 3}},
+                  }),
                   patch.object(routes, 'expected', return_value={'stage_id': expected}),
                   patch.object(routes, '_save', side_effect=lambda _ctx, _name, value: value)):
                 try:

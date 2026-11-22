@@ -623,8 +623,13 @@ def take_token(io, slot, cap=4, *, expected_context='training'):
     until = time.monotonic() + cap
     latest = before
     while True:
-        latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
-                                       pending_placement=True))
+        try:
+            latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
+                                           pending_placement=True))
+        except RuntimeError as exc:
+            if str(exc) == f'{TILE}: no newer active observation' and time.monotonic() >= until:
+                raise RuntimeError(f'A did not pick up coin {slot} within {cap} s') from exc
+            raise
         check_context(before, latest, 'css')
         if (number(latest, 'ack') != number(before, 'ack')
                 or number(latest, 'applied') != number(before, 'applied')):
@@ -637,8 +642,10 @@ def take_token(io, slot, cap=4, *, expected_context='training'):
         if carried == slot and held:
             _coin_finish(io, ui, until, expected_context)
             return latest
-        if ((values.get('hand.token') in ('none', '0', '1') and values.get('hand.token') != 'unknown')
-                or (carried in ('0', '1') and values.get('settled') == '1')):
+        hand = values.get('hand.token')
+        other = '0' if slot == '1' else '1'
+        if ((hand in ('none', '0', '1') and hand != slot)
+                or carried == other or values.get('carried') == other):
             raise RuntimeError(f'p1.carried is {carried} after A')
 
 
@@ -697,9 +704,17 @@ def walk_cpu(io, target, topology, cap=4, *, expected_context='training'):
                 raise RuntimeError(f'wrong CPU tile step: {direction} {at} -> {dest}')
             if values.get('settled') != '1':
                 continue
-            if (dest not in topology.neighbors or settled(latest, after_step=True) != dest
-                    or Target.read(latest, 'carried.') != topology.targets.get(dest)):
+            if dest not in topology.neighbors or settled(latest, after_step=True) != dest:
                 raise RuntimeError('CPU tile step did not settle on a qualified topology identity')
+            identity = topology.targets.get(dest)
+            if identity is None:
+                raise RuntimeError('CPU tile step has no qualified topology identity')
+            parts = tuple(values.get('carried.' + key, 'unknown') for key in ('kind', 'name', 'form'))
+            expected_identity = (identity.kind, identity.name, identity.form)
+            if any(actual != 'unknown' and actual != wanted for actual, wanted in zip(parts, expected_identity)):
+                raise RuntimeError('CPU tile step did not settle on a qualified topology identity')
+            if 'unknown' in parts:
+                continue
             _coin_finish(io, ui, until, expected_context)
             break
         before, ui = _coin_baseline(io, cap, expected_context)
@@ -721,8 +736,13 @@ def place_cpu(io, target, tile, p1_before, cap=4, *, expected_context='training'
     until = time.monotonic() + cap
     latest = before
     while True:
-        latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
-                                       pending_placement=True))
+        try:
+            latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
+                                           pending_placement=True))
+        except RuntimeError as exc:
+            if str(exc) == f'{TILE}: no newer active observation' and time.monotonic() >= until:
+                raise RuntimeError(f'A did not place the CPU coin within {cap} s') from exc
+            raise
         check_context(before, latest, 'css')
         if (number(latest, 'ack') != number(before, 'ack')
                 or number(latest, 'applied') != number(before, 'applied')):
@@ -736,11 +756,21 @@ def place_cpu(io, target, tile, p1_before, cap=4, *, expected_context='training'
                 raise RuntimeError(f'cpu.placed is {identity!r}, not the target')
             _coin_finish(io, ui, until, expected_context)
             return latest
-        if values.get('settled') == '1':
-            raise RuntimeError(f'cpu.placed is {values.get("cpu.token")!r}, not the target')
         if (values.get('p1.coin') not in ('placed', 'unknown')
                 or values.get('p1.coin.at') not in (p1_at, 'unknown')):
             raise RuntimeError('P1 coin changed while placing the CPU coin')
+        for key, wanted in zip(('at', 'kind', 'name', 'form'), p1_before[1:]):
+            if values.get('p1.placed.' + key, 'unknown') not in ('unknown', wanted):
+                raise RuntimeError('P1 coin changed while placing the CPU coin')
+        if values.get('cpu.token') == 'held':
+            if values.get('p1.carried') not in ('1', 'unknown'):
+                raise RuntimeError('CPU coin changed hands while placing')
+            if values.get('at') not in (str(tile), 'unknown'):
+                raise RuntimeError('CPU coin changed tile while placing')
+            parts = tuple(values.get('carried.' + key, 'unknown') for key in ('kind', 'name', 'form'))
+            expected_identity = (target.kind, target.name, target.form)
+            if any(actual != 'unknown' and actual != wanted for actual, wanted in zip(parts, expected_identity)):
+                raise RuntimeError('CPU carried identity changed while placing')
 
 
 def verify_room_selection(current, expected_key, generation):

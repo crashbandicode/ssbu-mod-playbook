@@ -35,6 +35,7 @@ from collections import deque
 from pathlib import Path
 
 import native_picker
+import state_gate
 from native_picker_io import BridgePickerIO
 
 HERE = Path(__file__).resolve().parent
@@ -1064,28 +1065,40 @@ def _probe_step(ctx, walker, direction='left', cap=2.5):
 
 
 
-def pick_fighters(ctx, p1, cpu=None, coin_route=False, *, topology=None, form='default'):
+def pick_fighters(ctx, p1, cpu=None, coin_route=False, *, topology=None, form='default', take_back=False):
     """Place the verified local fighter token in CSS."""
     if coin_route:
         raise RuntimeError('the stick-based coin route is not supported')
     topology = topology or library_topology('css-training')
-    if cpu is None:
-        return pick_local_fighter(ctx, p1, topology=topology, form=form)
     metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     start = time.monotonic()
     try:
-        p1_result = pick_local_fighter(ctx, p1, topology=topology, form=form)
+        options = ({'take_back': True, 'expected_context': 'training'} if cpu is not None else
+                   {'take_back': True} if take_back else {})
+        p1_result = pick_local_fighter(ctx, p1, topology=topology, form=form, **options)
         p1_ms = round((time.monotonic() - start) * 1000)
-        cpu_result = pick_cpu(ctx, cpu, topology=topology, form=form)
+        cpu_result = pick_cpu(ctx, cpu, topology=topology, form=form) if cpu is not None else None
     finally:
         ctx.runner.setup_metrics = previous
-    receipt = {'block': 'pick_fighters', 'args': {'p1': p1, 'cpu': cpu, 'form': form},
+        if previous is not None:
+            _merge_setup_metrics(previous, metrics)
+    receipt = {**(p1_result if cpu is None else {}), 'block': 'pick_fighters',
+               'args': {'p1': p1, 'cpu': cpu, 'form': form, 'take_back': take_back},
                'verified': {'p1': p1_result, 'cpu': cpu_result}, **metrics,
                'ms': {'p1': p1_ms, 'cpu': round((time.monotonic() - start) * 1000) - p1_ms},
-               'skipped': [], 'p1': p1_result, 'cpu': cpu_result}
+               'skipped': ['pick_cpu'] if cpu is None else [], 'p1': p1_result, 'cpu': cpu_result}
     return _save(ctx, 'routes-pick-fighters', receipt)
+
+
+def _merge_setup_metrics(destination, source):
+    destination['inputs'] += source['inputs']
+    destination['bridge_requests'] += source['bridge_requests']
+    if source['bridge_boot'] is not None:
+        destination['bridge_boot'] = source['bridge_boot']
+    for provider, revisions in source['revisions'].items():
+        destination['revisions'].setdefault(provider, list(revisions))[1] = revisions[1]
 
 
 # --- Training: game state ---------------------------------------------------------------------------------------------
@@ -1104,20 +1117,26 @@ def _switch_hw():
     return module
 
 
-def native_state(ctx, fresh=(), cap=6.0):
+def native_state(ctx, fresh=(), cap=6.0, *, roster_entries=()):
     """The bridge's native reads (ssbu-hw-bridge; `switch_hw.py up --bridge-host` or an Eden bridge capture): the newest
     frame/wall, both bodies' `state pos`, stage, roster, items, speed and status ids (`switch_hw.bridge_state`).
     `fresh` (pos, speed, roster, status) are asked for first. Needs the instance's `bridge_log`."""
-    return _switch_hw().bridge_state(instance_path(ctx, 'bridge_log').parent, tuple(fresh), cap)
+    options = {'roster_entries': roster_entries} if roster_entries else {}
+    state = _switch_hw().bridge_state(instance_path(ctx, 'bridge_log').parent, tuple(fresh), cap, **options)
+    metrics = getattr(getattr(ctx, 'runner', None), 'setup_metrics', None)
+    if metrics is not None:
+        metrics['bridge_requests'] += len(fresh)
+    return state
 
 
-def wait_native(ctx, test, cap=10.0, fresh=(), every=0.25):
+def wait_native(ctx, test, cap=10.0, fresh=(), every=0.25, *, roster_entries=()):
     """Poll `native_state` until `test(state)` is true (e.g. the frame advancing in a fight, a held item); the last
     state is returned, or RuntimeError after `cap` s with it."""
     until = time.monotonic() + cap
     while True:
         ctx.check_stop()
-        state = native_state(ctx, fresh, cap=max(1.0, min(6.0, until - time.monotonic())))
+        options = {'roster_entries': roster_entries} if roster_entries else {}
+        state = native_state(ctx, fresh, cap=max(1.0, min(6.0, until - time.monotonic())), **options)
         if test(state):
             return state
         if time.monotonic() > until:
@@ -1178,9 +1197,40 @@ def read_state(ctx, cap=6.0):
 
 
 
-def enter_training(ctx, cap=90, *, stage_ids=None):
+def enter_training(ctx, cap=90, *, stage_ids=None, fighters=None):
     """Activate a placed local fighter and confirm native Training loaded."""
-    return _native_enter_training(ctx, cap, stage_ids)
+    return _with_setup_metrics(ctx, lambda metrics: _enter_training(ctx, cap, stage_ids, fighters, metrics))
+
+
+def _enter_training(ctx, cap, stage_ids, fighters, metrics):
+    wanted = expected(ctx)
+    kinds = {seat: wanted.get(f'{seat}_kind') for seat in ('p1', 'cpu')}
+    for seat, name in (fighters or {}).items():
+        if seat not in kinds:
+            raise ValueError(f'unknown fighter seat {seat!r}')
+        kinds[seat] = fighter_entry(name)['kind']
+    started = time.monotonic()
+    result = _native_enter_training(ctx, cap, stage_ids)
+    entry_ms = round((time.monotonic() - started) * 1000)
+    remaining = cap - (time.monotonic() - started)
+    if remaining <= 0:
+        raise RuntimeError('Training entry deadline expired before roster verification')
+    state = wait_native(ctx, lambda s: 0 in s.get('roster', {}) and 1 in s.get('roster', {}),
+                        cap=remaining, fresh=('roster',), roster_entries=(0, 1))
+    roster = state.get('roster', {})
+    actual = (roster.get(0, {}).get('kind'), roster.get(1, {}).get('kind'))
+    if (None in actual or (kinds['p1'] is not None and actual[0] != kinds['p1'])
+            or (kinds['cpu'] is not None and actual[1] != kinds['cpu'])):
+        raise RuntimeError(f'Training loaded fighters P1 kind {actual[0]}, CPU kind {actual[1]}; '
+                           f'expected P1 {kinds["p1"]}, CPU {kinds["cpu"]}')
+    checked = {seat: 'checked' if kind is not None else 'unchecked' for seat, kind in kinds.items()}
+    return _save(ctx, 'routes-enter-training', {
+        **result, 'block': 'enter_training', 'args': {'cap': cap, 'stage_ids': stage_ids, 'fighters': fighters},
+        'verified': {'stage_id': result['stage_id'], 'roster': roster, 'fighters_checked': checked},
+        'roster': roster, 'fighters_checked': checked, **metrics,
+        'ms': {'entry': entry_ms, 'roster': round((time.monotonic() - started) * 1000) - entry_ms},
+        'skipped': [],
+    })
 
 
 def stage_now(ctx):
@@ -1745,8 +1795,7 @@ def _native_enter_training(ctx, cap, stage_ids):
     if stage_ids is not None and actual_stage not in stage_ids:
         raise RuntimeError(f'Training loaded stage {actual_stage!r}; expected one of {sorted(stage_ids)}')
     io.finish()
-    return _save(ctx, 'routes-enter-training', {'focus': after.values['focus'], 'stage_id': actual_stage,
-                                                'stage_event': stage_event})
+    return {'focus': after.values['focus'], 'stage_id': actual_stage, 'stage_event': stage_event}
 
 def _tile_topology(pin):
     if pin is None:
@@ -1760,6 +1809,39 @@ def _tile_topology(pin):
     return native_picker.Topology(data['layout'], data['neighbors'],
                                   {index: native_picker.Target(**identity)
                                    for index, identity in data['targets'].items()})
+
+
+def tr_grid_step(cell, direction):
+    if not isinstance(cell, int) or isinstance(cell, bool) or not 0 <= cell < 87:
+        raise ValueError(f'invalid Training roster cell {cell!r}')
+    if direction not in ('left', 'up', 'right', 'down'):
+        raise ValueError(f'invalid Training roster direction {direction!r}')
+    cols, rows = 13, 7
+    row, index = divmod(cell, cols)
+    length = min(cols, 87 - row * cols)
+    if direction in ('left', 'right'):
+        return row * cols + (index + (-1 if direction == 'left' else 1)) % length
+    column = index + (cols - length) // 2
+    next_row = (row + (-1 if direction == 'up' else 1)) % rows
+    next_len = min(cols, 87 - next_row * cols)
+    first = (cols - next_len) // 2
+    return next_row * cols + min(max(column, first), first + next_len - 1) - first
+
+
+def tr_grid_path(start, goal):
+    tr_grid_step(start, 'left')
+    tr_grid_step(goal, 'left')
+    queue, visited = deque([(start, [])]), {start}
+    while queue:
+        cell, path = queue.popleft()
+        if cell == goal:
+            return path
+        for direction in ('left', 'up', 'right', 'down'):
+            next_cell = tr_grid_step(cell, direction)
+            if next_cell not in visited:
+                visited.add(next_cell)
+                queue.append((next_cell, [*path, direction]))
+    raise RuntimeError('Training roster target is unreachable')
 
 
 def library_topology(name):
@@ -1971,7 +2053,7 @@ def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=No
     out['training'] = enter_training(ctx)
     return _save(ctx, 'routes-switch-training', out)
 
-def _wait_tr_menu(io, until, opened, after=None):
+def _wait_tr_menu(io, until, opened, after=None, *, strict=False):
     while (remaining := until - time.monotonic()) > 0:
         state = io.read('tr.menu', remaining)
         block = state.block
@@ -1983,6 +2065,8 @@ def _wait_tr_menu(io, until, opened, after=None):
                 continue
         if _fields_match(state, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
             return state
+        if strict:
+            raise RuntimeError('Training Mod menu changed scene, keyboard, or open state')
     raise RuntimeError(f'Training Mod menu needs tr.menu scene=training, keyboard=0, open={int(opened)}')
 
 
@@ -2031,6 +2115,487 @@ def tr_menu(ctx):
             opened_revision = confirmed.block['rev']
     return _save(ctx, 'routes-tr-menu', {'opened': opened_revision, 'closed': confirmed.block['rev'],
                                          'boot': confirmed.block['boot']})
+
+
+def _spool_file(ctx, name, data):
+    directory = instance_path(ctx, 'bridge_log').parent / 'bridge'
+    if not directory.is_dir():
+        raise RuntimeError('bridge request spool is not available')
+    path = directory / name
+    if path.exists():
+        raise RuntimeError(f'bridge request is already pending: {name}')
+    temporary = directory / f'.{name}.{os.getpid()}.{time.time_ns()}.tmp'
+    try:
+        temporary.write_bytes(data)
+        os.replace(temporary, path)
+        metrics = getattr(ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics['bridge_requests'] += 1
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _wait_bridge_lines(ctx, cursor, until, predicate, label):
+    while (remaining := until - time.monotonic()) > 0:
+        ctx.check_stop()
+        for line in cursor.read():
+            if state_gate.BOUNDARY.search(line) or cursor.rotations:
+                raise RuntimeError(f'bridge continuity changed while waiting for {label}')
+            result = predicate(line)
+            if result is not None:
+                return result
+        time.sleep(min(.05, remaining))
+    raise RuntimeError(f'no fresh bridge {label} before deadline')
+
+
+def _wait_writer(ctx, cursor, until):
+    marker = '[TrainingRooms] settings.json written by the writer thread'
+    line = _wait_bridge_lines(ctx, cursor, until, lambda line: line if line.startswith(marker) else None,
+                              'settings writer')
+    return line
+
+
+def _fetch_settings(ctx, cap=20):
+    log = instance_path(ctx, 'bridge_log')
+    cursor = LogCursor(log, hold=False)
+    _spool_file(ctx, 'bridge-file.req', b'settings.json\n')
+    pattern = re.compile(r'\[Bridge\] file_end name=settings\.json bytes=(\d+) sha256=([0-9a-f]{64}) '
+                         r'result=ok.*\bmirrored=true(?: |$)')
+    line = _wait_bridge_lines(ctx, cursor, time.monotonic() + cap,
+                              lambda value: value if pattern.search(value) else None, 'settings file')
+    match = pattern.search(line)
+    data = (log.parent / 'bridge' / 'files' / 'settings.json').read_bytes()
+    if len(data) != int(match[1]) or hashlib.sha256(data).hexdigest() != match[2]:
+        raise RuntimeError('fresh settings file does not match the bridge receipt')
+    return data
+
+
+def _apply_settings(ctx, data, cap=30):
+    log = instance_path(ctx, 'bridge_log')
+    cursor = LogCursor(log, hold=False)
+    _spool_file(ctx, 'diag-settings-next.json', data)
+    until = time.monotonic() + cap
+    reply = writer = None
+    while time.monotonic() < until and not (reply and writer):
+        ctx.check_stop()
+        for line in cursor.read():
+            if state_gate.BOUNDARY.search(line) or cursor.rotations:
+                raise RuntimeError('bridge continuity changed while applying settings')
+            if '[Bridge] req set result=' in line:
+                if not re.search(r'\[Bridge\] req set result=ok(?: |$)', line):
+                    raise RuntimeError(line)
+                reply = line
+            if reply and line.startswith('[TrainingRooms] settings.json written by the writer thread'):
+                writer = line
+        if not (reply and writer):
+            time.sleep(min(.05, max(0, until - time.monotonic())))
+    if not (reply and writer):
+        raise RuntimeError('no fresh settings set reply and writer line before deadline')
+    metrics = getattr(ctx.runner, 'setup_metrics', None)
+    if metrics is not None:
+        metrics['bridge_requests'] += 1
+    return _fetch_settings(ctx, cap=max(.01, until - time.monotonic())), reply
+
+
+def _tr_input(io, before, macro, until, *, opened=True):
+    old_ack = native_picker.number(before, 'ack')
+    if time.monotonic() >= until:
+        raise RuntimeError(f'Training Mod deadline expired before {macro}')
+    io.send(macro)
+    latest = before
+    while (remaining := until - time.monotonic()) > 0:
+        after = io.read('tr.menu', remaining)
+        block = after.block
+        if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
+            raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
+        native_picker.same_epoch(latest, after, in_flight=True)
+        if block['rev'] <= latest.block['rev']:
+            continue
+        latest = after
+        ack = native_picker.number(after, 'ack')
+        if ack == old_ack:
+            continue
+        if ack != old_ack + 1 or after.values.get('ack.result') != 'handled':
+            raise RuntimeError(f'Training Mod input {macro} did not advance exactly one handled ACK')
+        if not _fields_match(after, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
+            raise RuntimeError('Training Mod menu changed scene, keyboard, or open state')
+        io.finish()
+        return after
+    raise RuntimeError(f'Training Mod input {macro} was not handled')
+
+
+def _roster_value(settings, key, kind):
+    catalog = tables()['roster_catalog']
+    wanted = [int(item['kind'] == kind) for item in catalog]
+    if sum(wanted) != 1:
+        raise RuntimeError(f'fighter kind {kind} is absent or ambiguous in the TR roster catalog')
+    actual = settings.get('menu', {}).get(key)
+    if actual != wanted:
+        raise RuntimeError(f'settings menu.{key} is not the required one-hot fighter')
+    return actual
+
+
+def _live_fighter(ctx, seat, kind, cap):
+    state = wait_native(ctx, lambda value: (
+        0 in value.get('roster', {}) and 1 in value.get('roster', {})
+        and value['roster'][seat].get('kind') == kind
+    ), cap=cap, fresh=('roster',), roster_entries=(0, 1))
+    roster = state.get('roster', {})
+    if (0 not in roster or 1 not in roster or roster[seat].get('kind') != kind):
+        raise RuntimeError(f'live roster does not confirm entry {seat} kind {kind}: {roster}')
+    return roster
+
+
+def _with_setup_metrics(ctx, action):
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    previous = getattr(ctx.runner, 'setup_metrics', None)
+    ctx.runner.setup_metrics = metrics
+    try:
+        return action(metrics)
+    finally:
+        ctx.runner.setup_metrics = previous
+        if previous is not None:
+            _merge_setup_metrics(previous, metrics)
+
+
+def _set_fighter(ctx, fighter, seat, cap, metrics):
+    started = time.monotonic()
+    entry = fighter_entry(fighter)
+    io = BridgePickerIO(ctx)
+    until = time.monotonic() + cap
+    ui = native_picker.wait_sample(io, native_picker.UI, until)
+    if not _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
+        raise RuntimeError('fighter setup needs the Training context without a modal dialog')
+    if _fields_match(ui, TRAINING_CSS):
+        nested = (pick_cpu(ctx, fighter) if seat == 1 else
+                  pick_local_fighter(ctx, fighter, topology=library_topology('css-training'),
+                                     take_back=True, expected_context='training'))
+        return _save(ctx, f'routes-set-{"cpu" if seat else "player"}', {
+            'block': 'set_cpu' if seat else 'set_player', 'args': {'fighter': fighter},
+            'verified': nested, 'skipped': ['tr_menu'], **metrics,
+            'ms': {'css': round((time.monotonic() - started) * 1000),
+                   'total': round((time.monotonic() - started) * 1000)},
+        })
+    if ui.values.get('screen') != 'training' or ui.values.get('input.owner') not in ('native', 'tr.menu'):
+        raise RuntimeError('fighter setup needs native Training or Training Mod menu ownership')
+    menu = io.read('tr.menu', max(.01, until - time.monotonic()))
+    if (menu.block['schema'] != 'tr.menu/1' or menu.block['filtered']
+            or menu.values.get('scene') != 'training' or menu.values.get('keyboard') != '0'
+            or menu.values.get('open') not in ('0', '1')):
+        raise RuntimeError('fighter setup needs a complete Training Mod menu observation')
+    owner = 'tr.menu' if menu.values['open'] == '1' else 'native'
+    ui = _wait_training_owner(io, menu, until, owner)
+    ui = _armed_native_sample(io, ui, until, 'Training Mod menu')
+    if not _fields_match(ui, {**TRAINING_SCREEN, 'input.owner': owner}):
+        raise RuntimeError('Training Mod menu lacks the expected input ownership')
+    native_picker.same_epoch(ui, menu, in_flight=True)
+    if menu.values['open'] == '0':
+        if time.monotonic() >= until:
+            raise RuntimeError('Training Mod deadline expired before opening the menu')
+        io.send('tr-menu-open')
+        menu = _wait_tr_menu(io, until, opened=True, after=menu)
+        _wait_training_owner(io, menu, until, 'tr.menu')
+        io.finish()
+
+    def depth(state):
+        value = state.values.get('depth')
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise RuntimeError(f'Training Mod menu depth is unknown: {value!r}') from None
+        if parsed < 0:
+            raise RuntimeError(f'Training Mod menu depth is unknown: {value!r}')
+        return parsed
+
+    while depth(menu) > 0:
+        old_depth = depth(menu)
+        menu = _tr_input(io, menu, 'tap-b1', until)
+        if depth(menu) >= old_depth:
+            raise RuntimeError('Training Mod grid did not close after B')
+    if menu.values.get('depth') != '0':
+        raise RuntimeError('Training Mod menu depth is unknown')
+    for _ in range(6):
+        if menu.values.get('page') == 'fighters_stages':
+            break
+        previous = menu.values.get('page')
+        menu = _tr_input(io, menu, 'tap-r1', until)
+        if menu.values.get('page') == previous or menu.values.get('depth') != '0':
+            raise RuntimeError('Training Mod page did not change after R')
+    if menu.values.get('page') != 'fighters_stages':
+        raise RuntimeError('Training Mod fighters_stages page not reached in six R presses')
+    action = 'cpu_character' if seat else 'player_character'
+    visited = set()
+    while menu.values.get('action') != action:
+        cursor = menu.values.get('cursor')
+        if cursor is None or cursor in visited:
+            raise RuntimeError(f'Training Mod row {action} was not found before wrapping')
+        visited.add(cursor)
+        menu = _tr_input(io, menu, 'main-menu-down', until)
+        if menu.values.get('cursor') == cursor or menu.values.get('page') != 'fighters_stages':
+            raise RuntimeError('Training Mod cursor did not move down')
+    menu = _tr_input(io, menu, 'tap-a1', until)
+    if menu.values.get('depth') != '1':
+        raise RuntimeError('Training Mod fighter grid did not open')
+    named = 'grid' in menu.values
+    if named and menu.values['grid'] != action:
+        raise RuntimeError(f'Training Mod grid is {menu.values["grid"]!r}, not {action!r}')
+    try:
+        cell = int(menu.values['editor.sel'])
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError('Training Mod grid editor.sel is unknown') from None
+    if not 0 <= cell < 87:
+        raise RuntimeError(f'Training Mod grid editor.sel is outside the roster: {cell}')
+    for direction in tr_grid_path(cell, entry['tile']):
+        predicted = tr_grid_step(cell, direction)
+        menu = _tr_input(io, menu, f'main-menu-{direction}', until)
+        if menu.values.get('editor.sel') != str(predicted):
+            raise RuntimeError(f'Training Mod grid cell did not reach predicted {predicted}')
+        if named and menu.values.get('grid') != action:
+            raise RuntimeError('Training Mod grid identity changed during movement')
+        cell = predicted
+    if ('grid.kind' in menu.values and menu.values['grid.kind'] != str(entry['kind'])
+            or 'grid.name' in menu.values and menu.values['grid.name'] != entry['name']):
+        raise RuntimeError('Training Mod grid kind/name does not match the fighter')
+    writer = LogCursor(instance_path(ctx, 'bridge_log'), hold=False)
+    menu = _tr_input(io, menu, 'tap-a1', until)
+    menu = _tr_input(io, menu, 'tap-b1', until)
+    if menu.values.get('depth') != '0':
+        raise RuntimeError('Training Mod fighter grid did not close')
+    menu = _tr_input(io, menu, 'tap-b1', until, opened=False)
+    _wait_training_owner(io, menu, until, 'native')
+    timings = {'menu': round((time.monotonic() - started) * 1000)}
+    phase = time.monotonic()
+    writer_line = _wait_writer(ctx, writer, until)
+    settings = json.loads(_fetch_settings(ctx, cap=max(.01, until - time.monotonic())))
+    picked = _roster_value(settings, action, entry['kind'])
+    timings['settings'] = round((time.monotonic() - phase) * 1000)
+    phase = time.monotonic()
+    roster = _live_fighter(ctx, seat, entry['kind'], max(.01, until - time.monotonic()))
+    timings['roster'] = round((time.monotonic() - phase) * 1000)
+    remember(ctx, **{f'{"cpu" if seat else "p1"}_kind': entry['kind'],
+                     'cpu' if seat else 'p1': entry['name']})
+    return _save(ctx, f'routes-set-{"cpu" if seat else "player"}', {
+        'block': 'set_cpu' if seat else 'set_player', 'args': {'fighter': fighter},
+        'verified': {'kind': entry['kind'], 'roster': roster, 'one_hot': picked},
+        'grid_named': named, 'writer': writer_line, **metrics,
+        'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],
+    })
+
+
+def set_cpu(ctx, fighter, cap=60):
+    return _with_setup_metrics(ctx, lambda metrics: _set_fighter(ctx, fighter, 1, cap, metrics))
+
+
+def set_player(ctx, fighter, cap=60):
+    return _with_setup_metrics(ctx, lambda metrics: _set_fighter(ctx, fighter, 0, cap, metrics))
+
+
+def tr_settings(ctx, values=None, file=None, cap=20, *, verify_roster=False):
+    return _with_setup_metrics(ctx, lambda metrics: _tr_settings(
+        ctx, values, file, cap, verify_roster, metrics,
+    ))
+
+
+def _tr_settings(ctx, values, file, cap, verify_roster, metrics):
+    if (values is None) == (file is None):
+        raise ValueError('supply exactly one of values or file')
+    start = time.monotonic()
+    io = BridgePickerIO(ctx)
+    native_picker.wait_sample(io, native_picker.UI, start + cap)
+    remaining = cap - (time.monotonic() - start)
+    if remaining <= 0:
+        raise RuntimeError('settings deadline expired before the initial read')
+    original = json.loads(_fetch_settings(ctx, cap=remaining))
+    timings = {'read': round((time.monotonic() - start) * 1000)}
+    if values is not None:
+        if not isinstance(values, dict) or not isinstance(original.get('menu'), dict):
+            raise ValueError('values and the current settings menu must be objects')
+        changed = json.loads(json.dumps(original))
+        changed['menu'].update(values)
+        keys = list(values)
+    else:
+        changed = json.loads(Path(file).read_bytes())
+        if not isinstance(changed, dict):
+            raise ValueError('settings file must contain a JSON object')
+        keys = list(changed)
+    phase = time.monotonic()
+    remaining = cap - (time.monotonic() - start)
+    if remaining <= 0:
+        raise RuntimeError('settings deadline expired before set')
+    readback_bytes, reply = _apply_settings(ctx, json.dumps(changed).encode(), cap=remaining)
+    timings['apply'] = round((time.monotonic() - phase) * 1000)
+    readback = json.loads(readback_bytes)
+    differences = ([key for key in keys if readback.get('menu', {}).get(key) != changed['menu'][key]]
+                   if values is not None else _settings_differences(changed, readback))
+    if differences:
+        raise RuntimeError(f'settings readback differs for {", ".join(differences)}')
+    live = {}
+    phase = time.monotonic()
+    if verify_roster:
+        for seat, key in ((0, 'player_character'), (1, 'cpu_character')):
+            if key in changed.get('menu', {}):
+                array = changed['menu'][key]
+                catalog = tables()['roster_catalog']
+                if len(array) != len(catalog) or sum(array) != 1 or any(x not in (0, 1) for x in array):
+                    raise RuntimeError(f'menu.{key} is not one-hot')
+                kind = catalog[array.index(1)]['kind']
+                live[key] = _live_fighter(ctx, seat, kind, max(.01, cap - (time.monotonic() - start)))
+    timings['roster'] = round((time.monotonic() - phase) * 1000)
+    fighter_keys = {'player_character', 'cpu_character'}
+    changed_fighters = fighter_keys.intersection(changed.get('menu', {}))
+    if values is not None:
+        changed_fighters.intersection_update(values)
+    return _save(ctx, 'routes-tr-settings', {
+        'block': 'tr_settings', 'args': {'values': values, 'file': str(file) if file else None},
+        'verified': {'keys': keys, 'live_roster': live}, 'set_reply': reply,
+        'live_fighter': ('checked' if verify_roster else 'not checked') if changed_fighters else 'not applicable',
+        'settings_sha256': hashlib.sha256(readback_bytes).hexdigest(),
+        **metrics,
+        'ms': {**timings, 'total': round((time.monotonic() - start) * 1000)}, 'skipped': [],
+    })
+
+
+def _settings_differences(sent, readback, path=''):
+    if isinstance(sent, dict):
+        if not isinstance(readback, dict):
+            return [path or '<root>']
+        differences = []
+        for key, value in sent.items():
+            child = f'{path}.{key}' if path else key
+            if key not in readback:
+                differences.append(child)
+            else:
+                differences.extend(_settings_differences(value, readback[key], child))
+        return differences
+    if (type(sent) is not type(readback)
+            or json.dumps(sent, sort_keys=True) != json.dumps(readback, sort_keys=True)):
+        return [path]
+    return []
+
+
+def setup_state(ctx):
+    started = time.monotonic()
+    io = BridgePickerIO(ctx)
+    ui = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 6)
+    screen = ui.values.get('screen', 'unknown')
+    p1 = cpu = 'unknown'
+    stage = expected(ctx).get('stage_id', 'unknown')
+    if screen == 'training':
+        state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
+        roster = state.get('roster', {})
+        names = {entry['kind']: entry['name'] for entry in tables()['roster_catalog']}
+        p1_kind = roster.get(0, {}).get('kind', 'unknown')
+        cpu_kind = roster.get(1, {}).get('kind', 'unknown')
+        p1 = {'kind': p1_kind, 'name': names.get(p1_kind, 'unknown')}
+        cpu = {'kind': cpu_kind, 'name': names.get(cpu_kind, 'unknown')}
+        stage = state.get('stage', 'unknown')
+    elif screen == 'css.training':
+        tile = native_picker.wait_sample(io, native_picker.TILE, time.monotonic() + 6)
+        native_picker.same_epoch(ui, tile, in_flight=True)
+        p1 = {key: tile.values.get('placed.' + key, 'unknown') for key in ('at', 'kind', 'name', 'form')}
+        cpu = {key: tile.values.get('cpu.placed.' + key, 'unknown') for key in ('at', 'kind', 'name', 'form')}
+    settings = _fetch_settings(ctx)
+    return _save(ctx, 'routes-setup-state', {
+        'block': 'setup_state', 'args': {}, 'verified': {'screen': screen, 'context': ui.values.get('screen.context'),
+                                                         'owner': ui.values.get('input.owner'), 'p1': p1, 'cpu': cpu,
+                                                         'stage_id': stage,
+                                                         'settings_sha256': hashlib.sha256(settings).hexdigest()},
+        'inputs': 0, 'bridge_requests': getattr(io, 'request_count', 0) + 1 + int(screen == 'training'),
+        'bridge_boot': ui.block['boot'], 'revisions': getattr(io, 'revisions', {}),
+        'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],
+    })
+
+
+def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', cap=180):
+    started = time.monotonic()
+    until = started + cap
+    wanted_stage = stage_entry(stage)['id']
+    wanted_p1 = fighter_entry(p1)['kind']
+    wanted_cpu = fighter_entry(cpu)['kind'] if cpu is not None else None
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    previous = getattr(ctx.runner, 'setup_metrics', None)
+    ctx.runner.setup_metrics = metrics
+    phases = ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
+              'pick_fighters', 'enter_training')
+    skipped, timings, receipts = list(phases), {}, {}
+
+    def run(name, function, *args, **kwargs):
+        if time.monotonic() >= until:
+            raise RuntimeError(f'reach_training deadline expired before {name}')
+        begin = time.monotonic()
+        value = function(*args, **kwargs)
+        timings[name] = round((time.monotonic() - begin) * 1000)
+        receipts[name] = value
+        if name in skipped:
+            skipped.remove(name)
+        return value
+
+    try:
+        io = BridgePickerIO(ctx)
+        ui = native_picker.wait_sample(io, native_picker.UI, until)
+        known_stage = expected(ctx).get('stage_id')
+        if not _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
+            if not _main_top(ui):
+                run('to_main', to_main, ctx)
+            screen = 'main'
+        else:
+            screen = ui.values.get('screen')
+        if screen == 'training':
+            if ui.values.get('input.owner') != 'native':
+                raise RuntimeError('reach_training needs native Training input ownership')
+            state = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
+                                 roster_entries=(0, 1))
+            known_stage = state.get('stage')
+            roster = state.get('roster', {})
+            stage_matches = state.get('stage') == wanted_stage
+            fighters_match = (roster.get(0, {}).get('kind') == wanted_p1
+                              and 1 in roster and (wanted_cpu is None or roster[1].get('kind') == wanted_cpu))
+            if stage_matches and fighters_match:
+                final = state
+                screen = 'done'
+            elif stage_matches:
+                run('quit_training', quit_training, ctx, cap=max(.01, until - time.monotonic()))
+                screen = 'css.training'
+            else:
+                run('back_to_main', back_to_main, ctx)
+                screen = 'main'
+        if screen == 'css.training':
+            if known_stage != wanted_stage:
+                run('back_to_main', back_to_main, ctx)
+                screen = 'main'
+        if screen not in ('done', 'main', 'stage_select', 'css.training'):
+            run('back_to_main', back_to_main, ctx)
+            screen = 'main'
+        if screen == 'main':
+            run('main_to_stage', main_to_stage, ctx)
+            screen = 'stage_select'
+        if screen == 'stage_select':
+            run('pick_stage', pick_stage, ctx, stage, topology=library_topology('sss-training'), form=form)
+            screen = 'css.training'
+        if screen == 'css.training':
+            run('pick_fighters', pick_fighters, ctx, p1, cpu=cpu, topology=library_topology('css-training'),
+                take_back=True)
+            run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
+                stage_ids={wanted_stage}, fighters={'p1': p1, **({'cpu': cpu} if cpu is not None else {})})
+            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
+                                 roster_entries=(0, 1))
+        final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+        if not _fields_match(final_ui, TRAINING_SCREEN):
+            raise RuntimeError('final Training screen is not owned by native input')
+        roster = final.get('roster', {})
+        if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
+                or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
+            raise RuntimeError(f'live Training state does not match the requested setup: {final}')
+    finally:
+        ctx.runner.setup_metrics = previous
+        if previous is not None:
+            _merge_setup_metrics(previous, metrics)
+    return _save(ctx, 'routes-reach-training', {
+        'block': 'reach_training', 'args': {'p1': p1, 'cpu': cpu, 'stage': stage, 'form': form},
+        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metrics,
+        'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
+    })
 
 
 def switch_close(ctx):

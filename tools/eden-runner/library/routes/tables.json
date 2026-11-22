@@ -4,7 +4,10 @@
   "checkout": "/home/intpa/tr-fixes-20261113/rc15-tech",
   "commit": "8f24c1c2fdc0e1926fa59822476c612409d1e172",
   "roster_grid.rs": "e8f4035a6b860ae3a0c0bd603af679e97a1eaf87fdff5db68187562ce4a87715",
-  "lobby_stages.rs": "f427e83c1c62fa2d62cc8e431c11f5facca0606fe1dfb5fbe690fca345dbd3f7"
+  "lobby_stages.rs": "f427e83c1c62fa2d62cc8e431c11f5facca0606fe1dfb5fbe690fca345dbd3f7",
+  "choices.rs": "eb42cd878bd4e176068b8d75e052f69c596ee3a163f00ad196d5fdf53d087f79",
+  "choices_checkout": "/home/intpa/tr-fixes-20261113/integration",
+  "choices_commit": "7d962416c81a5fe3790e70ec1bbc3df69e33fcd3"
  },
  "css_tiles": [
   {
@@ -1030,5 +1033,363 @@
   "Normal",
   "Omega",
   "Battlefield"
+ ],
+ "roster_catalog": [
+  {
+   "kind": 0,
+   "name": "Mario"
+  },
+  {
+   "kind": 1,
+   "name": "Donkey Kong"
+  },
+  {
+   "kind": 2,
+   "name": "Link"
+  },
+  {
+   "kind": 3,
+   "name": "Samus"
+  },
+  {
+   "kind": 4,
+   "name": "Dark Samus"
+  },
+  {
+   "kind": 5,
+   "name": "Yoshi"
+  },
+  {
+   "kind": 6,
+   "name": "Kirby"
+  },
+  {
+   "kind": 7,
+   "name": "Fox"
+  },
+  {
+   "kind": 8,
+   "name": "Pikachu"
+  },
+  {
+   "kind": 9,
+   "name": "Luigi"
+  },
+  {
+   "kind": 10,
+   "name": "Ness"
+  },
+  {
+   "kind": 11,
+   "name": "Captain Falcon"
+  },
+  {
+   "kind": 12,
+   "name": "Jigglypuff"
+  },
+  {
+   "kind": 13,
+   "name": "Peach"
+  },
+  {
+   "kind": 14,
+   "name": "Daisy"
+  },
+  {
+   "kind": 15,
+   "name": "Bowser"
+  },
+  {
+   "kind": 16,
+   "name": "Sheik"
+  },
+  {
+   "kind": 17,
+   "name": "Zelda"
+  },
+  {
+   "kind": 18,
+   "name": "Dr. Mario"
+  },
+  {
+   "kind": 19,
+   "name": "Pichu"
+  },
+  {
+   "kind": 20,
+   "name": "Falco"
+  },
+  {
+   "kind": 21,
+   "name": "Marth"
+  },
+  {
+   "kind": 22,
+   "name": "Lucina"
+  },
+  {
+   "kind": 23,
+   "name": "Young Link"
+  },
+  {
+   "kind": 24,
+   "name": "Ganondorf"
+  },
+  {
+   "kind": 25,
+   "name": "Mewtwo"
+  },
+  {
+   "kind": 26,
+   "name": "Roy"
+  },
+  {
+   "kind": 27,
+   "name": "Chrom"
+  },
+  {
+   "kind": 28,
+   "name": "Mr. Game & Watch"
+  },
+  {
+   "kind": 29,
+   "name": "Meta Knight"
+  },
+  {
+   "kind": 30,
+   "name": "Pit"
+  },
+  {
+   "kind": 31,
+   "name": "Dark Pit"
+  },
+  {
+   "kind": 32,
+   "name": "Zero Suit Samus"
+  },
+  {
+   "kind": 33,
+   "name": "Wario"
+  },
+  {
+   "kind": 34,
+   "name": "Snake"
+  },
+  {
+   "kind": 35,
+   "name": "Ike"
+  },
+  {
+   "kind": 39,
+   "name": "Diddy Kong"
+  },
+  {
+   "kind": 40,
+   "name": "Lucas"
+  },
+  {
+   "kind": 41,
+   "name": "Sonic"
+  },
+  {
+   "kind": 42,
+   "name": "King Dedede"
+  },
+  {
+   "kind": 43,
+   "name": "Olimar"
+  },
+  {
+   "kind": 44,
+   "name": "Lucario"
+  },
+  {
+   "kind": 45,
+   "name": "R.O.B."
+  },
+  {
+   "kind": 46,
+   "name": "Toon Link"
+  },
+  {
+   "kind": 47,
+   "name": "Wolf"
+  },
+  {
+   "kind": 48,
+   "name": "Villager"
+  },
+  {
+   "kind": 49,
+   "name": "Mega Man"
+  },
+  {
+   "kind": 50,
+   "name": "Wii Fit Trainer"
+  },
+  {
+   "kind": 51,
+   "name": "Rosalina & Luma"
+  },
+  {
+   "kind": 52,
+   "name": "Little Mac"
+  },
+  {
+   "kind": 53,
+   "name": "Greninja"
+  },
+  {
+   "kind": 54,
+   "name": "Palutena"
+  },
+  {
+   "kind": 55,
+   "name": "PAC-MAN"
+  },
+  {
+   "kind": 56,
+   "name": "Robin"
+  },
+  {
+   "kind": 57,
+   "name": "Shulk"
+  },
+  {
+   "kind": 58,
+   "name": "Bowser Jr."
+  },
+  {
+   "kind": 59,
+   "name": "Duck Hunt"
+  },
+  {
+   "kind": 60,
+   "name": "Ryu"
+  },
+  {
+   "kind": 61,
+   "name": "Ken"
+  },
+  {
+   "kind": 62,
+   "name": "Cloud"
+  },
+  {
+   "kind": 63,
+   "name": "Corrin"
+  },
+  {
+   "kind": 64,
+   "name": "Bayonetta"
+  },
+  {
+   "kind": 65,
+   "name": "Inkling"
+  },
+  {
+   "kind": 66,
+   "name": "Ridley"
+  },
+  {
+   "kind": 67,
+   "name": "Simon"
+  },
+  {
+   "kind": 68,
+   "name": "Richter"
+  },
+  {
+   "kind": 69,
+   "name": "King K. Rool"
+  },
+  {
+   "kind": 70,
+   "name": "Isabelle"
+  },
+  {
+   "kind": 71,
+   "name": "Incineroar"
+  },
+  {
+   "kind": 81,
+   "name": "Piranha Plant"
+  },
+  {
+   "kind": 82,
+   "name": "Joker"
+  },
+  {
+   "kind": 83,
+   "name": "Hero"
+  },
+  {
+   "kind": 84,
+   "name": "Banjo & Kazooie"
+  },
+  {
+   "kind": 85,
+   "name": "Terry"
+  },
+  {
+   "kind": 86,
+   "name": "Byleth"
+  },
+  {
+   "kind": 87,
+   "name": "Min Min"
+  },
+  {
+   "kind": 88,
+   "name": "Steve"
+  },
+  {
+   "kind": 89,
+   "name": "Sephiroth"
+  },
+  {
+   "kind": 92,
+   "name": "Kazuya"
+  },
+  {
+   "kind": 93,
+   "name": "Sora"
+  },
+  {
+   "kind": 90,
+   "name": "Pyra"
+  },
+  {
+   "kind": 91,
+   "name": "Mythra"
+  },
+  {
+   "kind": 36,
+   "name": "Squirtle"
+  },
+  {
+   "kind": 37,
+   "name": "Ivysaur"
+  },
+  {
+   "kind": 38,
+   "name": "Charizard"
+  },
+  {
+   "kind": 75,
+   "name": "Ice Climbers"
+  },
+  {
+   "kind": 73,
+   "name": "Mii Swordfighter"
+  },
+  {
+   "kind": 72,
+   "name": "Mii Brawler"
+  },
+  {
+   "kind": 74,
+   "name": "Mii Gunner"
+  }
  ]
 }

@@ -498,7 +498,7 @@ def parse_bridge_state(lines):
     return out
 
 
-def bridge_state(run, fresh=(), cap=6.0):
+def bridge_state(run, fresh=(), cap=6.0, *, roster_entries=()):
     """The console's state from a bridge run (`up --bridge-host`): `fresh` names (pos, speed, roster, status) are asked
     for first through the spool and must answer within `cap` s; everything else is the newest line already seen."""
     run = Path(run)
@@ -515,6 +515,9 @@ def bridge_state(run, fresh=(), cap=6.0):
         seen = {name for name, regex in want.items() if any(regex.search(line) for line in new)}
         if 'pos' in want and len({int(m.group(1)) for line in new if (m := STATE_POS.search(line))}) < 2:
             seen.discard('pos')
+        if ('roster' in want and roster_entries
+                and not set(roster_entries).issubset({int(m.group(1)) for line in new if (m := ROSTER.search(line))})):
+            seen.discard('roster')
         if len(seen) < len(want):
             if time.monotonic() > until:
                 raise RuntimeError(f'bridge state: no answer for {sorted(set(want) - seen)} within {cap} s')

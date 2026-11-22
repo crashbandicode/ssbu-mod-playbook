@@ -77,6 +77,22 @@
    "what": "L3, then L3+Right for 6 frames: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
+  "tap-l1": {
+   "file": "macros/tap-l1.edenmacro.json",
+   "sha256": "0b7ce2f8cc63e894149a32bb952d2a2f844eed3efb9839fde38cb52ad7df0c70",
+   "cap": 20,
+   "frames": 8,
+   "what": "L on frame 1, released frame 5",
+   "source": "authored 2026-11-22 from tap-a1 shape"
+  },
+  "tap-r1": {
+   "file": "macros/tap-r1.edenmacro.json",
+   "sha256": "467f3294bdac933fc86e061d9a02b676375a4a5aa8b96fa41039ca19f30651ea",
+   "cap": 20,
+   "frames": 8,
+   "what": "R on frame 1, released frame 5",
+   "source": "authored 2026-11-22 from tap-a1 shape"
+  },
   "tap-a1": {
    "file": "macros/tap-a1.edenmacro.json",
    "sha256": "a6662d148f41e5c7fabf37fce979325b6749fa8ef66e664be99a78c66b3513dd",

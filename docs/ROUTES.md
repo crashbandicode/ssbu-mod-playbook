@@ -52,8 +52,14 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `to_main` | qualified Title opening, Title prompt, How to Play skip prompt, or Main | a fresh bridge observation of native Main Menu top-tab focus |
 | `main_to_stage` | anywhere `to_main` handles | Training's stage select (`stage` gate) |
 | `pick_stage` `{stage, allow_derived}` | stage select | the named stage's tile settled (`at` equals `to`), A pressed, the character select (`css` gate). An unproven tile needs `allow_derived` and the stage-id check after the load |
-| `pick_fighters` `{p1}` | character select, P1's token in the hand | P1's token on its tile (`hovered` equals `at`) and placed. The CPU stays as it was; see "The CPU's coin" |
-| `enter_training` | both placed | Training: fresh state lines for both bodies, the HUD gate (a first-run tip is closed with A) |
+| `pick_fighters` `{p1, cpu, take_back}` | character select | P1 placed; when `cpu` is supplied, the CPU coin is placed too. `take_back` defaults to false for P1-only callers |
+| `pick_cpu` `{fighter, topology, form}` | Training character select, P1 placed | the CPU coin placed on the target; P1's original medal unchanged |
+| `enter_training` `{cap, stage_ids, fighters}` | both placed | Training and the verified stage; fresh roster entries 0 and 1, checked against remembered or supplied fighters where known |
+| `set_cpu` `{fighter, cap}` | Training character select or Training | the CPU selected; in Training, settings and live roster both verified |
+| `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings and live roster both verified |
+| `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
+| `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
+| `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded |
 | `chord` `{name}` | Training | the chord pressed in one frame, and for `tr-save`/`tr-load` TrainingRooms' `state saved`/`state placed` line after it |
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
@@ -70,20 +76,13 @@ from a constant.
 
 ### The CPU's coin: not proven
 
-The CPU's coin rests on the Random tile, the last one. Picking it up needs the empty hand moved onto it with the
-analog stick. On 2026-11-16 four approaches on the XPS (`harness-lib-xps-1`, r05) failed:
-1. **From Mii Gunner (tile 85):** P1 placed there, then six 6-frame pushes right, each followed by A. The first A
-   started Training (Mii Gunner against a random Daisy).
-2. **lr-04's recorded route from Steve (78):** `lr04-cpu-approach` and `lr04-cpu-pick` (right 26 and 20 frames,
-   down 14 and 18, then A) left the hand on the CPU panel below the coin. The A did nothing.
-3. **The same two right pushes with no down push** (`coin-pick`, first version): the A started Training.
-4. **The same with 10 frames down:** the A started Training.
+With P1 placed, `pick_cpu` steps the empty hand to the CPU coin and checks `hand.token=1` before A. It verifies that
+the CPU coin is held, walks it through the pinned CSS topology and verifies the target identity after placement.
+If the coins overlap and the hand points to P1's coin, it first parks P1's coin on a qualified tile, selects the
+CPU, then returns P1's coin and verifies the original medal. Unexpected state or an older Tile Cursor without the
+coin lines stops the route. The former stick-based `coin_route` is not supported.
 
-Each started Training because P1 was placed and the screen was ready to fight, so an A that misses the coin starts
-the match.
-
-`pick_fighters` therefore refuses a `cpu` argument unless `coin_route` is true, which is for testing a route only.
-Set the CPU with the lane's own fixture and assert it with `fixture {"cpu": …}`.
+2026-11-22: this token-step route is host-tested on modelled blocks and has not been flown.
 
 ## Game state (TrainingRooms diag build)
 
@@ -384,6 +383,13 @@ Surface calibration (2026-11-16): `pick_stage` accepts `transition_cap` (default
 
 2026-11-22: tile direction macros hold L3 plus direction for six frames, releasing at frame 7.
 `routes:pick_cpu(fighter, topology=None, form='default')` places the CPU coin at Training CSS with P1 placed;
-`routes:pick_fighters(p1, cpu=..., topology=None, form='default')` places both. Omitted topology uses the checked
+`routes:pick_fighters(p1, cpu=..., topology=None, form='default', take_back=False)` places both. Omitted topology uses the checked
 `css-training` library pin; an older Tile Cursor without CPU lines is refused before a CPU input. Receipts include
 the verified fighters and input/request counts. These paths have offline modelled-block tests, not a game proof.
+
+2026-11-22: `routes:set_cpu` and `routes:set_player` select fighters in Training CSS or the Training Mod menu;
+the latter verifies the settings one-hot value and live roster. `routes:tr_settings(values=... | file=...)`
+checks the bridge set reply, writer and file readback (20-second default cap); fighter keys do not prove the live
+fighter unless `verify_roster=True`. `routes:setup_state` is read-only; `routes:reach_training(p1, cpu=None,
+stage='Final Destination', form='normal', cap=180)` uses the shortest checked suffix and reports skipped phases.
+These paths require independent runtime proof.
