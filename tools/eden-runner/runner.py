@@ -141,10 +141,11 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import trace_text  # noqa: E402
 import subprocess  # noqa: E402
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
-GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status')
+GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status', 'text')
 # Control methods a row may call directly with a {"call": ...} step. Input stays in recorded segments.
 CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.get', 'settings.set', 'settings.save',
                 # Guest tracing (Eden persistent-tracing builds, docs/GUEST_TRACEPOINT.md); never input.
@@ -804,6 +805,10 @@ def dry_run(manifest_path):
                         errors.append(f'gate {name}: expect_groups {number} but the pattern has {pattern.groups} groups')
                 if gate.get('equal') and pattern.groups == 0:
                     errors.append(f'gate {name}: "equal" needs capture groups in the pattern')
+            elif kind == 'text':
+                if not isinstance(gate.get('pane'), str) or not gate['pane']:
+                    errors.append(f'gate {name}: text needs a non-empty "pane"')
+                re.compile(gate['pattern'])
             elif kind == 'change':
                 if len(gate['roi']) != 4 or not gate.get('mark'):
                     errors.append(f'gate {name}: change needs "mark" and a 4-number roi')
@@ -1518,6 +1523,15 @@ class Runner:
                 return Path(inst[name])
         return Path(key)
 
+    def trace_source(self, on):
+        inst = self.instances[on]
+        path = inst.get('trace_jsonl') or inst.get('trace')
+        if isinstance(path, (str, Path)) and path:
+            return Path(path)
+        if path:
+            raise RuntimeError(f'instance {on} is tracing but has no trace_jsonl file path')
+        raise RuntimeError(f'instance {on}: run is not tracing (no trace_jsonl)')
+
     def last_match(self, on, gate):
         """Last match of the gate's pattern in lines written during this row (or the whole file), or None."""
         source = self.source(on, gate['source'])
@@ -1665,7 +1679,19 @@ class Runner:
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
-        if kind == 'log':
+        if kind == 'text':
+            source = self.trace_source(on)
+            pattern = re.compile(gate['pattern'])
+            while time.monotonic() < until:
+                self.check_stop()
+                record = trace_text.current(source, gate['pane'], name_at=gate.get('name_at', trace_text.NAME_AT))
+                if record and pattern.search(record['text']) and time.monotonic() <= until:
+                    evidence = {'pane': gate['pane'], 'text': record['text'],
+                                'sequence': record['sequence'], 'frame': record['frame']}
+                    self.log({'gate': name, 'on': on, 'pass': True, **evidence})
+                    return evidence
+                time.sleep(max(0, min(.1, until - time.monotonic())))
+        elif kind == 'log':
             # Lines from this row only: the line usually appears while the segment before the gate is playing.
             # "on_all": every listed instance must match; "equal": their captured groups must be the same;
             # "expect_groups": {"2": "0"} pins captured values (group number -> text).
@@ -1787,10 +1813,11 @@ class Runner:
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
             raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
-        # Non-image gates (log, json, ui, status, change) save what the game showed when they gave up, so a
+        # Non-image gates save what the game showed when they gave up, so a
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
         self.failure_evidence(on, name)
-        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+        missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
+        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}')
 
     def failure_evidence(self, on, name):
         """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""

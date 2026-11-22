@@ -89,6 +89,11 @@ Set the CPU with the lane's own fixture and assert it with `fixture {"cpu": …}
   predicate. That predicate covered P1 only; this one covers both bodies.
 - **Tracing:** with the GDB stub on, tracing is off, so these reads come from the plugin's lines.
 
+**Release builds: the plugin's own text.** `trace_text.py` reads pane names and text from text-setter trace records;
+arm the point in a boot step with the stub off, `trace.configure` and the same-build ELF. A `text` gate matches the
+newest text for a pane in the instance's `trace_jsonl`. This reader and gate are host-tested on a real trace excerpt,
+not yet proven in a live boot.
+
 ## Logs that rotate
 
 `routes.LogCursor(path)` keeps the file it started on open:

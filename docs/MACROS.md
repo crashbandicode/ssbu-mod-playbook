@@ -425,6 +425,7 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
   reference shot), `hook` (a Python check such as `css_check.py`), `change`
   (a region that differs from a `mark` and has settled), `ui` (a matching
   frontend widget) and `status` (Eden's `status` fields).
+  A `text` gate matches the newest text-setter trace record for a pane.
   - Prefer a log line.
   - For an image gate, pick a region that doesn't animate. The default
     tolerance is a mean difference of 8 per colour byte; an exact match is

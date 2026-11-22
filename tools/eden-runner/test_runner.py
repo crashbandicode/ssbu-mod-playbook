@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runner  # noqa: E402
@@ -157,6 +158,124 @@ class RowRoleTests(unittest.TestCase):
             self.assertEqual(report['result'], 'BROKEN')
             self.assertIn('role', ' '.join(report['errors']))
             self.assertIn('other', ' '.join(report['errors']))
+
+
+class TextGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        fixture = Path(__file__).resolve().parent / 'fixtures/trace-text/set-text-excerpt.jsonl'
+        self.trace = self.dir / 'trace.jsonl'
+        shutil.copyfile(fixture, self.trace)
+        self.plan = {'start': 'training', 'gates': {'pane': {
+            'kind': 'text', 'pane': 'tr_crumb', 'pattern': 'CPU Character', 'cap': 1}},
+            'rows': [{'id': 'r1', 'start': 'training', 'end': 'training', 'steps': [{'gate': 'pane'}]}]}
+        self.manifest = self.dir / 'rows.json'
+        self.instances = {'a': {'socket': 'fake', 'trace_jsonl': str(self.trace)}}
+        self.out = self.dir / 'out'
+
+    def make(self):
+        self.manifest.write_text(json.dumps(self.plan))
+        return runner.Runner(self.manifest, self.instances, self.out, 15, client_factory=lambda socket: FakeEden({}))
+
+    def test_dry_run_accepts_text_gate_and_rejects_bad_inputs(self):
+        self.manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual((report['result'], report['errors'], report['review']['class']), ('READY', [], 'full'))
+        for change, expected in (({'pane': ''}, 'pane'), ({'pane': None}, 'pane'), ({'pattern': '['}, 'unterminated')):
+            with self.subTest(change=change):
+                plan = copy.deepcopy(self.plan)
+                plan['gates']['pane'].update(change)
+                self.manifest.write_text(json.dumps(plan))
+                report = runner.dry_run(self.manifest)
+                self.assertEqual(report['result'], 'BROKEN')
+                self.assertIn(expected, ' '.join(report['errors']))
+
+    def test_pass_records_latest_pane_text_sequence_and_frame(self):
+        r = self.make()
+        r.run()
+        receipt = json.loads((self.out / 'r1.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertEqual(receipt['results'][0]['evidence'],
+                         {'pane': 'tr_crumb', 'text': 'Fighters & Stages  >  CPU Character   page 1 of 1',
+                          'sequence': '1731', 'frame': '5523'})
+        self.assertEqual(r.last_gate_outcome['role'], 'trace')
+        self.assertEqual(runner.harness.assertion_role({'kind': 'text', 'asserts': 'effect'}), 'effect')
+
+    def test_nonmatching_pattern_times_out(self):
+        self.plan['gates']['pane']['pattern'] = 'never appears'
+        self.plan['gates']['pane']['cap'] = .08
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['status'], 'FAILED')
+
+    def test_older_matching_text_cannot_override_newest_text(self):
+        self.plan['gates']['pane']['cap'] = .08
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        with self.trace.open('ab') as f:
+            f.write(lines[1])
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+
+    def test_new_record_is_seen_while_polling(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[1])
+        self.plan['gates']['pane']['cap'] = .5
+        read = runner.trace_text.current
+        appended = []
+
+        def current(*args, **kwargs):
+            result = read(*args, **kwargs)
+            if not appended:
+                with self.trace.open('ab') as f:
+                    f.write(lines[9])
+                appended.append(True)
+            return result
+
+        with mock.patch.object(runner.trace_text, 'current', side_effect=current):
+            self.make().run()
+        result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual(result['sequence'], '1730')
+
+    def test_declared_but_missing_trace_file_fails_clearly(self):
+        self.trace.unlink()
+        self.plan['gates']['pane']['cap'] = .08
+        r = self.make()
+        with self.assertRaisesRegex(RuntimeError, 'trace file not found'):
+            r.run()
+        self.assertTrue(r.last_gate_outcome['missing_evidence'])
+
+    def test_missing_trace_declaration_fails_clearly(self):
+        self.instances['a'].pop('trace_jsonl')
+        r = self.make()
+        with self.assertRaisesRegex(RuntimeError, 'not tracing'):
+            r.run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['status'], 'FAILED')
+        self.assertTrue(r.last_gate_outcome['missing_evidence'])
+
+    def test_legacy_trace_file_source(self):
+        self.instances['a']['trace'] = self.instances['a'].pop('trace_jsonl')
+        self.make().run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['status'], 'PASS')
+
+    def test_trace_marker_without_file_path_fails_clearly(self):
+        self.instances['a'].pop('trace_jsonl')
+        self.instances['a']['trace'] = {'points': ['armed']}
+        with self.assertRaisesRegex(RuntimeError, 'trace_jsonl'):
+            self.make().run()
+
+    def test_custom_name_offset(self):
+        original = json.loads(self.trace.read_bytes().splitlines()[9])
+        pane = bytearray.fromhex(original['captures'][0]['hex'])
+        pane[0x90:0x90 + 25] = pane[0xb0:0xb0 + 25]
+        pane[0xb0:0xb0 + 25] = bytes(25)
+        original['captures'][0]['hex'] = pane.hex()
+        self.trace.write_text(json.dumps(original) + '\n')
+        self.plan['gates']['pane']['name_at'] = 0x90
+        self.make().run()
+        result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((result['pane'], result['sequence']), ('tr_crumb', '1730'))
 
 
 class RunnerTests(unittest.TestCase):
