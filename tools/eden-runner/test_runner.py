@@ -287,11 +287,26 @@ class TextGateTests(unittest.TestCase):
         r.run()
         receipt = json.loads((self.out / 'r1.json').read_text())
         self.assertEqual(receipt['status'], 'PASS')
+        pane_key = json.loads(self.trace.read_bytes().splitlines()[10])['registers']['x0']
         self.assertEqual(receipt['results'][0]['evidence'],
                          {'pane': 'tr_crumb', 'text': 'Fighters & Stages  >  CPU Character   page 1 of 1',
-                          'sequence': '1731', 'frame': '5523'})
+                          'sequence': '1731', 'frame': '5523', 'pane_key': pane_key, 'previous_text': ''})
         self.assertEqual(r.last_gate_outcome['role'], 'trace')
         self.assertEqual(runner.harness.assertion_role({'kind': 'text', 'asserts': 'effect'}), 'effect')
+
+    def test_text_evidence_identifies_pane_and_previous_different_text(self):
+        latest = json.loads(self.trace.read_bytes().splitlines()[10])
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual(evidence['pane_key'], latest['registers']['x0'])
+        self.assertEqual(evidence['previous_text'], '')
+
+    def test_text_evidence_without_earlier_change_has_no_previous_text(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[9] + lines[10])
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertIsNone(evidence['previous_text'])
 
     def test_nonmatching_pattern_times_out(self):
         self.plan['gates']['pane']['pattern'] = 'never appears'
@@ -327,6 +342,7 @@ class TextGateTests(unittest.TestCase):
             self.make().run()
         result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
         self.assertEqual(result['sequence'], '1730')
+        self.assertEqual(result['previous_text'], '')
 
     def test_declared_but_missing_trace_file_fails_clearly(self):
         self.trace.unlink()
@@ -426,7 +442,9 @@ class TextGateTests(unittest.TestCase):
 
         with mock.patch.object(runner.time, 'sleep', side_effect=sleep):
             self.make().run()
-        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']['sequence'], '1730')
+        result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual(result['sequence'], '1730')
+        self.assertIsNone(result['previous_text'])
 
 
 class RunnerTests(unittest.TestCase):

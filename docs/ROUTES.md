@@ -93,6 +93,9 @@ Set the CPU with the lane's own fixture and assert it with `fixture {"cpu": …}
 arm the point in a boot step with the stub off, `trace.configure` and the same-build ELF. A `text` gate matches the
 newest text for a pane in the instance's `trace_jsonl`, optionally bound to a `point_id`. This reader and gate are
 host-tested on a real trace excerpt, not yet proven in a live boot.
+At the setter's entry, a text record is a request and proves neither that the text was written nor that the pane is
+visible or focused. Bind `point_id` to the game's write-call point when a write must be shown, and use a still or
+another state source for visibility, focus and positions.
 
 ## Logs that rotate
 

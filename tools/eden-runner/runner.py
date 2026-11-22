@@ -1744,26 +1744,29 @@ class Runner:
         if kind == 'text':
             source = self.trace_source(on)
             pattern = re.compile(gate['pattern'])
-            offset, identity, record = 0, None, None
+            offset, identity, record, previous_text = 0, None, None, None
             while time.monotonic() < until:
                 self.check_stop()
                 try:
                     stat = source.stat()
                 except FileNotFoundError:
-                    offset, identity, record = 0, None, None
+                    offset, identity, record, previous_text = 0, None, None, None
                 else:
                     current_identity = (stat.st_dev, stat.st_ino)
                     if identity is not None and (identity != current_identity or stat.st_size < offset):
-                        offset, record = 0, None
+                        offset, record, previous_text = 0, None, None
                     identity = current_identity
                     found, offset = trace_text.scan(source, gate['pane'], since=offset,
                                                     name_at=gate.get('name_at', trace_text.NAME_AT),
                                                     point_id=gate.get('point_id'))
-                    if found:
-                        record = found[-1]
+                    for latest in found:
+                        if record is not None and record['text'] != latest['text']:
+                            previous_text = record['text']
+                        record = latest
                 if record and pattern.search(record['text']) and time.monotonic() <= until:
                     evidence = {'pane': gate['pane'], 'text': record['text'],
-                                'sequence': record['sequence'], 'frame': record['frame']}
+                                'sequence': record['sequence'], 'frame': record['frame'],
+                                'pane_key': record['pane'], 'previous_text': previous_text}
                     if 'point_id' in gate:
                         evidence['point_id'] = record['point_id']
                     self.log({'gate': name, 'on': on, 'pass': True, **evidence})
