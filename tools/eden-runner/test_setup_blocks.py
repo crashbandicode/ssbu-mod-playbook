@@ -42,7 +42,7 @@ class MenuIO:
         if provider == 'tr.menu':
             return recorded.snapshot(provider, self.rev, dict(self.menu), epoch=epoch)
         owner = 'tr.menu' if self.menu['open'] == '1' else 'native'
-        if self.fault == 'owner':
+        if self.fault == 'owner' or self.fault == 'owner_after_input' and self.actions:
             owner = 'unknown'
         return recorded.native(self.rev, epoch=epoch, screen='training', focus='training',
                                **{'screen.context': 'training', 'input.owner': owner})
@@ -139,6 +139,26 @@ class OpenCloseTests(unittest.TestCase):
             self.invoke('tr_open', io, cap=.02)
         self.assertEqual(io.actions, [])
 
+    def test_open_final_unknown_owner_is_failure_receipt(self):
+        io = MenuIO(self.ctx, opened=True, fault='owner_after_input')
+        with self.assertRaisesRegex(RuntimeError, r'expected.*owner.*tr.menu.*saw.*unknown'):
+            self.invoke('tr_open', io, page='saves', cap=.03)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-open.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+        self.assertEqual(receipt['last_seen']['input.owner'], 'unknown')
+
+    def test_repeated_block_receipts_do_not_overwrite(self):
+        io = MenuIO(self.ctx, opened=True)
+        first = self.invoke('tr_open', io, cap=.1)
+        first_path = Path(self.ctx.row_dir) / 'routes-tr-open.json'
+        original = first_path.read_bytes()
+        second = self.invoke('tr_open', io, page='saves', cap=.1)
+        self.assertTrue(first['ok'])
+        self.assertTrue(second['ok'])
+        self.assertEqual(first_path.read_bytes(), original)
+        self.assertEqual(json.loads((Path(self.ctx.row_dir) / 'routes-tr-open-2.json').read_text()), second)
+
 
 class RowsIO(MenuIO):
     def __init__(self, ctx, *, fault=None):
@@ -184,6 +204,15 @@ class RowsIO(MenuIO):
 
 
 class GotoTests(OpenCloseTests):
+    def test_goto_final_unknown_owner_is_failure_receipt(self):
+        io = RowsIO(self.ctx, fault='owner_after_input')
+        with self.assertRaisesRegex(RuntimeError, r'expected.*owner.*tr.menu.*saw.*unknown'):
+            self.invoke('tr_goto', io, page='fighters_stages', path=['game.6'], cap=.03)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-goto.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+        self.assertEqual(receipt['last_seen']['input.owner'], 'unknown')
+
     def test_nested_path_uses_focused_identity_not_outer_cursor(self):
         io = RowsIO(self.ctx)
         result = self.invoke('tr_goto', io, page='fighters_stages',
@@ -566,6 +595,34 @@ class SetTests(OpenCloseTests):
         self.assertEqual((writers, cursors, len(reads)), (0, 0, 2))
         self.assertEqual(io.actions, ['tr-menu-open', 'tap-b1'])
         self.assertEqual(result['verified']['before'], result['verified']['after'])
+
+    def test_malformed_boolean_and_float_settings_are_not_certified_off(self):
+        for values in ([False, True], [0.0, 1.0]):
+            with self.subTest(values=values):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', values)
+                with self.assertRaisesRegex(RuntimeError, r'expected a 0/1 integer array for menu.lra_reset'):
+                    self.run_set(io, 'toggle', [0, 1])
+
+    def test_duplicate_settings_key_is_not_certified_off(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        raw = b'{"menu":{"lra_reset":[1,0],"lra_reset":[0,1]}}'
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings', return_value=raw)):
+            with self.assertRaisesRegex(RuntimeError, 'duplicate'):
+                routes.tr_set(self.ctx, page='cpu', path=['lra_reset'], kind='toggle', value=[0, 1], cap=.1)
+        self.assertNotIn('tap-a1', io.actions)
+
+    def test_friendly_toggle_and_list_values_preserve_original_arguments(self):
+        for value, target in (('On', [1, 0]), ('OFF', [0, 1]), (True, [1, 0]), (False, [0, 1])):
+            with self.subTest(value=value):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', target)
+                result, _, _, _ = self.run_set(io, 'toggle', value)
+                self.assertEqual(result['args']['value'], value)
+                self.assertEqual(result['verified']['value_stored'], target)
+        io = SetIO(self.ctx, 'list', 'sdi_strength', [0, 0, 1])
+        result, _, _, _ = self.run_set(io, 'list', 2)
+        self.assertEqual(result['args']['value'], 2)
+        self.assertEqual(result['verified']['value_stored'], [0, 0, 1])
 
     def test_changed_toggle_list_and_checklist_require_writer(self):
         for kind, row, before, target in (('toggle', 'lra_reset', [0, 1], [1, 0]),
