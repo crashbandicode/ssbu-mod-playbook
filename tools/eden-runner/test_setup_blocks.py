@@ -204,6 +204,52 @@ class RowsIO(MenuIO):
 
 
 class GotoTests(OpenCloseTests):
+    def test_dropped_first_input_retries_once(self):
+        io = RowsIO(self.ctx)
+        send = io.send
+        dropped = False
+
+        def send_with_drop(segment):
+            nonlocal dropped
+            if segment == 'main-menu-down' and not dropped:
+                dropped = True
+                io.actions.append(segment)
+                io.ctx.runner.setup_metrics['inputs'] += 1
+                return
+            send(segment)
+
+        io.send = send_with_drop
+        with patch.object(routes, 'INPUT_LAG_S', .003, create=True):
+            result = self.invoke('tr_goto', io, page='fighters_stages', path=['game.6'], cap=.1)
+        self.assertEqual(result['retries'], 1)
+        self.assertEqual(io.actions, ['main-menu-down', 'main-menu-down'])
+
+    def test_late_input_and_retry_double_ack_fails(self):
+        io = RowsIO(self.ctx)
+        send = io.send
+        first = True
+
+        def send_with_late_input(segment):
+            nonlocal first
+            if segment == 'main-menu-down' and first:
+                first = False
+                io.actions.append(segment)
+                io.ctx.runner.setup_metrics['inputs'] += 1
+                return
+            send(segment)
+            send(segment)
+
+        io.send = send_with_late_input
+        with patch.object(routes, 'INPUT_LAG_S', .003, create=True):
+            with self.assertRaisesRegex(RuntimeError, 'input handled twice'):
+                self.invoke('tr_goto', io, page='fighters_stages', path=['game.6'], cap=.1)
+
+    def test_row_title_matches_normalized_meaning(self):
+        io = RowsIO(self.ctx)
+        result = self.invoke('tr_goto', io, page='fighters_stages',
+                             path=['game.6', {'row': '  SET   UP... '}], cap=1)
+        self.assertEqual(result['verified']['row'], 'Set up…')
+
     def test_goto_final_unknown_owner_is_failure_receipt(self):
         io = RowsIO(self.ctx, fault='owner_after_input')
         with self.assertRaisesRegex(RuntimeError, r'expected.*owner.*tr.menu.*saw.*unknown'):
@@ -316,9 +362,10 @@ class StopTests(OpenCloseTests):
 
 
 class WizardIO(RowsIO):
-    def __init__(self, ctx, *, step=1, fault=None):
+    def __init__(self, ctx, *, step=1, fault=None, pages=4):
         super().__init__(ctx, fault=fault)
         self.step = step
+        self.pages = pages
         self.area_index = 3
         self.areas = ('Lower left', 'Lower right', 'Upper left', 'Upper right')
         self.cpu = [1.0, 1.0]
@@ -329,13 +376,14 @@ class WizardIO(RowsIO):
         self.refresh_notice()
 
     def refresh_notice(self):
-        self.menu['notice.header'] = f'Edge · {self.step}/4'
+        self.menu['notice.header'] = f'Edge · {self.step}/{self.pages}'
         cpu = ', '.join(format(v, '.0f') for v in self.cpu)
         p1 = ', '.join(format(v, '.0f') for v in self.p1)
+        kind = (('area', 'cpu', 'p1', 'preview') if self.pages == 4 else ('cpu', 'p1', 'preview'))[self.step - 1]
         self.menu['notice.body'] = (
-            f'{self.areas[self.area_index]} ({cpu}) · D-pad choose · A next' if self.step == 1 else
-            f'CPU ({cpu}) · Stick move · A next' if self.step == 2 else
-            f'P1 ({p1}) · Stick move · A next' if self.step == 3 else
+            f'{self.areas[self.area_index]} ({cpu}) · D-pad choose · A next' if kind == 'area' else
+            f'CPU ({cpu}) · Stick move · A next' if kind == 'cpu' else
+            f'P1 ({p1}) · Stick move · A next' if kind == 'p1' else
             f'CPU ({cpu}) · 100% · P1 ({p1}) · A/+ start')
 
     def read(self, provider, cap):
@@ -358,7 +406,7 @@ class WizardIO(RowsIO):
                 self.actions.append(segment)
                 self.ctx.runner.setup_metrics['inputs'] += 1
                 self.menu['ack'] = str(int(self.menu['ack']) + 1)
-                self.menu['open'] = '0'
+                self.menu.update({'open': '0', 'game': 'Guard the Edge', 'game.running': '1'})
                 self.step = 1
                 self.refresh_notice()
                 return
@@ -367,17 +415,19 @@ class WizardIO(RowsIO):
         if self.ctx.runner.setup_metrics is not None:
             self.ctx.runner.setup_metrics['inputs'] += 1
         if segment == 'tap-a1':
-            if self.fault != 'header_stuck' and self.step < 4:
+            if self.fault != 'header_stuck' and self.step < self.pages:
                 self.step += 1
         elif segment == 'main-menu-right':
             self.area_index = (self.area_index + 1) % 4
         elif segment.startswith('wizard-'):
             _, direction, size = segment.split('-')
             if self.fault != 'null':
-                amount = {'coarse': 20.0, 'medium': 4.0, 'fine': .7}[size]
+                first_hidden = self.fault == 'unpublished_once' and sum(
+                    action.startswith('wizard-') for action in self.actions) == 1
+                amount = .2 if first_hidden else {'coarse': 20.0, 'medium': 4.0, 'fine': .7}[size]
                 axis = 0 if direction in ('left', 'right') else 1
                 sign = -1 if direction in ('left', 'down') else 1
-                point = self.cpu if self.step == 2 else self.p1
+                point = self.cpu if self.step == (2 if self.pages == 4 else 1) else self.p1
                 point[axis] += sign * amount
                 if self.fault == 'disturb' and axis == 1:
                     point[0] += 1
@@ -387,6 +437,45 @@ class WizardIO(RowsIO):
 
 
 class WizardTests(OpenCloseTests):
+    def test_wrong_or_stopped_game_never_accepts_wizard_or_sends_input(self):
+        for step in (2, 4):
+            for game, running in (('Eggs-ercise', '1'), ('Guard the Edge', '0')):
+                with self.subTest(step=step, game=game, running=running):
+                    io = WizardIO(self.ctx, step=step)
+                    io.menu.update({'game': game, 'game.running': running})
+                    with self.assertRaisesRegex(RuntimeError, 'expected.*Guard the Edge'):
+                        self.invoke('wizard_place', io, game='Guard the Edge', cap=.1, pulse_cap=.002)
+                    self.assertEqual(io.actions, [])
+
+    def test_three_page_wizard_uses_page_meaning(self):
+        io = WizardIO(self.ctx, pages=3)
+        result = self.invoke('wizard_place', io, game='Guard the Edge',
+                             cpu=[1, 1], p1=[0, 0], cap=.2, pulse_cap=.002)
+        self.assertEqual([page['kind'] for page in result['verified']['pages']], ['CPU', 'P1', 'Preview'])
+        self.assertEqual(result['verified']['pages'][-1]['header'], 'Edge · 3/3')
+
+    def test_area_request_on_three_page_wizard_fails_before_input(self):
+        io = WizardIO(self.ctx, pages=3)
+        with self.assertRaisesRegex(RuntimeError, 'expected an Area page to choose Upper left'):
+            self.invoke('wizard_place', io, game='Guard the Edge', area='Upper left', cap=.1, pulse_cap=.002)
+        self.assertEqual(io.actions, [])
+
+    def test_unpublished_pulse_then_reached_target_records_uncertainty(self):
+        io = WizardIO(self.ctx, step=2, fault='unpublished_once')
+        io.cpu = [0.0, 1.0]
+        io.refresh_notice()
+        result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[1, 1], cap=.2, pulse_cap=.002)
+        self.assertEqual(result['verified']['unconfirmed_pulses'], 1)
+        self.assertFalse(result['verified']['pulses']['cpu'][0]['published'])
+        self.assertEqual(result['verified']['cpu_shown'], ['1', '1'])
+
+    def test_wizard_tolerance_accepts_nearby_shown_coordinates(self):
+        io = WizardIO(self.ctx, step=4)
+        result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[2, 1], p1=[0, 0],
+                             tolerance=1, cap=.1, pulse_cap=.002)
+        self.assertEqual(result['verified']['cpu_shown'], ['1', '1'])
+        self.assertEqual(io.actions, [])
+
     def test_analog_macros_are_indexed_full_state_events(self):
         base = Path(routes.ROUTES)
         entries = json.loads((base / 'index.json').read_text())['macros']
