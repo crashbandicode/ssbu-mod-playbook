@@ -90,7 +90,7 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
                 and values.get('screen') == 'sss' and values.get('settled') == '0'
                 and values.get('layout') == values.get('hovered') == 'unknown')
     step = (stepping and provider == TILE and focus == 'unknown'
-            and values.get('settled') == '0' and values.get('hovered') == 'unknown')
+            and values.get('kind') == 'unknown' and values.get('name') == 'unknown')
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
@@ -309,8 +309,9 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, exp
         token_held(latest, screen)
         values = latest.values
         ack, applied = number(latest, 'ack'), number(latest, 'applied')
-        if values.get('focus') == 'unknown' and (ack, applied) != (prior_ack + 1, prior_applied + 1):
-            raise RuntimeError('unsettled tile observation without the outstanding step')
+        pending = values.get('focus') == 'unknown'
+        if pending and (ack, applied) != (prior_ack + 1, prior_applied + 1):
+            raise RuntimeError('tile identity pending without the outstanding step')
         if ack == prior_ack and applied == prior_applied and values.get('at') == at:
             continue
         if ack != prior_ack + 1 or applied != prior_applied + 1:
@@ -319,6 +320,10 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, exp
         if step != (direction, at, dest, 'handled', 'handled'):
             raise RuntimeError(f'wrong step: expected {direction} {at}->{dest}, observed {step!r}')
         if values.get('settled') != '1':
+            continue
+        if pending:
+            if settled(latest, after_step=True) != dest:
+                raise RuntimeError('settled tile coordinate disagrees with the outstanding step')
             continue
         if settled(latest, after_step=True) != dest or Target.read(latest) != expected_tile:
             raise RuntimeError('settled tile identity disagrees with the qualified topology')

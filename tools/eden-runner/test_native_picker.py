@@ -56,6 +56,49 @@ def loading(rev, *, epoch=1, **extra):
     return native(rev, epoch, **{**fields, 'observation.active': 'no', **extra})
 
 
+def recorded_training_tile(rev):
+    observation, generation, ack, settled, complete = {
+        543: (3316, 21, 11, False, False),
+        551: (3365, 21, 11, True, True),
+        809: (4785, 28, 24, True, False),
+        816: (4813, 28, 24, True, True),
+    }[rev]
+    boot = '0x3d1b9bf2497aaa1f'
+    values = {
+        'schema': 'tile.cursor/1', 'rev': str(rev), 'boot': boot, 'ack': str(ack),
+        'ack.result': 'handled', 'focus': 'css.grid.richter' if complete else 'unknown',
+        'observation': str(observation), 'observation.active': '1', 'screen': 'css',
+        'generation': str(generation), 'layout': 'css.9f1fb03bf7c98fb9', 'grid': 'css.9f1fb03bf7c98fb9',
+        'at': '67', 'hovered': '67' if settled else 'unknown', 'kind': '68' if complete else 'unknown',
+        'name': 'Richter' if complete else 'unknown', 'form': 'default' if complete else 'unknown',
+        'controller': '0', 'seat': '0', 'carried': '0', 'p1.carried': '0', 'p1.token': 'held',
+        'p1.placed.at': 'unknown', 'p1.placed.kind': 'unknown', 'p1.placed.name': 'unknown',
+        'p1.placed.form': 'unknown', 'local.token': 'held', 'placed.at': 'unknown',
+        'placed.kind': 'unknown', 'placed.name': 'unknown', 'placed.form': 'unknown',
+        'settled': '1' if settled else '0', 'applied': str(ack), 'direction': 'up',
+        'from': '78', 'to': '67', 'result': 'handled', 'settled.ack': str(ack) if settled else 'unknown',
+    }
+    return picker.Sample({'name': 'tile.cursor', 'schema': 'tile.cursor/1', 'rev': rev,
+                          'boot': boot, 'filtered': False, 'values': values}, 1)
+
+
+def recorded_before(rev):
+    state = recorded_training_tile(rev)
+    ack = str(int(state.values['ack']) - 1)
+    state.block['rev'] -= 1
+    state.values.update({'rev': str(state.block['rev']), 'observation': str(int(state.values['observation']) - 1),
+                         'ack': ack, 'applied': ack, 'settled.ack': ack, 'at': '78', 'hovered': '78',
+                         'settled': '1', 'focus': 'css.grid.pickel', 'kind': '88', 'name': 'Steve',
+                         'form': 'default'})
+    return state
+
+
+def recorded_native(rev):
+    state = native(rev, screen='css.training', **{'screen.context': 'training'})
+    state.block['boot'] = state.values['boot'] = '0x3d1b9bf2497aaa1f'
+    return state
+
+
 class Replay:
     def __init__(self, tiles=(), native_blocks=()):
         self.tiles = iter(tiles)
@@ -150,7 +193,7 @@ class PickerTests(unittest.TestCase):
         sample = self.training_step(543, ack=10, applied=10)
         sample.values['at'] = '78'
         replay = Replay([sample])
-        with self.assertRaisesRegex(RuntimeError, '^unsettled tile observation without the outstanding step$'):
+        with self.assertRaisesRegex(RuntimeError, '^tile identity pending without the outstanding step$'):
             self.training_move(replay)
         self.assertEqual(replay.actions, ['tile-up'])
 
@@ -160,18 +203,94 @@ class PickerTests(unittest.TestCase):
             self.training_move(replay)
         self.assertEqual(replay.actions, ['tile-up'])
 
-    def test_settled_unknown_focus_still_fails(self):
-        replay = Replay([self.training_step(543, settled=True)])
-        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
-            self.training_move(replay)
-        self.assertEqual(replay.actions, ['tile-up'])
-
     def test_baseline_rejects_unknown_midstep(self):
         replay = Replay([self.training_step(543)],
                         [native(540, screen='css.training', **{'screen.context': 'training'})])
         with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
             picker.baseline(replay, 'css', cap=.02, expected_context='training')
         self.assertEqual(replay.actions, [])
+
+    def captured_move(self, samples, before_rev=809, cap=.02):
+        replay = Replay(samples, [recorded_native(2)])
+        result = picker.move(replay, 'css', recorded_before(before_rev), recorded_native(1), '78', 'up', '67',
+                             picker.Target('68', 'Richter', 'default'), cap, expected_context='training')
+        return replay, result
+
+    def test_n02_settled_coordinate_waits_for_recorded_identity(self):
+        replay, (latest, _) = self.captured_move([recorded_training_tile(809), recorded_training_tile(816)])
+        self.assertEqual(latest.values, recorded_training_tile(816).values)
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_tg00_unsettled_replay_still_finishes(self):
+        replay, (latest, _) = self.captured_move([recorded_training_tile(543), recorded_training_tile(551)], 543)
+        self.assertEqual(latest.values, recorded_training_tile(551).values)
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_pending_identity_wrong_settled_coordinate_rejected(self):
+        pending = recorded_training_tile(809)
+        pending.values.update({'at': '68', 'hovered': '68'})
+        with self.assertRaisesRegex(RuntimeError, '^settled tile coordinate disagrees with the outstanding step$'):
+            self.captured_move([pending])
+
+    def test_pending_identity_wrong_step_rejected(self):
+        pending = recorded_training_tile(809)
+        pending.values.update({'from': '0', 'to': '1'})
+        with self.assertRaisesRegex(RuntimeError, '^wrong step:'):
+            self.captured_move([pending])
+
+    def test_pending_identity_without_ack_rejected(self):
+        pending = recorded_training_tile(809)
+        pending.values.update({'ack': '23', 'applied': '23', 'at': '78', 'hovered': '78', 'settled.ack': '23'})
+        with self.assertRaisesRegex(RuntimeError, '^tile identity pending without the outstanding step$'):
+            self.captured_move([pending])
+
+    def test_unknown_focus_with_known_kind_remains_rejected(self):
+        pending = recorded_training_tile(809)
+        pending.values['kind'] = '68'
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
+            self.captured_move([pending])
+
+    def test_pending_identity_never_completes(self):
+        pending = recorded_training_tile(809)
+
+        class RepeatPending(Replay):
+            def read(self, provider, cap):
+                return pending
+
+        replay = RepeatPending()
+        with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
+            picker.move(replay, 'css', recorded_before(809), recorded_native(1), '78', 'up', '67',
+                        picker.Target('68', 'Richter', 'default'), .005, expected_context='training')
+        self.assertEqual(replay.actions, ['tile-up'])
+        self.assertEqual(replay.evidence, [])
+
+    def test_baseline_rejects_settled_pending_identity(self):
+        replay = Replay([recorded_training_tile(809)], [recorded_native(1)])
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
+            picker.baseline(replay, 'css', cap=.02, expected_context='training')
+        self.assertEqual(replay.actions, [])
+
+    def test_older_revision_after_pending_does_not_pass_the_fence(self):
+        pending = recorded_training_tile(809)
+        older = recorded_training_tile(809)
+        older.block['rev'] = 808
+        older.values.update({'rev': '808', 'observation': '4784'})
+
+        class RepeatOlder(Replay):
+            def __init__(self):
+                super().__init__([pending, older])
+
+            def read(self, provider, cap):
+                try:
+                    return super().read(provider, cap)
+                except RuntimeError:
+                    return older
+
+        replay = RepeatOlder()
+        with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
+            picker.move(replay, 'css', recorded_before(809), recorded_native(1), '78', 'up', '67',
+                        picker.Target('68', 'Richter', 'default'), .005, expected_context='training')
+        self.assertEqual(replay.actions, ['tile-up'])
 
     def test_unsettled_or_older_sample_never_completes_the_step(self):
         class RepeatingReplay(Replay):
