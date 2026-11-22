@@ -496,10 +496,12 @@ def acquire_local_token(io, target, topology, cap=4, *, expected_context=None):
             raise RuntimeError('a tile step arrived while taking back the local token')
         if state.values.get('local.token') == 'held':
             token_held(state, 'css')
-            if state.values['focus'] == 'unknown':
-                if state.values.get('at') != before.values['placed.at']:
+            if state.values.get('settled') != '1':
+                if state.values.get('settled') != '0' or state.values.get('target.at') != before.values['placed.at']:
                     raise RuntimeError('the held token is not returning to the medal tile')
                 continue
+            if settled(state) != before.values['placed.at'] or Target.read(state) != wanted:
+                raise RuntimeError('the held token did not settle on the medal tile')
             if state.values['focus'] == before.values['focus']:
                 raise RuntimeError('local token takeback did not change native focus')
             native_input_owner(wait_sample(io, UI, until, ui, in_flight=True), 'css',

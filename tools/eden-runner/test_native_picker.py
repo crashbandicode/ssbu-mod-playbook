@@ -181,18 +181,20 @@ L8W_TOPOLOGY = picker.Topology(layout=L8W_LAYOUT, neighbors={},
 
 
 def l8w_tile(rev):
-    """tile.cursor blocks of boot l8w (Tile Cursor 236c98d) around the take-back B: 1789 and 1792 are the placed Mario
-    medal, 1795 the hand flying back with the token (captured, 43 fields). 1801 is modelled on the settled held Mario
-    block of the same boot (rev 149); the capture has no complete block after 1795."""
-    observation, phase = {1789: (10781, 'placed'), 1792: (10799, 'placed'), 1795: (10817, 'moving'),
-                          1801: (10853, 'settled')}[rev]
+    """tile.cursor blocks of boot l8w (Tile Cursor 236c98d) around the take-back B, 43 fields each. 1789 and 1792 are
+    bridge replies (the placed Mario medal). 1794, 1795 and 1796 are the plugin's own publish payloads (trace point P,
+    sequences 3871, 3873, 3875) with the bridge's boot: the hand flying back from tile 13, then over tile 0, then
+    settled on Mario. The bridge served 1795; no reply carries 1794 or 1796."""
+    observation, phase, at = {1789: (10781, 'placed', 'unknown'), 1792: (10799, 'placed', 'unknown'),
+                              1794: (10811, 'moving', '13'), 1795: (10817, 'moving', '0'),
+                              1796: (10823, 'settled', '0')}[rev]
     placed, moving, settled = phase == 'placed', phase == 'moving', phase == 'settled'
     values = {
         'schema': 'tile.cursor/1', 'rev': str(rev), 'boot': L8W_BOOT, 'ack': '13',
-        'ack.result': 'handled' if settled else 'unknown',
+        'ack.result': 'unknown',
         'focus': 'css.medal.mario' if placed else 'css.grid.mario' if settled else 'unknown',
         'observation': str(observation), 'observation.active': '1', 'screen': 'css', 'generation': '6',
-        'layout': L8W_LAYOUT, 'grid': L8W_LAYOUT, 'at': 'unknown' if placed else '0',
+        'layout': L8W_LAYOUT, 'grid': L8W_LAYOUT, 'at': at,
         'hovered': '0' if settled else 'unknown', 'kind': '0' if settled else 'unknown',
         'name': 'Mario' if settled else 'unknown', 'form': 'default' if settled else 'unknown',
         'controller': '0', 'seat': '0', 'carried': 'none' if placed else '0',
@@ -202,9 +204,7 @@ def l8w_tile(rev):
         'local.token': 'placed' if placed else 'held', 'placed.at': '0' if placed else 'unknown',
         'placed.kind': '0' if placed else 'unknown', 'placed.name': 'Mario' if placed else 'unknown',
         'placed.form': 'default' if placed else 'unknown', 'settled': '1' if settled else '0', 'applied': '13',
-        'direction': 'left' if settled else 'unknown', 'from': '1' if settled else 'unknown',
-        'to': '0' if settled else 'unknown', 'result': 'handled' if settled else 'unknown',
-        'settled.ack': '13' if settled else 'unknown',
+        'direction': 'unknown', 'from': 'unknown', 'to': 'unknown', 'result': 'unknown', 'settled.ack': 'unknown',
         'phase': 'resting' if placed else phase, 'target.at': 'none' if placed else '0',
         'target.kind': 'unknown' if placed else '0', 'target.name': 'unknown' if placed else 'Mario', 'blocked': '0',
     }
@@ -223,32 +223,58 @@ class PickerTests(unittest.TestCase):
         io = Replay(tiles, natives or [l8w_native(rev) for rev in (1841, 1844, 1850)])
         return io, picker.acquire_local_token(io, L8W_RICHTER, L8W_TOPOLOGY, cap=.2, expected_context='training')
 
-    def test_takeback_waits_while_the_hand_flies_back_with_the_token(self):
-        io, result = self.run_takeback([l8w_tile(rev) for rev in (1789, 1792, 1795, 1801)])
-        self.assertIsNone(result)
-        self.assertEqual(io.actions, ['tap-b1'])
-        self.assertEqual(io.evidence[-1]['rev'], 1801)
+    def test_takeback_waits_through_the_measured_flight_to_the_settled_block(self):
+        for flight in ((1794, 1795), (1795,), (1794,), ()):
+            with self.subTest(flight=flight):
+                io, result = self.run_takeback([l8w_tile(rev) for rev in (1789, 1792, *flight, 1796)])
+                self.assertIsNone(result)
+                self.assertEqual(io.actions, ['tap-b1'])
+                self.assertEqual(io.evidence[-1]['rev'], 1796)
 
-    def test_takeback_never_returns_on_the_flying_block(self):
-        io = Replay([l8w_tile(rev) for rev in (1789, 1792, 1795)], [l8w_native(rev) for rev in (1841, 1844, 1850)])
+    def test_takeback_never_returns_on_a_flying_block(self):
+        io = Replay([l8w_tile(rev) for rev in (1789, 1792, 1794, 1795)],
+                    [l8w_native(rev) for rev in (1841, 1844, 1850)])
         with self.assertRaisesRegex(RuntimeError, 'tile.cursor missing'):
             picker.acquire_local_token(io, L8W_RICHTER, L8W_TOPOLOGY, cap=.2, expected_context='training')
         self.assertEqual(io.actions, ['tap-b1'])
 
+    def test_takeback_does_not_finish_on_an_unsettled_block_with_a_known_focus(self):
+        early = l8w_tile(1795)
+        early.values['focus'] = 'css.grid.mario'
+        io, result = self.run_takeback([l8w_tile(1789), l8w_tile(1792), early, l8w_tile(1796)])
+        self.assertIsNone(result)
+        self.assertEqual(io.evidence[-1]['rev'], 1796)
+
     def test_takeback_rejects_a_flying_block_that_contradicts_the_medal(self):
         cases = (
-            ({'at': '5'}, 'not returning to the medal tile'),
-            ({'carried': 'none'}, "local token ownership is 'held'"),
-            ({'ack': '14', 'applied': '14'}, 'a tile step arrived'),
-            ({'settled': '1'}, 'incomplete, inactive or wrong-schema'),
-            ({'kind': '0'}, 'incomplete, inactive or wrong-schema'),
-            ({'hovered': '0'}, 'incomplete, inactive or wrong-schema'),
+            (1795, {'target.at': '67', 'target.kind': '68', 'target.name': 'Richter'}, 'not returning to the medal'),
+            (1794, {'target.at': 'none'}, 'not returning to the medal'),
+            (1795, {'carried': 'none'}, "local token ownership is 'held'"),
+            (1795, {'ack': '14', 'applied': '14'}, 'a tile step arrived'),
+            (1795, {'settled': '1'}, 'incomplete, inactive or wrong-schema'),
+            (1795, {'settled': '1', 'hovered': '0', 'settled.ack': '13'}, 'identity .* is incomplete'),
+            (1795, {'kind': '0'}, 'incomplete, inactive or wrong-schema'),
+            (1795, {'hovered': '0'}, 'incomplete, inactive or wrong-schema'),
         )
-        for change, reason in cases:
-            flying = l8w_tile(1795)
+        for rev, change, reason in cases:
+            flying = l8w_tile(rev)
             flying.values.update(change)
             with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, reason):
-                self.run_takeback([l8w_tile(1789), l8w_tile(1792), flying, l8w_tile(1801)])
+                self.run_takeback([l8w_tile(1789), l8w_tile(1792), flying, l8w_tile(1796)])
+
+    def test_takeback_rejects_a_settled_block_that_is_not_the_medal(self):
+        cases = (
+            ({'at': '1', 'hovered': '1', 'kind': '1', 'name': 'Donkey Kong', 'focus': 'css.grid.donkey'},
+             'did not settle on the medal tile'),
+            ({'kind': '68', 'name': 'Richter', 'focus': 'css.grid.richter'}, 'did not settle on the medal tile'),
+            ({'hovered': 'unknown'}, 'has not settled natively'),
+            ({'kind': 'unknown', 'name': 'unknown', 'form': 'unknown'}, 'identity .* is incomplete'),
+        )
+        for change, reason in cases:
+            landed = l8w_tile(1796)
+            landed.values.update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, reason):
+                self.run_takeback([l8w_tile(1789), l8w_tile(1792), l8w_tile(1795), landed])
 
     def test_takeback_still_rejects_a_flying_block_before_the_press(self):
         for tiles in ([l8w_tile(1795)], [l8w_tile(1789), l8w_tile(1795)]):
