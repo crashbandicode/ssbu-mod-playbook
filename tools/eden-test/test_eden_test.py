@@ -218,8 +218,12 @@ class VolatilePinsTests(unittest.TestCase):
                   'relative': 'old/plugins/plugin.nro',
                   'outside': str(self.root.parent / 'runs-other' / 'old' / 'plugin.nro'),
                   'folder': str(self.root / 'old'),
+                  'shared_folder': str(self.root / '_shared-inputs'),
+                  'own_folder': str(self.run),
+                  'root': str(self.root),
                   'normalized': str(self.root / 'old' / '..' / '_shared-inputs' / 'settings.json')}
-        self.assertEqual(eden_test.volatile_pins(config, self.run), [(self.pin, 'old'), (second, 'z-run')])
+        self.assertEqual(eden_test.volatile_pins(config, self.run),
+                         [(str(self.root / 'old'), 'old'), (self.pin, 'old'), (second, 'z-run')])
 
     def test_up_refuses_before_dry_run(self):
         with mock.patch.object(eden_test, 'sh') as sh:

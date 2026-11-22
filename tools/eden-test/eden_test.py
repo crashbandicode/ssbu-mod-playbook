@@ -251,7 +251,7 @@ def volatile_pins(config, run):
                 parts = Path(os.path.normpath(value)).relative_to(root).parts
             except ValueError:
                 return
-            if len(parts) >= 2 and parts[0] != run.name and not parts[0].startswith('_'):
+            if parts and parts[0] != run.name and not parts[0].startswith('_'):
                 found.add((value, parts[0]))
 
     walk(config)
