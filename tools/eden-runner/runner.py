@@ -206,6 +206,12 @@ def dotted(document, key):
     return value
 
 
+def row_role(row):
+    if 'role' in row:
+        return row['role']
+    return 'setup' if row['start'] != row['end'] else 'test'
+
+
 def load_hook(base, gate):
     spec = importlib.util.spec_from_file_location('gate_hook_' + Path(gate['module']).stem, base / gate['module'])
     module = importlib.util.module_from_spec(spec)
@@ -764,6 +770,8 @@ def dry_run(manifest_path):
     ids = set()
     rows = plan['rows']
     for index, row in enumerate(rows):
+        if 'role' in row and row['role'] not in ('setup', 'test'):
+            errors.append(f'row {row["id"]}: role {row["role"]!r} must be "setup" or "test"')
         if row['id'] in ids:
             errors.append(f'row {row["id"]}: duplicate id')
         ids.add(row['id'])
@@ -2569,7 +2577,8 @@ class Runner:
             self.last_gate_outcome = None
             self.effects_passed = []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
-                       'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
+                       'role': row_role(row), 'manifest_sha256': self.snapshot_manifest(),
+                       'started': time.time(), 'results': []}
             try:
                 self.session_start()
                 start_mark = self.session_mark('row-start', row['id'])

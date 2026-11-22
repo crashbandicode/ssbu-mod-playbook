@@ -283,6 +283,9 @@ The rules:
       <run>` does the lifecycle `down`, the harvest, a `RESULTS.md` skeleton
       of 20 lines or fewer (build, plugins, rows, the unit's exit result,
       prune, harvest, timing) and `timing.json`.
+      A row may set `"role": "setup"` or `"test"`; otherwise a screen-changing
+      row is setup and a same-screen row is test. The Timing line and
+      `timing.json` split harness and test seconds.
     - `all` does new, up, run and down in one go, for a batch you don't
       expect to fix mid-boot.
     - `--plugin <new build>` on `new` swaps the pinned plugin with that file

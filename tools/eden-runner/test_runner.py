@@ -68,6 +68,24 @@ class FakeEden:
         return {'ok': True, 'result': {}}
 
 
+class RowRoleTests(unittest.TestCase):
+    def test_default_and_explicit_roles(self):
+        self.assertEqual(runner.row_role({'start': 'menu', 'end': 'training'}), 'setup')
+        self.assertEqual(runner.row_role({'start': 'training', 'end': 'training'}), 'test')
+        self.assertEqual(runner.row_role({'start': 'menu', 'end': 'training', 'role': 'test'}), 'test')
+        self.assertEqual(runner.row_role({'start': 'training', 'end': 'training', 'role': 'setup'}), 'setup')
+
+    def test_dry_run_refuses_other_role(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'rows.json'
+            path.write_text(json.dumps({'start': 'menu', 'rows': [
+                {'id': 'r1', 'start': 'menu', 'end': 'menu', 'role': 'other', 'steps': [{'shot': 'x'}]}]}))
+            report = runner.dry_run(path)
+            self.assertEqual(report['result'], 'BROKEN')
+            self.assertIn('role', ' '.join(report['errors']))
+            self.assertIn('other', ' '.join(report['errors']))
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix='eden-runner-test-'))
@@ -134,10 +152,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('to-blue: file missing and no recipe', errors)
 
     def test_run_plays_records_gates_and_writes_receipts(self):
+        self.plan['rows'][1]['role'] = 'test'
+        self.manifest.write_text(json.dumps(self.plan))
         eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
         self.make(eden).run()
-        for row in ('r1', 'r2', 'r3'):
-            self.assertEqual(json.loads((self.dir / 'out' / f'{row}.json').read_text())['status'], 'PASS')
+        for row, role in (('r1', 'setup'), ('r2', 'test'), ('r3', 'setup')):
+            receipt = json.loads((self.dir / 'out' / f'{row}.json').read_text())
+            self.assertEqual(receipt['status'], 'PASS')
+            self.assertEqual(receipt['role'], role)
         saved = json.loads(self.manifest.read_text())['segments']['to-blue']
         self.assertEqual(saved['sha256'], sha(self.dir / 'segments' / 'to-blue.edenmacro.json'))
         self.assertIn('macro.record', eden.calls)

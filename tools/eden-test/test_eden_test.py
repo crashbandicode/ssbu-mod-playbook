@@ -140,6 +140,63 @@ class SetupFixtureTests(unittest.TestCase):
         self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}, self.rows), [])
 
 
+class TimeSplitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        (self.run / 'rows').mkdir()
+        (self.run / 'out').mkdir()
+        self.rows = [
+            {'id': 'setup', 'start': 'menu', 'end': 'training'},
+            {'id': 'test', 'start': 'training', 'end': 'training', 'role': 'setup'},
+            {'id': 'unfinished', 'start': 'training', 'end': 'training', 'role': 'setup'},
+        ]
+        (self.run / 'rows/rows.json').write_text(json.dumps(self.rows))
+        (self.run / 'timing.json').write_text(json.dumps(
+            {'up_start': 1, 'up_done': 11, 'runs': [[12, 62]], 'down_start': 70, 'down_done': 75}))
+        for name, receipt in (
+            ('setup', {'status': 'PASS', 'started': 10, 'ended': 18, 'role': 'setup'}),
+            ('test', {'status': 'PASS', 'started': 20, 'ended': 40}),
+            ('unfinished', {'status': 'FAILED', 'started': 50, 'role': 'setup'}),
+        ):
+            (self.run / 'out' / f'{name}.json').write_text(json.dumps(receipt))
+
+    def test_split_uses_receipts_fallback_and_skips_unfinished(self):
+        self.assertEqual(eden_test.time_split(self.run),
+                         {'up': 10, 'setup': 8, 'test': 20, 'between_rows': 22,
+                          'down': 5, 'harness': 45, 'test_share': 0.308})
+
+    def test_missing_timing_and_receipts_are_zero(self):
+        (self.run / 'timing.json').write_text('{}')
+        (self.run / 'rows/rows.json').write_text('[]')
+        self.assertEqual(eden_test.time_split(self.run),
+                         {'up': 0, 'setup': 0, 'test': 0, 'between_rows': 0,
+                          'down': 0, 'harness': 0, 'test_share': 0})
+
+    def test_receipt_role_overrides_the_row_default(self):
+        path = self.run / 'out/setup.json'
+        receipt = json.loads(path.read_text())
+        receipt['role'] = 'test'
+        path.write_text(json.dumps(receipt))
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test'], split['harness'], split['test_share']), (0, 28, 37, 0.431))
+
+    def test_partial_timing_and_between_rows_floor(self):
+        (self.run / 'timing.json').write_text(json.dumps(
+            {'up_start': 10, 'runs': [[30, 35]], 'down_done': 70}))
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['up'], split['down'], split['between_rows'], split['harness'], split['test_share']),
+                         (0, 0, 0, 8, 0.714))
+
+    def test_results_timing_line_includes_the_split(self):
+        config = {'label': 'fake', 'rows': {'sha256': sha(self.run / 'rows/rows.json')},
+                  'instances': [{'app': {'path': '/fake', 'sha256': '0' * 64}}]}
+        eden_test.results_md(self.run, config)
+        timing = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
+        self.assertIn('harness 45 s, test 20 s (30.8 %)', timing)
+
+
 class EdenTestTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix='eden-test-test-'))
@@ -254,6 +311,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertLessEqual(len(results.splitlines()), 20)
         timing = json.loads((run / 'timing.json').read_text())
         self.assertTrue({'new', 'up_start', 'up_done', 'run_start', 'run_end', 'down_start', 'down_done'} <= set(timing))
+        self.assertIn('split', timing)
         # Down hands the lifecycle the run's out/ for the files the run wrote, and RESULTS.md gives the prune's bytes.
         self.assertIn(f'--evidence-dir {run / "out"}', (run / 'lifecycle-down.log').read_text())
         self.assertEqual((run / 'out/post-run-a/run.log').read_text(), 'run bytes')

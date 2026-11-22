@@ -444,12 +444,41 @@ def prune_summary(run, journal):
             + (f'; {len(prune["skipped"])} skipped' if prune.get('skipped') else ''))
 
 
+def time_split(run):
+    timing_path = run / 'timing.json'
+    timing = json.loads(timing_path.read_text()) if timing_path.exists() else {}
+    runs = [(start, end) for start, end in timing.get('runs', []) if end]
+    rows_seconds = sum(end - start for start, end in runs) if runs else timing.get('run_end', 0) - timing.get('run_start', 0)
+    rows_path = run / 'rows' / 'rows.json'
+    spec = json.loads(rows_path.read_text()) if rows_path.exists() else []
+    rows = spec.get('rows', []) if isinstance(spec, dict) else spec
+    durations = {'setup': 0, 'test': 0}
+    for row in rows:
+        path = run / 'out' / f'{row["id"]}.json'
+        if not path.exists():
+            continue
+        receipt = json.loads(path.read_text())
+        if receipt.get('started') is None or receipt.get('ended') is None:
+            continue
+        role = receipt.get('role', 'setup' if row.get('start') != row.get('end') else 'test')
+        if role in durations:
+            durations[role] += receipt['ended'] - receipt['started']
+    up = timing['up_done'] - timing['up_start'] if 'up_done' in timing and 'up_start' in timing else 0
+    down = timing['down_done'] - timing['down_start'] if 'down_done' in timing and 'down_start' in timing else 0
+    between = max(0, rows_seconds - durations['setup'] - durations['test'])
+    harness = up + durations['setup'] + between + down
+    total = harness + durations['test']
+    return {'up': up, 'setup': durations['setup'], 'test': durations['test'], 'between_rows': between,
+            'down': down, 'harness': harness, 'test_share': round(durations['test'] / total, 3) if total else 0}
+
+
 def results_md(run, config):
     passed, failed, unrun, retained = row_accounting(run)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
     timing = json.loads((run / 'timing.json').read_text())
     runs = [(start, end) for start, end in timing.get('runs', []) if end]
     rows_seconds = sum(end - start for start, end in runs) if runs else timing.get('run_end', 0) - timing.get('run_start', 0)
+    split = timing.get('split') or time_split(run)
     rows_now = sha256(run / 'rows' / 'rows.json')
     rows_note = rows_now[:12] + '…' + ('' if rows_now == config['rows']['sha256'] else
                                        f' (changed during the boot; Up had {config["rows"]["sha256"][:12]}…)')
@@ -469,7 +498,8 @@ def results_md(run, config):
               one_line(f'- Prune: {prune_summary(run, journal)}', 240),
               f'- Harvest: {harvest_summary(run)}',
               f'- Timing: up {timing.get("up_done", 0) - timing.get("up_start", 0):.0f} s, rows {rows_seconds:.0f} s over '
-              f'{max(len(runs), 1)} run call(s), down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s',
+              f'{max(len(runs), 1)} run call(s), down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s; '
+              f'harness {split["harness"]:.0f} s, test {split["test"]:.0f} s ({split["test_share"] * 100:.1f} %)',
               '- Next: ']
     (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
     print('\n'.join(lines[:20]))
@@ -503,6 +533,10 @@ def cmd_down(run, keep_state=False):
     done = subprocess.run([sys.executable, '-B', '-I', str(HARVEST), str(run / 'rows' / 'rows.json'),
                            '--label', config['label'], '--out', str(run / 'out')], capture_output=True, text=True)
     (run / 'harvest.json').write_text(done.stdout.strip() + '\n')
+    timing_path = run / 'timing.json'
+    timing = json.loads(timing_path.read_text())
+    timing['split'] = time_split(run)
+    timing_path.write_text(json.dumps(timing, indent=2) + '\n')
     results_md(run, config)
     if code != 0:
         raise SystemExit(f'lifecycle down failed ({code}); the claim stays held; see {run / "lifecycle-down.log"}')
