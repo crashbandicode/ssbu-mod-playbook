@@ -60,7 +60,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
-| `drill_observe` `{attempts, cap, allow_stopped}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |
+| `drill_observe` `{attempts, cap, allow_stopped, count}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
 | `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded |
@@ -423,9 +423,9 @@ the static `row` title, into nested Rows screens. It stops before activating the
 Down must move the published cursor; in a Rows screen it must change the published `(action,row,row_id)` identity
 with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed.
 
-`routes:drill_observe(attempts, cap, allow_stopped=False)` counts Guard Edge release and terminal markers from
+`routes:drill_observe(attempts, cap, allow_stopped=False, count='terminals')` counts Guard Edge release and terminal markers from
 the trace, then checks `tr.menu.game.running`. It needs an armed records point targeting the
 `edge_juggle_attempt` symbol and a trace file on the instance. It rejects trace loss, unreadable records,
-point changes and bridge epoch changes. It also refuses nonzero boot-wide file-loss or point-drop counters at
-entry, since their timing relative to the byte-offset fence is unknown. Zoom results have no terminal marker and cannot be counted by this
-block. A stopped game fails unless `allow_stopped` is true. The block performs no inputs.
+point changes and bridge epoch changes. File-loss and point-drop counters are recorded at entry and exit and
+must remain unchanged; nonzero initial counts are allowed. Zoom results have no terminal marker: use
+`count='releases'` for Zoom. A stopped game fails unless `allow_stopped` is true. The block performs no inputs.

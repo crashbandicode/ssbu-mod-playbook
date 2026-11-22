@@ -2456,12 +2456,14 @@ def _tr_goto(ctx, page, path, targets, cap, metrics):
     })
 
 
-def drill_observe(ctx, attempts, cap, allow_stopped=False):
+def drill_observe(ctx, attempts, cap, allow_stopped=False, count='terminals'):
     if type(attempts) is not int or attempts <= 0 or type(cap) not in (int, float) or not 0 < cap < float('inf'):
         raise RuntimeError('drill observation needs positive attempts and cap')
     if type(allow_stopped) is not bool:
         raise RuntimeError('allow_stopped must be a boolean')
-    return _with_setup_metrics(ctx, lambda metrics: _drill_observe(ctx, attempts, cap, allow_stopped, metrics))
+    if count not in ('terminals', 'releases'):
+        raise RuntimeError('drill observation count must be terminals or releases')
+    return _with_setup_metrics(ctx, lambda metrics: _drill_observe(ctx, attempts, cap, allow_stopped, count, metrics))
 
 
 def _attempt_trace_status(ctx, path):
@@ -2486,7 +2488,7 @@ def _attempt_trace_status(ctx, path):
     return point, baseline_loss, identity
 
 
-def _drill_observe(ctx, attempts, cap, allow_stopped, metrics):
+def _drill_observe(ctx, attempts, cap, allow_stopped, count, metrics):
     started = time.monotonic()
     until = started + cap
     path = ctx.instance.get('trace_jsonl')
@@ -2495,8 +2497,6 @@ def _drill_observe(ctx, attempts, cap, allow_stopped, metrics):
     stream = trace_attempts.Stream(path, '')
     trace_identity = _attempt_trace_status(ctx, path)
     point, loss, identity = trace_identity
-    if loss != (0, 0):
-        raise RuntimeError('attempt trace loss counters are nonzero at observation start')
     stream.point = point
     if _attempt_trace_status(ctx, path) != trace_identity:
         raise RuntimeError('attempt trace loss or output changed')
@@ -2514,29 +2514,37 @@ def _drill_observe(ctx, attempts, cap, allow_stopped, metrics):
             if terminal:
                 counts[terminal] = counts.get(terminal, 0) + 1
 
+    def reached():
+        return (sum(mark['event'] == 0 for mark in marks) if count == 'releases' else sum(counts.values()))
+
     while time.monotonic() < until:
         ctx.check_stop()
         collect()
-        if sum(counts.values()) >= attempts:
+        if reached() >= attempts:
             break
         time.sleep(min(.05, max(0, until - time.monotonic())))
-    if sum(counts.values()) < attempts:
-        raise RuntimeError(f'{sum(counts.values())} terminals observed before deadline; wanted {attempts}')
+    if reached() < attempts:
+        raise RuntimeError(f'{reached()} {count} observed before deadline; wanted {attempts}')
     final = _tr_current(io, until)
     native_picker.same_epoch(baseline, final, in_flight=True)
     running = final.values.get('game.running')
     if running not in ('0', '1'):
         raise RuntimeError('drill running state is missing')
-    if _attempt_trace_status(ctx, path) != trace_identity:
-        raise RuntimeError('attempt trace loss or output changed')
     collect()
+    end_trace_identity = _attempt_trace_status(ctx, path)
+    if end_trace_identity != trace_identity:
+        raise RuntimeError('attempt trace loss or output changed')
     if time.monotonic() >= until:
-        raise RuntimeError(f'{sum(counts.values())} terminals observed but drill observation deadline expired')
+        raise RuntimeError(f'{reached()} {count} observed but drill observation deadline expired')
     elapsed = round((time.monotonic() - started) * 1000)
     receipt = _save(ctx, 'routes-drill-observe', {
-        'block': 'drill_observe', 'args': {'attempts': attempts, 'cap': cap, 'allow_stopped': allow_stopped},
+        'block': 'drill_observe', 'args': {'attempts': attempts, 'cap': cap,
+                                           'allow_stopped': allow_stopped, 'count': count},
         'verified': {'game': final.values.get('game'), 'running': running,
                      'releases': sum(mark['event'] == 0 for mark in marks), 'terminals': counts,
+                     'trace_loss_start': {'file_lost': loss[0], 'point_dropped': loss[1]},
+                     'trace_loss_end': {'file_lost': end_trace_identity[1][0],
+                                        'point_dropped': end_trace_identity[1][1]},
                      'first_sequence': marks[0]['sequence'], 'last_sequence': marks[-1]['sequence'],
                      'first_frame': marks[0]['frame'], 'last_frame': marks[-1]['frame']},
         **metrics, 'ms': {'observe': elapsed, 'total': elapsed}, 'skipped': [],
