@@ -87,6 +87,111 @@ class PickerTests(unittest.TestCase):
     def run_pick(self, replay, *, target=TARGET, topology=GRAPH):
         return picker.pick(replay, 'css', target, topology=topology, cap=.01)
 
+    @staticmethod
+    def training_step(rev, *, ack=11, applied=11, source='78', dest='67', settled=False):
+        unknown = picker.Target('unknown', 'unknown', 'unknown')
+        state = tile(rev, at='67', target=unknown, ack=ack, applied=applied, settled=settled,
+                     direction='up', source=source, dest=dest, seat='0')
+        state.values.update({'layout': 'css.9f1fb03bf7c98fb9', 'focus': 'unknown', 'hovered': 'unknown',
+                             'settled.ack': 'unknown'})
+        return state
+
+    @staticmethod
+    def training_before(rev=540):
+        state = tile(rev, at='78', target=picker.Target('88', 'Steve', 'default'), ack=10, seat='0')
+        state.values.update({'layout': 'css.9f1fb03bf7c98fb9', 'focus': 'css.grid.pickel'})
+        return state
+
+    @staticmethod
+    def training_settled():
+        state = tile(551, at='67', target=picker.Target('68', 'Richter', 'default'), ack=11, seat='0',
+                     direction='up', source='78', dest='67')
+        state.values.update({'layout': 'css.9f1fb03bf7c98fb9', 'focus': 'css.grid.richter'})
+        return state
+
+    def training_move(self, replay, cap=.02):
+        ui = native(540, screen='css.training', **{'screen.context': 'training'})
+        return picker.move(replay, 'css', self.training_before(), ui, '78', 'up', '67',
+                           picker.Target('68', 'Richter', 'default'), cap, expected_context='training')
+
+    def test_training_step_waits_for_the_exact_outstanding_settlement(self):
+        replay = Replay([self.training_step(543), self.training_step(548), self.training_settled()],
+                        [native(551, screen='css.training', **{'screen.context': 'training'})])
+        latest, _ = self.training_move(replay)
+        self.assertEqual((latest.block['rev'], latest.values['name'], latest.values['settled.ack']),
+                         (551, 'Richter', '11'))
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_hover_continues_to_mario_after_the_training_midstep(self):
+        richter = picker.Target('68', 'Richter', 'default')
+        topology = picker.Topology(
+            layout='css.9f1fb03bf7c98fb9',
+            neighbors={'78': {'up': '67'}, '67': {'down': '12'}},
+            targets={'78': picker.Target('88', 'Steve', 'default'), '67': richter, '12': OTHER},
+        )
+        richter_idle = self.training_settled()
+        richter_idle.block['rev'] = 552
+        richter_idle.values.update({'rev': '552', 'observation': '552'})
+        mario_step = self.training_step(553, ack=12, applied=12, source='67', dest='12')
+        mario_step.values.update({'direction': 'down', 'at': '12'})
+        mario = tile(556, at='12', target=OTHER, ack=12, seat='0', direction='down', source='67', dest='12')
+        mario.values.update({'layout': topology.layout, 'focus': 'css.grid.mario'})
+        native_blocks = [native(rev, screen='css.training', **{'screen.context': 'training'})
+                         for rev in range(1, 6)]
+        replay = Replay([self.training_before(539), self.training_before(), self.training_step(543),
+                         self.training_step(548), self.training_settled(), richter_idle, mario_step, mario],
+                        native_blocks)
+        latest, _, target = picker.hover(replay, 'css', OTHER, topology=topology, cap=.1,
+                                        expected_context='training')
+        self.assertEqual((latest.values['name'], target), ('Mario', OTHER))
+        self.assertEqual(replay.actions, ['tile-up', 'tile-down'])
+
+    def test_unsettled_unknown_without_outstanding_ack_fails(self):
+        sample = self.training_step(543, ack=10, applied=10)
+        sample.values['at'] = '78'
+        replay = Replay([sample])
+        with self.assertRaisesRegex(RuntimeError, '^unsettled tile observation without the outstanding step$'):
+            self.training_move(replay)
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_unsettled_unknown_with_wrong_step_fails(self):
+        replay = Replay([self.training_step(543, source='0', dest='1')])
+        with self.assertRaisesRegex(RuntimeError, 'wrong step:'):
+            self.training_move(replay)
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_settled_unknown_focus_still_fails(self):
+        replay = Replay([self.training_step(543, settled=True)])
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
+            self.training_move(replay)
+        self.assertEqual(replay.actions, ['tile-up'])
+
+    def test_baseline_rejects_unknown_midstep(self):
+        replay = Replay([self.training_step(543)],
+                        [native(540, screen='css.training', **{'screen.context': 'training'})])
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
+            picker.baseline(replay, 'css', cap=.02, expected_context='training')
+        self.assertEqual(replay.actions, [])
+
+    def test_unsettled_or_older_sample_never_completes_the_step(self):
+        class RepeatingReplay(Replay):
+            def __init__(self, samples):
+                super().__init__(samples)
+                self.last = samples[-1]
+
+            def read(self, provider, cap):
+                try:
+                    return super().read(provider, cap)
+                except RuntimeError:
+                    return self.last
+
+        for samples in ([self.training_step(548)], [self.training_step(548), self.training_step(543)]):
+            with self.subTest(revisions=[sample.block['rev'] for sample in samples]):
+                replay = RepeatingReplay(samples)
+                with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
+                    self.training_move(replay)
+                self.assertEqual(replay.actions, ['tile-up'])
+
     def test_irregular_grid_and_native_settlement(self):
         replay = Replay([
             tile(1), tile(2),

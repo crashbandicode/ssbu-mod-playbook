@@ -77,7 +77,7 @@ def number(state, key):
     return int(text)
 
 
-def check_sample(state, provider, *, loading_ui=False, pending_placement=False, entering_stage=False):
+def check_sample(state, provider, *, loading_ui=False, pending_placement=False, entering_stage=False, stepping=False):
     block, values = state.block, state.values
     active = values.get('observation.active') == ACTIVE[provider]
     loading = loading_ui and provider == UI and values.get('observation.active') == 'no'
@@ -89,12 +89,14 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
     entering = (entering_stage and provider == TILE and focus == 'unknown'
                 and values.get('screen') == 'sss' and values.get('settled') == '0'
                 and values.get('layout') == values.get('hovered') == 'unknown')
+    step = (stepping and provider == TILE and focus == 'unknown'
+            and values.get('settled') == '0' and values.get('hovered') == 'unknown')
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
             or any(values.get(key) != str(block[key]) for key in ('schema', 'boot', 'rev'))
             or (number(state, 'observation') == 0 and not empty_boot)
-            or not (loading or (active and (focus not in ABSENT or placing or entering)))):
+            or not (loading or (active and (focus not in ABSENT or placing or entering or step)))):
         raise RuntimeError(f'{provider}: incomplete, inactive or wrong-schema observation')
     return state
 
@@ -107,11 +109,11 @@ def same_epoch(previous, current, *, in_flight):
 
 
 def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=False,
-                pending_placement=False):
+                pending_placement=False, stepping=False):
     settling = loading_ui and provider == UI and after is not None
     while time.monotonic() < until:
         state = check_sample(io.read(provider, until - time.monotonic()), provider,
-                             loading_ui=settling, pending_placement=pending_placement)
+                             loading_ui=settling, pending_placement=pending_placement, stepping=stepping)
         if after is None:
             return state
         same_epoch(after, state, in_flight=in_flight or settling)
@@ -302,11 +304,13 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, exp
     prior_applied = number(before, 'applied')
     latest = before
     while True:
-        latest = wait_sample(io, TILE, until, latest, in_flight=True)
+        latest = wait_sample(io, TILE, until, latest, in_flight=True, stepping=True)
         check_context(before, latest, screen)
         token_held(latest, screen)
         values = latest.values
         ack, applied = number(latest, 'ack'), number(latest, 'applied')
+        if values.get('focus') == 'unknown' and (ack, applied) != (prior_ack + 1, prior_applied + 1):
+            raise RuntimeError('unsettled tile observation without the outstanding step')
         if ack == prior_ack and applied == prior_applied and values.get('at') == at:
             continue
         if ack != prior_ack + 1 or applied != prior_applied + 1:
