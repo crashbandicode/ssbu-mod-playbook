@@ -427,5 +427,167 @@ class WizardTests(OpenCloseTests):
         self.assertEqual(io.menu['row'], 'Set up…')
 
 
+class SetIO(MenuIO):
+    def __init__(self, ctx, kind, row_id, before, *, fault=None):
+        super().__init__(ctx, page='cpu', fault=fault)
+        self.kind = kind
+        self.row_id = row_id
+        self.stored = {row_id: list(before)}
+        self.menu.update({'action': row_id, 'row_id': row_id, 'row': row_id,
+                          'editor': '', 'editor.sel': '-1', 'editor.sel_key': ''})
+
+    def send(self, segment):
+        if segment == 'tr-menu-open' or segment == 'tap-b1' and self.menu['depth'] == '0':
+            return super().send(segment)
+        self.actions.append(segment)
+        if self.ctx.runner.setup_metrics is not None:
+            self.ctx.runner.setup_metrics['inputs'] += 1
+        if self.fault != 'no_ack':
+            self.menu['ack'] = str(int(self.menu['ack']) + 1)
+        if segment == 'tap-a1' and self.menu['depth'] == '0':
+            if self.kind == 'toggle':
+                self.stored[self.row_id] = list(reversed(self.stored[self.row_id]))
+            else:
+                self.menu['depth'] = '1'
+                self.menu['editor.sel'] = str(self.stored[self.row_id].index(1)
+                                              if self.kind == 'list' else 0)
+        elif segment in ('main-menu-down', 'main-menu-up'):
+            delta = 1 if segment.endswith('down') else -1
+            cursor = (int(self.menu['editor.sel']) + delta) % len(self.stored[self.row_id])
+            self.menu['editor.sel'] = str(cursor)
+        elif segment == 'tap-a1':
+            cursor = int(self.menu['editor.sel'])
+            if self.kind == 'list':
+                self.stored[self.row_id] = [int(index == cursor) for index in range(len(self.stored[self.row_id]))]
+                self.menu['depth'] = '0'
+                self.menu['editor.sel'] = '-1'
+            else:
+                self.stored[self.row_id][cursor] ^= 1
+        elif segment == 'tap-b1':
+            self.menu['depth'] = '0'
+            self.menu['editor.sel'] = '-1'
+        else:
+            raise AssertionError(segment)
+
+
+class PracticeSetIO(RowsIO):
+    def __init__(self, ctx, *, fault=None):
+        super().__init__(ctx, fault=fault)
+        self.menu.update({'open': '0', 'editor': '', 'editor.sel': '-1', 'editor.sel_key': ''})
+        self.stored = {'edge_difficulty': [1, 0, 0], 'edge_cpu_fighter': [1] + [0] * len(routes.tables()['roster_catalog']),
+                       'edge_cpu_level': [0] * 8 + [1]}
+        self.editor = False
+        self.popup = False
+        self.cell = 0
+
+    def send(self, segment):
+        if self.menu['open'] == '0' or not self.editor and not (
+                segment == 'tap-a1' and self.menu['depth'] == '1' and self.menu['action'] == 'edge_difficulty'):
+            result = super().send(segment)
+            if segment == 'tap-b1' and self.menu['open'] == '1':
+                self.update_focus()
+            return result
+        self.actions.append(segment)
+        if self.ctx.runner.setup_metrics is not None:
+            self.ctx.runner.setup_metrics['inputs'] += 1
+        if self.fault != 'no_ack':
+            self.menu['ack'] = str(int(self.menu['ack']) + 1)
+        if not self.editor:
+            self.editor = True
+            self.menu.update({'depth': '2', 'group': '-1', 'editor': 'PracticeCpu(GuardEdge)',
+                              'editor.sel': '0', 'editor.sel_key': ''})
+        elif not self.popup and segment.startswith('main-menu-'):
+            self.cell = routes.tr_grid_step(self.cell, segment.removeprefix('main-menu-'))
+            self.menu['editor.sel'] = str(self.cell)
+        elif not self.popup and segment == 'tap-a1':
+            self.popup = True
+            self.stored['edge_cpu_fighter'] = [0, 1] + [0] * (len(routes.tables()['roster_catalog']) - 1)
+            self.menu.update({'editor.sel': '0', 'editor.sel_key': 'CPU 9'})
+        elif self.popup and segment == 'main-menu-down':
+            choice = (int(self.menu['editor.sel']) + 1) % 2
+            self.stored['edge_difficulty'] = [int(i == choice) for i in range(3)]
+            self.menu.update({'editor.sel': str(choice), 'editor.sel_key': 'Perfect' if choice else 'CPU 9'})
+        elif self.popup and segment == 'tap-b1':
+            self.popup = False
+            self.menu.update({'editor.sel': str(self.cell), 'editor.sel_key': ''})
+        elif not self.popup and segment == 'tap-b1':
+            self.editor = False
+            self.menu.update({'depth': '1', 'editor': '', 'editor.sel': '-1', 'editor.sel_key': ''})
+            self.update_focus()
+        else:
+            raise AssertionError(segment)
+
+
+class SetTests(OpenCloseTests):
+    def run_set(self, io, kind, value, *, missing_writer=False, final=None, path=None):
+        reads = []
+
+        def fetch(ctx, cap=20):
+            data = final if reads and final is not None else io.stored
+            reads.append(dict(data))
+            return json.dumps({'menu': data}).encode()
+
+        def writer(ctx, cursor, until):
+            if missing_writer:
+                raise RuntimeError('settings writer missing')
+            return '[TrainingRooms] settings.json written by the writer thread'
+
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings', side_effect=fetch),
+              patch.object(routes, '_wait_writer', side_effect=writer) as waited,
+              patch.object(routes, 'instance_path', return_value=Path(self.ctx.row_dir) / 'bridge.log'),
+              patch.object(routes, 'LogCursor', return_value=object()) as cursor):
+            result = routes.tr_set(self.ctx, page=io.menu['page'], path=path or [io.menu['row_id']],
+                                   kind=kind, value=value, cap=1)
+        return result, waited.call_count, cursor.call_count, reads
+
+    def test_already_stored_skips_change_and_writer_and_rereads(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [1, 0])
+        result, writers, cursors, reads = self.run_set(io, 'toggle', [1, 0])
+        self.assertEqual(result['skipped'], ['change', 'writer'])
+        self.assertEqual((writers, cursors, len(reads)), (0, 0, 2))
+        self.assertEqual(io.actions, ['tr-menu-open', 'tap-b1'])
+        self.assertEqual(result['verified']['before'], result['verified']['after'])
+
+    def test_changed_toggle_list_and_checklist_require_writer(self):
+        for kind, row, before, target in (('toggle', 'lra_reset', [0, 1], [1, 0]),
+                                           ('list', 'sdi_strength', [1, 0, 0], [0, 0, 1]),
+                                           ('checklist', 'mash_state', [1, 0, 0], [0, 1, 1])):
+            with self.subTest(kind=kind):
+                io = SetIO(self.ctx, kind, row, before)
+                result, writers, cursors, reads = self.run_set(io, kind, target)
+                self.assertEqual((writers, cursors, len(reads)), (1, 1, 2))
+                self.assertEqual(result['verified']['after'], target)
+                io = SetIO(self.ctx, kind, row, before)
+                with self.assertRaisesRegex(RuntimeError, 'writer'):
+                    self.run_set(io, kind, target, missing_writer=True)
+
+    def test_readback_change_and_wrong_kind_fail(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [1, 0])
+        with self.assertRaisesRegex(RuntimeError, 'read.back|settings'):
+            self.run_set(io, 'toggle', [1, 0], final={'lra_reset': [0, 1]})
+        for kind in ('list', 'checklist'):
+            io = SetIO(self.ctx, 'toggle', 'lra_reset', [1, 0])
+            with self.assertRaisesRegex(RuntimeError, 'kind'):
+                self.run_set(io, kind, [1, 0])
+
+    def test_ack_and_epoch_failure_do_not_pass(self):
+        for fault, message in (('no_ack', 'not handled'), ('epoch', 'connection')):
+            with self.subTest(fault=fault):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1], fault=fault)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.run_set(io, 'toggle', [1, 0])
+
+    def test_practice_cpu_fighter_mode_and_level_are_read_back(self):
+        io = PracticeSetIO(self.ctx)
+        result, writers, _, _ = self.run_set(io, 'practice_cpu',
+                                             {'fighter': 'Mario', 'mode': 'Perfect', 'level': 9},
+                                             path=['game.6', 'edge_difficulty'])
+        self.assertEqual(writers, 1)
+        self.assertEqual(result['verified']['after']['edge_difficulty'], [0, 1, 0])
+        self.assertEqual(result['verified']['after']['edge_cpu_fighter'][1], 1)
+        self.assertEqual(result['verified']['mode'], 'Perfect')
+
+
 if __name__ == '__main__':
     unittest.main()
