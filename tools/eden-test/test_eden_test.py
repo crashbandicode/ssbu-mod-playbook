@@ -1024,5 +1024,166 @@ class EdenTestTests(unittest.TestCase):
         self.assertIsNone(eden_test.restore_up_config(run))  # nothing to do the second time
 
 
+FLOWN = Path('/home/intpa/smash-training-lobby/artifacts/phase23/test-setup-speed/blocks')
+
+
+class ReportTests(unittest.TestCase):
+    """`report`: per row PASS / FAIL / NOT RUN with the reason and the proof, read from the run folder only."""
+
+    def setUp(self):
+        self.run = Path(tempfile.mkdtemp(prefix='eden-test-report-'))
+        self.addCleanup(shutil.rmtree, self.run)
+        out = self.run / 'out'
+        (self.run / 'rows').mkdir()
+        (out / 'r1').mkdir(parents=True)
+        (self.run / 'state').mkdir()
+        rows = [{'id': f'r{i}', 'start': 't', 'end': 't', 'steps': [{'run': f'routes:block{i}'}]} for i in range(4)]
+        (self.run / 'rows/rows.json').write_text(json.dumps({'rows': rows}))
+        line = '[Bridge] roster entry=1 kind=83 nana=false ev=106 frame=2595 wall=379783903'
+        (out / 'r0.json').write_text(json.dumps({
+            'id': 'r0', 'status': 'PASS', 'started': 10, 'ended': 12, 'role': 'setup',
+            'results': [{'run': 'routes:block0', 'value': {'block': 'block0', 'verified': {'kind': 83}, 'line': line}}]}))
+        (out / 'r1/shot-FAIL.png').write_bytes(b'png!')
+        (out / 'r1.json').write_text(json.dumps({
+            'id': 'r1', 'status': 'FAILED', 'started': 12, 'ended': 13, 'role': 'test', 'results': [],
+            'error': "RuntimeError('[Bridge] req set result=refused reason=no_backup frame=2627 wall=379784461')",
+            'evidence_paths': ['/home/intpa/eden-runs/x/out/r1/shot-FAIL.png']}))
+        (out / 'r3.json').write_text(json.dumps({'id': 'r3', 'status': 'RAN-UNVERIFIED', 'started': 13, 'ended': 14,
+                                                 'results': []}))
+        (out / 'attempts.jsonl').write_text(''.join(json.dumps({'id': i, 'status': s}) + '\n' for i, s in (
+            ('r0', 'FAILED'), ('r0', 'PASS'), ('r1', 'FAILED'), ('r3', 'RAN-UNVERIFIED'))))
+        profile = self.run / 'work/profiles/profile-a'
+        plugins = profile / eden_test.PLUGINS
+        plugins.mkdir(parents=True)
+        (plugins / 'libx.nro').write_bytes(b'the build under test')
+        (plugins / 'stray.nro').write_bytes(b'not pinned')
+        (self.run / 'state/instances.json').write_text(json.dumps({'a': {'profile': str(profile)}}))
+        self.pin = hashlib.sha256(b'the build under test').hexdigest()
+        self.config = {'label': 'lab-1', 'host': 'yoga',
+                       'instances': [{'key': 'a', 'plugins': [{'name': 'libx.nro', 'path': '/in/libx.nro',
+                                                               'sha256': self.pin}]}]}
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+        (self.run / 'timing.json').write_text(json.dumps({'up_start': 1, 'up_done': 9, 'run_start': 10, 'run_end': 14}))
+
+    def rows_of(self, text):
+        return {line.split('|')[1].strip(): line for line in text.splitlines() if line.startswith('| r')}
+
+    def test_each_row_is_pass_fail_or_not_run_with_reason_and_proof(self):
+        text = eden_test.report_md(self.run)
+        rows = self.rows_of(text)
+        self.assertEqual(sorted(rows), ['r0', 'r1', 'r2', 'r3'])
+        self.assertIn('| PASS |', rows['r0'])
+        self.assertIn('kind', rows['r0'])                         # the reason: what the block verified
+        self.assertIn('roster entry=1 kind=83', rows['r0'])       # the proof: the raw line in the receipt
+        self.assertIn('earlier attempts: FAILED', rows['r0'])     # a pass after a failed attempt says so
+        self.assertIn('| FAIL |', rows['r1'])
+        self.assertIn('reason=no_backup frame=2627', rows['r1'])
+        self.assertIn('out/r1/shot-FAIL.png (4 bytes)', rows['r1'])
+        self.assertIn('| NOT RUN |', rows['r2'])
+        self.assertIn('| FAIL |', rows['r3'])                     # ran but unverified is never a PASS
+        self.assertIn('RAN-UNVERIFIED', rows['r3'])
+        for row in ('r1', 'r2', 'r3'):
+            self.assertNotIn('PASS', rows[row])
+        self.assertIn('1 PASS, 2 FAIL, 1 NOT RUN of 4', text)
+
+    def test_the_nro_hashes_at_the_top_are_of_the_files_in_the_profile(self):
+        top = eden_test.report_md(self.run).split('| Row |')[0]
+        self.assertIn(f'libx.nro `{self.pin}` in the profile; matches the config pin', top)
+        stray = hashlib.sha256(b'not pinned').hexdigest()
+        self.assertIn(f'stray.nro `{stray}` in the profile; NOT in the config', top)
+        (self.run / 'work/profiles/profile-a' / eden_test.PLUGINS / 'libx.nro').write_bytes(b'another build')
+        top = eden_test.report_md(self.run).split('| Row |')[0]
+        self.assertIn('DIFFERS from the config pin', top)
+
+    def test_a_pruned_profile_is_said_and_the_pins_are_shown_as_pins(self):
+        shutil.rmtree(self.run / 'work')
+        top = eden_test.report_md(self.run).split('| Row |')[0]
+        self.assertIn(f'libx.nro `{self.pin}` as pinned in config.json (the profile is gone', top)
+
+    def test_up_or_down_is_read_from_the_run_and_the_next_commands_are_printed(self):
+        text = eden_test.report_md(self.run)
+        self.assertIn('EDEN UP on yoga', text)
+        self.assertIn(f'run {self.run} --rows <id>', text)
+        self.assertIn(f'down {self.run}', text)
+        timing = json.loads((self.run / 'timing.json').read_text())
+        (self.run / 'timing.json').write_text(json.dumps(dict(timing, down_start=20, down_done=30)))
+        (self.run / 'state/lifecycle.json').write_text(json.dumps({'released': True, 'cleanup_failures': []}))
+        text = eden_test.report_md(self.run)
+        self.assertNotIn('EDEN UP', text)
+        self.assertIn('DOWN', text)
+        self.assertIn('released=True', text)
+
+    def test_report_command_writes_the_file(self):
+        self.assertEqual(eden_test.main(['report', str(self.run)]), 0)
+        self.assertIn('1 PASS, 2 FAIL, 1 NOT RUN of 4', (self.run / 'REPORT.md').read_text())
+
+    @unittest.skipUnless((FLOWN / 'proof-tss-blocks-83ee-1/yoga/out').is_dir(), 'flown run -1 not on this machine')
+    def test_flown_run_1_whose_runner_crashed_never_shows_r01_as_pass(self):
+        rows = self.rows_of(eden_test.report_md(FLOWN / 'proof-tss-blocks-83ee-1/yoga'))
+        self.assertIn('| PASS |', rows['r00'])
+        self.assertIn('| NOT RUN |', rows['r01'])  # its blocks ran, but the runner crashed before the row receipt
+        self.assertEqual([r for r, line in rows.items() if 'PASS' in line], ['r00'])
+
+    @unittest.skipUnless((FLOWN / 'proof-tss-blocks-83ee-2/yoga/out').is_dir(), 'flown run -2 not on this machine')
+    def test_flown_run_2_shows_three_passes_the_refusal_and_fifteen_unrun(self):
+        text = eden_test.report_md(FLOWN / 'proof-tss-blocks-83ee-2/yoga')
+        rows = self.rows_of(text)
+        self.assertEqual([r for r, line in rows.items() if '| PASS |' in line], ['r00', 'r01', 'r02'])
+        self.assertIn('| FAIL |', rows['r03'])
+        self.assertIn('req set result=refused reason=no_backup frame=2627 wall=379784461', rows['r03'])
+        self.assertEqual(sum('| NOT RUN |' in line for line in rows.values()), 15)
+        self.assertIn('3 PASS, 1 FAIL, 15 NOT RUN of 19', text)
+        self.assertIn('DOWN', text)
+
+
+class RerunTests(unittest.TestCase):
+    def setUp(self):
+        self.run = Path(tempfile.mkdtemp(prefix='eden-test-rerun-'))
+        self.addCleanup(shutil.rmtree, self.run)
+        (self.run / 'out/r1').mkdir(parents=True)
+        (self.run / 'out/r1/sub.json').write_text('{}')
+        (self.run / 'out/r1.json').write_text(json.dumps({'id': 'r1', 'status': 'PASS'}))
+        (self.run / 'out/STOP-INPUT').write_text('r0')
+
+    def test_named_rows_are_set_aside_so_a_passed_row_runs_again(self):
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, mock.patch.object(eden_test, 'cmd_pace'):
+            eden_test.cmd_run(self.run, rows='r1,r9')
+        argv = sh.call_args[0][0]
+        self.assertEqual(argv[argv.index('--rows') + 1], 'r1,r9')
+        out = self.run / 'out'
+        self.assertFalse((out / 'r1.json').exists())
+        self.assertEqual(json.loads((out / 'r1.rerun-1.json').read_text())['status'], 'PASS')
+        self.assertTrue((out / 'r1.rerun-1/sub.json').exists())
+        self.assertFalse((out / 'STOP-INPUT').exists())  # a named re-run is a retry
+        (out / 'r1.json').write_text(json.dumps({'id': 'r1', 'status': 'FAILED'}))
+        with mock.patch.object(eden_test, 'sh', return_value=0), mock.patch.object(eden_test, 'cmd_pace'):
+            eden_test.cmd_run(self.run, rows='r1')
+        self.assertEqual(json.loads((out / 'r1.rerun-2.json').read_text())['status'], 'FAILED')
+
+    def test_a_plain_run_sets_nothing_aside(self):
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, mock.patch.object(eden_test, 'cmd_pace'):
+            eden_test.cmd_run(self.run)
+        self.assertNotIn('--rows', sh.call_args[0][0])
+        self.assertTrue((self.run / 'out/r1.json').exists())
+
+    def test_down_stops_only_this_runs_bridge_capture(self):
+        import subprocess
+        import time
+        folder = self.run / 'out/bridge-run'
+        folder.mkdir()
+        script = self.run / 'fake_capture.py'
+        script.write_text('import time\ntime.sleep(60)\n')
+        mine = subprocess.Popen([sys.executable, str(script), 'capture-bridge', str(folder)])
+        other = subprocess.Popen([sys.executable, str(script), 'something-else', str(folder)])
+        self.addCleanup(lambda: [p.kill() for p in (mine, other) if p.poll() is None])
+        (folder / 'capture.json').write_text(json.dumps({'pid': other.pid}))
+        self.assertFalse(eden_test.stop_capture(self.run)['stopped'])  # not a capture of this run: left alone
+        self.assertIsNone(other.poll())
+        (folder / 'capture.json').write_text(json.dumps({'pid': mine.pid}))
+        self.assertTrue(eden_test.stop_capture(self.run)['stopped'])
+        mine.wait(timeout=10)
+        time.sleep(0.1)
+        self.assertFalse(eden_test.stop_capture(self.run)['stopped'])  # already gone
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
