@@ -6,23 +6,6 @@
   "gates": {
     "loaded": {"library": "loaded"}
   },
-  "setup": [
-    {
-      "state": "reviewed TrainingRooms settings at boot",
-      "via": "fixture",
-      "ref": "inputs/practice-settings.json",
-      "to": "user/sdmc/ultimate/TrainingRooms/settings.json",
-      "reviewed": {
-        "path": "../inputs/practice-settings.json",
-        "sha256": "cedf5b77a13625ffb327fbba79e59d2fd800d229b544464f523fb85d7c79edd6"
-      }
-    },
-    {
-      "state": "P1 Mario on Final Destination in Training",
-      "via": "hook",
-      "ref": "routes:reach_training"
-    }
-  ],
   "rows": [
     {
       "id": "r00",
