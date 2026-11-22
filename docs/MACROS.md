@@ -358,7 +358,8 @@ The rules:
     source for each selected instance and refuse missing or invalid files,
     wrong hashes or differences outside those paths. Direct `lifecycle.py up`
     and `runner.py dry-run` do not run this check. Paths are compared by
-    component; write a key that contains a dot as a list entry.
+    component; write a key that contains a dot as a list entry. An entry
+    must name at least one key.
 14. **Press a chord in one frame.** A plugin that reads a button combination
     (a menu chord such as `B`+`Up`, a shortcut such as `ZL`+`Left`, the
     `L`+`R`+`A` start) sees it only when every button goes down in the same

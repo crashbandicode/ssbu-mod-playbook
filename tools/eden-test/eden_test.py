@@ -223,6 +223,9 @@ def fixture_comparison(item, base, config):
         allowed = []
     allowed = [[int(part) if part.isdecimal() else part for part in path.split('.')]
                if isinstance(path, str) else path for path in allowed]
+    if any(not path or any(part == '' for part in path) for path in allowed):
+        problems.append(f'{state}: differs_only entries must name at least one key')
+        allowed = [path for path in allowed if path and all(part != '' for part in path)]
     missing = object()
     reviewed_value = missing
     if not isinstance(reviewed, dict) or not reviewed.get('path'):

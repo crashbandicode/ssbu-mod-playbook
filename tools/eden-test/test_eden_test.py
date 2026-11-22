@@ -119,6 +119,31 @@ class SetupFixtureTests(unittest.TestCase):
                 problems, _ = self.comparison({'menu': 1}, {'menu': 2}, allowed)
                 self.assertIn('differs_only', ' '.join(problems))
 
+    def test_empty_allowance_entries_are_refused_and_authorise_nothing(self):
+        reviewed = {'cpu': 'Mario', 'menu': {'setting': 1}}
+        pinned = {'cpu': 'Kirby', 'menu': {'setting': 2}, 'added': True}
+        for allowed in ([[]], [''], ['menu.'], ['.menu'], ['menu..setting'], [['menu', '']]):
+            with self.subTest(allowed=allowed):
+                problems, evidence = self.comparison(reviewed, pinned, allowed)
+                self.assertIn('differs_only entries must name at least one key', ' '.join(problems))
+                self.assertIn('3 differing paths', ' '.join(problems))
+                self.assertEqual(evidence['differing_paths'], [['added'], ['cpu'], ['menu', 'setting']])
+                self.assertFalse(evidence['ok'])
+
+    def test_empty_allowance_list_requires_exact_match(self):
+        original = {'cpu': 'Mario', 'menu': {'setting': 1}}
+        self.assertEqual(self.comparison(original, original, [])[0], [])
+        problems, evidence = self.comparison(original, {'cpu': 'Kirby', 'menu': {'setting': 1}}, [])
+        self.assertIn('cpu', ' '.join(problems))
+        self.assertFalse(evidence['ok'])
+
+    def test_valid_allowance_still_applies_beside_an_invalid_one(self):
+        problems, evidence = self.comparison({'cpu': 'Mario', 'menu': {'setting': 1}},
+                                             {'cpu': 'Kirby', 'menu': {'setting': 2}}, [[], 'menu'])
+        self.assertIn('differs_only entries must name at least one key', ' '.join(problems))
+        self.assertIn('1 differing paths: cpu', ' '.join(problems))
+        self.assertFalse(evidence['ok'])
+
     def test_fixture_diff_nested_lists_types_and_root(self):
         self.assertEqual(eden_test.fixture_diff(
             {'nest': {'a': 1}, 'list': [0, {'x': 2}], 'old': 1},
