@@ -2183,6 +2183,29 @@ def _fetch_settings(ctx, cap=20):
     return data
 
 
+def _current_settings_observation(ctx, cap):
+    data = _fetch_settings(ctx, cap=cap)
+    log = instance_path(ctx, 'bridge_log')
+    lines = log.read_text(errors='replace').splitlines() if log.is_file() else []
+    marker = next((line for line in reversed(lines)
+                   if re.search(r'\[Bridge\] req set result=ok(?: |$)', line)
+                   or '[TrainingRooms] settings.json written by the writer thread' in line), None)
+    if marker is None or '[TrainingRooms] settings.json written by the writer thread' in marker:
+        return json.loads(data), 'file', data
+    try:
+        record = json.loads((log.parent / 'live-settings.json').read_text())
+        if record.get('set_reply') != marker or not isinstance(record.get('settings'), dict):
+            raise ValueError('missing matching payload')
+    except (OSError, ValueError, AttributeError, TypeError):
+        raise RuntimeError('settings.json is stale: a bridge set was applied after the last file write '
+                           'and its payload is not on record: ' + marker) from None
+    return record['settings'], 'live-set', json.dumps(record['settings']).encode()
+
+
+def _current_settings(ctx, cap):
+    return _current_settings_observation(ctx, cap)[0]
+
+
 _BRIDGE_ON_TITLE_MOVIE_READ = 0x1865104
 _BRIDGE_ON_TITLE_LAYOUT = "[[x19+0xe0]+0x80]"
 _BRIDGE_ON_TITLE_CONTEXT = "x19+0xc4"
@@ -2473,8 +2496,9 @@ def _apply_settings(ctx, data, cap=30):
     cursor = LogCursor(log, hold=False)
     _spool_file(ctx, 'diag-settings-next.json', data)
     until = time.monotonic() + cap
-    reply = writer = None
-    while time.monotonic() < until and not (reply and writer):
+    reply = reload = None
+    pattern = re.compile(r'\[TrainingRooms\] diag_settings_reload rerolls=\S+ issues=(\d+)(?: |$)')
+    while time.monotonic() < until and not (reply and reload):
         ctx.check_stop()
         for line in cursor.read():
             if state_gate.BOUNDARY.search(line) or cursor.rotations:
@@ -2487,16 +2511,25 @@ def _apply_settings(ctx, data, cap=30):
                                            '("[Bridge] req backup result=ok"; routes:bridge_on does). Saw: ' + line)
                     raise RuntimeError(line)
                 reply = line
-            if reply and line.startswith('[TrainingRooms] settings.json written by the writer thread'):
-                writer = line
-        if not (reply and writer):
+            if match := pattern.search(line):
+                if int(match[1]) != 0:
+                    raise RuntimeError(f'settings set: expected reload issues=0, saw: {line}')
+                reload = line
+        if not (reply and reload):
             time.sleep(min(.05, max(0, until - time.monotonic())))
-    if not (reply and writer):
-        raise RuntimeError('no fresh settings set reply and writer line before deadline')
-    metrics = getattr(ctx.runner, 'setup_metrics', None)
-    if metrics is not None:
-        metrics['bridge_requests'] += 1
-    return _fetch_settings(ctx, cap=max(.01, until - time.monotonic())), reply
+    if not (reply and reload):
+        raise RuntimeError('no fresh settings set reply and reload line before deadline')
+    settings = json.loads(data)
+    if not isinstance(settings, dict):
+        raise RuntimeError('settings set: expected a JSON object')
+    live = log.parent / 'live-settings.json'
+    temporary = live.with_suffix('.json.tmp')
+    try:
+        temporary.write_text(json.dumps({'set_reply': reply, 'reload': reload, 'settings': settings}) + '\n')
+        os.replace(temporary, live)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return reply, reload
 
 
 INPUT_LAG_S = 3.0
@@ -2765,6 +2798,47 @@ def _tr_close(ctx, cap, metrics):
     }
 
 
+def tr_idle(ctx, cap=20):
+    return _block(ctx, 'tr_idle', 'routes-tr-idle', {'cap': cap},
+                  lambda metrics: _tr_idle(ctx, cap, metrics))
+
+
+def _tr_idle(ctx, cap, metrics):
+    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+        raise RuntimeError('tr_idle needs a positive cap')
+    started = time.monotonic()
+    until = started + cap
+    io = BridgePickerIO(ctx)
+    steps = []
+    last = {}
+    for _ in range(12):
+        if time.monotonic() >= until:
+            break
+        ctx.check_stop()
+        menu = _tr_current(io, until)
+        ui = _remember(io, io.read(native_picker.UI, max(.001, until - time.monotonic())))
+        native_picker.same_epoch(menu, ui, in_flight=True)
+        last = {'open': menu.values.get('open'), 'game.running': menu.values.get('game.running'),
+                'notice.header': menu.values.get('notice.header'), 'input.owner': ui.values.get('input.owner')}
+        if last == {'open': '0', 'game.running': '0', 'notice.header': '', 'input.owner': 'native'}:
+            return {'block': 'tr_idle', 'args': {'cap': cap}, 'steps': steps, 'verified': last,
+                    **metrics, 'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': []}
+        if isinstance(last['notice.header'], str) and _edge_wizard(menu):
+            raise RuntimeError(f'tr_idle: expected plain idle Training; saw {last!r}; wizard exit is not established')
+        if last['open'] == '1':
+            _close_menu(io, until, after=menu)
+            steps.append('close menu')
+        elif last['game.running'] == '1':
+            game = menu.values.get('game')
+            if game != 'Guard the Edge':
+                raise RuntimeError(f'tr_idle: expected stoppable Guard the Edge; saw {last!r}, game={game!r}')
+            _drill_stop(ctx, game, max(.001, until - time.monotonic()), metrics)
+            steps.append('stop Guard the Edge')
+        else:
+            raise RuntimeError(f'tr_idle: expected plain idle Training; saw {last!r}')
+    raise RuntimeError(f'tr_idle: expected plain idle Training within {cap} s and 12 steps; saw {last!r}')
+
+
 def _tr_path(path):
     if not isinstance(path, list) or not path:
         raise RuntimeError('Training Mod path must be a nonempty list')
@@ -2973,7 +3047,7 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
     io = BridgePickerIO(ctx)
     initial = _tr_current(io, until)
     closed, _ = _close_menu(io, until, after=initial)
-    before_bytes = _fetch_settings(ctx, cap=max(.001, until - time.monotonic()))
+    _, before_source, before_bytes = _current_settings_observation(ctx, max(.001, until - time.monotonic()))
     before_menu = _settings_menu(before_bytes)
     menu, _ = _open_menu(io, until, page, after=closed)
     menu = _navigate_menu(io, menu, page, targets, until)
@@ -3129,7 +3203,10 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
     line = _wait_writer(ctx, writer, until) if writer is not None else None
     if time.monotonic() >= until:
         raise RuntimeError('Training Mod setting deadline expired before read-back')
-    after_bytes = _fetch_settings(ctx, cap=max(.001, until - time.monotonic()))
+    if line is None:
+        _, _, after_bytes = _current_settings_observation(ctx, max(.001, until - time.monotonic()))
+    else:
+        after_bytes = _fetch_settings(ctx, cap=max(.001, until - time.monotonic()))
     after_menu = _settings_menu(after_bytes)
     current = _tr_current(io, until)
     native_picker.same_epoch(closed, current, in_flight=True)
@@ -3154,7 +3231,7 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
     return {
         'block': 'tr_set', 'args': {'page': page, 'path': path, 'kind': kind,
                                     'value': value if kind == 'practice_cpu' else original_value, 'cap': cap},
-        'verified': verified, **metrics, 'ms': {'setting': elapsed, 'total': elapsed},
+        'verified': verified, 'before_source': before_source, **metrics, 'ms': {'setting': elapsed, 'total': elapsed},
         'skipped': ['change', 'writer'] if already else [],
     }
 
@@ -3223,8 +3300,21 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
     page = _wizard_body(menu, game)
     io.send(macro)
     deadline = min(until, time.monotonic() + pulse_cap)
+
+    def read(cap):
+        try:
+            return io.read('tr.menu', cap)
+        except RuntimeError as error:
+            if str(error) != 'no fenced bridge reply for state tr.menu':
+                raise
+            io.finish()
+            return None
+
     while (remaining := deadline - time.monotonic()) > 0:
-        state = _remember(io, io.read('tr.menu', remaining))
+        state = read(remaining)
+        if state is None:
+            return menu, False
+        state = _remember(io, state)
         if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
             raise RuntimeError(f'expected complete wizard tr.menu/1 reply; saw {state.block!r}')
         native_picker.same_epoch(menu, state, in_flight=True)
@@ -3237,7 +3327,10 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
         time.sleep(min(.01, max(0, deadline - time.monotonic())))
     if time.monotonic() >= until:
         raise RuntimeError(f'wizard deadline after pulse; last shown {page["body"]!r}')
-    state = _remember(io, io.read('tr.menu', min(pulse_cap, until - time.monotonic())))
+    state = read(min(pulse_cap, until - time.monotonic()))
+    if state is None:
+        return menu, False
+    state = _remember(io, state)
     if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
         raise RuntimeError(f'expected complete wizard tr.menu/1 reply; saw {state.block!r}')
     native_picker.same_epoch(menu, state, in_flight=True)
@@ -3255,8 +3348,6 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
 
 def _wizard_move(io, menu, game, label, target, until, pulse_cap):
     pulses = []
-    nulls = 0
-    last_size = None
     for _ in range(60):
         shown = _wizard_body(menu, game)[label.lower()]
         if shown == target:
@@ -3269,17 +3360,22 @@ def _wizard_move(io, menu, game, label, target, until, pulse_cap):
         direction = (('left' if distance < 0 else 'right') if axis == 0
                      else ('down' if distance < 0 else 'up'))
         macro = f'wizard-{direction}-{size}'
-        try:
-            menu, published = _wizard_pulse(io, menu, game, macro, until, pulse_cap)
-        except RuntimeError as error:
-            raise RuntimeError(f'wizard {label} unreachable: last {shown}, target {target}, '
-                               f'pulses {pulses + [macro]}: {error}') from error
-        pulses.append({'axis': 'x' if axis == 0 else 'y', 'macro': macro, 'published': published})
-        nulls = nulls + 1 if not published and last_size == size else int(not published)
-        last_size = size
-        if nulls >= (4 if size == 'fine' else 2):
-            shown = _wizard_body(menu, game)[label.lower()]
-            raise RuntimeError(f'wizard {label} unreachable: last {shown}, target {target}, pulses {pulses}')
+        for _ in range(3):
+            try:
+                menu, published = _wizard_pulse(io, menu, game, macro, until, pulse_cap)
+            except RuntimeError as error:
+                io.finish()
+                raise RuntimeError(f'wizard {label} unreachable: last {shown}, target {target}, '
+                                   f'pulses {pulses + [macro]}: {error}') from error
+            current = _wizard_body(menu, game)[label.lower()]
+            published = bool(published and current != shown)
+            pulses.append({'axis': 'x' if axis == 0 else 'y', 'macro': macro, 'published': published})
+            if published:
+                break
+        else:
+            io.finish()
+            raise RuntimeError(f"wizard {label} unreachable: expected {target}, shown {current} "
+                               f"after 3 unpublished '{macro}' pulses")
     shown = _wizard_body(menu, game)[label.lower()]
     raise RuntimeError(f'wizard {label} unreachable after 60 pulses: last {shown}, target {target}, pulses {pulses}')
 
@@ -3995,7 +4091,7 @@ def _tr_settings(ctx, values, file, cap, verify_roster, metrics):
     remaining = cap - (time.monotonic() - start)
     if remaining <= 0:
         raise RuntimeError('settings deadline expired before the initial read')
-    original = json.loads(_fetch_settings(ctx, cap=remaining))
+    original = _current_settings(ctx, remaining)
     timings = {'read': round((time.monotonic() - start) * 1000)}
     if values is not None:
         if not isinstance(values, dict) or not isinstance(original.get('menu'), dict):
@@ -4012,13 +4108,9 @@ def _tr_settings(ctx, values, file, cap, verify_roster, metrics):
     remaining = cap - (time.monotonic() - start)
     if remaining <= 0:
         raise RuntimeError('settings deadline expired before set')
-    readback_bytes, reply = _apply_settings(ctx, json.dumps(changed).encode(), cap=remaining)
+    sent = json.dumps(changed).encode()
+    reply, reload = _apply_settings(ctx, sent, cap=remaining)
     timings['apply'] = round((time.monotonic() - phase) * 1000)
-    readback = json.loads(readback_bytes)
-    differences = ([key for key in keys if readback.get('menu', {}).get(key) != changed['menu'][key]]
-                   if values is not None else _settings_differences(changed, readback))
-    if differences:
-        raise RuntimeError(f'settings readback differs for {", ".join(differences)}')
     live = {}
     phase = time.monotonic()
     if verify_roster:
@@ -4037,30 +4129,15 @@ def _tr_settings(ctx, values, file, cap, verify_roster, metrics):
         changed_fighters.intersection_update(values)
     return _save(ctx, 'routes-tr-settings', {
         'block': 'tr_settings', 'args': {'values': values, 'file': str(file) if file else None},
-        'verified': {'keys': keys, 'live_roster': live}, 'set_reply': reply,
+        'verified': {'keys': keys, 'values': ({key: changed['menu'][key] for key in keys}
+                                               if values is not None else {key: changed[key] for key in keys}),
+                     'live_roster': live}, 'set_reply': reply, 'reload': reload,
+        'applied': 'live; settings.json is rewritten only by the next menu write',
         'live_fighter': ('checked' if verify_roster else 'not checked') if changed_fighters else 'not applicable',
-        'settings_sha256': hashlib.sha256(readback_bytes).hexdigest(),
+        'sent_sha256': hashlib.sha256(sent).hexdigest(),
         **metrics,
         'ms': {**timings, 'total': round((time.monotonic() - start) * 1000)}, 'skipped': [],
     })
-
-
-def _settings_differences(sent, readback, path=''):
-    if isinstance(sent, dict):
-        if not isinstance(readback, dict):
-            return [path or '<root>']
-        differences = []
-        for key, value in sent.items():
-            child = f'{path}.{key}' if path else key
-            if key not in readback:
-                differences.append(child)
-            else:
-                differences.extend(_settings_differences(value, readback[key], child))
-        return differences
-    if (type(sent) is not type(readback)
-            or json.dumps(sent, sort_keys=True) != json.dumps(readback, sort_keys=True)):
-        return [path]
-    return []
 
 
 def setup_state(ctx):
@@ -4084,12 +4161,13 @@ def setup_state(ctx):
         native_picker.same_epoch(ui, tile, in_flight=True)
         p1 = {key: tile.values.get('placed.' + key, 'unknown') for key in ('at', 'kind', 'name', 'form')}
         cpu = {key: tile.values.get('cpu.placed.' + key, 'unknown') for key in ('at', 'kind', 'name', 'form')}
-    settings = _fetch_settings(ctx)
+    _, source, settings = _current_settings_observation(ctx, 20)
     return _save(ctx, 'routes-setup-state', {
         'block': 'setup_state', 'args': {}, 'verified': {'screen': screen, 'context': ui.values.get('screen.context'),
                                                          'owner': ui.values.get('input.owner'), 'p1': p1, 'cpu': cpu,
                                                          'stage_id': stage,
-                                                         'settings_sha256': hashlib.sha256(settings).hexdigest()},
+                                                         'settings_sha256': hashlib.sha256(settings).hexdigest(),
+                                                         'settings_source': source},
         'inputs': 0, 'bridge_requests': getattr(io, 'request_count', 0) + 1 + int(screen == 'training'),
         'bridge_boot': ui.block['boot'], 'revisions': getattr(io, 'revisions', {}),
         'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],

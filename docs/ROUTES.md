@@ -66,6 +66,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings and live roster both verified |
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
+| `tr_idle` `{cap}` | Training, without an active wizard notice | close the menu or stop Guard the Edge; verify plain idle Training |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
 | `tr_set` `{page, path, kind, value, cap}` | Training, settings file available through bridge | stored value reread, with a writer line for changes |
 | `wizard_place` `{game, area, cpu, p1, cap, pulse_cap, tolerance}` | Guard the Edge wizard or Training menu | shown positions checked at unconfirmed Preview |

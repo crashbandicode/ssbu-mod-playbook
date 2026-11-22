@@ -81,6 +81,7 @@ class OpenCloseTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.ctx = SimpleNamespace(runner=SimpleNamespace(), row_dir=directory.name, on='s',
+                                   instance={'bridge_log': str(Path(directory.name) / 'bridge.log')},
                                    check_stop=lambda: None)
 
     def invoke(self, name, io, **kwargs):
@@ -144,11 +145,12 @@ class OpenCloseTests(unittest.TestCase):
 
     def test_idle_stops_running_guard_edge_with_existing_helper(self):
         io = MenuIO(self.ctx)
-        io.menu.update({'game.running': '1', 'game': 'Guard the Edge', 'notice.header': ''})
+        io.menu.update({'game.running': '1', 'game': 'Guard the Edge', 'notice.header': 'Guard the Edge'})
 
         def stop(ctx, game, cap, metrics):
             self.assertEqual(game, 'Guard the Edge')
             io.menu['game.running'] = '0'
+            io.menu['notice.header'] = ''
 
         with patch.object(routes, '_drill_stop', side_effect=stop):
             result = self.invoke('tr_idle', io, cap=1)
@@ -597,7 +599,14 @@ class WizardTests(OpenCloseTests):
         io = WizardIO(self.ctx, step=2)
         io.cpu = [0.0, 1.0]
         io.refresh_notice()
-        read = io.read
+        read, send = io.read, io.send
+
+        def send_with_misses(segment):
+            count = len([a for a in io.actions if a.startswith('wizard-')])
+            if segment.startswith('wizard-') and count < 2:
+                io.actions.append(segment)
+            else:
+                send(segment)
 
         def read_with_misses(provider, cap):
             count = len([a for a in io.actions if a.startswith('wizard-')])
@@ -605,7 +614,7 @@ class WizardTests(OpenCloseTests):
                 raise RuntimeError('no fenced bridge reply for state tr.menu')
             return read(provider, cap)
 
-        io.read = read_with_misses
+        io.read, io.send = read_with_misses, send_with_misses
         result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[1, 1], cap=.2, pulse_cap=.002)
         self.assertEqual([x['published'] for x in result['verified']['pulses']['cpu']], [False, False, True])
 

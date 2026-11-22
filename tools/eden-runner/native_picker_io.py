@@ -72,8 +72,15 @@ class BridgePickerIO:
         self.stage_window = None
         self.pending = getattr(ctx.runner, 'native_ui_pending', {})
         ctx.runner.native_ui_pending = self.pending
+        self.cleared_pending = None
         if ctx.on in self.pending:
-            raise RuntimeError(f'native input {self.pending[ctx.on]!r} remains unconfirmed on {ctx.on}')
+            entry = self.pending[ctx.on]
+            macro, row = entry if isinstance(entry, tuple) and len(entry) == 2 else (entry, None)
+            if row is not None and row != str(getattr(ctx, 'row_dir', None)):
+                self.cleared_pending = macro
+                self.pending.pop(ctx.on)
+            else:
+                raise RuntimeError(f'native input {macro!r} remains unconfirmed on {ctx.on}')
 
     def _receive(self):
         rotations = self.cursor.rotations
@@ -312,7 +319,7 @@ class BridgePickerIO:
         if self.stage_window is not None:
             for line in lines:
                 self.stage_window.observe_before_press(line)
-        self.pending[self.ctx.on] = segment
+        self.pending[self.ctx.on] = (segment, str(getattr(self.ctx, 'row_dir', None)))
         self.routes.play(self.ctx, segment)
         self.input_count += 1
         metrics = getattr(self.ctx.runner, 'setup_metrics', None)
