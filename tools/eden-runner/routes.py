@@ -1228,7 +1228,8 @@ def _enter_training(ctx, cap, stage_ids, fighters, metrics):
                            f'expected P1 {kinds["p1"]}, CPU {kinds["cpu"]}')
     checked = {seat: 'checked' if kind is not None else 'unchecked' for seat, kind in kinds.items()}
     return _save(ctx, 'routes-enter-training', {
-        **result, 'block': 'enter_training', 'args': {'cap': cap, 'stage_ids': stage_ids, 'fighters': fighters},
+        **result, 'block': 'enter_training', 'args': {
+            'cap': cap, 'stage_ids': sorted(stage_ids) if stage_ids is not None else None, 'fighters': fighters},
         'verified': {'stage_id': result['stage_id'], 'roster': roster, 'fighters_checked': checked},
         'roster': roster, 'fighters_checked': checked, **metrics,
         'ms': {'entry': entry_ms, 'roster': round((time.monotonic() - started) * 1000) - entry_ms},

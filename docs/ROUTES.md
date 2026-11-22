@@ -34,6 +34,7 @@ A block is a runner step hook. A row names it with `routes:` and no path:
   It sleeps a fixed time only where no state exists.
 - Every block ends on a still in the row folder and returns a small receipt. Stills are reviewed after the run; a
   block never stops for a live review (the game would idle into its attract demo).
+- Block receipts are plain JSON values; the runner stringifies anything else rather than failing the row.
 - Every block fails closed: a missing state raises with what was seen, and nothing guesses.
 
 ### Own steps

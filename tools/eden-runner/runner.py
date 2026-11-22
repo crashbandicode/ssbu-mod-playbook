@@ -1320,7 +1320,7 @@ class Runner:
         if row.get('judge') == 'skip':
             # a setup row (fixture, navigation): no gameplay effect to judge; its gates are its evidence
             receipt.update(status='PASS', status_reason='setup row: judge skipped', judge={'state': 'skipped'})
-            receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+            receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
             return None
         try:
             job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip,
@@ -2121,7 +2121,7 @@ class Runner:
         if receipt.get('not_executed'):
             attempt['not_executed'] = True
         with (self.out / 'attempts.jsonl').open('a') as f:
-            f.write(json.dumps(attempt) + '\n')
+            f.write(json.dumps(attempt, default=str) + '\n')
 
     def stop_input(self, row, text):
         (self.out / 'STOP-INPUT').write_text(text if str(text).endswith('\n') else f'{text}\n')
@@ -2788,7 +2788,7 @@ class Runner:
                                clip_finalized=finalized)
                 if len(f.get('rows') or []) > 1:
                     receipt['clip_spans_rows'] = f['rows']
-                receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
         record = {'event': 'clip', 'row': row, 'path': str(path), 'clip': clip, 'file_rec_ms': f.get('file_rec_ms'),
                   'rows': f.get('rows') or [], 'finalized': finalized, 'rec_ms': None}
         if note:
@@ -2896,7 +2896,7 @@ class Runner:
                 start_mark = self.session_mark('row-start', row['id'])
             except StopRun as error:  # never run a row unrecorded: stopped before any of its input
                 receipt.update(status='FAILED', error=repr(error), ended=time.time(), not_executed=True)
-                receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
                 self.note(row['id'], 'fail', receipt='FAILED')
                 print(json.dumps({'row': row['id'], 'status': 'FAILED', 'error': repr(error)[:300],
@@ -2977,7 +2977,7 @@ class Runner:
                                          end_mark.get('rec_ms') if end_mark else None]
                 if self.acquired:
                     receipt['acquired_references'] = self.acquired
-                receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
                 for key in self.clients:
                     try:
