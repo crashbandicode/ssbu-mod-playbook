@@ -489,13 +489,17 @@ def acquire_local_token(io, target, topology, cap=4, *, expected_context=None):
     until = time.monotonic() + cap
     state = before
     while True:
-        state = wait_sample(io, TILE, until, state, in_flight=True)
+        state = wait_sample(io, TILE, until, state, in_flight=True, stepping=True)
         check_context(before, state, 'css')
         if (number(state, 'ack') != number(before, 'ack')
                 or number(state, 'applied') != number(before, 'applied')):
             raise RuntimeError('a tile step arrived while taking back the local token')
         if state.values.get('local.token') == 'held':
             token_held(state, 'css')
+            if state.values['focus'] == 'unknown':
+                if state.values.get('at') != before.values['placed.at']:
+                    raise RuntimeError('the held token is not returning to the medal tile')
+                continue
             if state.values['focus'] == before.values['focus']:
                 raise RuntimeError('local token takeback did not change native focus')
             native_input_owner(wait_sample(io, UI, until, ui, in_flight=True), 'css',
