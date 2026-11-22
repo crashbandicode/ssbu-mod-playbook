@@ -2824,7 +2824,24 @@ def _tr_idle(ctx, cap, metrics):
             return {'block': 'tr_idle', 'args': {'cap': cap}, 'steps': steps, 'verified': last,
                     **metrics, 'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': []}
         if isinstance(last['notice.header'], str) and _edge_wizard(menu):
-            raise RuntimeError(f'tr_idle: expected plain idle Training; saw {last!r}; wizard exit is not established')
+            header = last['notice.header']
+            try:
+                io.send('tap-b1')
+                after = _try_tr_condition(
+                    io, menu, min(until, time.monotonic() + INPUT_LAG_S),
+                    lambda state: any(state.values.get(key) != menu.values.get(key)
+                                      for key in ('notice.header', 'open', 'game.running')))
+            except RuntimeError as error:
+                io.finish()
+                if str(error) == 'no fenced bridge reply for state tr.menu':
+                    raise RuntimeError(f'tr_idle: expected the wizard page to change after B; saw {last!r}') from error
+                raise
+            if after is None:
+                io.finish()
+                raise RuntimeError(f'tr_idle: expected the wizard page to change after B; saw {last!r}')
+            io.finish()
+            steps.append(f'B out of wizard page {header}')
+            continue
         if last['open'] == '1':
             _close_menu(io, until, after=menu)
             steps.append('close menu')

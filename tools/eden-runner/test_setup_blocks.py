@@ -136,12 +136,25 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual(io.actions, ['tap-b1', 'tap-b1', 'tap-b1'])
         self.assertTrue(result['steps'])
 
-    def test_idle_does_not_guess_how_to_leave_wizard(self):
-        io = MenuIO(self.ctx)
-        io.menu.update({'game.running': '1', 'notice.header': 'Edge · 2/4'})
-        with self.assertRaisesRegex(RuntimeError, r'expected.*idle.*saw.*wizard'):
-            self.invoke('tr_idle', io, cap=1)
-        self.assertEqual(io.actions, [])
+    def test_idle_backs_out_of_wizard_to_menu_or_idle(self):
+        for ending in ('menu', 'idle'):
+            with self.subTest(ending=ending):
+                io = BackWizardIO(self.ctx, ending=ending)
+                result = self.invoke('tr_idle', io, cap=1)
+                self.assertEqual(io.actions, ['tap-b1', 'tap-b1'] + (['tap-b1'] if ending == 'menu' else []))
+                self.assertEqual(result['steps'][:2], ['B out of wizard page Edge · 2/4',
+                                                      'B out of wizard page Edge · 1/4'])
+                self.assertEqual(result['verified']['open'], '0')
+                self.assertEqual(result['verified']['game.running'], '0')
+                self.assertIsNone(io.pending_input)
+
+    def test_idle_wizard_no_change_clears_pending_without_retry(self):
+        io = BackWizardIO(self.ctx, stuck=True)
+        with patch.object(routes, 'INPUT_LAG_S', .003):
+            with self.assertRaisesRegex(RuntimeError, 'tr_idle: expected the wizard page to change after B; saw'):
+                self.invoke('tr_idle', io, cap=.1)
+        self.assertEqual(io.actions, ['tap-b1'])
+        self.assertIsNone(io.pending_input)
 
     def test_idle_stops_running_guard_edge_with_existing_helper(self):
         io = MenuIO(self.ctx)
@@ -482,6 +495,32 @@ class WizardIO(RowsIO):
         else:
             raise AssertionError(segment)
         self.refresh_notice()
+
+
+class BackWizardIO(WizardIO):
+    def __init__(self, ctx, *, ending='idle', stuck=False):
+        super().__init__(ctx, step=2)
+        self.ending = ending
+        self.stuck = stuck
+        self.pending_input = None
+
+    def send(self, segment):
+        if segment == 'tap-b1' and self.menu['open'] == '0' and self.menu['notice.header'].startswith('Edge · '):
+            self.actions.append(segment)
+            self.ctx.runner.setup_metrics['inputs'] += 1
+            self.pending_input = segment
+            if not self.stuck:
+                if self.step > 1:
+                    self.step -= 1
+                    self.refresh_notice()
+                else:
+                    self.menu.update({'open': '1' if self.ending == 'menu' else '0', 'depth': '0',
+                                      'game.running': '0', 'notice.header': '', 'notice.body': ''})
+            return
+        return super().send(segment)
+
+    def finish(self):
+        self.pending_input = None
 
 
 class WizardTests(OpenCloseTests):
