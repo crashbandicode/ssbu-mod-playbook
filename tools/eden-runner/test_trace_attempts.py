@@ -169,6 +169,64 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(result['inputs'], 0)
         self.assertTrue((Path(self.ctx.row_dir) / 'routes-drill-observe.json').is_file())
 
+    def test_delayed_pre_observation_terminal_is_not_counted(self):
+        terminal = dict(excerpt('cp1b-hero-attempt.jsonl')[1], sequence='1')
+        self.pending = [json.dumps(terminal) + '\n']
+        original = self.ctx.call
+
+        def recorded_before_file(method, params):
+            result = original(method, params)
+            for key in ('hits', 'matched', 'recorded'):
+                result['points'][0][key] = '1'
+            return result
+
+        self.ctx.call = recorded_before_file
+        with self.assertRaisesRegex(RuntimeError, r'0 terminals observed.*wanted 1'):
+            self.invoke(attempts=1, cap=.05)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-observe.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+        self.assertEqual(receipt['observed']['markers'], [])
+        self.assertEqual(receipt['observed']['markers_before_observation'][0]['sequence'], 1)
+
+    def test_observe_excludes_stale_wrong_arm_then_counts_new_marker(self):
+        stale = dict(excerpt('cp1b-hero-attempt.jsonl')[1], sequence='1')
+        stale['registers'] = dict(stale['registers'])
+        stale['registers']['x0'] = hex(int(stale['registers']['x0'], 16) | (1 << 24))
+        current = dict(excerpt('cp1b-hero-attempt.jsonl')[1], sequence='2')
+        self.pending = [contiguous([stale, current])]
+        original = self.ctx.call
+
+        def recorded_before_file(method, params):
+            result = original(method, params)
+            if not self.path.stat().st_size:
+                for key in ('hits', 'matched', 'recorded'):
+                    result['points'][0][key] = '1'
+            return result
+
+        self.ctx.call = recorded_before_file
+        result = self.invoke(attempts=1, cap=.5)
+        self.assertEqual(result['verified']['fence'],
+                         {'sequence': 1, 'taken': 'at the start of the observation'})
+        self.assertEqual(result['verified']['markers_before_observation'][0]['sequence'], 1)
+        self.assertEqual(result['verified']['first_sequence'], 2)
+
+    def test_observe_counter_sum_must_cover_file_sequence(self):
+        terminal = dict(excerpt('cp1b-hero-attempt.jsonl')[1], sequence='1')
+        self.pending = [json.dumps(terminal) + '\n']
+        original = self.ctx.call
+
+        def missing_counter(method, params):
+            result = original(method, params)
+            if self.path.stat().st_size:
+                for key in ('hits', 'matched', 'recorded'):
+                    result['points'][0][key] = '0'
+            return result
+
+        self.ctx.call = missing_counter
+        with self.assertRaisesRegex(RuntimeError, 'trace counters do not account for file sequences'):
+            self.invoke(attempts=1, cap=.5)
+
     def test_expiry_reports_count(self):
         with self.assertRaisesRegex(RuntimeError, r'0.*terminal'):
             self.invoke(attempts=1, cap=.02)
