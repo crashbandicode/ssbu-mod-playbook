@@ -121,6 +121,40 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual(result['skipped'], ['close'])
         self.assertEqual(result['verified'], {'open': '0', 'owner': 'native'})
 
+    def test_idle_already_idle_requires_no_input(self):
+        io = MenuIO(self.ctx)
+        io.menu.update({'game.running': '0', 'notice.header': ''})
+        result = self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(io.actions, [])
+        self.assertEqual(result['steps'], [])
+
+    def test_idle_closes_open_menu(self):
+        io = MenuIO(self.ctx, opened=True, depth=2)
+        io.menu.update({'game.running': '0', 'notice.header': ''})
+        result = self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(io.actions, ['tap-b1', 'tap-b1', 'tap-b1'])
+        self.assertTrue(result['steps'])
+
+    def test_idle_does_not_guess_how_to_leave_wizard(self):
+        io = MenuIO(self.ctx)
+        io.menu.update({'game.running': '1', 'notice.header': 'Edge · 2/4'})
+        with self.assertRaisesRegex(RuntimeError, r'expected.*idle.*saw.*wizard'):
+            self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(io.actions, [])
+
+    def test_idle_stops_running_guard_edge_with_existing_helper(self):
+        io = MenuIO(self.ctx)
+        io.menu.update({'game.running': '1', 'game': 'Guard the Edge', 'notice.header': ''})
+
+        def stop(ctx, game, cap, metrics):
+            self.assertEqual(game, 'Guard the Edge')
+            io.menu['game.running'] = '0'
+
+        with patch.object(routes, '_drill_stop', side_effect=stop):
+            result = self.invoke('tr_idle', io, cap=1)
+        self.assertTrue(result['steps'])
+        self.assertEqual(io.menu['game.running'], '0')
+
     def test_unknown_page_is_refused_before_any_input(self):
         io = MenuIO(self.ctx)
         with self.assertRaisesRegex(RuntimeError, 'page'):
@@ -523,6 +557,58 @@ class WizardTests(OpenCloseTests):
         self.assertFalse(result['verified']['pulses']['cpu'][0]['published'])
         self.assertEqual(result['verified']['cpu_shown'], ['1', '1'])
 
+    def test_two_unpublished_pulses_then_coordinate_change(self):
+        io = WizardIO(self.ctx, step=2)
+        io.cpu = [0.0, 1.0]
+        io.refresh_notice()
+        send = io.send
+
+        def delayed(segment):
+            if segment.startswith('wizard-') and len([a for a in io.actions if a.startswith('wizard-')]) < 2:
+                io.actions.append(segment)
+                return
+            send(segment)
+
+        io.send = delayed
+        result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[1, 1], cap=.2, pulse_cap=.002)
+        self.assertEqual([x['published'] for x in result['verified']['pulses']['cpu']], [False, False, True])
+        self.assertEqual(result['verified']['cpu_shown'], ['1', '1'])
+
+    def test_three_unpublished_pulses_fail_and_clear_pending(self):
+        io = WizardIO(self.ctx, step=2, fault='null')
+        pending = []
+        send, finish = io.send, io.finish
+
+        def track(segment):
+            pending[:] = [segment]
+            send(segment)
+
+        def clear():
+            pending.clear()
+            finish()
+
+        io.send, io.finish = track, clear
+        with self.assertRaisesRegex(RuntimeError, r"wizard CPU unreachable: expected .* shown .* after 3 unpublished 'wizard-right-fine' pulses"):
+            self.invoke('wizard_place', io, game='Guard the Edge', cpu=[2, 1], cap=.2, pulse_cap=.002)
+        self.assertEqual(len([a for a in io.actions if a.startswith('wizard-')]), 3)
+        self.assertEqual(pending, [])
+
+    def test_no_fenced_reply_for_two_pulses_retries_then_moves(self):
+        io = WizardIO(self.ctx, step=2)
+        io.cpu = [0.0, 1.0]
+        io.refresh_notice()
+        read = io.read
+
+        def read_with_misses(provider, cap):
+            count = len([a for a in io.actions if a.startswith('wizard-')])
+            if provider == 'tr.menu' and count in (1, 2):
+                raise RuntimeError('no fenced bridge reply for state tr.menu')
+            return read(provider, cap)
+
+        io.read = read_with_misses
+        result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[1, 1], cap=.2, pulse_cap=.002)
+        self.assertEqual([x['published'] for x in result['verified']['pulses']['cpu']], [False, False, True])
+
     def test_wizard_requires_exact_shown_coordinates_and_rejects_tolerance(self):
         io = WizardIO(self.ctx, step=4)
         with self.assertRaisesRegex(RuntimeError, 'expected Preview coordinates'):
@@ -561,7 +647,7 @@ class WizardTests(OpenCloseTests):
         self.assertTrue((Path(self.ctx.row_dir) / 'routes-wizard-place.json').is_file())
 
     def test_null_coarse_and_fine_fail_after_required_pulses(self):
-        for target, expected in (([40, 1], 2), ([2, 1], 4)):
+        for target, expected in (([40, 1], 3), ([2, 1], 3)):
             with self.subTest(target=target):
                 io = WizardIO(self.ctx, step=2, fault='null')
                 with self.assertRaisesRegex(RuntimeError, 'unreachable'):
@@ -590,7 +676,7 @@ class WizardTests(OpenCloseTests):
         io.refresh_notice()
         with self.assertRaisesRegex(RuntimeError, 'unreachable'):
             self.invoke('wizard_place', io, game='Guard the Edge', cpu=['-0', 1], cap=.1, pulse_cap=.002)
-        self.assertEqual(len([a for a in io.actions if a.startswith('wizard-')]), 4)
+        self.assertEqual(len([a for a in io.actions if a.startswith('wizard-')]), 3)
         io = WizardIO(self.ctx, step=2, fault='disturb')
         result = self.invoke('wizard_place', io, game='Guard the Edge',
                              cpu=[1, 2], cap=.5, pulse_cap=.002)
@@ -775,6 +861,30 @@ class SetTests(OpenCloseTests):
         self.assertEqual((writers, cursors, len(reads)), (0, 0, 2))
         self.assertEqual(io.actions, ['tr-menu-open', 'tap-b1'])
         self.assertEqual(result['verified']['before'], result['verified']['after'])
+
+    def test_tr_set_uses_live_set_not_stale_file_for_already_equal(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        log = Path(self.ctx.row_dir) / 'bridge.log'
+        line = '[Bridge] req set result=ok frame=2899 wall=383391489'
+        log.write_text(line + '\n')
+        (log.parent / 'live-settings.json').write_text(json.dumps({
+            'set_reply': line, 'reload': '[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0',
+            'settings': {'menu': {'lra_reset': [0, 1]}}}))
+        reads = []
+
+        def fetch(ctx, cap=20):
+            reads.append(True)
+            return json.dumps({'menu': {'lra_reset': [1, 0]} if len(reads) == 1 else io.stored}).encode()
+
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings', side_effect=fetch),
+              patch.object(routes, '_wait_writer', return_value='writer'),
+              patch.object(routes, 'instance_path', return_value=log)):
+            result = routes.tr_set(self.ctx, page='cpu', path=['lra_reset'], kind='toggle', value='on', cap=1)
+        self.assertIn('tap-a1', io.actions)
+        self.assertNotIn('change', result['skipped'])
+        self.assertEqual(result['verified']['before'], [0, 1])
+        self.assertEqual(result['before_source'], 'live-set')
 
     def test_malformed_boolean_and_float_settings_are_not_certified_off(self):
         for values in ([False, True], [0.0, 1.0]):

@@ -1180,6 +1180,30 @@ class BridgeFramingTests(unittest.TestCase):
             bridge.finish()
             BridgePickerIO(ctx)
 
+    def test_unconfirmed_input_from_earlier_row_is_cleared(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import routes
+        from native_picker_io import BridgePickerIO
+
+        with TemporaryDirectory() as temp:
+            log = Path(temp, 'bridge.log')
+            log.touch()
+            ctx = SimpleNamespace(instance={'bridge_log': str(log)}, runner=SimpleNamespace(), on='sw',
+                                  row_dir=str(Path(temp, 'r14')))
+            bridge = BridgePickerIO(ctx)
+            with patch.object(routes, 'play'):
+                bridge.send('wizard-down-fine')
+            with self.assertRaisesRegex(RuntimeError, 'remains unconfirmed'):
+                BridgePickerIO(ctx)
+            ctx.row_dir = str(Path(temp, 'r15'))
+            next_bridge = BridgePickerIO(ctx)
+            self.assertEqual(next_bridge.cleared_pending, 'wizard-down-fine')
+            self.assertNotIn('sw', ctx.runner.native_ui_pending)
+
     def test_exact_since_gap_blocks_pending_input(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory

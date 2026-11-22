@@ -450,20 +450,15 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(replay.actions, ['tap-b1', 'tap-a1', 'tap-a1', 'tap-b1', 'tap-b1'])
         self.assertTrue(result['grid_named'])
 
-    def test_tr_settings_refuses_a_refused_set_and_a_readback_difference(self):
+    def test_tr_settings_refuses_a_refused_set(self):
         initial = b'{"menu":{"stage_hazards":[1,0]}}'
         changed = {'stage_hazards': [0, 1]}
-        cases = ((RuntimeError('[Bridge] req set result=refused reason=busy'), 'refused'),
-                 ((b'{"menu":{"stage_hazards":[1,0]}}', '[Bridge] req set result=ok'), 'stage_hazards'))
-        for outcome, message in cases:
-            with self.subTest(message=message):
-                apply = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
-                with patch.object(routes, '_fetch_settings', return_value=initial, create=True), \
-                     patch.object(routes, '_apply_settings', create=True, **apply), \
-                     patch.object(routes, 'BridgePickerIO', return_value=MenuReplay()), \
-                     patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-                    with self.assertRaisesRegex(RuntimeError, message):
-                        routes.tr_settings(self.ctx, values=changed)
+        with patch.object(routes, '_fetch_settings', return_value=initial), \
+             patch.object(routes, '_apply_settings', side_effect=RuntimeError('[Bridge] req set result=refused reason=busy')), \
+             patch.object(routes, 'BridgePickerIO', return_value=MenuReplay()), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'refused'):
+                routes.tr_settings(self.ctx, values=changed)
 
     def test_reach_training_skips_what_already_holds_and_writes_one_receipt(self):
         replay = MenuReplay()
@@ -506,7 +501,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(len(writes), 2)
         self.assertEqual(state['roster'][1]['kind'], 3)
 
-    def test_settings_set_requires_fresh_success_and_writer(self):
+    def test_settings_set_requires_fresh_success_and_reload(self):
         sent = []
         mode = ['ok']
 
@@ -518,13 +513,13 @@ class SetupCallsR2Tests(unittest.TestCase):
                 with self.log.open('a') as stream:
                     stream.write(f'[Bridge] req set result={mode[0]} frame=2 wall=2\n')
                     if mode[0] == 'ok':
-                        stream.write('[TrainingRooms] settings.json written by the writer thread frame=2 wall=2\n')
+                        stream.write('[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0 ev=2 frame=2 wall=2\n')
 
         self.ctx.check_stop = respond
         with patch.object(routes, '_fetch_settings', return_value=b'{"menu":{}}'):
-            data, line = routes._apply_settings(self.ctx, b'{"menu":{}}', cap=1)
-            self.assertEqual(data, b'{"menu":{}}')
+            line, reload = routes._apply_settings(self.ctx, b'{"menu":{}}', cap=1)
             self.assertIn('result=ok', line)
+            self.assertIn('issues=0', reload)
             mode[0] = 'refused reason=busy'
             with self.assertRaisesRegex(RuntimeError, 'refused reason=busy'):
                 routes._apply_settings(self.ctx, b'{}', cap=1)
@@ -630,13 +625,13 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual((result['verified']['p1']['kind'], result['verified']['cpu']['kind']), (0, 7))
         self.assertEqual((result['verified']['p1']['name'], result['verified']['cpu']['name']), ('Mario', 'Fox'))
 
-    def test_tr_settings_preserves_other_keys_and_checks_the_fresh_file(self):
+    def test_tr_settings_preserves_other_keys_and_reports_the_sent_values(self):
         original = b'{"menu":{"stage_hazards":[1,0],"other":[2,3]},"version":1}'
         bodies = []
 
         def apply(_ctx, data, cap):
             bodies.append(json.loads(data))
-            return data, '[Bridge] req set result=ok'
+            return '[Bridge] req set result=ok', '[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0'
 
         with patch.object(routes, 'BridgePickerIO', return_value=MenuReplay()), \
              patch.object(routes, '_fetch_settings', return_value=original), \
@@ -646,6 +641,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         json.dumps(result)
         self.assertEqual(bodies[0], {'menu': {'stage_hazards': [0, 1], 'other': [2, 3]}, 'version': 1})
         self.assertEqual(result['verified']['keys'], ['stage_hazards'])
+        self.assertEqual(result['verified']['values'], {'stage_hazards': [0, 1]})
 
     def test_fresh_settings_file_must_match_its_bridge_receipt(self):
         files = self.bridge / 'files'

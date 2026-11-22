@@ -16,6 +16,8 @@ import routes
 SET_NO_BACKUP = '[Bridge] req set result=refused reason=no_backup frame=2627 wall=379784461'
 SET_OK = '[Bridge] req set result=ok frame=2628 wall=379784462'
 WRITER = '[TrainingRooms] settings.json written by the writer thread'
+REAL_SET = '[Bridge] req set result=ok frame=2899 wall=383391489'
+REAL_RELOAD = '[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0 ev=110 frame=2899 wall=383391484'
 
 
 def delayed_coin(*, action='a', pending='once'):
@@ -269,7 +271,7 @@ class SetupReworkTests(unittest.TestCase):
             routes._wait_writer(self.ctx, object(), time.monotonic() + 1)
         self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 7)
 
-    def bridge_spool(self, replies):
+    def bridge_spool(self, replies, body=b'settings'):
         self.ctx.runner.setup_metrics = {'bridge_requests': 0}
         calls = []
         replies = iter(replies)
@@ -277,7 +279,7 @@ class SetupReworkTests(unittest.TestCase):
         def spool(ctx, name, data):
             expected, lines = next(replies)
             self.assertEqual(name, expected)
-            self.assertEqual(data, b'' if name == 'bridge-backup.req' else b'settings')
+            self.assertEqual(data, b'' if name == 'bridge-backup.req' else body)
             calls.append(name)
             ctx.runner.setup_metrics['bridge_requests'] += 1
             with self.log.open('a') as stream:
@@ -299,13 +301,49 @@ class SetupReworkTests(unittest.TestCase):
         self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 1)
 
     def test_apply_settings_open_backup_does_not_send_backup(self):
-        spool, calls = self.bridge_spool([('diag-settings-next.json', [SET_OK, WRITER])])
+        body = b'{"menu":{"lra_reset":[0,1]}}'
+        spool, calls = self.bridge_spool([('diag-settings-next.json', [REAL_SET, REAL_RELOAD])], body)
         with patch.object(routes, '_spool_file', side_effect=spool), \
-             patch.object(routes, '_fetch_settings', return_value=b'readback'):
-            self.assertEqual(routes._apply_settings(self.ctx, b'settings', cap=1), (b'readback', SET_OK))
+             patch.object(routes, '_fetch_settings') as fetch:
+            self.assertEqual(routes._apply_settings(self.ctx, body, cap=.2), (REAL_SET, REAL_RELOAD))
+            fetch.assert_not_called()
         self.assertEqual(calls, ['diag-settings-next.json'])
-        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 2)
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 1)
+        self.assertEqual(json.loads((self.root / 'live-settings.json').read_text()),
+                         {'set_reply': REAL_SET, 'reload': REAL_RELOAD, 'settings': json.loads(body)})
         self.assertFalse((self.root / 'routes-bridge-backup.json').exists())
+
+    def test_apply_settings_accepts_reload_before_set_and_rejects_reload_issues(self):
+        body = b'{"menu":{}}'
+        spool, _ = self.bridge_spool([('diag-settings-next.json', [REAL_RELOAD, REAL_SET])], body)
+        with patch.object(routes, '_spool_file', side_effect=spool):
+            self.assertEqual(routes._apply_settings(self.ctx, body, cap=.2), (REAL_SET, REAL_RELOAD))
+        bad = REAL_RELOAD.replace('issues=0', 'issues=2')
+        spool, _ = self.bridge_spool([('diag-settings-next.json', [REAL_SET, bad])], body)
+        with patch.object(routes, '_spool_file', side_effect=spool):
+            with self.assertRaises(RuntimeError) as error:
+                routes._apply_settings(self.ctx, body, cap=.2)
+        self.assertIn(bad, str(error.exception))
+
+    def test_current_settings_follows_set_writer_and_missing_record(self):
+        stale = b'{"menu":{"lra_reset":[1,0]}}'
+        live = {'menu': {'lra_reset': [0, 1]}}
+        self.log.write_text(WRITER + '\n' + REAL_SET + '\n')
+        (self.root / 'live-settings.json').write_text(json.dumps(
+            {'set_reply': REAL_SET, 'reload': REAL_RELOAD, 'settings': live}))
+        with patch.object(routes, '_fetch_settings', return_value=stale):
+            self.assertEqual(routes._current_settings(self.ctx, 1), live)
+            with self.log.open('a') as stream:
+                stream.write(WRITER + '\n')
+            self.assertEqual(routes._current_settings(self.ctx, 1), json.loads(stale))
+            self.log.write_text(REAL_SET + '\n')
+            record = self.root / 'live-settings.json'
+            record.write_text(json.dumps({'set_reply': SET_OK, 'settings': live}))
+            for missing in (False, True):
+                if missing:
+                    record.unlink()
+                with self.assertRaisesRegex(RuntimeError, 'settings.json is stale:.*payload is not on record'):
+                    routes._current_settings(self.ctx, 1)
 
     def test_apply_settings_other_refusal_does_not_open_backup(self):
         refused = '[Bridge] req set result=refused reason=busy frame=2627 wall=379784461'
@@ -319,22 +357,19 @@ class SetupReworkTests(unittest.TestCase):
         self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 1)
         self.assertFalse((self.root / 'routes-bridge-backup.json').exists())
 
-    def test_tr_settings_file_readback_allows_added_keys_and_names_changed_paths(self):
+    def test_tr_settings_file_reports_sent_values_without_readback(self):
         path = self.root / 'settings.json'
         path.write_text('{"menu":{"cpu_level":[1,0]},"version":1}')
-        good = b'{"menu":{"cpu_level":[1,0],"added":42},"version":1,"extra":true}'
-        bad = b'{"menu":{"cpu_level":[0,1],"added":42},"version":1}'
-        missing = b'{"menu":{"added":42},"version":1}'
         with patch.object(routes, 'BridgePickerIO', return_value=menu_replay()), \
              patch.object(routes, '_fetch_settings', return_value=b'{"menu":{}}'), \
-             patch.object(routes, '_apply_settings', side_effect=[(good, 'ok'), (bad, 'ok'), (missing, 'ok')]), \
+             patch.object(routes, '_apply_settings', return_value=(REAL_SET, REAL_RELOAD)), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.tr_settings(self.ctx, file=path)
             json.dumps(result)
             self.assertEqual(result['verified']['keys'], ['menu', 'version'])
-            for _ in range(2):
-                with self.assertRaisesRegex(RuntimeError, r'menu\.cpu_level'):
-                    routes.tr_settings(self.ctx, file=path)
+            self.assertEqual(result['verified']['values'], json.loads(path.read_text()))
+            self.assertEqual(result['reload'], REAL_RELOAD)
+            self.assertIn('sent_sha256', result)
 
     def test_pick_fighters_without_cpu_calls_the_old_p1_path(self):
         topology = {'path': 'modelled', 'sha256': 'modelled'}
