@@ -14,6 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runner  # noqa: E402
+import routes  # noqa: E402
 
 from PIL import Image  # noqa: E402
 
@@ -202,6 +203,20 @@ class ReviewAdmissionTests(unittest.TestCase):
             {'run': 'routes:drill_observe', 'args': {'attempts': 1, 'cap': 10}},
             {'gate': 'main'},
         ])
+        report = self.report(plan)
+        self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
+        row = next(item['item'] for item in report['review']['composition'] if item['where'] == 'row r1')
+        self.assertEqual(row['role'], 'setup')
+
+    def test_available_bridge_blocks_compose_as_library_only(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'] = [{'state': 'training', 'via': 'hook', 'ref': 'routes:reach_training'}]
+        names = ('reach_training', 'set_cpu', 'set_player', 'tr_settings', 'setup_state', 'tr_open',
+                 'tr_goto', 'tr_close', 'drill_start', 'drill_observe', 'drill_stop')
+        for name in names:
+            self.assertTrue(callable(getattr(routes, name, None)), name)
+        plan['rows'][0].update(role='setup', steps=[{'run': f'routes:{name}'} for name in names]
+                               + [{'gate': 'main'}])
         report = self.report(plan)
         self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
         row = next(item['item'] for item in report['review']['composition'] if item['where'] == 'row r1')
