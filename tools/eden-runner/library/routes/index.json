@@ -141,6 +141,18 @@
    "what": "left stick up for 21 frames (real-Switch CSS: P1 panel hand onto the grid)",
    "source": "authored 2026-11-16 harness-lib from switch-hw-ledger-rc15 P2d \"stick 0 1 350\""
   },
+  "wizard-left-coarse": {"file":"macros/wizard-left-coarse.edenmacro.json","sha256":"d581cbb8ab7b749e34e4a47258afbe36fdbf288fcb2562a3d5760fe03bdae487","cap":20,"frames":13,"what":"wizard left full tilt 10 frames","source":"authored from edenmacro schema"},
+  "wizard-right-coarse": {"file":"macros/wizard-right-coarse.edenmacro.json","sha256":"28347ace16f6f25265e622daa0d8bcfd186f703f5046ea14968b70c51ca1f021","cap":20,"frames":13,"what":"wizard right full tilt 10 frames","source":"authored from edenmacro schema"},
+  "wizard-up-coarse": {"file":"macros/wizard-up-coarse.edenmacro.json","sha256":"419a2e08c6bf12990e06a6041e0e22ef3d5c31418ee0aad6cf3184f4c58f82c4","cap":20,"frames":13,"what":"wizard up full tilt 10 frames","source":"authored from edenmacro schema"},
+  "wizard-down-coarse": {"file":"macros/wizard-down-coarse.edenmacro.json","sha256":"918c9618090e2e84a6a929c49b2c926ab3e6e6175ea95755b80a64d804b406ae","cap":20,"frames":13,"what":"wizard down full tilt 10 frames","source":"authored from edenmacro schema"},
+  "wizard-left-medium": {"file":"macros/wizard-left-medium.edenmacro.json","sha256":"e5b25964c522fdb9839b12c1b8478d82bee65a6daadf35dbdeecbb17338bf0b5","cap":20,"frames":5,"what":"wizard left full tilt 2 frames","source":"authored from edenmacro schema"},
+  "wizard-right-medium": {"file":"macros/wizard-right-medium.edenmacro.json","sha256":"75570993846752e59fcecf383ef870fac197de9c28d4a88e2b850166d4e846b9","cap":20,"frames":5,"what":"wizard right full tilt 2 frames","source":"authored from edenmacro schema"},
+  "wizard-up-medium": {"file":"macros/wizard-up-medium.edenmacro.json","sha256":"628cdbaeb0203bd626d80da46ee2f0ead3a82bb500ffd4c10eface0a6626960f","cap":20,"frames":5,"what":"wizard up full tilt 2 frames","source":"authored from edenmacro schema"},
+  "wizard-down-medium": {"file":"macros/wizard-down-medium.edenmacro.json","sha256":"3dc0801ebc82ced731b1e8d082a2c70c305f2e0165f2ba9910358051430274bd","cap":20,"frames":5,"what":"wizard down full tilt 2 frames","source":"authored from edenmacro schema"},
+  "wizard-left-fine": {"file":"macros/wizard-left-fine.edenmacro.json","sha256":"f5087c5a5ac4630bfeb167f6e69973b42ceeaa09d95a4e61aeb28cf9f4bf6a70","cap":20,"frames":4,"what":"wizard left 0.35 tilt 1 frame","source":"authored from edenmacro schema"},
+  "wizard-right-fine": {"file":"macros/wizard-right-fine.edenmacro.json","sha256":"330a1992673f0002e6faa51025cb360004f5f241c8ac5de98a22001af29e4d42","cap":20,"frames":4,"what":"wizard right 0.35 tilt 1 frame","source":"authored from edenmacro schema"},
+  "wizard-up-fine": {"file":"macros/wizard-up-fine.edenmacro.json","sha256":"6ce704735802b8fd0839bb50de2a578cda18bbc7c0290632b064fb8ff35a2563","cap":20,"frames":4,"what":"wizard up 0.35 tilt 1 frame","source":"authored from edenmacro schema"},
+  "wizard-down-fine": {"file":"macros/wizard-down-fine.edenmacro.json","sha256":"507a88c4d44700b15b55cc834f162d42c88491a4ecf24e225337c58eeaf6557a","cap":20,"frames":4,"what":"wizard down 0.35 tilt 1 frame","source":"authored from edenmacro schema"},
   "tr-menu-open": {
    "file": "macros/tr-menu-open.edenmacro.json",
    "sha256": "1185704f7b97f2981a8bae42fbe42166d5bc37aa2e9cba197bdf585a616f78ce",

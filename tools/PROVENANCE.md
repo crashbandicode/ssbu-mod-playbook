@@ -173,3 +173,7 @@ The marker's form field is the stage form, not the CPU form. No live acceptance 
 order. `test-data/cp1b-hero-level9-none.jsonl` is an exact release/terminal excerpt from the Hero trace named
 in `test_trace_attempts.py`; its source interval 312411–312685 contains no planner entry. These are host
 decoder and control-flow probes, not runtime acceptance.
+
+2026-11-22: the 12 `library/routes/macros/wizard-{direction}-{coarse,medium,fine}` analog pulses
+are authored from Eden's `macro_file.h` full-state JSON schema: full tilt for 10 or 2 frames and 0.35 tilt
+for 1 frame. Actual TrainingRooms controller-poll counts and wizard behavior need runtime proof.

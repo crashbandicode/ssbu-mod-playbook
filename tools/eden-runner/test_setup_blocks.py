@@ -1,5 +1,7 @@
 """Host-only setup block probes with modelled bridge observations."""
 
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -356,6 +358,22 @@ class WizardIO(RowsIO):
 
 
 class WizardTests(OpenCloseTests):
+    def test_analog_macros_are_indexed_full_state_events(self):
+        base = Path(routes.ROUTES)
+        entries = json.loads((base / 'index.json').read_text())['macros']
+        for direction, axis, sign in (('left', 0, -1), ('right', 0, 1), ('up', 1, 1), ('down', 1, -1)):
+            for size, tilt, held in (('coarse', 1, 10), ('medium', 1, 2), ('fine', .35, 1)):
+                name = f'wizard-{direction}-{size}'
+                entry = entries[name]
+                data = (base / entry['file']).read_bytes()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), entry['sha256'])
+                macro = json.loads(data)
+                self.assertEqual([event['frame'] for event in macro['events']], [0, 1, held + 1])
+                self.assertEqual(macro['events'][1]['sticks'][axis], sign * tilt)
+                for event in macro['events']:
+                    self.assertEqual(set(event), {'frame', 'buttons', 'sticks', 'triggers', 'motion'})
+                    self.assertEqual(len(event['motion']), 2)
+
     def test_far_odd_even_and_area_reaches_preview(self):
         io = WizardIO(self.ctx)
         result = self.invoke('wizard_place', io, game='Guard the Edge', area='Upper right',

@@ -427,6 +427,13 @@ Down must move the published cursor; in a Rows screen it must change the publish
 with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed. This does
 not read or establish the focused row's stored value.
 
+`routes:wizard_place(game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0)` reaches the Guard the
+Edge Preview using bridged notice headers and shown coordinates. It sends fixed library stick pulses, follows
+the shown text after each pulse, and leaves Preview unconfirmed. `pulse_cap` is a harness publication-wait
+bound, not a product tolerance. A null is inferred from no publication and cannot be distinguished from a
+late publication; the bounded loop fails closed on consecutive nulls. Shown positions are whole units, not
+exact position words, and notice text is a request, not proof it was visibly rendered.
+
 `routes:drill_stop(game, cap=30)` refuses a visible wizard and a different or stopped practice game. It opens
 the Guard the Edge Start row, presses A, requires a same-epoch `game.running=0`, and closes the menu. The
 published row title is static Start even when the UI draws Stop; it is not used as a stop witness.
