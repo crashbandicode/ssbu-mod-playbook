@@ -16,6 +16,7 @@ sys.path.insert(0, str(HERE))
 import routes  # noqa: E402
 import routes_online  # noqa: E402
 import runner  # noqa: E402
+import test_native_picker as picker_fixtures  # noqa: E402
 
 
 class LogCursorTests(unittest.TestCase):
@@ -243,6 +244,17 @@ class TileWalkerTests(unittest.TestCase):
 
 
 class StageTransitionTests(unittest.TestCase):
+    def test_generic_stage_finish_rejects_a_different_destination_context(self):
+        pending = picker_fixtures.recorded_smash_ui(847)
+        pending.values['screen.context'] = 'training'
+        io, prepared = picker_fixtures.stage_confirmation_replay(
+            'smash', pending, picker_fixtures.recorded_smash_ui(870))
+        ctx = FakeCtx(FakeRunner({}, None), Path(tempfile.mkdtemp()))
+        with self.assertRaisesRegex(RuntimeError, 'unexpected pending css.smash observation'):
+            routes._finish_native_pick(ctx, io, 'sss', prepared, {'id': 308, 'name': 'Training'},
+                                       'css.smash', .1)
+        self.assertEqual(io.actions, ['tap-a1'])
+
     def test_transition_deadline_changes_only_the_css_wait(self):
         from unittest.mock import Mock, patch
         ctx = Mock()

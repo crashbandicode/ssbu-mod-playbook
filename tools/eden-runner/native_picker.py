@@ -419,13 +419,16 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
     else:
         until = time.monotonic() + transition_cap
         after = ui
+        context = expected_context
+        if context is None and ui.values.get('screen.context') not in ABSENT:
+            context = ui.values['screen.context']
         while True:
             after = wait_sample(io, UI, until, after, in_flight=True)
             values = after.values
             if values.get('screen') == next_screen:
                 owner, dialog = values.get('input.owner'), values.get('dialog')
                 destination = (values.get('focus') == next_screen and values.get('focus.source') == TILE
-                               and (expected_context is None or values.get('screen.context') == expected_context))
+                               and (context is None or values.get('screen.context') == context))
                 if owner == 'unknown' and dialog == 'unknown':
                     if not destination:
                         raise RuntimeError(f'after stage confirmation, unexpected pending {next_screen} observation')

@@ -145,6 +145,32 @@ class Replay:
         self.evidence.append(evidence)
 
 
+def stage_confirmation_replay(source_context, *tail):
+    target = picker.Target('308', 'Training', 'normal')
+
+    def stage_tile(rev):
+        state = snapshot('tile.cursor', rev, {
+            'screen': 'sss', 'layout': 'stage-layout', 'generation': '3',
+            'controller': '0', 'seat': '0', 'carried': 'none',
+            'local.token': 'none', 'at': '8', 'hovered': '8', 'settled': '1',
+            'kind': target.kind, 'name': target.name, 'form': target.form, 'settled.ack': '0',
+            'ack': '0', 'applied': '0', 'focus': 'sss/8',
+        })
+        state.block['boot'] = state.values['boot'] = '0x3d1b9bf2497aaa1f'
+        return state
+
+    def source_ui(rev):
+        state = recorded_smash_ui(844)
+        state.block['rev'] = rev
+        state.values.update({'rev': str(rev), 'observation': str(5008 + rev - 842),
+                             'input.owner': 'native', 'dialog': 'none',
+                             'screen.context': source_context})
+        return state
+
+    return (Replay([stage_tile(842)], [source_ui(843), *tail]),
+            (stage_tile(841), source_ui(842), target))
+
+
 class PickerTests(unittest.TestCase):
     def run_pick(self, replay, *, target=TARGET, topology=GRAPH):
         return picker.pick(replay, 'css', target, topology=topology, cap=.01)
@@ -542,6 +568,41 @@ class PickerTests(unittest.TestCase):
         self.run_pick(replay)
         self.assertEqual(replay.actions, ['tap-a1'])
 
+
+    def test_stage_confirm_inherits_context_for_pending_and_final_destination(self):
+        for bad_revision in (847, 870):
+            with self.subTest(bad_revision=bad_revision):
+                pending, ready = recorded_smash_ui(847), recorded_smash_ui(870)
+                (pending if bad_revision == 847 else ready).values['screen.context'] = 'training'
+                io, prepared = stage_confirmation_replay('smash', pending, ready)
+                message = ('unexpected pending css.smash observation' if bad_revision == 847
+                           else 'unexpected css.smash observation')
+                with self.assertRaisesRegex(RuntimeError, message):
+                    picker.confirm(io, 'sss', prepared, next_screen='css.smash', cap=.1)
+                self.assertEqual(io.actions, ['tap-a1'])
+
+    def test_stage_confirm_inherits_smash_or_local_wireless_without_a_fixed_mapping(self):
+        for context in ('smash', 'local_wireless'):
+            with self.subTest(context=context):
+                pending, ready = recorded_smash_ui(847), recorded_smash_ui(870)
+                pending.values['screen.context'] = ready.values['screen.context'] = context
+                io, prepared = stage_confirmation_replay(context, pending, ready)
+                result = picker.confirm(io, 'sss', prepared, next_screen='css.smash', cap=.1)
+                self.assertEqual(result['screen'], 'css.smash')
+                self.assertEqual(io.actions, ['tap-a1'])
+
+        io, prepared = stage_confirmation_replay('local_wireless', recorded_smash_ui(847), recorded_smash_ui(870))
+        with self.assertRaisesRegex(RuntimeError, 'unexpected pending css.smash observation'):
+            picker.confirm(io, 'sss', prepared, next_screen='css.smash', cap=.1)
+        self.assertEqual(io.actions, ['tap-a1'])
+
+    def test_stage_confirm_unknown_source_context_remains_permissive(self):
+        pending, ready = recorded_smash_ui(847), recorded_smash_ui(870)
+        pending.values['screen.context'] = ready.values['screen.context'] = 'training'
+        io, prepared = stage_confirmation_replay('unknown', pending, ready)
+        result = picker.confirm(io, 'sss', prepared, next_screen='css.smash', cap=.1)
+        self.assertEqual(result['screen'], 'css.smash')
+        self.assertEqual(io.actions, ['tap-a1'])
 
     def test_smash_stage_confirmation_waits_for_the_destination_owner(self):
         target = picker.Target('308', 'Training', 'normal')
