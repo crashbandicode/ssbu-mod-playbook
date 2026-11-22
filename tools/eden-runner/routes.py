@@ -1225,7 +1225,8 @@ def _enter_training(ctx, cap, stage_ids, fighters, metrics):
                            f'expected P1 {kinds["p1"]}, CPU {kinds["cpu"]}')
     checked = {seat: 'checked' if kind is not None else 'unchecked' for seat, kind in kinds.items()}
     return _save(ctx, 'routes-enter-training', {
-        **result, 'block': 'enter_training', 'args': {'cap': cap, 'stage_ids': stage_ids, 'fighters': fighters},
+        **result, 'block': 'enter_training', 'args': {
+            'cap': cap, 'stage_ids': sorted(stage_ids) if stage_ids is not None else None, 'fighters': fighters},
         'verified': {'stage_id': result['stage_id'], 'roster': roster, 'fighters_checked': checked},
         'roster': roster, 'fighters_checked': checked, **metrics,
         'ms': {'entry': entry_ms, 'roster': round((time.monotonic() - started) * 1000) - entry_ms},
@@ -2480,7 +2481,7 @@ def setup_state(ctx):
     ui = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 6)
     screen = ui.values.get('screen', 'unknown')
     p1 = cpu = 'unknown'
-    stage = expected(ctx).get('stage_id', 'unknown')
+    stage = 'unknown'
     if screen == 'training':
         state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
         roster = state.get('roster', {})
@@ -2502,6 +2503,7 @@ def setup_state(ctx):
                                                          'stage_id': stage,
                                                          'settings_sha256': hashlib.sha256(settings).hexdigest()},
         'inputs': 0, 'bridge_requests': getattr(io, 'request_count', 0) + 1 + int(screen == 'training'),
+        'remembered': {'stage_id': expected(ctx).get('stage_id')},
         'bridge_boot': ui.block['boot'], 'revisions': getattr(io, 'revisions', {}),
         'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],
     })

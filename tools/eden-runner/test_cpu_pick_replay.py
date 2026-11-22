@@ -14,7 +14,7 @@ import native_picker as picker
 import routes
 import state_gate
 import test_native_picker as recorded
-from test_setup_calls import CoinReplay
+from test_setup_calls import CoinReplay, modelled_block
 
 FIXTURE = Path(__file__).resolve().parent / 'fixtures/tile-cursor-cpu-pick-wire.txt'
 FIXTURE_SHA256 = '723115256380789c1d64af390e719fe8601c320db76c2ecd8d7ea8dea4da8dd5'
@@ -124,6 +124,19 @@ class ProducerReplayTests(unittest.TestCase):
             self.fail(str(exc))
         self.assertEqual((result.values['settled'], result.values['at']), ('1', '86'))
 
+    def test_take_token_reports_picked_up_but_unsettled_on_timeout(self):
+        replay = ProducerReplay('reach-settled')
+        original = replay.send
+
+        def send(segment):
+            original(segment)
+            replay.pending = deque(['held-moving'])
+
+        replay.send = send
+        with self.assertRaisesRegex(RuntimeError, 'coin 1 was picked up but its hover did not settle within'):
+            picker.take_token(replay, 1, cap=.01)
+        self.assertEqual(replay.actions, ['tap-a1'])
+
     def test_the_wrong_coin_is_refused(self):
         replay = ProducerReplay(fault='wrong-coin')
         with self.assertRaisesRegex(RuntimeError, 'p1.carried is 0 after A'):
@@ -151,11 +164,11 @@ class ProducerReplayTests(unittest.TestCase):
     def test_the_modelled_replay_has_the_producers_shape(self):
         replay = CoinReplay()
         replay._take('1')
-        phases = [('held', dict(replay.values))]
+        phases = [('held', modelled_block(1, replay.values).values)]
         replay.send('tile-left')
-        phases.append(('step1-settled', dict(replay.values)))
+        phases.append(('step1-settled', modelled_block(2, replay.values).values))
         replay._place('1')
-        phases.append(('placed', dict(replay.values)))
+        phases.append(('placed', modelled_block(3, replay.values).values))
         unknown_keys = ('focus', 'kind', 'name', 'form', 'carried', 'p1.carried', 'p1.token', 'local.token',
                         'placed.at', 'placed.kind', 'placed.name', 'placed.form', 'settled', 'settled.ack',
                         'ack.result', 'result', 'direction', 'from', 'to', 'hand.token', 'p1.coin', 'cpu.token',
@@ -166,10 +179,10 @@ class ProducerReplayTests(unittest.TestCase):
             producer = sample(phase).values
             for key in unknown_keys:
                 with self.subTest(phase=phase, key=key, comparison='unknown'):
-                    self.assertEqual(model.get(key, 'unknown') == 'unknown', producer[key] == 'unknown')
+                    self.assertEqual(model[key] == 'unknown', producer[key] == 'unknown')
             for key in equal_keys:
                 with self.subTest(phase=phase, key=key, comparison='value'):
-                    self.assertEqual(model.get(key, 'unknown'), producer[key])
+                    self.assertEqual(model[key], producer[key])
 
     def test_setup_state_distinguishes_live_and_remembered_stage(self):
         self.ctx.runner.routes_expect['stage_id'] = 3

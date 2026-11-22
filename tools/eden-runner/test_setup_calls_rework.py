@@ -45,7 +45,9 @@ def delayed_coin(*, action='a', pending='once'):
         def send(self, segment):
             if action == 'a' and segment == 'tap-a1':
                 self.actions.append(segment)
-                held = self.values.get('carried', 'none')
+                held = self.values.get('p1.carried', self.values.get('carried', 'none'))
+                if held == 'unknown':
+                    held = 'none'
                 self.pending = ('take', self.values['hand.token']) if held == 'none' else ('place', held)
                 return
             super().send(segment)
@@ -219,6 +221,7 @@ class SetupReworkTests(unittest.TestCase):
                         io.values['carried.name'] = 'Mario'
                     elif fault == 'tile':
                         io.values['at'] = '2'
+                        io.values['hovered'] = '2'
                     elif fault == 'p1':
                         io.values['p1.coin.at'] = '1'
 

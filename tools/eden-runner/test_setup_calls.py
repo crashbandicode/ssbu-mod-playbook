@@ -104,15 +104,18 @@ class CoinReplay:
                                 **self._identity(TOPOLOGY.targets[self.p1_tile], 'carried.')})
         else:
             self.values.update({'cpu.token': 'held', 'at': self.cpu_tile, 'hovered': self.cpu_tile,
-                                'focus': 'css.grid.cpu'})
+                                'focus': 'unknown', 'carried': 'unknown', 'kind': 'unknown',
+                                'name': 'unknown', 'form': 'unknown', 'settled.ack': 'unknown',
+                                'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
+                                'from': 'unknown', 'to': 'unknown'})
             target = TOPOLOGY.targets.get(self.cpu_tile)
             if target:
-                self.values.update({**self._identity(target), **self._identity(target, 'carried.')})
+                self.values.update(self._identity(target, 'carried.'))
             else:
-                self.values.update({'kind': 'unknown', 'name': 'unknown', 'form': 'unknown',
-                                    'carried.kind': 'unknown', 'carried.name': 'unknown',
-                                    'carried.form': 'unknown'})
-        self.values['settled.ack'] = self.values['ack']
+                self.values.update({'carried.kind': 'unknown', 'carried.name': 'Random',
+                                    'carried.form': 'default'})
+        if slot == '0':
+            self.values['settled.ack'] = self.values['ack']
 
     def _place(self, slot):
         at = self.values['at']
@@ -129,11 +132,18 @@ class CoinReplay:
         self.values.update({'carried': 'none', 'p1.carried': 'unknown', 'hand.token': slot,
                             'token.settled': '0', 'focus': 'css.medal.' + slot,
                             'settled': '0', 'settled.ack': 'unknown'})
+        if slot == '1':
+            self.values.update({'hand.token': 'none', 'focus': 'css.medal.mario',
+                                'kind': 'unknown', 'name': 'unknown', 'form': 'unknown',
+                                'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
+                                'from': 'unknown', 'to': 'unknown'})
 
     def send(self, segment):
         self.actions.append(segment)
         if segment == 'tap-a1':
-            held = self.values.get('carried', 'none')
+            held = self.values.get('p1.carried', self.values.get('carried', 'none'))
+            if held == 'unknown':
+                held = 'none'
             if held == 'none':
                 slot = self.values['hand.token']
                 self._take('0' if self.fault == 'wrong_carried' else slot)
@@ -143,7 +153,9 @@ class CoinReplay:
         if not segment.startswith('tile-'):
             raise AssertionError(segment)
         direction = segment[5:]
-        carried = self.values.get('carried', 'none')
+        carried = self.values.get('p1.carried', self.values.get('carried', 'none'))
+        if carried == 'unknown':
+            carried = 'none'
         before = self.values.get('at', 'none')
         ack = int(self.values['ack']) + (2 if self.fault == 'second_step' else 1)
         applied = int(self.values['applied']) + (2 if self.fault == 'second_step' else 1)
@@ -161,8 +173,11 @@ class CoinReplay:
             to = '85' if before == '86' and direction == 'left' else TOPOLOGY.neighbors[before][direction]
             target = TOPOLOGY.targets[to]
             self.values.update({'at': to, 'hovered': to, 'settled': '1', 'settled.ack': str(ack),
-                                'focus': 'css.grid.' + to, 'target.token': 'none', 'token.settled': '0',
-                                **self._identity(target), **self._identity(target, 'carried.')})
+                                'focus': 'unknown' if carried == '1' else 'css.grid.' + to,
+                                'target.token': 'none', 'token.settled': '0',
+                                **self._identity(target, 'carried.')})
+            if carried != '1':
+                self.values.update(self._identity(target))
         self.values.update({'ack': str(ack), 'applied': str(applied), 'ack.result': 'handled',
                             'result': 'handled', 'direction': direction,
                             'from': before if before != 'unknown' else 'none', 'to': to})
@@ -178,7 +193,9 @@ class SetupCallsR1Tests(unittest.TestCase):
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-            return routes.pick_cpu(self.ctx, 'Fox', topology={'path': 'modelled', 'sha256': 'modelled'})
+            result = routes.pick_cpu(self.ctx, 'Fox', topology={'path': 'modelled', 'sha256': 'modelled'})
+        json.dumps(result)
+        return result
 
     def test_pick_cpu_reaches_takes_walks_and_places(self):
         result = self.pick_cpu()
@@ -238,7 +255,8 @@ class SetupCallsR1Tests(unittest.TestCase):
              patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value), \
              patch.object(routes, 'remember', side_effect=remember):
-            routes.pick_fighters(self.ctx, 'Mario', cpu='Fox', topology={'path': 'modelled', 'sha256': 'modelled'})
+            result = routes.pick_fighters(self.ctx, 'Mario', cpu='Fox', topology={'path': 'modelled', 'sha256': 'modelled'})
+        json.dumps(result)
         local.assert_called_once()
         self.assertEqual(seen, [7])
 
@@ -246,6 +264,7 @@ class SetupCallsR1Tests(unittest.TestCase):
         with patch.object(routes, 'pick_local_fighter', return_value={'placed': True}) as local, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.pick_fighters(self.ctx, 'Mario', topology={'path': 'modelled', 'sha256': 'modelled'})
+        json.dumps(result)
         self.assertTrue(result['placed'])
         self.assertEqual(result['block'], 'pick_fighters')
         self.assertEqual(result['skipped'], ['pick_cpu'])
@@ -393,6 +412,7 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, 'wait_native', return_value=state), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.enter_training(self.ctx, cap=1)
+        json.dumps(result)
         self.assertEqual(result['fighters_checked'], {'p1': 'unchecked', 'cpu': 'unchecked'})
         self.assertEqual(result['roster'], state['roster'])
 
@@ -432,7 +452,9 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, '_fetch_settings', return_value=json.dumps(settings).encode(), create=True), \
              patch.object(routes, 'wait_native', return_value={'roster': roster, 'stage': 3}), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
-            return routes.set_cpu(self.ctx, 'Mario')
+            result = routes.set_cpu(self.ctx, 'Mario')
+        json.dumps(result)
+        return result
 
     def test_set_cpu_stops_before_a_on_an_unexpected_cell(self):
         replay = MenuReplay(wrong_cell=True)
@@ -472,6 +494,7 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, 'native_state', return_value=state), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: saved.append(name) or value):
             receipt = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+        json.dumps(receipt)
         self.assertEqual(saved, ['routes-reach-training'])
         self.assertEqual(replay.actions, [])
         self.assertEqual(set(receipt['skipped']), {'to_main', 'back_to_main', 'main_to_stage', 'pick_stage',
@@ -488,7 +511,8 @@ class SetupCallsR2Tests(unittest.TestCase):
         import switch_hw
 
         self.log.write_text('[Bridge] roster entry=1 kind=7 nana=false frame=1 wall=1\n')
-        lines = iter(('[Bridge] roster entry=0 kind=0 nana=false frame=2 wall=2\n',
+        lines = iter(('[Bridge] req roster result=ok entries=0x3 frame=2 wall=2\n'
+                      '[Bridge] roster entry=0 kind=0 nana=false frame=2 wall=2\n',
                       '[Bridge] roster entry=1 kind=3 nana=false frame=2 wall=2\n'))
         writes = []
 
@@ -575,6 +599,7 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, 'enter_training', side_effect=lambda *a, **k: calls.append(('enter', k))), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+        json.dumps(result)
         self.assertEqual([item if isinstance(item, str) else item[0] for item in calls], ['quit', 'pick', 'enter'])
         self.assertEqual(calls[-1][1]['stage_ids'], {3})
         self.assertTrue({'to_main', 'main_to_stage', 'pick_stage'} <= set(result['skipped']))
@@ -623,6 +648,7 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, '_fetch_settings', return_value=b'{"menu":{}}'), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.setup_state(self.ctx)
+        json.dumps(result)
         self.assertEqual(replay.actions, [])
         self.assertEqual(result['verified']['settings_sha256'], hashlib.sha256(b'{"menu":{}}').hexdigest())
         self.assertEqual((result['verified']['p1']['kind'], result['verified']['cpu']['kind']), (0, 7))
@@ -641,6 +667,7 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, '_apply_settings', side_effect=apply), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.tr_settings(self.ctx, values={'stage_hazards': [0, 1]})
+        json.dumps(result)
         self.assertEqual(bodies[0], {'menu': {'stage_hazards': [0, 1], 'other': [2, 3]}, 'version': 1})
         self.assertEqual(result['verified']['keys'], ['stage_hazards'])
 

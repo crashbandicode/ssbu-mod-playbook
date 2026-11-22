@@ -90,6 +90,10 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
                 and values.get('screen') == 'sss' and values.get('settled') == '0'
                 and values.get('layout') == values.get('hovered') == 'unknown')
     at = values.get('at')
+    idle = all(values.get(key) == 'unknown'
+               for key in ('settled.ack', 'ack.result', 'result', 'direction', 'from', 'to'))
+    # The hand carries the CPU's coin: the old lines then never name a focus or a fighter (WIRE.md).
+    carrying_cpu = values.get('p1.carried') == '1'
     step = (stepping and provider == TILE and focus == 'unknown'
             and values.get('kind') == 'unknown' and values.get('name') == 'unknown'
             and values.get('form') == 'unknown'
@@ -97,8 +101,8 @@ def check_sample(state, provider, *, loading_ui=False, pending_placement=False, 
                   and values.get('settled.ack') == 'unknown')
                  or (values.get('settled') == '1' and values.get('hovered') == at
                      and isinstance(at, str) and re.fullmatch(r'[0-9]+', at)
-                     and values.get('settled.ack') is not None
-                     and values.get('settled.ack') == values.get('ack'))))
+                     and ((values.get('settled.ack') is not None and values.get('settled.ack') == values.get('ack'))
+                          or (carrying_cpu and idle)))))
     if (block['name'] != provider or block['schema'] != provider + '/1'
             or block['filtered'] or block['rev'] <= 0
             or not re.fullmatch(r'0x[0-9a-f]{16}', block['boot'])
@@ -622,12 +626,15 @@ def take_token(io, slot, cap=4, *, expected_context='training'):
     io.send('tap-a1')
     until = time.monotonic() + cap
     latest = before
+    picked_up = False
     while True:
         try:
             latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
                                            pending_placement=True))
         except RuntimeError as exc:
             if str(exc) == f'{TILE}: no newer active observation' and time.monotonic() >= until:
+                if picked_up:
+                    raise RuntimeError(f'coin {slot} was picked up but its hover did not settle within {cap} s') from exc
                 raise RuntimeError(f'A did not pick up coin {slot} within {cap} s') from exc
             raise
         check_context(before, latest, 'css')
@@ -640,8 +647,12 @@ def take_token(io, slot, cap=4, *, expected_context='training'):
                 and values.get('p1.coin.at') == coin_at) if slot == '1' else (
                     values.get('local.token') == 'held' and values.get('carried') == '0')
         if carried == slot and held:
-            _coin_finish(io, ui, until, expected_context)
-            return latest
+            picked_up = True
+            if values.get('settled') == '1':
+                settled(latest)
+                _coin_finish(io, ui, until, expected_context)
+                return latest
+            continue
         hand = values.get('hand.token')
         other = '0' if slot == '1' else '1'
         if ((hand in ('none', '0', '1') and hand != slot)
