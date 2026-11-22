@@ -2694,21 +2694,29 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
         before = {key: before_menu.get(key) for key in wanted}
     else:
         before = _settings_row(before_menu, row_id)
+        widths = json.loads((ROUTES / 'tr-setting-widths.json').read_text())['widths']
+        width = widths.get(row_id)
+        if width is None:
+            raise RuntimeError(f'unsupported: no product width for menu.{row_id}')
+        if len(before) != width:
+            raise RuntimeError(f'unsupported: settings file menu.{row_id} has {len(before)} slots; '
+                               f'product schema has {width}')
         original_value = value
         if kind == 'toggle' and (type(value) is bool or isinstance(value, str) and value.casefold() in ('on', 'off')):
             on = value if type(value) is bool else value.casefold() == 'on'
             value = [int(on), int(not on)]
         elif kind == 'list' and type(value) is int:
-            if not 0 <= value < len(before):
-                raise RuntimeError(f'expected list index in range; saw {value!r}')
-            value = _stored_one_hot(len(before), value)
+            if not 0 <= value < width:
+                raise RuntimeError(f'unsupported list index {value} for menu.{row_id}: '
+                                   f'product schema has {width} options')
+            value = _stored_one_hot(width, value)
         if (not isinstance(value, list) or not value
                 or any(type(item) is not int or item not in (0, 1) for item in value)):
             raise RuntimeError(f'expected a 0/1 integer array for value; saw {value!r}')
         if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
             raise RuntimeError(f'invalid {kind} value encoding')
-        if len(before) != len(value):
-            raise RuntimeError(f'expected settings menu.{row_id} array of length {len(value)}; saw {before!r}')
+        if len(value) != width:
+            raise RuntimeError(f'expected settings menu.{row_id} array of length {width}; saw {value!r}')
         wanted = {row_id: value}
     if time.monotonic() >= until:
         raise RuntimeError('Training Mod setting deadline expired before applying')
@@ -2844,6 +2852,7 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
         verified['mode_witness'] = 'stored encoding' if already else 'editor.sel_key'
     else:
         verified['value_stored'] = value
+        verified['width'] = width
     elapsed = round((time.monotonic() - started) * 1000)
     return {
         'block': 'tr_set', 'args': {'page': page, 'path': path, 'kind': kind,

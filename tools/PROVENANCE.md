@@ -182,3 +182,6 @@ for 1 frame. Actual TrainingRooms controller-poll counts and wizard behavior nee
 TrainingRooms `aad616bc` `src/model/menu/table.rs` (full source SHA-256 in the file), excluding
 recording-owned `playback_loop`; the `tap-x1` macro is `tap-a1`'s full-state shape with X's mask.
 Retired practice-mode and hitbox slots are handled from `practice_games.rs` and `legend.rs`.
+
+2026-11-22: `library/routes/tr-setting-widths.json` records the product row widths from TrainingRooms
+`7d962416` `src/model/factory.rs` DEFS, cross-checked against its product-written settings fixture.

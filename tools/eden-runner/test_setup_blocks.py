@@ -773,15 +773,16 @@ class SetTests(OpenCloseTests):
                 result, _, _, _ = self.run_set(io, 'toggle', value)
                 self.assertEqual(result['args']['value'], value)
                 self.assertEqual(result['verified']['value_stored'], target)
-        io = SetIO(self.ctx, 'list', 'sdi_strength', [0, 0, 1])
+        io = SetIO(self.ctx, 'list', 'sdi_strength', [0, 0, 1, 0])
         result, _, _, _ = self.run_set(io, 'list', 2)
         self.assertEqual(result['args']['value'], 2)
-        self.assertEqual(result['verified']['value_stored'], [0, 0, 1])
+        self.assertEqual(result['verified']['value_stored'], [0, 0, 1, 0])
 
     def test_changed_toggle_list_and_checklist_require_writer(self):
         for kind, row, before, target in (('toggle', 'lra_reset', [0, 1], [1, 0]),
-                                           ('list', 'sdi_strength', [1, 0, 0], [0, 0, 1]),
-                                           ('checklist', 'mash_state', [1, 0, 0], [0, 1, 1])):
+                                           ('list', 'sdi_strength', [1, 0, 0, 0], [0, 0, 1, 0]),
+                                           ('checklist', 'mash_state', [1, 0, 0] + [0] * 27,
+                                            [0, 1, 1] + [0] * 27)):
             with self.subTest(kind=kind):
                 io = SetIO(self.ctx, kind, row, before)
                 result, writers, cursors, reads = self.run_set(io, kind, target)
