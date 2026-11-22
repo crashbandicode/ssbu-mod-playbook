@@ -9,7 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import chdir, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -866,6 +866,8 @@ class EdenTestTests(unittest.TestCase):
         self.assertTrue((run / 'rows/relative-link').is_symlink())
         self.assertIn('2 PASS, 0 FAIL, 0 NOT RUN', (run / 'REPORT.md').read_text())
         self.assertIn('2 PASS, 0 FAIL, 0 NOT RUN', output.getvalue())
+        self.assertEqual(json.loads((run / 'go-result.json').read_text()),
+                         {'code': 0, 'counts': {'PASS': 2, 'FAIL': 0, 'NOT RUN': 0}})
         self.assertFalse((run / 'lifecycle-down.log').exists())
 
     def test_go_file_rows_owner_and_no_trace_rule(self):
@@ -921,6 +923,7 @@ class EdenTestTests(unittest.TestCase):
                     self.assertEqual(eden_test.main(self.go_args(label=label)), 3)
                 down.assert_not_called()
                 self.assertIn(expected, (self.dir / f'runs/{label}/REPORT.md').read_text())
+                self.assertEqual(json.loads((self.dir / f'runs/{label}/go-result.json').read_text())['code'], 3)
 
     def test_go_trace_stub_refusal_precedes_lifecycle(self):
         source = self.dir / 'source/user/config'
@@ -989,7 +992,17 @@ class EdenTestTests(unittest.TestCase):
             '--nro', str(second), '--elf', str(elf), '--trace-point', 'plugin.nro!attempt',
             '--owner', 'test-owner', '--ssh', host]
         output = io.StringIO()
-        with mock.patch.object(eden_test, 'sh', side_effect=[0, 0, 0, 0, 0, 3, 0]) as sh, \
+        def fake_sh(command, log=None):
+            if command[0] == 'ssh':
+                return 1
+            if command[0] == 'scp':
+                if command[1].endswith('/go-result.json'):
+                    Path(command[2]).write_text(json.dumps({'code': 3, 'counts': {'PASS': 3, 'FAIL': 1, 'NOT RUN': 16}}))
+                else:
+                    Path(command[2]).write_text('report')
+            return 0
+
+        with chdir(self.dir), mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh, \
              redirect_stdout(output):
             self.assertEqual(eden_test.main(argv), 3)
         expected = [
@@ -1003,6 +1016,7 @@ class EdenTestTests(unittest.TestCase):
              '--nro', f'{stage}/nro/plugin.nro', '--nro', f'{stage}/nro/extra.nro',
              '--rows', f'{stage}/rows', '--elf', f'{stage}/elf/plugin.so',
              '--trace-point', 'plugin.nro!attempt', '--owner', 'test-owner'],
+            ['scp', f'{host}:/home/intpa/eden-runs/{label}/go-result.json', f'./go-result-{label}.json'],
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/REPORT.md', f'./REPORT-{label}.md'],
         ]
         self.assertEqual([call.args[0] for call in sh.call_args_list], expected)
@@ -1015,12 +1029,32 @@ class EdenTestTests(unittest.TestCase):
         hosts.parent.mkdir(parents=True)
         hosts.write_text(json.dumps({'xps': 'mapped-xps'}))
         rowfile = self.rows / 'rows.json'
-        with mock.patch.object(eden_test, 'sh', return_value=0) as sh:
+        def fake_sh(command, log=None):
+            if command[0] == 'scp' and command[1].endswith('/go-result.json'):
+                Path(command[2]).write_text(json.dumps({'code': 0, 'counts': {'PASS': 2, 'FAIL': 0, 'NOT RUN': 0}}))
+            return 0
+
+        with chdir(self.dir), mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh:
             self.assertEqual(eden_test.main(self.go_args(host='xps', rows=rowfile)), 0)
         commands = [call.args[0] for call in sh.call_args_list]
         self.assertIn(['rsync', '-a', '--mkpath', str(rowfile),
                        'mapped-xps:/home/intpa/eden-runs/_eden-test/stage/go-1/rows/rows.json'], commands)
-        self.assertEqual(commands[-2][0:4], ['ssh', '-o', 'BatchMode=yes', 'mapped-xps'])
+        self.assertEqual(commands[-3][0:4], ['ssh', '-o', 'BatchMode=yes', 'mapped-xps'])
+
+    def test_go_remote_missing_result_still_prints_down_when_report_copied(self):
+        output = io.StringIO()
+
+        def fake_sh(command, log=None):
+            if command[0] == 'ssh' or command[0] == 'scp' and command[1].endswith('/go-result.json'):
+                return 1
+            if command[0] == 'scp':
+                Path(command[2]).write_text('report')
+            return 0
+
+        with chdir(self.dir), mock.patch.object(eden_test, 'sh', side_effect=fake_sh), redirect_stdout(output):
+            with self.assertRaisesRegex(SystemExit, 'remote go did not produce a result \\(ssh exit 1\\)'):
+                eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
+        self.assertIn('down /home/intpa/eden-runs/go-1', output.getvalue())
 
     def test_go_remote_staging_failure_never_invokes_ssh(self):
         with mock.patch.object(eden_test, 'sh', return_value=9) as sh:

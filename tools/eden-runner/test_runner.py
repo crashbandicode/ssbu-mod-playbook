@@ -1806,17 +1806,84 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('trace.counters', eden.calls)
         self.assertIn('trace.read', eden.calls)
 
-    def test_failed_recovery_stops_the_run(self):
+    def test_failed_recovery_continues_while_game_is_running(self):
         self._continue_plan()
+        self.plan['rows'][1]['steps'] = [{'shot': 'ok'}]
+        self.manifest.write_text(json.dumps(self.plan))
         eden = FakeEden({'to-red': BLUE}, log_path=self.log)  # recover never reaches the red start gate
-        with self.assertRaises(RuntimeError):
-            self.make(eden).run()
-        self.assertTrue((self.dir / 'out' / 'STOP-INPUT').exists())
-        self.assertFalse((self.dir / 'out' / 'r3.json').exists())
+        engine = self.make(eden)
+        self.assertEqual(engine.run(), 'FAILED')
+        self.assertFalse((self.dir / 'out' / 'STOP-INPUT').exists())
+        self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
+        self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
         receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
         self.assertFalse(receipt['recovery']['ok'])
+        self.assertIn('recovery to r2 failed', receipt['recovery']['error'])
+        self.assertIsNone(engine.recovered_to)
         summary = json.loads((self.dir / 'out' / 'summary.json').read_text())
-        self.assertEqual(summary['rows'][2]['status'], 'not run')
+        self.assertEqual([row['status'] for row in summary['rows']], ['fail', 'pass', 'pass'])
+
+    def test_recovery_hook_raises_but_successor_steps_still_run(self):
+        self._continue_plan()
+        with (self.dir / 'steps.py').open('a') as f:
+            f.write('def broken(ctx):\n    raise RuntimeError("recover broke")\n')
+        self.plan['rows'][0]['on_failure'] = 'continue'
+        self.plan['rows'][1]['recover'] = [{'run': 'steps.py:broken'}]
+        self.plan['rows'][1]['steps'] = [{'shot': 'ok'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        engine = self.make(FakeEden({}, log_path=self.log))
+        self.assertEqual(engine.run(), 'FAILED')
+        receipt = json.loads((self.dir / 'out/r1.json').read_text())
+        self.assertIn('recover broke', receipt['recovery']['error'])
+        self.assertEqual(receipt['recovery']['to'], 'r2')
+        self.assertFalse(receipt['recovery']['ok'])
+        summary = json.loads((self.dir / 'out/summary.json').read_text())
+        self.assertEqual([row['status'] for row in summary['rows']], ['fail', 'pass', 'pass'])
+        self.assertFalse((self.dir / 'out/STOP-INPUT').exists())
+
+    def test_failed_rerun_recovery_does_not_prevent_row_steps(self):
+        self._continue_plan()
+        with (self.dir / 'steps.py').open('a') as f:
+            f.write('def broken(ctx):\n    raise RuntimeError("rerun recover broke")\n')
+        self.plan['rows'][1]['recover'] = [{'run': 'steps.py:broken'}]
+        self.plan['rows'][1]['steps'] = [{'shot': 'ok'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        out = self.dir / 'out'
+        out.mkdir()
+        (out / 'r2.json').write_text(json.dumps({'status': 'FAILED'}))
+        engine = self.make(FakeEden({}, log_path=self.log))
+        self.assertEqual(engine.run(only={'r2'}), 'DONE')
+        receipt = json.loads((out / 'r2.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        self.assertFalse(receipt['recovery']['ok'])
+        self.assertIn('rerun recover broke', receipt['recovery']['error'])
+        self.assertFalse((out / 'STOP-INPUT').exists())
+        self.assertIsNone(engine.recovered_to)
+
+    def test_game_stopping_during_recovery_still_stops_run(self):
+        self._continue_plan()
+        engine = self.make(FakeEden({}, log_path=self.log))
+        with mock.patch.object(engine, 'game_running', side_effect=[True, False]), \
+             mock.patch.object(engine, 'recover_to', side_effect=runner.RecoveryFailed('game quit')):
+            with self.assertRaises(runner.RecoveryFailed):
+                engine.run()
+        self.assertTrue((self.dir / 'out/STOP-INPUT').exists())
+        self.assertFalse((self.dir / 'out/r2.json').exists())
+
+    def test_failed_rerun_recovery_still_stops_if_game_is_not_running(self):
+        self._continue_plan()
+        out = self.dir / 'out'
+        out.mkdir()
+        (out / 'r2.json').write_text(json.dumps({'status': 'FAILED'}))
+        engine = self.make(FakeEden({}, log_path=self.log))
+        with mock.patch.object(engine, 'game_running', return_value=False), \
+             mock.patch.object(engine, 'recover_to', side_effect=runner.RecoveryFailed('game quit')):
+            with self.assertRaises(runner.RecoveryFailed):
+                engine.run(only={'r2'})
+        self.assertTrue((out / 'STOP-INPUT').exists())
+        receipt = json.loads((out / 'r2.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertFalse(receipt['recovery']['ok'])
 
     def test_a_crashed_game_stops_without_recovery(self):
         self._continue_plan()

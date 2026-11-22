@@ -129,6 +129,57 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual(io.actions, [])
         self.assertEqual(result['steps'], [])
 
+    def test_idle_waits_for_transient_notice_without_spending_input_steps(self):
+        for header in ('CPU Character', 'Fighters'):
+            with self.subTest(header=header):
+                io = MenuIO(self.ctx)
+                io.menu.update({'game.running': '0', 'notice.header': header})
+                clock, reads = [0.0], [0]
+                read = io.read
+
+                def delayed_read(provider, cap):
+                    if provider == 'tr.menu':
+                        reads[0] += 1
+                        if reads[0] > 15:
+                            io.menu['notice.header'] = ''
+                    return read(provider, cap)
+
+                io.read = delayed_read
+                with patch.object(routes.time, 'monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(routes.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                    result = self.invoke('tr_idle', io, cap=5)
+                self.assertEqual(io.actions, [])
+                self.assertEqual(result['steps'], [f'waited for notice "{header}" to clear'])
+                self.assertGreater(reads[0], 12)
+                self.assertLess(clock[0], 5)
+
+    def test_idle_notice_that_never_clears_fails_at_cap(self):
+        io = MenuIO(self.ctx)
+        io.menu.update({'game.running': '0', 'notice.header': 'CPU Character'})
+        clock = [0.0]
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(routes.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            with self.assertRaisesRegex(RuntimeError, 'expected plain idle Training within 1 s.*CPU Character'):
+                self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(clock[0], 1)
+        self.assertEqual(io.actions, [])
+
+    def test_idle_waits_for_native_owner_without_input(self):
+        io = MenuIO(self.ctx, fault='owner')
+        io.menu.update({'game.running': '0', 'notice.header': ''})
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+            if clock[0] >= .6:
+                io.fault = None
+
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(routes.time, 'sleep', side_effect=sleep):
+            result = self.invoke('tr_idle', io, cap=2)
+        self.assertEqual(result['verified']['input.owner'], 'native')
+        self.assertEqual(io.actions, [])
+
     def test_idle_closes_open_menu(self):
         io = MenuIO(self.ctx, opened=True, depth=2)
         io.menu.update({'game.running': '0', 'notice.header': ''})
