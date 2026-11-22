@@ -612,6 +612,14 @@ class SetTests(OpenCloseTests):
                 routes.tr_set(self.ctx, page='cpu', path=['lra_reset'], kind='toggle', value=[0, 1], cap=.1)
         self.assertNotIn('tap-a1', io.actions)
 
+    def test_malformed_final_settings_are_not_certified_off(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        with self.assertRaisesRegex(RuntimeError, r'expected a 0/1 integer array for menu.lra_reset'):
+            self.run_set(io, 'toggle', [0, 1], final={'lra_reset': [False, True]})
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-set.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+
     def test_friendly_toggle_and_list_values_preserve_original_arguments(self):
         for value, target in (('On', [1, 0]), ('OFF', [0, 1]), (True, [1, 0]), (False, [0, 1])):
             with self.subTest(value=value):

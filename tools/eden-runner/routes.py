@@ -2057,7 +2057,7 @@ def switch_to_training(ctx, p1=None, *, stage_topology=None, fighter_topology=No
 
 def _wait_tr_menu(io, until, opened, after=None, *, strict=False):
     while (remaining := until - time.monotonic()) > 0:
-        state = io.read('tr.menu', remaining)
+        state = _remember(io, io.read('tr.menu', remaining))
         block = state.block
         if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
             raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
@@ -2087,11 +2087,12 @@ def _wait_training_owner(io, menu, until, owner):
     expected = {**TRAINING_SCREEN, 'input.owner': owner}
     ui = None
     while time.monotonic() < until:
-        ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+        ui = _remember(io, native_picker.check_sample(
+            io.read(native_picker.UI, until - time.monotonic()), native_picker.UI))
         native_picker.same_epoch(menu, ui, in_flight=True)
         if _fields_match(ui, expected):
             return ui
-    raise _missing_navigation_state('Training Mod menu', ui, str(expected))
+    raise RuntimeError(f'expected input owner {owner}; saw {ui.values.get("input.owner") if ui else "unknown"}')
 
 
 def tr_menu(ctx):
@@ -2207,7 +2208,7 @@ def _tr_input(io, before, macro, until, *, opened=True):
     io.send(macro)
     latest = before
     while (remaining := until - time.monotonic()) > 0:
-        after = io.read('tr.menu', remaining)
+        after = _remember(io, io.read('tr.menu', remaining))
         block = after.block
         if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
             raise RuntimeError('Training Mod menu needs a complete tr.menu/1 reply')
@@ -2261,6 +2262,59 @@ def _with_setup_metrics(ctx, action):
             _merge_setup_metrics(previous, metrics)
 
 
+def _remember(io, state):
+    metrics = getattr(io.ctx.runner, 'setup_metrics', None)
+    if metrics is not None and 'last_seen' in metrics:
+        fields = ('open', 'page', 'depth', 'focus', 'action', 'row', 'game', 'game.running',
+                  'notice.header', 'notice.body', 'editor', 'editor.sel')
+        if state.block['name'] == 'tr.menu':
+            metrics['last_seen'].update({key: state.values[key] for key in fields if key in state.values})
+        elif state.block['name'] == native_picker.UI:
+            metrics['last_seen']['input.owner'] = state.values.get('input.owner', 'unknown')
+    return state
+
+
+def _block(ctx, block, name, args, action):
+    started = time.monotonic()
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {},
+               'retries': 0, 'last_seen': {}}
+    previous = getattr(ctx.runner, 'setup_metrics', None)
+    ctx.runner.setup_metrics = metrics
+    try:
+        try:
+            receipt = action(metrics)
+            receipt['ok'] = True
+        except RuntimeError as error:
+            last = dict(metrics['last_seen'])
+            seen = ' '.join(f'{key}={value}' for key, value in last.items()) or 'none'
+            observed = metrics.pop('observed', None)
+            elapsed = round((time.monotonic() - started) * 1000)
+            receipt = {'block': block, 'args': args, 'ok': False, 'error': str(error),
+                       'last_seen': last, **metrics, 'ms': {'total': elapsed}}
+            if observed is not None:
+                receipt['observed'] = observed
+            _save_block(ctx, name, receipt)
+            raise RuntimeError(f'{error}; last seen: {seen}') from error
+        return _save_block(ctx, name, receipt)
+    finally:
+        ctx.runner.setup_metrics = previous
+        if previous is not None:
+            _merge_setup_metrics(previous, metrics)
+
+
+def _save_block(ctx, name, receipt):
+    directory = Path(ctx.row_dir)
+    number = 1
+    while True:
+        suffix = '' if number == 1 else f'-{number}'
+        try:
+            with (directory / f'{name}{suffix}.json').open('x') as target:
+                target.write(json.dumps(receipt, indent=1, default=str) + '\n')
+            return receipt
+        except FileExistsError:
+            number += 1
+
+
 TR_PAGES = ('cpu', 'saves', 'recording', 'fighters_stages', 'display_controls', 'developer')
 
 
@@ -2268,7 +2322,7 @@ def _tr_current(io, until):
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise RuntimeError('Training Mod deadline expired before the menu read')
-    menu = io.read('tr.menu', remaining)
+    menu = _remember(io, io.read('tr.menu', remaining))
     if (menu.block['schema'] != 'tr.menu/1' or menu.block['rev'] <= 0 or menu.block['filtered']
             or menu.values.get('scene') != 'training' or menu.values.get('keyboard') != '0'
             or menu.values.get('open') not in ('0', '1')):
@@ -2339,37 +2393,48 @@ def _close_menu(io, until, *, after=None):
 
 
 def tr_open(ctx, page=None, cap=20):
-    if page is not None and page not in TR_PAGES:
-        raise RuntimeError(f'unknown Training Mod page {page!r}')
-    return _with_setup_metrics(ctx, lambda metrics: _tr_open(ctx, page, cap, metrics))
+    args = {'page': page, 'cap': cap}
+
+    def action(metrics):
+        if page is not None and page not in TR_PAGES:
+            raise RuntimeError(f'unknown Training Mod page {page!r}')
+        return _tr_open(ctx, page, cap, metrics)
+
+    return _block(ctx, 'tr_open', 'routes-tr-open', args, action)
 
 
 def _tr_open(ctx, page, cap, metrics):
     started = time.monotonic()
-    menu, skipped = _open_menu(BridgePickerIO(ctx), started + cap, page)
+    io = BridgePickerIO(ctx)
+    menu, skipped = _open_menu(io, started + cap, page)
     if menu.values.get('page') not in TR_PAGES or not menu.values.get('focus'):
         raise RuntimeError('Training Mod open menu page or focus is missing')
+    owner = _wait_training_owner(io, menu, started + cap, 'tr.menu')
     elapsed = round((time.monotonic() - started) * 1000)
-    return _save(ctx, 'routes-tr-open', {
+    return {
         'block': 'tr_open', 'args': {'page': page, 'cap': cap},
         'verified': {'open': menu.values['open'], 'page': menu.values.get('page'),
-                     'depth': _tr_depth(menu), 'owner': 'tr.menu', 'focus': menu.values.get('focus')},
+                     'depth': _tr_depth(menu), 'owner': owner.values['input.owner'], 'focus': menu.values.get('focus')},
         **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
-    })
+    }
 
 
 def tr_close(ctx, cap=20):
-    return _with_setup_metrics(ctx, lambda metrics: _tr_close(ctx, cap, metrics))
+    return _block(ctx, 'tr_close', 'routes-tr-close', {'cap': cap},
+                  lambda metrics: _tr_close(ctx, cap, metrics))
 
 
 def _tr_close(ctx, cap, metrics):
     started = time.monotonic()
-    menu, skipped = _close_menu(BridgePickerIO(ctx), started + cap)
+    io = BridgePickerIO(ctx)
+    menu, skipped = _close_menu(io, started + cap)
+    owner = _wait_training_owner(io, menu, started + cap, 'native')
     elapsed = round((time.monotonic() - started) * 1000)
-    return _save(ctx, 'routes-tr-close', {
-        'block': 'tr_close', 'args': {'cap': cap}, 'verified': {'open': menu.values['open'], 'owner': 'native'},
+    return {
+        'block': 'tr_close', 'args': {'cap': cap},
+        'verified': {'open': menu.values['open'], 'owner': owner.values['input.owner']},
         **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
-    })
+    }
 
 
 def _tr_path(path):
@@ -2435,12 +2500,17 @@ def _navigate_menu(io, menu, page, path, until):
 
 
 def tr_goto(ctx, page, path, cap=30):
-    if page not in TR_PAGES:
-        raise RuntimeError(f'unknown Training Mod page {page!r}')
-    targets = _tr_path(path)
-    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
-        raise RuntimeError('Training Mod path needs a positive cap')
-    return _with_setup_metrics(ctx, lambda metrics: _tr_goto(ctx, page, path, targets, cap, metrics))
+    args = {'page': page, 'path': path, 'cap': cap}
+
+    def action(metrics):
+        if page not in TR_PAGES:
+            raise RuntimeError(f'unknown Training Mod page {page!r}')
+        targets = _tr_path(path)
+        if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+            raise RuntimeError('Training Mod path needs a positive cap')
+        return _tr_goto(ctx, page, path, targets, cap, metrics)
+
+    return _block(ctx, 'tr_goto', 'routes-tr-goto', args, action)
 
 
 def _tr_goto(ctx, page, path, targets, cap, metrics):
@@ -2452,23 +2522,49 @@ def _tr_goto(ctx, page, path, targets, cap, metrics):
     _tr_identity(menu)
     if not menu.values.get('focus'):
         raise RuntimeError('Training Mod focus is missing')
+    owner = _wait_training_owner(io, menu, until, 'tr.menu')
     elapsed = round((time.monotonic() - started) * 1000)
-    return _save(ctx, 'routes-tr-goto', {
+    return {
         'block': 'tr_goto', 'args': {'page': page, 'path': path, 'cap': cap},
         'verified': {key: menu.values.get(key) for key in ('focus', 'page', 'group', 'cursor', 'action', 'row')}
-                    | {'depth': _tr_depth(menu)},
+                    | {'depth': _tr_depth(menu), 'owner': owner.values['input.owner']},
         **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
-    })
+    }
 
 
 def _settings_menu(data):
+    class Pairs(list):
+        pass
+
+    def unique(pairs, label):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise RuntimeError(f'duplicate settings key {label}{key}')
+            result[key] = value
+        return result
+
     try:
-        menu = json.loads(data)['menu']
+        root = json.loads(data, object_pairs_hook=Pairs)
+        if not isinstance(root, Pairs):
+            raise ValueError('top-level settings is not an object')
+        top = unique(root, '')
+        menu = top['menu']
+        for name in ('menu', 'defaults_menu'):
+            if isinstance(top.get(name), Pairs):
+                unique(top[name], name + '.')
     except (ValueError, KeyError, TypeError) as error:
         raise RuntimeError(f'settings menu is missing or malformed: {error}') from error
-    if not isinstance(menu, dict):
+    if not isinstance(menu, Pairs):
         raise RuntimeError('settings menu is not an object')
-    return menu
+    return unique(menu, 'menu.')
+
+
+def _settings_row(menu, key):
+    value = menu.get(key)
+    if not isinstance(value, list) or any(type(item) is not int or item not in (0, 1) for item in value):
+        raise RuntimeError(f'expected a 0/1 integer array for menu.{key}; saw {value!r}')
+    return value
 
 
 def _stored_one_hot(size, selected):
@@ -2522,20 +2618,19 @@ def _practice_target(row_id, value, before):
 
 
 def tr_set(ctx, page, path, kind, value, cap=45):
-    if page not in TR_PAGES:
-        raise RuntimeError(f'unknown Training Mod page {page!r}')
-    targets = _tr_path(path)
-    if kind not in ('list', 'toggle', 'checklist', 'practice_cpu'):
-        raise RuntimeError(f'unknown Training Mod setting kind {kind!r}')
-    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
-        raise RuntimeError('Training Mod setting needs a positive cap')
-    if kind != 'practice_cpu':
-        if (not isinstance(value, list) or not value
-                or any(type(item) is not int or item not in (0, 1) for item in value)):
-            raise RuntimeError('setting value must be a binary array')
-        if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
-            raise RuntimeError(f'invalid {kind} value encoding')
-    return _with_setup_metrics(ctx, lambda metrics: _tr_set(ctx, page, path, targets, kind, value, cap, metrics))
+    args = {'page': page, 'path': path, 'kind': kind, 'value': value, 'cap': cap}
+
+    def action(metrics):
+        if page not in TR_PAGES:
+            raise RuntimeError(f'unknown Training Mod page {page!r}')
+        targets = _tr_path(path)
+        if kind not in ('list', 'toggle', 'checklist', 'practice_cpu'):
+            raise RuntimeError(f'unknown Training Mod setting kind {kind!r}')
+        if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+            raise RuntimeError('Training Mod setting needs a positive cap')
+        return _tr_set(ctx, page, path, targets, kind, value, cap, metrics)
+
+    return _block(ctx, 'tr_set', 'routes-tr-set', args, action)
 
 
 def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
@@ -2555,10 +2650,26 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
     if row_id not in kinds[kind]:
         raise RuntimeError(f'Training Mod row {row_id!r} is not the requested kind {kind!r}')
     if kind == 'practice_cpu':
+        prefix = 'edge' if row_id == 'edge_difficulty' else 'juggle'
+        for key in (row_id, prefix + '_cpu_fighter', prefix + '_cpu_level'):
+            _settings_row(before_menu, key)
         entry, level, mode, wanted = _practice_target(row_id, value, before_menu)
         before = {key: before_menu.get(key) for key in wanted}
     else:
-        before = before_menu.get(row_id)
+        before = _settings_row(before_menu, row_id)
+        original_value = value
+        if kind == 'toggle' and (type(value) is bool or isinstance(value, str) and value.casefold() in ('on', 'off')):
+            on = value if type(value) is bool else value.casefold() == 'on'
+            value = [int(on), int(not on)]
+        elif kind == 'list' and type(value) is int:
+            if not 0 <= value < len(before):
+                raise RuntimeError(f'expected list index in range; saw {value!r}')
+            value = _stored_one_hot(len(before), value)
+        if (not isinstance(value, list) or not value
+                or any(type(item) is not int or item not in (0, 1) for item in value)):
+            raise RuntimeError(f'expected a 0/1 integer array for value; saw {value!r}')
+        if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
+            raise RuntimeError(f'invalid {kind} value encoding')
         if not isinstance(before, list) or len(before) != len(value):
             raise RuntimeError(f'settings menu.{row_id} has a missing or incompatible array')
         wanted = {row_id: value}
@@ -2683,9 +2794,10 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
     if current.values.get('open') != '0':
         raise RuntimeError('Training Mod menu reopened during settings read-back')
     for key, target in wanted.items():
-        if after_menu.get(key) != target:
+        current_value = _settings_row(after_menu, key)
+        if current_value != target:
             raise RuntimeError(f'settings read-back mismatch for menu.{key}: expected {target!r}, '
-                               f'got {after_menu.get(key)!r}')
+                               f'saw {current_value!r}')
     after = {key: after_menu[key] for key in wanted} if kind == 'practice_cpu' else after_menu[row_id]
     verified = {'row_id': row_id, 'before': before, 'after': after,
                 'settings_sha256': hashlib.sha256(after_bytes).hexdigest(), 'writer': line}
@@ -2693,12 +2805,15 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
         verified['mode'] = value['mode']
         verified['mode_stored'] = wanted[row_id]
         verified['mode_witness'] = 'stored encoding' if already else 'editor.sel_key'
+    else:
+        verified['value_stored'] = value
     elapsed = round((time.monotonic() - started) * 1000)
-    return _save(ctx, 'routes-tr-set', {
-        'block': 'tr_set', 'args': {'page': page, 'path': path, 'kind': kind, 'value': value, 'cap': cap},
+    return {
+        'block': 'tr_set', 'args': {'page': page, 'path': path, 'kind': kind,
+                                    'value': value if kind == 'practice_cpu' else original_value, 'cap': cap},
         'verified': verified, **metrics, 'ms': {'setting': elapsed, 'total': elapsed},
         'skipped': ['change', 'writer'] if already else [],
-    })
+    }
 
 
 def _edge_wizard(menu):
