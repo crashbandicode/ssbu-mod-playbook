@@ -139,9 +139,12 @@ class ReviewClassTests(unittest.TestCase):
             path.write_text(json.dumps(plan))
             self.assertEqual(runner.dry_run(path)['review'],
                              {'class': 'library-only', 'private': [],
-                              'arguments': [{'where': 'setup 0', 'step': 'setup fixture',
-                                             'args': {'state': 'training', 'ref': 'settings',
-                                                      'reviewed': plan['setup'][0]['reviewed']}}]})
+                              'composition': [
+                                  {'where': 'plan', 'item': {'start': 'menu'}},
+                                  {'where': 'imports', 'item': {'segments': {}, 'gates': {}}},
+                                  {'where': 'setup 0', 'item': plan['setup'][0]},
+                                  {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu'}},
+                                  {'where': 'row r1 step 0', 'item': {'shot': 'x'}}]})
             plan['setup'] = [{'via': 'fixture'}]
             path.write_text(json.dumps(plan))
             report = runner.dry_run(path)
@@ -151,7 +154,7 @@ class ReviewClassTests(unittest.TestCase):
             path.write_text(json.dumps({'segments': {'missing': {'library': 'not-an-entry'}}}))
             report = runner.dry_run(path)
             self.assertEqual(report['result'], 'BROKEN')
-            self.assertEqual(report['review'], {'class': 'full', 'private': [], 'arguments': []})
+            self.assertEqual(report['review'], {'class': 'full', 'private': [], 'composition': []})
 
 
 class ReviewAdmissionTests(unittest.TestCase):
@@ -189,7 +192,71 @@ class ReviewAdmissionTests(unittest.TestCase):
         self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
         self.assertEqual(report['roles_defaulted'], ['r1'])
 
-    def test_arguments_list_clean_composition_in_manifest_order(self):
+    def test_composition_distinguishes_reviewer_packets(self):
+        first = copy.deepcopy(self.plan)
+        first['gates']['confirm'] = {'library': 'main'}
+        first['rows'][0].update(start_gate='confirm', steps=[
+            {'gate': 'confirm', 'on': 'guest'},
+            {'copy': 'settings', 'as': 'before', 'on': 'guest'},
+            {'json_diff': {'source': 'settings', 'before': 'before', 'must_change': ['p1']}, 'on': 'guest'}])
+        second = copy.deepcopy(first)
+        second['gates']['confirm'] = {'library': 'installed'}
+        second['rows'][0]['steps'][0]['on'] = 'host'
+        second['rows'][0]['steps'][1]['on'] = 'host'
+        second['rows'][0]['steps'][2]['on'] = 'host'
+        second['rows'][0]['steps'][2]['json_diff'].pop('must_change')
+        reviews = [self.report(plan)['review'] for plan in (first, second)]
+        self.assertEqual([review['class'] for review in reviews], ['library-only', 'library-only'])
+        self.assertNotEqual(reviews[0].get('composition', reviews[0].get('arguments')),
+                            reviews[1].get('composition', reviews[1].get('arguments')))
+        for plan, review in zip((first, second), reviews):
+            entries = {entry['where']: entry['item'] for entry in review['composition']}
+            self.assertEqual(entries['imports']['gates']['confirm'], plan['gates']['confirm']['library'])
+            self.assertEqual(entries['row r1']['start_gate'], 'confirm')
+            self.assertEqual(entries['row r1 step 0'], plan['rows'][0]['steps'][0])
+            self.assertEqual(entries['row r1 step 1'], plan['rows'][0]['steps'][1])
+            self.assertEqual(entries['row r1 step 2'], plan['rows'][0]['steps'][2])
+
+    def test_composition_reconstructs_clean_packet(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'][0]['differs_only'] = ['menu.cpu_percent']
+        plan['rows'][0]['recover'] = [{'call': 'status', 'params': {'side': 'guest'}}]
+        plan['recover'] = [{'gate': 'main'}, {'library': 'smash-main'}]
+        review = self.report(plan)['review']
+        self.assertEqual(review['class'], 'library-only')
+        composition = review['composition']
+        self.assertEqual(composition[0], {'where': 'plan', 'item': {'start': 'menu'}})
+        imports = composition[1]['item']
+        rebuilt = {'segments': {key: {'library': value} for key, value in imports['segments'].items()},
+                   'gates': {key: {'library': value} for key, value in imports['gates'].items()},
+                   'setup': [], 'rows': [], 'recover': []}
+        row = None
+        for entry in composition[2:]:
+            where, item = entry['where'], entry['item']
+            if where.startswith('setup '):
+                rebuilt['setup'].append(item)
+            elif where == 'row r1':
+                row = {**item, 'steps': [], 'recover': []}
+                rebuilt['rows'].append(row)
+            elif where.startswith('row r1 step '):
+                row['steps'].append(item)
+            elif where.startswith('row r1 recover '):
+                row['recover'].append(item)
+            elif where.startswith('plan recover '):
+                rebuilt['recover'].append(item)
+        self.assertEqual(rebuilt, {key: plan[key] for key in rebuilt})
+
+    def test_full_composition_includes_raw_private_step_and_import_override(self):
+        plan = copy.deepcopy(self.plan)
+        plan['gates']['main']['tolerance'] = 255
+        plan['rows'][0]['steps'].append({'ui': 'trigger', 'target': 'widget', 'on': 'guest'})
+        review = self.report(plan)['review']
+        self.assertEqual(review['class'], 'full')
+        entries = {entry['where']: entry['item'] for entry in review['composition']}
+        self.assertEqual(entries['imports']['gates']['main'], plan['gates']['main'])
+        self.assertEqual(entries['row r1 step 5'], plan['rows'][0]['steps'][5])
+
+    def test_composition_lists_raw_items_in_order(self):
         plan = copy.deepcopy(self.plan)
         plan['setup'][0].update(to='settings.json', instance='a', differs_only=['menu.cpu_percent'], ignored=True)
         plan['rows'][0]['steps'] = [
@@ -202,47 +269,36 @@ class ReviewAdmissionTests(unittest.TestCase):
         plan['recover'] = [{'gate': 'main'}, {'play': 'route'}, {'library': 'smash-main'}]
         report = self.report(plan)['review']
         self.assertEqual(report['class'], 'library-only')
-        self.assertEqual(report['arguments'], [
-            {'where': 'setup 0', 'step': 'setup fixture',
-             'args': {'state': 'training', 'ref': 'settings', 'to': 'settings.json', 'instance': 'a',
-                      'differs_only': ['menu.cpu_percent'], 'reviewed': plan['setup'][0]['reviewed']}},
-            {'where': 'row r1 step 0', 'step': 'gate main'},
-            {'where': 'row r1 step 1', 'step': 'play route'},
-            {'where': 'row r1 step 2', 'step': 'library smash-main'},
-            {'where': 'row r1 step 3', 'step': 'run routes:wait_lines',
-             'args': {'lines': [['console', '.*']]}},
-            {'where': 'row r1 step 4', 'step': 'call status', 'args': {'selector': 'a'}},
-            {'where': 'row r1 step 5', 'step': 'run routes:to_main', 'args': {}},
-            {'where': 'row r1 step 6', 'step': 'call status', 'args': {}},
-            {'where': 'row r1 recover 0', 'step': 'call status', 'args': {'selector': 'b'}},
-            {'where': 'row r1 recover 1', 'step': 'run routes:wait_lines',
-             'args': {'lines': [['trace', 'ok']]}},
-            {'where': 'plan recover 0', 'step': 'gate main'},
-            {'where': 'plan recover 1', 'step': 'play route'},
-            {'where': 'plan recover 2', 'step': 'library smash-main'}])
+        self.assertEqual(report['composition'], [
+            {'where': 'plan', 'item': {'start': 'menu'}},
+            {'where': 'imports', 'item': {'segments': {'route': 'smash-main'},
+                                           'gates': {'main': 'main', 'installed': 'installed',
+                                                     'smash-submenu': 'smash-submenu'}}},
+            {'where': 'setup 0', 'item': plan['setup'][0]},
+            {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu'}},
+            *[{'where': f'row r1 step {i}', 'item': step} for i, step in enumerate(plan['rows'][0]['steps'])],
+            *[{'where': f'row r1 recover {i}', 'item': step} for i, step in enumerate(plan['rows'][0]['recover'])],
+            *[{'where': f'plan recover {i}', 'item': step} for i, step in enumerate(plan['recover'])]])
 
         reordered = {key: plan[key] for key in ('start', 'rows', 'recover', 'setup', 'segments', 'gates')}
         reordered_report = self.report(reordered)['review']
         self.assertEqual(reordered_report['class'], 'library-only')
-        self.assertEqual(reordered_report['arguments'],
-                         report['arguments'][1:] + report['arguments'][:1])
+        self.assertEqual(reordered_report['composition'], report['composition'])
 
-    def test_full_review_still_lists_arguments(self):
+    def test_full_review_still_lists_composition(self):
         plan = copy.deepcopy(self.plan)
         plan['rows'][0]['steps'].append({'run': 'custom.py:boot', 'args': {'value': 7}})
         plan['rows'][0]['recover'] = [{'call': 'settings.set', 'params': {'key': 'value'}}]
         report = self.report(plan)['review']
         self.assertEqual(report['class'], 'full')
-        self.assertIn({'where': 'row r1 step 5', 'step': 'run custom.py:boot', 'args': {'value': 7}},
-                      report['arguments'])
-        self.assertIn({'where': 'row r1 recover 0', 'step': 'call settings.set', 'args': {'key': 'value'}},
-                      report['arguments'])
+        self.assertIn({'where': 'row r1 step 5', 'item': plan['rows'][0]['steps'][5]}, report['composition'])
+        self.assertIn({'where': 'row r1 recover 0', 'item': plan['rows'][0]['recover'][0]}, report['composition'])
 
-    def test_broken_library_reference_has_empty_arguments(self):
+    def test_broken_library_reference_has_empty_composition(self):
         self.manifest.write_text(json.dumps({'segments': {'bad': {'library': 'not-an-entry'}}}))
         report = runner.dry_run(self.manifest)
         self.assertEqual(report['result'], 'BROKEN')
-        self.assertEqual(report['review']['arguments'], [])
+        self.assertEqual(report['review']['composition'], [])
 
     def test_allowlist_rejects_reviewer_cases_and_unused_entries(self):
         ref = self.dir / 'private-gate.png'

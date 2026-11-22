@@ -686,7 +686,6 @@ def publish_gif(raw_path, dest, spec, source_fps=None):
 
 def review_class(plan, base, raw_plan=None):
     private = []
-    arguments = []
     segments = plan.get('segments', {})
     raw = plan if raw_plan is None else raw_plan
     raw_segments, raw_gates = raw.get('segments', {}), raw.get('gates', {})
@@ -745,35 +744,27 @@ def review_class(plan, base, raw_plan=None):
         if verb == 'call' and (not isinstance(item['call'], str) or item['call'] not in read_only):
             add(where, f'call {item["call"]}')
 
-    def describe_steps(steps, where):
-        if not isinstance(steps, list):
-            return
-        for i, item in enumerate(steps):
-            if not isinstance(item, dict):
-                continue
-            for verb in item:
-                if verb not in ('run', 'call', 'library', 'play', 'gate'):
-                    continue
-                entry = {'where': f'{where} {i}', 'step': f'{verb} {item[verb]}'}
-                if verb in ('run', 'call'):
-                    entry['args'] = item.get('args' if verb == 'run' else 'params', {})
-                arguments.append(entry)
-
-    for section, value in raw.items():
-        if section == 'setup' and isinstance(value, list):
-            for i, item in enumerate(value):
-                item = item if isinstance(item, dict) else {}
-                args = {key: item[key] for key in ('state', 'ref', 'to', 'instance', 'differs_only', 'reviewed')
-                        if key in item}
-                arguments.append({'where': f'setup {i}', 'step': f'setup {item.get("via")}', 'args': args})
-        elif section == 'rows' and isinstance(value, list):
-            for row in value:
-                for key, items in row.items():
-                    if key in ('steps', 'recover'):
-                        suffix = 'step' if key == 'steps' else 'recover'
-                        describe_steps(items, f'row {row["id"]} {suffix}')
-        elif section == 'recover':
-            describe_steps(value, 'plan recover')
+    composition = [
+        {'where': 'plan', 'item': {key: value for key, value in raw.items()
+                                   if key not in ('rows', 'segments', 'gates', 'setup', 'recover')}},
+        {'where': 'imports', 'item': {
+            kind: {name: entry['library'] if isinstance(entry, dict) and set(entry) == {'library'} else entry
+                   for name, entry in entries.items()}
+            for kind, entries in (('segments', raw_segments), ('gates', raw_gates))}}]
+    setup = raw.get('setup')
+    if isinstance(setup, list):
+        composition.extend({'where': f'setup {i}', 'item': item} for i, item in enumerate(setup))
+    for row in raw.get('rows', []):
+        where = f'row {row["id"]}'
+        composition.append({'where': where, 'item': {key: value for key, value in row.items()
+                                                     if key not in ('steps', 'recover')}})
+        for key, label in (('steps', 'step'), ('recover', 'recover')):
+            if isinstance(row.get(key), list):
+                composition.extend({'where': f'{where} {label} {i}', 'item': item}
+                                   for i, item in enumerate(row[key]))
+    if isinstance(raw.get('recover'), list):
+        composition.extend({'where': f'plan recover {i}', 'item': item}
+                           for i, item in enumerate(raw['recover']))
 
     for key in sorted(set(raw) - plan_keys):
         add('plan', f'plan key {key}')
@@ -810,7 +801,7 @@ def review_class(plan, base, raw_plan=None):
                               and ref[len('library:'):] in index.get('segments', {}))
             if not valid:
                 add(f'setup {i}', f'{via or "unknown"} setup {ref or ""}'.strip())
-    return {'class': 'full' if private else 'library-only', 'private': private, 'arguments': arguments}
+    return {'class': 'full' if private else 'library-only', 'private': private, 'composition': composition}
 
 
 def dry_run(manifest_path):
@@ -823,7 +814,7 @@ def dry_run(manifest_path):
     except KeyError as error:
         return {'manifest': str(manifest_path), 'errors': [str(error)], 'result': 'BROKEN', 'rows': 0,
                 'missing_segments': [], 'references_to_acquire': [], 'available_segments': [],
-                'review': {'class': 'full', 'private': [], 'arguments': []}, 'roles_defaulted': roles_defaulted}
+                'review': {'class': 'full', 'private': [], 'composition': []}, 'roles_defaulted': roles_defaulted}
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
