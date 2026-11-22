@@ -104,12 +104,44 @@ class ObserveTests(unittest.TestCase):
         self.path.write_text('')
         self.ctx = SimpleNamespace(runner=SimpleNamespace(), row_dir=directory.name, on='s',
                                    instance={'trace_jsonl': str(self.path)})
-        self.ctx.call = lambda method, params: {
-            'points': [{'id': '8', 'state': 'armed', 'mode': 'records',
-                        'target': 'libtraining_rooms.nro!edge_juggle_attempt', 'dropped': '0',
-                        'process_id': '81', 'address': '0x1234'}],
-            'output': str(self.path), 'output_error': '', 'boot_error': '', 'file_lost': '0'}
         self.pending = []
+
+        def counters(point):
+            rows = []
+            for line in self.path.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict) and str(row.get('sequence', '')).isdigit():
+                        rows.append(row)
+                except ValueError:
+                    pass
+            recorded = sum(str(row.get('point_id')) == point for row in rows)
+            return {'hits': str(recorded), 'matched': str(recorded), 'recorded': str(recorded), 'dropped': '0'}
+
+        self.counters = counters
+
+        def call(method, params):
+            rows = []
+            for line in self.path.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict) and str(row.get('sequence', '')).isdigit():
+                        rows.append(row)
+                except ValueError:
+                    pass
+            maximum = max((int(row['sequence']) for row in rows), default=0)
+            own = int(counters('8')['recorded'])
+            other = max(0, maximum - own)
+            return {
+                'points': [{'id': '8', 'state': 'armed', 'mode': 'records',
+                            'target': 'libtraining_rooms.nro!edge_juggle_attempt',
+                            'process_id': '81', 'address': '0x1234', **counters('8')},
+                           {'id': '99', 'state': 'armed', 'mode': 'records',
+                            'target': 'other!point', 'hits': str(other), 'matched': str(other),
+                            'recorded': str(other), 'dropped': '0'}],
+                'output': str(self.path), 'output_error': '', 'boot_error': '', 'file_lost': '0'}
+
+        self.ctx.call = call
 
         def check_stop():
             if self.pending:
@@ -155,9 +187,48 @@ class ObserveTests(unittest.TestCase):
         self.pending = [json.dumps(terminal) + '\n']
         with self.assertRaisesRegex(RuntimeError, 'stopped'):
             self.invoke(attempts=1, cap=.5)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-observe.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+        self.assertEqual(receipt['observed']['running'], '0')
         self.pending = [json.dumps(terminal) + '\n']
         result = self.invoke(attempts=1, cap=.5, allow_stopped=True)
         self.assertEqual(result['verified']['running'], '0')
+
+    def test_changed_game_and_juggler_terminal_are_not_guard_observation(self):
+        terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
+        terminal['registers']['x0'] = hex(int(terminal['registers']['x0'], 16) | (1 << 24))
+        self.pending = [json.dumps(terminal) + '\n']
+        read = self.io.read
+        count = 0
+
+        def changed(provider, cap):
+            nonlocal count
+            count += 1
+            if count > 1:
+                self.io.menu['game'] = 'Juggler'
+            return read(provider, cap)
+
+        self.io.read = changed
+        with self.assertRaisesRegex(RuntimeError, r'expected.*Guard|sequence.*expected'):
+            self.invoke(attempts=1, cap=.5)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-observe.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+
+    def test_filtered_attempt_hit_is_not_complete_observation(self):
+        self.pending = [json.dumps(excerpt('cp1b-hero-attempt.jsonl')[1]) + '\n']
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            if self.path.stat().st_size:
+                result['points'][0]['hits'] = str(int(result['points'][0]['hits']) + 1)
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'expected every attempt hit recorded'):
+            self.invoke(attempts=1, cap=.5)
 
     def test_epoch_change_fails(self):
         terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
@@ -336,7 +407,8 @@ class StartIO(fake.RowsIO):
         self.wizard = wizard
         self.menu.update({'open': '0' if wizard else '1', 'game': 'Guard the Edge' if wizard else '',
                           'game.running': '1' if wizard else '0',
-                          'notice.header': 'Edge · 4/4' if wizard else '', 'notice.body': ''})
+                          'notice.header': 'Edge · 4/4' if wizard else '',
+                          'notice.body': 'CPU (1, 1) · 0% · P1 (0, 0)' if wizard else ''})
 
     def send(self, segment):
         if segment == 'tap-a1' and (self.wizard or self.menu['depth'] == '1'):
@@ -365,12 +437,66 @@ class StartTests(ObserveTests):
 
         def call(method, params):
             result = original(method, params)
+            other = next(point for point in result['points'] if point['id'] == '99')
+            for key in ('hits', 'matched', 'recorded'):
+                other[key] = str(int(other[key]) - int(self.counters('5')['recorded']))
             result['points'].append({'id': '5', 'state': 'armed', 'mode': 'records',
-                                     'target': 'libtraining_rooms.nro!planner_chose', 'dropped': '0',
-                                     'process_id': '81', 'address': '0x5678'})
+                                     'target': 'libtraining_rooms.nro!planner_chose',
+                                     'process_id': '81', 'address': '0x5678', **self.counters('5')})
             return result
 
         self.ctx.call = call
+
+    def test_pre_input_pyra_records_cannot_certify_start(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        original = self.ctx.call
+        injected = False
+
+        def call(method, params):
+            nonlocal injected
+            if not injected:
+                injected = True
+                self.path.write_text(contiguous(excerpt('cp1b-pyra-attempt.jsonl')))
+            return original(method, params)
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'first release|deadline'):
+            self.invoke_start(expect={'plan': [0, 38]}, cap=.2)
+
+    def test_terminal_must_close_same_release_ordinal(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, _, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        terminal['registers']['x0'] = hex((int(terminal['registers']['x0'], 16) & ~0xffff) | 2)
+        self.pending = [contiguous([release, terminal])]
+        with self.assertRaisesRegex(RuntimeError, 'expected.*ordinal.*1.*saw.*2'):
+            self.invoke_start(expect={'plan': 'none'})
+
+    def test_filtered_planner_hit_cannot_certify_none(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, terminal = excerpt('cp1b-hero-level9-none.jsonl')
+        self.pending = [contiguous([release, terminal])]
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            if self.path.stat().st_size:
+                point = next(point for point in result['points'] if point['id'] == '5')
+                point['hits'] = '1'
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, r'not observed \(planner hit 1 times, recorded 0\)'):
+            self.invoke_start(expect={'plan': 'none'})
+
+    def test_start_accepts_three_page_preview_by_body(self):
+        del self.ctx.instance['trace_jsonl']
+        self.io = StartIO(self.ctx)
+        self.io.menu['notice.header'] = 'Edge · 3/3'
+        result = self.invoke_start()
+        self.assertTrue(result['ok'])
 
     def test_wizard_bridge_only_without_trace(self):
         del self.ctx.instance['trace_jsonl']
@@ -406,7 +532,9 @@ class StartTests(ObserveTests):
         with self.assertRaisesRegex(RuntimeError, 'mismatch'):
             self.invoke_start(expect={'cpu_kind': 0})
         receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
-        self.assertEqual(receipt['verified']['markers_before_release'],
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+        self.assertEqual(receipt['observed']['markers_before_release'],
                          [{'sequence': 44361, 'frame': 33041, 'event': 2, 'terminal': 'ledge'}])
 
     def test_expect_without_trace_and_missing_planner_refuse_before_input(self):
@@ -456,8 +584,12 @@ class StartTests(ObserveTests):
                     self.enable_planner()
                 with self.assertRaisesRegex(RuntimeError, 'mismatch'):
                     self.invoke_start(expect={key: value})
-                receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
-                self.assertEqual(receipt['verified']['first_release']['sequence'], 44362)
+                latest = max(Path(self.ctx.row_dir).glob('routes-drill-start*.json'),
+                             key=lambda path: path.stat().st_mtime_ns)
+                receipt = json.loads(latest.read_text())
+                self.assertFalse(receipt['ok'])
+                self.assertNotIn('verified', receipt)
+                self.assertEqual(receipt['observed']['first_release']['sequence'], 44362)
                 self.ctx.call = original
 
     def test_menu_start_requires_a_running_transition_and_no_existing_game(self):
