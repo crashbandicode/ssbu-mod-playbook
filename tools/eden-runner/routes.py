@@ -36,6 +36,7 @@ from pathlib import Path
 
 import native_picker
 import state_gate
+import trace_attempts
 from native_picker_io import BridgePickerIO
 
 HERE = Path(__file__).resolve().parent
@@ -2364,6 +2365,96 @@ def _tr_close(ctx, cap, metrics):
         'block': 'tr_close', 'args': {'cap': cap}, 'verified': {'open': menu.values['open'], 'owner': 'native'},
         **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
     })
+
+
+def drill_observe(ctx, attempts, cap, allow_stopped=False):
+    if type(attempts) is not int or attempts <= 0 or type(cap) not in (int, float) or not 0 < cap < float('inf'):
+        raise RuntimeError('drill observation needs positive attempts and cap')
+    if type(allow_stopped) is not bool:
+        raise RuntimeError('allow_stopped must be a boolean')
+    return _with_setup_metrics(ctx, lambda metrics: _drill_observe(ctx, attempts, cap, allow_stopped, metrics))
+
+
+def _attempt_trace_status(ctx, path):
+    status = ctx.call('trace.list', {})
+    point = trace_attempts.point_id(status, 'edge_juggle_attempt')
+    if (status.get('output_error') or status.get('boot_error') or status.get('output') != path
+            or 'file_lost' not in status):
+        raise RuntimeError('attempt trace output is unavailable or mismatched')
+    initial_point = next(item for item in status['points'] if isinstance(item, dict) and str(item.get('id')) == point)
+    if 'dropped' not in initial_point:
+        raise RuntimeError('attempt trace loss counter is unavailable')
+    try:
+        baseline_loss = (trace_attempts._decimal(status['file_lost']), trace_attempts._decimal(initial_point['dropped']))
+    except ValueError:
+        raise RuntimeError('attempt trace loss counter is unavailable') from None
+    identity = (initial_point.get('process_id'), initial_point.get('address'))
+    try:
+        if int(identity[0]) <= 0 or int(identity[1], 0) <= 0:
+            raise ValueError('invalid identity')
+    except (TypeError, ValueError):
+        raise RuntimeError('attempt trace point lacks a live process and address') from None
+    return point, baseline_loss, identity
+
+
+def _drill_observe(ctx, attempts, cap, allow_stopped, metrics):
+    started = time.monotonic()
+    until = started + cap
+    path = ctx.instance.get('trace_jsonl')
+    if not isinstance(path, str) or not path:
+        raise RuntimeError('drill observation needs a trace_jsonl')
+    stream = trace_attempts.Stream(path, '')
+    trace_identity = _attempt_trace_status(ctx, path)
+    point, loss, identity = trace_identity
+    if loss != (0, 0):
+        raise RuntimeError('attempt trace loss counters are nonzero at observation start')
+    stream.point = point
+    if _attempt_trace_status(ctx, path) != trace_identity:
+        raise RuntimeError('attempt trace loss or output changed')
+    io = BridgePickerIO(ctx)
+    baseline = _tr_current(io, until)
+    marks = []
+    counts = {}
+
+    def collect():
+        for mark in stream.read(until):
+            if mark['process'] != str(identity[0]):
+                raise RuntimeError('attempt marker came from a different trace process')
+            marks.append(mark)
+            terminal = mark['terminal']
+            if terminal:
+                counts[terminal] = counts.get(terminal, 0) + 1
+
+    while time.monotonic() < until:
+        ctx.check_stop()
+        collect()
+        if sum(counts.values()) >= attempts:
+            break
+        time.sleep(min(.05, max(0, until - time.monotonic())))
+    if sum(counts.values()) < attempts:
+        raise RuntimeError(f'{sum(counts.values())} terminals observed before deadline; wanted {attempts}')
+    final = _tr_current(io, until)
+    native_picker.same_epoch(baseline, final, in_flight=True)
+    running = final.values.get('game.running')
+    if running not in ('0', '1'):
+        raise RuntimeError('drill running state is missing')
+    if _attempt_trace_status(ctx, path) != trace_identity:
+        raise RuntimeError('attempt trace loss or output changed')
+    collect()
+    if time.monotonic() >= until:
+        raise RuntimeError(f'{sum(counts.values())} terminals observed but drill observation deadline expired')
+    elapsed = round((time.monotonic() - started) * 1000)
+    receipt = _save(ctx, 'routes-drill-observe', {
+        'block': 'drill_observe', 'args': {'attempts': attempts, 'cap': cap, 'allow_stopped': allow_stopped},
+        'verified': {'game': final.values.get('game'), 'running': running,
+                     'releases': sum(mark['event'] == 0 for mark in marks), 'terminals': counts,
+                     'first_sequence': marks[0]['sequence'], 'last_sequence': marks[-1]['sequence'],
+                     'first_frame': marks[0]['frame'], 'last_frame': marks[-1]['frame']},
+        **metrics, 'ms': {'observe': elapsed, 'total': elapsed}, 'skipped': [],
+    })
+    if running == '0' and not allow_stopped:
+        raise RuntimeError('drill stopped while observing attempts')
+    return receipt
 
 
 def _set_fighter(ctx, fighter, seat, cap, metrics):

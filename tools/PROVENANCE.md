@@ -163,3 +163,8 @@ temporary library (5 host tests); `2eb13ee5204f28cc`.
 The 15-line real trace fixture is `eden-runner/fixtures/trace-text/set-text-excerpt.jsonl` (`418ecc8cb4c813ce`);
 its source and sequences are in `eden-runner/fixtures/trace-text/PROVENANCE.md`. Twenty-six reader host tests; no live boot
 proof yet.
+
+2026-11-22: `eden-runner/trace_attempts.py` ports marker decoding from edge-juggle
+`evidence/tools/attempt_boundaries.py` and plan registers from `compare_attempts.py`. The Pyra and Hero excerpts
+in `eden-runner/test-data/` are identified with their full source paths and SHA-256 in `test_trace_attempts.py`.
+The marker's form field is the stage form, not the CPU form. No live acceptance is claimed.

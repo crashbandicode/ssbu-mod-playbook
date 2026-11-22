@@ -3,6 +3,7 @@
 import importlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,9 +13,9 @@ import routes
 import test_setup_blocks as fake
 
 
-# Source: phase23/edge-juggle/evidence/cp1b-pyra38-1/trace/edge-juggle-p0-83eecc32.trace.jsonl
+# Source: /home/intpa/smash-training-lobby/artifacts/phase23/edge-juggle/evidence/cp1b-pyra38-1/trace/edge-juggle-p0-83eecc32.trace.jsonl
 # SHA-256 bb83adcca818425248239fbe6fe575d0c382cb50fcb9be9b57cb5ff1e573a9df
-# Source: phase23/edge-juggle/evidence/cp1b-hero32-3/trace/edge-juggle-p0-83eecc32.trace.jsonl
+# Source: /home/intpa/smash-training-lobby/artifacts/phase23/edge-juggle/evidence/cp1b-hero32-3/trace/edge-juggle-p0-83eecc32.trace.jsonl
 # SHA-256 a1966f89197ed537e24864e9502f2b9399b4ba186a15b4118efc24f24a6a3103
 DATA = Path(__file__).parent / 'test-data'
 
@@ -74,7 +75,8 @@ class ObserveTests(unittest.TestCase):
                                    instance={'trace_jsonl': str(self.path)})
         self.ctx.call = lambda method, params: {
             'points': [{'id': '8', 'state': 'armed', 'mode': 'records',
-                        'target': 'libtraining_rooms.nro!edge_juggle_attempt'}],
+                        'target': 'libtraining_rooms.nro!edge_juggle_attempt', 'dropped': '0',
+                        'process_id': '81', 'address': '0x1234'}],
             'output': str(self.path), 'output_error': '', 'boot_error': '', 'file_lost': '0'}
         self.pending = []
 
@@ -93,7 +95,9 @@ class ObserveTests(unittest.TestCase):
 
     def test_counts_new_terminal_and_saves_receipt(self):
         release, terminal = excerpt('cp1b-hero-attempt.jsonl')
-        self.pending = [json.dumps(release) + '\n' + json.dumps(terminal) + '\n']
+        rows = [release] + [{'event': 'entry', 'point_id': 'other', 'sequence': str(seq)}
+                            for seq in range(57905, 58100)] + [terminal]
+        self.pending = [''.join(json.dumps(row) + '\n' for row in rows)]
         result = self.invoke(attempts=1, cap=.5)
         self.assertEqual(result['verified']['releases'], 1)
         self.assertEqual(result['verified']['terminals'], {'ledge': 1})
@@ -107,7 +111,8 @@ class ObserveTests(unittest.TestCase):
             self.invoke(attempts=1, cap=.02)
 
     def test_loss_and_unreadable_marker_fail(self):
-        for line in ('{"event":"loss","records":"1"}\n', '{"event":"entry","point_id":"8"}\n'):
+        for line in ('{"event":"loss","records":"1"}\n', '{"event":"entry","point_id":"8"}\n',
+                     '{"event":"unknown","point_id":"8","sequence":"2"}\n'):
             with self.subTest(line=line):
                 self.pending = [line]
                 with self.assertRaisesRegex(RuntimeError, 'loss|marker'):
@@ -140,6 +145,112 @@ class ObserveTests(unittest.TestCase):
         self.io.read = read
         with self.assertRaisesRegex(RuntimeError, 'connection'):
             self.invoke(attempts=1, cap=.5)
+
+    def test_missing_sequence_and_dropped_records_fail(self):
+        first, last = excerpt('cp1b-hero-attempt.jsonl')
+        self.pending = [json.dumps(first) + '\n' + json.dumps(last) + '\n']
+        with self.assertRaisesRegex(RuntimeError, 'sequence'):
+            self.invoke(attempts=1, cap=.5)
+
+    def test_no_trace_fails(self):
+        del self.ctx.instance['trace_jsonl']
+        with self.assertRaisesRegex(RuntimeError, 'trace'):
+            self.invoke(attempts=1, cap=.1)
+
+    def test_trace_drop_after_baseline_fails(self):
+        terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
+        self.pending = [json.dumps(terminal) + '\n']
+        original = self.ctx.call
+        calls = 0
+
+        def call(method, params):
+            nonlocal calls
+            calls += 1
+            result = original(method, params)
+            if calls > 1:
+                result['points'][0]['dropped'] = '1'
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'loss'):
+            self.invoke(attempts=1, cap=.5)
+
+    def test_trace_replacement_fails_closed(self):
+        def replace():
+            replacement = self.path.with_name('replacement.jsonl')
+            replacement.write_text('')
+            replacement.replace(self.path)
+
+        self.ctx.check_stop = replace
+        with self.assertRaisesRegex(RuntimeError, 'continuity'):
+            self.invoke(attempts=1, cap=.2)
+
+    def test_point_is_not_a_counter_or_duplicate(self):
+        decode = importlib.import_module('trace_attempts')
+        point = {'id': '19', 'state': 'armed', 'mode': 'counters',
+                 'target': 'libtraining_rooms.nro!edge_juggle_attempt'}
+        with self.assertRaisesRegex(RuntimeError, 'point'):
+            decode.point_id({'points': [point]}, 'edge_juggle_attempt')
+        point['mode'] = 'records'
+        with self.assertRaisesRegex(RuntimeError, 'point'):
+            decode.point_id({'points': [point, dict(point, id='20')]}, 'edge_juggle_attempt')
+
+    def test_counter_fields_are_mandatory(self):
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            del result['points'][0]['dropped']
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'counter'):
+            self.invoke(attempts=1, cap=.2)
+
+    def test_slow_final_trace_check_cannot_pass_after_cap(self):
+        terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
+        self.pending = [json.dumps(terminal) + '\n']
+        original = self.ctx.call
+        calls = 0
+
+        def call(method, params):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                time.sleep(.03)
+            return original(method, params)
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'deadline'):
+            self.invoke(attempts=1, cap=.02)
+
+    def test_terminal_written_during_preflight_is_not_missed(self):
+        terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
+        original = self.ctx.call
+        calls = 0
+
+        def call(method, params):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                self.path.write_text(json.dumps(terminal) + '\n')
+            return original(method, params)
+
+        self.ctx.call = call
+        result = self.invoke(attempts=1, cap=.5)
+        self.assertEqual(result['verified']['last_sequence'], 58100)
+
+    def test_nonzero_initial_drop_counter_fails_closed(self):
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            result['points'][0]['dropped'] = '1'
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'loss'):
+            self.invoke(attempts=1, cap=.2)
 
 
 if __name__ == '__main__':

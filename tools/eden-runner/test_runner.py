@@ -193,6 +193,20 @@ class ReviewAdmissionTests(unittest.TestCase):
         self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
         self.assertEqual(report['roles_defaulted'], ['r1'])
 
+    def test_setup_blocks_and_role_are_library_only(self):
+        plan = copy.deepcopy(self.plan)
+        plan['rows'][0].update(role='setup', steps=[
+            {'run': 'routes:tr_open', 'args': {'page': 'cpu'}},
+            {'run': 'routes:tr_close'},
+            {'run': 'routes:set_cpu', 'args': {'fighter': 'Mario'}},
+            {'run': 'routes:drill_observe', 'args': {'attempts': 1, 'cap': 10}},
+            {'gate': 'main'},
+        ])
+        report = self.report(plan)
+        self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
+        row = next(item['item'] for item in report['review']['composition'] if item['where'] == 'row r1')
+        self.assertEqual(row['role'], 'setup')
+
     def test_composition_distinguishes_reviewer_packets(self):
         first = copy.deepcopy(self.plan)
         first['gates']['confirm'] = {'library': 'main'}
