@@ -2259,6 +2259,113 @@ def _with_setup_metrics(ctx, action):
             _merge_setup_metrics(previous, metrics)
 
 
+TR_PAGES = ('cpu', 'saves', 'recording', 'fighters_stages', 'display_controls', 'developer')
+
+
+def _tr_current(io, until):
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError('Training Mod deadline expired before the menu read')
+    menu = io.read('tr.menu', remaining)
+    if (menu.block['schema'] != 'tr.menu/1' or menu.block['rev'] <= 0 or menu.block['filtered']
+            or menu.values.get('scene') != 'training' or menu.values.get('keyboard') != '0'
+            or menu.values.get('open') not in ('0', '1')):
+        raise RuntimeError('Training Mod needs a complete menu observation in Training without a keyboard')
+    return menu
+
+
+def _tr_depth(menu):
+    return native_picker.number(menu, 'depth')
+
+
+def _tr_back_to_page(io, menu, until):
+    while _tr_depth(menu) > 0:
+        before = _tr_depth(menu)
+        menu = _tr_input(io, menu, 'tap-b1', until)
+        if _tr_depth(menu) >= before:
+            raise RuntimeError('Training Mod depth did not decrease after B')
+    return menu
+
+
+def _open_menu(io, until, page):
+    menu = _tr_current(io, until)
+    opened = menu.values['open'] == '1'
+    owner = 'tr.menu' if opened else 'native'
+    ui = _wait_training_owner(io, menu, until, owner)
+    if not opened:
+        before = _armed_native_sample(io, ui, until, 'Training Mod menu')
+        if not _fields_match(before, {**TRAINING_SCREEN, 'input.owner': 'native'}):
+            raise RuntimeError('Training Mod menu lacks native Training input owner')
+        native_picker.same_epoch(before, menu, in_flight=True)
+        if time.monotonic() >= until:
+            raise RuntimeError('Training Mod deadline expired before opening the menu')
+        io.send('tr-menu-open')
+        menu = _wait_tr_menu(io, until, opened=True, after=menu)
+        _wait_training_owner(io, menu, until, 'tr.menu')
+        io.finish()
+    skipped = ['open'] if opened else []
+    if page is not None:
+        menu = _tr_back_to_page(io, menu, until)
+        for _ in range(len(TR_PAGES)):
+            current = menu.values.get('page')
+            if current == page:
+                break
+            if current not in TR_PAGES:
+                raise RuntimeError(f'Training Mod current page is unknown: {current!r}')
+            menu = _tr_input(io, menu, 'tap-r1', until)
+            if menu.values.get('page') == current or _tr_depth(menu) != 0:
+                raise RuntimeError('Training Mod page did not change at depth 0 after R')
+        if menu.values.get('page') != page:
+            raise RuntimeError(f'Training Mod page {page!r} was not reached within the page ring')
+    return menu, skipped
+
+
+def _close_menu(io, until):
+    menu = _tr_current(io, until)
+    opened = menu.values['open'] == '1'
+    _wait_training_owner(io, menu, until, 'tr.menu' if opened else 'native')
+    if not opened:
+        return menu, ['close']
+    menu = _tr_back_to_page(io, menu, until)
+    menu = _tr_input(io, menu, 'tap-b1', until, opened=False)
+    _wait_training_owner(io, menu, until, 'native')
+    return menu, []
+
+
+def tr_open(ctx, page=None, cap=20):
+    if page is not None and page not in TR_PAGES:
+        raise RuntimeError(f'unknown Training Mod page {page!r}')
+    return _with_setup_metrics(ctx, lambda metrics: _tr_open(ctx, page, cap, metrics))
+
+
+def _tr_open(ctx, page, cap, metrics):
+    started = time.monotonic()
+    menu, skipped = _open_menu(BridgePickerIO(ctx), started + cap, page)
+    if menu.values.get('page') not in TR_PAGES or not menu.values.get('focus'):
+        raise RuntimeError('Training Mod open menu page or focus is missing')
+    elapsed = round((time.monotonic() - started) * 1000)
+    return _save(ctx, 'routes-tr-open', {
+        'block': 'tr_open', 'args': {'page': page, 'cap': cap},
+        'verified': {'open': menu.values['open'], 'page': menu.values.get('page'),
+                     'depth': _tr_depth(menu), 'owner': 'tr.menu', 'focus': menu.values.get('focus')},
+        **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
+    })
+
+
+def tr_close(ctx, cap=20):
+    return _with_setup_metrics(ctx, lambda metrics: _tr_close(ctx, cap, metrics))
+
+
+def _tr_close(ctx, cap, metrics):
+    started = time.monotonic()
+    menu, skipped = _close_menu(BridgePickerIO(ctx), started + cap)
+    elapsed = round((time.monotonic() - started) * 1000)
+    return _save(ctx, 'routes-tr-close', {
+        'block': 'tr_close', 'args': {'cap': cap}, 'verified': {'open': menu.values['open'], 'owner': 'native'},
+        **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
+    })
+
+
 def _set_fighter(ctx, fighter, seat, cap, metrics):
     started = time.monotonic()
     entry = fighter_entry(fighter)

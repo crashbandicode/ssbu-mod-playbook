@@ -110,6 +110,13 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual(result['verified'], {'open': '0', 'owner': 'native'})
         self.assertTrue((Path(self.ctx.row_dir) / 'routes-tr-close.json').is_file())
 
+    def test_already_closed_checks_owner_without_input(self):
+        io = MenuIO(self.ctx)
+        result = self.invoke('tr_close', io, cap=1)
+        self.assertEqual(io.actions, [])
+        self.assertEqual(result['skipped'], ['close'])
+        self.assertEqual(result['verified'], {'open': '0', 'owner': 'native'})
+
     def test_unknown_page_is_refused_before_any_input(self):
         io = MenuIO(self.ctx)
         with self.assertRaisesRegex(RuntimeError, 'page'):
