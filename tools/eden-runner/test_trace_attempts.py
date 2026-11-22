@@ -249,6 +249,7 @@ class ObserveTests(unittest.TestCase):
         self.assertFalse(receipt['ok'])
         self.assertNotIn('verified', receipt)
         self.assertEqual(receipt['observed']['running'], '0')
+        terminal = dict(terminal, sequence='58101')
         self.pending = [json.dumps(terminal) + '\n']
         result = self.invoke(attempts=1, cap=.5, allow_stopped=True)
         self.assertEqual(result['verified']['running'], '0')
@@ -397,7 +398,7 @@ class ObserveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'deadline'):
             self.invoke(attempts=1, cap=.02)
 
-    def test_terminal_written_during_preflight_is_not_missed(self):
+    def test_terminal_recorded_during_first_snapshot_is_before_observation(self):
         terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
         original = self.ctx.call
         calls = 0
@@ -410,8 +411,8 @@ class ObserveTests(unittest.TestCase):
             return original(method, params)
 
         self.ctx.call = call
-        result = self.invoke(attempts=1, cap=.5)
-        self.assertEqual(result['verified']['last_sequence'], 58100)
+        with self.assertRaisesRegex(RuntimeError, r'0 terminals observed.*wanted 1'):
+            self.invoke(attempts=1, cap=.05)
 
     def test_nonzero_initial_counters_are_recorded_and_allowed(self):
         release = excerpt('cp1b-hero-attempt.jsonl')[0]

@@ -3481,13 +3481,18 @@ def _drill_observe(ctx, args, metrics):
     counts = {}
     kinds = set()
     expected_perfect = args['perfect']
+    before_observation = []
     observed = {'game': baseline.values.get('game'), 'running': baseline.values.get('game.running'),
-                'markers': marks}
+                'markers': marks, 'markers_before_observation': before_observation,
+                'fence': {'sequence': trace_start['sequence'], 'taken': 'at the start of the observation'}}
     metrics['observed'] = observed
 
     def collect():
         nonlocal expected_perfect
         for mark in stream.read(until):
+            if mark['sequence'] <= trace_start['sequence']:
+                before_observation.append({key: mark[key] for key in ('sequence', 'frame', 'event', 'terminal')})
+                continue
             if mark['process'] != str(trace_start['attempt']['identity'][0]):
                 raise RuntimeError('attempt marker came from a different trace process')
             marks.append(mark)
@@ -3528,6 +3533,9 @@ def _drill_observe(ctx, args, metrics):
         raise RuntimeError(f'expected drill running state 0 or 1; saw {running!r}')
     collect()
     trace_end = _trace_snapshot(ctx, path)
+    if stream.sequence is not None and stream.sequence > trace_end['sequence']:
+        raise RuntimeError(f'trace counters do not account for file sequences: expected <= {trace_end["sequence"]}; '
+                           f'saw {stream.sequence}')
     _trace_delta(trace_start, trace_end)
     if time.monotonic() >= until:
         raise RuntimeError(f'{reached()} {args["count"]} observed but drill observation deadline expired')
@@ -3539,6 +3547,7 @@ def _drill_observe(ctx, args, metrics):
         'verified': {'game': final.values.get('game'), 'running': running,
                      'releases': sum(mark['event'] == 0 for mark in marks), 'terminals': counts,
                      'cpu_kinds': sorted(kinds), 'perfect': expected_perfect,
+                     'fence': observed['fence'], 'markers_before_observation': before_observation,
                      'trace_loss_start': {'file_lost': trace_start['file_lost'],
                                           'point_dropped': trace_start['attempt']['counters']['dropped']},
                      'trace_loss_end': {'file_lost': trace_end['file_lost'],
