@@ -85,7 +85,8 @@ class ReviewClassTests(unittest.TestCase):
         }
 
     def test_shared_hooks_segments_gates_and_reviewed_setup_are_library_only(self):
-        self.assertEqual(runner.review_class(self.plan, Path('.')), {'class': 'library-only', 'private': []})
+        review = runner.review_class(self.plan, Path('.'))
+        self.assertEqual((review['class'], review['private']), ('library-only', []))
 
     def test_private_step_segment_gate_and_setup_are_listed(self):
         variants = [
@@ -136,7 +137,11 @@ class ReviewClassTests(unittest.TestCase):
             plan['setup'] = [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
                               'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}]
             path.write_text(json.dumps(plan))
-            self.assertEqual(runner.dry_run(path)['review'], {'class': 'library-only', 'private': []})
+            self.assertEqual(runner.dry_run(path)['review'],
+                             {'class': 'library-only', 'private': [],
+                              'arguments': [{'where': 'setup 0', 'step': 'setup fixture',
+                                             'args': {'state': 'training', 'ref': 'settings',
+                                                      'reviewed': plan['setup'][0]['reviewed']}}]})
             plan['setup'] = [{'via': 'fixture'}]
             path.write_text(json.dumps(plan))
             report = runner.dry_run(path)
@@ -146,7 +151,7 @@ class ReviewClassTests(unittest.TestCase):
             path.write_text(json.dumps({'segments': {'missing': {'library': 'not-an-entry'}}}))
             report = runner.dry_run(path)
             self.assertEqual(report['result'], 'BROKEN')
-            self.assertEqual(report['review'], {'class': 'full', 'private': []})
+            self.assertEqual(report['review'], {'class': 'full', 'private': [], 'arguments': []})
 
 
 class ReviewAdmissionTests(unittest.TestCase):
@@ -181,8 +186,63 @@ class ReviewAdmissionTests(unittest.TestCase):
 
     def test_clean_packet_is_library_only_and_reports_defaulted_roles(self):
         report = self.report(self.plan)
-        self.assertEqual(report['review'], {'class': 'library-only', 'private': []})
+        self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
         self.assertEqual(report['roles_defaulted'], ['r1'])
+
+    def test_arguments_list_clean_composition_in_manifest_order(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'][0].update(to='settings.json', instance='a', differs_only=['menu.cpu_percent'], ignored=True)
+        plan['rows'][0]['steps'] = [
+            {'gate': 'main'}, {'play': 'route'}, {'library': 'smash-main'},
+            {'run': 'routes:wait_lines', 'args': {'lines': [['console', '.*']]}},
+            {'call': 'status', 'params': {'selector': 'a'}},
+            {'run': 'routes:to_main'}, {'call': 'status'}]
+        plan['rows'][0]['recover'] = [{'call': 'status', 'params': {'selector': 'b'}},
+                                     {'run': 'routes:wait_lines', 'args': {'lines': [['trace', 'ok']]}}]
+        plan['recover'] = [{'gate': 'main'}, {'play': 'route'}, {'library': 'smash-main'}]
+        report = self.report(plan)['review']
+        self.assertEqual(report['class'], 'library-only')
+        self.assertEqual(report['arguments'], [
+            {'where': 'setup 0', 'step': 'setup fixture',
+             'args': {'state': 'training', 'ref': 'settings', 'to': 'settings.json', 'instance': 'a',
+                      'differs_only': ['menu.cpu_percent'], 'reviewed': plan['setup'][0]['reviewed']}},
+            {'where': 'row r1 step 0', 'step': 'gate main'},
+            {'where': 'row r1 step 1', 'step': 'play route'},
+            {'where': 'row r1 step 2', 'step': 'library smash-main'},
+            {'where': 'row r1 step 3', 'step': 'run routes:wait_lines',
+             'args': {'lines': [['console', '.*']]}},
+            {'where': 'row r1 step 4', 'step': 'call status', 'args': {'selector': 'a'}},
+            {'where': 'row r1 step 5', 'step': 'run routes:to_main', 'args': {}},
+            {'where': 'row r1 step 6', 'step': 'call status', 'args': {}},
+            {'where': 'row r1 recover 0', 'step': 'call status', 'args': {'selector': 'b'}},
+            {'where': 'row r1 recover 1', 'step': 'run routes:wait_lines',
+             'args': {'lines': [['trace', 'ok']]}},
+            {'where': 'plan recover 0', 'step': 'gate main'},
+            {'where': 'plan recover 1', 'step': 'play route'},
+            {'where': 'plan recover 2', 'step': 'library smash-main'}])
+
+        reordered = {key: plan[key] for key in ('start', 'rows', 'recover', 'setup', 'segments', 'gates')}
+        reordered_report = self.report(reordered)['review']
+        self.assertEqual(reordered_report['class'], 'library-only')
+        self.assertEqual(reordered_report['arguments'],
+                         report['arguments'][1:] + report['arguments'][:1])
+
+    def test_full_review_still_lists_arguments(self):
+        plan = copy.deepcopy(self.plan)
+        plan['rows'][0]['steps'].append({'run': 'custom.py:boot', 'args': {'value': 7}})
+        plan['rows'][0]['recover'] = [{'call': 'settings.set', 'params': {'key': 'value'}}]
+        report = self.report(plan)['review']
+        self.assertEqual(report['class'], 'full')
+        self.assertIn({'where': 'row r1 step 5', 'step': 'run custom.py:boot', 'args': {'value': 7}},
+                      report['arguments'])
+        self.assertIn({'where': 'row r1 recover 0', 'step': 'call settings.set', 'args': {'key': 'value'}},
+                      report['arguments'])
+
+    def test_broken_library_reference_has_empty_arguments(self):
+        self.manifest.write_text(json.dumps({'segments': {'bad': {'library': 'not-an-entry'}}}))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertEqual(report['review']['arguments'], [])
 
     def test_allowlist_rejects_reviewer_cases_and_unused_entries(self):
         ref = self.dir / 'private-gate.png'

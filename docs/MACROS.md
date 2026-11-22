@@ -184,6 +184,9 @@ The rules:
    gate loads, and that each row starts on the screen the row before it ends
    on. `library-only` means every plan, row and step key is on the runner's
    allowlist and every gate and segment is an unchanged library import.
+   `review.arguments` lists every hook, call, gate, segment and setup item
+   with its arguments in order; the class does not judge arguments, the
+   reviewer reads them.
    Shared hooks, read-only calls and a reviewed setup plan are also required; otherwise it is
    `full` with a list of private parts. This class does not change the
    dry-run result. No packet is admitted to light review by this class
