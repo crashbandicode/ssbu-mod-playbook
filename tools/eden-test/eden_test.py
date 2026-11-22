@@ -1107,14 +1107,28 @@ def _go_remote(args):
         remote.extend(('--trace-point', point))
     if args.owner:
         remote.extend(('--owner', args.owner))
-    code = _go_sh(['ssh', '-o', 'BatchMode=yes', host, *(_pwsh_arg(arg) for arg in remote)])
-    if code not in (0, 3):
-        raise SystemExit(f'remote go failed ({code})')
-    report = f'./REPORT-{args.label}.md'
-    if result := _go_sh(['scp', f'{host}:/home/intpa/eden-runs/{args.label}/REPORT.md', report]):
-        raise SystemExit(f'copying remote report failed ({result})')
+    ssh_code = _go_sh(['ssh', '-o', 'BatchMode=yes', host, *(_pwsh_arg(arg) for arg in remote)])
     run = f'/home/intpa/eden-runs/{args.label}'
     prefix = f'ssh -o BatchMode=yes {host} /usr/bin/python3 -I -B {script}'
+    result_file = f'./go-result-{args.label}.json'
+    report = f'./REPORT-{args.label}.md'
+    result_error = _go_sh(['scp', f'{host}:{run}/go-result.json', result_file])
+    report_error = _go_sh(['scp', f'{host}:{run}/REPORT.md', report])
+    if result_error:
+        if not report_error:
+            print(f'Down: {prefix} down {run}')
+        raise SystemExit(f'remote go did not produce a result (ssh exit {ssh_code}); see the output above')
+    if report_error:
+        print(f'Down: {prefix} down {run}')
+        raise SystemExit(f'copying remote report failed ({report_error})')
+    try:
+        result = json.loads(Path(result_file).read_text())
+        code = result['code']
+        if type(code) is not int or code not in (0, 3) or not isinstance(result['counts'], dict):
+            raise ValueError('invalid result')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f'Down: {prefix} down {run}')
+        raise SystemExit(f'invalid remote go result: {error}') from error
     print(f'Report: {Path(report).resolve()}')
     print(f'Re-run: {prefix} run {run} --rows <id>; then {prefix} report {run}')
     print(f'Down: {prefix} down {run}')
@@ -1143,7 +1157,9 @@ def cmd_go(args):
         cmd_report(run)
         print(f'Report: {run / "REPORT.md"}')
     counts = report_counts(run)
-    return 0 if code == 0 and not counts['FAIL'] and not counts['NOT RUN'] else 3
+    code = 0 if code == 0 and not counts['FAIL'] and not counts['NOT RUN'] else 3
+    (run / 'go-result.json').write_text(json.dumps({'code': code, 'counts': counts}, indent=2) + '\n')
+    return code
 
 
 def stop_capture(run):

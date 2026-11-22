@@ -180,6 +180,21 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual(result['verified']['input.owner'], 'native')
         self.assertEqual(io.actions, [])
 
+    def test_idle_observes_success_after_twelfth_input_step(self):
+        io = MenuIO(self.ctx, opened=True)
+        io.menu.update({'game.running': '0', 'notice.header': ''})
+        calls = []
+
+        def close(_io, _until, after):
+            calls.append(after)
+            if len(calls) == 12:
+                io.menu['open'] = '0'
+
+        with patch.object(routes, '_close_menu', side_effect=close):
+            result = self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(result['verified']['open'], '0')
+
     def test_idle_closes_open_menu(self):
         io = MenuIO(self.ctx, opened=True, depth=2)
         io.menu.update({'game.running': '0', 'notice.header': ''})

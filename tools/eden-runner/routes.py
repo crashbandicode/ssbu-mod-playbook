@@ -2810,10 +2810,10 @@ def _tr_idle(ctx, cap, metrics):
     until = started + cap
     io = BridgePickerIO(ctx)
     steps = []
+    waited_notices = set()
     last = {}
-    for _ in range(12):
-        if time.monotonic() >= until:
-            break
+    input_steps = 0
+    while time.monotonic() < until:
         ctx.check_stop()
         menu = _tr_current(io, until)
         ui = _remember(io, io.read(native_picker.UI, max(.001, until - time.monotonic())))
@@ -2823,8 +2823,11 @@ def _tr_idle(ctx, cap, metrics):
         if last == {'open': '0', 'game.running': '0', 'notice.header': '', 'input.owner': 'native'}:
             return {'block': 'tr_idle', 'args': {'cap': cap}, 'steps': steps, 'verified': last,
                     **metrics, 'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': []}
+        if input_steps >= 12 and (_edge_wizard(menu) or last['open'] == '1' or last['game.running'] == '1'):
+            break
         if isinstance(last['notice.header'], str) and _edge_wizard(menu):
             header = last['notice.header']
+            input_steps += 1
             try:
                 io.send('tap-b1')
                 after = _try_tr_condition(
@@ -2843,14 +2846,22 @@ def _tr_idle(ctx, cap, metrics):
             steps.append(f'B out of wizard page {header}')
             continue
         if last['open'] == '1':
+            input_steps += 1
             _close_menu(io, until, after=menu)
             steps.append('close menu')
         elif last['game.running'] == '1':
+            input_steps += 1
             game = menu.values.get('game')
             if game != 'Guard the Edge':
                 raise RuntimeError(f'tr_idle: expected stoppable Guard the Edge; saw {last!r}, game={game!r}')
             _drill_stop(ctx, game, max(.001, until - time.monotonic()), metrics)
             steps.append('stop Guard the Edge')
+        elif last['open'] == '0' and last['game.running'] == '0':
+            header = last['notice.header']
+            if header not in waited_notices:
+                steps.append(f'waited for notice "{header}" to clear')
+                waited_notices.add(header)
+            time.sleep(min(.2, max(0, until - time.monotonic())))
         else:
             raise RuntimeError(f'tr_idle: expected plain idle Training; saw {last!r}')
     raise RuntimeError(f'tr_idle: expected plain idle Training within {cap} s and 12 steps; saw {last!r}')

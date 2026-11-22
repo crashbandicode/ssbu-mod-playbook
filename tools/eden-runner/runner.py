@@ -106,8 +106,9 @@ trace.counters plus trace.read when that instance is tracing). It then follows o
 The default is continue when the next row has a start gate and a recover list, and stop otherwise, so a rows.json
 with no recover still stops at the first failure (STOP-INPUT) as before. continue plays that next row's recover
 (or the plan's recover list) and checks its start gate; the list may hold segments, a library route, a run hook,
-or a ui or call step. If the start gate passes, the run carries on. If recovery fails, or status says the game is
-not running (running false, or a crash), it writes STOP-INPUT and stops. The runner never reboots Eden.
+or a ui or call step. If recovery fails but the game is still running, the failure is recorded and the next row
+runs anyway. If status says the game is not running (running false, or a crash), it writes STOP-INPUT and stops.
+The runner never reboots Eden.
 Each failure is tagged harness-suspect (the screen never changed, recovery or the start
 state failed, or evidence is missing), product-suspect (a screen gate passed and a later
 effect, card file, or trace assertion failed), or unknown. out/summary.json groups them
@@ -2853,6 +2854,7 @@ class Runner:
 
     def _run_rows(self, only):
         previous_end = self.plan['start']
+        unrecovered_to = None
         rows = self.plan['rows']
         review = None
         for index, row in enumerate(rows):
@@ -2872,12 +2874,14 @@ class Runner:
             if only is not None and row['id'] not in only:
                 self.note(row['id'], 'skipped', receipt=prior_status)
                 continue
-            if only is None and row['start'] != previous_end and self.recovered_to != row['id']:
+            if (only is None and row['start'] != previous_end and self.recovered_to != row['id']
+                    and unrecovered_to != row['id']):
                 mismatch = StopRun(f'row {row["id"]} starts on {row["start"]}, but the game is on {previous_end}')
                 early = self.apply_failure(row, None, mismatch)
                 if early:
                     raise harness.EarlyStop(early['result'])
                 raise mismatch
+            unrecovered_to = None
             late = self.verdict_stop()  # judge FAILs land a row or two late: the stop rule counts them in row order
             if late:
                 self.stop_input(row, late['result'])
@@ -2911,7 +2915,15 @@ class Runner:
             try:
                 if (self.recovered_to != row['id'] and prior_status == 'FAILED'
                         and start_gate_of(self.plan, row) and recover_steps_of(self.plan, row) is not None):
-                    self.recover_to(row)
+                    self.recovered_to = None
+                    try:
+                        self.recover_to(row)
+                    except StopRun:
+                        raise
+                    except Exception as recovered:
+                        receipt['recovery'] = {'to': row['id'], 'ok': False, 'error': repr(recovered)}
+                        if not self.game_running(row.get('on') or self.default):
+                            raise
                 for step in row['steps']:
                     self.execute_step(step, receipt['results'])
                 status = self.passed_status(receipt)
@@ -2961,16 +2973,24 @@ class Runner:
                 saved_dir = self.row_dir
                 self.row_dir = self.out / successor['id']
                 self.row_dir.mkdir(exist_ok=True)
+                self.recovered_to = None
                 try:
                     self.recover_to(successor)
-                except Exception as recovered:
+                except StopRun as recovered:
                     receipt['recovery'] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
                     self.stop_input(row, f'{row["id"]}: {error!r}; recovery to {successor["id"]} failed: {recovered!r}')
-                    raise recovered
+                    raise
+                except Exception as recovered:
+                    receipt['recovery'] = {'to': successor['id'], 'ok': False, 'error': repr(recovered)}
+                    if not self.game_running(successor.get('on') or self.default):
+                        self.stop_input(row, f'{row["id"]}: {error!r}; recovery to {successor["id"]} failed: {recovered!r}')
+                        raise
+                    unrecovered_to = successor['id']
+                else:
+                    receipt['recovery'] = {'to': successor['id'], 'ok': True}
+                    self.recovered_to = successor['id']
                 finally:
                     self.row_dir = saved_dir
-                receipt['recovery'] = {'to': successor['id'], 'ok': True}
-                self.recovered_to = successor['id']
             except BaseException as error:
                 receipt.update(status='FAILED', error=repr(error))
                 self.stop_input(row, f'{row["id"]}: {error!r}')
