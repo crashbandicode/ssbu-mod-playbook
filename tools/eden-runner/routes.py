@@ -2309,6 +2309,7 @@ def _block(ctx, block, name, args, action):
     try:
         try:
             receipt = action(metrics)
+            receipt.pop('observed', None)
             receipt['ok'] = True
         except RuntimeError as error:
             last = dict(metrics['last_seen'])
@@ -3045,10 +3046,15 @@ def _wizard_place(ctx, args, targets, metrics):
                 if area is None or page['area'] == area:
                     break
                 before = menu
+
+                def changed(state):
+                    current = _wizard_body(state, game)
+                    if current['header'] != page['header']:
+                        raise RuntimeError(f'expected wizard header {page["header"]}; saw {current["header"]!r}')
+                    return current['body'] != page['body']
+
                 menu = _send_with_retry(io, 'main-menu-right', until,
-                                        lambda deadline: _try_tr_condition(
-                                            io, before, deadline,
-                                            lambda state: _wizard_body(state, game)['body'] != page['body']))
+                                        lambda deadline: _try_tr_condition(io, before, deadline, changed))
                 if menu is None:
                     raise RuntimeError(f'expected wizard area change; saw {page["body"]!r}')
             else:
@@ -3104,11 +3110,16 @@ def _wait_tr_condition(io, before, until, predicate, label):
 
 
 def drill_stop(ctx, game, cap=30):
-    if game != 'Guard the Edge':
-        raise RuntimeError(f'unsupported practice game {game!r}')
-    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
-        raise RuntimeError('practice stop needs a positive cap')
-    return _with_setup_metrics(ctx, lambda metrics: _drill_stop(ctx, game, cap, metrics))
+    args = {'game': game, 'cap': cap}
+
+    def action(metrics):
+        if game != 'Guard the Edge':
+            raise RuntimeError(f'unsupported practice game {game!r}')
+        if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+            raise RuntimeError('practice stop needs a positive cap')
+        return _drill_stop(ctx, game, cap, metrics)
+
+    return _block(ctx, 'drill_stop', 'routes-drill-stop', args, action)
 
 
 def _drill_stop(ctx, game, cap, metrics):
@@ -3134,43 +3145,89 @@ def _drill_stop(ctx, game, cap, metrics):
                                   and state.values.get('game.running') == '0', 'running=0')
     _, close_skipped = _close_menu(io, until, after=menu)
     elapsed = round((time.monotonic() - started) * 1000)
-    return _save(ctx, 'routes-drill-stop', {
+    return {
         'block': 'drill_stop', 'args': {'game': game, 'cap': cap},
         'verified': {'game': game, 'running': '0'},
         **metrics, 'ms': {'stop': elapsed, 'total': elapsed}, 'skipped': skipped + close_skipped,
-    })
+    }
 
 
-def drill_observe(ctx, attempts, cap, allow_stopped=False, count='terminals'):
-    if type(attempts) is not int or attempts <= 0 or type(cap) not in (int, float) or not 0 < cap < float('inf'):
-        raise RuntimeError('drill observation needs positive attempts and cap')
-    if type(allow_stopped) is not bool:
-        raise RuntimeError('allow_stopped must be a boolean')
-    if count not in ('terminals', 'releases'):
-        raise RuntimeError('drill observation count must be terminals or releases')
-    return _with_setup_metrics(ctx, lambda metrics: _drill_observe(ctx, attempts, cap, allow_stopped, count, metrics))
+def drill_observe(ctx, attempts, cap, game='Guard the Edge', perfect=None, allow_stopped=False, count='terminals'):
+    args = {'attempts': attempts, 'cap': cap, 'game': game, 'perfect': perfect,
+            'allow_stopped': allow_stopped, 'count': count}
+
+    def action(metrics):
+        if type(attempts) is not int or attempts <= 0 or type(cap) not in (int, float) or not 0 < cap < float('inf'):
+            raise RuntimeError('drill observation needs positive attempts and cap')
+        if game not in ('Guard the Edge', 'Juggler'):
+            raise RuntimeError(f'unsupported practice game {game!r}')
+        if perfect is not None and type(perfect) is not bool or type(allow_stopped) is not bool:
+            raise RuntimeError('perfect and allow_stopped must be booleans')
+        if count not in ('terminals', 'releases'):
+            raise RuntimeError('drill observation count must be terminals or releases')
+        return _drill_observe(ctx, args, metrics)
+
+    return _block(ctx, 'drill_observe', 'routes-drill-observe', args, action)
 
 
-def _attempt_trace_status(ctx, path, symbol='edge_juggle_attempt'):
+def _trace_snapshot(ctx, path, needs_plan=False):
     status = ctx.call('trace.list', {})
-    point = trace_attempts.point_id(status, symbol)
     if (status.get('output_error') or status.get('boot_error') or status.get('output') != path
             or 'file_lost' not in status):
         raise RuntimeError('attempt trace output is unavailable or mismatched')
-    initial_point = next(item for item in status['points'] if isinstance(item, dict) and str(item.get('id')) == point)
-    if 'dropped' not in initial_point:
-        raise RuntimeError('attempt trace loss counter is unavailable')
     try:
-        baseline_loss = (trace_attempts._decimal(status['file_lost']), trace_attempts._decimal(initial_point['dropped']))
-    except ValueError:
-        raise RuntimeError('attempt trace loss counter is unavailable') from None
-    identity = (initial_point.get('process_id'), initial_point.get('address'))
-    try:
-        if int(identity[0]) <= 0 or int(identity[1], 0) <= 0:
-            raise ValueError('invalid identity')
-    except (TypeError, ValueError):
-        raise RuntimeError('attempt trace point lacks a live process and address') from None
-    return point, baseline_loss, identity
+        points = status['points']
+        sequence = sum(trace_attempts._decimal(point['recorded']) for point in points)
+        loss = trace_attempts._decimal(status['file_lost'])
+
+        def selected(symbol):
+            point_id = trace_attempts.point_id(status, symbol)
+            point = next(item for item in points if str(item.get('id')) == point_id)
+            identity = (point.get('process_id'), point.get('address'))
+            if int(identity[0]) <= 0 or int(identity[1], 0) <= 0:
+                raise ValueError('invalid identity')
+            counters = {key: trace_attempts._decimal(point[key]) for key in ('hits', 'matched', 'recorded', 'dropped')}
+            return {'id': point_id, 'identity': identity, 'counters': counters}
+
+        attempt = selected('edge_juggle_attempt')
+        planner = selected('planner_chose') if needs_plan else None
+        if planner and planner['identity'][0] != attempt['identity'][0]:
+            raise RuntimeError('planner and attempt trace processes differ')
+        return {'sequence': sequence, 'file_lost': loss, 'attempt': attempt, 'planner': planner}
+    except (KeyError, TypeError, ValueError, StopIteration) as error:
+        raise RuntimeError(f'attempt trace counter or point identity is unavailable: {error}') from error
+
+
+def _trace_delta(start, end, *, require_hits=True):
+    if start['file_lost'] != end['file_lost']:
+        raise RuntimeError(f'expected unchanged trace loss {start["file_lost"]}; saw {end["file_lost"]}')
+    result = {}
+    for name in ('attempt', 'planner'):
+        before, after = start[name], end[name]
+        if before is None:
+            continue
+        if after is None or (before['id'], before['identity']) != (after['id'], after['identity']):
+            raise RuntimeError(f'expected unchanged {name} trace point; saw {after!r}')
+        a, b = before['counters'], after['counters']
+        if b['dropped'] != a['dropped']:
+            raise RuntimeError(f'expected unchanged {name} trace loss {a["dropped"]}; saw {b["dropped"]}')
+        delta = {key: b[key] - a[key] for key in a}
+        if any(value < 0 for value in delta.values()):
+            raise RuntimeError(f'expected monotonic {name} trace counters; saw {a!r} then {b!r}')
+        result[name] = delta
+    attempt = result['attempt']
+    if require_hits and attempt['hits'] != attempt['recorded']:
+        raise RuntimeError(f'expected every attempt hit recorded; saw hits +{attempt["hits"]}, '
+                           f'recorded +{attempt["recorded"]}')
+    return result
+
+
+def _same_trace_points(start, end):
+    for name in ('attempt', 'planner'):
+        before, after = start[name], end[name]
+        if before is not None and (after is None or
+                                   (before['id'], before['identity']) != (after['id'], after['identity'])):
+            raise RuntimeError(f'expected unchanged {name} trace point; saw {after!r}')
 
 
 def _shown_coordinate(value):
@@ -3187,7 +3244,7 @@ def _start_expect(expect):
     if expect is None:
         return None
     keys = {'cpu_kind', 'stage_form', 'stage_id', 'perfect', 'juggler', 'damage',
-            'cpu', 'cpu_words', 'p1', 'p1_words', 'plan'}
+            'cpu', 'cpu_words', 'p1', 'p1_words', 'plan', 'tolerance'}
     if not isinstance(expect, dict) or not set(expect) <= keys:
         raise RuntimeError('invalid first-release expect keys')
     for key, value in expect.items():
@@ -3195,6 +3252,8 @@ def _start_expect(expect):
             valid = type(value) is bool
         elif key in ('cpu_kind', 'stage_form', 'stage_id'):
             valid = type(value) is int and value >= 0
+        elif key == 'tolerance':
+            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
         elif key == 'damage':
             valid = type(value) is int or type(value) is float and math.isfinite(value)
         elif key in ('cpu', 'p1'):
@@ -3214,12 +3273,17 @@ def _start_expect(expect):
 
 
 def drill_start(ctx, game, expect=None, cap=60):
-    if game != 'Guard the Edge':
-        raise RuntimeError(f'unsupported practice game {game!r}')
-    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
-        raise RuntimeError('practice start needs a positive cap')
-    _start_expect(expect)
-    return _with_setup_metrics(ctx, lambda metrics: _drill_start(ctx, game, expect, cap, metrics))
+    args = {'game': game, 'expect': expect, 'cap': cap}
+
+    def action(metrics):
+        if game != 'Guard the Edge':
+            raise RuntimeError(f'unsupported practice game {game!r}')
+        if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+            raise RuntimeError('practice start needs a positive cap')
+        _start_expect(expect)
+        return _drill_start(ctx, game, expect, cap, metrics)
+
+    return _block(ctx, 'drill_start', 'routes-drill-start', args, action)
 
 
 def _drill_start(ctx, game, expect, cap, metrics):
@@ -3230,36 +3294,35 @@ def _drill_start(ctx, game, expect, cap, metrics):
         raise RuntimeError('practice trace path is invalid')
     if path is None and expect is not None:
         raise RuntimeError('first-release expect requires a trace in this boot')
-    stream = None
-    attempt_status = planner_status = None
+    stream = fence = None
     needs_plan = expect is not None and 'plan' in expect
+    observed = {'markers_before_start': [], 'markers_before_release': []}
+    metrics['observed'] = observed
     if path is not None:
         stream = trace_attempts.Stream(path, '')
-        attempt_status = _attempt_trace_status(ctx, path)
-        stream.point = attempt_status[0]
+        preflight = _trace_snapshot(ctx, path, needs_plan)
+        stream.point = preflight['attempt']['id']
         if needs_plan:
-            planner_status = _attempt_trace_status(ctx, path, 'planner_chose')
-            if (planner_status[2][0] != attempt_status[2][0]
-                    or planner_status[1][0] != attempt_status[1][0]):
-                raise RuntimeError('planner and attempt trace identities or loss counters differ')
-            stream.planner = planner_status[0]
-        if (_attempt_trace_status(ctx, path) != attempt_status
-                or needs_plan and _attempt_trace_status(ctx, path, 'planner_chose') != planner_status):
-            raise RuntimeError('practice trace loss or point changed during preflight')
+            stream.planner = preflight['planner']['id']
     io = BridgePickerIO(ctx)
     initial = _tr_current(io, until)
     wizard = _edge_wizard(initial)
     skipped = []
     if wizard:
-        if initial.values.get('notice.header') != 'Edge · 4/4' or initial.values.get('open') != '0':
-            raise RuntimeError('practice wizard is not at the closed-menu Preview step')
+        page = _wizard_body(initial, game)
+        if page['kind'] != 'Preview':
+            raise RuntimeError(f'expected Preview; saw header={page["header"]!r} body={page["body"]!r}')
         if time.monotonic() >= until:
             raise RuntimeError('practice start deadline expired before wizard input')
-        io.send('tap-a1')
-        menu = _wait_tr_condition(io, initial, until,
-                                  lambda state: state.values.get('open') == '0' and not _edge_wizard(state),
-                                  'wizard Preview dismissal')
-        io.finish()
+        if stream is not None:
+            fence = _trace_snapshot(ctx, path, needs_plan)
+            _same_trace_points(preflight, fence)
+        menu = _send_with_retry(io, 'tap-a1', until,
+                                lambda deadline: _try_tr_condition(
+                                    io, initial, deadline,
+                                    lambda state: state.values.get('open') == '0' and not _edge_wizard(state)))
+        if menu is None:
+            raise RuntimeError(f'expected wizard Preview dismissal; saw header={page["header"]!r} body={page["body"]!r}')
     else:
         if initial.values.get('game.running') == '1':
             raise RuntimeError('a practice game is already running; call drill_stop')
@@ -3269,6 +3332,9 @@ def _drill_start(ctx, game, expect, cap, metrics):
         menu = _navigate_menu(io, menu, 'fighters_stages', _tr_path(['game.6', 'start.6']), until)
         if _edge_wizard(menu) or menu.values.get('game.running') != '0':
             raise RuntimeError('practice running or wizard state changed before start')
+        if stream is not None:
+            fence = _trace_snapshot(ctx, path, needs_plan)
+            _same_trace_points(preflight, fence)
         menu = _tr_input(io, menu, 'tap-a1', until, opened=False)
         if menu.values.get('game') != game or menu.values.get('game.running') != '1':
             menu = _wait_tr_condition(io, menu, until,
@@ -3277,28 +3343,38 @@ def _drill_start(ctx, game, expect, cap, metrics):
                                       and state.values.get('game.running') == '1',
                                       'game running=1')
     release = None
-    markers_before_release = []
     selected_plan = None
     terminal = None
     if stream is not None:
+        observed['fence'] = fence['sequence']
         while time.monotonic() < until:
             ctx.check_stop()
             for mark in stream.read(until):
-                if mark['process'] != str(attempt_status[2][0]):
+                if mark['process'] != str(fence['attempt']['identity'][0]):
                     raise RuntimeError('practice trace record came from a different process')
+                if mark['sequence'] <= fence['sequence']:
+                    keys = ('sequence', 'frame', 'event', 'terminal') if mark['record'] == 'attempt' else (
+                        'sequence', 'frame', 'record')
+                    observed['markers_before_start'].append({key: mark[key] for key in keys})
+                    continue
                 if mark['record'] == 'plan':
                     if release is not None and selected_plan is None:
                         selected_plan = mark
+                        observed['plan'] = mark
                 elif release is None:
                     if mark['event'] == 0:
                         release = mark
+                        observed['first_release'] = mark
                     else:
-                        markers_before_release.append({key: mark[key]
-                                                       for key in ('sequence', 'frame', 'event', 'terminal')})
+                        observed['markers_before_release'].append(
+                            {key: mark[key] for key in ('sequence', 'frame', 'event', 'terminal')})
                 elif mark['event'] == 0:
                     raise RuntimeError('next release arrived before first-attempt terminal')
                 else:
                     terminal = mark
+                    observed['plan_terminal'] = terminal
+                    if terminal['ordinal'] != release['ordinal']:
+                        raise RuntimeError(f'expected terminal ordinal {release["ordinal"]}; saw {terminal["ordinal"]}')
                     break
                 if release is not None and not needs_plan:
                     break
@@ -3307,107 +3383,143 @@ def _drill_start(ctx, game, expect, cap, metrics):
             time.sleep(min(.05, max(0, until - time.monotonic())))
         if release is None or needs_plan and terminal is None:
             raise RuntimeError('first release or first-attempt terminal not observed before deadline')
-        if (_attempt_trace_status(ctx, path) != attempt_status
-                or needs_plan and _attempt_trace_status(ctx, path, 'planner_chose') != planner_status):
-            raise RuntimeError('practice trace loss or point changed')
+        end = _trace_snapshot(ctx, path, needs_plan)
+        if stream.sequence is not None and stream.sequence > end['sequence']:
+            raise RuntimeError(f'trace counters do not account for file sequences: expected <= {end["sequence"]}; '
+                               f'saw {stream.sequence}')
+        delta = _trace_delta(fence, end)
         if time.monotonic() >= until:
             raise RuntimeError('practice start deadline expired during trace fence')
     plan_value = selected_plan if selected_plan is not None else 'none'
+    if needs_plan and selected_plan is None and delta['planner']['hits']:
+        planner = delta['planner']
+        plan_value = f'not observed (planner hit {planner["hits"]} times, recorded {planner["recorded"]})'
     verified = {'game': menu.values.get('game'), 'running': menu.values.get('game.running'),
                 'first_release': release if release is not None else 'not checked: no trace in this boot',
-                'markers_before_release': markers_before_release}
+                'markers_before_start': observed['markers_before_start'],
+                'markers_before_release': observed['markers_before_release']}
     if needs_plan:
-        verified.update({'plan': plan_value, 'plan_terminal': terminal})
-    if attempt_status:
-        verified['trace_loss_start'] = {'file_lost': attempt_status[1][0],
-                                        'point_dropped': attempt_status[1][1]}
-        verified['trace_loss_end'] = dict(verified['trace_loss_start'])
-        if planner_status:
-            verified['trace_loss_start']['planner_dropped'] = planner_status[1][1]
-            verified['trace_loss_end']['planner_dropped'] = planner_status[1][1]
+        verified.update({'plan': plan_value, 'plan_terminal': terminal, 'planner': delta['planner']})
+    if fence:
+        verified['fence'] = fence['sequence']
+        verified['trace_loss_start'] = {'file_lost': fence['file_lost'],
+                                        'point_dropped': fence['attempt']['counters']['dropped']}
+        verified['trace_loss_end'] = {'file_lost': end['file_lost'],
+                                      'point_dropped': end['attempt']['counters']['dropped']}
+        if needs_plan:
+            verified['trace_loss_start']['planner_dropped'] = fence['planner']['counters']['dropped']
+            verified['trace_loss_end']['planner_dropped'] = end['planner']['counters']['dropped']
+    observed.update(verified)
     elapsed = round((time.monotonic() - started) * 1000)
     receipt = {'block': 'drill_start', 'args': {'game': game, 'expect': expect, 'cap': cap},
                'verified': verified, **metrics, 'ms': {'start': elapsed, 'total': elapsed}, 'skipped': skipped}
     if expect is not None:
         for key, wanted in expect.items():
+            if key == 'tolerance':
+                continue
             if key == 'plan':
-                actual = ([selected_plan['route'], selected_plan['row']] if selected_plan is not None else 'none')
+                actual = ([selected_plan['route'], selected_plan['row']] if selected_plan is not None else plan_value)
             elif key in ('cpu', 'p1'):
-                actual = [_shown_coordinate(value) for value in release[key]]
-                wanted = [_shown_coordinate(value) for value in wanted]
+                if 'tolerance' in expect:
+                    actual = release[key]
+                    if all(abs(actual[i] - float(wanted[i])) <= expect['tolerance'] for i in range(2)):
+                        continue
+                else:
+                    actual = [_shown_coordinate(value) for value in release[key]]
+                    wanted = [_shown_coordinate(value) for value in wanted]
             else:
                 actual = release['stage' if key == 'stage_id' else key]
+            if key == 'damage' and abs(actual - wanted) <= .05:
+                continue
             if actual != wanted:
-                receipt['error'] = f'first-release mismatch for {key}: expected {wanted!r}, got {actual!r}'
-                _save(ctx, 'routes-drill-start', receipt)
-                raise RuntimeError(f'{receipt["error"]}; decoded release {release!r}')
-    return _save(ctx, 'routes-drill-start', receipt)
+                raise RuntimeError(f'first-release mismatch for {key}: expected {wanted!r}; saw {actual!r}')
+    return receipt
 
 
-def _drill_observe(ctx, attempts, cap, allow_stopped, count, metrics):
+def _drill_observe(ctx, args, metrics):
     started = time.monotonic()
-    until = started + cap
+    until = started + args['cap']
     path = ctx.instance.get('trace_jsonl')
     if not isinstance(path, str) or not path:
         raise RuntimeError('drill observation needs a trace_jsonl')
     stream = trace_attempts.Stream(path, '')
-    trace_identity = _attempt_trace_status(ctx, path)
-    point, loss, identity = trace_identity
-    stream.point = point
-    if _attempt_trace_status(ctx, path) != trace_identity:
-        raise RuntimeError('attempt trace loss or output changed')
+    trace_start = _trace_snapshot(ctx, path)
+    stream.point = trace_start['attempt']['id']
+    _trace_delta(trace_start, _trace_snapshot(ctx, path), require_hits=False)
     io = BridgePickerIO(ctx)
     baseline = _tr_current(io, until)
+    if baseline.values.get('game') != args['game']:
+        raise RuntimeError(f'expected game {args["game"]}; saw {baseline.values.get("game")!r}')
     marks = []
     counts = {}
+    kinds = set()
+    expected_perfect = args['perfect']
+    observed = {'game': baseline.values.get('game'), 'running': baseline.values.get('game.running'),
+                'markers': marks}
+    metrics['observed'] = observed
 
     def collect():
+        nonlocal expected_perfect
         for mark in stream.read(until):
-            if mark['process'] != str(identity[0]):
+            if mark['process'] != str(trace_start['attempt']['identity'][0]):
                 raise RuntimeError('attempt marker came from a different trace process')
             marks.append(mark)
+            expected_juggler = args['game'] == 'Juggler'
+            if mark['juggler'] != expected_juggler:
+                raise RuntimeError(f'marker sequence {mark["sequence"]}: expected juggler={expected_juggler}; '
+                                   f'saw {mark["juggler"]}')
+            if expected_perfect is None:
+                expected_perfect = mark['perfect']
+            elif mark['perfect'] != expected_perfect:
+                raise RuntimeError(f'marker sequence {mark["sequence"]}: expected perfect={expected_perfect}; '
+                                   f'saw {mark["perfect"]}')
+            kinds.add(mark['cpu_kind'])
             terminal = mark['terminal']
             if terminal:
                 counts[terminal] = counts.get(terminal, 0) + 1
 
     def reached():
-        return (sum(mark['event'] == 0 for mark in marks) if count == 'releases' else sum(counts.values()))
+        return (sum(mark['event'] == 0 for mark in marks) if args['count'] == 'releases' else sum(counts.values()))
 
     while time.monotonic() < until:
         ctx.check_stop()
         collect()
-        if reached() >= attempts:
+        if reached() >= args['attempts']:
             break
         time.sleep(min(.05, max(0, until - time.monotonic())))
-    if reached() < attempts:
-        raise RuntimeError(f'{reached()} {count} observed before deadline; wanted {attempts}')
+    if reached() < args['attempts']:
+        note = ' (a Zoom arm emits no attempt markers)' if not marks else ''
+        raise RuntimeError(f'{reached()} {args["count"]} observed in {args["cap"]} s; '
+                           f'wanted {args["attempts"]}{note}')
     final = _tr_current(io, until)
     native_picker.same_epoch(baseline, final, in_flight=True)
     running = final.values.get('game.running')
+    observed.update({'game': final.values.get('game'), 'running': running})
+    if final.values.get('game') != args['game']:
+        raise RuntimeError(f'expected game {args["game"]}; saw {final.values.get("game")!r}')
     if running not in ('0', '1'):
         raise RuntimeError('drill running state is missing')
     collect()
-    end_trace_identity = _attempt_trace_status(ctx, path)
-    if end_trace_identity != trace_identity:
-        raise RuntimeError('attempt trace loss or output changed')
+    trace_end = _trace_snapshot(ctx, path)
+    _trace_delta(trace_start, trace_end)
     if time.monotonic() >= until:
-        raise RuntimeError(f'{reached()} {count} observed but drill observation deadline expired')
+        raise RuntimeError(f'{reached()} {args["count"]} observed but drill observation deadline expired')
+    if running == '0' and not args['allow_stopped']:
+        raise RuntimeError('expected running drill; saw stopped')
     elapsed = round((time.monotonic() - started) * 1000)
-    receipt = _save(ctx, 'routes-drill-observe', {
-        'block': 'drill_observe', 'args': {'attempts': attempts, 'cap': cap,
-                                           'allow_stopped': allow_stopped, 'count': count},
+    return {
+        'block': 'drill_observe', 'args': args,
         'verified': {'game': final.values.get('game'), 'running': running,
                      'releases': sum(mark['event'] == 0 for mark in marks), 'terminals': counts,
-                     'trace_loss_start': {'file_lost': loss[0], 'point_dropped': loss[1]},
-                     'trace_loss_end': {'file_lost': end_trace_identity[1][0],
-                                        'point_dropped': end_trace_identity[1][1]},
+                     'cpu_kinds': sorted(kinds), 'perfect': expected_perfect,
+                     'trace_loss_start': {'file_lost': trace_start['file_lost'],
+                                          'point_dropped': trace_start['attempt']['counters']['dropped']},
+                     'trace_loss_end': {'file_lost': trace_end['file_lost'],
+                                        'point_dropped': trace_end['attempt']['counters']['dropped']},
                      'first_sequence': marks[0]['sequence'], 'last_sequence': marks[-1]['sequence'],
                      'first_frame': marks[0]['frame'], 'last_frame': marks[-1]['frame']},
         **metrics, 'ms': {'observe': elapsed, 'total': elapsed}, 'skipped': [],
-    })
-    if running == '0' and not allow_stopped:
-        raise RuntimeError('drill stopped while observing attempts')
-    return receipt
+    }
 
 
 def _set_fighter(ctx, fighter, seat, cap, metrics):

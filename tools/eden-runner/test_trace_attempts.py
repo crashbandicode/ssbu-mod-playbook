@@ -230,6 +230,19 @@ class ObserveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'expected every attempt hit recorded'):
             self.invoke(attempts=1, cap=.5)
 
+    def test_changed_perfect_bit_names_the_marker(self):
+        release, terminal = excerpt('cp1b-hero-attempt.jsonl')
+        terminal['registers']['x0'] = hex(int(terminal['registers']['x0'], 16) ^ (1 << 25))
+        self.pending = [contiguous([release, terminal])]
+        with self.assertRaisesRegex(RuntimeError, r'marker sequence 58100: expected perfect=.*saw'):
+            self.invoke(attempts=1, cap=.5)
+
+    def test_cpu_kinds_can_change_within_one_observation(self):
+        release, _, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        self.pending = [contiguous([release, terminal])]
+        result = self.invoke(attempts=1, cap=.5, perfect=True)
+        self.assertEqual(result['verified']['cpu_kinds'], [0x5a, 0x5b])
+
     def test_epoch_change_fails(self):
         terminal = excerpt('cp1b-hero-attempt.jsonl')[1]
         self.pending = [json.dumps(terminal) + '\n']
@@ -464,6 +477,53 @@ class StartTests(ObserveTests):
         with self.assertRaisesRegex(RuntimeError, 'first release|deadline'):
             self.invoke_start(expect={'plan': [0, 38]}, cap=.2)
 
+    def test_pre_input_markers_are_reported_but_not_selected(self):
+        self.io = StartIO(self.ctx)
+        old_release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        later = dict(old_release, sequence='44871')
+        self.pending = [json.dumps(later) + '\n']
+        original = self.ctx.call
+        injected = False
+
+        def call(method, params):
+            nonlocal injected
+            if not injected:
+                injected = True
+                self.path.write_text(contiguous([old_release, plan, terminal]))
+            return original(method, params)
+
+        self.ctx.call = call
+        result = self.invoke_start(expect={'cpu_kind': 0x5a})
+        self.assertEqual(result['verified']['fence'], 44870)
+        self.assertEqual(result['verified']['first_release']['sequence'], 44871)
+        self.assertEqual([mark['sequence'] for mark in result['verified']['markers_before_start']],
+                         [44362, 44870])
+
+    def test_start_counter_sum_must_cover_all_file_sequences(self):
+        self.io = StartIO(self.ctx)
+        release = excerpt('cp1b-pyra-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
+        original = self.ctx.call
+
+        def call(method, params):
+            result = original(method, params)
+            if self.path.stat().st_size:
+                result['points'][1]['recorded'] = '0'
+            return result
+
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, 'trace counters do not account for file sequences'):
+            self.invoke_start(expect={'cpu_kind': 0x5a})
+
+    def test_start_world_tolerance_and_damage_tolerance(self):
+        self.io = StartIO(self.ctx)
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
+        decoded = importlib.import_module('trace_attempts').attempt(release)
+        result = self.invoke_start(expect={'cpu': [-120, 20], 'tolerance': .02,
+                                           'damage': decoded['damage'] + .04})
+        self.assertEqual(result['verified']['first_release']['sequence'], int(release['sequence']))
+
     def test_terminal_must_close_same_release_ordinal(self):
         self.io = StartIO(self.ctx)
         self.enable_planner()
@@ -497,6 +557,17 @@ class StartTests(ObserveTests):
         self.io.menu['notice.header'] = 'Edge · 3/3'
         result = self.invoke_start()
         self.assertTrue(result['ok'])
+
+    def test_start_refuses_wrong_game_preview_without_input(self):
+        del self.ctx.instance['trace_jsonl']
+        self.io = StartIO(self.ctx)
+        self.io.menu['game'] = 'Eggs-ercise'
+        with self.assertRaisesRegex(RuntimeError, 'expected Guard the Edge'):
+            self.invoke_start()
+        self.assertEqual(self.io.actions, [])
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
 
     def test_wizard_bridge_only_without_trace(self):
         del self.ctx.instance['trace_jsonl']
@@ -558,6 +629,7 @@ class StartTests(ObserveTests):
         self.assertEqual(result['verified']['first_release']['sequence'], 44362)
         self.assertEqual(result['verified']['plan']['sequence'], 44368)
         self.assertEqual(result['verified']['plan_terminal']['sequence'], 44870)
+        self.assertEqual(result['verified']['planner'], {'hits': 1, 'matched': 1, 'recorded': 1, 'dropped': 0})
 
     def test_level9_none_plan_uses_reviewed_attempt(self):
         self.io = StartIO(self.ctx)
@@ -629,14 +701,11 @@ class StartTests(ObserveTests):
         self.io = StartIO(self.ctx)
         self.pending = [contiguous([release, plan, terminal])]
         original = self.ctx.call
-        calls = 0
 
         def call(method, params):
-            nonlocal calls
-            calls += 1
             result = original(method, params)
-            if calls >= 6:
-                result['points'][1]['dropped'] = '1'
+            if self.path.stat().st_size:
+                next(point for point in result['points'] if point['id'] == '5')['dropped'] = '1'
             return result
 
         self.ctx.call = call

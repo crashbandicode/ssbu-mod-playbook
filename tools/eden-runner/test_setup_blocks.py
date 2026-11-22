@@ -329,6 +329,16 @@ class StopIO(RowsIO):
 
 
 class StopTests(OpenCloseTests):
+    def test_stop_failure_receipt_records_last_seen_without_verified(self):
+        io = StopIO(self.ctx)
+        io.menu['game.running'] = '0'
+        with self.assertRaisesRegex(RuntimeError, 'running'):
+            self.invoke('drill_stop', io, game='Guard the Edge', cap=.1)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-stop.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+        self.assertEqual(receipt['last_seen']['game.running'], '0')
+
     def test_stop_uses_running_transition_and_closes_the_menu(self):
         io = StopIO(self.ctx)
         result = self.invoke('drill_stop', io, game='Guard the Edge', cap=1)
