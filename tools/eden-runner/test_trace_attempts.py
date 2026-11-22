@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import struct
 import tempfile
 import time
 import unittest
@@ -622,14 +623,16 @@ class StartTests(ObserveTests):
         with self.assertRaisesRegex(RuntimeError, 'trace counters do not account for file sequences'):
             self.invoke_start(expect={'cpu_kind': 0x5a})
 
-    def test_start_world_tolerance_and_damage_tolerance(self):
+    def test_start_damage_is_exact_and_tolerance_expect_is_rejected(self):
         self.io = StartIO(self.ctx)
         release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        damage = struct.unpack('<I', struct.pack('<f', .04))[0]
+        release['registers']['x1'] = hex((int(release['registers']['x1'], 16) & ~0xffffffff) | damage)
         self.pending = [json.dumps(release) + '\n']
-        decoded = importlib.import_module('trace_attempts').attempt(release)
-        result = self.invoke_start(expect={'cpu': [-120, 20], 'tolerance': .02,
-                                           'damage': decoded['damage'] + .04})
-        self.assertEqual(result['verified']['first_release']['sequence'], int(release['sequence']))
+        with self.assertRaisesRegex(RuntimeError, 'first-release mismatch for damage'):
+            self.invoke_start(expect={'damage': 0})
+        with self.assertRaisesRegex(RuntimeError, 'invalid first-release expect keys'):
+            self.invoke_start(expect={'tolerance': 1})
 
     def test_menu_start_fence_records_not_running_precondition(self):
         self.io = StartIO(self.ctx, wizard=False)

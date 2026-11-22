@@ -2956,21 +2956,15 @@ def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
     raise RuntimeError(f'expected unchanged or newer wizard notice; saw {current!r}')
 
 
-def _shown_matches(shown, target, tolerance):
-    if tolerance == 0:
-        return shown == target
-    return all(abs(int(actual) - int(wanted)) <= tolerance for actual, wanted in zip(shown, target))
-
-
-def _wizard_move(io, menu, game, label, target, until, pulse_cap, tolerance):
+def _wizard_move(io, menu, game, label, target, until, pulse_cap):
     pulses = []
     nulls = 0
     last_size = None
     for _ in range(60):
         shown = _wizard_body(menu, game)[label.lower()]
-        if _shown_matches(shown, target, tolerance):
+        if shown == target:
             return menu, shown, pulses
-        axis = 0 if not _shown_matches(shown[:1], target[:1], tolerance) else 1
+        axis = 0 if shown[0] != target[0] else 1
         distance = int(target[axis]) - int(shown[axis])
         if distance == 0:
             distance = -1 if target[axis] == '-0' else 1
@@ -2993,9 +2987,9 @@ def _wizard_move(io, menu, game, label, target, until, pulse_cap, tolerance):
     raise RuntimeError(f'wizard {label} unreachable after 60 pulses: last {shown}, target {target}, pulses {pulses}')
 
 
-def wizard_place(ctx, game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0, tolerance=0):
+def wizard_place(ctx, game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0):
     args = {'game': game, 'area': area, 'cpu': cpu, 'p1': p1, 'cap': cap,
-            'pulse_cap': pulse_cap, 'tolerance': tolerance}
+            'pulse_cap': pulse_cap}
 
     def action(metrics):
         if game != 'Guard the Edge':
@@ -3012,8 +3006,6 @@ def wizard_place(ctx, game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0
                 raise RuntimeError(f'wizard {label} requires two shown coordinates')
         if any(type(value) not in (int, float) or not 0 < value < float('inf') for value in (cap, pulse_cap)):
             raise RuntimeError('wizard caps must be positive')
-        if type(tolerance) not in (int, float) or not 0 <= tolerance < float('inf'):
-            raise RuntimeError(f'expected nonnegative finite tolerance; saw {tolerance!r}')
         return _wizard_place(ctx, args, targets, metrics)
 
     return _block(ctx, 'wizard_place', 'routes-wizard-place', args, action)
@@ -3071,13 +3063,13 @@ def _wizard_place(ctx, args, targets, metrics):
             index = 0 if page['kind'] == 'CPU' else 1
             if targets[index] is not None:
                 menu, _, moves[page['kind'].lower()] = _wizard_move(
-                    io, menu, game, page['kind'], targets[index], until, args['pulse_cap'], args['tolerance'])
+                    io, menu, game, page['kind'], targets[index], until, args['pulse_cap'])
         else:
             break
         menu = _wizard_next(io, menu, game, until)
     cpu_shown, p1_shown = page['cpu'], page['p1']
-    if (targets[0] is not None and not _shown_matches(cpu_shown, targets[0], args['tolerance'])
-            or targets[1] is not None and not _shown_matches(p1_shown, targets[1], args['tolerance'])):
+    if (targets[0] is not None and cpu_shown != targets[0]
+            or targets[1] is not None and p1_shown != targets[1]):
         raise RuntimeError(f'expected Preview coordinates {targets!r}; saw {page["body"]!r}, pulses {moves!r}')
     elapsed = round((time.monotonic() - started) * 1000)
     return {
@@ -3257,7 +3249,7 @@ def _start_expect(expect):
     if expect is None:
         return None
     keys = {'cpu_kind', 'stage_form', 'stage_id', 'perfect', 'juggler', 'damage',
-            'cpu', 'cpu_words', 'p1', 'p1_words', 'plan', 'tolerance'}
+            'cpu', 'cpu_words', 'p1', 'p1_words', 'plan'}
     if not isinstance(expect, dict) or not set(expect) <= keys:
         raise RuntimeError('invalid first-release expect keys')
     for key, value in expect.items():
@@ -3265,8 +3257,6 @@ def _start_expect(expect):
             valid = type(value) is bool
         elif key in ('cpu_kind', 'stage_form', 'stage_id'):
             valid = type(value) is int and value >= 0
-        elif key == 'tolerance':
-            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
         elif key == 'damage':
             valid = type(value) is int or type(value) is float and math.isfinite(value)
         elif key in ('cpu', 'p1'):
@@ -3449,24 +3439,15 @@ def _drill_start(ctx, game, expect, cap, metrics):
                'verified': verified, **metrics, 'ms': {'start': elapsed, 'total': elapsed}, 'skipped': skipped}
     if expect is not None:
         for key, wanted in expect.items():
-            if key == 'tolerance':
-                continue
             if key == 'plan':
                 if wanted == 'any':
                     continue
                 actual = ([selected_plan['route'], selected_plan['row']] if selected_plan is not None else plan_value)
             elif key in ('cpu', 'p1'):
-                if 'tolerance' in expect:
-                    actual = release[key]
-                    if all(abs(actual[i] - float(wanted[i])) <= expect['tolerance'] for i in range(2)):
-                        continue
-                else:
-                    actual = [_shown_coordinate(value) for value in release[key]]
-                    wanted = [_shown_coordinate(value) for value in wanted]
+                actual = [_shown_coordinate(value) for value in release[key]]
+                wanted = [_shown_coordinate(value) for value in wanted]
             else:
                 actual = release['stage' if key == 'stage_id' else key]
-            if key == 'damage' and abs(actual - wanted) <= .05:
-                continue
             if actual != wanted:
                 raise RuntimeError(f'first-release mismatch for {key}: expected {wanted!r}; saw {actual!r}')
     return receipt

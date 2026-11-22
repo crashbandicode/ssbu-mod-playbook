@@ -499,11 +499,12 @@ class WizardTests(OpenCloseTests):
         self.assertFalse(result['verified']['pulses']['cpu'][0]['published'])
         self.assertEqual(result['verified']['cpu_shown'], ['1', '1'])
 
-    def test_wizard_tolerance_accepts_nearby_shown_coordinates(self):
+    def test_wizard_requires_exact_shown_coordinates_and_rejects_tolerance(self):
         io = WizardIO(self.ctx, step=4)
-        result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[2, 1], p1=[0, 0],
-                             tolerance=1, cap=.1, pulse_cap=.002)
-        self.assertEqual(result['verified']['cpu_shown'], ['1', '1'])
+        with self.assertRaisesRegex(RuntimeError, 'expected Preview coordinates'):
+            self.invoke('wizard_place', io, game='Guard the Edge', cpu=[2, 1], p1=[0, 0], cap=.1, pulse_cap=.002)
+        with self.assertRaisesRegex(TypeError, 'tolerance'):
+            self.invoke('wizard_place', io, game='Guard the Edge', tolerance=1)
         self.assertEqual(io.actions, [])
 
     def test_analog_macros_are_indexed_full_state_events(self):
