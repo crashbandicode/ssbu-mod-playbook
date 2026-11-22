@@ -166,7 +166,7 @@ def fixture_diff(fixture, reviewed):
         if isinstance(left, dict):
             found = []
             for key in left.keys() | right.keys():
-                child = f'{path}.{key}' if path else key
+                child = path + [key]
                 if key not in left or key not in right:
                     found.append(child)
                 else:
@@ -176,9 +176,18 @@ def fixture_diff(fixture, reviewed):
             if len(left) != len(right):
                 return [path]
             return [item for i, (a, b) in enumerate(zip(left, right))
-                    for item in diff(a, b, f'{path}.{i}' if path else str(i))]
+                    for item in diff(a, b, path + [i])]
         return [] if left == right else [path]
-    return sorted(diff(fixture, reviewed, ''))
+    return sorted(diff(fixture, reviewed, []),
+                  key=lambda path: [(0, item) if isinstance(item, str) else (1, item) for item in path])
+
+
+def fixture_path(path):
+    if not path:
+        return '<root>'
+    if any(isinstance(part, str) and '.' in part for part in path):
+        return json.dumps(path, ensure_ascii=False)
+    return '.'.join(str(part) for part in path)
 
 
 def fixture_comparison(item, base, config):
@@ -206,9 +215,14 @@ def fixture_comparison(item, base, config):
     if not selected:
         return [], problems + [f'{state}: no instance selected for {destination}']
     allowed = item.get('differs_only', [])
-    if not isinstance(allowed, list) or any(not isinstance(path, str) for path in allowed):
+    if (not isinstance(allowed, list) or any(
+            not isinstance(path, str) and
+            not (isinstance(path, list) and all(isinstance(part, str) or type(part) is int for part in path))
+            for path in allowed)):
         problems.append(f'{state}: differs_only must be a list of paths')
         allowed = []
+    allowed = [[int(part) if part.isdecimal() else part for part in path.split('.')]
+               if isinstance(path, str) else path for path in allowed]
     missing = object()
     reviewed_value = missing
     if not isinstance(reviewed, dict) or not reviewed.get('path'):
@@ -257,10 +271,10 @@ def fixture_comparison(item, base, config):
                     if reviewed_value is not missing:
                         result['differing_paths'] = fixture_diff(value, reviewed_value)
                         offending = [path for path in result['differing_paths']
-                                     if not any(path == allow or path.startswith(allow + '.') for allow in allowed)]
+                                     if not any(path[:len(allow)] == allow for allow in allowed)]
                         if offending:
                             found.append(f'{prefix}: {len(offending)} differing paths: '
-                                         + ', '.join(path or '<root>' for path in offending[:12]))
+                                         + ', '.join(fixture_path(path) for path in offending[:12]))
         result['ok'] = not common_problems and not found
         results.append(result)
         problems.extend(found)

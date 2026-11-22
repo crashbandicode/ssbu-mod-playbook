@@ -74,14 +74,59 @@ class SetupFixtureTests(unittest.TestCase):
     def plan(self):
         (self.rows / 'rows.json').write_text(json.dumps({'setup': [self.item], 'rows': []}))
 
+    def comparison(self, reviewed, pinned, allowed):
+        self.reviewed.write_text(json.dumps(reviewed))
+        self.fixture.write_text(json.dumps(pinned))
+        self.item['reviewed']['sha256'] = sha(self.reviewed)
+        self.item['differs_only'] = allowed
+        self.config['instances'][0]['files'][0]['sha256'] = sha(self.fixture)
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+        self.plan()
+        problems = eden_test.check_run(self.run)
+        evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
+        return problems, evidence[0]
+
+    def test_literal_dot_key_requires_its_own_component_allowance(self):
+        reviewed = {'allowed': {'x': 1}}
+        pinned = {'allowed': {'x': 1}, 'allowed.x': 9}
+        problems, result = self.comparison(reviewed, pinned, ['allowed'])
+        self.assertIn('["allowed.x"]', ' '.join(problems))
+        self.assertEqual(result['differing_paths'], [['allowed.x']])
+        self.assertFalse(result['ok'])
+        problems, result = self.comparison(reviewed, pinned, [['allowed.x']])
+        self.assertEqual(problems, [])
+        self.assertTrue(result['ok'])
+
+    def test_list_index_allowances_accept_string_and_component_forms(self):
+        reviewed, pinned = {'menu': [1, 2, 3, 4]}, {'menu': [1, 2, 3, 9]}
+        for allowed in (['menu.3'], [['menu', 3]]):
+            with self.subTest(allowed=allowed):
+                problems, result = self.comparison(reviewed, pinned, allowed)
+                self.assertEqual(problems, [])
+                self.assertEqual(result['differing_paths'], [['menu', 3]])
+                self.assertTrue(result['ok'])
+
+    def test_numeric_dict_key_is_not_a_list_index(self):
+        reviewed, pinned = {'menu': {'3': 1}}, {'menu': {'3': 9}}
+        problems, result = self.comparison(reviewed, pinned, ['menu.3'])
+        self.assertTrue(problems)
+        self.assertEqual(result['differing_paths'], [['menu', '3']])
+        self.assertEqual(self.comparison(reviewed, pinned, [['menu', '3']])[0], [])
+
+    def test_invalid_component_allowances_are_refused(self):
+        for allowed in ([['menu', True]], [['menu', {}]], [3], 'menu'):
+            with self.subTest(allowed=allowed):
+                problems, _ = self.comparison({'menu': 1}, {'menu': 2}, allowed)
+                self.assertIn('differs_only', ' '.join(problems))
+
     def test_fixture_diff_nested_lists_types_and_root(self):
         self.assertEqual(eden_test.fixture_diff(
             {'nest': {'a': 1}, 'list': [0, {'x': 2}], 'old': 1},
             {'nest': {'a': 3}, 'list': [0, {'x': 4}], 'new': 1}),
-            ['list.1.x', 'nest.a', 'new', 'old'])
-        self.assertEqual(eden_test.fixture_diff({'list': [1, 2]}, {'list': [1]}), ['list'])
-        self.assertEqual(eden_test.fixture_diff({'value': 1}, {'value': True}), ['value'])
-        self.assertEqual(eden_test.fixture_diff([1], {'one': 1}), [''])
+            [['list', 1, 'x'], ['nest', 'a'], ['new'], ['old']])
+        self.assertEqual(eden_test.fixture_diff({'list': [1, 2]}, {'list': [1]}), [['list']])
+        self.assertEqual(eden_test.fixture_diff({'value': 1}, {'value': True}), [['value']])
+        self.assertEqual(eden_test.fixture_diff([1], {'one': 1}), [[]])
         self.assertEqual(eden_test.fixture_diff({'x': [1, 2]}, {'x': [1, 2]}), [])
 
     def test_up_refuses_differences_and_writes_evidence(self):
@@ -94,7 +139,7 @@ class SetupFixtureTests(unittest.TestCase):
         self.assertIn('3', str(caught.exception))
         sh.assert_not_called()
         evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
-        self.assertEqual(evidence[0]['differing_paths'], ['last_page', 'menu.a.0', 'menu.b.1'])
+        self.assertEqual(evidence[0]['differing_paths'], [['last_page'], ['menu', 'a', 0], ['menu', 'b', 1]])
         self.assertFalse(evidence[0]['ok'])
 
     def test_skip_setup_plan_does_not_skip_reviewed_fixture(self):
