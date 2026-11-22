@@ -2288,8 +2288,10 @@ def _tr_back_to_page(io, menu, until):
     return menu
 
 
-def _open_menu(io, until, page):
+def _open_menu(io, until, page, *, after=None):
     menu = _tr_current(io, until)
+    if after is not None:
+        native_picker.same_epoch(after, menu, in_flight=True)
     opened = menu.values['open'] == '1'
     owner = 'tr.menu' if opened else 'native'
     ui = _wait_training_owner(io, menu, until, owner)
@@ -2321,8 +2323,10 @@ def _open_menu(io, until, page):
     return menu, skipped
 
 
-def _close_menu(io, until):
+def _close_menu(io, until, *, after=None):
     menu = _tr_current(io, until)
+    if after is not None:
+        native_picker.same_epoch(after, menu, in_flight=True)
     opened = menu.values['open'] == '1'
     _wait_training_owner(io, menu, until, 'tr.menu' if opened else 'native')
     if not opened:
@@ -2453,6 +2457,68 @@ def _tr_goto(ctx, page, path, targets, cap, metrics):
         'verified': {key: menu.values.get(key) for key in ('focus', 'page', 'group', 'cursor', 'action', 'row')}
                     | {'depth': _tr_depth(menu)},
         **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
+    })
+
+
+def _edge_wizard(menu):
+    header = menu.values.get('notice.header')
+    if not isinstance(header, str):
+        raise RuntimeError('practice wizard notice header is missing')
+    return bool(re.fullmatch(r'Edge · [1-4]/4', header))
+
+
+def _wait_tr_condition(io, before, until, predicate, label):
+    latest = before
+    while (remaining := until - time.monotonic()) > 0:
+        state = io.read('tr.menu', remaining)
+        if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
+            raise RuntimeError('practice witness needs a complete tr.menu/1 reply')
+        native_picker.same_epoch(latest, state, in_flight=True)
+        if state.block['rev'] <= latest.block['rev']:
+            continue
+        latest = state
+        if state.values.get('scene') != 'training' or state.values.get('keyboard') != '0':
+            raise RuntimeError('practice witness changed scene or opened a keyboard')
+        if predicate(state):
+            return state
+    raise RuntimeError(f'practice {label} not observed before deadline')
+
+
+def drill_stop(ctx, game, cap=30):
+    if game != 'Guard the Edge':
+        raise RuntimeError(f'unsupported practice game {game!r}')
+    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+        raise RuntimeError('practice stop needs a positive cap')
+    return _with_setup_metrics(ctx, lambda metrics: _drill_stop(ctx, game, cap, metrics))
+
+
+def _drill_stop(ctx, game, cap, metrics):
+    started = time.monotonic()
+    until = started + cap
+    io = BridgePickerIO(ctx)
+    initial = _tr_current(io, until)
+    if _edge_wizard(initial):
+        raise RuntimeError('practice wizard is up; cannot stop it through the menu')
+    if initial.values.get('game.running') != '1':
+        raise RuntimeError('practice game is not running')
+    if initial.values.get('game') != game:
+        raise RuntimeError('running practice game does not match the requested game')
+    menu, skipped = _open_menu(io, until, 'fighters_stages', after=initial)
+    menu = _navigate_menu(io, menu, 'fighters_stages', _tr_path(['game.6', 'start.6']), until)
+    if (_edge_wizard(menu) or menu.values.get('game') != game
+            or menu.values.get('game.running') != '1'):
+        raise RuntimeError('practice game or wizard state changed before stop')
+    menu = _tr_input(io, menu, 'tap-a1', until)
+    if menu.values.get('game.running') != '0':
+        menu = _wait_tr_condition(io, menu, until,
+                                  lambda state: state.values.get('open') == '1'
+                                  and state.values.get('game.running') == '0', 'running=0')
+    _, close_skipped = _close_menu(io, until, after=menu)
+    elapsed = round((time.monotonic() - started) * 1000)
+    return _save(ctx, 'routes-drill-stop', {
+        'block': 'drill_stop', 'args': {'game': game, 'cap': cap},
+        'verified': {'game': game, 'running': '0'},
+        **metrics, 'ms': {'stop': elapsed, 'total': elapsed}, 'skipped': skipped + close_skipped,
     })
 
 

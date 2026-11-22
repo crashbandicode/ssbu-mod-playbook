@@ -60,6 +60,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
+| `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, allow_stopped, count}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
@@ -422,6 +423,10 @@ not read settings. Both check the bridge owner and each handled menu input and r
 the static `row` title, into nested Rows screens. It stops before activating the last row. At page depth a
 Down must move the published cursor; in a Rows screen it must change the published `(action,row,row_id)` identity
 with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed.
+
+`routes:drill_stop(game, cap=30)` refuses a visible wizard and a different or stopped practice game. It opens
+the Guard the Edge Start row, presses A, requires a same-epoch `game.running=0`, and closes the menu. The
+published row title is static Start even when the UI draws Stop; it is not used as a stop witness.
 
 `routes:drill_observe(attempts, cap, allow_stopped=False, count='terminals')` counts Guard Edge release and terminal markers from
 the trace, then checks `tr.menu.game.running`. It needs an armed records point targeting the
