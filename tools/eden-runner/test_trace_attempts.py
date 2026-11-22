@@ -595,7 +595,7 @@ class StartTests(ObserveTests):
         release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
         terminal['registers']['x0'] = hex(int(terminal['registers']['x0'], 16) ^ (1 << 24) ^ (1 << 25))
         self.pending = [contiguous([release, plan, terminal])]
-        with self.assertRaisesRegex(RuntimeError, r'terminal.*juggler.*expected.*saw'):
+        with self.assertRaisesRegex(RuntimeError, r'terminal.*expected.*juggler.*saw'):
             self.invoke_start(expect={'juggler': False, 'perfect': True, 'plan': [0, 38]})
         receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
         self.assertFalse(receipt['ok'])
@@ -607,7 +607,7 @@ class StartTests(ObserveTests):
         release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
         terminal['registers']['x0'] = hex(int(terminal['registers']['x0'], 16) ^ (1 << 25))
         self.pending = [contiguous([release, plan, terminal])]
-        with self.assertRaisesRegex(RuntimeError, r'terminal.*perfect.*expected.*saw'):
+        with self.assertRaisesRegex(RuntimeError, r'terminal.*expected.*perfect.*saw'):
             self.invoke_start(expect={'plan': [0, 38]})
 
     def test_first_release_must_match_requested_game(self):

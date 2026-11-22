@@ -3379,6 +3379,10 @@ def _drill_start(ctx, game, expect, cap, metrics):
                     if mark['event'] == 0:
                         release = mark
                         observed['first_release'] = mark
+                        wanted = game == 'Juggler'
+                        if release['juggler'] != wanted:
+                            raise RuntimeError(f'release sequence {release["sequence"]}: expected juggler={wanted}; '
+                                               f'saw {release["juggler"]}')
                     else:
                         observed['markers_before_release'].append(
                             {key: mark[key] for key in ('sequence', 'frame', 'event', 'terminal')})
@@ -3387,8 +3391,10 @@ def _drill_start(ctx, game, expect, cap, metrics):
                 else:
                     terminal = mark
                     observed['plan_terminal'] = terminal
-                    if terminal['ordinal'] != release['ordinal']:
-                        raise RuntimeError(f'expected terminal ordinal {release["ordinal"]}; saw {terminal["ordinal"]}')
+                    for field in ('ordinal', 'juggler', 'perfect'):
+                        if terminal[field] != release[field]:
+                            raise RuntimeError(f'terminal sequence {terminal["sequence"]}: expected terminal '
+                                               f'{field} {release[field]}; saw {terminal[field]}')
                     break
                 if release is not None and not needs_plan:
                     break
