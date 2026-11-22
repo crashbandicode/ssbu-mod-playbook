@@ -681,7 +681,7 @@ class EdenTestTests(unittest.TestCase):
         comparison = json.loads((run / 'setup-fixtures.json').read_text())[0]
         self.assertEqual(comparison['pin']['path'], json.loads((run / 'config.json').read_text())
                          ['instances'][0]['files'][0]['path'])
-        self.assertEqual(comparison['differing_paths'], ['last_page'])
+        self.assertEqual(comparison['differing_paths'], [['last_page']])
 
     def test_new_refuses_a_changed_pin(self):
         (self.dir / 'plugin.nro').write_bytes(b'different')
