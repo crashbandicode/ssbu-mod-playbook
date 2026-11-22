@@ -869,6 +869,8 @@ def dry_run(manifest_path):
                     errors.append(f'gate {name}: text needs a non-empty "pane"')
                 if 'point_id' in gate and not (isinstance(gate['point_id'], str) or type(gate['point_id']) is int):
                     errors.append(f'gate {name}: point_id must be a string or integer')
+                if 'whole_file' in gate and type(gate['whole_file']) is not bool:
+                    errors.append(f'gate {name}: whole_file must be a boolean')
                 re.compile(gate['pattern'])
             elif kind == 'change':
                 if len(gate['roi']) != 4 or not gate.get('mark'):
@@ -1744,29 +1746,39 @@ class Runner:
         if kind == 'text':
             source = self.trace_source(on)
             pattern = re.compile(gate['pattern'])
-            offset, identity, record, previous_text = 0, None, None, None
+            whole_file = gate.get('whole_file', False)
+            row_start, row_inode = (0, None) if whole_file else self.row_offsets.get(str(source), (0, None))
+            offset, identity, record = 0, None, None
+            history, keys = [], set()
             while time.monotonic() < until:
                 self.check_stop()
                 try:
                     stat = source.stat()
                 except FileNotFoundError:
-                    offset, identity, record, previous_text = 0, None, None, None
+                    offset, identity, record, row_start, row_inode = 0, None, None, 0, None
+                    history, keys = [], set()
                 else:
                     current_identity = (stat.st_dev, stat.st_ino)
+                    if row_inode is not None and (row_inode != stat.st_ino or stat.st_size < row_start):
+                        row_start, row_inode = 0, None
                     if identity is not None and (identity != current_identity or stat.st_size < offset):
-                        offset, record, previous_text = 0, None, None
+                        offset, record, row_start = 0, None, 0
+                        history, keys = [], set()
                     identity = current_identity
                     found, offset = trace_text.scan(source, gate['pane'], since=offset,
                                                     name_at=gate.get('name_at', trace_text.NAME_AT),
-                                                    point_id=gate.get('point_id'))
+                                                    point_id=gate.get('point_id'), keys=keys)
                     for latest in found:
-                        if record is not None and record['text'] != latest['text']:
-                            previous_text = record['text']
-                        record = latest
-                if record and pattern.search(record['text']) and time.monotonic() <= until:
+                        history.append(latest)
+                        keys.add(latest['pane'])
+                        if whole_file or latest['at'] >= row_start:
+                            record = latest
+                if record and record['known'] and pattern.search(record['text']) and time.monotonic() <= until:
+                    transition, previous = trace_text.transition(history)
                     evidence = {'pane': gate['pane'], 'text': record['text'],
                                 'sequence': record['sequence'], 'frame': record['frame'],
-                                'pane_key': record['pane'], 'previous_text': previous_text}
+                                'pane_key': record['pane'], 'scope': 'whole_file' if whole_file else 'row',
+                                'transition': transition, 'previous': previous}
                     if 'point_id' in gate:
                         evidence['point_id'] = record['point_id']
                     self.log({'gate': name, 'on': on, 'pass': True, **evidence})
@@ -1898,7 +1910,9 @@ class Runner:
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
         self.failure_evidence(on, name)
         missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
-        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}')
+        unreadable = (f'; newest sample unreadable (sequence {record["sequence"]})'
+                      if kind == 'text' and record and not record['known'] else '')
+        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}{unreadable}')
 
     def failure_evidence(self, on, name):
         """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""
@@ -2037,6 +2051,10 @@ class Runner:
         paths = set()
         for on, inst in self.instances.items():
             paths.update(str(v) for v in inst.values() if isinstance(v, str) and v.startswith('/'))
+            try:
+                paths.add(str(self.trace_source(on)))
+            except RuntimeError:
+                pass
             for gate in self.plan.get('gates', {}).values():
                 if gate.get('kind') == 'log':
                     paths.add(str(self.source(on, gate['source'])))
