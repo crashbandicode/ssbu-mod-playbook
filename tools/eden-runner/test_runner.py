@@ -1211,6 +1211,29 @@ class RunnerTests(unittest.TestCase):
         self.make(eden).run()
         self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
 
+    def _check_unusual_step_value(self, expression, expected):
+        (self.dir / 'steps.py').write_text('def value(ctx):\n    return ' + expression + '\n')
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'run': 'steps.py:value'}]},
+            {'id': 'r2', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'next'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+        try:
+            self.make(FakeEden({})).run()
+        except (TypeError, ValueError) as exc:
+            self.fail(str(exc))
+        first = json.loads((self.dir / 'out/r1.json').read_text())
+        second = json.loads((self.dir / 'out/r2.json').read_text())
+        self.assertEqual(first['status'], 'PASS')
+        self.assertEqual(first['results'][0]['value'], expected)
+        self.assertEqual(second['status'], 'PASS')
+
+    def test_non_json_step_value_writes_receipt_and_runs_next_row(self):
+        self._check_unusual_step_value('{"stage_ids": {3}}', {'stage_ids': '{3}'})
+
+    def test_an_unwritable_step_value_is_recorded_as_text(self):
+        self._check_unusual_step_value('{("a", 1): 2}', "{('a', 1): 2}")
+
     def test_log_gate_sees_a_rotated_or_truncated_log(self):
         # The plugin rotates its log mid-row: the new file is shorter than the row-start offset (lr-04, row 13).
         self.log.write_text('x' * 5000 + '\n')

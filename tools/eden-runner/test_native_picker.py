@@ -1,7 +1,10 @@
 """Replay exact tile and native state facts without controller or bridge I/O."""
 
+import sys
 import unittest
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
 
 

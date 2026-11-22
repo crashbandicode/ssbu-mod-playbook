@@ -2303,6 +2303,10 @@ class Runner:
         value = hook(StepContext(self, on), **step.get('args', {}))
         if not isinstance(value, (str, int, float, bool, list, dict, type(None))):
             value = repr(value)
+        try:
+            json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            value = repr(value)
         return {'run': step['run'], 'on': on, 'value': value}
 
     def _step_call(self, on, step):

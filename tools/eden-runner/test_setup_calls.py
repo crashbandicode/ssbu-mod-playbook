@@ -3,12 +3,14 @@
 import copy
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
 import routes
 import test_native_picker as recorded
@@ -102,15 +104,18 @@ class CoinReplay:
                                 **self._identity(TOPOLOGY.targets[self.p1_tile], 'carried.')})
         else:
             self.values.update({'cpu.token': 'held', 'at': self.cpu_tile, 'hovered': self.cpu_tile,
-                                'focus': 'css.grid.cpu'})
+                                'focus': 'unknown', 'carried': 'unknown', 'kind': 'unknown',
+                                'name': 'unknown', 'form': 'unknown', 'settled.ack': 'unknown',
+                                'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
+                                'from': 'unknown', 'to': 'unknown'})
             target = TOPOLOGY.targets.get(self.cpu_tile)
             if target:
-                self.values.update({**self._identity(target), **self._identity(target, 'carried.')})
+                self.values.update(self._identity(target, 'carried.'))
             else:
-                self.values.update({'kind': 'unknown', 'name': 'unknown', 'form': 'unknown',
-                                    'carried.kind': 'unknown', 'carried.name': 'unknown',
-                                    'carried.form': 'unknown'})
-        self.values['settled.ack'] = self.values['ack']
+                self.values.update({'carried.kind': 'unknown', 'carried.name': 'Random',
+                                    'carried.form': 'default'})
+        if slot == '0':
+            self.values['settled.ack'] = self.values['ack']
 
     def _place(self, slot):
         at = self.values['at']
@@ -127,11 +132,18 @@ class CoinReplay:
         self.values.update({'carried': 'none', 'p1.carried': 'unknown', 'hand.token': slot,
                             'token.settled': '0', 'focus': 'css.medal.' + slot,
                             'settled': '0', 'settled.ack': 'unknown'})
+        if slot == '1':
+            self.values.update({'hand.token': 'none', 'focus': 'css.medal.mario',
+                                'kind': 'unknown', 'name': 'unknown', 'form': 'unknown',
+                                'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
+                                'from': 'unknown', 'to': 'unknown'})
 
     def send(self, segment):
         self.actions.append(segment)
         if segment == 'tap-a1':
-            held = self.values.get('carried', 'none')
+            held = self.values.get('p1.carried', self.values.get('carried', 'none'))
+            if held == 'unknown':
+                held = 'none'
             if held == 'none':
                 slot = self.values['hand.token']
                 self._take('0' if self.fault == 'wrong_carried' else slot)
@@ -141,7 +153,9 @@ class CoinReplay:
         if not segment.startswith('tile-'):
             raise AssertionError(segment)
         direction = segment[5:]
-        carried = self.values.get('carried', 'none')
+        carried = self.values.get('p1.carried', self.values.get('carried', 'none'))
+        if carried == 'unknown':
+            carried = 'none'
         before = self.values.get('at', 'none')
         ack = int(self.values['ack']) + (2 if self.fault == 'second_step' else 1)
         applied = int(self.values['applied']) + (2 if self.fault == 'second_step' else 1)
@@ -159,8 +173,11 @@ class CoinReplay:
             to = '85' if before == '86' and direction == 'left' else TOPOLOGY.neighbors[before][direction]
             target = TOPOLOGY.targets[to]
             self.values.update({'at': to, 'hovered': to, 'settled': '1', 'settled.ack': str(ack),
-                                'focus': 'css.grid.' + to, 'target.token': 'none', 'token.settled': '0',
-                                **self._identity(target), **self._identity(target, 'carried.')})
+                                'focus': 'unknown' if carried == '1' else 'css.grid.' + to,
+                                'target.token': 'none', 'token.settled': '0',
+                                **self._identity(target, 'carried.')})
+            if carried != '1':
+                self.values.update(self._identity(target))
         self.values.update({'ack': str(ack), 'applied': str(applied), 'ack.result': 'handled',
                             'result': 'handled', 'direction': direction,
                             'from': before if before != 'unknown' else 'none', 'to': to})
@@ -405,7 +422,10 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, 'wait_native', return_value=state), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.enter_training(self.ctx, cap=1, stage_ids={3})
-        json.dumps(result)
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            self.fail(str(exc))
         self.assertEqual(result['args']['stage_ids'], [3])
 
     def test_tr_grid_path_matches_trainingrooms_step_rule(self):
@@ -486,7 +506,8 @@ class SetupCallsR2Tests(unittest.TestCase):
         import switch_hw
 
         self.log.write_text('[Bridge] roster entry=1 kind=7 nana=false frame=1 wall=1\n')
-        lines = iter(('[Bridge] roster entry=0 kind=0 nana=false frame=2 wall=2\n',
+        lines = iter(('[Bridge] req roster result=ok entries=0x3 frame=2 wall=2\n'
+                      '[Bridge] roster entry=0 kind=0 nana=false frame=2 wall=2\n',
                       '[Bridge] roster entry=1 kind=3 nana=false frame=2 wall=2\n'))
         writes = []
 
@@ -609,6 +630,25 @@ class SetupCallsR2Tests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'not owned by native'):
                 routes.reach_training(self.ctx, 'Mario', cpu='Fox')
         self.assertEqual(replay.actions, [])
+
+    def test_reach_training_css_suffix_return_is_plain_json(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        initial = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 3}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=final), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            self.fail(str(exc))
+        self.assertEqual(result['phases']['enter_training']['args']['stage_ids'], [3])
 
     def test_setup_state_reads_without_any_controller_input(self):
         replay = MenuReplay()

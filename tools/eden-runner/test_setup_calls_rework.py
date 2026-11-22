@@ -11,6 +11,26 @@ from unittest.mock import patch
 
 import native_picker as picker
 import routes
+import switch_hw
+
+
+REPLAY = (
+    '[Bridge] fighter entry=0 kind=85 x=-35.999996 y=0.010259508 lr=1 dmg=0 status=0 situation=0 stock=0 dead=0 item=-1 ev=65 frame=3065 wall=372929275\n'
+    '[Bridge] fighter entry=1 kind=86 x=36 y=0.010259508 lr=-1 dmg=0 status=0 situation=0 stock=0 dead=0 item=-1 ev=66 frame=3065 wall=372929275\n'
+    '[Bridge] stage id=3 ev=67 frame=3065 wall=372929276\n'
+    '[Bridge] roster entry=0 kind=85 nana=false ev=68 frame=3065 wall=372929277\n'
+    '[Bridge] item entry=0 held=false kind=-1 ev=69 frame=3065 wall=372929277\n'
+    '[Bridge] roster entry=1 kind=86 nana=false ev=70 frame=3065 wall=372929277\n'
+    '[Bridge] item entry=1 held=false kind=-1 ev=71 frame=3065 wall=372929277\n'
+    '[Bridge] since result=ok cursor=3 from=4 oldest=1 latest=71 count=68 boot=0x3c406bf9e6141397 frame=3083 wall=372929587\n'
+)
+REPLY = '[Bridge] req roster result=ok entries=0x3 frame=3089 wall=372929673\n'
+FRESH = (
+    '[Bridge] roster entry=0 kind=85 nana=false ev=72 frame=3090 wall=372929688\n'
+    '[Bridge] item entry=0 held=false kind=-1 ev=73 frame=3090 wall=372929688\n'
+    '[Bridge] roster entry=1 kind=86 nana=false ev=74 frame=3090 wall=372929688\n'
+    '[Bridge] item entry=1 held=false kind=-1 ev=75 frame=3090 wall=372929688\n'
+)
 
 
 SET_NO_BACKUP = '[Bridge] req set result=refused reason=no_backup frame=2627 wall=379784461'
@@ -32,7 +52,9 @@ def delayed_coin(*, action='a', pending='once'):
         def send(self, segment):
             if action == 'a' and segment == 'tap-a1':
                 self.actions.append(segment)
-                held = self.values.get('carried', 'none')
+                held = self.values.get('p1.carried', self.values.get('carried', 'none'))
+                if held == 'unknown':
+                    held = 'none'
                 self.pending = ('take', self.values['hand.token']) if held == 'none' else ('place', held)
                 return
             super().send(segment)
@@ -104,6 +126,44 @@ class SetupReworkTests(unittest.TestCase):
                                              'settings': str(self.bridge / 'settings.json')},
                                    check_stop=lambda: None)
 
+    def roster_response(self, text):
+        """`bridge_state` on a stepped clock: its first wait appends `text` to the log, every wait takes 0.1 s."""
+        clock = [0.0]
+
+        def wait(seconds):
+            if clock[0] == 0.0:
+                with self.log.open('a') as stream:
+                    stream.write(text)
+            clock[0] += seconds
+
+        with patch.object(switch_hw.time, 'sleep', side_effect=wait), \
+             patch.object(switch_hw.time, 'monotonic', side_effect=lambda: clock[0]):
+            return switch_hw.bridge_state(self.root, fresh=('roster',), cap=1, roster_entries=(0, 1))
+
+    def test_a_replayed_roster_is_not_a_fresh_answer(self):
+        with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
+            self.roster_response(REPLAY)
+
+    def test_the_roster_comes_from_the_lines_after_the_reply(self):
+        old = REPLAY.replace('entry=0 kind=85', 'entry=0 kind=1').replace('entry=1 kind=86', 'entry=1 kind=2')
+        file_end = '[Bridge] file_end name=settings.json bytes=54229 sha256=bf68a0f4553a636bc650fc1a85f9ca45d383c77632d8573605a0f96706c76913 result=ok frame=3088 wall=372929661 mirrored=true\n'
+        state = self.roster_response(old + file_end + REPLY + FRESH)
+        self.assertEqual(state['roster'], {0: {'kind': 85, 'nana': False}, 1: {'kind': 86, 'nana': False}})
+
+    def test_roster_lines_older_than_the_reply_do_not_count(self):
+        old = ''.join(line + '\n' for line in REPLAY.splitlines() if '[Bridge] roster entry=' in line)
+        with self.assertRaisesRegex(RuntimeError, r"no answer for \['roster'\]"):
+            self.roster_response(REPLY + old)
+
+    def test_a_reply_without_an_entry_answers_without_it(self):
+        one = FRESH.splitlines()[0] + '\n'
+        state = self.roster_response(REPLY.replace('entries=0x3', 'entries=0x1') + one)
+        self.assertEqual(state['roster'], {0: {'kind': 85, 'nana': False}})
+
+    def test_a_reply_without_a_mask_needs_the_asked_entries(self):
+        state = self.roster_response(REPLY.replace(' entries=0x3', '') + FRESH)
+        self.assertEqual(state['roster'], {0: {'kind': 85, 'nana': False}, 1: {'kind': 86, 'nana': False}})
+
     def test_take_token_waits_through_a_block_published_before_the_a_lands(self):
         io = delayed_coin()
         io.values.update({'hand.token': '1', 'target.token': '1', 'token.settled': '1',
@@ -169,6 +229,7 @@ class SetupReworkTests(unittest.TestCase):
                         io.values['carried.name'] = 'Mario'
                     elif fault == 'tile':
                         io.values['at'] = '2'
+                        io.values['hovered'] = '2'
                     elif fault == 'p1':
                         io.values['p1.coin.at'] = '1'
 

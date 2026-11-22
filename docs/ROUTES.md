@@ -418,12 +418,15 @@ Surface calibration (2026-11-16): `pick_stage` accepts `transition_cap` (default
 `routes:pick_cpu(fighter, topology=None, form='default')` places the CPU coin at Training CSS with P1 placed;
 `routes:pick_fighters(p1, cpu=..., topology=None, form='default', take_back=False)` places both. Omitted topology uses the checked
 `css-training` library pin; an older Tile Cursor without CPU lines is refused before a CPU input. Receipts include
-the verified fighters and input/request counts. These paths have offline modelled-block tests, not a game proof.
+the verified fighters and input/request counts. A carried CPU coin has no focus in the Tile Cursor's old fields.
+These paths have offline modelled-block tests, not a game proof.
 
 2026-11-22: `routes:set_cpu` and `routes:set_player` select fighters in Training CSS or the Training Mod menu;
 the latter verifies the settings one-hot value and live roster. `routes:tr_settings(values=... | file=...)`
 checks the bridge set reply, writer and file readback (20-second default cap); fighter keys do not prove the live
-fighter unless `verify_roster=True`. `routes:setup_state` is read-only; `routes:reach_training(p1, cpu=None,
+fighter unless `verify_roster=True`; fresh rosters come from lines after the request's reply.
+`routes:setup_state` is read-only: `verified.stage_id` is the live Training stage or `unknown` elsewhere, with
+the remembered stage separate. `routes:reach_training(p1, cpu=None,
 stage='Final Destination', form='normal', cap=180)` uses the shortest checked suffix and reports skipped phases.
 These paths require independent runtime proof.
 
