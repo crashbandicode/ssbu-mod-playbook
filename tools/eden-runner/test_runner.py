@@ -139,7 +139,7 @@ class ReviewClassTests(unittest.TestCase):
                               'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}]
             path.write_text(json.dumps(plan))
             self.assertEqual(runner.dry_run(path)['review'],
-                             {'class': 'library-only', 'private': [],
+                             {'class': 'library-only', 'private': [], 'missing_reasons': [],
                               'composition': [
                                   {'where': 'plan', 'item': {'start': 'menu', '_keys': ['rows', 'setup', 'start']}},
                                   {'where': 'imports', 'item': {'segments': {}, 'gates': {}}},
@@ -156,7 +156,8 @@ class ReviewClassTests(unittest.TestCase):
             path.write_text(json.dumps({'segments': {'missing': {'library': 'not-an-entry'}}}))
             report = runner.dry_run(path)
             self.assertEqual(report['result'], 'BROKEN')
-            self.assertEqual(report['review'], {'class': 'full', 'private': [], 'composition': []})
+            self.assertEqual(report['review'], {'class': 'full', 'private': [], 'missing_reasons': [],
+                                                'composition': []})
 
 
 class ReviewAdmissionTests(unittest.TestCase):
@@ -193,6 +194,28 @@ class ReviewAdmissionTests(unittest.TestCase):
         report = self.report(self.plan)
         self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
         self.assertEqual(report['roles_defaulted'], ['r1'])
+
+    def test_reason_on_library_steps_and_setup_does_not_make_them_private(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'][0]['reason'] = 'Reviewed fixture for this stage'
+        plan['rows'][0]['steps'][3]['reason'] = 'Navigate to main'
+        report = self.report(plan)
+        self.assertEqual(report['review']['class'], 'library-only')
+        self.assertEqual(report['review']['private'], [])
+        self.assertEqual(report['review']['missing_reasons'], [])
+
+    def test_private_reasons_and_missing_reasons_are_reported_without_blocking(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'] = [{'via': 'hook', 'ref': 'custom.py:boot', 'reason': 'Custom staging'},
+                         {'via': 'hook', 'ref': 'custom.py:other'}]
+        plan['rows'][0]['steps'] = [{'run': 'custom.py:boot', 'reason': 'One-off operation'},
+                                    {'call': 'settings.set', 'params': {}}]
+        report = self.report(plan)
+        self.assertEqual(report['review']['class'], 'full')
+        entries = {item['where']: item for item in report['review']['private']}
+        self.assertEqual(entries['setup 0']['reason'], 'Custom staging')
+        self.assertEqual(entries['row r1 step 0']['reason'], 'One-off operation')
+        self.assertEqual(report['review']['missing_reasons'], ['row r1 step 1', 'setup 1'])
 
     def test_setup_blocks_and_role_are_library_only(self):
         plan = copy.deepcopy(self.plan)
