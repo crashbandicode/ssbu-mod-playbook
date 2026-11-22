@@ -407,7 +407,12 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
         while True:
             after = wait_sample(io, UI, until, after, in_flight=True)
             values = after.values
-            if values.get('screen') == next_screen and values.get('input.owner') == 'native':
+            if values.get('screen') == next_screen:
+                owner, dialog = values.get('input.owner'), values.get('dialog')
+                if owner == 'unknown' and dialog == 'unknown':
+                    continue
+                if owner != 'native' or dialog != 'none':
+                    raise RuntimeError(f'after stage confirmation, {next_screen} is owned by {owner!r} with dialog {dialog!r}')
                 if values['focus'] == ui.values['focus']:
                     raise RuntimeError('stage confirmation did not change native focus')
                 break

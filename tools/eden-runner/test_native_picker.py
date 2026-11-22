@@ -373,6 +373,47 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(replay.actions, ['tap-a1'])
 
 
+    def test_smash_stage_confirmation_waits_for_the_destination_owner(self):
+        target = picker.Target('308', 'Training', 'normal')
+
+        def stage_tile(rev):
+            return snapshot('tile.cursor', rev, {
+                'screen': 'sss', 'layout': 'stage-layout', 'generation': '3',
+                'controller': '0', 'seat': '0', 'carried': 'none',
+                'local.token': 'none', 'at': '8', 'hovered': '8', 'settled': '1',
+                'kind': target.kind, 'name': target.name, 'form': target.form, 'settled.ack': '0',
+                'ack': '0', 'applied': '0', 'focus': 'sss/8',
+            })
+
+        source = [native(rev, screen='stage_select', focus='stage_select') for rev in (842, 843)]
+        source_pending = native(844, screen='stage_select', focus='stage_select',
+                                **{'input.owner': 'unknown', 'dialog': 'unknown'})
+        css_pending = native(847, screen='css.smash', focus='css.smash',
+                             **{'input.owner': 'unknown', 'dialog': 'unknown'})
+        css_ready = native(870, screen='css.smash', focus='css.smash')
+
+        def replay(*tail):
+            return Replay([stage_tile(841), stage_tile(842)], [*source, *tail])
+
+        io = replay(source_pending, css_pending, css_ready)
+        result = picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1)
+        self.assertEqual(result['screen'], 'css.smash')
+        self.assertEqual(io.actions, ['tap-a1'])
+
+        for owner, dialog in (('foreign', 'unknown'), ('native', 'confirmation'),
+                              ('unknown', 'none'), ('native', 'unknown')):
+            with self.subTest(owner=owner, dialog=dialog):
+                io = replay(native(847, screen='css.smash', focus='css.smash',
+                                   **{'input.owner': owner, 'dialog': dialog}))
+                with self.assertRaisesRegex(RuntimeError, f'css.smash is owned by {owner!r} with dialog {dialog!r}'):
+                    picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1)
+                self.assertEqual(io.actions, ['tap-a1'])
+
+        io = replay(native(847, screen='rules', focus='rules'))
+        with self.assertRaisesRegex(RuntimeError, "after stage confirmation, unexpected native screen 'rules'"):
+            picker.pick(io, 'sss', target, next_screen='css.smash', cap=.1)
+        self.assertEqual(io.actions, ['tap-a1'])
+
     def test_stage_confirmation_requires_native_transition(self):
         def stage_tile(rev):
             return snapshot('tile.cursor', rev, {
