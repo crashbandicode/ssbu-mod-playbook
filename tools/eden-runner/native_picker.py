@@ -383,6 +383,9 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
     io.log({'tile_confirm_before': at, 'kind': target.kind, 'name': target.name, 'form': target.form,
             'ack': number(before, 'ack'), 'applied': number(before, 'applied'),
             'seat': before.values['seat'], 'boot': before.block['boot'], 'rev': before.block['rev']})
+    context = expected_context
+    if context is None and ui.values.get('screen.context') not in (None, *ABSENT):
+        context = ui.values['screen.context']
     io.send('tap-a1')
     if screen == 'css':
         until = time.monotonic() + cap
@@ -419,9 +422,6 @@ def confirm(io, screen, prepared, *, next_screen='css.training', cap=4, transiti
     else:
         until = time.monotonic() + transition_cap
         after = ui
-        context = expected_context
-        if context is None and ui.values.get('screen.context') not in ABSENT:
-            context = ui.values['screen.context']
         while True:
             after = wait_sample(io, UI, until, after, in_flight=True)
             values = after.values

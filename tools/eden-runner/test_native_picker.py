@@ -165,6 +165,8 @@ def stage_confirmation_replay(source_context, *tail):
         state.values.update({'rev': str(rev), 'observation': str(5008 + rev - 842),
                              'input.owner': 'native', 'dialog': 'none',
                              'screen.context': source_context})
+        if source_context is None:
+            del state.values['screen.context']
         return state
 
     return (Replay([stage_tile(842)], [source_ui(843), *tail]),
@@ -600,6 +602,14 @@ class PickerTests(unittest.TestCase):
         pending, ready = recorded_smash_ui(847), recorded_smash_ui(870)
         pending.values['screen.context'] = ready.values['screen.context'] = 'training'
         io, prepared = stage_confirmation_replay('unknown', pending, ready)
+        result = picker.confirm(io, 'sss', prepared, next_screen='css.smash', cap=.1)
+        self.assertEqual(result['screen'], 'css.smash')
+        self.assertEqual(io.actions, ['tap-a1'])
+
+    def test_stage_confirm_without_a_source_context_field_remains_permissive(self):
+        pending, ready = recorded_smash_ui(847), recorded_smash_ui(870)
+        io, prepared = stage_confirmation_replay(None, pending, ready)
+        self.assertNotIn('screen.context', prepared[1].values)
         result = picker.confirm(io, 'sss', prepared, next_screen='css.smash', cap=.1)
         self.assertEqual(result['screen'], 'css.smash')
         self.assertEqual(io.actions, ['tap-a1'])
