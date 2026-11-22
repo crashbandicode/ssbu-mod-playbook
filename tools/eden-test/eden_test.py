@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """One command for an Eden test run: eden-lifecycle + eden-runner + harvest + a short RESULTS.md.
 
+  eden_test.py go --host <host> --label <label> --nro <file> --rows <rows>  stage, Up, run, report (no Down)
+  eden_test.py run <run> --rows <id>   rerun one row; eden_test.py report <run>   show the updated report
+
 Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh yoga python3 ~/ssbu-mod-playbook/...`,
 after `git -C ~/ssbu-mod-playbook pull --ff-only` there and copying the rows folder over).
 
@@ -31,6 +34,7 @@ import math
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -109,8 +113,11 @@ def cmd_new(args):
             actual = sha256(pin['path'])
             if actual != pin['sha256']:
                 raise SystemExit(f'pin changed: {pin["path"]} is {actual[:12]}…, config says {pin["sha256"][:12]}…')
-    rows_src = Path(args.rows)
-    run.mkdir(parents=True)
+    return _finish_new(run, config, Path(args.rows))
+
+
+def _finish_new(run, config, rows_src):
+    run.mkdir(parents=True, exist_ok=True)
     # A pinned Qt fixture is applied after lifecycle's source-config rewrite.
     # Derive a new pinned fixture; never change the inherited input in place.
     for item in config['instances']:
@@ -139,14 +146,115 @@ def cmd_new(args):
             (derived.with_suffix('.provenance.json')).write_text(json.dumps({
                 'source': str(source), 'source_sha256': sha256(source),
                 'derived_sha256': pin['sha256'], 'changed_keys': list(counts)}, indent=2) + '\n')
-    shutil.copytree(rows_src, run / 'rows', symlinks=True)
+    if rows_src.is_dir():
+        shutil.copytree(rows_src, run / 'rows', symlinks=True)
+    else:
+        (run / 'rows').mkdir()
+        shutil.copy2(rows_src, run / 'rows' / 'rows.json')
     config['rows'] = {'path': str(run / 'rows' / 'rows.json'), 'sha256': sha256(run / 'rows' / 'rows.json')}
     # The lifecycle dry-runs the rows with the runner it pins: always this playbook's runner, never a staged copy.
     config['runner'] = {'path': str(RUNNER), 'sha256': sha256(RUNNER)}
     (run / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
     stamp(run, 'new')
-    print(json.dumps({'run': str(run), 'label': args.label, 'apps': sorted({i['app']['path'] for i in config['instances']})}))
+    print(json.dumps({'run': str(run), 'label': config['label'],
+                      'apps': sorted({i['app']['path'] for i in config['instances']})}))
     return run
+
+
+def _go_trace(args):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', args.label):
+        raise SystemExit(f'invalid run label {args.label!r}')
+    names = [Path(nro).name for nro in args.nro]
+    if len(names) != len(set(names)):
+        raise SystemExit('each --nro must have a distinct file name')
+    if args.trace_point and not args.elf:
+        raise SystemExit('--trace-point requires --elf')
+    if not args.elf:
+        return None
+    elf = Path(args.elf)
+    if elf.suffix != '.so':
+        raise SystemExit(f'--elf must be a .so file: {elf.name}')
+    match = next((Path(nro).name for nro in args.nro if Path(nro).stem == elf.stem), None)
+    if match is None:
+        raise SystemExit(f'--elf {elf.name} has no matching --nro among: '
+                         + ', '.join(Path(nro).name for nro in args.nro))
+    return match
+
+
+def go_new(args):
+    module = _go_trace(args)
+    base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
+    config = copy.deepcopy(json.loads(base.read_text()))
+    if config.get('host') != args.host:
+        raise SystemExit(f'base {base} is for host {config.get("host")!r}, not {args.host!r}')
+    run = RUNS / args.label
+    if run.exists():
+        raise SystemExit(f'{run} exists; pick a new label')
+    config.update(label=args.label, owner=args.owner or f'eden-test/{args.label}',
+                  state_dir=str(run / 'state'), work_root=str(run / 'work'), defer_load=True)
+    for key in ('rows', 'runner', 'authorization'):
+        config.pop(key, None)
+    trace_run = any('trace' in item for item in config['instances']) or bool(args.elf)
+    if trace_run:
+        for item in config['instances']:
+            profile = Path(item['source']) / 'user/config/qt-config.ini'
+            if profile.is_file() and any(line.strip() == 'use_gdbstub=true'
+                                         for line in profile.read_text().splitlines()):
+                raise SystemExit(f'trace run: the GDB stub must be off before game.load, but the source profile '
+                                 f'{profile} has use_gdbstub=true. Turn it off there '
+                                 '(or use a base without a trace section for a stub-on run).')
+    config['stub_rule'] = (
+        'trace run: GDB stub off (source profile checked; the boot row sets core.use_gdbstub=false before game.load)'
+        if trace_run else
+        'no trace section: stub left to the rows (routes:configure_boot)')
+    inputs = run / 'inputs'
+    inputs.mkdir(parents=True)
+    swapped = []
+    for nro in args.nro:
+        original = Path(nro).resolve()
+        target = inputs / original.name
+        shutil.copy2(original, target)
+        digest = sha256(target)
+        for item in config['instances']:
+            pins = item.setdefault('plugins', [])
+            hits = [pin for pin in pins if pin.get('name', Path(pin['path']).name) == original.name]
+            for pin in hits:
+                swapped.append({'from': pin['path'], 'from_sha256': pin['sha256'], 'to': str(target)})
+                pin.update(path=str(target), sha256=digest)
+            if not hits:
+                pins.append({'name': original.name, 'path': str(target), 'sha256': digest})
+    if swapped:
+        config['plugin_swaps'] = swapped
+    for item in config['instances']:
+        for pin in [item['app'], *item.get('plugins', []), *item.get('files', [])]:
+            actual = sha256(pin['path'])
+            if actual != pin['sha256']:
+                raise SystemExit(f'pin changed: {pin["path"]} is {actual[:12]}…, config says {pin["sha256"][:12]}…')
+    if args.elf:
+        elf = inputs / Path(args.elf).name
+        shutil.copy2(args.elf, elf)
+        for item in config['instances']:
+            trace = item.setdefault('trace', {})
+            trace.setdefault('symbols', []).append({'module': module, 'elf': str(elf)})
+            trace.setdefault('points', []).extend({'target': point, 'mode': 'records',
+                                                   'registers': ['x0', 'x1', 'x2', 'x3']}
+                                                  for point in args.trace_point)
+    port_pins = [pin for item in config['instances'] for pin in item.get('files', [])
+                 if pin.get('to', '').endswith('ultimate/ssbu-hw-bridge/port.txt')]
+    if port_pins:
+        sys.path.insert(0, str(RUNNER.parent))
+        try:
+            import routes
+            port = routes.free_port()
+        finally:
+            sys.path.pop(0)
+        port_path = inputs / 'port.txt'
+        port_path.write_text(f'{port}\n')
+        digest = sha256(port_path)
+        for pin in port_pins:
+            pin.update(path=str(port_path), sha256=digest)
+        config['bridge_port'] = port
+    return _finish_new(run, config, Path(args.rows))
 
 
 def lifecycle(run, mode, *extra):
@@ -871,14 +979,10 @@ def row_report(run, row, history):
     return result, reason, proof + [f'out/{name}' for name in asides]
 
 
-def report_md(run):
-    """The run's report: the NRO hashes, then every row as PASS, FAIL or NOT RUN with the reason and the proof, read
-    from the run folder alone. Works while Eden is still up and again after Down."""
+def report_rows(run):
     run = Path(run)
-    config = json.loads((run / 'config.json').read_text())
     spec = json.loads((run / 'rows' / 'rows.json').read_text())
     rows = spec['rows'] if isinstance(spec, dict) else spec
-    timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
     history = {}
     attempts = run / 'out' / 'attempts.jsonl'
     for line in attempts.read_text().splitlines() if attempts.exists() else []:
@@ -887,6 +991,23 @@ def report_md(run):
         except ValueError:
             continue
         history.setdefault(attempt.get('id'), []).append(str(attempt.get('status')))
+    return [(row, *row_report(run, row, history)) for row in rows]
+
+
+def report_counts(run):
+    counts = {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}
+    for _, result, _, _ in report_rows(run):
+        counts[result] += 1
+    return counts
+
+
+def report_md(run):
+    """The run's report: the NRO hashes, then every row as PASS, FAIL or NOT RUN with the reason and the proof, read
+    from the run folder alone. Works while Eden is still up and again after Down."""
+    run = Path(run)
+    config = json.loads((run / 'config.json').read_text())
+    rows = report_rows(run)
+    timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
 
     def utc(key):
         return time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(timing[key])) if key in timing else '?'
@@ -902,8 +1023,7 @@ def report_md(run):
     else:
         state = f'no Up recorded on {host}'
     table, counts = [], {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}
-    for row in rows:
-        result, reason, proof = row_report(run, row, history)
+    for row, result, reason, proof in rows:
         counts[result] += 1
         blocks = ', '.join(str(step.get('run', next(iter(step), '?'))).split(':')[-1] for step in row.get('steps', []))
         table.append(f'| {row["id"]} | {cell(blocks, 60)} | {result} | {cell(reason, 420)} | {"<br>".join(proof)} |')
@@ -939,6 +1059,91 @@ def cmd_report(run):
     (run / 'REPORT.md').write_text(text)
     print(text, end='')
     return 0
+
+
+def _go_sh(argv):
+    print('$ ' + shlex.join(str(arg) for arg in argv), flush=True)
+    return sh(argv)
+
+
+def _pwsh_arg(value):
+    value = str(value)
+    if re.fullmatch(r'[A-Za-z0-9_./:@!=+-]+', value):
+        return value
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _go_remote(args):
+    hosts = RUNS / '_eden-test' / 'hosts.json'
+    mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
+    host = args.ssh or mapping.get(args.host)
+    if not host:
+        raise SystemExit(f'no SSH host for {args.host!r}; use --ssh or add it to {hosts}')
+    if host.startswith('-'):
+        raise SystemExit(f'invalid SSH host {host!r}')
+    stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
+    commands = [
+        ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
+        *[['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro],
+    ]
+    if args.elf:
+        commands.append(['rsync', '-a', '--mkpath', str(args.elf), f'{host}:{stage}/elf/'])
+    rows = Path(args.rows)
+    if rows.is_dir():
+        commands.append(['rsync', '-a', '--mkpath', str(rows) + '/', f'{host}:{stage}/rows/'])
+    else:
+        commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
+    for command in commands:
+        if code := _go_sh(command):
+            raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}')
+    script = f'{stage}/tools/eden-test/eden_test.py'
+    remote = ['/usr/bin/python3', '-I', '-B', script, 'go', '--host', args.host, '--label', args.label]
+    for nro in args.nro:
+        remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
+    remote.extend(('--rows', f'{stage}/rows'))
+    if args.elf:
+        remote.extend(('--elf', f'{stage}/elf/{Path(args.elf).name}'))
+    for point in args.trace_point:
+        remote.extend(('--trace-point', point))
+    if args.owner:
+        remote.extend(('--owner', args.owner))
+    code = _go_sh(['ssh', '-o', 'BatchMode=yes', host, *(_pwsh_arg(arg) for arg in remote)])
+    if code not in (0, 3):
+        raise SystemExit(f'remote go failed ({code})')
+    report = f'./REPORT-{args.label}.md'
+    if result := _go_sh(['scp', f'{host}:/home/intpa/eden-runs/{args.label}/REPORT.md', report]):
+        raise SystemExit(f'copying remote report failed ({result})')
+    run = f'/home/intpa/eden-runs/{args.label}'
+    prefix = f'ssh -o BatchMode=yes {host} /usr/bin/python3 -I -B {script}'
+    print(f'Report: {Path(report).resolve()}')
+    print(f'Re-run: {prefix} run {run} --rows <id>; then {prefix} report {run}')
+    print(f'Down: {prefix} down {run}')
+    return code
+
+
+def cmd_go(args):
+    _go_trace(args)
+    base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
+    if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
+        return _go_remote(args)
+    run = go_new(args)
+    try:
+        cmd_up(run, skip_setup_plan=True, allow_volatile_pins=True)
+    except BaseException:
+        timing = run / 'timing.json'
+        if timing.is_file() and 'up_start' in json.loads(timing.read_text()):
+            print(f'Down: /usr/bin/python3 -I -B {Path(__file__).resolve()} down {run}')
+        raise
+    code = 3
+    try:
+        code = cmd_run(run)
+    except (Exception, SystemExit) as error:
+        print(f'run failed: {error}')
+    finally:
+        cmd_report(run)
+        print(f'Report: {run / "REPORT.md"}')
+    counts = report_counts(run)
+    return 0 if code == 0 and not counts['FAIL'] and not counts['NOT RUN'] else 3
 
 
 def stop_capture(run):
@@ -1017,6 +1222,16 @@ def main(argv=None):
                            help='re-running rows whose starting states are already recorded')
             p.add_argument('--allow-volatile-pins', action='store_true',
                            help='allow pins inside another run folder')
+    p = sub.add_parser('go', help='stage a local or remote run, Up, run and report without Down')
+    p.add_argument('--host', required=True)
+    p.add_argument('--label', required=True)
+    p.add_argument('--nro', action='append', required=True)
+    p.add_argument('--rows', required=True, help='rows.json or a folder containing rows.json')
+    p.add_argument('--elf')
+    p.add_argument('--trace-point', action='append', default=[])
+    p.add_argument('--owner')
+    p.add_argument('--from', dest='from_config')
+    p.add_argument('--ssh')
     sub.add_parser('pace').add_argument('run', type=Path)
     sub.add_parser('report').add_argument('run', type=Path)
     p = sub.add_parser('down')
@@ -1036,6 +1251,8 @@ def main(argv=None):
     p.add_argument('--rows', help='comma-separated row ids to run again in this boot, passed or failed; the earlier '
                                   'receipt is kept as out/<id>.rerun-<n>.json')
     args = parser.parse_args(argv)
+    if args.mode == 'go':
+        return cmd_go(args)
     if args.mode == 'new':
         cmd_new(args)
     elif args.mode == 'check':

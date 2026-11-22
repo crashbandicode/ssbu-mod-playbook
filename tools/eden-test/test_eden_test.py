@@ -882,6 +882,34 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual((run / 'rows/rows.json').read_bytes(), rowfile.read_bytes())
         self.assertNotIn('bridge_port', config)
 
+    def test_go_default_base_updates_every_instances_plugin_and_port(self):
+        base = json.loads(self.previous.read_text())
+        port = self.dir / 'base-port.txt'
+        port.write_text('6979\n')
+        base['instances'][0]['files'] = [{'path': str(port), 'sha256': sha(port),
+                                        'to': 'user/sdmc/ultimate/ssbu-hw-bridge/port.txt'}]
+        second = json.loads(json.dumps(base['instances'][0]))
+        second['key'] = 'b'
+        base['instances'].append(second)
+        default = eden_test.RUNS / '_eden-test/base.json'
+        default.parent.mkdir(parents=True)
+        default.write_text(json.dumps(base))
+        free = mock.Mock(return_value=6991)
+        fake_routes = types.SimpleNamespace(free_port=free)
+        argv = self.go_args()[:-2]
+        with mock.patch.dict(sys.modules, {'routes': fake_routes}), \
+             mock.patch.object(eden_test, 'cmd_up') as up, \
+             mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(argv), 0)
+        up.assert_called_once_with(self.dir / 'runs/go-1', skip_setup_plan=True, allow_volatile_pins=True)
+        free.assert_called_once_with()
+        config = json.loads((self.dir / 'runs/go-1/config.json').read_text())
+        self.assertEqual(len(config['plugin_swaps']), 2)
+        for item in config['instances']:
+            self.assertEqual(item['plugins'][0]['path'], str(self.dir / 'runs/go-1/inputs/plugin.nro'))
+            self.assertEqual(item['files'][0]['path'], str(self.dir / 'runs/go-1/inputs/port.txt'))
+        self.assertEqual(config['bridge_port'], 6991)
+
     def test_go_row_failure_and_not_run_return_three(self):
         for label, spec, expected in (
             ('failed', {'rows': [{'id': 'r1'}, {'id': 'r2'}], 'note': 'fail-once'}, '1 FAIL, 0 NOT RUN'),
@@ -993,6 +1021,13 @@ class EdenTestTests(unittest.TestCase):
         self.assertIn(['rsync', '-a', '--mkpath', str(rowfile),
                        'mapped-xps:/home/intpa/eden-runs/_eden-test/stage/go-1/rows/rows.json'], commands)
         self.assertEqual(commands[-2][0:4], ['ssh', '-o', 'BatchMode=yes', 'mapped-xps'])
+
+    def test_go_remote_staging_failure_never_invokes_ssh(self):
+        with mock.patch.object(eden_test, 'sh', return_value=9) as sh:
+            with self.assertRaisesRegex(SystemExit, 'staging failed'):
+                eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
+        self.assertEqual(sh.call_count, 1)
+        self.assertEqual(sh.call_args.args[0][0], 'rsync')
 
     def test_new_makes_fresh_paths_and_keeps_pins(self):
         eden_test.main(['new', *self.args()])

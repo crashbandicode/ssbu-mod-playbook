@@ -1,0 +1,124 @@
+{
+  "start": "frontend",
+  "early_stop": false,
+  "game_id": "01006A800016E000",
+  "recover": [{"run": "routes:tr_idle"}],
+  "gates": {
+    "loaded": {"library": "loaded"}
+  },
+  "setup": [
+    {
+      "state": "reviewed TrainingRooms settings at boot",
+      "via": "fixture",
+      "ref": "inputs/practice-settings.json",
+      "to": "user/sdmc/ultimate/TrainingRooms/settings.json",
+      "reviewed": {
+        "path": "../inputs/practice-settings.json",
+        "sha256": "cedf5b77a13625ffb327fbba79e59d2fd800d229b544464f523fb85d7c79edd6"
+      }
+    },
+    {
+      "state": "P1 Mario on Final Destination in Training",
+      "via": "hook",
+      "ref": "routes:reach_training"
+    }
+  ],
+  "rows": [
+    {
+      "id": "r00",
+      "start": "frontend",
+      "end": "main",
+      "role": "setup",
+      "on_failure": "stop",
+      "steps": [
+        {"run": "routes:_setting", "args": {"key": "core.use_gdbstub", "value": false}},
+        {"run": "routes:_setting", "args": {"key": "core.network_interface", "value": "lo"}},
+        {"run": "routes:_setting", "args": {"key": "core.lan_online", "value": false}},
+        {"run": "routes:configure_boot"},
+        {"run": "routes:load_game"},
+        {"run": "routes:bridge_on"},
+        {"run": "routes:to_main"}
+      ]
+    },
+    {
+      "id": "r01", "start": "main", "end": "training", "role": "setup", "on_failure": "stop",
+      "steps": [{"run": "routes:reach_training", "args": {"p1": "Mario", "stage": "Final Destination"}}]
+    },
+    {
+      "id": "r02", "start": "training", "end": "training", "role": "setup", "on_failure": "stop",
+      "steps": [{"run": "routes:set_cpu", "args": {"fighter": "Hero"}}]
+    },
+    {
+      "id": "r02a", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_idle"}]
+    },
+    {
+      "id": "r03", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_settings", "args": {"values": {"lra_reset": [0, 1]}}}]
+    },
+    {
+      "id": "r04", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_open", "args": {"page": "fighters_stages"}}]
+    },
+    {
+      "id": "r05", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_goto", "args": {"page": "fighters_stages", "path": ["game.6", "edge_difficulty"]}}]
+    },
+    {
+      "id": "r06", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_close"}]
+    },
+    {
+      "id": "r07", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_set", "args": {"page": "display_controls", "path": ["lra_reset"], "kind": "toggle", "value": "on"}}]
+    },
+    {
+      "id": "r08", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_set", "args": {"page": "fighters_stages", "path": ["game.6", "edge_difficulty"], "kind": "practice_cpu", "value": {"fighter": "Hero", "mode": "Perfect"}}}]
+    },
+    {
+      "id": "r09", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:wizard_place", "args": {"game": "Guard the Edge", "area": "Upper left"}}]
+    },
+    {
+      "id": "r10", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:drill_start", "args": {"game": "Guard the Edge", "expect": {"cpu_kind": 83, "perfect": true, "juggler": false, "damage": 100, "plan": "any"}}}]
+    },
+    {
+      "id": "r11", "start": "training", "end": "training", "role": "test", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:drill_observe", "args": {"attempts": 3, "cap": 120, "perfect": true}}]
+    },
+    {
+      "id": "r12", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:drill_stop", "args": {"game": "Guard the Edge"}}]
+    },
+    {
+      "id": "r13", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:tr_set", "args": {"page": "fighters_stages", "path": ["game.6", "edge_difficulty"], "kind": "practice_cpu", "value": {"fighter": "Hero", "mode": "CPU 9"}}}]
+    },
+    {
+      "id": "r14", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:wizard_place", "args": {"game": "Guard the Edge", "area": "Upper left", "cpu": [-116, 24], "p1": [-64, 0]}}]
+    },
+    {
+      "id": "r15", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:drill_start", "args": {"game": "Guard the Edge", "expect": {"cpu_kind": 83, "perfect": false, "cpu": [-116, 24], "p1": [-64, 0], "plan": "any"}}}]
+    },
+    {
+      "id": "r16", "start": "training", "end": "training", "role": "test", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:drill_observe", "args": {"attempts": 2, "cap": 120, "perfect": false}}]
+    },
+    {
+      "id": "r17", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:drill_stop", "args": {"game": "Guard the Edge"}}]
+    },
+    {
+      "id": "r18", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "witness.py:end_state", "reason": "end-state witness; no library block reads the final menu state"}]
+    },
+    {
+      "id": "r19", "start": "training", "end": "training", "role": "setup", "on_failure": "continue", "start_gate": "loaded",
+      "steps": [{"run": "routes:wizard_place", "args": {"game": "Guard the Edge", "area": "Upper left"}}, {"run": "routes:tr_idle"}]
+    }
+  ]
+}
