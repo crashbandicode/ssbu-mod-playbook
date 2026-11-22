@@ -60,6 +60,7 @@ class SetupFixtureTests(unittest.TestCase):
         self.run = Path(self.tmp.name) / 'run'
         self.rows = self.run / 'rows'
         self.rows.mkdir(parents=True)
+        (self.run / 'config.json').write_text('{}')
         self.reviewed = self.rows / 'reviewed.json'
         self.fixture = self.rows / 'fixture.json'
         self.reviewed.write_text(json.dumps({'last_page': 2, 'menu': {'a': [0, 0], 'b': [5, 6]}}))
@@ -195,6 +196,49 @@ class TimeSplitTests(unittest.TestCase):
         eden_test.results_md(self.run, config)
         timing = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
         self.assertIn('harness 45 s, test 20 s (30.8 %)', timing)
+
+
+class VolatilePinsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'runs'
+        self.run = self.root / 'new'
+        (self.run / 'rows').mkdir(parents=True)
+        (self.run / 'rows/rows.json').write_text(json.dumps({
+            'setup': [{'state': 'Training', 'via': 'segment', 'ref': 's1'}], 'rows': []}))
+        self.pin = str(self.root / 'old' / 'plugins' / 'plugin.nro')
+        (self.run / 'config.json').write_text(json.dumps({'instances': [{'plugins': [{'path': self.pin}]}]}))
+
+    def test_only_sibling_run_paths_are_listed(self):
+        second = str(self.root / 'z-run' / 'data.json')
+        config = {'nested': [{'plugin': self.pin}, second, self.pin],
+                  'shared': str(self.root / '_shared-inputs' / 'plugin.nro'),
+                  'own': str(self.run / 'inputs' / 'settings.json'),
+                  'relative': 'old/plugins/plugin.nro',
+                  'outside': str(self.root.parent / 'runs-other' / 'old' / 'plugin.nro'),
+                  'folder': str(self.root / 'old'),
+                  'normalized': str(self.root / 'old' / '..' / '_shared-inputs' / 'settings.json')}
+        self.assertEqual(eden_test.volatile_pins(config, self.run), [(self.pin, 'old'), (second, 'z-run')])
+
+    def test_up_refuses_before_dry_run(self):
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn(self.pin, str(caught.exception))
+        self.assertIn(str(self.root / '_<name>'), str(caught.exception))
+        self.assertIn('janitor', str(caught.exception))
+        sh.assert_not_called()
+        self.assertEqual(json.loads((self.run / 'setup-fixtures.json').read_text()), [])
+
+    def test_allow_flag_reaches_dry_run(self):
+        with mock.patch.object(eden_test, 'sh', return_value=1) as sh, \
+                mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(['up', str(self.run), '--allow-volatile-pins'])
+        self.assertIn('dry run failed', str(caught.exception))
+        sh.assert_called_once()
+        lifecycle.assert_not_called()
 
 
 class EdenTestTests(unittest.TestCase):

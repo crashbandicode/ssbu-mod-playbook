@@ -25,6 +25,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -234,7 +235,30 @@ def setup_plan_problems(spec, base=None):
     return problems
 
 
-def cmd_up(run, skip_setup_plan=False):
+def volatile_pins(config, run):
+    root = Path(os.path.abspath(run.parent))
+    found = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+        elif isinstance(value, str) and Path(value).is_absolute():
+            try:
+                parts = Path(os.path.normpath(value)).relative_to(root).parts
+            except ValueError:
+                return
+            if len(parts) >= 2 and parts[0] != run.name and not parts[0].startswith('_'):
+                found.add((value, parts[0]))
+
+    walk(config)
+    return sorted(found)
+
+
+def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
     rows = run / 'rows' / 'rows.json'
     spec = json.loads(rows.read_text())
     problems = setup_plan_problems(spec, rows.parent)
@@ -247,6 +271,13 @@ def cmd_up(run, skip_setup_plan=False):
     if problems:
         raise SystemExit('setup plan: ' + '; '.join(problems) + ' (MACROS rule 13; --skip-setup-plan only to re-run '
                          'rows that already have their segments)')
+    if not allow_volatile_pins:
+        config = json.loads((run / 'config.json').read_text())
+        pins = volatile_pins(config, run)
+        if pins:
+            paths = ', '.join(path for path, _ in pins[:8])
+            raise SystemExit(f'volatile pins: {paths}; shared inputs belong in {run.parent}/_<name>/ '
+                             'because the host janitor keeps only those')
     if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
@@ -565,6 +596,8 @@ def main(argv=None):
     p.add_argument('run', type=Path)
     p.add_argument('--skip-setup-plan', action='store_true',
                    help='re-running rows whose starting states are already recorded (no "setup" list yet)')
+    p.add_argument('--allow-volatile-pins', action='store_true',
+                   help='allow pins inside another run folder')
     p = sub.add_parser('run')
     p.add_argument('run', type=Path)
     p.add_argument('--retry', action='store_true')
@@ -572,7 +605,7 @@ def main(argv=None):
     if args.mode == 'new':
         cmd_new(args)
     elif args.mode == 'up':
-        cmd_up(args.run.resolve(), args.skip_setup_plan)
+        cmd_up(args.run.resolve(), args.skip_setup_plan, args.allow_volatile_pins)
     elif args.mode == 'run':
         return cmd_run(args.run.resolve(), args.retry)
     elif args.mode == 'down':
