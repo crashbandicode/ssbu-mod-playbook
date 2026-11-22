@@ -60,13 +60,15 @@ class SetupFixtureTests(unittest.TestCase):
         self.run = Path(self.tmp.name) / 'run'
         self.rows = self.run / 'rows'
         self.rows.mkdir(parents=True)
-        (self.run / 'config.json').write_text('{}')
         self.reviewed = self.rows / 'reviewed.json'
         self.fixture = self.rows / 'fixture.json'
         self.reviewed.write_text(json.dumps({'last_page': 2, 'menu': {'a': [0, 0], 'b': [5, 6]}}))
         self.fixture.write_text(json.dumps({'menu': {'a': [1, 0], 'b': [5, 8]}}))
-        self.item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings',
-                     'file': 'fixture.json', 'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.reviewed)}}
+        self.item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings', 'to': 'TrainingRooms/settings.json',
+                     'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.reviewed)}}
+        self.config = {'instances': [{'key': 'a', 'files': [{'to': self.item['to'], 'path': str(self.fixture),
+                                                            'sha256': sha(self.fixture)}]}]}
+        (self.run / 'config.json').write_text(json.dumps(self.config))
 
     def plan(self):
         (self.rows / 'rows.json').write_text(json.dumps({'setup': [self.item], 'rows': []}))
@@ -111,34 +113,137 @@ class SetupFixtureTests(unittest.TestCase):
         evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
         self.assertTrue(evidence[0]['ok'])
         self.assertEqual(evidence[0]['reviewed'], self.item['reviewed'])
-        self.assertEqual(evidence[0]['file'], 'fixture.json')
+        self.assertEqual(evidence[0]['pin']['path'], str(self.fixture))
 
     def test_wrong_reviewed_hash_is_refused(self):
         self.item['reviewed']['sha256'] = '0' * 64
-        problems = eden_test.fixture_problems(self.item, self.rows)
+        problems = eden_test.fixture_problems(self.item, self.rows, self.config)
         self.assertTrue(any('sha256' in p for p in problems))
 
     def test_missing_fixture_is_refused(self):
-        self.item['file'] = 'missing.json'
-        self.assertTrue(eden_test.fixture_problems(self.item, self.rows))
+        self.config['instances'][0]['files'][0]['path'] = str(self.rows / 'missing.json')
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows, self.config))
 
     def test_invalid_json_is_refused(self):
         self.fixture.write_text('{')
-        self.assertTrue(eden_test.fixture_problems(self.item, self.rows))
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows, self.config))
 
     def test_null_fixture_root_is_compared(self):
         self.fixture.write_text('null')
-        self.assertIn('<root>', ' '.join(eden_test.fixture_problems(self.item, self.rows)))
+        self.assertIn('<root>', ' '.join(eden_test.fixture_problems(self.item, self.rows, self.config)))
 
-    def test_review_without_file_is_refused(self):
-        del self.item['file']
-        self.assertTrue(eden_test.fixture_problems(self.item, self.rows))
+    def test_review_without_to_is_refused(self):
+        del self.item['to']
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows, self.config))
 
     def test_unreviewed_item_is_untouched(self):
         del self.item['reviewed']
-        self.assertEqual(eden_test.fixture_problems(self.item, self.rows), [])
+        self.assertEqual(eden_test.fixture_problems(self.item, self.rows, self.config), [])
         self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}), [])
-        self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}, self.rows), [])
+        self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}, self.rows, self.config), [])
+
+
+class PinnedFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name) / 'runs' / 'run'
+        self.rows = self.run / 'rows'
+        self.rows.mkdir(parents=True)
+        self.reviewed = self.rows / 'reviewed.json'
+        self.reviewed.write_text('{"last_page": 2}')
+        self.clean = self.rows / 'clean.json'
+        self.clean.write_text(self.reviewed.read_text())
+        self.actual = Path(self.tmp.name) / 'actual.json'
+        self.actual.write_text('{"last_page": 9}')
+        self.destination = 'user/sdmc/ultimate/TrainingRooms/settings.json'
+        self.item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings', 'to': self.destination,
+                     'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.reviewed)}}
+        self.config = {'instances': [{'key': 'a', 'files': [
+            {'to': './' + self.destination, 'path': str(self.actual), 'sha256': sha(self.actual)}]}]}
+
+    def save(self):
+        (self.rows / 'rows.json').write_text(json.dumps({'setup': [self.item], 'rows': []}))
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+
+    def check(self, *flags):
+        self.save()
+        return eden_test.main(['check', str(self.run), *flags])
+
+    def test_up_refuses_clean_declaration_when_installed_pin_differs(self):
+        self.item['file'] = 'clean.json'
+        self.save()
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('last_page', str(caught.exception))
+        sh.assert_not_called()
+
+    def test_matching_pin_passes_check_and_writes_comparison(self):
+        self.config['instances'][0]['files'][0].update(path=str(self.clean), sha256=sha(self.clean))
+        self.assertEqual(self.check(), 0)
+        entry = json.loads((self.run / 'setup-fixtures.json').read_text())[0]
+        self.assertEqual((entry['state'], entry['instance'], entry['to']), ('Training', 'a', self.destination))
+        self.assertEqual((entry['pin']['path'], entry['pin']['sha256']), (str(self.clean), sha(self.clean)))
+        self.assertEqual((entry['reviewed']['path'], entry['reviewed']['sha256']),
+                         ('reviewed.json', sha(self.reviewed)))
+        self.assertEqual(entry['differing_paths'], [])
+        self.assertTrue(entry['ok'])
+
+    def test_multiple_instances_and_explicit_instance_selection(self):
+        self.config['instances'][0]['files'][0].update(path=str(self.clean), sha256=sha(self.clean))
+        self.config['instances'].append({'key': 'b', 'files': [
+            {'to': self.destination, 'path': str(self.actual), 'sha256': sha(self.actual)}]})
+        self.assertEqual(self.check(), 2)
+        entries = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertEqual([(e['instance'], e['ok']) for e in entries], [('a', True), ('b', False)])
+        self.item['instance'] = 'a'
+        self.assertEqual(self.check(), 0)
+        self.item['instance'] = 'b'
+        self.assertEqual(self.check(), 2)
+
+    def test_per_instance_results_remain_independent(self):
+        self.config['instances'].append({'key': 'b', 'files': [
+            {'to': self.destination, 'path': str(self.clean), 'sha256': sha(self.clean)}]})
+        self.assertEqual(self.check(), 2)
+        entries = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertEqual([(e['instance'], e['ok']) for e in entries], [('a', False), ('b', True)])
+
+    def test_last_pin_is_the_one_installed_for_a_duplicate_destination(self):
+        self.config['instances'][0]['files'].append(
+            {'to': self.destination, 'path': str(self.clean), 'sha256': sha(self.clean)})
+        self.assertEqual(self.check(), 0)
+        entry = json.loads((self.run / 'setup-fixtures.json').read_text())[0]
+        self.assertEqual(entry['pin']['path'], str(self.clean))
+
+    def test_bad_pin_hash_and_missing_pin_are_refused(self):
+        self.config['instances'][0]['files'][0]['sha256'] = '0' * 64
+        self.assertEqual(self.check(), 2)
+        entry = json.loads((self.run / 'setup-fixtures.json').read_text())[0]
+        self.assertFalse(entry['ok'])
+        self.item['instance'] = 'a'
+        self.config['instances'][0]['files'] = []
+        self.assertEqual(self.check(), 2)
+        self.item['instance'] = 'missing'
+        self.assertEqual(self.check(), 2)
+
+    def test_legacy_file_and_missing_to_are_refused(self):
+        self.config['instances'][0]['files'][0].update(path=str(self.clean), sha256=sha(self.clean))
+        self.item['file'] = 'clean.json'
+        self.save()
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('to', str(caught.exception))
+        sh.assert_not_called()
+        del self.item['file']
+        del self.item['to']
+        self.assertEqual(self.check(), 2)
+
+    def test_skip_setup_plan_does_not_skip_pin_comparison(self):
+        self.assertEqual(self.check('--skip-setup-plan'), 2)
 
 
 class TimeSplitTests(unittest.TestCase):
@@ -283,6 +388,31 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(config['rows']['sha256'], sha(self.dir / 'runs/lr-14/rows/rows.json'))
         with self.assertRaises(SystemExit):  # labels are never reused
             eden_test.main(['new', *self.args()])
+
+    def test_new_stages_and_up_checks_the_configured_file_pin(self):
+        actual = self.dir / 'actual.json'
+        actual.write_text('{"last_page": 9}')
+        (self.rows / 'reviewed.json').write_text('{"last_page": 2}')
+        (self.rows / 'clean.json').write_text('{"last_page": 2}')
+        destination = 'user/sdmc/ultimate/TrainingRooms/settings.json'
+        previous = json.loads(self.previous.read_text())
+        previous['instances'][0]['files'] = [{'path': str(actual), 'sha256': sha(actual), 'to': destination}]
+        self.previous.write_text(json.dumps(previous))
+        item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings', 'to': destination, 'file': 'clean.json',
+                'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.rows / 'reviewed.json')}}
+        (self.rows / 'rows.json').write_text(json.dumps({'setup': [item], 'rows': []}))
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(run)
+        self.assertIn('last_page', str(caught.exception))
+        sh.assert_not_called()
+        comparison = json.loads((run / 'setup-fixtures.json').read_text())[0]
+        self.assertEqual(comparison['pin']['path'], json.loads((run / 'config.json').read_text())
+                         ['instances'][0]['files'][0]['path'])
+        self.assertEqual(comparison['differing_paths'], ['last_page'])
 
     def test_new_refuses_a_changed_pin(self):
         (self.dir / 'plugin.nro').write_bytes(b'different')

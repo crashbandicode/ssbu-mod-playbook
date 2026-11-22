@@ -5,6 +5,7 @@ Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh yoga 
 after `git -C ~/ssbu-mod-playbook pull --ff-only` there and copying the rows folder over).
 
   eden_test.py new  --from <previous config.json> --label lr-14 --rows <rows folder>   new run folder + config
+  eden_test.py check <run folder>      check setup, pinned fixtures and volatile inputs without starting anything
   eden_test.py up   <run folder>        offline dry run, then lifecycle up
   eden_test.py run  <run folder> [--retry]   runner (with --retry: clear STOP-INPUT first; passed rows skip)
   eden_test.py down <run folder> [--keep-state]   lifecycle down (and its prune), harvest, RESULTS.md, timing.json
@@ -26,6 +27,7 @@ import copy
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -176,50 +178,97 @@ def fixture_diff(fixture, reviewed):
     return sorted(diff(fixture, reviewed, ''))
 
 
-def fixture_comparison(item, base):
+def fixture_comparison(item, base, config):
     reviewed = item.get('reviewed')
-    result = {'state': item.get('state'), 'file': item.get('file'), 'reviewed': reviewed,
-              'differing_paths': [], 'differs_only': item.get('differs_only', []), 'ok': False}
     problems = []
     state = item.get('state', '?')
-    if not item.get('file'):
-        return result, [f'{state}: reviewed requires file']
-    if not isinstance(reviewed, dict) or not reviewed.get('path'):
-        return result, [f'{state}: reviewed needs path and sha256']
-    allowed = result['differs_only']
+    if 'file' in item:
+        problems.append(f'{state}: use "to" instead of "file"')
+    if 'reviewed' not in item:
+        return [], problems
+    destination = item.get('to')
+    if not isinstance(destination, str) or not destination:
+        return [], problems + [f'{state}: reviewed requires "to"']
+    destination = posixpath.normpath(destination)
+    selected = []
+    for instance in config.get('instances', []):
+        if not isinstance(instance, dict):
+            continue
+        if item.get('instance') is not None and instance.get('key') != item['instance']:
+            continue
+        pins = [pin for pin in instance.get('files', []) if isinstance(pin, dict)
+                and isinstance(pin.get('to'), str) and posixpath.normpath(pin['to']) == destination]
+        if pins or item.get('instance') is not None:
+            selected.append((instance.get('key'), pins[-1] if pins else None))
+    if not selected:
+        return [], problems + [f'{state}: no instance selected for {destination}']
+    allowed = item.get('differs_only', [])
     if not isinstance(allowed, list) or any(not isinstance(path, str) for path in allowed):
-        return result, [f'{state}: differs_only must be a list of paths']
+        problems.append(f'{state}: differs_only must be a list of paths')
+        allowed = []
     missing = object()
-    values = []
-    for name, source in (('fixture', item['file']), ('reviewed', reviewed['path'])):
+    reviewed_value = missing
+    if not isinstance(reviewed, dict) or not reviewed.get('path'):
+        problems.append(f'{state}: reviewed needs path and sha256')
+    else:
+        source = reviewed['path']
         try:
             path = Path(source)
             data = (path if path.is_absolute() else Path(base) / path).read_bytes()
-            value = json.loads(data)
         except (OSError, ValueError, TypeError) as error:
-            problems.append(f'{state}: {name} {source}: {type(error).__name__}')
-            values.append(missing)
-            continue
-        if name == 'reviewed' and (not isinstance(reviewed.get('sha256'), str)
-                                   or reviewed['sha256'].lower() != hashlib.sha256(data).hexdigest()):
-            problems.append(f'{state}: reviewed sha256 mismatch: {source}')
-        values.append(value)
-    if len(values) == 2 and all(value is not missing for value in values):
-        result['differing_paths'] = fixture_diff(*values)
-        offending = [path for path in result['differing_paths']
-                     if not any(path == allow or path.startswith(allow + '.') for allow in allowed)]
-        if offending:
-            problems.append(f'{state}: {len(offending)} differing paths: '
-                            + ', '.join(path or '<root>' for path in offending[:12]))
-    result['ok'] = not problems
-    return result, problems
+            problems.append(f'{state}: reviewed {source}: {type(error).__name__}')
+        else:
+            if (not isinstance(reviewed.get('sha256'), str)
+                    or reviewed['sha256'].lower() != hashlib.sha256(data).hexdigest()):
+                problems.append(f'{state}: reviewed sha256 mismatch: {source}')
+            try:
+                reviewed_value = json.loads(data)
+            except (ValueError, TypeError) as error:
+                problems.append(f'{state}: reviewed {source}: {type(error).__name__}')
+    common_problems = list(problems)
+    results = []
+    for instance, pin in selected:
+        result = {'state': item.get('state'), 'instance': instance, 'to': destination,
+                  'pin': {'path': pin.get('path'), 'sha256': pin.get('sha256')} if pin else None,
+                  'reviewed': reviewed, 'differing_paths': [], 'differs_only': item.get('differs_only', []),
+                  'ok': False}
+        found = []
+        prefix = f'{state} instance {instance}'
+        if pin is None:
+            found.append(f'{prefix}: no pin for {destination}')
+        else:
+            source = pin.get('path')
+            try:
+                data = Path(source).read_bytes()
+            except (OSError, ValueError, TypeError) as error:
+                found.append(f'{prefix}: pin {source}: {type(error).__name__}')
+            else:
+                if (not isinstance(pin.get('sha256'), str)
+                        or pin['sha256'].lower() != hashlib.sha256(data).hexdigest()):
+                    found.append(f'{prefix}: pin sha256 mismatch: {source}')
+                try:
+                    value = json.loads(data)
+                except (ValueError, TypeError) as error:
+                    found.append(f'{prefix}: pin {source}: {type(error).__name__}')
+                else:
+                    if reviewed_value is not missing:
+                        result['differing_paths'] = fixture_diff(value, reviewed_value)
+                        offending = [path for path in result['differing_paths']
+                                     if not any(path == allow or path.startswith(allow + '.') for allow in allowed)]
+                        if offending:
+                            found.append(f'{prefix}: {len(offending)} differing paths: '
+                                         + ', '.join(path or '<root>' for path in offending[:12]))
+        result['ok'] = not common_problems and not found
+        results.append(result)
+        problems.extend(found)
+    return results, problems
 
 
-def fixture_problems(item, base):
-    return fixture_comparison(item, base)[1] if 'reviewed' in item else []
+def fixture_problems(item, base, config):
+    return fixture_comparison(item, base, config)[1]
 
 
-def setup_plan_problems(spec, base=None):
+def setup_plan_problems(spec, base=None, config=None):
     """MACROS rule 13: rows.json names how each starting state is reached, before Up.
     "setup": [{"state": "Training, P1 Kirby, CPU Kirby", "via": "fixture", "ref": "files: settings.json"}, ...]"""
     plan = spec.get('setup') if isinstance(spec, dict) else None
@@ -230,8 +279,8 @@ def setup_plan_problems(spec, base=None):
     for i, item in enumerate(plan):
         if not isinstance(item, dict) or not item.get('state') or item.get('via') not in SETUP_VIA or not item.get('ref'):
             problems.append(f'setup[{i}] needs "state", "via" ({"/".join(SETUP_VIA)}) and "ref"')
-        if base is not None and isinstance(item, dict):
-            problems.extend(f'setup[{i}]: {problem}' for problem in fixture_problems(item, base))
+        if base is not None and config is not None and isinstance(item, dict):
+            problems.extend(f'setup[{i}]: {problem}' for problem in fixture_problems(item, base, config))
     return problems
 
 
@@ -258,26 +307,40 @@ def volatile_pins(config, run):
     return sorted(found)
 
 
-def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
+def check_run(run, skip_setup_plan=False, allow_volatile_pins=False):
     rows = run / 'rows' / 'rows.json'
     spec = json.loads(rows.read_text())
-    problems = setup_plan_problems(spec, rows.parent)
+    config = json.loads((run / 'config.json').read_text())
+    problems = [] if skip_setup_plan else setup_plan_problems(spec)
     setup = spec.get('setup', []) if isinstance(spec, dict) else []
-    comparisons = [(i, fixture_comparison(item, rows.parent)) for i, item in enumerate(setup)
-                   if isinstance(item, dict) and 'reviewed' in item] if isinstance(setup, list) else []
-    (run / 'setup-fixtures.json').write_text(json.dumps([result for _, (result, _) in comparisons], indent=2) + '\n')
-    if skip_setup_plan:
-        problems = [f'setup[{i}]: {problem}' for i, (_, found) in comparisons for problem in found]
-    if problems:
-        raise SystemExit('setup plan: ' + '; '.join(problems) + ' (MACROS rule 13; --skip-setup-plan only to re-run '
-                         'rows that already have their segments)')
+    comparisons = []
+    for i, item in enumerate(setup if isinstance(setup, list) else []):
+        if isinstance(item, dict) and ('reviewed' in item or 'file' in item):
+            results, found = fixture_comparison(item, rows.parent, config)
+            comparisons.extend(results)
+            problems.extend(f'setup[{i}]: {problem}' for problem in found)
+    (run / 'setup-fixtures.json').write_text(json.dumps(comparisons, indent=2) + '\n')
     if not allow_volatile_pins:
-        config = json.loads((run / 'config.json').read_text())
         pins = volatile_pins(config, run)
         if pins:
             paths = ', '.join(path for path, _ in pins[:8])
-            raise SystemExit(f'volatile pins: {paths}; shared inputs belong in {run.parent}/_<name>/ '
-                             'because the host janitor keeps only those')
+            problems.append(f'volatile pins: {paths}; shared inputs belong in {run.parent}/_<name>/ '
+                            'because the host janitor keeps only those')
+    return problems
+
+
+def cmd_check(run, skip_setup_plan=False, allow_volatile_pins=False):
+    problems = check_run(run, skip_setup_plan, allow_volatile_pins)
+    for problem in problems:
+        print(problem)
+    return 2 if problems else 0
+
+
+def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
+    problems = check_run(run, skip_setup_plan, allow_volatile_pins)
+    if problems:
+        raise SystemExit('; '.join(problems))
+    rows = run / 'rows' / 'rows.json'
     if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
@@ -592,18 +655,21 @@ def main(argv=None):
     p.add_argument('run', type=Path)
     p.add_argument('--keep-state', action='store_true',
                    help='keep work/ and the state snapshots for debugging (only when asked); a later down prunes them')
-    p = sub.add_parser('up')
-    p.add_argument('run', type=Path)
-    p.add_argument('--skip-setup-plan', action='store_true',
-                   help='re-running rows whose starting states are already recorded (no "setup" list yet)')
-    p.add_argument('--allow-volatile-pins', action='store_true',
-                   help='allow pins inside another run folder')
+    for name in ('check', 'up'):
+        p = sub.add_parser(name)
+        p.add_argument('run', type=Path)
+        p.add_argument('--skip-setup-plan', action='store_true',
+                       help='re-running rows whose starting states are already recorded (no "setup" list yet)')
+        p.add_argument('--allow-volatile-pins', action='store_true',
+                       help='allow pins inside another run folder')
     p = sub.add_parser('run')
     p.add_argument('run', type=Path)
     p.add_argument('--retry', action='store_true')
     args = parser.parse_args(argv)
     if args.mode == 'new':
         cmd_new(args)
+    elif args.mode == 'check':
+        return cmd_check(args.run.resolve(), args.skip_setup_plan, args.allow_volatile_pins)
     elif args.mode == 'up':
         cmd_up(args.run.resolve(), args.skip_setup_plan, args.allow_volatile_pins)
     elif args.mode == 'run':
