@@ -30,7 +30,7 @@ def assertion_role(gate):
     if kind == 'json':
         return 'card'
     source = str((gate or {}).get('source', ''))
-    if kind == 'log' and 'trace' in source:
+    if kind == 'text' or (kind == 'log' and 'trace' in source):
         return 'trace'
     return 'effect'
 
@@ -129,6 +129,8 @@ def gate_inputs_missing(runner, on, gate):
     try:
         if kind in ('log', 'json'):
             return not runner.source(on, gate['source']).is_file()
+        if kind == 'text':
+            return not runner.trace_source(on).is_file()
         if kind == 'image' and not gate.get('acquire'):
             return not (runner.base / gate['reference']).is_file()
         if kind == 'hook':

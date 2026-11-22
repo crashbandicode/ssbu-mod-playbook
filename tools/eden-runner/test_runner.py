@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline tests for runner.py with a fake Eden: no emulator, no input. Run: python3 -I test_runner.py"""
+import copy
 import hashlib
 import json
 import shutil
@@ -9,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runner  # noqa: E402
@@ -66,6 +68,944 @@ class FakeEden:
             Image.new('RGB', (64, 36), self.colour).save(params['path'])
             return {'ok': True, 'result': {}}
         return {'ok': True, 'result': {}}
+
+
+class ReviewClassTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = {
+            'segments': {'shared': {'library': 'smash-main'}},
+            'gates': {'shared-gate': {'library': 'main'}},
+            'setup': [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
+                       'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}],
+            'recover': [{'run': 'routes:recover'}],
+            'rows': [{'id': 'r1', 'start': 'menu', 'end': 'menu', 'start_gate': 'shared-gate',
+                      'recover': [{'run': 'routes_online:recover'}],
+                      'steps': [{'run': 'routes:to_main'}, {'play': 'shared'}, {'gate': 'shared-gate'},
+                                {'shot': 'end'}]}],
+        }
+
+    def test_shared_hooks_segments_gates_and_reviewed_setup_are_library_only(self):
+        review = runner.review_class(self.plan, Path('.'))
+        self.assertEqual((review['class'], review['private']), ('library-only', []))
+
+    def test_private_step_segment_gate_and_setup_are_listed(self):
+        variants = [
+            ('row r1 step 0', lambda p: p['rows'][0]['steps'][0].update(run='project.py:open')),
+            ('segment shared', lambda p: p['segments']['shared'].pop('library')),
+            ('gate shared-gate', lambda p: p['gates']['shared-gate'].pop('library')),
+            ('setup 0', lambda p: p.update(setup=[{'via': 'fixture'}])),
+            ('setup 0', lambda p: p.update(setup=[{'via': 'record'}])),
+        ]
+        for where, change in variants:
+            with self.subTest(where=where):
+                plan = copy.deepcopy(self.plan)
+                change(plan)
+                report = runner.review_class(plan, Path('.'))
+                self.assertEqual(report['class'], 'full')
+                self.assertIn(where, [item['where'] for item in report['private']])
+                self.assertTrue(all(item['what'] for item in report['private']))
+
+    def test_nested_steps_recovery_and_failure_hook_are_listed(self):
+        self.plan['rows'][0]['steps'][3] = {'gif': {'steps': [{'run': 'project.py:nested'}]}}
+        self.plan['rows'][0]['recover'].append({'run': 'project.py:recover'})
+        self.plan['rows'][0]['on_failure_hook'] = {'run': 'project.py:failure'}
+        self.plan['recover'].append({'run': 'project.py:recover'})
+        where = [item['where'] for item in runner.review_class(self.plan, Path('.'))['private']]
+        self.assertIn('row r1 step 3', where)
+        self.assertIn('row r1 recover 1', where)
+        self.assertIn('row r1', where)
+        self.assertIn('plan recover 1', where)
+
+    def test_segment_and_row_start_gates_are_reviewed(self):
+        self.plan['gates']['private'] = {'kind': 'status'}
+        self.plan['segments']['shared']['start_gate'] = 'private'
+        self.plan['rows'][0]['start_gate'] = 'private'
+        where = [item['where'] for item in runner.review_class(self.plan, Path('.'))['private']]
+        self.assertIn('segment shared', where)
+        self.assertIn('gate private', where)
+
+    def test_dry_run_includes_review_without_changing_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'rows.json'
+            path.write_text(json.dumps({'start': 'menu', 'rows': [
+                {'id': 'r1', 'start': 'menu', 'end': 'menu', 'steps': [{'shot': 'x'}]}]}))
+            report = runner.dry_run(path)
+            self.assertEqual(report['result'], 'READY')
+            self.assertEqual(report['review']['class'], 'full')
+            self.assertEqual(report['review']['private'][0]['what'], 'no setup plan')
+            plan = json.loads(path.read_text())
+            plan['setup'] = [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
+                              'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}]
+            path.write_text(json.dumps(plan))
+            self.assertEqual(runner.dry_run(path)['review'],
+                             {'class': 'library-only', 'private': [],
+                              'composition': [
+                                  {'where': 'plan', 'item': {'start': 'menu', '_keys': ['rows', 'setup', 'start']}},
+                                  {'where': 'imports', 'item': {'segments': {}, 'gates': {}}},
+                                  {'where': 'setup 0', 'item': plan['setup'][0]},
+                                  {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu',
+                                                              '_keys': ['end', 'id', 'start', 'steps']}},
+                                  {'where': 'row r1 step 0', 'item': {'shot': 'x'}}]})
+            plan['setup'] = [{'via': 'fixture'}]
+            path.write_text(json.dumps(plan))
+            report = runner.dry_run(path)
+            self.assertEqual((report['result'], report['errors']), ('READY', []))
+            self.assertEqual(report['review']['class'], 'full')
+            self.assertEqual(report['review']['private'][0]['where'], 'setup 0')
+            path.write_text(json.dumps({'segments': {'missing': {'library': 'not-an-entry'}}}))
+            report = runner.dry_run(path)
+            self.assertEqual(report['result'], 'BROKEN')
+            self.assertEqual(report['review'], {'class': 'full', 'private': [], 'composition': []})
+
+
+class ReviewAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.manifest = self.dir / 'rows.json'
+        (self.dir / 'custom.py').write_text('def boot(ctx):\n    return True\n')
+        self.macro = self.dir / 'private.json'
+        self.macro.write_text(json.dumps({'events': [{'frame': 1, 'buttons': 1}]}))
+        self.plan = {
+            'start': 'menu',
+            'segments': {'route': {'library': 'smash-main'}},
+            'gates': {'main': {'library': 'main'}, 'installed': {'library': 'installed'},
+                      'smash-submenu': {'library': 'smash-submenu'}},
+            'setup': [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
+                       'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}],
+            'rows': [{'id': 'r1', 'start': 'menu', 'end': 'menu',
+                      'steps': [{'gate': 'main'}, {'play': 'route'}, {'gate': 'installed'},
+                                {'run': 'routes:to_main'}, {'call': 'status'}]}],
+        }
+
+    def report(self, plan):
+        self.manifest.write_text(json.dumps(plan))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual((report['result'], report['errors']), ('READY', []))
+        return report
+
+    def private_segment(self, plan):
+        plan['segments']['mine'] = {'file': str(self.macro), 'sha256': sha(self.macro)}
+
+    def test_clean_packet_is_library_only_and_reports_defaulted_roles(self):
+        report = self.report(self.plan)
+        self.assertEqual((report['review']['class'], report['review']['private']), ('library-only', []))
+        self.assertEqual(report['roles_defaulted'], ['r1'])
+
+    def test_composition_distinguishes_reviewer_packets(self):
+        first = copy.deepcopy(self.plan)
+        first['gates']['confirm'] = {'library': 'main'}
+        first['rows'][0].update(start_gate='confirm', steps=[
+            {'gate': 'confirm', 'on': 'guest'},
+            {'copy': 'settings', 'as': 'before', 'on': 'guest'},
+            {'json_diff': {'source': 'settings', 'before': 'before', 'must_change': ['p1']}, 'on': 'guest'}])
+        second = copy.deepcopy(first)
+        second['gates']['confirm'] = {'library': 'installed'}
+        second['rows'][0]['steps'][0]['on'] = 'host'
+        second['rows'][0]['steps'][1]['on'] = 'host'
+        second['rows'][0]['steps'][2]['on'] = 'host'
+        second['rows'][0]['steps'][2]['json_diff'].pop('must_change')
+        reviews = [self.report(plan)['review'] for plan in (first, second)]
+        self.assertEqual([review['class'] for review in reviews], ['library-only', 'library-only'])
+        self.assertNotEqual(reviews[0].get('composition', reviews[0].get('arguments')),
+                            reviews[1].get('composition', reviews[1].get('arguments')))
+        for plan, review in zip((first, second), reviews):
+            entries = {entry['where']: entry['item'] for entry in review['composition']}
+            self.assertEqual(entries['imports']['gates']['confirm'], plan['gates']['confirm']['library'])
+            self.assertEqual(entries['row r1']['start_gate'], 'confirm')
+            self.assertEqual(entries['row r1 step 0'], plan['rows'][0]['steps'][0])
+            self.assertEqual(entries['row r1 step 1'], plan['rows'][0]['steps'][1])
+            self.assertEqual(entries['row r1 step 2'], plan['rows'][0]['steps'][2])
+
+    def test_composition_distinguishes_empty_row_recovery_override(self):
+        first = copy.deepcopy(self.plan)
+        first['recover'] = [{'play': 'route'}]
+        first['rows'] = [
+            {'id': 'r1', 'start': 'menu', 'end': 'menu', 'on_failure': 'continue', 'steps': [{'gate': 'main'}]},
+            {'id': 'r2', 'start': 'menu', 'end': 'menu', 'start_gate': 'main', 'steps': [{'gate': 'main'}]}]
+        second = copy.deepcopy(first)
+        second['rows'][1]['recover'] = []
+        self.assertEqual(runner.recover_steps_of(first, first['rows'][1]), [{'play': 'route'}])
+        self.assertEqual(runner.recover_steps_of(second, second['rows'][1]), [])
+        reviews = [self.report(plan)['review'] for plan in (first, second)]
+        self.assertEqual([review['class'] for review in reviews], ['library-only', 'library-only'])
+        self.assertNotEqual(reviews[0]['composition'], reviews[1]['composition'])
+        first_row = next(e['item'] for e in reviews[0]['composition'] if e['where'] == 'row r2')
+        second_row = next(e['item'] for e in reviews[1]['composition'] if e['where'] == 'row r2')
+        self.assertNotIn('recover', first_row)
+        self.assertEqual(second_row['recover'], [])
+        self.assertNotIn('recover', first_row['_keys'])
+        self.assertIn('recover', second_row['_keys'])
+
+    def test_composition_reconstructs_clean_packet(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'][0]['differs_only'] = ['menu.cpu_percent']
+        plan['rows'][0]['recover'] = [{'call': 'status', 'params': {'side': 'guest'}}]
+        plan['rows'].append({'id': 'r2', 'start': 'menu', 'end': 'menu',
+                             'steps': [{'gate': 'main'}], 'recover': []})
+        plan['recover'] = [{'gate': 'main'}, {'library': 'smash-main'}]
+        variants = [plan, copy.deepcopy(plan), copy.deepcopy(plan), copy.deepcopy(plan)]
+        variants[1]['recover'] = []
+        variants[1]['setup'] = []
+        del variants[2]['rows'][1]['recover']
+        del variants[2]['recover']
+        variants[3]['rows'][1]['steps'] = []
+        for variant in variants:
+            with self.subTest(keys=sorted(variant), second_row=variant['rows'][1]):
+                self.manifest.write_text(json.dumps(variant))
+                report = runner.dry_run(self.manifest)
+                if variant['rows'][1]['steps']:
+                    self.assertEqual((report['result'], report['errors']), ('READY', []))
+                else:
+                    self.assertEqual(report['result'], 'BROKEN')
+                    self.assertIn('row r2: no steps', report['errors'])
+                composition = report['review']['composition']
+                header = dict(composition[0]['item'])
+                plan_keys = header.pop('_keys')
+                self.assertEqual(plan_keys, sorted(variant))
+                imports = composition[1]['item']
+                rebuilt = header
+                for key in ('segments', 'gates'):
+                    if key in plan_keys and key not in rebuilt:
+                        rebuilt[key] = {alias: {'library': value} if isinstance(value, str) else value
+                                        for alias, value in imports[key].items()}
+                for key in ('setup', 'rows', 'recover'):
+                    if key in plan_keys and key not in rebuilt:
+                        rebuilt[key] = []
+                row = None
+                for entry in composition[2:]:
+                    where, item = entry['where'], entry['item']
+                    if where.startswith('setup '):
+                        rebuilt['setup'].append(item)
+                    elif where.startswith('row ') and ' step ' not in where and ' recover ' not in where:
+                        row = dict(item)
+                        row_keys = row.pop('_keys')
+                        for key in ('steps', 'recover'):
+                            if key in row_keys and key not in row:
+                                row[key] = []
+                        rebuilt['rows'].append(row)
+                    elif ' step ' in where:
+                        row['steps'].append(item)
+                    elif where.startswith('row ') and ' recover ' in where:
+                        row['recover'].append(item)
+                    elif where.startswith('plan recover '):
+                        rebuilt['recover'].append(item)
+                self.assertEqual(rebuilt, variant)
+
+    def test_composition_keeps_wrong_type_sections_and_empty_imports(self):
+        for section in ('rows', 'segments', 'gates', 'setup', 'recover'):
+            with self.subTest(section=section):
+                raw = copy.deepcopy(self.plan)
+                raw[section] = None
+                item = runner.review_class(self.plan, self.dir, raw)['composition'][0]['item']
+                self.assertIn(section, item['_keys'])
+                self.assertIsNone(item[section])
+        for section in ('steps', 'recover'):
+            with self.subTest(section=section):
+                raw = copy.deepcopy(self.plan)
+                raw['rows'][0][section] = None
+                composition = runner.review_class(self.plan, self.dir, raw)['composition']
+                item = next(entry['item'] for entry in composition if entry['where'] == 'row r1')
+                self.assertIn(section, item['_keys'])
+                self.assertIsNone(item[section])
+        raw = copy.deepcopy(self.plan)
+        raw['segments'], raw['gates'], raw['recover'] = {}, {}, []
+        raw['rows'][0]['steps'] = []
+        self.manifest.write_text(json.dumps(raw))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertIn('row r1: no steps', report['errors'])
+        review = report['review']
+        self.assertEqual(review['composition'][0]['item']['recover'], [])
+        self.assertNotIn('segments', review['composition'][0]['item'])
+        self.assertNotIn('gates', review['composition'][0]['item'])
+        self.assertEqual(review['composition'][1]['item'], {'segments': {}, 'gates': {}})
+        self.assertEqual(next(e['item'] for e in review['composition'] if e['where'] == 'row r1')['steps'], [])
+
+    def test_full_composition_includes_raw_private_step_and_import_override(self):
+        plan = copy.deepcopy(self.plan)
+        plan['gates']['main']['tolerance'] = 255
+        plan['rows'][0]['steps'].append({'ui': 'trigger', 'target': 'widget', 'on': 'guest'})
+        review = self.report(plan)['review']
+        self.assertEqual(review['class'], 'full')
+        entries = {entry['where']: entry['item'] for entry in review['composition']}
+        self.assertEqual(entries['imports']['gates']['main'], plan['gates']['main'])
+        self.assertEqual(entries['row r1 step 5'], plan['rows'][0]['steps'][5])
+
+    def test_composition_lists_raw_items_in_order(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'][0].update(to='settings.json', instance='a', differs_only=['menu.cpu_percent'], ignored=True)
+        plan['rows'][0]['steps'] = [
+            {'gate': 'main'}, {'play': 'route'}, {'library': 'smash-main'},
+            {'run': 'routes:wait_lines', 'args': {'lines': [['console', '.*']]}},
+            {'call': 'status', 'params': {'selector': 'a'}},
+            {'run': 'routes:to_main'}, {'call': 'status'}]
+        plan['rows'][0]['recover'] = [{'call': 'status', 'params': {'selector': 'b'}},
+                                     {'run': 'routes:wait_lines', 'args': {'lines': [['trace', 'ok']]}}]
+        plan['recover'] = [{'gate': 'main'}, {'play': 'route'}, {'library': 'smash-main'}]
+        report = self.report(plan)['review']
+        self.assertEqual(report['class'], 'library-only')
+        self.assertEqual(report['composition'], [
+            {'where': 'plan', 'item': {'start': 'menu', '_keys': sorted(plan)}},
+            {'where': 'imports', 'item': {'segments': {'route': 'smash-main'},
+                                           'gates': {'main': 'main', 'installed': 'installed',
+                                                     'smash-submenu': 'smash-submenu'}}},
+            {'where': 'setup 0', 'item': plan['setup'][0]},
+            {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu',
+                                        '_keys': sorted(plan['rows'][0])}},
+            *[{'where': f'row r1 step {i}', 'item': step} for i, step in enumerate(plan['rows'][0]['steps'])],
+            *[{'where': f'row r1 recover {i}', 'item': step} for i, step in enumerate(plan['rows'][0]['recover'])],
+            *[{'where': f'plan recover {i}', 'item': step} for i, step in enumerate(plan['recover'])]])
+
+        reordered = {key: plan[key] for key in ('start', 'rows', 'recover', 'setup', 'segments', 'gates')}
+        reordered_report = self.report(reordered)['review']
+        self.assertEqual(reordered_report['class'], 'library-only')
+        self.assertEqual(reordered_report['composition'], report['composition'])
+
+    def test_full_review_still_lists_composition(self):
+        plan = copy.deepcopy(self.plan)
+        plan['rows'][0]['steps'].append({'run': 'custom.py:boot', 'args': {'value': 7}})
+        plan['rows'][0]['recover'] = [{'call': 'settings.set', 'params': {'key': 'value'}}]
+        report = self.report(plan)['review']
+        self.assertEqual(report['class'], 'full')
+        self.assertIn({'where': 'row r1 step 5', 'item': plan['rows'][0]['steps'][5]}, report['composition'])
+        self.assertIn({'where': 'row r1 recover 0', 'item': plan['rows'][0]['recover'][0]}, report['composition'])
+
+    def test_broken_library_reference_has_empty_composition(self):
+        self.manifest.write_text(json.dumps({'segments': {'bad': {'library': 'not-an-entry'}}}))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertEqual(report['review']['composition'], [])
+
+    def test_allowlist_rejects_reviewer_cases_and_unused_entries(self):
+        ref = self.dir / 'private-gate.png'
+        Image.new('RGB', (64, 36), RED).save(ref)
+
+        def private_gate(plan, name):
+            plan['gates'][name] = {'kind': 'image', 'reference': str(ref), 'sha256': sha(ref),
+                                   'roi': [0, 0, 64, 36], 'cap': 1}
+
+        def hook_gate(plan):
+            private_gate(plan, 'routes.main')
+            plan['rows'][0]['steps'].append({'run': 'routes:gate', 'args': {'name': 'main'}})
+
+        def retry_gate(plan):
+            private_gate(plan, 'menu')
+            plan['recover'] = [{'call': 'status'}]
+
+        def private_judge(plan):
+            plan['judge'] = {'cmd': 'custom.py'}
+            plan['rows'][0]['expected'] = 'a result'
+
+        def unused_segment(plan):
+            self.private_segment(plan)
+
+        def scaled(plan):
+            plan['segments'] = {}
+            plan['gates'] = {'main': {'library': 'main'}}
+            plan['rows'][0]['steps'] = [{'gate': 'main'}]
+            plan['scale'] = 'fit'
+
+        variants = [
+            ('gate routes.main', hook_gate),
+            ('gate menu', retry_gate),
+            ('plan key judge', private_judge),
+            ('plan key scale', scaled),
+            ('gate unused', lambda p: private_gate(p, 'unused')),
+            ('segment mine', unused_segment),
+            ('plan key surprise', lambda p: p.update(surprise=True)),
+            ('row r1 key surprise', lambda p: p['rows'][0].update(surprise=True)),
+            ('step 1 key unchecked', lambda p: p['rows'][0]['steps'][1].update(unchecked=True)),
+            ('step 5', lambda p: p['rows'][0]['steps'].append({'future_verb': 'x'})),
+        ]
+        for expected, change in variants:
+            with self.subTest(expected=expected):
+                plan = copy.deepcopy(self.plan)
+                change(plan)
+                review = self.report(plan)['review']
+                self.assertEqual(review['class'], 'full')
+                self.assertIn(expected, ' '.join(item['what'] for item in review['private']))
+
+    def test_reviewer_cases_are_private(self):
+        def raw_library_step(plan):
+            self.private_segment(plan)
+            plan['rows'][0]['steps'].append({'library': 'mine'})
+
+        variants = [
+            ('tolerance', lambda p: p['gates']['main'].update(tolerance=255)),
+            ('pattern', lambda p: p['gates']['installed'].update(pattern='.*')),
+            ('custom.py:boot', lambda p: p['setup'][0].update(via='hook', ref='custom.py:boot')),
+            ('fixture', lambda p: p['setup'][0].update(reviewed=None)),
+            ('plan key on_failure_hook', lambda p: p.update(on_failure_hook='custom.py:boot')),
+            ('settings.set', lambda p: p['rows'][0]['steps'].append({'call': 'settings.set'})),
+            ('segment mine', raw_library_step),
+        ]
+        for expected, change in variants:
+            with self.subTest(expected=expected):
+                plan = copy.deepcopy(self.plan)
+                change(plan)
+                report = self.report(plan)['review']
+                self.assertEqual(report['class'], 'full')
+                self.assertIn(expected, ' '.join(item['what'] for item in report['private']))
+
+    def test_nested_gate_recovery_start_gate_and_setup_policy(self):
+        plan = copy.deepcopy(self.plan)
+        self.private_segment(plan)
+        plan['gates']['main']['recover'] = 'mine'
+        plan['gates']['smash-submenu']['tolerance'] = 255
+        report = self.report(plan)['review']
+        messages = ' '.join(item['what'] for item in report['private'])
+        self.assertIn('segment mine', messages)
+        self.assertIn('tolerance', messages)
+        for setup in ([], [{'state': 'training', 'via': 'segment', 'ref': 'library:not-real'}],
+                      [{'state': 'training', 'via': 'record', 'ref': 'mine'}]):
+            with self.subTest(setup=setup):
+                plan = copy.deepcopy(self.plan)
+                plan['setup'] = setup
+                self.assertEqual(self.report(plan)['review']['class'], 'full')
+
+    def test_ui_is_private_and_shared_segment_setup_is_clean(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'] = [{'state': 'training', 'via': 'segment', 'ref': 'library:smash-main'}]
+        self.assertEqual(self.report(plan)['review']['class'], 'library-only')
+        plan['rows'][0]['steps'].append({'ui': 'trigger'})
+        review = self.report(plan)['review']
+        self.assertEqual(review['class'], 'full')
+        self.assertIn('ui', ' '.join(item['what'] for item in review['private']))
+
+
+class RowRoleTests(unittest.TestCase):
+    def test_default_and_explicit_roles(self):
+        self.assertEqual(runner.row_role({'start': 'menu', 'end': 'training'}), 'setup')
+        self.assertEqual(runner.row_role({'start': 'training', 'end': 'training'}), 'test')
+        self.assertEqual(runner.row_role({'start': 'menu', 'end': 'training', 'role': 'test'}), 'test')
+        self.assertEqual(runner.row_role({'start': 'training', 'end': 'training', 'role': 'setup'}), 'setup')
+
+    def test_dry_run_refuses_other_role(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'rows.json'
+            path.write_text(json.dumps({'start': 'menu', 'rows': [
+                {'id': 'r1', 'start': 'menu', 'end': 'menu', 'role': 'other', 'steps': [{'shot': 'x'}]}]}))
+            report = runner.dry_run(path)
+            self.assertEqual(report['result'], 'BROKEN')
+            self.assertIn('role', ' '.join(report['errors']))
+            self.assertIn('other', ' '.join(report['errors']))
+
+
+class TextGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        fixture = Path(__file__).resolve().parent / 'fixtures/trace-text/set-text-excerpt.jsonl'
+        self.trace = self.dir / 'trace.jsonl'
+        shutil.copyfile(fixture, self.trace)
+        self.plan = {'start': 'training', 'gates': {'pane': {
+            'kind': 'text', 'pane': 'tr_crumb', 'pattern': 'CPU Character', 'cap': 1, 'whole_file': True}},
+            'rows': [{'id': 'r1', 'start': 'training', 'end': 'training', 'steps': [{'gate': 'pane'}]}]}
+        self.manifest = self.dir / 'rows.json'
+        self.instances = {'a': {'socket': 'fake', 'trace_jsonl': str(self.trace)}}
+        self.out = self.dir / 'out'
+
+    def make(self):
+        self.manifest.write_text(json.dumps(self.plan))
+        return runner.Runner(self.manifest, self.instances, self.out, 15, client_factory=lambda socket: FakeEden({}))
+
+    def fixture_record(self):
+        return json.loads(self.trace.read_bytes().splitlines()[9])
+
+    def write_records(self, *records):
+        self.trace.write_text(''.join(json.dumps(record) + '\n' for record in records))
+
+    def run_row_records(self, *records):
+        r = self.make()
+
+        def append():
+            with self.trace.open('a') as f:
+                f.write(''.join(json.dumps(record) + '\n' for record in records))
+
+        with mock.patch.object(r, 'session_start', side_effect=append):
+            return r.run()
+
+    def test_row_unknown_length_invalidates_and_later_valid_recovers(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged.update(sequence='1732', frame='5524')
+        damaged['registers'].pop('x2')
+        damaged['captures'][1] = {'error': 'memory_unavailable'}
+        recovered = copy.deepcopy(valid)
+        recovered.update(sequence='1733', frame='5525')
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_row_records(valid, damaged)
+        self.assertIn('unreadable', str(caught.exception))
+        self.assertIn('1732', str(caught.exception))
+        self.assertIn('no length register', str(caught.exception))
+        (self.out / 'STOP-INPUT').unlink()
+        self.trace.write_bytes(b'')
+        self.run_row_records(valid, damaged, recovered)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], evidence['scope']), (1733, 'row'))
+
+    def test_row_missing_sequence_invalidates_earlier_match(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged.pop('sequence')
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_row_records(valid, damaged)
+        self.assertIn('unreadable', str(caught.exception))
+        self.assertIn('no sequence or frame', str(caught.exception))
+
+    def test_row_missing_address_or_point_invalidates_earlier_match(self):
+        valid = self.fixture_record()
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        for missing, why in (('address', 'no pane address'), ('point', 'no point id')):
+            with self.subTest(missing=missing):
+                damaged = copy.deepcopy(valid)
+                damaged.update(sequence='1732', frame='5524')
+                if missing == 'address':
+                    damaged['registers'].pop('x0')
+                else:
+                    damaged.pop('point_id')
+                self.trace.write_bytes(b'')
+                with self.assertRaises(RuntimeError) as caught:
+                    self.run_row_records(valid, damaged)
+                self.assertIn('1732', str(caught.exception))
+                self.assertIn(why, str(caught.exception))
+                (self.out / 'STOP-INPUT').unlink()
+
+    def test_row_loss_marker_invalidates_and_later_valid_recovers(self):
+        valid = self.fixture_record()
+        recovered = copy.deepcopy(valid)
+        recovered.update(sequence='1733', frame='5525')
+        loss = {'schema': 1, 'event': 'loss', 'records': '7'}
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_row_records(valid, loss)
+        self.assertIn('trace loss (7 records)', str(caught.exception))
+        (self.out / 'STOP-INPUT').unlink()
+        self.trace.write_bytes(b'')
+        self.run_row_records(valid, loss, recovered)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], evidence['scope']), (1733, 'row'))
+
+    def test_row_other_pane_name_does_not_invalidate_even_at_same_address(self):
+        lines = self.trace.read_bytes().splitlines()
+        valid, other = json.loads(lines[9]), json.loads(lines[5])
+        other.update(sequence='1732', frame='5524', point_id=valid['point_id'])
+        for same_address in (False, True):
+            with self.subTest(same_address=same_address):
+                other['registers']['x0'] = valid['registers']['x0'] if same_address else '0xdeadbeef'
+                self.trace.write_bytes(b'')
+                self.plan['gates']['pane'].pop('whole_file', None)
+                self.plan['gates']['pane'].update(point_id=1, cap=.03)
+                (self.out / 'r1.json').unlink(missing_ok=True)
+                self.run_row_records(valid, other)
+                evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+                self.assertEqual((evidence['sequence'], evidence['scope']), (1730, 'row'))
+
+    def test_row_transition_uses_only_row_and_reports_prior_scope(self):
+        lines = self.trace.read_bytes().splitlines()
+        empty, valid = json.loads(lines[1]), json.loads(lines[9])
+        repeat = copy.deepcopy(valid)
+        repeat.update(sequence='1732', frame='5524')
+        self.write_records(empty, valid)
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        self.run_row_records(repeat)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['transition'], evidence['previous']), ('row', 'sampled', None))
+        self.assertEqual(evidence['before_scope'],
+                         {'text': 'Fighters & Stages  >  CPU Character   page 1 of 1',
+                          'sequence': 1730, 'frame': 5523, 'pane': valid['registers']['x0']})
+
+        (self.out / 'r1.json').unlink()
+        self.write_records(empty, valid)
+        changed = copy.deepcopy(empty)
+        changed.update(sequence='1732', frame='5524')
+        repeat.update(sequence='1733', frame='5525')
+        self.run_row_records(changed, repeat)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['transition'], evidence['previous']['sequence']), ('measured', 1732))
+        self.assertEqual(evidence['before_scope']['sequence'], 1730)
+
+    def test_text_unknown_capture_fails_and_newer_good_record_recovers(self):
+        valid = self.fixture_record()
+        self.assertGreater(int(valid['registers']['x2'], 0), 0)
+        damaged = copy.deepcopy(valid)
+        damaged['sequence'], damaged['frame'] = '1732', '5524'
+        damaged['captures'][1] = {'error': 'memory_unavailable'}
+        self.write_records(valid, damaged)
+        self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
+        with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
+            self.make().run()
+        (self.out / 'STOP-INPUT').unlink()
+        recovered = copy.deepcopy(valid)
+        recovered['sequence'], recovered['frame'] = '1733', '5525'
+        with self.trace.open('a') as f:
+            f.write(json.dumps(recovered) + '\n')
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], evidence['frame'], evidence['scope']), (1733, 5525, 'whole_file'))
+
+    def test_pane_capture_loss_for_known_key_fails(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged['sequence'], damaged['frame'] = '1732', '5524'
+        damaged['captures'][0] = {'error': 'memory_unavailable'}
+        self.write_records(valid, damaged)
+        self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
+        with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
+            self.make().run()
+
+    def test_text_capture_error_without_length_is_unknown(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged['sequence'], damaged['frame'] = '1732', '5524'
+        damaged['registers'].pop('x2')
+        damaged['captures'][1] = {'error': 'memory_unavailable'}
+        self.assertEqual(runner.trace_text.parse(json.dumps(damaged))['why'], 'no length register')
+        self.write_records(damaged)
+        self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
+        with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732.*no length register'):
+            self.make().run()
+
+    def test_unrelated_pane_capture_loss_does_not_invalidate(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged['sequence'], damaged['frame'] = '1732', '5524'
+        damaged['registers']['x0'] = '0xdeadbeef'
+        damaged['captures'][0] = {'error': 'memory_unavailable'}
+        self.write_records(valid, damaged)
+        self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], evidence['scope']), (1730, 'whole_file'))
+
+    def test_pane_capture_loss_from_another_point_does_not_invalidate(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged['sequence'], damaged['frame'], damaged['point_id'] = '1732', '5524', '2'
+        damaged['captures'][0] = {'error': 'memory_unavailable'}
+        self.write_records(valid, damaged)
+        self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], str(evidence['point_id'])), (1730, '1'))
+
+    def test_text_match_without_sequence_and_frame_is_not_accepted(self):
+        valid = self.fixture_record()
+        del valid['sequence']
+        del valid['frame']
+        self.write_records(valid)
+        self.plan['gates']['pane'].update(whole_file=True, cap=.03)
+        with self.assertRaisesRegex(RuntimeError, 'unreadable.*no sequence or frame'):
+            self.make().run()
+
+    def test_text_gate_defaults_to_row_scope_and_whole_file_is_explicit(self):
+        valid = self.fixture_record()
+        self.write_records(valid)
+        self.plan['gates']['pane']['cap'] = .03
+        del self.plan['gates']['pane']['whole_file']
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+        (self.out / 'STOP-INPUT').unlink()
+        self.plan['gates']['pane']['whole_file'] = True
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['sequence']), ('whole_file', 1730))
+
+    def test_text_gate_accepts_a_record_written_after_row_start(self):
+        valid = self.fixture_record()
+        self.trace.write_bytes(b'')
+        del self.plan['gates']['pane']['whole_file']
+        r = self.make()
+        with mock.patch.object(r, 'session_start', side_effect=lambda: self.write_records(valid)):
+            r.run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['sequence']), ('row', 1730))
+
+    def test_empty_text_capture_error_written_during_row_passes(self):
+        empty = self.trace.read_bytes().splitlines(keepends=True)[0]
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].update(pane='tr_tab_00', pattern='^$', cap=.05)
+        del self.plan['gates']['pane']['whole_file']
+        r = self.make()
+        with mock.patch.object(r, 'session_start', side_effect=lambda: self.trace.write_bytes(empty)):
+            r.run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['sequence'], evidence['text']), ('row', 75, ''))
+
+    def test_row_scope_uses_pre_row_key_for_unreadable_sample(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged['sequence'], damaged['frame'] = '1732', '5524'
+        damaged['captures'][0] = {'error': 'memory_unavailable'}
+        self.write_records(valid)
+        del self.plan['gates']['pane']['whole_file']
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        r = self.make()
+
+        def append():
+            with self.trace.open('a') as f:
+                f.write(json.dumps(damaged) + '\n')
+
+        with mock.patch.object(r, 'session_start', side_effect=append):
+            with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
+                r.run()
+
+    def test_row_scope_keeps_pre_row_observation_separate_from_transition(self):
+        lines = self.trace.read_bytes().splitlines()
+        empty, valid = json.loads(lines[1]), json.loads(lines[9])
+        self.write_records(empty)
+        del self.plan['gates']['pane']['whole_file']
+        r = self.make()
+
+        def append():
+            with self.trace.open('a') as f:
+                f.write(json.dumps(valid) + '\n')
+
+        with mock.patch.object(r, 'session_start', side_effect=append):
+            r.run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['transition'], evidence['previous']), ('row', 'sampled', None))
+        self.assertEqual(evidence['before_scope']['sequence'], 82)
+
+    def test_row_scope_captures_path_object_trace_offset(self):
+        self.write_records(self.fixture_record())
+        self.instances['a']['trace_jsonl'] = self.trace
+        del self.plan['gates']['pane']['whole_file']
+        self.plan['gates']['pane']['cap'] = .03
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+
+    def test_incremental_poll_retains_pane_key_for_unreadable_sample(self):
+        lines = self.trace.read_bytes().splitlines()
+        empty = json.loads(lines[1])
+        damaged = copy.deepcopy(empty)
+        damaged['sequence'], damaged['frame'] = '1732', '5524'
+        damaged['captures'][0] = {'error': 'memory_unavailable'}
+        self.write_records(empty)
+        self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
+        appended = []
+
+        def sleep(_delay):
+            if not appended:
+                with self.trace.open('a') as f:
+                    f.write(json.dumps(damaged) + '\n')
+                appended.append(True)
+
+        with mock.patch.object(runner.time, 'sleep', side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
+                self.make().run()
+        self.assertTrue(appended)
+
+    def test_previous_text_from_another_native_pane_is_not_a_transition(self):
+        lines = self.trace.read_bytes().splitlines()
+        old, valid = json.loads(lines[1]), json.loads(lines[9])
+        old['registers']['x0'] = '0xdeadbeef'
+        self.write_records(old, valid)
+        self.plan['gates']['pane']['whole_file'] = True
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['transition'], evidence['previous']), ('sampled', None))
+
+    def test_text_whole_file_requires_a_boolean(self):
+        self.plan['gates']['pane']['whole_file'] = 'yes'
+        self.manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertIn('whole_file', ' '.join(report['errors']))
+
+    def test_dry_run_accepts_text_gate_and_rejects_bad_inputs(self):
+        self.manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual((report['result'], report['errors'], report['review']['class']), ('READY', [], 'full'))
+        for change, expected in (({'pane': ''}, 'pane'), ({'pane': None}, 'pane'), ({'pattern': '['}, 'unterminated')):
+            with self.subTest(change=change):
+                plan = copy.deepcopy(self.plan)
+                plan['gates']['pane'].update(change)
+                self.manifest.write_text(json.dumps(plan))
+                report = runner.dry_run(self.manifest)
+                self.assertEqual(report['result'], 'BROKEN')
+                self.assertIn(expected, ' '.join(report['errors']))
+
+    def test_pass_records_latest_pane_text_sequence_and_frame(self):
+        r = self.make()
+        r.run()
+        receipt = json.loads((self.out / 'r1.json').read_text())
+        self.assertEqual(receipt['status'], 'PASS')
+        pane_key = json.loads(self.trace.read_bytes().splitlines()[10])['registers']['x0']
+        self.assertEqual(receipt['results'][0]['evidence'],
+                         {'pane': 'tr_crumb', 'text': 'Fighters & Stages  >  CPU Character   page 1 of 1',
+                          'sequence': 1731, 'frame': 5523, 'pane_key': pane_key, 'scope': 'whole_file',
+                          'transition': 'measured',
+                          'previous': {'text': '', 'sequence': 311, 'frame': 5285, 'pane': pane_key},
+                          'before_scope': None})
+        self.assertEqual(r.last_gate_outcome['role'], 'trace')
+        self.assertEqual(runner.harness.assertion_role({'kind': 'text', 'asserts': 'effect'}), 'effect')
+
+    def test_text_evidence_identifies_pane_and_previous_different_text(self):
+        latest = json.loads(self.trace.read_bytes().splitlines()[10])
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual(evidence['pane_key'], latest['registers']['x0'])
+        self.assertEqual(evidence['previous'], {'text': '', 'sequence': 311, 'frame': 5285,
+                                                 'pane': latest['registers']['x0']})
+
+    def test_text_evidence_without_earlier_change_has_no_previous_text(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[9] + lines[10])
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['transition'], evidence['previous']), ('unmeasured', None))
+
+    def test_nonmatching_pattern_times_out(self):
+        self.plan['gates']['pane']['pattern'] = 'never appears'
+        self.plan['gates']['pane']['cap'] = .08
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['status'], 'FAILED')
+
+    def test_older_matching_text_cannot_override_newest_text(self):
+        self.plan['gates']['pane']['cap'] = .08
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        with self.trace.open('ab') as f:
+            f.write(lines[1])
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+
+    def test_new_record_is_seen_while_polling(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[1])
+        self.plan['gates']['pane']['cap'] = .5
+        read = runner.trace_text.scan
+        appended = []
+
+        def scan(*args, **kwargs):
+            result = read(*args, **kwargs)
+            if not appended:
+                with self.trace.open('ab') as f:
+                    f.write(lines[9])
+                appended.append(True)
+            return result
+
+        with mock.patch.object(runner.trace_text, 'scan', side_effect=scan):
+            self.make().run()
+        result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual(result['sequence'], 1730)
+        self.assertEqual(result['previous']['text'], '')
+
+    def test_declared_but_missing_trace_file_fails_clearly(self):
+        self.trace.unlink()
+        self.plan['gates']['pane']['cap'] = .08
+        r = self.make()
+        with self.assertRaisesRegex(RuntimeError, 'trace file not found'):
+            r.run()
+        self.assertTrue(r.last_gate_outcome['missing_evidence'])
+
+    def test_missing_trace_declaration_fails_clearly(self):
+        self.instances['a'].pop('trace_jsonl')
+        r = self.make()
+        with self.assertRaisesRegex(RuntimeError, 'not tracing'):
+            r.run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['status'], 'FAILED')
+        self.assertTrue(r.last_gate_outcome['missing_evidence'])
+
+    def test_legacy_trace_file_source(self):
+        self.instances['a']['trace'] = self.instances['a'].pop('trace_jsonl')
+        self.make().run()
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['status'], 'PASS')
+
+    def test_trace_marker_without_file_path_fails_clearly(self):
+        self.instances['a'].pop('trace_jsonl')
+        self.instances['a']['trace'] = {'points': ['armed']}
+        with self.assertRaisesRegex(RuntimeError, 'trace_jsonl'):
+            self.make().run()
+
+    def test_custom_name_offset(self):
+        original = json.loads(self.trace.read_bytes().splitlines()[9])
+        pane = bytearray.fromhex(original['captures'][0]['hex'])
+        pane[0x90:0x90 + 25] = pane[0xb0:0xb0 + 25]
+        pane[0xb0:0xb0 + 25] = bytes(25)
+        original['captures'][0]['hex'] = pane.hex()
+        self.trace.write_text(json.dumps(original) + '\n')
+        self.plan['gates']['pane']['name_at'] = 0x90
+        self.make().run()
+        result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((result['pane'], result['sequence']), ('tr_crumb', 1730))
+
+    def test_point_id_dry_run_validation(self):
+        for point_id, valid in (('1', True), (1, True), (None, False), (True, False), (1.5, False), ([], False)):
+            with self.subTest(point_id=point_id):
+                self.plan['gates']['pane']['point_id'] = point_id
+                self.manifest.write_text(json.dumps(self.plan))
+                report = runner.dry_run(self.manifest)
+                self.assertEqual(report['result'] == 'READY', valid)
+                if not valid:
+                    self.assertIn('point_id', ' '.join(report['errors']))
+
+    def test_point_bound_gate_ignores_a_newer_other_point(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        other = json.loads(lines[10])
+        text = 'other point'
+        other['registers']['x2'] = hex(len(text))
+        other['captures'][1]['hex'] = text.encode('utf-16-le').hex()
+        self.trace.write_bytes(lines[9] + (json.dumps(other) + '\n').encode())
+        self.plan['gates']['pane']['point_id'] = 1
+        self.make().run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], str(evidence['point_id'])), (1730, '1'))
+
+    def test_nonexistent_point_fails_at_cap(self):
+        self.plan['gates']['pane'].update(point_id='not-a-point', cap=.08)
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+            self.make().run()
+
+    def test_gate_does_not_reparse_old_lines_on_the_next_poll(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[1] + lines[3])
+        self.plan['gates']['pane']['cap'] = 1
+        appended = []
+        with mock.patch.object(runner.trace_text, 'parse', wraps=runner.trace_text.parse) as parse:
+            def sleep(_delay):
+                if not appended:
+                    self.assertEqual(parse.call_count, 1)
+                    with self.trace.open('ab') as f:
+                        f.write(lines[9])
+                    appended.append(True)
+
+            with mock.patch.object(runner.time, 'sleep', side_effect=sleep):
+                self.make().run()
+        self.assertEqual([json.loads(call.args[0])['sequence'] for call in parse.call_args_list], ['82', '1730'])
+        self.assertEqual(json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']['sequence'], 1730)
+
+    def test_gate_rescans_a_replaced_trace(self):
+        lines = self.trace.read_bytes().splitlines(keepends=True)
+        self.trace.write_bytes(lines[1])
+        replaced = []
+
+        def sleep(_delay):
+            if not replaced:
+                target = self.dir / 'new-trace.jsonl'
+                target.write_bytes(lines[9])
+                target.replace(self.trace)
+                replaced.append(True)
+
+        with mock.patch.object(runner.time, 'sleep', side_effect=sleep):
+            self.make().run()
+        result = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual(result['sequence'], 1730)
+        self.assertIsNone(result['previous'])
 
 
 class RunnerTests(unittest.TestCase):
@@ -150,10 +1090,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('to-blue: file missing and no recipe', errors)
 
     def test_run_plays_records_gates_and_writes_receipts(self):
+        self.plan['rows'][1]['role'] = 'test'
+        self.manifest.write_text(json.dumps(self.plan))
         eden = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)
         self.make(eden).run()
-        for row in ('r1', 'r2', 'r3'):
-            self.assertEqual(json.loads((self.dir / 'out' / f'{row}.json').read_text())['status'], 'PASS')
+        for row, role in (('r1', 'setup'), ('r2', 'test'), ('r3', 'setup')):
+            receipt = json.loads((self.dir / 'out' / f'{row}.json').read_text())
+            self.assertEqual(receipt['status'], 'PASS')
+            self.assertEqual(receipt['role'], role)
         saved = json.loads(self.manifest.read_text())['segments']['to-blue']
         self.assertEqual(saved['sha256'], sha(self.dir / 'segments' / 'to-blue.edenmacro.json'))
         self.assertIn('macro.record', eden.calls)
@@ -213,6 +1157,69 @@ class RunnerTests(unittest.TestCase):
         stop.unlink()
         self.make(FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)).run()
         self.assertEqual(json.loads((self.dir / 'out' / 'r3.json').read_text())['status'], 'PASS')
+
+    def test_attempt_journal_preserves_failure_retry_and_skips_passed_rows(self):
+        self.plan['rows'] = [self.plan['rows'][0]]
+        self.plan['rows'][0]['role'] = 'test'
+        self.plan['gates']['red']['cap'] = .1
+        self.manifest.write_text(json.dumps(self.plan))
+        with self.assertRaises(RuntimeError):
+            self.make(FakeEden({'to-red': BLUE})).run()
+        (self.dir / 'out' / 'STOP-INPUT').unlink()
+        self.make(FakeEden({'to-red': RED})).run()
+        journal = self.dir / 'out' / 'attempts.jsonl'
+        before = journal.read_bytes()
+        self.make(FakeEden({'to-red': RED})).run()
+        self.assertEqual(journal.read_bytes(), before)
+        attempts = [json.loads(line) for line in before.splitlines()]
+        self.assertEqual([(a['id'], a['role'], a['status']) for a in attempts],
+                         [('r1', 'test', 'FAILED'), ('r1', 'test', 'PASS')])
+        self.assertTrue(all(set(a) == {'id', 'role', 'role_source', 'manifest_sha256', 'start', 'end',
+                                       'started', 'ended', 'status'} for a in attempts))
+        self.assertTrue(all(a['role_source'] == 'explicit' for a in attempts))
+        self.assertLessEqual(attempts[0]['started'], attempts[0]['ended'])
+        self.assertLess(attempts[0]['started'], attempts[1]['started'])
+        self.assertLessEqual(attempts[1]['started'], attempts[1]['ended'])
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        self.assertEqual((receipt['status'], receipt['started'], receipt['ended']),
+                         ('PASS', attempts[1]['started'], attempts[1]['ended']))
+
+    def test_receipts_and_journal_record_explicit_and_default_role_sources(self):
+        self.plan['rows'] = [
+            {'id': 'explicit', 'start': 'blue', 'end': 'blue', 'role': 'setup', 'steps': [{'shot': 'one'}]},
+            {'id': 'default', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'two'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.make(FakeEden({})).run()
+        attempts = [json.loads(line) for line in (self.dir / 'out' / 'attempts.jsonl').read_text().splitlines()]
+        self.assertEqual([(a['id'], a['role'], a['role_source']) for a in attempts],
+                         [('explicit', 'setup', 'explicit'), ('default', 'test', 'default')])
+        for attempt in attempts:
+            receipt = json.loads((self.dir / 'out' / (attempt['id'] + '.json')).read_text())
+            self.assertEqual((receipt['role'], receipt['role_source']), (attempt['role'], attempt['role_source']))
+
+    def test_attempt_journal_carries_receipt_manifest_and_screens(self):
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'one'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.make(FakeEden({})).run()
+        receipt = json.loads((self.dir / 'out/r1.json').read_text())
+        attempt = json.loads((self.dir / 'out/attempts.jsonl').read_text())
+        self.assertEqual({key: attempt[key] for key in ('manifest_sha256', 'start', 'end')},
+                         {key: receipt[key] for key in ('manifest_sha256', 'start', 'end')})
+        self.assertEqual(attempt['manifest_sha256'], sha(self.manifest))
+
+    def test_attempt_journal_includes_refused_unexecuted_row(self):
+        r = self.make(FakeEden({}))
+        with mock.patch.object(r, 'session_start', side_effect=runner.StopRun('recording unavailable')):
+            with self.assertRaises(runner.StopRun):
+                r.run()
+        receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+        attempts = [json.loads(line) for line in (self.dir / 'out' / 'attempts.jsonl').read_text().splitlines()]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0], {key: receipt[key] for key in
+                                      ('id', 'role', 'role_source', 'manifest_sha256', 'start', 'end',
+                                       'started', 'ended', 'status', 'not_executed')})
+        self.assertEqual(attempts[0]['role_source'], 'default')
 
     def two_instances(self):
         logs = {}
@@ -773,9 +1780,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_gif_presets_record_and_a_breaking_file_is_refused(self):
         class GifEden(FakeEden):
-            def __init__(self, screens, frames=4, frame_ms=100):
+            def __init__(self, screens, frames=4, frame_ms=80, source=None):
                 super().__init__(screens)
                 self.frames, self.frame_ms, self.gif, self.params = frames, frame_ms, None, []
+                self.source = source
 
             def request(self, method, params):
                 self.params.append((method, dict(params or {})))
@@ -786,11 +1794,14 @@ class RunnerTests(unittest.TestCase):
                     spec = self.gif or {}
                     width = spec.get('width', 640)
                     height = max(1, round(width * 9 / 16))
-                    images = [Image.new('RGB', (width, height), RED) for _ in range(self.frames)]
+                    colors = (RED, BLUE, (100, 100, 100))
+                    images = [Image.new('RGB', (width, height), colors[i % len(colors)]) for i in range(self.frames)]
                     images[0].save(spec['path'], save_all=True, append_images=images[1:],
                                    duration=self.frame_ms, loop=0)
                     self.gif = None
                     return {'ok': True, 'result': {'state': 'finished'}}
+                if method == 'status' and self.source is not None:
+                    return {'ok': True, 'result': self.source}
                 if method == 'recording.status':
                     return {'ok': True, 'result': {'state': 'finished', 'frames': self.frames,
                                                    'dropped_frames': 0, 'error': None}}
@@ -804,7 +1815,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.make(eden).run(), 'DONE')
         started = next(params for method, params in eden.params if method == 'recording.start')
         self.assertEqual(started['width'], 1280)
-        self.assertEqual(started['fps'], 10)
+        self.assertEqual(started['fps'], 12)
         self.assertEqual(started['duration_ms'], 10000)
         info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
         self.assertEqual(set(info) & {'frames', 'duration', 'size', 'sha256', 'path'},
@@ -839,15 +1850,112 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('size', refused['gif_refused']['why'])
         self.assertFalse((self.dir / 'out' / 'g1' / 'huge.gif').exists())
 
-        long = GifEden({}, frames=12, frame_ms=1000)
-        self.plan['rows'][0]['steps'] = [
-            {'gif': {'name': 'long', 'preset': 'docs', 'steps': [{'shot': 'mid'}]}}]
+        long = GifEden({}, frames=130)
+        gif = {'name': 'long', 'preset': 'docs', 'width': 160, 'reason': 'duration fixture',
+               'steps': [{'shot': 'mid'}]}
+        self.plan['rows'][0]['steps'] = [{'gif': gif}]
         self.manifest.write_text(json.dumps(self.plan))
         (self.dir / 'out' / 'g1.json').unlink()
         (self.dir / 'out' / 'STOP-INPUT').unlink()
         self.make(long).run()
         info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
-        self.assertLessEqual(info['duration'], 10)
+        self.assertEqual(info['duration'], 10.0)
+
+        source = {'game_fps': 5, 'stats_age_ms': 50, 'running': True, 'loading_complete': True}
+        (self.dir / 'out' / 'g1.json').unlink()
+        self.assertEqual(self.make(GifEden({}, frame_ms=200, source=source)).run(), 'DONE')
+        info = json.loads((self.dir / 'out' / 'g1.json').read_text())['results'][0]['gif']
+        self.assertEqual((info['sampled_fps'], info['source_fps']), (5, 5))
+        (self.dir / 'out' / 'g1.json').unlink()
+        with self.assertRaisesRegex(RuntimeError, r'at least 12 fps'):
+            self.make(GifEden({}, frame_ms=200, source=source | {'stats_age_ms': 5000})).run()
+
+    def test_legacy_and_custom_publication_cannot_request_keyframe_only(self):
+        published = {"name": "published", "preset": "docs", "fps": 1}
+        presets = {"gif_presets": {"custom": {"width": 1280, "fps": 12, "max_duration_s": 10}}}
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [{'gif': published}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertIn('at least 12 fps', ' | '.join(runner.dry_run(self.manifest)['errors']))
+        for gif in (published, published | {"preset": "custom", "reason": "smaller file"},
+                    published | {"preset": "evidence", "out": "docs/media/published.gif"}):
+            with self.subTest(gif=gif):
+                spec = runner.resolve_gif_spec(presets, {}, gif)
+                self.assertRegex(runner.gif_policy_error(spec) or "", r"at least 12 fps")
+        menu = published | {"scene": "menu", "fps": 10}
+        self.assertIsNone(runner.gif_policy_error(runner.resolve_gif_spec(presets, {}, menu)))
+        spec = runner.resolve_gif_spec(presets, {}, menu | {"fps": 9})
+        self.assertRegex(runner.gif_policy_error(spec) or "", r"at least 10 fps")
+
+    def test_dry_run_checks_preview_frame_rate_even_with_a_reason(self):
+        gif = {'name': 'hover', 'preset': 'preview', 'steps': []}
+        self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [{'gif': gif}]}]
+        for preset, minimum in (('preview', 12), ('preview-menu', 10)):
+            with self.subTest(preset=preset):
+                gif.update(preset=preset, fps=minimum, reason='smaller file')
+                self.manifest.write_text(json.dumps(self.plan))
+                self.assertEqual(runner.dry_run(self.manifest)['errors'], [])
+                gif['fps'] -= 1
+                self.manifest.write_text(json.dumps(self.plan))
+                self.assertIn(f'at least {minimum} fps', ' | '.join(runner.dry_run(self.manifest)['errors']))
+
+    def test_preview_verifies_motion_in_written_gif(self):
+        raw = self.dir / 'raw.gif'
+        out = self.dir / 'preview.gif'
+        frames = [Image.new('RGB', (160, 90), color) for color in (RED, BLUE) * 6]
+        frames[0].save(raw, save_all=True, append_images=frames[1:], duration=[80, 90, 80] * 4, loop=0)
+        spec = runner.resolve_gif_spec({}, {}, {'name': 'demo', 'preset': 'preview', 'width': 160})
+        receipt = runner.publish_gif(raw, out, spec)
+        self.assertEqual(receipt['frames'], 12)
+        self.assertEqual(receipt['duration'], 1.0)
+
+        frames[0].save(raw, duration=1000)
+        with self.assertRaisesRegex(runner.GifRefused, r'at least 12 fps'):
+            runner.publish_gif(raw, out, spec)
+        self.assertFalse(out.exists())
+
+    def test_preview_accepts_a_sampled_hold_that_pillow_merges(self):
+        from PIL import GifImagePlugin
+        raw = self.dir / 'raw.gif'
+        out = self.dir / 'preview.gif'
+        frames = [Image.new('P', (160, 90), color) for color in (0, 1)]
+        for frame in frames:
+            frame.putpalette([*RED, *BLUE])
+        # Eden emits an image descriptor per successful sample, including identical frames.
+        with raw.open('wb') as capture:
+            capture.writelines(GifImagePlugin.getheader(frames[0])[0])
+            for frame, delay in zip([frames[0]] * 6 + [frames[1]] * 6, [80, 90, 80] * 4):
+                capture.writelines(GifImagePlugin.getdata(frame, duration=delay))
+            capture.write(b';')
+        with Image.open(raw) as capture:
+            self.assertEqual(capture.n_frames, 12)
+
+        spec = runner.resolve_gif_spec({}, {}, {'name': 'demo', 'preset': 'preview', 'width': 160})
+        receipt = runner.publish_gif(raw, out, spec)
+        self.assertEqual((receipt['frames'], receipt['frames_sampled'], receipt['duration']), (2, 12, 1.0))
+
+        frames[0].save(raw, save_all=True, append_images=frames[1:], duration=500, loop=0)
+        with self.assertRaisesRegex(runner.GifRefused, r'at least 12 fps.*sampled'):
+            runner.publish_gif(raw, out, spec)
+
+    def test_native_gif_size_fitting_keeps_all_frames(self):
+        from unittest.mock import patch
+        raw = self.dir / 'raw.gif'
+        out = self.dir / 'preview.gif'
+        frames = [Image.new('RGB', (160, 90), color) for color in (RED, BLUE) * 6]
+        frames[0].save(raw, save_all=True, append_images=frames[1:], duration=80, loop=0)
+        spec = runner.resolve_gif_spec({}, {}, {'name': 'demo', 'preset': 'docs', 'width': 160, 'max_bytes': 100})
+        real_save = Image.Image.save
+        attempts = []
+
+        def simulated_size(image, target, **kwargs):
+            attempts.append(len(kwargs['append_images']) + 1)
+            return real_save(image, target, **kwargs)
+
+        with patch.object(Image.Image, 'save', simulated_size):
+            with self.assertRaisesRegex(runner.GifRefused, r'trim or crop'):
+                runner.publish_gif(raw, out, spec)
+        self.assertEqual(attempts, [12] * 4)
+        self.assertFalse(out.exists())
 
     def test_dry_run_catches_a_bad_gif_or_recover_and_keeps_a_reason(self):
         self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
@@ -863,7 +1971,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('out', errors)
 
         self.plan['rows'][0]['steps'][0]['gif'].pop('out')
-        self.plan['gif_presets'] = {'lobby': {'width': 800, 'fps': 8, 'max_duration_s': 4, 'max_bytes': 2_000_000}}
+        self.plan['gif_presets'] = {'lobby': {'width': 800, 'fps': 12, 'max_duration_s': 4, 'max_bytes': 2_000_000}}
         self.manifest.write_text(json.dumps(self.plan))
         self.assertIn('reason', ' | '.join(runner.dry_run(self.manifest)['errors']))
         self.plan['gif_presets']['lobby']['reason'] = 'lobby art is drawn for 800'
@@ -891,13 +1999,15 @@ class RunnerTests(unittest.TestCase):
                     self.gif = dict(params)
                     return {'ok': True, 'result': {'state': 'recording'}}
                 if method == 'recording.stop':
-                    Image.new('RGB', (self.gif['width'], 32), BLUE).save(self.gif['path'])
+                    size = (self.gif['width'], 32)
+                    blue, red = (Image.new('RGB', size, color) for color in (BLUE, RED))
+                    blue.save(self.gif['path'], save_all=True, append_images=[red], duration=[80, 80])
                     return {'ok': True, 'result': {}}
                 if method == 'recording.status':
                     return {'ok': True, 'result': {'state': 'finished', 'frames': 1, 'error': None}}
                 return super().request(method, params)
 
-        # A one-frame PNG is not a multi-frame gif; ImageSequence still yields one frame. Width follows the preset.
+        # The custom preset's width and reason are preserved.
         self.plan['rows'] = [{'id': 'g1', 'start': 'blue', 'end': 'blue', 'steps': [
             {'gif': {'name': 'lobby', 'preset': 'lobby', 'steps': [{'shot': 'mid'}]}}]}]
         self.manifest.write_text(json.dumps(self.plan))

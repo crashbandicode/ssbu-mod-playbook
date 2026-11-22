@@ -44,7 +44,8 @@ gate <gate>, shot <name> (screenshot into the row folder), mark <name> (screensh
 copy <instance key> [as <name>] (copy that instance file into the row folder), json_diff {source, before, allowed,
 must_change, must_keep} (compare the file now with an earlier copy), wait_ms <ms> (only where no gate exists),
 library <name> (play a shared-library segment by its index name), gif {name, preset, steps, out?} (record the nested
-steps; presets "docs" and "evidence", or a preset the plan defines). A step has one kind. New kinds register on
+steps for a GIF image; use "preview" for gameplay and "preview-menu" for menus. "docs" and "evidence" remain
+for existing plans. See docs/GIFS.md for source-rate MP4 documentation clips). A step has one kind. New kinds register on
 Runner.step_handlers instead of another branch in the row loop.
 
 Shared library: a segment or gate written as {"library": "<name>"} comes from library/index.json next to this file
@@ -124,9 +125,11 @@ STOP-INPUT. Every control call goes to out/actions.jsonl; each row writes out/<r
 out/<row>/. Rerunning skips rows whose receipt passed and resumes at the next.
 """
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -139,10 +142,11 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import trace_text  # noqa: E402
 import subprocess  # noqa: E402
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
-GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status', 'state')
+GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status', 'state', 'text')
 # Control methods a row may call directly with a {"call": ...} step. Input stays in recorded segments.
 CALL_METHODS = ('game.load', 'game.pause', 'game.resume', 'status', 'settings.get', 'settings.set', 'settings.save',
                 # Guest tracing (Eden persistent-tracing builds, docs/GUEST_TRACEPOINT.md); never input.
@@ -154,12 +158,12 @@ STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 
 UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
 # Shared step-hook modules next to runner.py, named without ".py" in a run step: {"run": "routes:to_main"}.
 SHARED_HOOKS = ('routes', 'routes_online')
-# Eden recording.start limits (tools/edenctl.py, docs/GIFRecording.md): fps 1-30, width 160-1280,
-# duration_ms 100-120000. Presets below are the playbook's defaults (docs/GIFS.md), not a ceiling:
-# a plan or row gif_presets entry, or fields on the gif step, override them. Leaving the operator's
-# envelope (docs: 1280 wide and under 10 s; evidence: 640 wide, fps at most 15, at most 10 MB) needs a reason.
+# Eden recording.start accepts fps 1..30, width 160..1280, duration_ms 100..120000.
+# Use GIF previews where the surface requires an image. Documentation/tutorial videos are source-rate MP4s.
+GIF_PREVIEW_FPS = {'preview': 12, 'preview-menu': 10}
 BUILTIN_GIF_PRESETS = {
-    'docs': {'width': 1280, 'fps': 10, 'max_duration_s': 10},
+    **{name: {'width': 1280, 'fps': fps, 'max_duration_s': 10} for name, fps in GIF_PREVIEW_FPS.items()},
+    'docs': {'width': 1280, 'fps': 12, 'max_duration_s': 10},
     'evidence': {'width': 640, 'fps': 10, 'max_duration_s': 10, 'max_bytes': 10 * 1024 * 1024},
 }
 EVIDENCE_MAX_BYTES = 10 * 1024 * 1024
@@ -203,6 +207,12 @@ def dotted(document, key):
     for part in key.split('.'):
         value = value[part]
     return value
+
+
+def row_role(row):
+    if 'role' in row:
+        return row['role']
+    return 'setup' if row['start'] != row['end'] else 'test'
 
 
 def load_hook(base, gate):
@@ -351,6 +361,10 @@ def resolve_gif_spec(plan, row, gif):
     if spec.get('max_bytes') is not None:
         spec['max_bytes'] = int(spec['max_bytes'])
     spec['preset'] = gif['preset']
+    spec['out'] = gif.get('out')
+    spec['scene'] = gif.get('scene', spec.get('scene', 'menu' if gif['preset'] == 'preview-menu' else 'gameplay'))
+    if spec['scene'] not in ('gameplay', 'menu'):
+        raise ValueError('GIF scene must be gameplay or menu')
     spec['reason'] = gif.get('reason') or spec.get('reason')
     return spec
 
@@ -367,18 +381,42 @@ def gif_api_error(spec):
     return None
 
 
-def gif_outside_operator_rules(spec):
-    """True when the spec is outside both playbook envelopes and therefore needs a reason.
+def gif_preview_minimum(spec):
+    if spec.get('preset') == 'evidence' and not spec.get('out'):
+        return None
+    return 10 if spec.get('scene', 'menu' if spec.get('preset') == 'preview-menu' else 'gameplay') == 'menu' else 12
 
-    docs (GIFS.md): full frame, 1280 wide, under 10 s. fps stays inside Eden's 1..30.
-    evidence: 640 wide, fps at most 15, a size cap of at most 10 MB. Duration may run up to
-    Eden's 120 s so a longer action still counts as evidence when the file stays small.
-    """
+
+def gif_preview_error(spec):
+    minimum = gif_preview_minimum(spec)
+    if minimum is not None and spec['fps'] < minimum:
+        return f'GIF {spec["preset"]} needs at least {minimum} fps'
+    return None
+
+
+def eden_source_fps(status):
+    """Fresh game telemetry, independent of the GIF recorder's requested rate."""
+    if not isinstance(status, dict) or not status.get('running') or not status.get('loading_complete'):
+        return None
+    rate, age = status.get('game_fps'), status.get('stats_age_ms')
+    if (isinstance(rate, (int, float)) and math.isfinite(rate) and rate > 0
+            and isinstance(age, (int, float)) and 0 <= age <= 1000):
+        return rate
+    return None
+
+
+def gif_policy_error(spec):
+    """Validate existing capture envelopes and the minimum rates for new GIF previews."""
+    error = gif_api_error(spec) or gif_preview_error(spec)
+    if error or spec.get('reason'):
+        return error
     width, fps, duration = spec['width'], spec['fps'], spec['max_duration_s']
     size = spec.get('max_bytes')
-    docs = width == 1280 and duration <= 10 and 1 <= fps <= 30
+    full_frame = width == 1280 and duration <= 10
     evidence = (width == 640 and fps <= 15 and duration <= 120 and size is not None and size <= EVIDENCE_MAX_BYTES)
-    return not (docs or evidence)
+    if not (full_frame or evidence):
+        return 'override outside the GIF capture defaults needs a "reason"'
+    return None
 
 
 def gif_dest_path(root, row_dir, gif):
@@ -483,11 +521,9 @@ def _check_gif(plan, base, row, step, where, errors):
         return
     if 'crop' in gif:
         errors.append(f'{where}: gif records the full frame and does not crop')
-    api = gif_api_error(spec)
-    if api:
-        errors.append(f'{where}: gif {gif.get("name")}: {api}')
-    elif gif_outside_operator_rules(spec) and not spec.get('reason'):
-        errors.append(f'{where}: gif {gif.get("name")} leaves the docs/evidence rules and needs a "reason"')
+    error = gif_policy_error(spec)
+    if error:
+        errors.append(f'{where}: gif {gif.get("name")}: {error}')
     if gif.get('out'):
         root = Path(plan['root']) if plan.get('root') else project_root(base)
         try:
@@ -517,11 +553,9 @@ def check_plan_policies(plan, base, errors):
         except ValueError as error:
             errors.append(f'gif preset {name}: {error}')
             continue
-        api = gif_api_error(probe)
-        if api:
-            errors.append(f'gif preset {name}: {api}')
-        elif gif_outside_operator_rules(probe) and not probe.get('reason'):
-            errors.append(f'gif preset {name} leaves the docs/evidence rules and needs a "reason"')
+        error = gif_policy_error(probe)
+        if error:
+            errors.append(f'gif preset {name}: {error}')
     if 'recover' in plan and not isinstance(plan['recover'], list):
         errors.append('plan recover must be a list of steps (a gate\'s recover stays a segment name)')
     if isinstance(plan.get('recover'), list):
@@ -568,11 +602,11 @@ def check_plan_policies(plan, base, errors):
     harness.validate_declarations(plan, errors)
 
 
-def publish_gif(raw_path, dest, spec):
+def publish_gif(raw_path, dest, spec, source_fps=None):
     """Trim to the preset duration, scale the full frame to its width, and palette-encode.
 
-    No crop: docs GIFs are the whole frame (GIFS.md). Returns frames, duration, size, sha256 and path.
-    Raises GifRefused and deletes dest when the file still breaks the preset.
+    Returns the encoded frame count, duration, size, SHA-256 and path. Raises GifRefused and deletes dest
+    when the palette-reduced file exceeds its byte cap or a preview misses its minimum frame rate.
     """
     from PIL import Image, ImageSequence
     resample = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS', Image.BICUBIC)
@@ -596,66 +630,199 @@ def publish_gif(raw_path, dest, spec):
         raise GifRefused(f'gif {spec.get("preset")} captured no frames', {'preset': spec.get('preset'), 'why': 'no frames'})
     width = spec['width']
 
-    def scaled(source):
-        out = []
-        for frame in source:
-            height = max(1, round(width * frame.height / max(frame.width, 1)))
-            out.append(frame if frame.size == (width, height) else frame.resize((width, height), resample))
-        return out
+    pictures = []
+    for frame in frames:
+        height = max(1, round(width * frame.height / max(frame.width, 1)))
+        pictures.append(frame if frame.size == (width, height) else frame.resize((width, height), resample))
 
-    def save(source, durs, colors):
-        pictures = scaled(source)
-        height = pictures[0].height
-        sample = [0, len(pictures) // 2, len(pictures) - 1]
-        mosaic = Image.new('RGB', (width, height * 3))
-        for index, which in enumerate(sample):
-            mosaic.paste(pictures[which], (0, index * height))
-        palette = mosaic.quantize(colors=max(2, colors), method=Image.Quantize.MEDIANCUT)
-        encoded = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in pictures]
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        encoded[0].save(dest, save_all=True, append_images=encoded[1:], duration=durs[:len(encoded)],
-                        loop=0, disposal=1)
-        return dest.stat().st_size, len(encoded), pictures[0].size
-
-    colors, step = 128, 1
-    size, count, dimensions = save(frames, durations, colors)
+    height = pictures[0].height
+    sample = [0, len(pictures) // 2, len(pictures) - 1]
+    mosaic = Image.new('RGB', (width, height * 3))
+    for index, which in enumerate(sample):
+        mosaic.paste(pictures[which], (0, index * height))
+    dest.parent.mkdir(parents=True, exist_ok=True)
     max_bytes = spec.get('max_bytes')
-    kept, durs = frames, durations
-    while max_bytes and size > max_bytes and (colors > 16 or step * 2 < len(frames)):
-        if colors > 16:
-            colors //= 2
-        else:
-            step *= 2
-            kept = frames[::step] or frames[:1]
-            durs = []
-            for index in range(0, len(frames), step):
-                durs.append(max(1, sum(durations[index:index + step])))
-            durs = durs[:len(kept)]
-        size, count, dimensions = save(kept, durs, colors)
-    duration_s = round(sum(durs if step > 1 else durations[:count]) / 1000, 3)
+    for colors in (128, 64, 32, 16):
+        palette = mosaic.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+        encoded = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in pictures]
+        encoded[0].save(dest, save_all=True, append_images=encoded[1:], duration=durations, loop=0, disposal=1)
+        size = dest.stat().st_size
+        if not max_bytes or size <= max_bytes:
+            break
+
+    with Image.open(dest) as written:
+        dimensions = written.size
+        count = written.n_frames
+        total_ms = sum(frame.info.get('duration', 0) for frame in ImageSequence.Iterator(written))
+    duration_s = round(total_ms / 1000, 3)
+    preview_minimum = gif_preview_minimum(spec)
+    if preview_minimum is not None and source_fps is not None:
+        preview_minimum = min(preview_minimum, source_fps)
     why = None
     if dimensions[0] != width:
         why = f'width is {dimensions[0]}, preset wants {width}'
     elif duration_s > spec['max_duration_s'] + 0.05:
         why = f'duration is {duration_s} s, preset allows {spec["max_duration_s"]} s'
     elif max_bytes and size > max_bytes:
-        why = f'size is {size} bytes, preset allows {max_bytes}'
+        why = f'size is {size} bytes, preset allows {max_bytes}; trim or crop the source and retry'
+    elif preview_minimum:
+        # Eden's GifWriter emits one descriptor per successful sample, even for identical images.
+        # Pillow may merge a sampled hold when re-encoding. Check raw cadence with one GIF tick of tolerance.
+        if len(frames) * 1000 < preview_minimum * (total - 10):
+            why = f'preview needs at least {preview_minimum:g} fps; sampled {len(frames)} frames in {total / 1000:g} s'
+        elif count < 2:
+            why = f'preview needs at least {preview_minimum:g} fps and more than one distinct image'
     if why:
         dest.unlink(missing_ok=True)
         raise GifRefused(f'gif breaks preset {spec.get("preset")}: {why}', {
             'preset': spec.get('preset'), 'why': why, 'frames': count, 'duration': duration_s, 'size': size})
-    return {'frames': count, 'duration': duration_s, 'size': size, 'sha256': digest(dest), 'path': str(dest),
-            'width': dimensions[0], 'fps': spec['fps']}
+    receipt = {'frames': count, 'duration': duration_s, 'size': size, 'sha256': digest(dest), 'path': str(dest),
+               'width': dimensions[0], 'fps': spec['fps']}
+    if preview_minimum:
+        receipt.update(frames_sampled=len(frames), sampled_fps=round(len(frames) * 1000 / total, 3))
+        if source_fps is not None:
+            receipt['source_fps'] = source_fps
+    return receipt
+
+
+def review_class(plan, base, raw_plan=None):
+    private = []
+    segments = plan.get('segments', {})
+    raw = plan if raw_plan is None else raw_plan
+    raw_segments = raw.get('segments') if isinstance(raw.get('segments'), dict) else {}
+    raw_gates = raw.get('gates') if isinstance(raw.get('gates'), dict) else {}
+    raw_rows = raw.get('rows') if isinstance(raw.get('rows'), list) else []
+    index = library_index()
+    plan_keys = {'start', 'rows', 'segments', 'gates', 'setup', 'game_id', 'recover', 'on_failure', 'trace'}
+    row_keys = {'id', 'start', 'end', 'steps', 'role', 'evidence', 'budget_min', 'on_failure', 'recover', 'start_gate'}
+    step_keys = {'play': {'play', 'on'}, 'gate': {'gate', 'on'}, 'library': {'library', 'on'},
+                 'run': {'run', 'args', 'check', 'on'}, 'call': {'call', 'params', 'on', 'job_cap'},
+                 'shot': {'shot', 'on'}, 'mark': {'mark', 'on'}, 'copy': {'copy', 'on', 'as'},
+                 'json_diff': {'json_diff', 'on'}, 'wait_ms': {'wait_ms', 'on'}}
+    read_only = {'status', 'settings.get', 'trace.read', 'trace.counters', 'trace.list', 'modules.list',
+                 'tracepoint.status'}
+
+    def add(where, what):
+        private.append({'where': where, 'what': what})
+
+    def imported(kind, name, entries, where):
+        entry = entries.get(name, {})
+        if (not isinstance(entry, dict) or not isinstance(entry.get('library'), str) or
+                entry['library'] not in index.get(kind + 's', {})):
+            add(where, f'{kind} {name}')
+        elif set(entry) != {'library'}:
+            overrides = ', '.join(sorted(set(entry) - {'library'}))
+            add(where, f'{kind} {name} overrides {overrides}')
+
+    def library(name, where):
+        if not isinstance(name, str):
+            add(where, f'segment {name}')
+            return
+        for seg_name, entry in segments.items():
+            if seg_name == name or entry.get('library') == name:
+                imported('segment', seg_name, raw_segments, where)
+                return
+        if name not in index.get('segments', {}):
+            add(where, f'segment {name}')
+
+    def step(item, where):
+        if not isinstance(item, dict):
+            add(where, f'{where} invalid step')
+            return
+        verbs = [key for key in STEP_KINDS if key in item]
+        if len(verbs) != 1:
+            add(where, f'{where} needs exactly one known verb')
+            return
+        verb = verbs[0]
+        if verb not in step_keys:
+            add(where, f'{verb} {item[verb]}')
+            return
+        for key in sorted(set(item) - step_keys[verb]):
+            add(where, f'{where} key {key}')
+        if verb == 'library':
+            library(item['library'], where)
+        if verb == 'run' and (not isinstance(item['run'], str)
+                              or item['run'].partition(':')[0] not in SHARED_HOOKS):
+            add(where, f'hook {item["run"]}')
+        if verb == 'call' and (not isinstance(item['call'], str) or item['call'] not in read_only):
+            add(where, f'call {item["call"]}')
+
+    def composition_item(source, list_keys, dict_keys=()):
+        item = {key: value for key, value in source.items()
+                if not (key in list_keys and isinstance(value, list) and value)
+                and not (key in dict_keys and isinstance(value, dict))}
+        item['_keys'] = sorted(source)
+        return item
+
+    composition = [
+        {'where': 'plan', 'item': composition_item(raw, ('rows', 'setup', 'recover'), ('segments', 'gates'))},
+        {'where': 'imports', 'item': {
+            kind: {name: entry['library'] if isinstance(entry, dict) and set(entry) == {'library'} else entry
+                   for name, entry in entries.items()}
+            for kind, entries in (('segments', raw_segments), ('gates', raw_gates))}}]
+    setup = raw.get('setup')
+    if isinstance(setup, list):
+        composition.extend({'where': f'setup {i}', 'item': item} for i, item in enumerate(setup))
+    for row in raw_rows:
+        where = f'row {row["id"]}'
+        composition.append({'where': where, 'item': composition_item(row, ('steps', 'recover'))})
+        for key, label in (('steps', 'step'), ('recover', 'recover')):
+            if isinstance(row.get(key), list):
+                composition.extend({'where': f'{where} {label} {i}', 'item': item}
+                                   for i, item in enumerate(row[key]))
+    if isinstance(raw.get('recover'), list):
+        composition.extend({'where': f'plan recover {i}', 'item': item}
+                           for i, item in enumerate(raw['recover']))
+
+    for key in sorted(set(raw) - plan_keys):
+        add('plan', f'plan key {key}')
+    if 'on_failure' in raw and raw['on_failure'] not in ('continue', 'stop'):
+        add('plan', f'plan on_failure {raw["on_failure"]}')
+    for kind, entries in (('segment', raw_segments), ('gate', raw_gates)):
+        for name in entries:
+            imported(kind, name, entries, f'{kind} {name}')
+    for row in raw_rows:
+        where = f'row {row["id"]}'
+        for key in sorted(set(row) - row_keys):
+            add(where, f'{where} key {key}')
+        for i, item in enumerate(row.get('steps', []) if isinstance(row.get('steps', []), list) else []):
+            step(item, f'{where} step {i}')
+        for i, item in enumerate(row.get('recover', []) if isinstance(row.get('recover', []), list) else []):
+            step(item, f'{where} recover {i}')
+    for i, item in enumerate(raw.get('recover', []) if isinstance(raw.get('recover', []), list) else []):
+        step(item, f'plan recover {i}')
+    setup = raw.get('setup')
+    if not isinstance(setup, list) or not setup:
+        add('setup', 'no setup plan')
+    else:
+        for i, item in enumerate(setup):
+            via = item.get('via') if isinstance(item, dict) else None
+            ref = item.get('ref') if isinstance(item, dict) else None
+            reviewed = item.get('reviewed') if isinstance(item, dict) else None
+            valid = (via == 'fixture' and isinstance(reviewed, dict)
+                     and isinstance(reviewed.get('path'), str) and bool(reviewed['path'])
+                     and isinstance(reviewed.get('sha256'), str)
+                     and re.fullmatch(r'[0-9a-fA-F]{64}', reviewed['sha256']))
+            valid = valid or (via == 'hook' and isinstance(ref, str)
+                              and any(ref.startswith(module + ':') for module in SHARED_HOOKS))
+            valid = valid or (via == 'segment' and isinstance(ref, str) and ref.startswith('library:')
+                              and ref[len('library:'):] in index.get('segments', {}))
+            if not valid:
+                add(f'setup {i}', f'{via or "unknown"} setup {ref or ""}'.strip())
+    return {'class': 'full' if private else 'library-only', 'private': private, 'composition': composition}
 
 
 def dry_run(manifest_path):
     """Offline only. Raises on a broken manifest; returns the report (missing segments are not an error)."""
     base = manifest_path.parent
+    raw = json.loads(manifest_path.read_text())
+    roles_defaulted = [row.get('id') for row in raw.get('rows', []) if 'role' not in row]
     try:
-        plan = expand_library(json.loads(manifest_path.read_text()))
+        plan = expand_library(copy.deepcopy(raw))
     except KeyError as error:
         return {'manifest': str(manifest_path), 'errors': [str(error)], 'result': 'BROKEN', 'rows': 0,
-                'missing_segments': [], 'references_to_acquire': [], 'available_segments': []}
+                'missing_segments': [], 'references_to_acquire': [], 'available_segments': [],
+                'review': {'class': 'full', 'private': [], 'composition': []}, 'roles_defaulted': roles_defaulted}
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
@@ -714,6 +881,14 @@ def dry_run(manifest_path):
                         errors.append(f'gate {name}: expect_groups {number} but the pattern has {pattern.groups} groups')
                 if gate.get('equal') and pattern.groups == 0:
                     errors.append(f'gate {name}: "equal" needs capture groups in the pattern')
+            elif kind == 'text':
+                if not isinstance(gate.get('pane'), str) or not gate['pane']:
+                    errors.append(f'gate {name}: text needs a non-empty "pane"')
+                if 'point_id' in gate and not (isinstance(gate['point_id'], str) or type(gate['point_id']) is int):
+                    errors.append(f'gate {name}: point_id must be a string or integer')
+                if 'whole_file' in gate and type(gate['whole_file']) is not bool:
+                    errors.append(f'gate {name}: whole_file must be a boolean')
+                re.compile(gate['pattern'])
             elif kind == 'change':
                 if len(gate['roi']) != 4 or not gate.get('mark'):
                     errors.append(f'gate {name}: change needs "mark" and a 4-number roi')
@@ -745,6 +920,8 @@ def dry_run(manifest_path):
     ids = set()
     rows = plan['rows']
     for index, row in enumerate(rows):
+        if 'role' in row and row['role'] not in ('setup', 'test'):
+            errors.append(f'row {row["id"]}: role {row["role"]!r} must be "setup" or "test"')
         if row['id'] in ids:
             errors.append(f'row {row["id"]}: duplicate id')
         ids.add(row['id'])
@@ -834,11 +1011,9 @@ def dry_run(manifest_path):
                     probe = resolve_gif_spec(plan, row, {'name': name, 'preset': name,
                                                         **({'reason': row['gif_presets'][name].get('reason')}
                                                            if isinstance(row['gif_presets'][name], dict) else {})})
-                    api = gif_api_error(probe)
-                    if api:
-                        errors.append(f'row {row["id"]} gif preset {name}: {api}')
-                    elif gif_outside_operator_rules(probe) and not probe.get('reason'):
-                        errors.append(f'row {row["id"]} gif preset {name} leaves the docs/evidence rules and needs a "reason"')
+                    error = gif_policy_error(probe)
+                    if error:
+                        errors.append(f'row {row["id"]} gif preset {name}: {error}')
             except ValueError as error:
                 errors.append(f'row {row["id"]}: {error}')
         hook = row.get('on_failure_hook')
@@ -864,7 +1039,8 @@ def dry_run(manifest_path):
     effects = effect_report(plan, base, errors)
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
-              'gates': len(plan.get('gates', {})), 'errors': errors,
+              'gates': len(plan.get('gates', {})), 'errors': errors, 'review': review_class(plan, base, raw),
+              'roles_defaulted': roles_defaulted,
               'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing or to_acquire else 'READY')}
     report.update(effects)
     return report
@@ -1437,6 +1613,15 @@ class Runner:
                 return Path(inst[name])
         return Path(key)
 
+    def trace_source(self, on):
+        inst = self.instances[on]
+        path = inst.get('trace_jsonl') or inst.get('trace')
+        if isinstance(path, (str, Path)) and path:
+            return Path(path)
+        if path:
+            raise RuntimeError(f'instance {on} is tracing but has no trace_jsonl file path')
+        raise RuntimeError(f'instance {on}: run is not tracing (no trace_jsonl)')
+
     def last_match(self, on, gate):
         """Last match of the gate's pattern in lines written during this row (or the whole file), or None."""
         source = self.source(on, gate['source'])
@@ -1584,7 +1769,49 @@ class Runner:
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
-        if kind == 'log':
+        if kind == 'text':
+            source = self.trace_source(on)
+            pattern = re.compile(gate['pattern'])
+            whole_file = gate.get('whole_file', False)
+            row_start, row_inode = (0, None) if whole_file else self.row_offsets.get(str(source), (0, None))
+            offset, identity, record = 0, None, None
+            history, keys = [], set()
+            while time.monotonic() < until:
+                self.check_stop()
+                try:
+                    stat = source.stat()
+                except FileNotFoundError:
+                    offset, identity, record, row_start, row_inode = 0, None, None, 0, None
+                    history, keys = [], set()
+                else:
+                    current_identity = (stat.st_dev, stat.st_ino)
+                    if row_inode is not None and (row_inode != stat.st_ino or stat.st_size < row_start):
+                        row_start, row_inode = 0, None
+                    if identity is not None and (identity != current_identity or stat.st_size < offset):
+                        offset, record, row_start = 0, None, 0
+                        history, keys = [], set()
+                    identity = current_identity
+                    found, offset = trace_text.scan(source, gate['pane'], since=offset,
+                                                    name_at=gate.get('name_at', trace_text.NAME_AT),
+                                                    point_id=gate.get('point_id'), keys=keys)
+                    for latest in found:
+                        history.append(latest)
+                        if isinstance(latest['pane'], str):
+                            keys.add(latest['pane'])
+                        if whole_file or latest['at'] >= row_start:
+                            record = latest
+                if record and record['known'] and pattern.search(record['text']) and time.monotonic() <= until:
+                    transition, previous, before_scope = trace_text.transition(history, row_start)
+                    evidence = {'pane': gate['pane'], 'text': record['text'],
+                                'sequence': record['sequence'], 'frame': record['frame'],
+                                'pane_key': record['pane'], 'scope': 'whole_file' if whole_file else 'row',
+                                'transition': transition, 'previous': previous, 'before_scope': before_scope}
+                    if 'point_id' in gate:
+                        evidence['point_id'] = record['point_id']
+                    self.log({'gate': name, 'on': on, 'pass': True, **evidence})
+                    return evidence
+                time.sleep(max(0, min(.1, until - time.monotonic())))
+        elif kind == 'log':
             # Lines from this row only: the line usually appears while the segment before the gate is playing.
             # "on_all": every listed instance must match; "equal": their captured groups must be the same;
             # "expect_groups": {"2": "0"} pins captured values (group number -> text).
@@ -1708,10 +1935,13 @@ class Runner:
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
             raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
-        # Non-image gates (log, json, ui, status, change) save what the game showed when they gave up, so a
+        # Non-image gates save what the game showed when they gave up, so a
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
         self.failure_evidence(on, name)
-        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+        missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
+        unreadable = (f'; newest sample unreadable (sequence {record["sequence"]}: {record["why"]})'
+                      if kind == 'text' and record and not record['known'] else '')
+        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}{unreadable}')
 
     def failure_evidence(self, on, name):
         """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""
@@ -1850,6 +2080,10 @@ class Runner:
         paths = set()
         for on, inst in self.instances.items():
             paths.update(str(v) for v in inst.values() if isinstance(v, str) and v.startswith('/'))
+            try:
+                paths.add(str(self.trace_source(on)))
+            except RuntimeError:
+                pass
             for gate in self.plan.get('gates', {}).values():
                 if gate.get('kind') == 'log':
                     paths.add(str(self.source(on, gate['source'])))
@@ -1869,6 +2103,14 @@ class Runner:
             if value is not None and value != []:
                 item[key] = value
         self.outcomes[row_id] = item
+
+    def record_attempt(self, receipt):
+        attempt = {key: receipt[key] for key in ('id', 'role', 'role_source', 'manifest_sha256', 'start', 'end',
+                                                 'started', 'ended', 'status')}
+        if receipt.get('not_executed'):
+            attempt['not_executed'] = True
+        with (self.out / 'attempts.jsonl').open('a') as f:
+            f.write(json.dumps(attempt) + '\n')
 
     def stop_input(self, row, text):
         (self.out / 'STOP-INPUT').write_text(text if str(text).endswith('\n') else f'{text}\n')
@@ -2079,14 +2321,11 @@ class Runner:
         if str(self.instances[on].get('socket', '')).startswith(SWITCH_SCHEMES):
             return self._step_gif_marked(on, step, row)
         spec = resolve_gif_spec(self.plan, row, gif)
-        api = gif_api_error(spec)
-        if api:
-            raise GifRefused(f'gif {gif.get("name")}: {api}', {'why': api, 'preset': spec.get('preset')})
+        error = gif_policy_error(spec)
+        if error:
+            raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': error, 'preset': spec.get('preset')})
         if 'crop' in gif:
             why = 'gif records the full frame and does not crop'
-            raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
-        if gif_outside_operator_rules(spec) and not spec.get('reason'):
-            why = 'override outside the GIF rules needs a reason'
             raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
         root = Path(self.plan['root']) if self.plan.get('root') else project_root(self.base)
         try:
@@ -2095,6 +2334,8 @@ class Runner:
             raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': str(error), 'preset': spec.get('preset')}) from error
         slug = re.sub(r'[^A-Za-z0-9._-]+', '-', gif['name']).strip('-') or 'clip'
         raw = self.row_dir / f'{slug}.{time.time_ns()}.capture.gif'
+        minimum = gif_preview_minimum(spec)
+        source_before = eden_source_fps(self.call(on, 'status', {})) if minimum is not None else None
         self.call(on, 'recording.start', {'path': str(raw), 'fps': spec['fps'], 'width': spec['width'],
                                           'duration_ms': int(spec['max_duration_s'] * 1000)})
         nested = []
@@ -2113,7 +2354,13 @@ class Runner:
         if not raw.is_file():
             why = 'Eden wrote no gif'
             raise GifRefused(f'gif {gif.get("name")}: {why}', {'why': why, 'preset': spec.get('preset')})
-        info = publish_gif(raw, dest, spec)
+        source_fps = None
+        if (source_before is not None and source_before < minimum
+                and isinstance(status, dict) and status.get('dropped_frames') == 0):
+            source_after = eden_source_fps(self.call(on, 'status', {}))
+            if source_after is not None and source_after < minimum:
+                source_fps = max(source_before, source_after)
+        info = publish_gif(raw, dest, spec, source_fps)
         info['steps'] = nested
         info['preset'] = spec['preset']
         if spec.get('reason'):
@@ -2132,13 +2379,16 @@ class Runner:
         is cut offline from the session recording by those marks (preset, name and out are in the marks)."""
         gif = step['gif']
         spec = resolve_gif_spec(self.plan, row, gif)
+        error = gif_preview_error(spec)
+        if error:
+            raise GifRefused(f'gif {gif.get("name")}: {error}', {'why': error, 'preset': spec['preset']})
         if self.session is None:
             raise GifRefused(f'gif {gif.get("name")}: on a real Switch a gif is cut from the session recording; '
                              'set plan "session_recording"', {'why': 'no session recording',
                                                               'preset': spec.get('preset')})
         label = json.dumps({'gif': gif.get('name'), 'preset': spec['preset'], 'out': gif.get('out'),
                             'width': spec['width'], 'fps': spec['fps'], 'max_duration_s': spec['max_duration_s'],
-                            'max_bytes': spec.get('max_bytes')}, separators=(',', ':'))
+                            'max_bytes': spec.get('max_bytes'), 'scene': spec['scene']}, separators=(',', ':'))
         start = self.session_mark('gif-start', row.get('id'), label=label, force=True)
         nested = []
         try:
@@ -2627,13 +2877,16 @@ class Runner:
             self.last_gate_outcome = None
             self.effects_passed = []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
-                       'manifest_sha256': self.snapshot_manifest(), 'started': time.time(), 'results': []}
+                       'role': row_role(row), 'role_source': 'explicit' if 'role' in row else 'default',
+                       'manifest_sha256': self.snapshot_manifest(),
+                       'started': time.time(), 'results': []}
             try:
                 self.session_start()
                 start_mark = self.session_mark('row-start', row['id'])
             except StopRun as error:  # never run a row unrecorded: stopped before any of its input
                 receipt.update(status='FAILED', error=repr(error), ended=time.time(), not_executed=True)
                 receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                self.record_attempt(receipt)
                 self.note(row['id'], 'fail', receipt='FAILED')
                 print(json.dumps({'row': row['id'], 'status': 'FAILED', 'error': repr(error)[:300],
                                   'receipt': str(receipt_path)}), flush=True)
@@ -2714,6 +2967,7 @@ class Runner:
                 if self.acquired:
                     receipt['acquired_references'] = self.acquired
                 receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+                self.record_attempt(receipt)
                 for key in self.clients:
                     try:
                         self.call(key, 'input.reset')

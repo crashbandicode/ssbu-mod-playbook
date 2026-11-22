@@ -21,6 +21,45 @@ lifecycle, playbook gv/prep/launch/stop and the shared runner. That draft left t
 runner.py untouched. Phase2 was then paused at product commit4814381,
 with no-default/review/native acceptance pending and no owned host claim/job.
 
+## Approved reservations
+
+For an approved Linux run with a prepared lifecycle config, reserve the host
+from its normal executor:
+
+```text
+python3 -B -I lifecycle.py reserve config.json --approver tr-primary-2 --execute
+```
+
+Use the same `host`, `owner` and `label` for preflight and Up. The command
+appends one reservation to the configured authoritative ledger, using
+`ledger_ssh` when present. The approver name records the approval already
+granted. A host can have one live reservation. It can be left for an existing
+run to finish and expires 20 minutes after issuance if still unclaimed.
+
+Preflight is read-only. It ignores an exact matching reservation and refuses a
+different owner or label while the reservation is open. Up still checks
+ordinary claims, resources and pins, then converts the reservation to its
+normal lifecycle claim in the locked ledger append. Down releases the normal
+claim. An elapsed reservation stays in ledger history, and the next
+successful reservation or claim on that host records its release. For new reserve,
+preflight and Up operations use the current shared lifecycle on the executor.
+Existing runtime owners can Down with their already-pinned tools.
+
+### Whole-host hold
+
+For an approved single-Eden run on Surface, Yoga or XPS, set
+`"exclusive_host": true` in its lifecycle config. Use the same config for
+reserve, preflight, Up and Down. Run the reserve command above on the executor
+or pass `--ssh <executor>` so it can check for running Edens on that host.
+The ledger refuses the reservation if any claims are open. The process check
+also refuses a running Eden without a claim. No process is stopped.
+
+The owner's Up requires the matching exclusive reservation and converts it in
+one locked append. Other runs cannot reserve or claim that host until verified
+Down releases the active claim. The 20-minute TTL applies only before Up.
+Run all new reserve, preflight and Up operations with the current lifecycle
+version on the relevant hosts so they recognize the exclusive claim.
+
 ## CLI and integration
 
 ```text
@@ -164,7 +203,17 @@ must be recorded/acquired by that shared runner, not accepted by the lifecycle.
 
 For an explicitly assigned same-host pair, set `pair_authorized:true` and add
 key `b` with a distinct display/source/inputs. One lifecycle claim covers the
-pair; memory/disk and foreign-process checks repeat before EACH launch. Both
+pair; memory/disk and foreign-process checks repeat before EACH launch.
+Preflight (so also Up) refuses a pair whose instance boots with `lan_online=true`
+(check `pair-lan-online`; the value is read from the pinned
+`user/config/qt-config.ini` fixture, else the source profile's). It fails
+closed: any value other than `false` or absent (Eden's default is off), or an
+unreadable config, also refuses. With LAN Online
+on, an Eden↔Eden local-wireless join fails: the room LDN layer connects, then
+the guest game gives up ("Unable to join"; `ldn2c-vanilla-yoga-1` failed,
+`ldn2c-eblan-yoga-1` joined with it off, 2026-11-18). Pin a Qt fixture with
+`lan_online=false`, or declare `lan_online_pair:true` for a pair that really
+tests LAN Online. Both
 guests count against the host's slot limit (two Edens on the Surface, Yoga and XPS; one on the Ally, so no pair there). Other owners' Eden instances count against the
 host's slot limit; their compilers refuse Up unless the headroom rule below admits it. Open claims are
 strictly blocking unless they are other runs' lifecycle claims on this host (`host=<h> lifecycle=<token> Eden

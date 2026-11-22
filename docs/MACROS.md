@@ -182,7 +182,16 @@ The rules:
    saves (screenshots, log lines, a receipt per row). The dry run happens
    offline and checks that every file exists and matches its hash, that every
    gate loads, and that each row starts on the screen the row before it ends
-   on.
+   on. `library-only` means every plan, row and step key is on the runner's
+   allowlist and every gate and segment is an unchanged library import.
+   `review.composition` lists the plan's keys, imports, setup items, rows and
+   every step verbatim and in order, as a reading aid; an explicitly empty
+   list is shown. The sealed manifest remains the authority and the class
+   does not judge arguments.
+   Shared hooks, read-only calls and a reviewed setup plan are also required; otherwise it is
+   `full` with a list of private parts. This class does not change the
+   dry-run result. No packet is admitted to light review by this class
+   alone; the reviewers decide.
 2. **Chain rows on their end state.** Order the rows so each one starts
    where the last one ended. Restore state between rows only where the next
    row needs it. The full restore happens once, at `Down`.
@@ -283,6 +292,16 @@ The rules:
       <run>` does the lifecycle `down`, the harvest, a `RESULTS.md` skeleton
       of 20 lines or fewer (build, plugins, rows, the unit's exit result,
       prune, harvest, timing) and `timing.json`.
+      A row may set `"role": "setup"` or `"test"`; otherwise a screen-changing
+      row is setup and a same-screen row is test. Set the role explicitly
+      when that default is wrong. Receipts and attempt journals record
+      `role_source` as `explicit` or `default`. The Timing line and
+      `timing.json` report time not covered by Up, a row attempt or Down as
+      unclassified, attempts with no recoverable role as unroled, and missing
+      window endpoints as incomplete timing. Timing includes matching legacy
+      receipts and journal entries even for superseded row IDs
+      (`attempt_ids_not_in_manifest`), and resolves missing roles from the
+      attempt's own manifest (`roles_from_manifest`) or its recorded screens.
     - `all` does new, up, run and down in one go, for a batch you don't
       expect to fix mid-boot.
     - `--plugin <new build>` on `new` swaps the pinned plugin with that file
@@ -336,6 +355,15 @@ The rules:
     boot steering the character select to make the CPU Kirby, 139 single
     inputs and no finished row, until the runtime cap stopped Eden; the
     plugin's settings fixture reached the same state in one step.)
+    A fixture may add `"to": "user/sdmc/ultimate/TrainingRooms/settings.json"`,
+    optional `"instance": "a"`, `"reviewed": {"path": "reviewed.json",
+    "sha256": "..."}` and `"differs_only": ["menu.cpu_percent"]`. The
+    `eden_test.py check`, `up` and `all` commands compare the actual pinned
+    source for each selected instance and refuse missing or invalid files,
+    wrong hashes or differences outside those paths. Direct `lifecycle.py up`
+    and `runner.py dry-run` do not run this check. Paths are compared by
+    component; write a key that contains a dot as a list entry. An entry
+    must name at least one key.
 14. **Press a chord in one frame.** A plugin that reads a button combination
     (a menu chord such as `B`+`Up`, a shortcut such as `ZL`+`Left`, the
     `L`+`R`+`A` start) sees it only when every button goes down in the same
@@ -391,7 +419,8 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
 - **Steps:** `play` a segment (`macro.play`, wait for it to finish, then
   `input.reset`), `gate`, `shot`, `copy` (save an instance file into the row
   folder), `wait_ms` (only where no gate exists), `library` (a shared-library
-  segment by name), `gif` (record the nested steps; [GIFS](GIFS.md)), `mark`
+  segment by name), `gif` (record an image preview or run an existing GIF
+  recipe; [GIFS](GIFS.md)), `mark`
   (a "before" shot for a `change` gate), `json_diff` (compare a file with an
   earlier `copy`), `ui` and `call` (Eden's frontend and allowed control
   methods) and `run` (a project hook, above).
@@ -415,6 +444,7 @@ python3 -I tools/eden-runner/runner.py run eden/rows.json --instances <state_dir
   reference shot), `hook` (a Python check such as `css_check.py`), `change`
   (a region that differs from a `mark` and has settled), `ui` (a matching
   frontend widget) and `status` (Eden's `status` fields).
+  A `text` gate matches the newest text-setter trace record for a pane written during the row.
   - Prefer a log line.
   - For an image gate, pick a region that doesn't animate. The default
     tolerance is a mean difference of 8 per colour byte; an exact match is

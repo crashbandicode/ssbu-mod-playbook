@@ -2,7 +2,7 @@
 """Offline only: fake host/RPC/claims; all filesystem fixtures are temporary."""
 import base64
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
@@ -1181,6 +1181,192 @@ class LifecycleTests(unittest.TestCase):
                     with self.assertRaisesRegex(life.Refused, 'stop policy'):
                         host.launch(c.state['instances'][0], self.config)
 
+    def test_preflight_accepts_own_reservation_without_consuming_it(self):
+        reservation = (f"{life.stamp()} CLAIMED: {self.config['owner']} host=surface "
+                       "lifecycle=0ade00000000000000000000000000ed "
+                       "Eden reservation run test-01 approver=tr-primary-2\n")
+        self.ledger_path.write_text(reservation)
+        report = life.Lifecycle(self.config, self.host).preflight()
+        self.assertTrue(report['ok'], report['message'])
+        self.assertFalse(report['mutation'])
+        self.assertEqual(self.ledger_path.read_text(), reservation)
+        self.assertFalse(Path(self.config['state_dir']).exists())
+
+    def test_reservation_cli_up_conversion_and_normal_down(self):
+        config = self.base / 'config.json'
+        config.write_text(json.dumps(self.config))
+        argv = ['reserve', str(config), '--approver', 'tr-primary-2', '--execute']
+        with patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.assertEqual(life.main(argv), 0)
+            reserved = json.loads(stdout.getvalue())
+        self.assertEqual(reserved['expires_in_seconds'], 1200)
+        self.assertIn('Eden reservation run test-01 approver=tr-primary-2', reserved['line'])
+        controller = life.Lifecycle(self.config, self.host)
+        self.assertEqual(controller.up()['phase'], 'up')
+        text = self.ledger_path.read_text()
+        opened = life.active_claims(text, 'surface')
+        self.assertEqual(len(opened), 1)
+        self.assertIn('Eden lifecycle admitted', opened[0])
+        self.assertIn('Eden reservation converted to lifecycle claim', text)
+        self.assertLess(text.index('Eden lifecycle admitted'), text.index('Eden reservation converted'))
+        self.assertEqual(controller.down()['phase'], 'down')
+        self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'surface'), [])
+
+    def test_reservation_rejects_multiline_owner_before_append(self):
+        before = self.ledger_path.read_bytes()
+        reserve = life.Ledger(self.ledger_path, 'surface', 'Codex\nmultiline', 'a' * 32, label='test-01')
+        with self.assertRaisesRegex(life.Refused, 'valid Linux host, owner, run label and approver'):
+            reserve.operate('reserve', approver='tr-primary-2')
+        self.assertEqual(self.ledger_path.read_bytes(), before)
+
+    def test_exclusive_reservation_converts_and_blocks_until_normal_down(self):
+        config = dict(self.config, exclusive_host=True)
+        config_path = self.base / 'exclusive.json'
+        config_path.write_text(json.dumps(config))
+        self.host.max_eden = 2
+        owner = life.Lifecycle(config, self.host)
+        self.assertIn('requires a matching approved reservation', owner.preflight()['message'])
+        with patch.object(life, 'Host', return_value=self.host), patch('sys.stdout', new_callable=io.StringIO):
+            self.assertEqual(life.main(['reserve', str(config_path), '--approver', 'tr-primary-2', '--execute']), 0)
+        self.assertTrue(owner.preflight()['ok'])
+        self.assertFalse(life.Lifecycle(self.config, self.host).preflight()['ok'])
+        foreign = life.Ledger(self.ledger_path, 'surface', 'Codex other/stream', 'b' * 32, label='other-run')
+        capacity = {'max_eden': 2, 'foreign_processes': []}
+        for after_up in (False, True):
+            if after_up:
+                self.assertEqual(owner.up()['phase'], 'up')
+            opened = life.active_claims(self.ledger_path.read_text(), 'surface')
+            self.assertEqual(len(opened), 1)
+            self.assertIn('exclusive_host=true', opened[0])
+            self.assertEqual('Eden lifecycle admitted' in opened[0], after_up)
+            before = self.ledger_path.read_bytes()
+            with self.assertRaises(life.Refused):
+                foreign.operate('reserve', approver='tr-primary-2')
+            with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+                foreign.claim(stale_claim_hours=1e-12, admission=capacity)
+            self.assertEqual(self.ledger_path.read_bytes(), before)
+        self.assertEqual(owner.down()['phase'], 'down')
+        foreign.operate('reserve', approver='tr-primary-2')
+        self.assertIn('consumed_reservation', foreign.claim(admission=capacity))
+
+    def test_exclusive_reserve_scans_executor_and_forwards_to_authoritative_ledger(self):
+        config = dict(self.config, host='xps', exclusive_host=True, ledger_ssh='ledger-host')
+        config_path = self.base / 'exclusive.json'
+        config_path.write_text(json.dumps(config))
+        calls = []
+
+        def forward(host, mode, packet, execute):
+            calls.append((host, mode, execute))
+            return life.dispatch(mode, packet, execute)
+
+        with patch.object(life, 'forward', forward), patch.object(life, 'Host', return_value=self.host), \
+                patch('sys.stdout', new_callable=io.StringIO):
+            self.assertEqual(life.main(['reserve', str(config_path), '--ssh', 'executor',
+                                       '--approver', 'tr-primary-2', '--execute']), 0)
+            controller = life.Lifecycle(config, self.host)
+            self.assertTrue(controller.preflight()['ok'])
+            self.assertEqual(controller.up()['phase'], 'up')
+            self.assertEqual(controller.down()['phase'], 'down')
+        self.assertEqual(calls[:2], [('executor', 'reserve-exclusive', True), ('ledger-host', 'ledger-reserve', True)])
+        self.assertIn(('ledger-host', 'ledger-claim', True), calls)
+        self.assertIn(('ledger-host', 'ledger-release', True), calls)
+        self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'xps'), [])
+
+    def test_exclusive_reservation_expires_without_up(self):
+        now = datetime.now(timezone.utc)
+        line = (f"CLAIMED: Codex other/stream host=surface lifecycle={'a' * 32} "
+                "Eden reservation run other-run approver=tr-primary-2 exclusive_host=true")
+        young = f'{(now - timedelta(minutes=19)).isoformat()} {line}'
+        expired = f'{(now - timedelta(minutes=20)).isoformat()} {line}'
+        self.assertEqual(life.claim_admission(young, 'surface', self.config['owner'], now=now)['blocking'], [young])
+        self.assertEqual(life.claim_admission(expired, 'surface', self.config['owner'], now=now)['blocking'], [])
+        self.ledger_path.write_text(expired + '\n')
+        ordinary = life.Ledger(self.ledger_path, 'surface', self.config['owner'], 'b' * 32, label='test-01')
+        ordinary.operate('reserve', approver='tr-primary-2')
+        self.assertIn('Eden reservation expired', self.ledger_path.read_text())
+
+    def test_exclusive_request_refuses_existing_claim_or_untracked_eden(self):
+        config = dict(self.config, exclusive_host=True)
+        config_path = self.base / 'exclusive.json'
+        config_path.write_text(json.dumps(config))
+        self.host.max_eden = 2
+        existing = (f"{life.stamp()} CLAIMED: Codex other/stream host=surface lifecycle={'c' * 32} "
+                    "Eden lifecycle admitted\n")
+        pristine = self.ledger_path.read_text()
+        for existing_text, processes in ((existing, []), (pristine, [{'name': 'eden', 'pid': 1234}])):
+            self.ledger_path.write_text(existing_text)
+            self.host.foreign = processes
+            with patch.object(life, 'Host', return_value=self.host), patch('sys.stderr', new_callable=io.StringIO):
+                self.assertEqual(life.main(['reserve', str(config_path), '--approver', 'tr-primary-2', '--execute']), 1)
+            self.assertEqual(self.ledger_path.read_text(), existing_text)
+            self.assertEqual(self.host.foreign, processes)
+
+    def test_reservation_refuses_foreign_owner_or_label_at_preflight_and_claim(self):
+        owner, label = self.config['owner'], self.config['label']
+        reservation = life.Ledger(self.ledger_path, 'surface', owner, 'a' * 32, label=label)
+        line = reservation.operate('reserve', approver='tr-primary-2')['line']
+        before = self.ledger_path.read_bytes()
+        for config in (dict(self.config, owner='Codex other/stream'), dict(self.config, label='other-run')):
+            with self.subTest(owner=config['owner'], label=config['label']):
+                config['stale_claim_hours'] = 0.0000001
+                report = life.Lifecycle(config, self.host).preflight()
+                self.assertIn('Open host claim', report['message'])
+                foreign = life.Ledger(self.ledger_path, 'surface', config['owner'], 'b' * 32,
+                                      label=config['label'])
+                with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+                    foreign.claim(config['stale_claim_hours'], {'foreign_processes': []})
+                with self.assertRaisesRegex(life.Refused, 'already has an open'):
+                    foreign.operate('reserve', approver='tr-primary-2')
+        self.assertEqual(self.ledger_path.read_bytes(), before)
+        self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'surface'), [line])
+
+    def test_reservation_expires_at_twenty_minutes(self):
+        now = datetime.now(timezone.utc)
+        owner = 'Codex priority/run-owner'
+        prefix = (f'CLAIMED: {owner} host=surface lifecycle=' + 'a' * 32
+                  + ' Eden reservation run test-01 approver=tr-primary-2')
+        expired = f'{(now - timedelta(minutes=20)).isoformat()} {prefix}'
+        live = f'{(now - timedelta(minutes=20) + timedelta(seconds=1)).isoformat()} {prefix}'
+        self.assertEqual(life.claim_admission(live, 'surface', self.config['owner'], now=now)['blocking'], [live])
+        self.assertEqual(life.claim_admission(expired, 'surface', self.config['owner'], now=now)['blocking'], [])
+        self.ledger_path.write_text(expired + '\n')
+        report = life.Lifecycle(self.config, self.host).preflight()
+        self.assertTrue(report['ok'], report['message'])
+        later = life.Ledger(self.ledger_path, 'surface', self.config['owner'], 'b' * 32, label='test-01')
+        self.assertNotIn('consumed_reservation', later.claim())
+        opened = later.inspect()['open']
+        self.assertEqual(len(opened), 1)
+        self.assertIn('Eden lifecycle admitted', opened[0])
+        self.assertIn('Eden reservation expired', self.ledger_path.read_text())
+
+    def test_reservation_leaves_ordinary_claim_capacity_in_force(self):
+        owner, label = self.config['owner'], self.config['label']
+        self.ledger_path.write_text(
+            f"{life.stamp()} CLAIMED: Codex present/ordinary host=surface lifecycle={'c' * 32} Eden lifecycle admitted\n")
+        reservation = life.Ledger(self.ledger_path, 'surface', owner, 'a' * 32, label=label)
+        reservation.operate('reserve', approver='tr-primary-2')
+        claimant = life.Ledger(self.ledger_path, 'surface', owner, 'b' * 32, label=label)
+        with self.assertRaisesRegex(life.Refused, 'Open host claim'):
+            claimant.claim(admission={'max_eden': 1})
+        claim = claimant.claim(admission={'max_eden': 2})
+        self.assertEqual(claim['consumed_reservation'], 'a' * 32)
+        self.assertEqual(len(life.active_claims(self.ledger_path.read_text(), 'surface')), 2)
+
+    def test_forwarded_reservation_and_claim_carry_the_run_label(self):
+        def forward(host, mode, config, execute):
+            self.assertEqual(host, 'fake-ledger-host')
+            self.assertTrue(execute)
+            return life.dispatch(mode, config, execute)
+        reserve = life.Ledger(self.ledger_path, 'xps', self.config['owner'], 'a' * 32,
+                              'fake-ledger-host', label='test-01')
+        claimant = life.Ledger(self.ledger_path, 'xps', self.config['owner'], 'b' * 32,
+                               'fake-ledger-host', label='test-01')
+        with patch.object(life, 'forward', forward):
+            reserve.operate('reserve', approver='tr-primary-2')
+            claim = claimant.claim(admission={'max_eden': 2})
+            self.assertEqual(claim['consumed_reservation'], 'a' * 32)
+            claimant.release()
+
     def test_preflight_is_read_only_and_names_a_bad_pin(self):
         value = self.controller().preflight()
         self.assertTrue(value['ok'])
@@ -1511,6 +1697,45 @@ class LifecycleTests(unittest.TestCase):
         ready = self.controller().preflight()
         self.assertTrue(ready['ok'], ready['message'])
         self.assertTrue(any(line.startswith('OK trace elf:') for line in ready['lines']))
+
+    def test_pair_preflight_refuses_lan_online_unless_declared(self):
+        config = self.source / life.CONFIG
+        config.write_text(config.read_text() + '[Network]\nlan_online\\default=false\nlan_online=true\n')
+        single = self.controller().preflight()
+        self.assertTrue(single['ok'], single['message'])  # a single instance may use LAN Online
+        self.pair()
+        refused = self.controller().preflight()
+        self.assertFalse(refused['ok'])
+        self.assertIn('Pair instance a boots with lan_online=true', refused['message'])
+        self.assertIn('Pair instance b boots with lan_online=true', refused['message'])
+        with self.assertRaises(Exception):
+            self.controller().up()
+        self.assertFalse(Path(self.config['state_dir']).exists())
+        self.assertFalse(self.ledger.claimed)
+        fixture = self.base / 'qt-lan-off.ini'
+        fixture.write_text(config.read_text().replace('lan_online=true', 'lan_online=false'))
+        for item in self.config['instances']:
+            item['files'].append({'path': str(fixture), 'sha256': life.digest(fixture), 'to': life.CONFIG})
+        pinned = self.controller().preflight()
+        self.assertTrue(pinned['ok'], pinned['message'])
+        lan = [check for check in pinned['checks'] if check['name'] == 'pair-lan-online']
+        self.assertEqual([(check['instance'], check['value'], check['ok']) for check in lan],
+                         [('a', 'false', True), ('b', 'false', True)])
+        odd = self.base / 'qt-lan-odd.ini'  # fail closed: anything but false/absent refuses the pair
+        odd.write_text(config.read_text().replace('lan_online=true', 'lan_online=1'))
+        self.config['instances'][1]['files'][-1] = {'path': str(odd), 'sha256': life.digest(odd), 'to': life.CONFIG}
+        unclear = self.controller().preflight()
+        self.assertFalse(unclear['ok'])
+        self.assertIn('Pair instance b boots with lan_online=1', unclear['message'])
+        self.assertNotIn('Pair instance a', unclear['message'])
+        for item in self.config['instances']:
+            item['files'] = [pin for pin in item['files'] if pin['to'] != life.CONFIG]
+        self.config['lan_online_pair'] = True
+        declared = self.controller().preflight()
+        self.assertTrue(declared['ok'], declared['message'])
+        self.config['lan_online_pair'] = 'yes'
+        with self.assertRaises(Exception):
+            life.validate(self.config)
 
 
 class LinuxStopTests(unittest.TestCase):

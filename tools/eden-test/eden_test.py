@@ -5,6 +5,7 @@ Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh yoga 
 after `git -C ~/ssbu-mod-playbook pull --ff-only` there and copying the rows folder over).
 
   eden_test.py new  --from <previous config.json> --label lr-14 --rows <rows folder>   new run folder + config
+  eden_test.py check <run folder>      check setup, pinned fixtures and volatile inputs without starting anything
   eden_test.py up   <run folder>        offline dry run, then lifecycle up
   eden_test.py run  <run folder> [--retry]   runner (with --retry: clear STOP-INPUT first; passed rows skip)
   eden_test.py down <run folder> [--keep-state]   lifecycle down (and its prune), harvest, RESULTS.md, timing.json
@@ -24,7 +25,12 @@ fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 import argparse
 import copy
 import hashlib
+import heapq
 import json
+import math
+import os
+import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -153,7 +159,136 @@ def lifecycle(run, mode, *extra):
 SETUP_VIA = ('fixture', 'segment', 'record', 'hook')
 
 
-def setup_plan_problems(spec):
+def fixture_diff(fixture, reviewed):
+    def diff(left, right, path):
+        if type(left) is not type(right):
+            return [path]
+        if isinstance(left, dict):
+            found = []
+            for key in left.keys() | right.keys():
+                child = path + [key]
+                if key not in left or key not in right:
+                    found.append(child)
+                else:
+                    found.extend(diff(left[key], right[key], child))
+            return found
+        if isinstance(left, list):
+            if len(left) != len(right):
+                return [path]
+            return [item for i, (a, b) in enumerate(zip(left, right))
+                    for item in diff(a, b, path + [i])]
+        return [] if left == right else [path]
+    return sorted(diff(fixture, reviewed, []),
+                  key=lambda path: [(0, item) if isinstance(item, str) else (1, item) for item in path])
+
+
+def fixture_path(path):
+    if not path:
+        return '<root>'
+    if any(isinstance(part, str) and '.' in part for part in path):
+        return json.dumps(path, ensure_ascii=False)
+    return '.'.join(str(part) for part in path)
+
+
+def fixture_comparison(item, base, config):
+    reviewed = item.get('reviewed')
+    problems = []
+    state = item.get('state', '?')
+    if 'file' in item:
+        problems.append(f'{state}: use "to" instead of "file"')
+    if 'reviewed' not in item:
+        return [], problems
+    destination = item.get('to')
+    if not isinstance(destination, str) or not destination:
+        return [], problems + [f'{state}: reviewed requires "to"']
+    destination = posixpath.normpath(destination)
+    selected = []
+    for instance in config.get('instances', []):
+        if not isinstance(instance, dict):
+            continue
+        if item.get('instance') is not None and instance.get('key') != item['instance']:
+            continue
+        pins = [pin for pin in instance.get('files', []) if isinstance(pin, dict)
+                and isinstance(pin.get('to'), str) and posixpath.normpath(pin['to']) == destination]
+        if pins or item.get('instance') is not None:
+            selected.append((instance.get('key'), pins[-1] if pins else None))
+    if not selected:
+        return [], problems + [f'{state}: no instance selected for {destination}']
+    allowed = item.get('differs_only', [])
+    if (not isinstance(allowed, list) or any(
+            not isinstance(path, str) and
+            not (isinstance(path, list) and all(isinstance(part, str) or type(part) is int for part in path))
+            for path in allowed)):
+        problems.append(f'{state}: differs_only must be a list of paths')
+        allowed = []
+    allowed = [[int(part) if part.isdecimal() else part for part in path.split('.')]
+               if isinstance(path, str) else path for path in allowed]
+    if any(not path or any(part == '' for part in path) for path in allowed):
+        problems.append(f'{state}: differs_only entries must name at least one key')
+        allowed = [path for path in allowed if path and all(part != '' for part in path)]
+    missing = object()
+    reviewed_value = missing
+    if not isinstance(reviewed, dict) or not reviewed.get('path'):
+        problems.append(f'{state}: reviewed needs path and sha256')
+    else:
+        source = reviewed['path']
+        try:
+            path = Path(source)
+            data = (path if path.is_absolute() else Path(base) / path).read_bytes()
+        except (OSError, ValueError, TypeError) as error:
+            problems.append(f'{state}: reviewed {source}: {type(error).__name__}')
+        else:
+            if (not isinstance(reviewed.get('sha256'), str)
+                    or reviewed['sha256'].lower() != hashlib.sha256(data).hexdigest()):
+                problems.append(f'{state}: reviewed sha256 mismatch: {source}')
+            try:
+                reviewed_value = json.loads(data)
+            except (ValueError, TypeError) as error:
+                problems.append(f'{state}: reviewed {source}: {type(error).__name__}')
+    common_problems = list(problems)
+    results = []
+    for instance, pin in selected:
+        result = {'state': item.get('state'), 'instance': instance, 'to': destination,
+                  'pin': {'path': pin.get('path'), 'sha256': pin.get('sha256')} if pin else None,
+                  'reviewed': reviewed, 'differing_paths': [], 'differs_only': item.get('differs_only', []),
+                  'ok': False}
+        found = []
+        prefix = f'{state} instance {instance}'
+        if pin is None:
+            found.append(f'{prefix}: no pin for {destination}')
+        else:
+            source = pin.get('path')
+            try:
+                data = Path(source).read_bytes()
+            except (OSError, ValueError, TypeError) as error:
+                found.append(f'{prefix}: pin {source}: {type(error).__name__}')
+            else:
+                if (not isinstance(pin.get('sha256'), str)
+                        or pin['sha256'].lower() != hashlib.sha256(data).hexdigest()):
+                    found.append(f'{prefix}: pin sha256 mismatch: {source}')
+                try:
+                    value = json.loads(data)
+                except (ValueError, TypeError) as error:
+                    found.append(f'{prefix}: pin {source}: {type(error).__name__}')
+                else:
+                    if reviewed_value is not missing:
+                        result['differing_paths'] = fixture_diff(value, reviewed_value)
+                        offending = [path for path in result['differing_paths']
+                                     if not any(path[:len(allow)] == allow for allow in allowed)]
+                        if offending:
+                            found.append(f'{prefix}: {len(offending)} differing paths: '
+                                         + ', '.join(fixture_path(path) for path in offending[:12]))
+        result['ok'] = not common_problems and not found
+        results.append(result)
+        problems.extend(found)
+    return results, problems
+
+
+def fixture_problems(item, base, config):
+    return fixture_comparison(item, base, config)[1]
+
+
+def setup_plan_problems(spec, base=None, config=None):
     """MACROS rule 13: rows.json names how each starting state is reached, before Up.
     "setup": [{"state": "Training, P1 Kirby, CPU Kirby", "via": "fixture", "ref": "files: settings.json"}, ...]"""
     plan = spec.get('setup') if isinstance(spec, dict) else None
@@ -164,15 +299,77 @@ def setup_plan_problems(spec):
     for i, item in enumerate(plan):
         if not isinstance(item, dict) or not item.get('state') or item.get('via') not in SETUP_VIA or not item.get('ref'):
             problems.append(f'setup[{i}] needs "state", "via" ({"/".join(SETUP_VIA)}) and "ref"')
+        if base is not None and config is not None and isinstance(item, dict):
+            problems.extend(f'setup[{i}]: {problem}' for problem in fixture_problems(item, base, config))
     return problems
 
 
-def cmd_up(run, skip_setup_plan=False):
+def iter_pin_nodes(node):
+    if isinstance(node, dict):
+        path, digest_value = node.get('path'), node.get('sha256')
+        if isinstance(path, str) and isinstance(digest_value, str) and re.fullmatch(r'[0-9a-f]{64}', digest_value):
+            yield node
+        for key, child in node.items():
+            if key not in ('path', 'sha256'):
+                yield from iter_pin_nodes(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from iter_pin_nodes(child)
+
+
+def volatile_pins(config, run):
+    root = Path(os.path.abspath(run.parent))
+    found = set()
+    paths = [pin['path'] for pin in iter_pin_nodes(config)]
+    for instance in config.get('instances', []):
+        if isinstance(instance, dict):
+            paths.extend(instance.get(key) for key in ('source', 'game'))
+    for value in paths:
+        if isinstance(value, str) and Path(value).is_absolute():
+            try:
+                parts = Path(os.path.normpath(value)).relative_to(root).parts
+            except ValueError:
+                continue
+            if parts and parts[0] != run.name and not parts[0].startswith('_'):
+                found.add((value, parts[0]))
+    return sorted(found)
+
+
+def check_run(run, skip_setup_plan=False, allow_volatile_pins=False):
     rows = run / 'rows' / 'rows.json'
-    problems = setup_plan_problems(json.loads(rows.read_text()))
-    if problems and not skip_setup_plan:
-        raise SystemExit('setup plan: ' + '; '.join(problems) + ' (MACROS rule 13; --skip-setup-plan only to re-run '
-                         'rows that already have their segments)')
+    spec = json.loads(rows.read_text())
+    config = json.loads((run / 'config.json').read_text())
+    problems = [] if skip_setup_plan else setup_plan_problems(spec)
+    setup = spec.get('setup', []) if isinstance(spec, dict) else []
+    comparisons = []
+    for i, item in enumerate(setup if isinstance(setup, list) else []):
+        if isinstance(item, dict) and ('reviewed' in item or 'file' in item):
+            results, found = fixture_comparison(item, rows.parent, config)
+            comparisons.extend(results)
+            problems.extend(f'setup[{i}]: {problem}' for problem in found)
+    (run / 'setup-fixtures.json').write_text(json.dumps(comparisons, indent=2) + '\n')
+    if not allow_volatile_pins:
+        pins = volatile_pins(config, run)
+        if pins:
+            paths = ', '.join(path for path, _ in pins[:8])
+            problems.append(f'volatile pins: {paths}; shared inputs belong in {run.parent}/_<name>/ '
+                            'because the host janitor keeps only those '
+                            '(configs that pin inputs-* folders: move them to _<name>/ or pass --allow-volatile-pins)')
+    return problems
+
+
+def cmd_check(run, skip_setup_plan=False, allow_volatile_pins=False):
+    problems = check_run(run, skip_setup_plan, allow_volatile_pins)
+    for problem in problems:
+        print(problem)
+    return 2 if problems else 0
+
+
+def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
+    problems = check_run(run, skip_setup_plan, allow_volatile_pins)
+    if problems:
+        raise SystemExit('; '.join(problems))
+    rows = run / 'rows' / 'rows.json'
     if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
@@ -370,12 +567,172 @@ def prune_summary(run, journal):
             + (f'; {len(prune["skipped"])} skipped' if prune.get('skipped') else ''))
 
 
+def time_split(run):
+    timing_path = run / 'timing.json'
+    timing = json.loads(timing_path.read_text()) if timing_path.exists() else {}
+    rows_path = run / 'rows' / 'rows.json'
+    try:
+        rows_data = rows_path.read_bytes()
+    except FileNotFoundError:
+        rows_data = None
+    spec = json.loads(rows_data) if rows_data is not None else []
+    current_sha = hashlib.sha256(rows_data).hexdigest() if rows_data is not None else None
+    rows = spec.get('rows', []) if isinstance(spec, dict) else spec
+    rows_by_id = {row['id']: row for row in rows}
+    out = run / 'out'
+    candidates = []
+
+    def numeric(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
+    journal = out / 'attempts.jsonl'
+    if journal.is_file():
+        for line in journal.read_text().splitlines():
+            try:
+                attempt = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(attempt, dict) and isinstance(attempt.get('id'), str):
+                candidates.append(attempt)
+    for path in sorted(out.glob('*.json')) if out.is_dir() else []:
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('id'), str):
+            continue
+        row_id = receipt['id']
+        if ((path.name == f'{row_id}.json' or path.name.startswith(f'{row_id}.FAILED.'))
+                and numeric(receipt.get('started')) and 'start' in receipt and 'end' in receipt):
+            candidates.append(receipt)
+
+    def valid_interval(attempt):
+        start, end = attempt.get('started'), attempt.get('ended')
+        return numeric(start) and numeric(end) and end >= start
+
+    attempts_by_start, skipped = {}, 0
+    for attempt in candidates:
+        start = attempt.get('started')
+        start_key = ('numeric', start) if numeric(start) else ('invalid', json.dumps(start, sort_keys=True))
+        key = (attempt['id'], start_key)
+        prior = attempts_by_start.get(key)
+        if prior is None or (not valid_interval(prior) and valid_interval(attempt)):
+            attempts_by_start[key] = attempt
+        elif valid_interval(prior) and valid_interval(attempt):
+            for field in ('role', 'role_source', 'manifest_sha256', 'start', 'end'):
+                if prior.get(field) is None and attempt.get(field) is not None:
+                    prior[field] = attempt[field]
+
+    manifests = {}
+
+    def manifest_row(attempt):
+        manifest_sha = attempt.get('manifest_sha256')
+        if not isinstance(manifest_sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', manifest_sha):
+            return None
+        manifest_sha = manifest_sha.lower()
+        if manifest_sha == current_sha:
+            return rows_by_id.get(attempt['id'])
+        if manifest_sha not in manifests:
+            path = out / 'manifests' / f'{manifest_sha}.json'
+            try:
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != manifest_sha:
+                    raise ValueError('manifest hash mismatch')
+                manifest = json.loads(data)
+                manifest_rows = manifest.get('rows', []) if isinstance(manifest, dict) else manifest
+                manifests[manifest_sha] = {row['id']: row for row in manifest_rows
+                                           if isinstance(row, dict) and isinstance(row.get('id'), str)}
+            except (OSError, ValueError, TypeError):
+                manifests[manifest_sha] = {}
+        return manifests[manifest_sha].get(attempt['id'])
+
+    intervals = []
+    for kind in ('up', 'down'):
+        start, end = timing.get(kind + '_start'), timing.get(kind + '_done')
+        if numeric(start) and numeric(end) and end >= start:
+            intervals.append((start, end, kind))
+    attempts, attempts_unroled, roles_defaulted, roles_from_manifest = 0, 0, 0, 0
+    attempt_ids_not_in_manifest = set()
+    for attempt in attempts_by_start.values():
+        if not valid_interval(attempt):
+            skipped += 1
+            continue
+        start, end = attempt['started'], attempt['ended']
+        role = attempt.get('role')
+        inferred = False
+        from_manifest = False
+        if role is None:
+            row = manifest_row(attempt)
+            if row is not None and 'role' in row:
+                role = row['role']
+                from_manifest = True
+            elif isinstance(attempt.get('start'), str) and isinstance(attempt.get('end'), str):
+                role = 'setup' if attempt['start'] != attempt['end'] else 'test'
+                inferred = True
+            else:
+                role = 'unroled'
+        if role not in ('setup', 'test', 'unroled'):
+            skipped += 1
+            continue
+        if inferred or attempt.get('role_source') == 'default':
+            roles_defaulted += 1
+        roles_from_manifest += from_manifest
+        attempts += 1
+        attempts_unroled += role == 'unroled'
+        if attempt['id'] not in rows_by_id:
+            attempt_ids_not_in_manifest.add(attempt['id'])
+        intervals.append((start, end, role))
+
+    first, last = timing.get('up_start'), timing.get('down_done')
+    window = last - first if numeric(first) and numeric(last) and last >= first else None
+    durations = {'up': 0, 'setup': 0, 'test': 0, 'unroled': 0, 'down': 0}
+    events = []
+    if window is not None:
+        events.extend([(first, 0, None), (last, 0, None)])
+    for i, (start, end, _) in enumerate(intervals):
+        begin, finish = (max(start, first), min(end, last)) if window is not None else (start, end)
+        if finish > begin:
+            events.extend([(begin, 1, i), (finish, -1, i)])
+    events.sort()
+    active, earliest = set(), []
+    overlap, unclassified, previous = 0, 0, None
+    for at, change, i in events:
+        if previous is not None and at > previous:
+            duration = at - previous
+            if active:
+                while earliest[0][1] not in active:
+                    heapq.heappop(earliest)
+                durations[intervals[earliest[0][1]][2]] += duration
+                if len(active) > 1:
+                    overlap += duration
+            elif window is not None:
+                unclassified += duration
+        if change == 1:
+            active.add(i)
+            heapq.heappush(earliest, (intervals[i][0], i))
+        elif change == -1:
+            active.remove(i)
+        previous = at
+    total = sum(durations.values())
+    return {'window': window, **durations, 'unclassified': unclassified if window is not None else None,
+            'incomplete': window is None, 'overlap': overlap, 'attempts': attempts, 'attempts_skipped': skipped,
+            'attempts_unroled': attempts_unroled, 'roles_defaulted': roles_defaulted,
+            'roles_from_manifest': roles_from_manifest, 'attempt_ids_not_in_manifest': sorted(attempt_ids_not_in_manifest),
+            'test_share': round(durations['test'] / total, 3) if total else 0}
+
+
 def results_md(run, config):
     passed, failed, unrun, retained = row_accounting(run)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
     timing = json.loads((run / 'timing.json').read_text())
     runs = [(start, end) for start, end in timing.get('runs', []) if end]
     rows_seconds = sum(end - start for start, end in runs) if runs else timing.get('run_end', 0) - timing.get('run_start', 0)
+    up_seconds = timing['up_done'] - timing['up_start'] if 'up_done' in timing and 'up_start' in timing else 0
+    down_seconds = timing['down_done'] - timing['down_start'] if 'down_done' in timing and 'down_start' in timing else 0
+    split = timing.get('split')
+    if not isinstance(split, dict) or not {'unclassified', 'incomplete', 'unroled'} <= split.keys():
+        split = time_split(run)
+    unclassified = '?' if split['unclassified'] is None else f'{split["unclassified"]:.0f} s'
     rows_now = sha256(run / 'rows' / 'rows.json')
     rows_note = rows_now[:12] + '…' + ('' if rows_now == config['rows']['sha256'] else
                                        f' (changed during the boot; Up had {config["rows"]["sha256"][:12]}…)')
@@ -394,8 +751,14 @@ def results_md(run, config):
                        + '; '.join(unit_results(run)), 240),
               one_line(f'- Prune: {prune_summary(run, journal)}', 240),
               f'- Harvest: {harvest_summary(run)}',
-              f'- Timing: up {timing.get("up_done", 0) - timing.get("up_start", 0):.0f} s, rows {rows_seconds:.0f} s over '
-              f'{max(len(runs), 1)} run call(s), down {timing.get("down_done", 0) - timing.get("down_start", 0):.0f} s',
+              f'- Timing: up {up_seconds:.0f} s, rows {rows_seconds:.0f} s over '
+              f'{max(len(runs), 1)} run call(s), down {down_seconds:.0f} s; '
+              f'classified: up+setup+down {split["up"] + split["setup"] + split["down"]:.0f} s, '
+              f'test {split["test"]:.0f} s'
+              + (f', unroled {split["unroled"]:.0f} s' if split['unroled'] else '')
+              + f', unclassified {unclassified}'
+              + (' (incomplete timing)' if split['incomplete'] else '')
+              + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
     (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
     print('\n'.join(lines[:20]))
@@ -429,6 +792,10 @@ def cmd_down(run, keep_state=False):
     done = subprocess.run([sys.executable, '-B', '-I', str(HARVEST), str(run / 'rows' / 'rows.json'),
                            '--label', config['label'], '--out', str(run / 'out')], capture_output=True, text=True)
     (run / 'harvest.json').write_text(done.stdout.strip() + '\n')
+    timing_path = run / 'timing.json'
+    timing = json.loads(timing_path.read_text())
+    timing['split'] = time_split(run)
+    timing_path.write_text(json.dumps(timing, indent=2) + '\n')
     results_md(run, config)
     if code != 0:
         raise SystemExit(f'lifecycle down failed ({code}); the claim stays held; see {run / "lifecycle-down.log"}')
@@ -448,23 +815,33 @@ def main(argv=None):
                        help='swap the pinned plugin with this file name for this build (repeatable; sha256 is read)')
         p.add_argument('--defer-load', action='store_true',
                        help='leave the frontend ready so rows can configure boot tracing before game.load')
+        if name == 'all':
+            p.add_argument('--skip-setup-plan', action='store_true',
+                           help='re-running rows whose starting states are already recorded')
+            p.add_argument('--allow-volatile-pins', action='store_true',
+                           help='allow pins inside another run folder')
     sub.add_parser('pace').add_argument('run', type=Path)
     p = sub.add_parser('down')
     p.add_argument('run', type=Path)
     p.add_argument('--keep-state', action='store_true',
                    help='keep work/ and the state snapshots for debugging (only when asked); a later down prunes them')
-    p = sub.add_parser('up')
-    p.add_argument('run', type=Path)
-    p.add_argument('--skip-setup-plan', action='store_true',
-                   help='re-running rows whose starting states are already recorded (no "setup" list yet)')
+    for name in ('check', 'up'):
+        p = sub.add_parser(name)
+        p.add_argument('run', type=Path)
+        p.add_argument('--skip-setup-plan', action='store_true',
+                       help='re-running rows whose starting states are already recorded (no "setup" list yet)')
+        p.add_argument('--allow-volatile-pins', action='store_true',
+                       help='allow pins inside another run folder')
     p = sub.add_parser('run')
     p.add_argument('run', type=Path)
     p.add_argument('--retry', action='store_true')
     args = parser.parse_args(argv)
     if args.mode == 'new':
         cmd_new(args)
+    elif args.mode == 'check':
+        return cmd_check(args.run.resolve(), args.skip_setup_plan, args.allow_volatile_pins)
     elif args.mode == 'up':
-        cmd_up(args.run.resolve(), args.skip_setup_plan)
+        cmd_up(args.run.resolve(), args.skip_setup_plan, args.allow_volatile_pins)
     elif args.mode == 'run':
         return cmd_run(args.run.resolve(), args.retry)
     elif args.mode == 'down':
@@ -473,7 +850,7 @@ def main(argv=None):
         return cmd_pace(args.run.resolve())
     elif args.mode == 'all':
         run = cmd_new(args)
-        cmd_up(run)
+        cmd_up(run, args.skip_setup_plan, args.allow_volatile_pins)
         try:
             cmd_run(run)
         finally:

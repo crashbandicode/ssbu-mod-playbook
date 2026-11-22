@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Offline tests for eden_test.py: fake lifecycle/runner/harvest scripts, temp run folders, no Eden."""
 import hashlib
+import importlib.util
 import json
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eden_test  # noqa: E402
@@ -52,6 +54,721 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+class SetupFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name) / 'run'
+        self.rows = self.run / 'rows'
+        self.rows.mkdir(parents=True)
+        self.reviewed = self.rows / 'reviewed.json'
+        self.fixture = self.rows / 'fixture.json'
+        self.reviewed.write_text(json.dumps({'last_page': 2, 'menu': {'a': [0, 0], 'b': [5, 6]}}))
+        self.fixture.write_text(json.dumps({'menu': {'a': [1, 0], 'b': [5, 8]}}))
+        self.item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings', 'to': 'TrainingRooms/settings.json',
+                     'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.reviewed)}}
+        self.config = {'instances': [{'key': 'a', 'files': [{'to': self.item['to'], 'path': str(self.fixture),
+                                                            'sha256': sha(self.fixture)}]}]}
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+
+    def plan(self):
+        (self.rows / 'rows.json').write_text(json.dumps({'setup': [self.item], 'rows': []}))
+
+    def comparison(self, reviewed, pinned, allowed):
+        self.reviewed.write_text(json.dumps(reviewed))
+        self.fixture.write_text(json.dumps(pinned))
+        self.item['reviewed']['sha256'] = sha(self.reviewed)
+        self.item['differs_only'] = allowed
+        self.config['instances'][0]['files'][0]['sha256'] = sha(self.fixture)
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+        self.plan()
+        problems = eden_test.check_run(self.run)
+        evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
+        return problems, evidence[0]
+
+    def test_literal_dot_key_requires_its_own_component_allowance(self):
+        reviewed = {'allowed': {'x': 1}}
+        pinned = {'allowed': {'x': 1}, 'allowed.x': 9}
+        problems, result = self.comparison(reviewed, pinned, ['allowed'])
+        self.assertIn('["allowed.x"]', ' '.join(problems))
+        self.assertEqual(result['differing_paths'], [['allowed.x']])
+        self.assertFalse(result['ok'])
+        problems, result = self.comparison(reviewed, pinned, [['allowed.x']])
+        self.assertEqual(problems, [])
+        self.assertTrue(result['ok'])
+
+    def test_list_index_allowances_accept_string_and_component_forms(self):
+        reviewed, pinned = {'menu': [1, 2, 3, 4]}, {'menu': [1, 2, 3, 9]}
+        for allowed in (['menu.3'], [['menu', 3]]):
+            with self.subTest(allowed=allowed):
+                problems, result = self.comparison(reviewed, pinned, allowed)
+                self.assertEqual(problems, [])
+                self.assertEqual(result['differing_paths'], [['menu', 3]])
+                self.assertTrue(result['ok'])
+
+    def test_numeric_dict_key_is_not_a_list_index(self):
+        reviewed, pinned = {'menu': {'3': 1}}, {'menu': {'3': 9}}
+        problems, result = self.comparison(reviewed, pinned, ['menu.3'])
+        self.assertTrue(problems)
+        self.assertEqual(result['differing_paths'], [['menu', '3']])
+        self.assertEqual(self.comparison(reviewed, pinned, [['menu', '3']])[0], [])
+
+    def test_invalid_component_allowances_are_refused(self):
+        for allowed in ([['menu', True]], [['menu', {}]], [3], 'menu'):
+            with self.subTest(allowed=allowed):
+                problems, _ = self.comparison({'menu': 1}, {'menu': 2}, allowed)
+                self.assertIn('differs_only', ' '.join(problems))
+
+    def test_empty_allowance_entries_are_refused_and_authorise_nothing(self):
+        reviewed = {'cpu': 'Mario', 'menu': {'setting': 1}}
+        pinned = {'cpu': 'Kirby', 'menu': {'setting': 2}, 'added': True}
+        for allowed in ([[]], [''], ['menu.'], ['.menu'], ['menu..setting'], [['menu', '']]):
+            with self.subTest(allowed=allowed):
+                problems, evidence = self.comparison(reviewed, pinned, allowed)
+                self.assertIn('differs_only entries must name at least one key', ' '.join(problems))
+                self.assertIn('3 differing paths', ' '.join(problems))
+                self.assertEqual(evidence['differing_paths'], [['added'], ['cpu'], ['menu', 'setting']])
+                self.assertFalse(evidence['ok'])
+
+    def test_empty_allowance_list_requires_exact_match(self):
+        original = {'cpu': 'Mario', 'menu': {'setting': 1}}
+        self.assertEqual(self.comparison(original, original, [])[0], [])
+        problems, evidence = self.comparison(original, {'cpu': 'Kirby', 'menu': {'setting': 1}}, [])
+        self.assertIn('cpu', ' '.join(problems))
+        self.assertFalse(evidence['ok'])
+
+    def test_valid_allowance_still_applies_beside_an_invalid_one(self):
+        problems, evidence = self.comparison({'cpu': 'Mario', 'menu': {'setting': 1}},
+                                             {'cpu': 'Kirby', 'menu': {'setting': 2}}, [[], 'menu'])
+        self.assertIn('differs_only entries must name at least one key', ' '.join(problems))
+        self.assertIn('1 differing paths: cpu', ' '.join(problems))
+        self.assertFalse(evidence['ok'])
+
+    def test_fixture_diff_nested_lists_types_and_root(self):
+        self.assertEqual(eden_test.fixture_diff(
+            {'nest': {'a': 1}, 'list': [0, {'x': 2}], 'old': 1},
+            {'nest': {'a': 3}, 'list': [0, {'x': 4}], 'new': 1}),
+            [['list', 1, 'x'], ['nest', 'a'], ['new'], ['old']])
+        self.assertEqual(eden_test.fixture_diff({'list': [1, 2]}, {'list': [1]}), [['list']])
+        self.assertEqual(eden_test.fixture_diff({'value': 1}, {'value': True}), [['value']])
+        self.assertEqual(eden_test.fixture_diff([1], {'one': 1}), [[]])
+        self.assertEqual(eden_test.fixture_diff({'x': [1, 2]}, {'x': [1, 2]}), [])
+
+    def test_up_refuses_differences_and_writes_evidence(self):
+        self.plan()
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('last_page', str(caught.exception))
+        self.assertIn('Training', str(caught.exception))
+        self.assertIn('3', str(caught.exception))
+        sh.assert_not_called()
+        evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertEqual(evidence[0]['differing_paths'], [['last_page'], ['menu', 'a', 0], ['menu', 'b', 1]])
+        self.assertFalse(evidence[0]['ok'])
+
+    def test_skip_setup_plan_does_not_skip_reviewed_fixture(self):
+        self.plan()
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run, skip_setup_plan=True)
+        self.assertIn('last_page', str(caught.exception))
+        sh.assert_not_called()
+
+    def test_allowed_exact_and_parent_paths_pass(self):
+        self.item['differs_only'] = ['last_page', 'menu.a', 'menu.b.1']
+        self.plan()
+        with mock.patch.object(eden_test, 'sh', return_value=0), \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            eden_test.cmd_up(self.run)
+        evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertTrue(evidence[0]['ok'])
+        self.assertEqual(evidence[0]['reviewed'], self.item['reviewed'])
+        self.assertEqual(evidence[0]['pin']['path'], str(self.fixture))
+
+    def test_wrong_reviewed_hash_is_refused(self):
+        self.item['reviewed']['sha256'] = '0' * 64
+        problems = eden_test.fixture_problems(self.item, self.rows, self.config)
+        self.assertTrue(any('sha256' in p for p in problems))
+
+    def test_missing_fixture_is_refused(self):
+        self.config['instances'][0]['files'][0]['path'] = str(self.rows / 'missing.json')
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows, self.config))
+
+    def test_invalid_json_is_refused(self):
+        self.fixture.write_text('{')
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows, self.config))
+
+    def test_null_fixture_root_is_compared(self):
+        self.fixture.write_text('null')
+        self.assertIn('<root>', ' '.join(eden_test.fixture_problems(self.item, self.rows, self.config)))
+
+    def test_review_without_to_is_refused(self):
+        del self.item['to']
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows, self.config))
+
+    def test_unreviewed_item_is_untouched(self):
+        del self.item['reviewed']
+        self.assertEqual(eden_test.fixture_problems(self.item, self.rows, self.config), [])
+        self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}), [])
+        self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}, self.rows, self.config), [])
+
+
+class PinnedFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name) / 'runs' / 'run'
+        self.rows = self.run / 'rows'
+        self.rows.mkdir(parents=True)
+        self.reviewed = self.rows / 'reviewed.json'
+        self.reviewed.write_text('{"last_page": 2}')
+        self.clean = self.rows / 'clean.json'
+        self.clean.write_text(self.reviewed.read_text())
+        self.actual = Path(self.tmp.name) / 'actual.json'
+        self.actual.write_text('{"last_page": 9}')
+        self.destination = 'user/sdmc/ultimate/TrainingRooms/settings.json'
+        self.item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings', 'to': self.destination,
+                     'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.reviewed)}}
+        self.config = {'instances': [{'key': 'a', 'files': [
+            {'to': './' + self.destination, 'path': str(self.actual), 'sha256': sha(self.actual)}]}]}
+
+    def save(self):
+        (self.rows / 'rows.json').write_text(json.dumps({'setup': [self.item], 'rows': []}))
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+
+    def check(self, *flags):
+        self.save()
+        return eden_test.main(['check', str(self.run), *flags])
+
+    def test_up_refuses_clean_declaration_when_installed_pin_differs(self):
+        self.item['file'] = 'clean.json'
+        self.save()
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('last_page', str(caught.exception))
+        sh.assert_not_called()
+
+    def test_matching_pin_passes_check_and_writes_comparison(self):
+        self.config['instances'][0]['files'][0].update(path=str(self.clean), sha256=sha(self.clean))
+        self.assertEqual(self.check(), 0)
+        entry = json.loads((self.run / 'setup-fixtures.json').read_text())[0]
+        self.assertEqual((entry['state'], entry['instance'], entry['to']), ('Training', 'a', self.destination))
+        self.assertEqual((entry['pin']['path'], entry['pin']['sha256']), (str(self.clean), sha(self.clean)))
+        self.assertEqual((entry['reviewed']['path'], entry['reviewed']['sha256']),
+                         ('reviewed.json', sha(self.reviewed)))
+        self.assertEqual(entry['differing_paths'], [])
+        self.assertTrue(entry['ok'])
+
+    def test_multiple_instances_and_explicit_instance_selection(self):
+        self.config['instances'][0]['files'][0].update(path=str(self.clean), sha256=sha(self.clean))
+        self.config['instances'].append({'key': 'b', 'files': [
+            {'to': self.destination, 'path': str(self.actual), 'sha256': sha(self.actual)}]})
+        self.assertEqual(self.check(), 2)
+        entries = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertEqual([(e['instance'], e['ok']) for e in entries], [('a', True), ('b', False)])
+        self.item['instance'] = 'a'
+        self.assertEqual(self.check(), 0)
+        self.item['instance'] = 'b'
+        self.assertEqual(self.check(), 2)
+
+    def test_per_instance_results_remain_independent(self):
+        self.config['instances'].append({'key': 'b', 'files': [
+            {'to': self.destination, 'path': str(self.clean), 'sha256': sha(self.clean)}]})
+        self.assertEqual(self.check(), 2)
+        entries = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertEqual([(e['instance'], e['ok']) for e in entries], [('a', False), ('b', True)])
+
+    def test_last_pin_is_the_one_installed_for_a_duplicate_destination(self):
+        self.config['instances'][0]['files'].append(
+            {'to': self.destination, 'path': str(self.clean), 'sha256': sha(self.clean)})
+        self.assertEqual(self.check(), 0)
+        entry = json.loads((self.run / 'setup-fixtures.json').read_text())[0]
+        self.assertEqual(entry['pin']['path'], str(self.clean))
+
+    def test_bad_pin_hash_and_missing_pin_are_refused(self):
+        self.config['instances'][0]['files'][0]['sha256'] = '0' * 64
+        self.assertEqual(self.check(), 2)
+        entry = json.loads((self.run / 'setup-fixtures.json').read_text())[0]
+        self.assertFalse(entry['ok'])
+        self.item['instance'] = 'a'
+        self.config['instances'][0]['files'] = []
+        self.assertEqual(self.check(), 2)
+        self.item['instance'] = 'missing'
+        self.assertEqual(self.check(), 2)
+
+    def test_legacy_file_and_missing_to_are_refused(self):
+        self.config['instances'][0]['files'][0].update(path=str(self.clean), sha256=sha(self.clean))
+        self.item['file'] = 'clean.json'
+        self.save()
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('to', str(caught.exception))
+        sh.assert_not_called()
+        del self.item['file']
+        del self.item['to']
+        self.assertEqual(self.check(), 2)
+
+    def test_skip_setup_plan_does_not_skip_pin_comparison(self):
+        self.assertEqual(self.check('--skip-setup-plan'), 2)
+
+
+class IntervalAccountingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        (self.run / 'rows').mkdir()
+        (self.run / 'out').mkdir()
+        self.rows = [{'id': 'r1', 'start': 'training', 'end': 'training'}]
+        self.set_rows()
+        self.set_timing(up_start=0, up_done=5, down_start=25, down_done=30)
+
+    def set_rows(self):
+        (self.run / 'rows/rows.json').write_text(json.dumps({'rows': self.rows}))
+
+    def set_timing(self, **timing):
+        (self.run / 'timing.json').write_text(json.dumps(timing))
+
+    def receipt(self, name, value):
+        (self.run / 'out' / name).write_text(json.dumps(value))
+
+    def journal(self, values):
+        (self.run / 'out/attempts.jsonl').write_text(''.join(json.dumps(value) + '\n' for value in values))
+
+    def test_superseded_receipt_and_current_journal_are_both_counted(self):
+        self.set_timing(up_start=0, up_done=5, down_start=26, down_done=31)
+        self.rows = [{'id': 'new-name', 'start': 'training', 'end': 'training'}]
+        self.set_rows()
+        self.receipt('old-name.json', {'id': 'old-name', 'role': 'test', 'start': 'training',
+                                       'end': 'training', 'started': 5, 'ended': 15})
+        self.journal([{'id': 'new-name', 'role': 'test', 'started': 15, 'ended': 25}])
+        self.receipt('summary.json', {'started': 6, 'start': 'x', 'end': 'x'})
+        self.receipt('not-a-receipt.json', {'id': 'different', 'start': 'x', 'end': 'x', 'started': 6, 'ended': 7})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['test'], split['attempts'], split['unclassified']), (31, 20, 2, 1))
+        self.assertEqual(split['attempt_ids_not_in_manifest'], ['old-name'])
+
+    def test_old_receipt_role_uses_its_manifest_snapshot_not_current_rows(self):
+        snapshot_dir = self.run / 'out/manifests'
+        snapshot_dir.mkdir()
+        old = {'rows': [{'id': 'r1', 'start': 'menu', 'end': 'training', 'role': 'test'}]}
+        pending = snapshot_dir / 'pending'
+        pending.write_text(json.dumps(old))
+        old_sha = sha(pending)
+        pending.rename(snapshot_dir / f'{old_sha}.json')
+        self.rows[0]['role'] = 'setup'
+        self.set_rows()
+        self.receipt('r1.FAILED.old.json', {'id': 'r1', 'start': 'menu', 'end': 'training',
+                                          'started': 5, 'ended': 15, 'manifest_sha256': old_sha})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test']), (0, 10))
+        self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (1, 0))
+
+    def test_manifest_replacement_cannot_pair_one_version_with_another_hash(self):
+        rows_path = self.run / 'rows/rows.json'
+        original_rows = {'rows': [{'id': 'r1', 'start': 'training', 'end': 'training', 'role': 'test'}]}
+        replacement_rows = {'rows': [{'id': 'r1', 'start': 'training', 'end': 'training', 'role': 'setup'}]}
+        data_a, data_b = (json.dumps(value).encode() for value in (original_rows, replacement_rows))
+        hash_a, hash_b = (hashlib.sha256(data).hexdigest() for data in (data_a, data_b))
+        snapshots = self.run / 'out/manifests'
+        snapshots.mkdir()
+        (snapshots / f'{hash_b}.json').write_bytes(data_b)
+        original_read_bytes = Path.read_bytes
+        original_sha256 = eden_test.sha256
+        staging = rows_path.with_name('replacement.json')
+
+        def replace_manifest():
+            staging.write_bytes(data_b)
+            staging.replace(rows_path)
+
+        def replaced_sha256(path):
+            if path == rows_path:
+                replace_manifest()
+            return original_sha256(path)
+
+        for pinned, expected in ((hash_b, (10, 0)), (hash_a, (0, 10))):
+            with self.subTest(pinned=pinned):
+                rows_path.write_bytes(data_a)
+                self.receipt('r1.json', {'id': 'r1', 'start': 'training', 'end': 'training',
+                                         'started': 5, 'ended': 15, 'manifest_sha256': pinned})
+                reads = []
+
+                def interleaved_read(path):
+                    data = original_read_bytes(path)
+                    if path == rows_path:
+                        reads.append(path)
+                        replace_manifest()
+                    return data
+
+                with mock.patch.object(Path, 'read_bytes', interleaved_read), \
+                        mock.patch.object(eden_test, 'sha256', side_effect=replaced_sha256) as digest:
+                    split = eden_test.time_split(self.run)
+                self.assertEqual((split['setup'], split['test']), expected)
+                self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (1, 0))
+                self.assertFalse(any(call.args[0] == rows_path for call in digest.call_args_list))
+                self.assertEqual(reads, [rows_path])
+                self.assertEqual(rows_path.read_bytes(), data_b)
+
+    def test_missing_manifest_keeps_journal_attempt_without_a_current_hash(self):
+        (self.run / 'rows/rows.json').unlink()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['test'], split['attempts'], split['roles_from_manifest']), (10, 1, 0))
+        self.assertEqual(split['attempt_ids_not_in_manifest'], ['r1'])
+
+    def test_old_receipt_without_snapshot_defaults_from_own_screens(self):
+        self.rows[0]['role'] = 'test'
+        self.set_rows()
+        self.receipt('r1.json', {'id': 'r1', 'start': 'menu', 'end': 'training',
+                                 'started': 5, 'ended': 15, 'manifest_sha256': 'f' * 64})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test']), (10, 0))
+        self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (0, 1))
+
+    def test_tampered_snapshot_is_not_used_as_role_provenance(self):
+        snapshot_dir = self.run / 'out/manifests'
+        snapshot_dir.mkdir()
+        (snapshot_dir / ('f' * 64 + '.json')).write_text(json.dumps(
+            {'rows': [{'id': 'r1', 'role': 'test'}]}))
+        self.receipt('r1.json', {'id': 'r1', 'start': 'menu', 'end': 'training',
+                                 'started': 5, 'ended': 15, 'manifest_sha256': 'f' * 64})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test'], split['roles_from_manifest'], split['roles_defaulted']),
+                         (10, 0, 0, 1))
+
+    def test_journal_without_own_role_or_screens_is_unroled_even_if_current_row_has_role(self):
+        self.rows[0]['role'] = 'setup'
+        self.set_rows()
+        self.journal([{'id': 'r1', 'started': 5, 'ended': 15}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['unroled'], split['setup']), (10, 0))
+        self.assertEqual((split['roles_from_manifest'], split['attempts_unroled']), (0, 1))
+
+    def test_superseded_row_attempt_remains_in_the_journal_total(self):
+        self.set_timing(up_start=0, up_done=5, down_start=26, down_done=31)
+        self.journal([{'id': 'old-name', 'role': 'test', 'started': 5, 'ended': 15},
+                      {'id': 'r1', 'role': 'test', 'started': 15, 'ended': 25}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['test'], split['attempts'], split['unclassified']), (31, 20, 2, 1))
+
+    def test_role_source_counts_defaulted_journal_attempts(self):
+        self.rows.append({'id': 'r2', 'start': 'training', 'end': 'training'})
+        self.set_rows()
+        self.journal([{'id': 'r1', 'role': 'test', 'role_source': 'default', 'started': 5, 'ended': 15},
+                      {'id': 'r2', 'role': 'test', 'role_source': 'default', 'started': 15, 'ended': 25}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['test'], split['attempts'], split['roles_defaulted']), (20, 2, 2))
+
+    def test_old_receipt_uses_explicit_same_screen_setup_role(self):
+        self.rows[0]['role'] = 'setup'
+        self.set_rows()
+        self.receipt('r1.json', {'id': 'r1', 'start': 'training', 'end': 'training',
+                                 'manifest_sha256': sha(self.run / 'rows/rows.json'), 'started': 5, 'ended': 15})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test'], split['roles_defaulted'], split['roles_from_manifest']),
+                         (10, 0, 0, 1))
+
+    def test_missing_endpoint_still_sweeps_overlapping_attempts(self):
+        self.set_timing(up_start=0, up_done=2, down_start=20)
+        self.rows.append({'id': 'r2', 'start': 'training', 'end': 'training'})
+        self.set_rows()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 3, 'ended': 13},
+                      {'id': 'r2', 'role': 'test', 'started': 5, 'ended': 11}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['unclassified'], split['test'], split['overlap']), (None, None, 10, 6))
+        self.assertTrue(split['incomplete'])
+
+    def test_superseded_attempt_without_role_is_unroled(self):
+        self.set_timing(up_start=0, up_done=5, down_start=25)
+        self.journal([{'id': 'old-name', 'started': 5, 'ended': 15}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['attempts'], split['test_share']), (1, 0))
+        self.assertEqual((split['attempts_unroled'], split['unroled']), (1, 10))
+        config = {'label': 'fake', 'rows': {'sha256': sha(self.run / 'rows/rows.json')},
+                  'instances': [{'app': {'path': '/fake', 'sha256': '0' * 64}}]}
+        eden_test.results_md(self.run, config)
+        line = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
+        self.assertIn('test 0 s, unroled 10 s, unclassified ? (incomplete timing)', line)
+
+    def test_duplicate_receipt_supplies_missing_attempt_role(self):
+        self.journal([{'id': 'r1', 'started': 5, 'ended': 15}])
+        self.receipt('r1.json', {'id': 'r1', 'role': 'setup', 'role_source': 'explicit',
+                                 'start': 'training', 'end': 'training', 'started': 5, 'ended': 15})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['attempts'], split['setup'], split['test'], split['roles_defaulted']), (1, 10, 0, 0))
+
+    def test_two_journal_attempts_and_latest_receipt_deduplicate(self):
+        failed = {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15, 'status': 'FAILED'}
+        passed = {'id': 'r1', 'role': 'test', 'started': 15, 'ended': 25, 'status': 'PASS'}
+        self.journal([failed, passed])
+        self.receipt('r1.json', {**passed, 'start': 'training', 'end': 'training'})
+        split = eden_test.time_split(self.run)
+        self.assertEqual(split, {'window': 30, 'up': 5, 'setup': 0, 'test': 20, 'unroled': 0, 'down': 5,
+                                 'unclassified': 0, 'incomplete': False, 'overlap': 0, 'attempts': 2,
+                                 'attempts_skipped': 0, 'attempts_unroled': 0, 'roles_defaulted': 0,
+                                 'roles_from_manifest': 0, 'attempt_ids_not_in_manifest': [],
+                                 'test_share': 0.667})
+
+    def test_externally_retained_attempt_is_counted(self):
+        self.receipt('r1.FAILED.before-fix.json',
+                     {'id': 'r1', 'role': 'test', 'start': 'training', 'end': 'training',
+                      'started': 5, 'ended': 15, 'status': 'FAILED'})
+        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'start': 'training', 'end': 'training',
+                                 'started': 15, 'ended': 25, 'status': 'PASS'})
+        self.receipt('other.FAILED.outside.json', {'id': 'other', 'role': 'test', 'start': 'training',
+                                                   'end': 'training', 'started': 5, 'ended': 25})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['test'], split['attempts'], split['unclassified']), (20, 3, 0))
+        self.assertEqual(split['attempt_ids_not_in_manifest'], ['other'])
+
+    def test_runner_window_gap_is_unclassified(self):
+        self.set_timing(up_start=0, up_done=5, down_start=55, down_done=60, runs=[[10, 15], [45, 50]])
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 10, 'ended': 15},
+                      {'id': 'r1', 'role': 'test', 'started': 45, 'ended': 50}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['test'], split['unclassified']), (60, 10, 40))
+
+    def test_overlap_goes_to_the_interval_that_started_first(self):
+        self.set_timing(up_start=0, up_done=5, down_start=20, down_done=25)
+        self.rows.append({'id': 'r2', 'start': 'menu', 'end': 'training'})
+        self.set_rows()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15},
+                      {'id': 'r2', 'role': 'setup', 'started': 10, 'ended': 20}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['up'], split['test'], split['setup'], split['down'], split['overlap'],
+                          split['unclassified']), (5, 10, 5, 5, 5, 0))
+
+    def test_clipping_and_three_way_overlap_count_wall_time_once(self):
+        self.set_timing(up_start=10, up_done=12, down_start=25, down_done=30)
+        self.rows.extend([{'id': 'r2', 'start': 'menu', 'end': 'training'},
+                          {'id': 'r3', 'start': 'menu', 'end': 'training'}])
+        self.set_rows()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15},
+                      {'id': 'r2', 'role': 'setup', 'started': 11, 'ended': 20},
+                      {'id': 'r3', 'role': 'setup', 'started': 12, 'ended': 14}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['up'], split['test'], split['setup'], split['down'],
+                          split['overlap'], split['unclassified']), (20, 0, 5, 5, 5, 5, 5))
+
+    def test_missing_window_defaults_role_and_skips_unfinished_attempt(self):
+        self.set_timing(up_start=0, up_done=5, down_start=20)
+        self.journal([{'id': 'r1', 'start': 'training', 'end': 'training', 'started': 5, 'ended': 15},
+                      {'id': 'r1', 'started': 20}])
+        self.receipt('r1.json', {'id': 'r1', 'start': 'training', 'end': 'training', 'started': 5, 'ended': 15})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['unclassified'], split['up'], split['test'], split['down']),
+                         (None, None, 5, 10, 0))
+        self.assertEqual((split['attempts'], split['attempts_skipped'], split['roles_defaulted']), (1, 1, 1))
+        config = {'label': 'fake', 'rows': {'sha256': sha(self.run / 'rows/rows.json')},
+                  'instances': [{'app': {'path': '/fake', 'sha256': '0' * 64}}]}
+        eden_test.results_md(self.run, config)
+        line = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
+        self.assertIn('down 0 s;', line)
+        self.assertIn('; classified: up+setup+down 5 s, test 10 s, unclassified ? (incomplete timing) '
+                      '(1 roles defaulted)', line)
+
+    def test_invalid_duplicate_is_skipped_once(self):
+        invalid = {'id': 'r1', 'started': 'bad', 'ended': 15}
+        self.journal([invalid])
+        self.receipt('r1.json', invalid)
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['attempts'], split['attempts_skipped']), (0, 1))
+
+    def test_valid_duplicate_can_replace_incomplete_attempt(self):
+        self.journal([{'id': 'r1', 'started': 5, 'ended': 4}])
+        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'start': 'training', 'end': 'training',
+                                 'started': 5, 'ended': 15})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['attempts'], split['attempts_skipped'], split['test']), (1, 0, 10))
+
+
+class TimeSplitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        (self.run / 'rows').mkdir()
+        (self.run / 'out').mkdir()
+        self.rows = [
+            {'id': 'setup', 'start': 'menu', 'end': 'training'},
+            {'id': 'test', 'start': 'training', 'end': 'training', 'role': 'setup'},
+            {'id': 'unfinished', 'start': 'training', 'end': 'training', 'role': 'setup'},
+        ]
+        (self.run / 'rows/rows.json').write_text(json.dumps(self.rows))
+        (self.run / 'timing.json').write_text(json.dumps(
+            {'up_start': 1, 'up_done': 11, 'runs': [[12, 62]], 'down_start': 70, 'down_done': 75}))
+        for name, receipt in (
+            ('setup', {'status': 'PASS', 'started': 10, 'ended': 18, 'role': 'setup'}),
+            ('test', {'status': 'PASS', 'started': 20, 'ended': 40,
+                      'manifest_sha256': sha(self.run / 'rows/rows.json')}),
+            ('unfinished', {'status': 'FAILED', 'started': 50, 'role': 'setup'}),
+        ):
+            row = next(row for row in self.rows if row['id'] == name)
+            receipt.update(id=name, start=row['start'], end=row['end'])
+            (self.run / 'out' / f'{name}.json').write_text(json.dumps(receipt))
+
+    def test_split_uses_receipts_fallback_and_skips_unfinished(self):
+        self.assertEqual(eden_test.time_split(self.run),
+                         {'window': 74, 'up': 10, 'setup': 27, 'test': 0, 'unroled': 0, 'down': 5,
+                          'unclassified': 32, 'incomplete': False, 'overlap': 1, 'attempts': 2,
+                          'attempts_skipped': 1, 'attempts_unroled': 0, 'roles_defaulted': 0,
+                          'roles_from_manifest': 1, 'attempt_ids_not_in_manifest': [], 'test_share': 0})
+
+    def test_missing_timing_and_receipts_are_zero(self):
+        (self.run / 'timing.json').write_text('{}')
+        (self.run / 'rows/rows.json').write_text('[]')
+        for receipt in (self.run / 'out').glob('*.json'):
+            receipt.unlink()
+        self.assertEqual(eden_test.time_split(self.run),
+                         {'window': None, 'up': 0, 'setup': 0, 'test': 0, 'unroled': 0, 'down': 0,
+                          'unclassified': None, 'incomplete': True, 'overlap': 0, 'attempts': 0,
+                          'attempts_skipped': 0, 'attempts_unroled': 0, 'roles_defaulted': 0,
+                          'roles_from_manifest': 0, 'attempt_ids_not_in_manifest': [], 'test_share': 0})
+
+    def test_receipt_role_overrides_the_row_default(self):
+        path = self.run / 'out/setup.json'
+        receipt = json.loads(path.read_text())
+        receipt['role'] = 'test'
+        path.write_text(json.dumps(receipt))
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test'], split['unclassified'], split['test_share']), (20, 7, 32, 0.167))
+
+    def test_partial_timing_leaves_uncovered_time_unclassified(self):
+        (self.run / 'timing.json').write_text(json.dumps(
+            {'up_start': 10, 'runs': [[30, 35]], 'down_done': 70}))
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['up'], split['down'], split['unclassified'], split['setup'], split['test_share']),
+                         (0, 0, 32, 28, 0))
+
+    def test_results_timing_line_includes_the_split(self):
+        config = {'label': 'fake', 'rows': {'sha256': sha(self.run / 'rows/rows.json')},
+                  'instances': [{'app': {'path': '/fake', 'sha256': '0' * 64}}]}
+        eden_test.results_md(self.run, config)
+        timing = next(line for line in (self.run / 'RESULTS.md').read_text().splitlines() if line.startswith('- Timing:'))
+        self.assertIn('classified: up+setup+down 42 s, test 0 s, unclassified 32 s', timing)
+
+
+class VolatilePinsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'runs'
+        self.run = self.root / 'new'
+        (self.run / 'rows').mkdir(parents=True)
+        (self.run / 'rows/rows.json').write_text(json.dumps({
+            'setup': [{'state': 'Training', 'via': 'segment', 'ref': 's1'}], 'rows': []}))
+        self.pin = str(self.root / 'old' / 'plugins' / 'plugin.nro')
+        (self.run / 'config.json').write_text(json.dumps(
+            {'instances': [{'plugins': [{'path': self.pin, 'sha256': 'a' * 64}]}]}))
+
+    def test_only_sibling_run_paths_are_listed(self):
+        second = str(self.root / 'z-run' / 'data.json')
+        pin = lambda value: {'path': value, 'sha256': 'a' * 64}
+        config = {'nested': [{'plugin': pin(self.pin)}, pin(second), pin(self.pin)],
+                  'shared': pin(str(self.root / '_shared-inputs' / 'plugin.nro')),
+                  'own': pin(str(self.run / 'inputs' / 'settings.json')),
+                  'relative': pin('old/plugins/plugin.nro'),
+                  'outside': pin(str(self.root.parent / 'runs-other' / 'old' / 'plugin.nro')),
+                  'folder': pin(str(self.root / 'old')),
+                  'shared_folder': pin(str(self.root / '_shared-inputs')),
+                  'own_folder': pin(str(self.run)),
+                  'root': pin(str(self.root)),
+                  'normalized': pin(str(self.root / 'old' / '..' / '_shared-inputs' / 'settings.json'))}
+        self.assertEqual(eden_test.volatile_pins(config, self.run),
+                         [(str(self.root / 'old'), 'old'), (self.pin, 'old'), (second, 'z-run')])
+
+    def test_up_refuses_before_dry_run(self):
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn(self.pin, str(caught.exception))
+        self.assertIn(str(self.root / '_<name>'), str(caught.exception))
+        self.assertIn('janitor', str(caught.exception))
+        sh.assert_not_called()
+        self.assertEqual(json.loads((self.run / 'setup-fixtures.json').read_text()), [])
+
+    def test_allow_flag_reaches_dry_run(self):
+        with mock.patch.object(eden_test, 'sh', return_value=1) as sh, \
+                mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(['up', str(self.run), '--allow-volatile-pins'])
+        self.assertIn('dry run failed', str(caught.exception))
+        sh.assert_called_once()
+        lifecycle.assert_not_called()
+
+
+class ActivePinTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'runs'
+        self.run = self.root / 'new'
+        (self.run / 'rows').mkdir(parents=True)
+        (self.run / 'rows/rows.json').write_text(json.dumps(
+            {'setup': [{'state': 'Training', 'via': 'segment', 'ref': 's1'}], 'rows': []}))
+        self.old = str(self.root / 'old' / 'plugins' / 'plugin.nro')
+        self.shared = str(self.root / '_shared' / 'plugin.nro')
+        self.config = {'plugin_swaps': [{'from': self.old, 'from_sha256': '1' * 64, 'to': self.shared}],
+                       'notes': str(self.root / 'notes' / 'history'),
+                       'instances': [{'key': 'a', 'plugins': [{'path': self.shared, 'sha256': '2' * 64}]}]}
+
+    def save(self):
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+
+    def test_historical_swap_path_does_not_block_up(self):
+        self.save()
+        with mock.patch.object(eden_test, 'sh', return_value=1) as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('dry run failed', str(caught.exception))
+        sh.assert_called_once()
+
+    def test_active_pin_source_and_game_are_listed_by_up(self):
+        self.config['instances'][0].update(source=str(self.root / 'profile-run'),
+                                           game=str(self.root / 'game-run' / 'game.xci'))
+        pin = str(self.root / 'pin-run' / 'plugin.nro')
+        self.config['instances'][0]['plugins'].append({'path': pin, 'sha256': 'a' * 64})
+        self.save()
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        for path in (str(self.root / 'profile-run'), str(self.root / 'game-run' / 'game.xci'), pin):
+            self.assertIn(path, str(caught.exception))
+        self.assertNotIn(self.old, str(caught.exception))
+        sh.assert_not_called()
+
+    def test_pin_walk_matches_lifecycle(self):
+        lifecycle_path = Path(__file__).resolve().parent.parent / 'eden-lifecycle' / 'lifecycle.py'
+        spec = importlib.util.spec_from_file_location('lifecycle_for_pin_test', lifecycle_path)
+        lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lifecycle)
+        sample = {'pin': {'path': self.old, 'sha256': 'a' * 64, 'nested': [
+            {'path': self.shared, 'sha256': 'b' * 64}]}, 'bad': {'path': '/x', 'sha256': 'A' * 64},
+            'plugin_swaps': self.config['plugin_swaps']}
+        self.assertEqual([p['path'] for p in eden_test.iter_pin_nodes(sample)],
+                         [p['path'] for p in lifecycle.iter_pin_nodes(sample)])
+
+    def test_all_flags_reach_dry_run(self):
+        self.config['instances'][0]['source'] = str(self.root / 'old')
+        self.save()
+        (self.run / 'rows/rows.json').write_text('{"rows": []}')
+        argv = ['all', '--from', 'unused', '--label', 'unused', '--rows', 'unused',
+                '--skip-setup-plan', '--allow-volatile-pins']
+        with mock.patch.object(eden_test, 'cmd_new', return_value=self.run), \
+                mock.patch.object(eden_test, 'sh', return_value=1) as sh, \
+                mock.patch.object(eden_test, 'cmd_down') as down:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(argv)
+        self.assertIn('dry run failed', str(caught.exception))
+        sh.assert_called_once()
+        down.assert_not_called()
+
+
 class EdenTestTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix='eden-test-test-'))
@@ -90,6 +807,31 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(config['rows']['sha256'], sha(self.dir / 'runs/lr-14/rows/rows.json'))
         with self.assertRaises(SystemExit):  # labels are never reused
             eden_test.main(['new', *self.args()])
+
+    def test_new_stages_and_up_checks_the_configured_file_pin(self):
+        actual = self.dir / 'actual.json'
+        actual.write_text('{"last_page": 9}')
+        (self.rows / 'reviewed.json').write_text('{"last_page": 2}')
+        (self.rows / 'clean.json').write_text('{"last_page": 2}')
+        destination = 'user/sdmc/ultimate/TrainingRooms/settings.json'
+        previous = json.loads(self.previous.read_text())
+        previous['instances'][0]['files'] = [{'path': str(actual), 'sha256': sha(actual), 'to': destination}]
+        self.previous.write_text(json.dumps(previous))
+        item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings', 'to': destination, 'file': 'clean.json',
+                'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.rows / 'reviewed.json')}}
+        (self.rows / 'rows.json').write_text(json.dumps({'setup': [item], 'rows': []}))
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(run)
+        self.assertIn('last_page', str(caught.exception))
+        sh.assert_not_called()
+        comparison = json.loads((run / 'setup-fixtures.json').read_text())[0]
+        self.assertEqual(comparison['pin']['path'], json.loads((run / 'config.json').read_text())
+                         ['instances'][0]['files'][0]['path'])
+        self.assertEqual(comparison['differing_paths'], [['last_page']])
 
     def test_new_refuses_a_changed_pin(self):
         (self.dir / 'plugin.nro').write_bytes(b'different')
@@ -166,6 +908,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertLessEqual(len(results.splitlines()), 20)
         timing = json.loads((run / 'timing.json').read_text())
         self.assertTrue({'new', 'up_start', 'up_done', 'run_start', 'run_end', 'down_start', 'down_done'} <= set(timing))
+        self.assertIn('split', timing)
         # Down hands the lifecycle the run's out/ for the files the run wrote, and RESULTS.md gives the prune's bytes.
         self.assertIn(f'--evidence-dir {run / "out"}', (run / 'lifecycle-down.log').read_text())
         self.assertEqual((run / 'out/post-run-a/run.log').read_text(), 'run bytes')

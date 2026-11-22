@@ -1,29 +1,48 @@
-# README GIFs from Eden
+# Documentation clips, GIF previews and evidence
 
-2026-10-31. Eden-GIF has a built-in GIF recorder, so no screen capture is
-needed. The README GIFs of gsp-visualizer, ssbu-quiet-elite-switch,
-elite-rematch and ssbu-tile-cursor were all made this way.
+## Documentation and tutorial MP4s
 
-## What the operator wants
+Capture at 1920×1080 and keep the whole screen readable. Use one short MP4
+per behavior. Trim it to the action and keep it loop-friendly and at most
+10 seconds. For a plugin that removes something, record the same route
+with and without the plugin so the clips show the before and after.
 
-- **The whole screen, not cropped,** at a resolution where the plugin's text
-  reads in the README: record 1280 wide.
-- **One short clip per behaviour**, under 10 s, with a one-line caption below
-  it.
-- **For a plugin that removes something,** a before and an after clip.
-  Record the same route twice, once without the plugin and once with it
-  (ssbu-quiet-elite-switch's `before.gif`/`after.gif`).
+Encode from the original video with H.264 (`libx264`, `yuv420p`), scaling to
+1280×720 with Lanczos. Keep the source frame rate, including 60 fps when
+gameplay was recorded at 60 fps. Use CRF 23–24, the `slow` preset,
+`+faststart` and no audio track. Adjust the in-point and duration in this
+example to the action.
 
-## Evidence clips are not README GIFs
+```powershell
+ffmpeg -ss 2 -i /path/to/capture.mp4 -t 6 -map 0:v:0 -vf 'scale=1280:720:flags=lanczos' -fps_mode passthrough -c:v libx264 -pix_fmt yuv420p -crf 23 -preset slow -movflags +faststart -an /path/to/repo/docs/media/demo.mp4
+```
 
-Clips recorded as **test evidence** (a hit, a respawn, a menu step inside an Eden row) stay small:
-- `width` 640, `fps` ≤15;
-- a `duration_ms` that covers only the action, a few seconds;
-- ≤10 MB each.
+Save the clip under `docs/media/` and embed it with a one-line caption
+that gives the date and build. This form assumes the page is at the repo
+root. Adjust the relative path for other pages.
 
-A raw take that has to stay bigger is compressed after review (`gifsicle -O3 --lossy=80`). On 2026-11-04 full-size 30 fps
-evidence takes of up to 60 s came out at 24–217 MB each, and the operator called that way too big. The full 1280 width
-below is for README clips only.
+```html
+<video src="docs/media/demo.mp4" autoplay muted loop playsinline controls></video>
+```
+
+## Test evidence
+
+Keep the 1080p evidence clip and a 2–3× zoom crop that shows the relevant
+detail. MP4 is suitable for both. Keep the original recordings out of git.
+
+## GIFs for image previews
+
+Use a GIF only where an image is required, such as a README preview.
+Use at least 12 fps for gameplay and 10 fps for menus, or keep the actual
+source rate if it is lower. Never use keyframe-only clips or drop frames to
+meet a size budget. Trim to the action, crop to the
+useful region where the preview permits it, turn off dithering and try 128
+colors if text stays readable. If the GIF is still over budget, report its
+size for review. A README GIF is 1280 pixels wide and under 10 seconds.
+
+Eden-GIF can record image previews directly. The gsp-visualizer,
+ssbu-quiet-elite-switch, elite-rematch and ssbu-tile-cursor README previews
+used its built-in recorder.
 
 ## Record
 
@@ -72,79 +91,84 @@ Other recorders:
 
 ## A `gif` step in a test run
 
-The operator, 2026-11-06: "during its boots grok should capture the gifs it
-needs for the documentation as well so another boot isn't necessary". A row
-records the moment while the other steps run:
+Record an image preview during its test row so the same boot captures the
+action and runs the checks.
 
 ```json
-{"gif": {"name": "hover", "preset": "docs", "out": "docs/media/hover.gif",
-         "steps": [{"play": "hover"}]}}
+{"gif": {"name": "hit", "preset": "preview", "out": "docs/media/hit.gif",
+         "steps": [{"play": "show-hit"}]}}
 ```
 
 `name` is the clip's name inside the row folder. `out`, when set, is a path
-inside the repo (the README's `docs/media/<name>.gif`). `preset` is `docs` or
-`evidence`, or a name in the plan's or the row's `gif_presets`. The runner
-calls Eden `recording.start`, runs the nested steps, then `recording.stop`,
-trims to the preset's length and encodes the full frame at the preset width.
-It does not crop.
+inside the repo. On Eden the runner calls `recording.start`, runs the nested
+steps, then calls `recording.stop`. It encodes the full frame at the preset
+width and trims to the preset duration. On Switch the runner marks the span
+in the session recording for offline cutting.
 
-| Preset | What the file must be |
-| --- | --- |
-| `docs` | full frame, 1280 wide, at most 10 s |
-| `evidence` | 640 wide, at most 15 fps, at most 10 MB |
+| Preset | Use | Default width | Default fps | Duration cap |
+| --- | --- | ---: | ---: | ---: |
+| `preview` | Gameplay image preview | 1280 | 12 | 10 s |
+| `preview-menu` | Menu image preview | 1280 | 10 | 10 s |
+| `docs` | Legacy image preview recipe | 1280 | 12 | 10 s |
+| `evidence` | Internal review GIF | 640 | 10 | 10 s |
 
-A step may override `width`, `fps`, `length` (`duration_s` or `duration_ms`)
-and `size` (`max_bytes` or `max_mb`). Plugins differ, so those are defaults.
-An override outside the two envelopes needs a `"reason"`, and the receipt
-copies that reason. Eden's own limits still apply (fps 1–30, width 160–1280,
-duration 100–120,000 ms); a reason does not widen them. The dry run checks
-the preset, the reason, the `out` path and any `recover` list.
+The legacy `evidence` GIF preset also has a 10 MiB cap. Retain the 1080p
+clip and zoom crop for test evidence. Use the original 1080p recording
+for documentation and tutorial MP4s.
 
-The receipt for the step holds the frame count, duration, size, sha256 and
-the output path. A file that still breaks its preset is not written, and the
-receipt says why.
+A plan or row may define more `gif_presets`. A step may override `width`,
+`fps`, `length` (`duration_s` or `duration_ms`) and `size` (`max_bytes`
+or `max_mb`). Overrides outside the full-frame or legacy evidence
+capture limits need a `"reason"`, which the receipt records. Request at
+least 12 fps for gameplay or 10 fps for menus. Set `"scene": "menu"` to
+identify a menu clip when using a legacy or custom preset. The runner and
+offline cutter enforce these minimums for published GIFs across all preset
+names. They accept a lower cadence when independently measured from the
+source. Automatic row review GIFs and `evidence` GIFs kept in the row folder
+without `out` use the internal review settings.
 
-## Shrink
+Eden's capture limits are 1–30 fps, 160–1280 pixels wide and 100–120,000 ms.
+The dry run checks the preset, the reason, the `out` path and any `recover` list.
 
-Eden's 1280-wide GIFs are large (8 s clips: 15–20 MB). `tools/eden-solo/encode.py`
-re-encodes them:
+The receipt holds the frame count, duration, size, SHA-256 and output
+path. If the file still breaks its preset, the receipt gives the reason
+and the output is refused.
 
-- It builds one shared palette from the first, middle and last frames. On
-  elite-rematch's e13 and e14 clips (2026-10-31), palettes from 9 frames
-  spread over the clip, or from every frame at quarter size, made no visible
-  difference: with all three, every frame's mean colour error stayed under
-  1.1 out of 255.
-- It doesn't dither, so pixels that don't change stay identical, and Pillow
-  stores only the changed part of each frame.
+## Trim and shrink a GIF preview
 
-Full-frame clips came out at 3–5 MB with nothing lost that showed:
+`tools/eden-solo/encode.py` uses one shared palette and no dithering, so
+unchanged pixels stay identical and Pillow stores only changed rectangles.
 
 ```text
-encode.py e08-in-elite-real.gif in-elite.gif 0,0,1280,720 10 128    # 20.4 MB -> 3.3 MB
+encode.py /path/to/raw-preview.gif /path/to/preview.gif 0,0,1280,720 0 128
 ```
 
-The arguments are the input GIF or a folder of PNGs, the output,
-`x,y,w,h`, fps and the number of colours. Use fps `0` with a GIF from Eden:
-each frame keeps the time Eden gave it, so the clip plays at game speed. A
-fixed fps gives every frame 1/fps instead. That clip's frames were 110 ms
-each in Eden, so at 10 fps it plays about 10% faster. To cut a clip, use
-`tools/eden-pair/trim_gif.py <in> <out> <start fraction> <end fraction>
-<frame step> <width>`.
+The arguments are the input GIF or a folder of PNGs, the output path,
+`x,y,w,h`, fps and the number of colors. Pass fps `0` to preserve an
+Eden GIF's frame delays. A positive fps sets a constant frame delay.
+Use one only for a known constant-rate frame sequence. Review the result
+for text readability and the minimum rate for the scene.
+
+To cut a time range with `tools/eden-pair/trim_gif.py`, pass
+`<in> <out> <start fraction> <end fraction> 1 <width>`. The frame step of
+`1` keeps every selected frame. This tool uses a constant delay based on
+the first frame, so use it on constant-delay captures.
 
 ## Check before you use it
 
-A GIF that encodes without error doesn't prove the behaviour happened. Look
-at the frames:
+Watch the exported clip and inspect the first, middle and last frames.
+For a GIF preview, the inspection tool extracts those frames.
 
 ```text
-python3 ~/.claude/skills/record-ui-demo/scripts/gif_tool.py inspect --input in-elite.gif --output-dir review-in-elite
+/usr/bin/python3 /home/intpa/.claude/skills/record-ui-demo/scripts/gif_tool.py inspect --input /path/to/preview.gif --output-dir /path/to/review-preview
 ```
 
 This writes the first, middle and last frames and a `metadata.json` (size,
 frame count, duration). View the PNGs. Then check:
 
 - The start, the action and the result are all in the clip.
-- The plugin's text is readable.
+- The plugin's text is readable. A GIF preview plays smoothly at the
+  required rate for its scene.
 - No loading screen or menu in between makes the caption untrue.
 - A claim about which picture is shown ("this tile is the mod's art", "these
   are the stock icons") is checked against the source, not by eye. Decode the
@@ -161,8 +185,9 @@ frame count, duration). View the PNGs. Then check:
   ([EDEN](EDEN.md), "Mods need ARCropolis"). Game-derived images stay out of
   every git repo.
 
-## Put it in the README
+## Caption the README demo
 
-Save the GIF as `docs/media/<name>.gif`. Write the caption in italics under
-the image: what happens, then where the clip comes from, for example
-*"Eden, 2026-10-29, build `15d3f31`."* Keep the raw recordings out of git.
+Include one line below the embedded MP4 or GIF preview. Describe what
+happens, then give the platform, date and build. For example, *The cursor
+moves to the requested tile. Eden, 2026-10-29, build `15d3f31`.* For a
+GIF preview, save the image as `docs/media/<name>.gif`.

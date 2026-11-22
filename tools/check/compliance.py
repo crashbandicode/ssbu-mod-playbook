@@ -15,12 +15,16 @@ line or the 3 lines above, and <ID> must be approved in docs/RESTRICTIONS.md.
 --trace <file>: a design report whose requirement-trace table maps each of the
 operator's clauses to a test; every row needs a test and every test must exist."""
 import argparse
+from fractions import Fraction
 import hashlib
+from html.parser import HTMLParser
+import json
 import re
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 # opt-level "z" is allowed when measured (CHECKLIST: resident, the stack analysis on the "z" ELF, a timed Eden run;
 # TrainingRooms rc.8 R6, 2026-11-11).
@@ -74,7 +78,7 @@ AGENT_ROWS = [
     ('Eden: console.log searched for panic/abort/crash; run.json and memory.peak kept', 'M'),
     ('Every local command under the memory and time guard', 'M'),
     ('Evidence doc states run labels, build, what was done, what the log showed', 'M'),
-    ('GIF caption gives date and build; clip shows start, action and result', 'M'),
+    ('Demo caption gives date and build; clip shows start, action and result', 'M'),
     ('No operator quotes, no claims beyond the tests', 'M'),
     ('Handoff file current (branch, commit, evidence, live state, next commands)', 'M'),
     ('Release: version bump, annotated tag, assets verified by anonymous download', 'C'),
@@ -294,18 +298,191 @@ def defined_tests(repo):
     return names
 
 
+VIDEO_ATTRIBUTES = {'autoplay', 'muted', 'loop', 'playsinline', 'controls'}
+MARKDOWN_DEST = r'(?:<([^>\n]+)>|([^\s)]+))'
+
+
+class MediaEmbeds(HTMLParser):
+    def __init__(self, markdown):
+        super().__init__()
+        self.videos = []
+        self.images = []
+        # Examples and disabled snippets are not publication embeds.
+        markdown = re.sub(r'<!--.*?(?:-->|\Z)', '', markdown, flags=re.S)
+        markdown = re.sub(r'^[ ]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ ]{0,3}\1[ ]*$|\Z)',
+                          '', markdown, flags=re.M | re.S)
+        markdown = re.sub(r'(`+)[^`\n]*\1', '', markdown)
+        self.feed(markdown)
+        for match in re.finditer(r'!\[[^\]\n]*\]\(\s*' + MARKDOWN_DEST, markdown):
+            self.images.append(match[1] or match[2])
+        refs = {m[1].casefold(): m[2] or m[3] for m in
+                re.finditer(r'^\s{0,3}\[([^\]\n]+)\]:\s*' + MARKDOWN_DEST, markdown, re.M)}
+        for match in re.finditer(r'!\[([^\]\n]+)\](?:\[([^\]\n]*)\]|(?!\(|\[))', markdown):
+            key = (match[2] or match[1]).casefold()
+            if key in refs:
+                self.images.append(refs[key])
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == 'video':
+            self.videos.append(attributes)
+        elif tag == 'img' and attributes.get('src'):
+            self.images.append(attributes['src'])
+
+
+def media_path(repo, document, source, suffix):
+    if not source:
+        return None
+    try:
+        url = urlsplit(source)
+        target = (document.parent / unquote(url.path)).resolve()
+    except (ValueError, OSError, RuntimeError):
+        return None
+    if url.scheme or url.netloc or url.path.startswith('/') or not target.is_relative_to(repo):
+        return None
+    return target if target.suffix.lower() == suffix else None
+
+
 def gif_info(path):
     try:
         from PIL import Image
     except ImportError:
         return None
     with Image.open(path) as image:
-        width = image.width
+        if image.format != 'GIF':
+            raise ValueError('not a GIF image')
+        width, frames = image.width, image.n_frames
         duration = 0
-        for frame in range(getattr(image, 'n_frames', 1)):
+        for frame in range(frames):
             image.seek(frame)
             duration += image.info.get('duration', 0)
-    return width, duration / 1000
+    return width, duration / 1000, frames
+
+
+def mp4_faststart(path):
+    """Check that the top-level moov (metadata) atom precedes the media data."""
+    with path.open('rb') as stream:
+        end = stream.seek(0, 2)
+        start = 0
+        metadata = False
+        while start + 8 <= end:
+            stream.seek(start)
+            size, atom = struct.unpack('>I4s', stream.read(8))
+            header = 8
+            if size == 1:
+                extended = stream.read(8)
+                if len(extended) != 8:
+                    return False
+                size, = struct.unpack('>Q', extended)
+                header = 16
+            elif size == 0:
+                size = end - start
+            if size < header or start + size > end:
+                return False
+            if atom == b'mdat':
+                return metadata
+            metadata |= atom == b'moov'
+            start += size
+    return False
+
+
+def mp4_info(path):
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-f', 'mov',
+             '-show_entries', 'stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate:format=duration',
+             '-of', 'json', str(path)], capture_output=True, text=True, check=True, timeout=20)
+    except FileNotFoundError:
+        return None
+    facts = json.loads(probe.stdout)
+    videos = [stream for stream in facts['streams'] if stream['codec_type'] == 'video']
+    if len(videos) != 1:
+        raise ValueError('expected one video stream')
+    video = videos[0]
+    return {'codec': video.get('codec_name'), 'pix_fmt': video.get('pix_fmt'),
+            'width': video.get('width'), 'height': video.get('height'),
+            'fps': float(Fraction(video['avg_frame_rate'])),
+            'seconds': float(facts['format']['duration']),
+            'audio': any(stream['codec_type'] == 'audio' for stream in facts['streams']),
+            'faststart': mp4_faststart(path)}
+
+
+def check_media(repo, readme, rows, row):
+    readme_path = repo / 'README.md'
+    readme_media = MediaEmbeds(readme)
+    gifs = set((repo / 'docs' / 'media').glob('*.gif'))
+    previews = [path for source in readme_media.images
+                if (path := media_path(repo, readme_path, source, '.gif')) and path.is_file()]
+    gifs.update(previews)
+    readme_video = False
+    mp4s = set()
+    documents = [(readme_path, readme_media)]
+    for document in sorted((repo / 'docs').rglob('*.md')):
+        text = read(document)
+        if '<video' in text.lower():
+            documents.append((document, MediaEmbeds(text)))
+    for document, media in documents:
+        for number, attrs in enumerate(media.videos, 1):
+            target = media_path(repo, document, attrs.get('src'), '.mp4')
+            present = target is not None and target.is_file()
+            missing = VIDEO_ATTRIBUTES - attrs.keys()
+            valid = present and not missing
+            if document == readme_path:
+                readme_video |= valid
+            if present:
+                mp4s.add(target)
+            problems = []
+            if not present:
+                problems.append('src must reference an existing local MP4')
+            if missing:
+                problems.append('missing ' + ', '.join(sorted(missing)))
+            if problems:
+                row(f'{document.relative_to(repo)} video {number}: MP4 embed', 'M', valid,
+                    '; '.join(problems))
+
+    row('README has a demo, build commands and a license line', 'M',
+        (readme_video or bool(previews)) and 'cargo skyline build' in readme and 'license' in readme.lower(),
+        'README.md; use a local MP4 video embed or an image-only GIF preview')
+    for gif in sorted(gifs):
+        name = f'GIF {gif.name}: animated, 1280 wide, under 10 s'
+        try:
+            info = gif_info(gif)
+        except (OSError, ValueError, EOFError) as error:
+            row(name, 'M', False, f'{gif.relative_to(repo)}: unreadable GIF ({type(error).__name__})')
+            continue
+        if info is None:
+            rows.append((name, 'M', 'agent', 'Pillow missing; check by hand'))
+            continue
+        width, seconds, frames = info
+        rate = frames / seconds if seconds else 0
+        row(name, 'M', width == 1280 and 0 < seconds < 10 and frames > 1,
+            f'{width} px, {seconds:.2f} s, {frames} frames ({rate:.1f} updates/s)')
+    if gifs:
+        rows.append(('GIF previews are for image-only surfaces; motion is smooth (12 fps gameplay, 10 fps menus), never keyframe-only',
+                     'M', 'agent', 'Review the capture cadence and playback; GIFs can merge held frames'))
+
+    for clip in sorted(mp4s):
+        name = f'MP4 {clip.relative_to(repo).as_posix()}: publication encoding'
+        try:
+            info = mp4_info(clip)
+        except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError, subprocess.SubprocessError) as error:
+            row(name, 'M', False, f'cannot inspect MP4 ({type(error).__name__})')
+            continue
+        if info is None:
+            rows.append((name, 'M', 'agent', 'ffprobe missing; check by hand'))
+            continue
+        valid = (info['codec'] == 'h264' and info['pix_fmt'] == 'yuv420p'
+                 and (info['width'], info['height']) == (1280, 720)
+                 and 0 < info['seconds'] <= 10 and info['fps'] > 0
+                 and not info['audio'] and info['faststart'])
+        row(name, 'M', valid,
+            f"{info['codec']} {info['pix_fmt']}, {info['width']}×{info['height']}, "
+            f"{info['seconds']:.3f} s, {info['fps']:g} fps, "
+            f"{'audio' if info['audio'] else 'no audio'}, "
+            f"{'faststart' if info['faststart'] else 'moov must precede mdat'}")
+    if mp4s:
+        rows.append(('MP4 clips use the 1080p source rate, Lanczos, CRF 23–24 and slow preset',
+                     'M', 'agent', 'Verify the source capture and encoding command or receipt'))
 
 
 def find_nro(repo, given):
@@ -405,21 +582,7 @@ def rows_for(repo, nro_path, base=None, traces=()):
     readme = read(repo / 'README.md')
     row('README carries the AI-assistance disclaimer', 'M',
         'assistance of ai' in readme.lower(), 'README.md')
-    row('README has a GIF, build commands and a license line', 'M',
-        '.gif' in readme and 'cargo skyline build' in readme and 'license' in readme.lower(),
-        'README.md')
-    gifs = sorted(repo.glob('docs/media/*.gif'))
-    for gif in gifs:
-        info = gif_info(gif)
-        if info is None:
-            rows.append((f'GIF {gif.name}: 1280 wide, under 10 s', 'M', 'agent',
-                         'Pillow missing; check by hand'))
-            continue
-        width, seconds = info
-        row(f'GIF {gif.name}: 1280 wide, under 10 s', 'M', width == 1280 and seconds < 10,
-            f'{width} px, {seconds:.1f} s')
-    if not gifs:
-        row('a GIF under docs/media', 'M', False, 'docs/media/*.gif: none')
+    check_media(repo, readme, rows, row)
     candidates = [p for p in list(repo.glob('*.md')) + list(repo.glob('docs/*.md'))
                   if p.name not in ('README.md', 'HANDOFF.md')]
     dated = sorted(str(p.relative_to(repo)) for p in candidates

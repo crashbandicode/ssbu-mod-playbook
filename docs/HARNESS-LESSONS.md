@@ -49,7 +49,10 @@ below; call them instead of writing those steps again.
   ("ProxyPacket received, but not in Proxy mode!"), and its join fails.
 - **On a multi-homed host, the room address is the host's default-route source address.** UDP replies leave from that
   address, so a guest that sent to the Wi-Fi address got replies from Ethernet and dropped them.
-- **Use `lan_online=false` on both sides for cross-PC local wireless.**
+- **Use `lan_online=false` on both sides for cross-PC local wireless, and for same-host Eden↔Eden pairs.** With it on,
+  the room's LDN connect succeeds and the guest then shows "Unable to join". A source profile can carry
+  `lan_online=true` (profile g does); pin a Qt fixture with it off. Lifecycle preflight refuses such a pair unless it
+  declares `lan_online_pair:true`.
 - **Arm the host's acceptance before the guest requests.** The guest gives up after about 30 s, and a slow approval path
   made one join fail.
 - **Windows (the Ally) screenshots:** use the Windows capture path. The Linux override's screenshot is black there.

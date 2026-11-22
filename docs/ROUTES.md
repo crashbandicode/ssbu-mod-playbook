@@ -94,6 +94,20 @@ coin lines stops the route. The former stick-based `coin_route` is not supported
   predicate. That predicate covered P1 only; this one covers both bodies.
 - **Tracing:** with the GDB stub on, tracing is off, so these reads come from the plugin's lines.
 
+**Release builds: the plugin's own text.** `trace_text.py` reads pane names and text from text-setter trace records;
+arm the point in a boot step with the stub off, `trace.configure` and the same-build ELF. A `text` gate matches the
+newest text for a pane in the instance's `trace_jsonl`, optionally bound to a `point_id`. By default it reads records
+written during the row; `"whole_file": true` includes earlier records. Any newer record that concerns the pane but
+cannot be read (text, length, sequence, address), and any trace loss line, leaves the pane's text unknown until a newer
+readable record. An empty request is read as empty text. Transition `measured` has earlier different text on the same
+pane key; `unmeasured` has the same earlier text without a different observation; `sampled` has no earlier observation
+on that key and shows only that text was requested. Transition and `previous` come from the gate's scope only, and
+`before_scope` gives the newest readable text on the same pane key before it. This reader and gate are host-tested on a
+real trace excerpt, not yet proven in a live boot.
+At the setter's entry, a text record is a request and proves neither that the text was written nor that the pane is
+visible or focused. Bind `point_id` to the game's write-call point when a write must be shown, and use a still or
+another state source for visibility, focus and positions.
+
 ## Logs that rotate
 
 `routes.LogCursor(path)` keeps the file it started on open:
@@ -172,7 +186,9 @@ instance differs, and every input is a macro (no manual presses).
   - **If the runner died:** `switch_hw.py down` stops a recording that this run started and never stopped. OBS is
     shared, so nothing else is touched.
   - **Clips:** `/usr/bin/python3 tools/eden-runner/cut_session.py <out> [--only gifs|rows|stills]` cuts each clip from
-    the recording into its preset. It needs PyGObject/GStreamer, so run it without `-I`. Live proof: live-rec-1,
+    the recording into its preset. It needs PyGObject/GStreamer, so run it without `-I`. Use its GIF output for
+    image previews and for existing GIF plans. Keep the 1080p recording and a 2–3× zoom crop for evidence. Encode
+    documentation and tutorial MP4s from the original recording ([GIFS](GIFS.md)). Live proof: live-rec-1,
     2026-11-16.
   - **Backends without it:** the run goes on without a session recording. Eden has no `recording.session_*`
     methods today.

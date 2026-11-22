@@ -1,7 +1,9 @@
 """judge_queue.known_issue: only an exact signature match is a KNOWN-PRODUCT-ISSUE (switch-hw-session-2)."""
 import sys
 import unittest
-sys.path.insert(0, '/tmp/pb-clip/tools/eden-runner')
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import judge_queue as jq  # noqa: E402
 
 KNOWN = {'a': {'title': 'P1 swap', 'reason': r'P1 \+ CPU.*one menu visit', 'rows': ['FX-01-for-FS-01']},

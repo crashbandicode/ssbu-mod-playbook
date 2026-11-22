@@ -265,6 +265,8 @@ freed about 106 GB.
     - no process uses it;
     - an artifacts manifest or receipt cites the label (the harvest exists on the Surface).
     Pinned input folders (`inputs-*`, `_*-inputs`) stay while any config pins them.
+    `eden_test.py check`, `up` and `all` refuse active pins, instance sources or games in another run folder unless
+    its name starts with `_` or `--allow-volatile-pins` is given; move pinned `inputs-*` folders to `_<name>/`.
   - **Lane caches** (`/home/intpa/build-hosts/lanes/<lane>`): each lane deletes its own cache when its branch
     merges or the lane ends. Another worker may delete a cache only when it is unused, unwritten for 6 h and not the
     newest dir of an active lane family.
@@ -283,7 +285,9 @@ Follow [EDEN](EDEN.md):
 1. Set up a profile with only the NROs under test, plus the tile cursor.
 2. Script the route ([MACROS](MACROS.md)) and pick fighters or stages
    exactly ([TILE-CURSOR](TILE-CURSOR.md)).
-3. Read `events.log`, take screenshots, record the GIF ([GIFS](GIFS.md)).
+3. Read `events.log`, take screenshots and keep the 1080p evidence clip
+   with a 2–3× zoom crop. Use the original recording for documentation
+   MP4s. Record a GIF only where an image preview is required ([GIFS](GIFS.md)).
 
 For a sanity check before shipping, use the card's full plugin set, play one
 match to the results screen and back, then check each plugin's install line
@@ -392,9 +396,10 @@ both ways:
 
 ## 6. README and evidence
 
-- **README:** one paragraph on what the plugin does, a GIF, the install path,
-  the build commands, a license line, and the disclaimer about AI assistance
-  that the other READMEs carry.
+- **README:** one paragraph on what the plugin does, a captioned full-screen
+  MP4, the install path, the build commands, a license line and the
+  AI-assistance disclaimer. Use a smooth GIF only where an image preview
+  is required ([GIFS](GIFS.md)).
 - **Evidence:** `docs/EDEN-RESULTS.md`, `VALIDATION.md` or `docs/SAFETY.md`,
   dated, with the run label, the build (commit or NRO sha256), what was done
   and what the log showed. For an online plugin, include the detector's

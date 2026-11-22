@@ -189,6 +189,27 @@ class SpanMaths(unittest.TestCase):
         plan = cs.clip_plan('gifs', {'preset': 'docs', 'max_duration_s': 4}, 0, 25000)
         self.assertEqual(plan['duration_s'], 4.0)
 
+    def test_preview_defaults_and_minimum_rates(self):
+        for preset, fps in (('preview', 12), ('preview-menu', 10)):
+            with self.subTest(preset=preset):
+                plan = cs.clip_plan('gifs', {'preset': preset}, 0, 12000)
+                self.assertEqual((plan['preset'], plan['width'], plan['fps'], plan['duration_s']),
+                                 (preset, 1280, fps, 10))
+                with self.assertRaisesRegex(ValueError, f'at least {fps} fps'):
+                    cs.clip_plan('gifs', {'preset': preset, 'fps': fps - 1}, 0, 1000)
+
+    def test_legacy_and_custom_publication_cannot_request_keyframe_only(self):
+        published = {"name": "published", "preset": "docs", "fps": 1}
+        for spec in (published, published | {"preset": "custom"},
+                     published | {"preset": "evidence", "out": "docs/media/published.gif"}):
+            with self.subTest(spec=spec):
+                with self.assertRaisesRegex(ValueError, r"at least 12 fps"):
+                    cs.clip_plan("gifs", spec, 0, 6000)
+        menu = published | {"scene": "menu", "fps": 10}
+        self.assertEqual(cs.clip_plan("gifs", menu, 0, 6000)["fps"], 10)
+        with self.assertRaisesRegex(ValueError, r"at least 10 fps"):
+            cs.clip_plan("gifs", menu | {"fps": 9}, 0, 6000)
+
     def test_long_row_lowers_fps_to_fit_the_frame_budget(self):
         plan = cs.clip_plan('rows', {}, 0, 300_000)
         self.assertLessEqual(plan['duration_s'] * plan['fps'], cs.FRAME_CAP + 1e-6)
@@ -231,6 +252,13 @@ class Resampling(unittest.TestCase):
         self.assertEqual(len(self.pick(15, pts, max_frames=20)), 20)
         self.assertEqual(len(self.pick(15, pts)), 150)
 
+    def test_source_rate_uses_real_decode_timestamps_not_filled_slots(self):
+        picker = cs.SlotPicker(12)
+        for pts in (0, 1_000_000_000, 1_000_000_000, 2_000_000_000):
+            picker.add(pts, lambda: pts)
+        self.assertEqual(len(picker.finish()), 25)
+        self.assertEqual(picker.source_fps(), 1.0)
+
     def test_gif_durations_track_real_time(self):
         d = cs.gif_durations(15, 15)
         self.assertTrue(all(x % 10 == 0 and x >= 20 for x in d))
@@ -244,17 +272,58 @@ class Encoding(unittest.TestCase):
         from PIL import Image
         return [Image.frombytes('RGB', size, os.urandom(size[0] * size[1] * 3)) for _ in range(n)]
 
-    def test_fits_by_dropping_colours_then_frames(self):
-        try:
-            import PIL  # noqa: F401
-        except ImportError:
-            self.skipTest('Pillow is not installed')
-        images = self.noise(12)
-        full, info = cs.encode_fitting(images, 12.0, None)
-        self.assertEqual((info['frames'], info['colours']), (12, 128))
-        small, info = cs.encode_fitting(images, 12.0, int(len(full) * 0.45))
-        self.assertLessEqual(len(small), int(len(full) * 0.45))
-        self.assertTrue(info['colours'] < 128 or info['frames'] < 12)
+    def test_palette_fitting_never_decimates_frames(self):
+        from unittest.mock import patch
+        images = list(range(12))
+        with patch.object(cs, 'gif_bytes', side_effect=lambda frames, fps, colours:
+                          b'x' * (len(frames) * colours)) as encode:
+            data, info = cs.encode_fitting(images, 12.0, 500)
+            self.assertEqual((len(data), info['colours'], info['frames_dropped']), (384, 32, 0))
+            self.assertTrue(all(call.args[0] == images and call.args[1] == 12.0
+                                for call in encode.call_args_list))
+            # A decimated GIF would fit even at 16 colours. Preserve motion and fail instead.
+            with self.assertRaisesRegex(ValueError, r'trim or crop'):
+                cs.encode_fitting(images, 12.0, 100)
+
+    def test_preview_refuses_an_animation_with_only_repeated_images(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / 'preview.gif'
+            still = Image.new('RGB', (160, 90), (0, 100, 150))
+            with self.assertRaisesRegex(ValueError, r'at least 12 fps'):
+                cs.write_gif([still] * 12, out, 12, None, {'preset': 'preview'}, minimum=12)
+            self.assertFalse(out.exists())
+            self.assertFalse(out.with_suffix('.gif.json').exists())
+
+    def test_preview_accepts_a_sampled_hold_that_pillow_merges(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / 'preview.gif'
+            red = Image.new('RGB', (160, 90), (200, 0, 0))
+            blue = Image.new('RGB', (160, 90), (0, 0, 200))
+            receipt = cs.write_gif([red] * 6 + [blue] * 6, out, 12, None, {'preset': 'preview'}, minimum=12)
+            self.assertEqual((receipt['frames'], receipt['frames_sampled'], receipt['duration_s']), (2, 12, 1.0))
+
+    def test_cut_preserves_measured_lower_source_rate(self):
+        from unittest.mock import patch
+        from PIL import Image
+        span = {'kind': 'gifs', 'name': 'published', 'row': 'R1', 'attempts': 1,
+                'spec': {'preset': 'docs', 'fps': 12}, 'start_ms': 0, 'end_ms': 2000}
+        red = Image.new('RGB', (160, 90), (200, 0, 0))
+        blue = Image.new('RGB', (160, 90), (0, 0, 200))
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / 'published.gif'
+            with patch.object(cs, 'cut_clip', return_value=([red], 0, 0)):
+                with self.assertRaisesRegex(ValueError, r'source frames'):
+                    cs.cut_span(span, 'source.mp4', out, 0, False)
+            self.assertFalse(out.exists())
+            with patch.object(cs, 'cut_clip', side_effect=[
+                    ([red] * 12 + [blue] * 12, 1_800_000_000, 5.0),
+                    ([red, blue] * 5, 1_800_000_000, 5.0)]) as cut:
+                receipt, error = cs.cut_span(span, 'source.mp4', out, 0, False)
+            self.assertIsNone(error)
+            self.assertEqual([call.args[2]['fps'] for call in cut.call_args_list], [12, 5])
+            self.assertEqual((receipt['fps'], receipt['source_fps'], receipt['frames']), (5, 5, 10))
 
     def test_impossible_limit_raises(self):
         try:
@@ -399,6 +468,15 @@ class RealCuts(unittest.TestCase):
         self.assertAlmostEqual(self.grey(menu), 80, delta=10)         # t = 2.5 s -> second 2
         self.assertAlmostEqual(self.grey(late), 160, delta=10)        # t = 4.2 s -> second 4
 
+    def test_legacy_keyframe_recipe_writes_no_gif(self):
+        spec = {"name": "published", "preset": "docs", "fps": 1}
+        label = json.dumps(spec | {"gif": spec["name"]})
+        self.session([mark('gif-start', 'R1', label, 0), mark('gif-end', 'R1', label, 6000)])
+        summary, code = cs.run(self.out, only=['gifs'])
+        self.assertEqual(code, cs.EXIT_FAILED, summary)
+        self.assertIn('at least 12 fps', str(summary['failed']))
+        self.assertFalse(list(self.out.rglob('published.gif*')))
+
     def test_gif_pair_cut_with_receipt(self):
         from PIL import Image
         label = gif_label('demo', 'evidence', 'gifs/demo.gif')
@@ -494,7 +572,7 @@ class RealCuts(unittest.TestCase):
     def test_partial_skips_open_and_truncated_spans_without_failing(self):
         la = gif_label('ok', out='g/ok.gif')
         lb = gif_label('cut', out='g/cut.gif')
-        self.session([mark('gif-start', 'R1', la, 1000), mark('gif-end', 'R1', la, 2000),
+        self.session([mark('gif-start', 'R1', la, 1000), mark('gif-end', 'R1', la, 2500),
                       mark('gif-start', 'R1', lb, 5000), mark('gif-end', 'R1', lb, 60_000),   # beyond the 6 s file
                       mark('row-start', 'R2', None, 3000),                                       # no end mark yet
                       mark('shot', 'R2', 'beyond', 90_000)], stop=False)

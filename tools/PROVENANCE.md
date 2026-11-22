@@ -154,3 +154,12 @@ transitions; `library/routes/build_tables.py --catalog-only` derives `roster_cat
 `src/model/swap/choices.rs`, with source checkout, commit and SHA-256 recorded in `tables.json`. The authored
 `tap-l1` and `tap-r1` macros use the existing `tap-a1` frame shape and plain L/R masks. No runtime acceptance is claimed.
 `test_setup_calls_rework.py` adds modelled race, timeout, settings and compatibility probes following lead review.
+
+2026-11-22: `eden-runner/test_harvest.py` tests no-op, new-segment, new-gate and dry-run harvests against a
+temporary library (5 host tests); `2eb13ee5204f28cc`.
+
+2026-11-22: `eden-runner/trace_text.py` and `test_trace_text.py` port the read side of compact-strip's
+`strip_trace.py` and notice-ui's `notice_steps.py`; `cb1781bf25583f07` and `2c7547a9f442f262`.
+The 15-line real trace fixture is `eden-runner/fixtures/trace-text/set-text-excerpt.jsonl` (`418ecc8cb4c813ce`);
+its source and sequences are in `eden-runner/fixtures/trace-text/PROVENANCE.md`. Twenty-six reader host tests; no live boot
+proof yet.

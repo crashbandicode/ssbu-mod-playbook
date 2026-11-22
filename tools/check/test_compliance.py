@@ -1,6 +1,7 @@
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -177,6 +178,86 @@ class GuardSize(unittest.TestCase):
     def test_existing_literal_guard_counts_are_preserved(self):
         for count in (0, 1, 63, 64, 65):
             self.assertEqual(guard_size(", ".join(["0x12"] * count), ""), count)
+
+
+class PublicationMedia(unittest.TestCase):
+    VALID_VIDEO = ('<video src="docs/media/clip.mp4" autoplay muted loop playsinline controls></video>')
+    VIDEO_INFO = {'codec': 'h264', 'pix_fmt': 'yuv420p', 'width': 1280, 'height': 720,
+                  'fps': 60.0, 'seconds': 10.0, 'audio': False, 'faststart': True}
+
+    def repo(self, readme):
+        return repo_with({'README.md': 'Demo\n\ncargo skyline build\n\nMIT License\n\n' + readme}, {})[0]
+
+    def asset(self, repo, name, content=b'media fixture'):
+        path = repo / 'docs' / 'media' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def rows(self, repo):
+        return {name: (result, evidence) for name, _, result, evidence in rows_for(repo, None)}
+
+    def test_readme_embedded_mp4_needs_no_gif(self):
+        repo = self.repo(self.VALID_VIDEO)
+        self.asset(repo, 'clip.mp4')
+        with patch('compliance.mp4_info', create=True, return_value=self.VIDEO_INFO):
+            rows = self.rows(repo)
+        self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
+        self.assertNotIn('a GIF under docs/media', rows)
+
+    def test_docs_video_is_checked_and_code_example_is_ignored(self):
+        repo = self.repo('See docs.')
+        self.asset(repo, 'clip.mp4')
+        (repo / 'docs' / 'guide.md').write_text(
+            self.VALID_VIDEO.replace('docs/media/', 'media/') + '\n\n```html\n'
+            + self.VALID_VIDEO.replace('clip.mp4', 'example.mp4') + '\n```\n')
+        with patch('compliance.mp4_info', create=True, return_value=self.VIDEO_INFO):
+            rows = self.rows(repo)
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
+        self.assertFalse(any('example.mp4' in name for name in rows))
+
+    def test_incomplete_video_embed_and_wrong_encoding_fail(self):
+        repo = self.repo(self.VALID_VIDEO.replace(' playsinline', ''))
+        self.asset(repo, 'clip.mp4')
+        bad = self.VIDEO_INFO | {'height': 1080, 'audio': True, 'seconds': 10.1, 'faststart': False}
+        with patch('compliance.mp4_info', create=True, return_value=bad):
+            rows = self.rows(repo)
+        self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'fail')
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'fail')
+        self.assertTrue(any('playsinline' in evidence for result, evidence in rows.values()
+                            if result == 'fail'))
+
+    def test_mp4_path_must_exist_and_a_hyperlink_is_not_an_embed(self):
+        repo = self.repo('[video](docs/media/clip.mp4)')
+        self.asset(repo, 'clip.mp4')
+        self.assertEqual(self.rows(repo)['README has a demo, build commands and a license line'][0], 'fail')
+        (repo / 'README.md').write_text('cargo skyline build\nLicense\n' +
+                                       self.VALID_VIDEO.replace('clip.mp4', 'missing.mp4'))
+        self.assertEqual(self.rows(repo)['README has a demo, build commands and a license line'][0], 'fail')
+
+    def test_legacy_gif_readme_preview_still_passes(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest('Pillow required for GIF fixture')
+        repo = self.repo('![Menu preview][menu]\n\n[menu]: docs/media/menu.gif\n')
+        path = self.asset(repo, 'menu.gif')
+        frames = [Image.new('RGB', (1280, 8), color) for color in ('red', 'blue')]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        rows = self.rows(repo)
+        self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
+        self.assertEqual(rows['GIF menu.gif: animated, 1280 wide, under 10 s'][0], 'pass')
+
+    def test_invalid_gif_reports_failure_without_crashing(self):
+        try:
+            import PIL
+        except ImportError:
+            self.skipTest('Pillow required for GIF validation')
+        repo = self.repo('![Menu preview](docs/media/invalid.gif)')
+        self.asset(repo, 'invalid.gif')
+        rows = self.rows(repo)
+        self.assertEqual(rows['GIF invalid.gif: animated, 1280 wide, under 10 s'][0], 'fail')
 
 
 if __name__ == "__main__":
