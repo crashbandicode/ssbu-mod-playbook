@@ -2250,7 +2250,7 @@ def _tr_input(io, before, macro, until, *, opened=True):
 
     after = _send_with_retry(io, macro, until, wait)
     if after is None:
-        raise RuntimeError(f'expected {macro} handled ACK; saw not handled')
+        raise RuntimeError(f'expected {macro} handled ACK; saw input was not handled')
     return after
 
 
@@ -2290,7 +2290,7 @@ def _with_setup_metrics(ctx, action):
 
 def _remember(io, state):
     metrics = getattr(getattr(getattr(io, 'ctx', None), 'runner', None), 'setup_metrics', None)
-    if metrics is not None and 'last_seen' in metrics:
+    if isinstance(metrics, dict) and 'last_seen' in metrics:
         fields = ('open', 'page', 'depth', 'focus', 'action', 'row', 'game', 'game.running',
                   'notice.header', 'notice.body', 'editor', 'editor.sel')
         if state.block['name'] == 'tr.menu':
