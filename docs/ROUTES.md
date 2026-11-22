@@ -427,6 +427,14 @@ Down must move the published cursor; in a Rows screen it must change the publish
 with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed. This does
 not read or establish the focused row's stored value.
 
+`routes:tr_set(page, path, kind, value, cap=45)` accepts `list`, `toggle`, `checklist`, or `practice_cpu`.
+It closes the menu, reads `settings.json` through the bridge, navigates to the row, changes it as needed,
+closes the menu and compares a fresh file read. Changed values require a fresh writer line; already-stored
+values skip both the change and writer and must match again on the final read. Source-pinned row kinds
+prevent a no-op from silently accepting a wrong kind. `practice_cpu` takes `fighter`, `mode` and optional
+`level`; popup mode is witnessed while changing, while a no-op proves only the stored encoding. It does
+not prove the live fighter was switched or text visibly rendered.
+
 `routes:wizard_place(game, area=None, cpu=None, p1=None, cap=120, pulse_cap=2.0)` reaches the Guard the
 Edge Preview using bridged notice headers and shown coordinates. It sends fixed library stick pulses, follows
 the shown text after each pulse, and leaves Preview unconfirmed. `pulse_cap` is a harness publication-wait

@@ -2461,6 +2461,246 @@ def _tr_goto(ctx, page, path, targets, cap, metrics):
     })
 
 
+def _settings_menu(data):
+    try:
+        menu = json.loads(data)['menu']
+    except (ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f'settings menu is missing or malformed: {error}') from error
+    if not isinstance(menu, dict):
+        raise RuntimeError('settings menu is not an object')
+    return menu
+
+
+def _stored_one_hot(size, selected):
+    return [int(index == selected) for index in range(size)]
+
+
+def _tr_editor_move(io, menu, wanted, count, depth, until):
+    current = native_picker.number(menu, 'editor.sel')
+    if not 0 <= current < count or not 0 <= wanted < count:
+        raise RuntimeError('Training Mod editor selection is outside its options')
+    for _ in range(count):
+        if current == wanted:
+            return menu
+        after = _tr_input(io, menu, 'main-menu-down', until)
+        expected = (current + 1) % count
+        if _tr_depth(after) != depth or native_picker.number(after, 'editor.sel') != expected:
+            raise RuntimeError('Training Mod editor selection did not move by one')
+        menu, current = after, expected
+    raise RuntimeError('Training Mod editor option not found before wrapping')
+
+
+def _practice_target(row_id, value, before):
+    if row_id not in ('edge_difficulty', 'juggle_difficulty'):
+        raise RuntimeError('practice_cpu kind needs a supported practice CPU row')
+    if not isinstance(value, dict) or not {'fighter', 'mode'} <= set(value) or set(value) - {'fighter', 'mode', 'level'}:
+        raise RuntimeError('practice_cpu value needs fighter, mode and optional level')
+    entry = fighter_entry(value['fighter'])
+    catalog = tables()['roster_catalog']
+    indices = [index for index, item in enumerate(catalog) if item['kind'] == entry['kind']]
+    if len(indices) != 1:
+        raise RuntimeError('practice fighter is absent or ambiguous in the source catalog')
+    prefix = 'edge' if row_id == 'edge_difficulty' else 'juggle'
+    fighter_key, level_key = prefix + '_cpu_fighter', prefix + '_cpu_level'
+    mode = value['mode']
+    match = re.fullmatch(r'CPU ([1-9])', mode) if isinstance(mode, str) else None
+    if mode not in ('Perfect', 'Zoom') and not match:
+        raise RuntimeError('practice CPU mode is not a supported mode key')
+    if mode == 'Zoom' and entry['kind'] != 0x53:
+        raise RuntimeError('practice Zoom is available only for Hero')
+    old_level = before.get(level_key)
+    if (not isinstance(old_level, list) or len(old_level) != 9
+            or any(type(item) is not int or item not in (0, 1) for item in old_level) or sum(old_level) != 1):
+        raise RuntimeError(f'settings menu.{level_key} is not a one-hot level')
+    level = value.get('level', int(match[1]) if match else old_level.index(1) + 1)
+    if type(level) is not int or not 1 <= level <= 9 or match and int(match[1]) != level:
+        raise RuntimeError('practice CPU level contradicts the requested mode')
+    mode_index = 0 if match else 1 if mode == 'Perfect' else 2
+    target = {fighter_key: _stored_one_hot(len(catalog) + 1, indices[0] + 1),
+              row_id: _stored_one_hot(3, mode_index), level_key: _stored_one_hot(9, level - 1)}
+    return entry, level, mode, target
+
+
+def tr_set(ctx, page, path, kind, value, cap=45):
+    if page not in TR_PAGES:
+        raise RuntimeError(f'unknown Training Mod page {page!r}')
+    targets = _tr_path(path)
+    if kind not in ('list', 'toggle', 'checklist', 'practice_cpu'):
+        raise RuntimeError(f'unknown Training Mod setting kind {kind!r}')
+    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+        raise RuntimeError('Training Mod setting needs a positive cap')
+    if kind != 'practice_cpu':
+        if (not isinstance(value, list) or not value
+                or any(type(item) is not int or item not in (0, 1) for item in value)):
+            raise RuntimeError('setting value must be a binary array')
+        if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
+            raise RuntimeError(f'invalid {kind} value encoding')
+    return _with_setup_metrics(ctx, lambda metrics: _tr_set(ctx, page, path, targets, kind, value, cap, metrics))
+
+
+def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
+    started = time.monotonic()
+    until = started + cap
+    io = BridgePickerIO(ctx)
+    initial = _tr_current(io, until)
+    closed, _ = _close_menu(io, until, after=initial)
+    before_bytes = _fetch_settings(ctx, cap=max(.001, until - time.monotonic()))
+    before_menu = _settings_menu(before_bytes)
+    menu, _ = _open_menu(io, until, page, after=closed)
+    menu = _navigate_menu(io, menu, page, targets, until)
+    row_id = menu.values.get('row_id')
+    if not isinstance(row_id, str) or not row_id:
+        raise RuntimeError('Training Mod focused row has no row_id')
+    kinds = json.loads((ROUTES / 'tr-menu-kinds.json').read_text())
+    if row_id not in kinds[kind]:
+        raise RuntimeError(f'Training Mod row {row_id!r} is not the requested kind {kind!r}')
+    if kind == 'practice_cpu':
+        entry, level, mode, wanted = _practice_target(row_id, value, before_menu)
+        before = {key: before_menu.get(key) for key in wanted}
+    else:
+        before = before_menu.get(row_id)
+        if not isinstance(before, list) or len(before) != len(value):
+            raise RuntimeError(f'settings menu.{row_id} has a missing or incompatible array')
+        wanted = {row_id: value}
+    if time.monotonic() >= until:
+        raise RuntimeError('Training Mod setting deadline expired before applying')
+    writer = None
+
+    def changing(state, macro):
+        nonlocal writer
+        if writer is None:
+            writer = LogCursor(instance_path(ctx, 'bridge_log'), hold=False)
+        return _tr_input(io, state, macro, until)
+
+    already = all(before_menu.get(key) == target for key, target in wanted.items())
+    original_depth = _tr_depth(menu)
+    if not already and kind == 'toggle':
+        menu = changing(menu, 'tap-a1')
+        if _tr_depth(menu) != original_depth:
+            raise RuntimeError('toggle kind unexpectedly entered an editor')
+    elif not already and kind in ('list', 'checklist'):
+        menu = _tr_input(io, menu, 'tap-a1', until)
+        depth = original_depth + 1
+        if _tr_depth(menu) != depth or menu.values.get('editor') not in ('', None):
+            raise RuntimeError(f'{kind} kind did not enter its list editor')
+        if kind == 'list':
+            desired = value.index(1)
+            count = len(value)
+            if row_id in kinds['retired']:
+                if desired == 0:
+                    raise RuntimeError('retired practice Off option cannot be written from the list')
+                desired -= 1
+                count -= 1
+            if row_id in kinds['yes_no_random']:
+                count = 3
+            menu = _tr_editor_move(io, menu, desired, count, depth, until)
+            menu = changing(menu, 'tap-a1')
+            if _tr_depth(menu) != original_depth:
+                raise RuntimeError('list kind did not commit and leave its editor')
+        else:
+            if any(type(item) is not int or item not in (0, 1) for item in before):
+                raise RuntimeError('checklist before value has non-binary weights')
+            if row_id == 'hitbox_vis' and len(value) > 3 and before[3] != value[3]:
+                raise RuntimeError('retired hitbox checklist slot cannot be edited')
+            count = len(value) - (1 if row_id == 'hitbox_vis' else 0)
+            for index, (old, target) in enumerate(zip(before, value)):
+                if old != target:
+                    cursor = index - (1 if row_id == 'hitbox_vis' and index > 3 else 0)
+                    menu = _tr_editor_move(io, menu, cursor, count, depth, until)
+                    menu = changing(menu, 'tap-a1')
+                    if _tr_depth(menu) != depth or native_picker.number(menu, 'editor.sel') != cursor:
+                        raise RuntimeError('checklist kind did not stay on its selected entry')
+            menu = _tr_input(io, menu, 'tap-b1', until)
+            if _tr_depth(menu) != original_depth:
+                raise RuntimeError('checklist editor did not close')
+    elif not already:
+        menu = _tr_input(io, menu, 'tap-a1', until)
+        depth = original_depth + 1
+        game_name = 'GuardEdge' if row_id == 'edge_difficulty' else 'Juggler'
+        editor = f'PracticeCpu({game_name})'
+        if _tr_depth(menu) != depth or menu.values.get('editor') != editor:
+            raise RuntimeError('practice_cpu kind did not open its roster editor')
+        cell = native_picker.number(menu, 'editor.sel')
+        for direction in tr_grid_path(cell, entry['tile']):
+            cell = tr_grid_step(cell, direction)
+            menu = _tr_input(io, menu, f'main-menu-{direction}', until)
+            if menu.values.get('editor') != editor or native_picker.number(menu, 'editor.sel') != cell:
+                raise RuntimeError('practice CPU roster did not reach the predicted cell')
+        menu = changing(menu, 'tap-a1')
+        if _tr_depth(menu) != depth or menu.values.get('editor') != editor or not menu.values.get('editor.sel_key'):
+            raise RuntimeError('practice CPU mode popup did not open')
+        mode_count = 3 if entry['kind'] == 0x53 else 2
+        current_level = before_menu[('edge' if row_id == 'edge_difficulty' else 'juggle') + '_cpu_level'].index(1) + 1
+
+        def popup_key(state):
+            choice = native_picker.number(state, 'editor.sel')
+            keys = (f'CPU {current_level}', 'Perfect', 'Zoom')[:mode_count]
+            if choice >= mode_count or state.values.get('editor.sel_key') != keys[choice]:
+                raise RuntimeError('practice CPU popup mode and selection disagree')
+            return choice
+
+        def cycle_to(state, predicate):
+            for _ in range(mode_count):
+                choice = popup_key(state)
+                old = state.values.get('editor.sel_key')
+                if predicate(old):
+                    return state
+                state = changing(state, 'main-menu-down')
+                if (state.values.get('editor') != editor or state.values.get('editor.sel_key') == old
+                        or popup_key(state) != (choice + 1) % mode_count):
+                    raise RuntimeError('practice CPU mode did not advance by one')
+            if predicate(state.values.get('editor.sel_key')):
+                return state
+            raise RuntimeError('practice CPU requested mode was not found before wrapping')
+
+        if current_level != level:
+            menu = cycle_to(menu, lambda key: isinstance(key, str) and key.startswith('CPU '))
+            for _ in range(9):
+                key = menu.values.get('editor.sel_key')
+                if key == f'CPU {level}':
+                    break
+                menu = changing(menu, 'tap-x1')
+                current_level = current_level % 9 + 1
+                if menu.values.get('editor') != editor or popup_key(menu) != 0:
+                    raise RuntimeError('practice CPU level did not advance by one')
+            else:
+                raise RuntimeError('practice CPU level not reached')
+        menu = cycle_to(menu, lambda key: key == mode)
+        menu = _tr_input(io, menu, 'tap-b1', until)
+        if _tr_depth(menu) != depth or menu.values.get('editor') != editor or menu.values.get('editor.sel_key'):
+            raise RuntimeError('practice CPU popup did not close')
+        menu = _tr_input(io, menu, 'tap-b1', until)
+        if _tr_depth(menu) != original_depth:
+            raise RuntimeError('practice CPU roster did not close')
+    closed, _ = _close_menu(io, until, after=menu)
+    line = _wait_writer(ctx, writer, until) if writer is not None else None
+    if time.monotonic() >= until:
+        raise RuntimeError('Training Mod setting deadline expired before read-back')
+    after_bytes = _fetch_settings(ctx, cap=max(.001, until - time.monotonic()))
+    after_menu = _settings_menu(after_bytes)
+    current = _tr_current(io, until)
+    native_picker.same_epoch(closed, current, in_flight=True)
+    if current.values.get('open') != '0':
+        raise RuntimeError('Training Mod menu reopened during settings read-back')
+    for key, target in wanted.items():
+        if after_menu.get(key) != target:
+            raise RuntimeError(f'settings read-back mismatch for menu.{key}: expected {target!r}, '
+                               f'got {after_menu.get(key)!r}')
+    after = {key: after_menu[key] for key in wanted} if kind == 'practice_cpu' else after_menu[row_id]
+    verified = {'row_id': row_id, 'before': before, 'after': after,
+                'settings_sha256': hashlib.sha256(after_bytes).hexdigest(), 'writer': line}
+    if kind == 'practice_cpu':
+        verified['mode'] = value['mode']
+        verified['mode_stored'] = wanted[row_id]
+        verified['mode_witness'] = 'stored encoding' if already else 'editor.sel_key'
+    elapsed = round((time.monotonic() - started) * 1000)
+    return _save(ctx, 'routes-tr-set', {
+        'block': 'tr_set', 'args': {'page': page, 'path': path, 'kind': kind, 'value': value, 'cap': cap},
+        'verified': verified, **metrics, 'ms': {'setting': elapsed, 'total': elapsed},
+        'skipped': ['change', 'writer'] if already else [],
+    })
+
+
 def _edge_wizard(menu):
     header = menu.values.get('notice.header')
     if not isinstance(header, str):
@@ -2523,6 +2763,8 @@ def _wizard_pulse(io, menu, step, macro, until, pulse_cap):
     if time.monotonic() >= until:
         raise RuntimeError(f'wizard deadline after pulse; last shown {body!r}')
     state = io.read('tr.menu', min(pulse_cap, until - time.monotonic()))
+    if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
+        raise RuntimeError('wizard needs a complete tr.menu/1 reply')
     native_picker.same_epoch(menu, state, in_flight=True)
     new_body = _wizard_body(state, step)
     if state.block['rev'] == menu.block['rev'] and new_body == body:

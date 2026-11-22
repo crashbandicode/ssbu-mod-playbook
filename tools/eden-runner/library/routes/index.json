@@ -141,6 +141,7 @@
    "what": "left stick up for 21 frames (real-Switch CSS: P1 panel hand onto the grid)",
    "source": "authored 2026-11-16 harness-lib from switch-hw-ledger-rc15 P2d \"stick 0 1 350\""
   },
+  "tap-x1": {"file":"macros/tap-x1.edenmacro.json","sha256":"35105b96b557305a37cff60797aba59618cd623b8853440570a3e9bd004796d2","cap":20,"frames":8,"what":"tap X","source":"authored from tap-a1 with X button mask"},
   "wizard-left-coarse": {"file":"macros/wizard-left-coarse.edenmacro.json","sha256":"d581cbb8ab7b749e34e4a47258afbe36fdbf288fcb2562a3d5760fe03bdae487","cap":20,"frames":13,"what":"wizard left full tilt 10 frames","source":"authored from edenmacro schema"},
   "wizard-right-coarse": {"file":"macros/wizard-right-coarse.edenmacro.json","sha256":"28347ace16f6f25265e622daa0d8bcfd186f703f5046ea14968b70c51ca1f021","cap":20,"frames":13,"what":"wizard right full tilt 10 frames","source":"authored from edenmacro schema"},
   "wizard-up-coarse": {"file":"macros/wizard-up-coarse.edenmacro.json","sha256":"419a2e08c6bf12990e06a6041e0e22ef3d5c31418ee0aad6cf3184f4c58f82c4","cap":20,"frames":13,"what":"wizard up full tilt 10 frames","source":"authored from edenmacro schema"},

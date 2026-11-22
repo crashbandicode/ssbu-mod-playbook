@@ -449,19 +449,26 @@ class SetIO(MenuIO):
                 self.stored[self.row_id] = list(reversed(self.stored[self.row_id]))
             else:
                 self.menu['depth'] = '1'
-                self.menu['editor.sel'] = str(self.stored[self.row_id].index(1)
-                                              if self.kind == 'list' else 0)
+                selected = self.stored[self.row_id].index(1) if self.kind == 'list' else 0
+                if self.row_id == 'eggsercise':
+                    selected = max(0, selected - 1)
+                self.menu['editor.sel'] = str(selected)
         elif segment in ('main-menu-down', 'main-menu-up'):
             delta = 1 if segment.endswith('down') else -1
-            cursor = (int(self.menu['editor.sel']) + delta) % len(self.stored[self.row_id])
+            count = len(self.stored[self.row_id]) - int(self.row_id in ('eggsercise', 'hitbox_vis'))
+            cursor = (int(self.menu['editor.sel']) + delta) % count
             self.menu['editor.sel'] = str(cursor)
         elif segment == 'tap-a1':
             cursor = int(self.menu['editor.sel'])
             if self.kind == 'list':
+                if self.row_id == 'eggsercise':
+                    cursor += 1
                 self.stored[self.row_id] = [int(index == cursor) for index in range(len(self.stored[self.row_id]))]
                 self.menu['depth'] = '0'
                 self.menu['editor.sel'] = '-1'
             else:
+                if self.row_id == 'hitbox_vis' and cursor >= 3:
+                    cursor += 1
                 self.stored[self.row_id][cursor] ^= 1
         elif segment == 'tap-b1':
             self.menu['depth'] = '0'
@@ -479,6 +486,7 @@ class PracticeSetIO(RowsIO):
         self.editor = False
         self.popup = False
         self.cell = 0
+        self.level = 9
 
     def send(self, segment):
         if self.menu['open'] == '0' or not self.editor and not (
@@ -502,11 +510,15 @@ class PracticeSetIO(RowsIO):
         elif not self.popup and segment == 'tap-a1':
             self.popup = True
             self.stored['edge_cpu_fighter'] = [0, 1] + [0] * (len(routes.tables()['roster_catalog']) - 1)
-            self.menu.update({'editor.sel': '0', 'editor.sel_key': 'CPU 9'})
+            self.menu.update({'editor.sel': '0', 'editor.sel_key': f'CPU {self.level}'})
         elif self.popup and segment == 'main-menu-down':
             choice = (int(self.menu['editor.sel']) + 1) % 2
             self.stored['edge_difficulty'] = [int(i == choice) for i in range(3)]
-            self.menu.update({'editor.sel': str(choice), 'editor.sel_key': 'Perfect' if choice else 'CPU 9'})
+            self.menu.update({'editor.sel': str(choice), 'editor.sel_key': 'Perfect' if choice else f'CPU {self.level}'})
+        elif self.popup and segment == 'tap-x1':
+            self.level = self.level % 9 + 1
+            self.stored['edge_cpu_level'] = [int(i == self.level - 1) for i in range(9)]
+            self.menu['editor.sel_key'] = f'CPU {self.level}'
         elif self.popup and segment == 'tap-b1':
             self.popup = False
             self.menu.update({'editor.sel': str(self.cell), 'editor.sel_key': ''})
@@ -587,6 +599,30 @@ class SetTests(OpenCloseTests):
         self.assertEqual(result['verified']['after']['edge_difficulty'], [0, 1, 0])
         self.assertEqual(result['verified']['after']['edge_cpu_fighter'][1], 1)
         self.assertEqual(result['verified']['mode'], 'Perfect')
+
+    def test_practice_cpu_changes_level_and_no_op_skips_writer(self):
+        io = PracticeSetIO(self.ctx)
+        value = {'fighter': 'Mario', 'mode': 'Perfect', 'level': 2}
+        result, writers, _, _ = self.run_set(io, 'practice_cpu', value, path=['game.6', 'edge_difficulty'])
+        self.assertEqual(writers, 1)
+        self.assertEqual(io.actions.count('tap-x1'), 2)
+        self.assertEqual(result['verified']['after']['edge_cpu_level'], [0, 1, 0, 0, 0, 0, 0, 0, 0])
+        io = PracticeSetIO(self.ctx)
+        io.stored.update(result['verified']['after'])
+        result, writers, cursors, _ = self.run_set(io, 'practice_cpu', value, path=['game.6', 'edge_difficulty'])
+        self.assertEqual((writers, cursors), (0, 0))
+        self.assertEqual(result['skipped'], ['change', 'writer'])
+
+    def test_source_retired_option_and_hitbox_slots_are_mapped(self):
+        io = SetIO(self.ctx, 'list', 'eggsercise', [0, 1, 0, 0, 0])
+        result, _, _, _ = self.run_set(io, 'list', [0, 0, 1, 0, 0])
+        self.assertEqual(result['verified']['after'], [0, 0, 1, 0, 0])
+        io = SetIO(self.ctx, 'checklist', 'hitbox_vis', [0, 0, 0, 0, 0, 0, 0])
+        result, _, _, _ = self.run_set(io, 'checklist', [0, 0, 0, 0, 1, 0, 0])
+        self.assertEqual(result['verified']['after'], [0, 0, 0, 0, 1, 0, 0])
+        io = SetIO(self.ctx, 'checklist', 'hitbox_vis', [0, 0, 0, 0, 0, 0, 0])
+        with self.assertRaisesRegex(RuntimeError, 'retired'):
+            self.run_set(io, 'checklist', [0, 0, 0, 1, 0, 0, 0])
 
 
 if __name__ == '__main__':

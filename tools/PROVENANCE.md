@@ -177,3 +177,8 @@ decoder and control-flow probes, not runtime acceptance.
 2026-11-22: the 12 `library/routes/macros/wizard-{direction}-{coarse,medium,fine}` analog pulses
 are authored from Eden's `macro_file.h` full-state JSON schema: full tilt for 10 or 2 frames and 0.35 tilt
 for 1 frame. Actual TrainingRooms controller-poll counts and wizard behavior need runtime proof.
+
+2026-11-22: `library/routes/tr-menu-kinds.json` records supported direct row control kinds from
+TrainingRooms `aad616bc` `src/model/menu/table.rs` (full source SHA-256 in the file), excluding
+recording-owned `playback_loop`; the `tap-x1` macro is `tap-a1`'s full-state shape with X's mask.
+Retired practice-mode and hitbox slots are handled from `practice_games.rs` and `legend.rs`.
