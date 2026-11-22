@@ -1,5 +1,6 @@
 """Regression coverage for native route decisions through fenced bridge replies."""
 
+import sys
 import unittest
 import zlib
 from pathlib import Path
@@ -7,6 +8,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker_io
 import routes
 import test_native_picker as state_fixtures

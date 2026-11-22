@@ -3,12 +3,14 @@
 import copy
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
 import routes
 import test_native_picker as recorded
@@ -394,6 +396,18 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(result['fighters_checked'], {'p1': 'unchecked', 'cpu': 'unchecked'})
         self.assertEqual(result['roster'], state['roster'])
 
+    def test_enter_training_set_stage_ids_return_plain_json(self):
+        state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}, 'stage': 3}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.enter_training(self.ctx, cap=1, stage_ids={3})
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            self.fail(str(exc))
+        self.assertEqual(result['args']['stage_ids'], [3])
+
     def test_tr_grid_path_matches_trainingrooms_step_rule(self):
         vectors = ((0, 'left', 12), (12, 'right', 0), (0, 'up', 78), (12, 'up', 86),
                    (78, 'down', 2), (86, 'down', 10), (65, 'down', 78),
@@ -580,6 +594,25 @@ class SetupCallsR2Tests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'not owned by native'):
                 routes.reach_training(self.ctx, 'Mario', cpu='Fox')
         self.assertEqual(replay.actions, [])
+
+    def test_reach_training_css_suffix_return_is_plain_json(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        initial = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 3}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=final), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            self.fail(str(exc))
+        self.assertEqual(result['phases']['enter_training']['args']['stage_ids'], [3])
 
     def test_setup_state_reads_without_any_controller_input(self):
         replay = MenuReplay()
