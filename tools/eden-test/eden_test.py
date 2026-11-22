@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -284,26 +285,34 @@ def setup_plan_problems(spec, base=None, config=None):
     return problems
 
 
+def iter_pin_nodes(node):
+    if isinstance(node, dict):
+        path, digest_value = node.get('path'), node.get('sha256')
+        if isinstance(path, str) and isinstance(digest_value, str) and re.fullmatch(r'[0-9a-f]{64}', digest_value):
+            yield node
+        for key, child in node.items():
+            if key not in ('path', 'sha256'):
+                yield from iter_pin_nodes(child)
+    elif isinstance(node, list):
+        for child in node:
+            yield from iter_pin_nodes(child)
+
+
 def volatile_pins(config, run):
     root = Path(os.path.abspath(run.parent))
     found = set()
-
-    def walk(value):
-        if isinstance(value, dict):
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-        elif isinstance(value, str) and Path(value).is_absolute():
+    paths = [pin['path'] for pin in iter_pin_nodes(config)]
+    for instance in config.get('instances', []):
+        if isinstance(instance, dict):
+            paths.extend(instance.get(key) for key in ('source', 'game'))
+    for value in paths:
+        if isinstance(value, str) and Path(value).is_absolute():
             try:
                 parts = Path(os.path.normpath(value)).relative_to(root).parts
             except ValueError:
-                return
+                continue
             if parts and parts[0] != run.name and not parts[0].startswith('_'):
                 found.add((value, parts[0]))
-
-    walk(config)
     return sorted(found)
 
 
@@ -325,7 +334,8 @@ def check_run(run, skip_setup_plan=False, allow_volatile_pins=False):
         if pins:
             paths = ', '.join(path for path, _ in pins[:8])
             problems.append(f'volatile pins: {paths}; shared inputs belong in {run.parent}/_<name>/ '
-                            'because the host janitor keeps only those')
+                            'because the host janitor keeps only those '
+                            '(configs that pin inputs-* folders: move them to _<name>/ or pass --allow-volatile-pins)')
     return problems
 
 
@@ -650,6 +660,11 @@ def main(argv=None):
                        help='swap the pinned plugin with this file name for this build (repeatable; sha256 is read)')
         p.add_argument('--defer-load', action='store_true',
                        help='leave the frontend ready so rows can configure boot tracing before game.load')
+        if name == 'all':
+            p.add_argument('--skip-setup-plan', action='store_true',
+                           help='re-running rows whose starting states are already recorded')
+            p.add_argument('--allow-volatile-pins', action='store_true',
+                           help='allow pins inside another run folder')
     sub.add_parser('pace').add_argument('run', type=Path)
     p = sub.add_parser('down')
     p.add_argument('run', type=Path)
@@ -680,7 +695,7 @@ def main(argv=None):
         return cmd_pace(args.run.resolve())
     elif args.mode == 'all':
         run = cmd_new(args)
-        cmd_up(run)
+        cmd_up(run, args.skip_setup_plan, args.allow_volatile_pins)
         try:
             cmd_run(run)
         finally:

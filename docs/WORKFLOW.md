@@ -265,8 +265,8 @@ freed about 106 GB.
     - no process uses it;
     - an artifacts manifest or receipt cites the label (the harvest exists on the Surface).
     Pinned input folders (`inputs-*`, `_*-inputs`) stay while any config pins them.
-    `eden_test.py up` refuses a pin in another run folder unless its name starts with `_` or
-    `--allow-volatile-pins` is given.
+    `eden_test.py check`, `up` and `all` refuse active pins, instance sources or games in another run folder unless
+    its name starts with `_` or `--allow-volatile-pins` is given; move pinned `inputs-*` folders to `_<name>/`.
   - **Lane caches** (`/home/intpa/build-hosts/lanes/<lane>`): each lane deletes its own cache when its branch
     merges or the lane ends. Another worker may delete a cache only when it is unused, unwritten for 6 h and not the
     newest dir of an active lane family.

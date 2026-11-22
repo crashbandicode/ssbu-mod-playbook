@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for eden_test.py: fake lifecycle/runner/harvest scripts, temp run folders, no Eden."""
 import hashlib
+import importlib.util
 import json
 import shutil
 import sys
@@ -313,20 +314,22 @@ class VolatilePinsTests(unittest.TestCase):
         (self.run / 'rows/rows.json').write_text(json.dumps({
             'setup': [{'state': 'Training', 'via': 'segment', 'ref': 's1'}], 'rows': []}))
         self.pin = str(self.root / 'old' / 'plugins' / 'plugin.nro')
-        (self.run / 'config.json').write_text(json.dumps({'instances': [{'plugins': [{'path': self.pin}]}]}))
+        (self.run / 'config.json').write_text(json.dumps(
+            {'instances': [{'plugins': [{'path': self.pin, 'sha256': 'a' * 64}]}]}))
 
     def test_only_sibling_run_paths_are_listed(self):
         second = str(self.root / 'z-run' / 'data.json')
-        config = {'nested': [{'plugin': self.pin}, second, self.pin],
-                  'shared': str(self.root / '_shared-inputs' / 'plugin.nro'),
-                  'own': str(self.run / 'inputs' / 'settings.json'),
-                  'relative': 'old/plugins/plugin.nro',
-                  'outside': str(self.root.parent / 'runs-other' / 'old' / 'plugin.nro'),
-                  'folder': str(self.root / 'old'),
-                  'shared_folder': str(self.root / '_shared-inputs'),
-                  'own_folder': str(self.run),
-                  'root': str(self.root),
-                  'normalized': str(self.root / 'old' / '..' / '_shared-inputs' / 'settings.json')}
+        pin = lambda value: {'path': value, 'sha256': 'a' * 64}
+        config = {'nested': [{'plugin': pin(self.pin)}, pin(second), pin(self.pin)],
+                  'shared': pin(str(self.root / '_shared-inputs' / 'plugin.nro')),
+                  'own': pin(str(self.run / 'inputs' / 'settings.json')),
+                  'relative': pin('old/plugins/plugin.nro'),
+                  'outside': pin(str(self.root.parent / 'runs-other' / 'old' / 'plugin.nro')),
+                  'folder': pin(str(self.root / 'old')),
+                  'shared_folder': pin(str(self.root / '_shared-inputs')),
+                  'own_folder': pin(str(self.run)),
+                  'root': pin(str(self.root)),
+                  'normalized': pin(str(self.root / 'old' / '..' / '_shared-inputs' / 'settings.json'))}
         self.assertEqual(eden_test.volatile_pins(config, self.run),
                          [(str(self.root / 'old'), 'old'), (self.pin, 'old'), (second, 'z-run')])
 
@@ -348,6 +351,73 @@ class VolatilePinsTests(unittest.TestCase):
         self.assertIn('dry run failed', str(caught.exception))
         sh.assert_called_once()
         lifecycle.assert_not_called()
+
+
+class ActivePinTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'runs'
+        self.run = self.root / 'new'
+        (self.run / 'rows').mkdir(parents=True)
+        (self.run / 'rows/rows.json').write_text(json.dumps(
+            {'setup': [{'state': 'Training', 'via': 'segment', 'ref': 's1'}], 'rows': []}))
+        self.old = str(self.root / 'old' / 'plugins' / 'plugin.nro')
+        self.shared = str(self.root / '_shared' / 'plugin.nro')
+        self.config = {'plugin_swaps': [{'from': self.old, 'from_sha256': '1' * 64, 'to': self.shared}],
+                       'notes': str(self.root / 'notes' / 'history'),
+                       'instances': [{'key': 'a', 'plugins': [{'path': self.shared, 'sha256': '2' * 64}]}]}
+
+    def save(self):
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+
+    def test_historical_swap_path_does_not_block_up(self):
+        self.save()
+        with mock.patch.object(eden_test, 'sh', return_value=1) as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('dry run failed', str(caught.exception))
+        sh.assert_called_once()
+
+    def test_active_pin_source_and_game_are_listed_by_up(self):
+        self.config['instances'][0].update(source=str(self.root / 'profile-run'),
+                                           game=str(self.root / 'game-run' / 'game.xci'))
+        pin = str(self.root / 'pin-run' / 'plugin.nro')
+        self.config['instances'][0]['plugins'].append({'path': pin, 'sha256': 'a' * 64})
+        self.save()
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        for path in (str(self.root / 'profile-run'), str(self.root / 'game-run' / 'game.xci'), pin):
+            self.assertIn(path, str(caught.exception))
+        self.assertNotIn(self.old, str(caught.exception))
+        sh.assert_not_called()
+
+    def test_pin_walk_matches_lifecycle(self):
+        lifecycle_path = Path(__file__).resolve().parent.parent / 'eden-lifecycle' / 'lifecycle.py'
+        spec = importlib.util.spec_from_file_location('lifecycle_for_pin_test', lifecycle_path)
+        lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lifecycle)
+        sample = {'pin': {'path': self.old, 'sha256': 'a' * 64, 'nested': [
+            {'path': self.shared, 'sha256': 'b' * 64}]}, 'bad': {'path': '/x', 'sha256': 'A' * 64},
+            'plugin_swaps': self.config['plugin_swaps']}
+        self.assertEqual([p['path'] for p in eden_test.iter_pin_nodes(sample)],
+                         [p['path'] for p in lifecycle.iter_pin_nodes(sample)])
+
+    def test_all_flags_reach_dry_run(self):
+        self.config['instances'][0]['source'] = str(self.root / 'old')
+        self.save()
+        (self.run / 'rows/rows.json').write_text('{"rows": []}')
+        argv = ['all', '--from', 'unused', '--label', 'unused', '--rows', 'unused',
+                '--skip-setup-plan', '--allow-volatile-pins']
+        with mock.patch.object(eden_test, 'cmd_new', return_value=self.run), \
+                mock.patch.object(eden_test, 'sh', return_value=1) as sh, \
+                mock.patch.object(eden_test, 'cmd_down') as down:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(argv)
+        self.assertIn('dry run failed', str(caught.exception))
+        sh.assert_called_once()
+        down.assert_not_called()
 
 
 class EdenTestTests(unittest.TestCase):
