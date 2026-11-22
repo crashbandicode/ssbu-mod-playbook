@@ -2367,6 +2367,95 @@ def _tr_close(ctx, cap, metrics):
     })
 
 
+def _tr_path(path):
+    if not isinstance(path, list) or not path:
+        raise RuntimeError('Training Mod path must be a nonempty list')
+    result = []
+    for item in path:
+        if isinstance(item, str) and item:
+            result.append({'action': item})
+        elif (isinstance(item, dict) and item and set(item) <= {'action', 'row'}
+              and all(isinstance(value, str) and value for value in item.values())):
+            result.append(dict(item))
+        else:
+            raise RuntimeError('Training Mod path element needs action and/or row')
+    return result
+
+
+def _tr_identity(menu):
+    fields = ('action', 'row', 'row_id')
+    if any(not isinstance(menu.values.get(key), str) for key in fields) or not menu.values['action']:
+        raise RuntimeError('Training Mod focus identity is missing')
+    return tuple(menu.values[key] for key in fields)
+
+
+def _navigate_menu(io, menu, page, path, until):
+    for index, target in enumerate(path):
+        depth = _tr_depth(menu)
+        group = menu.values.get('group')
+        nested = depth > 0
+        if nested and (not isinstance(group, str) or not group.isdigit()):
+            raise RuntimeError('Training Mod Rows group is missing')
+        seen = set()
+        while not all(menu.values.get(key) == value for key, value in target.items()):
+            before = _tr_identity(menu) if nested else native_picker.number(menu, 'cursor')
+            if before in seen:
+                raise RuntimeError(f'Training Mod row not found before wrapping: {target!r}')
+            seen.add(before)
+            after = _tr_input(io, menu, 'main-menu-down', until)
+            if after.values.get('page') != page or _tr_depth(after) != depth:
+                raise RuntimeError('Training Mod page or depth changed while seeking row')
+            if nested:
+                if after.values.get('group') != group:
+                    raise RuntimeError('Training Mod Rows group changed while seeking row')
+                current = _tr_identity(after)
+                if current == before:
+                    raise RuntimeError('Training Mod focus identity did not change after Down')
+            else:
+                current = native_picker.number(after, 'cursor')
+                if current == before:
+                    raise RuntimeError('Training Mod cursor did not change after Down')
+            if current in seen:
+                raise RuntimeError(f'Training Mod row not found before wrapping: {target!r}')
+            menu = after
+        if index + 1 < len(path):
+            after = _tr_input(io, menu, 'tap-a1', until)
+            if after.values.get('page') != page or _tr_depth(after) != depth + 1:
+                raise RuntimeError('Training Mod page or depth did not enter the requested sub-screen')
+            if not isinstance(after.values.get('group'), str) or not after.values['group'].isdigit():
+                raise RuntimeError('Training Mod Rows group was not published after A')
+            _tr_identity(after)
+            menu = after
+    return menu
+
+
+def tr_goto(ctx, page, path, cap=30):
+    if page not in TR_PAGES:
+        raise RuntimeError(f'unknown Training Mod page {page!r}')
+    targets = _tr_path(path)
+    if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+        raise RuntimeError('Training Mod path needs a positive cap')
+    return _with_setup_metrics(ctx, lambda metrics: _tr_goto(ctx, page, path, targets, cap, metrics))
+
+
+def _tr_goto(ctx, page, path, targets, cap, metrics):
+    started = time.monotonic()
+    until = started + cap
+    io = BridgePickerIO(ctx)
+    menu, skipped = _open_menu(io, until, page)
+    menu = _navigate_menu(io, menu, page, targets, until)
+    _tr_identity(menu)
+    if not menu.values.get('focus'):
+        raise RuntimeError('Training Mod focus is missing')
+    elapsed = round((time.monotonic() - started) * 1000)
+    return _save(ctx, 'routes-tr-goto', {
+        'block': 'tr_goto', 'args': {'page': page, 'path': path, 'cap': cap},
+        'verified': {key: menu.values.get(key) for key in ('focus', 'page', 'group', 'cursor', 'action', 'row')}
+                    | {'depth': _tr_depth(menu)},
+        **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
+    })
+
+
 def drill_observe(ctx, attempts, cap, allow_stopped=False):
     if type(attempts) is not int or attempts <= 0 or type(cap) not in (int, float) or not 0 < cap < float('inf'):
         raise RuntimeError('drill observation needs positive attempts and cap')

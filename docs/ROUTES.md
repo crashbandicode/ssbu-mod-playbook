@@ -59,6 +59,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings and live roster both verified |
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
+| `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
 | `drill_observe` `{attempts, cap, allow_stopped}` | Guard Edge running with an armed attempt tracepoint | counted releases and terminal kinds, sequence/frame bounds, and running state |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
@@ -416,6 +417,11 @@ These paths require independent runtime proof.
 `routes:tr_open(page=None, cap=20)` opens the Training Mod menu and optionally returns to its page ring
 and reaches the named page. `routes:tr_close(cap=20)` backs out through each depth and closes it; it does
 not read settings. Both check the bridge owner and each handled menu input and report skipped work.
+
+`routes:tr_goto(page, path, cap=30)` opens the menu and walks action IDs, or objects containing `action` and/or
+the static `row` title, into nested Rows screens. It stops before activating the last row. At page depth a
+Down must move the published cursor; in a Rows screen it must change the published `(action,row,row_id)` identity
+with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed.
 
 `routes:drill_observe(attempts, cap, allow_stopped=False)` counts Guard Edge release and terminal markers from
 the trace, then checks `tr.menu.game.running`. It needs an armed records point targeting the
