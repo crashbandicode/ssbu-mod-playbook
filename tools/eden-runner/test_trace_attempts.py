@@ -460,6 +460,53 @@ class StartTests(ObserveTests):
 
         self.ctx.call = call
 
+    def test_wizard_dismissed_into_wrong_stopped_game_is_failure(self):
+        del self.ctx.instance['trace_jsonl']
+        self.io = StartIO(self.ctx)
+        send = self.io.send
+
+        def wrong_game(segment):
+            send(segment)
+            self.io.menu.update({'game': 'Eggs-ercise', 'game.running': '0'})
+
+        self.io.send = wrong_game
+        with self.assertRaisesRegex(RuntimeError, r'expected Guard the Edge running after start; saw game=.*Eggs-ercise.*running=.*0'):
+            self.invoke_start(cap=.05)
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+
+    def test_menu_start_into_wrong_stopped_game_is_failure(self):
+        del self.ctx.instance['trace_jsonl']
+        self.io = StartIO(self.ctx, wizard=False)
+        send = self.io.send
+
+        def wrong_game(segment):
+            send(segment)
+            if segment == 'tap-a1' and self.io.menu['open'] == '0':
+                self.io.menu.update({'game': 'Eggs-ercise', 'game.running': '0'})
+
+        self.io.send = wrong_game
+        with self.assertRaisesRegex(RuntimeError, r'expected Guard the Edge running after start; saw game=.*Eggs-ercise.*running=.*0'):
+            self.invoke_start(cap=.05)
+
+    def test_start_rechecks_game_after_trace_before_receipt(self):
+        self.io = StartIO(self.ctx)
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        self.pending = [json.dumps(release) + '\n']
+        check_stop = self.ctx.check_stop
+
+        def changed_after_start():
+            check_stop()
+            self.io.menu.update({'game': 'Eggs-ercise', 'game.running': '0'})
+
+        self.ctx.check_stop = changed_after_start
+        with self.assertRaisesRegex(RuntimeError, r'expected Guard the Edge running after start; saw game=.*Eggs-ercise.*running=.*0'):
+            self.invoke_start(expect={'cpu_kind': 0x53})
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+
     def test_pre_input_pyra_records_cannot_certify_start(self):
         self.io = StartIO(self.ctx)
         self.enable_planner()
