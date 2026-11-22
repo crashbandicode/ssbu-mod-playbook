@@ -254,6 +254,72 @@ class RunnerEntryTests(unittest.TestCase):
         gate = {'kind': 'state', 'provider': 'tr.menu', **spec}
         return self.r.state_gate('tr', 'g', gate, time.monotonic() + 1.5)
 
+    def cadence(self, *, poll_s=None):
+        from unittest import mock
+        import runner
+        import switch_hw
+
+        class Clock:
+            now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += seconds + .001
+
+        clock, asks = Clock(), []
+
+        def answer(_run, _request):
+            elapsed = clock.now - 100.0
+            asks.append(elapsed)
+            phase = 'flight' if .45 <= elapsed < .95 else 'waiting'
+            with self.log.open('a') as output:
+                output.write(block(len(asks), [f'phase={phase}']))
+
+        gate = {'kind': 'state', 'provider': 'tr.menu', 'where': {'phase': 'flight'}}
+        if poll_s is not None:
+            gate['poll_s'] = poll_s
+        with (mock.patch.object(runner.time, 'monotonic', side_effect=clock.monotonic),
+              mock.patch.object(runner.time, 'sleep', side_effect=clock.sleep),
+              mock.patch.object(switch_hw, 'bridge_v2', side_effect=answer)):
+            result = self.r.state_gate('tr', 'timed', gate, 101.0)
+        return asks, result
+
+    def test_poll_s_sees_half_second_phase_with_four_queries_within_a_second(self):
+        asks, result = self.cadence(poll_s=.2)
+        self.assertGreaterEqual(len(asks), 4)
+        self.assertLess(asks[-1], 1)
+        self.assertEqual(result['values']['phase'], 'flight')
+
+    def test_default_polling_retains_once_per_second_cadence(self):
+        from unittest import mock
+        import runner
+        import switch_hw
+
+        class Clock:
+            now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += seconds + .001
+
+        clock, asks = Clock(), []
+
+        def answer(_run, _request):
+            asks.append(clock.now - 100.0)
+            with self.log.open('a') as output:
+                output.write(block(len(asks), ['phase=waiting']))
+
+        with (mock.patch.object(runner.time, 'monotonic', side_effect=clock.monotonic),
+              mock.patch.object(runner.time, 'sleep', side_effect=clock.sleep),
+              mock.patch.object(switch_hw, 'bridge_v2', side_effect=answer)):
+            with self.assertRaisesRegex(RuntimeError, 'did not pass'):
+                self.r.state_gate('tr', 'timed', {'provider': 'tr.menu', 'where': {'phase': 'flight'}}, 101.0)
+        self.assertEqual(asks, [0.0])
+
     def test_a_focus_change_after_the_press_passes_and_names_the_press(self):
         self.baseline(block(5, MENU))
         self.press()

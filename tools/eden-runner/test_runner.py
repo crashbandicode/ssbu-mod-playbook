@@ -123,6 +123,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report['missing_segments'], ['to-blue'])
         self.assertEqual(report['result'], 'READY_TO_RECORD')
 
+    def test_state_gate_poll_s_validation(self):
+        state = {'kind': 'state', 'provider': 'tr.menu', 'where': {'phase': 'flight'}, 'cap': 1}
+        self.plan['gates']['timed'] = state
+        for value in (.05, 2, None, '0.2', True):
+            with self.subTest(invalid=value):
+                state['poll_s'] = value
+                self.manifest.write_text(json.dumps(self.plan))
+                errors = runner.dry_run(self.manifest)['errors']
+                self.assertIn('gate timed: poll_s must be between 0.1 and 1.0', errors)
+        for value in (.1, .2, 1, 1.0):
+            with self.subTest(valid=value):
+                state['poll_s'] = value
+                self.manifest.write_text(json.dumps(self.plan))
+                errors = runner.dry_run(self.manifest)['errors']
+                self.assertNotIn('gate timed: poll_s must be between 0.1 and 1.0', errors)
+
     def test_dry_run_catches_broken_chain_hash_and_missing_recipe(self):
         self.plan['rows'][1]['start'] = 'elsewhere'
         self.plan['segments']['to-red']['sha256'] = '0' * 64

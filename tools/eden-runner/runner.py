@@ -734,6 +734,8 @@ def dry_run(manifest_path):
                 if gate.get('transition') not in (None, 'focus') or not (gate.get('where') or gate.get('transition')
                                                                          or gate.get('ack')):
                     errors.append(f'gate {name}: state needs "where", "transition": "focus" or "ack"')
+                if 'poll_s' in gate and (type(gate['poll_s']) not in (int, float) or not 0.1 <= gate['poll_s'] <= 1.0):
+                    errors.append(f'gate {name}: poll_s must be between 0.1 and 1.0')
             elif kind == 'hook':
                 load_hook(base, gate)
         except Exception as error:  # report every broken gate, not just the first
@@ -1894,7 +1896,7 @@ class Runner:
             raise RuntimeError(f'state: instance {on} has no bridge_log (bring it up with the bridge)')
         return Path(blog)
 
-    def _state_block(self, on, provider, cap, accept):
+    def _state_block(self, on, provider, cap, accept, ask_every=1.0):
         """Ask for fresh `state <provider>` blocks (the switch_hw spool, as for v2 reads) until one read after the
         request satisfies `accept(block)` -> (ok, why); returns (block, why) or raises with the last reason."""
         import state_gate
@@ -1903,7 +1905,7 @@ class Runner:
         start, until, asked, why = log.stat().st_size if log.exists() else 0, time.monotonic() + cap, 0.0, 'no block'
         while time.monotonic() < until:
             self.check_stop()
-            if time.monotonic() - asked > 1.0:
+            if time.monotonic() - asked > ask_every:
                 switch_hw.bridge_v2(log.parent, f'state {provider}')
                 asked = time.monotonic()
             with log.open('rb') as f:
@@ -1914,7 +1916,7 @@ class Runner:
                 if ok:
                     return block, why
                 break  # only the newest complete block decides; an older one is never fresher
-            time.sleep(.2)
+            time.sleep(min(.2, ask_every))
         raise RuntimeError(f'state {provider} did not pass within {cap} s: {why}')
 
     def _row_key(self):
@@ -1950,7 +1952,8 @@ class Runner:
             raise RuntimeError(f'gate {name}: press {pending!r} has no state_baseline for {provider} on {on} in this row')
         input_gate = pending is not None
         block, why = self._state_block(on, provider, max(0.1, until - time.monotonic()), lambda b: state_gate.satisfies(
-            b, gate.get('where', {}), base if input_gate else None, gate.get('transition'), gate.get('ack'), input_gate))
+            b, gate.get('where', {}), base if input_gate else None, gate.get('transition'), gate.get('ack'), input_gate),
+            ask_every=gate.get('poll_s', 1.0))
         if input_gate:
             self.state_marks.pop(key, None)  # one press, one baseline, one confirmation
             self.state_pending.pop((row, on), None)

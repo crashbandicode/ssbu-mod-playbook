@@ -13,6 +13,7 @@ taken before the input: passes on the first complete block newer than the baseli
 in which every `where` key is present and equal (values compare as the bridge sends them, strings unquoted).
 `"transition": "focus"` also needs `focus` to differ from the baseline's; `"ack": 1` needs `ack` exactly one past the
 baseline's with `ack.result` "handled". A bare revision change passes neither.
+`"poll_s"` sets the request interval from 0.1 to 1.0 seconds (default 1.0).
 """
 import re
 import zlib
