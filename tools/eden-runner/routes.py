@@ -3269,8 +3269,8 @@ def _start_expect(expect):
             valid = (isinstance(value, list) and len(value) == 2
                      and all(isinstance(word, str) and re.fullmatch(r'0x[0-9a-f]{8}', word) for word in value))
         else:
-            valid = (value == 'none' or (isinstance(value, list) and len(value) == 2
-                                         and all(type(item) is int and item >= 0 for item in value)))
+            valid = (value in ('none', 'any') or (isinstance(value, list) and len(value) == 2
+                                                  and all(type(item) is int and item >= 0 for item in value)))
         if not valid:
             raise RuntimeError(f'invalid first-release expect {key}')
     return expect
@@ -3421,6 +3421,8 @@ def _drill_start(ctx, game, expect, cap, metrics):
             if key == 'tolerance':
                 continue
             if key == 'plan':
+                if wanted == 'any':
+                    continue
                 actual = ([selected_plan['route'], selected_plan['row']] if selected_plan is not None else plan_value)
             elif key in ('cpu', 'p1'):
                 if 'tolerance' in expect:

@@ -477,6 +477,7 @@ A `plan` check needs the armed symbolic `planner_chose` point and holds the bloc
 matching-ordinal terminal. `'none'` requires no plan in the attempt and zero planner hits; a hit without
 a record is reported as not observed. The sequence fence assumes no recorded point has been removed
 from `trace.list`. It excludes stale queued records but does not itself prove the input/record ordering.
+`plan='any'` records the observed plan or its absence without asserting a particular value.
 The trace and bridge witnesses do not prove that the requested on-screen text was visibly rendered.
 
 `routes:drill_observe(attempts, cap, game='Guard the Edge', perfect=None, allow_stopped=False,
