@@ -1,5 +1,6 @@
 import fcntl
 import json
+import socket
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,15 @@ BOOT = ('379690490 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=inst
         'heap_register=1 guards=0x7fffff tr_export=available server=started result=installed '
         'heap_allocations=9 heap_install=9')
 READY = '379729902 [Bridge] chord ready'
+LISTENING = '379738760 [Bridge] listening port=6979 rebinds=0'
 ON = '379738765 [Bridge] toggle phase=on gen=1 reason=pad_chord source=pad_chord fixture=closed indicator=on'
+FAIL_BOOT = ('382550829 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=installed indicator=hooked '
+             'native_ui=installed chord=deferred toggle=off reason=boot_default fixture=closed deluxe=absent '
+             'heap_register=1 guards=0x7fffff tr_export=available server=started result=installed '
+             'heap_allocations=9 heap_install=9')
+FAIL_READY = '382593020 [Bridge] chord ready'
+LISTEN_FAILED = '382602979 [Bridge] listen failed port=6979 call=bind errno=98 retry_ms=250'
+FAIL_ON = '382602983 [Bridge] toggle phase=on gen=1 reason=pad_chord source=pad_chord fixture=closed indicator=on'
 HELLO = ('[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0-rc.15 port=6979 guards=0x7fffff '
          'boot=0x46024760bd126949 uptime_ms=379738869 reconnects=0 event_latest=2 state_api=1 toggle_gen=1 '
          'toggle_reason=pad_chord refusals=0 last_refusal=none frame=5 wall=379738870')
@@ -62,7 +71,7 @@ class BridgeOnTests(unittest.TestCase):
         if self.seconds >= 3.1 and len([c for c in self.calls if c[0] == 'input.button']) >= 4:
             if ON not in self.events.read_text():
                 with self.events.open('a') as stream:
-                    stream.write(ON + '\n')
+                    stream.write(LISTENING + '\n' + ON + '\n')
 
     def spawn(self, argv, **kwargs):
         self.popen.append((argv, kwargs))
@@ -86,6 +95,7 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual([call[1]['state'] for call in self.calls if call[0] == 'input.button'],
                          ['press'] * 4 + ['release'] * 4)
         self.assertEqual(receipt['chord']['event'], ON)
+        self.assertEqual(receipt['listening'], LISTENING)
         self.assertEqual((receipt['hello'], receipt['install'], receipt['backup'], receipt['backup_open']),
                          (HELLO, INSTALL, BACKUP, True))
         self.assertFalse(receipt['reused'])
@@ -106,7 +116,7 @@ class BridgeOnTests(unittest.TestCase):
         json.dumps(receipt)
 
     def test_bridge_on_reuses_locked_capture_and_skips_existing_on(self):
-        self.events.write_text(BOOT + '\n' + READY + '\n' + ON + '\n')
+        self.events.write_text(BOOT + '\n' + READY + '\n' + LISTENING + '\n' + ON + '\n')
         run = self.out / 'bridge-run'
         run.mkdir()
         (run / 'bridge.log').write_text(HELLO + '\n' + INSTALL + '\n' + BACKUP + '\n')
@@ -117,6 +127,7 @@ class BridgeOnTests(unittest.TestCase):
         self.assertTrue(receipt['reused'])
         self.assertEqual(receipt['capture']['pid'], 4312)
         self.assertEqual(receipt['chord'], {'chord': 'already on', 'event': ON})
+        self.assertEqual(receipt['listening'], LISTENING)
         self.assertEqual(self.popen, [])
         self.assertFalse(any(name == 'input.button' for name, _ in self.calls))
 
@@ -148,6 +159,81 @@ class BridgeOnTests(unittest.TestCase):
         self.assertIsNone(receipt['backup'])
         self.assertFalse(receipt['backup_open'])
         self.assertGreaterEqual(self.seconds, 15)
+
+    def test_bridge_on_refuses_real_bind_failure_before_starting_capture(self):
+        self.events.write_text('\n'.join((FAIL_BOOT, FAIL_READY, LISTEN_FAILED, FAIL_ON)) + '\n')
+        with self.assertRaises(RuntimeError) as error:
+            self.invoke(port=6979)
+        self.assertEqual(str(error.exception),
+                         'bridge_on: this Eden\'s bridge is not listening on port 6979; '
+                         'expected "[Bridge] listening port=6979" in its own events log, saw: '
+                         + LISTEN_FAILED + '. Another process holds the port: give the run its own free port '
+                         '(port.txt) and boot again. No capture was started.')
+        self.assertEqual(self.popen, [])
+        self.assertFalse((self.out / 'bridge-run' / 'capture.json').exists())
+        self.assertNotIn('bridge_log', self.ctx.runner.instances['offline'])
+
+    def test_bridge_on_refuses_listening_on_another_port_before_reuse(self):
+        other = '382602979 [Bridge] listening port=6978 rebinds=0'
+        self.events.write_text('\n'.join((FAIL_BOOT, FAIL_READY, other, FAIL_ON)) + '\n')
+        run = self.out / 'bridge-run'
+        run.mkdir()
+        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6979}))
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(RuntimeError) as error:
+                self.invoke(port=6979)
+        self.assertIn(other, str(error.exception))
+        self.assertEqual(self.popen, [])
+        self.assertNotIn('bridge_log', self.ctx.runner.instances['offline'])
+
+    def test_bridge_on_waits_for_own_listener(self):
+        self.events.write_text(BOOT + '\n' + READY + '\n' + ON + '\n')
+        sleep = self.sleep
+
+        def publish(amount):
+            sleep(amount)
+            if self.seconds >= .1 and LISTENING not in self.events.read_text():
+                with self.events.open('a') as stream:
+                    stream.write(LISTENING + '\n')
+
+        with patch.object(self, 'sleep', side_effect=publish):
+            receipt = self.invoke(port=6979)
+        self.assertEqual(receipt['listening'], LISTENING)
+        self.assertGreaterEqual(self.seconds, .1)
+
+
+class FreePortTests(unittest.TestCase):
+    def pair(self):
+        for _ in range(100):
+            first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            first.bind(('127.0.0.1', 0))
+            port = first.getsockname()[1]
+            second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if port == 65535:
+                    raise OSError('no next port')
+                second.bind(('127.0.0.1', port + 1))
+            except OSError:
+                first.close()
+                second.close()
+                continue
+            first.listen()
+            second.listen()
+            self.addCleanup(first.close)
+            self.addCleanup(second.close)
+            return port, second
+        self.fail('could not find two adjacent local test ports')
+
+    def test_free_port_skips_occupied_listener(self):
+        port, second = self.pair()
+        second.close()
+        self.assertEqual(routes.free_port(first=port, last=port + 1, host='127.0.0.1'), port + 1)
+
+    def test_free_port_refuses_fully_occupied_range(self):
+        port, _ = self.pair()
+        with self.assertRaisesRegex(RuntimeError, 'no free.*port'):
+            routes.free_port(first=port, last=port + 1, host='127.0.0.1')
 
 
 if __name__ == '__main__':
