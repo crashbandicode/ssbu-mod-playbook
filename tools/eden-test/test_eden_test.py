@@ -369,6 +369,58 @@ class IntervalAccountingTests(unittest.TestCase):
         self.assertEqual((split['setup'], split['test']), (0, 10))
         self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (1, 0))
 
+    def test_manifest_replacement_cannot_pair_one_version_with_another_hash(self):
+        rows_path = self.run / 'rows/rows.json'
+        original_rows = {'rows': [{'id': 'r1', 'start': 'training', 'end': 'training', 'role': 'test'}]}
+        replacement_rows = {'rows': [{'id': 'r1', 'start': 'training', 'end': 'training', 'role': 'setup'}]}
+        data_a, data_b = (json.dumps(value).encode() for value in (original_rows, replacement_rows))
+        hash_a, hash_b = (hashlib.sha256(data).hexdigest() for data in (data_a, data_b))
+        snapshots = self.run / 'out/manifests'
+        snapshots.mkdir()
+        (snapshots / f'{hash_b}.json').write_bytes(data_b)
+        original_read_bytes = Path.read_bytes
+        original_sha256 = eden_test.sha256
+        staging = rows_path.with_name('replacement.json')
+
+        def replace_manifest():
+            staging.write_bytes(data_b)
+            staging.replace(rows_path)
+
+        def replaced_sha256(path):
+            if path == rows_path:
+                replace_manifest()
+            return original_sha256(path)
+
+        for pinned, expected in ((hash_b, (10, 0)), (hash_a, (0, 10))):
+            with self.subTest(pinned=pinned):
+                rows_path.write_bytes(data_a)
+                self.receipt('r1.json', {'id': 'r1', 'start': 'training', 'end': 'training',
+                                         'started': 5, 'ended': 15, 'manifest_sha256': pinned})
+                reads = []
+
+                def interleaved_read(path):
+                    data = original_read_bytes(path)
+                    if path == rows_path:
+                        reads.append(path)
+                        replace_manifest()
+                    return data
+
+                with mock.patch.object(Path, 'read_bytes', interleaved_read), \
+                        mock.patch.object(eden_test, 'sha256', side_effect=replaced_sha256) as digest:
+                    split = eden_test.time_split(self.run)
+                self.assertEqual((split['setup'], split['test']), expected)
+                self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (1, 0))
+                self.assertFalse(any(call.args[0] == rows_path for call in digest.call_args_list))
+                self.assertEqual(reads, [rows_path])
+                self.assertEqual(rows_path.read_bytes(), data_b)
+
+    def test_missing_manifest_keeps_journal_attempt_without_a_current_hash(self):
+        (self.run / 'rows/rows.json').unlink()
+        self.journal([{'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['test'], split['attempts'], split['roles_from_manifest']), (10, 1, 0))
+        self.assertEqual(split['attempt_ids_not_in_manifest'], ['r1'])
+
     def test_old_receipt_without_snapshot_defaults_from_own_screens(self):
         self.rows[0]['role'] = 'test'
         self.set_rows()

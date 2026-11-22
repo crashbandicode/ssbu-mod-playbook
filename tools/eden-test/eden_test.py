@@ -571,7 +571,12 @@ def time_split(run):
     timing_path = run / 'timing.json'
     timing = json.loads(timing_path.read_text()) if timing_path.exists() else {}
     rows_path = run / 'rows' / 'rows.json'
-    spec = json.loads(rows_path.read_text()) if rows_path.exists() else []
+    try:
+        rows_data = rows_path.read_bytes()
+    except FileNotFoundError:
+        rows_data = None
+    spec = json.loads(rows_data) if rows_data is not None else []
+    current_sha = hashlib.sha256(rows_data).hexdigest() if rows_data is not None else None
     rows = spec.get('rows', []) if isinstance(spec, dict) else spec
     rows_by_id = {row['id']: row for row in rows}
     out = run / 'out'
@@ -618,7 +623,6 @@ def time_split(run):
                 if prior.get(field) is None and attempt.get(field) is not None:
                     prior[field] = attempt[field]
 
-    current_sha = sha256(rows_path) if rows_path.is_file() else None
     manifests = {}
 
     def manifest_row(attempt):
