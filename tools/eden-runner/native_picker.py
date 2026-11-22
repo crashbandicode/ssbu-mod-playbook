@@ -134,7 +134,7 @@ def wait_sample(io, provider, until, after=None, *, in_flight=False, loading_ui=
 
 
 def wait_scene_transition(io, before, until, source, target, *, label, pending_destinations=(),
-                          additional_targets=()):
+                          additional_targets=(), accept_source=False):
     """Wait for one already-sent scene-changing input, on the fenced connection."""
     destinations = [
         (candidate, {key: value for key, value in candidate.items() if key not in ('dialog', 'input.owner')})
@@ -167,6 +167,9 @@ def wait_scene_transition(io, before, until, source, target, *, label, pending_d
             all(values.get(key) == value for key, value in candidate.items())
             for candidate in (source, passive_source)
         ):
+            if (accept_source and observation > prior_observation
+                    and all(values.get(key) == value for key, value in source.items())):
+                return state
             continue
         if any(all(values.get(key) == value for key, value in pending.items())
                for pending in pending_destinations):

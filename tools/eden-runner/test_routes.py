@@ -1706,6 +1706,76 @@ class TrainingReturnTests(unittest.TestCase):
         self.assertEqual(result['looks'], ['css', 'games_and_more'])
         self.assertEqual(io.actions, ['leave-css', 'tap-b1'])
 
+    def test_held_then_foreign_main_before_games_is_rejected(self):
+        import test_native_picker as fixtures
+
+        io = self.IO('placed')
+        read = io.read
+        post_input_ui = 0
+
+        def foreign_then_games(provider, cap):
+            nonlocal post_input_ui
+            sample = read(provider, cap)
+            if provider == routes.native_picker.UI and io.actions:
+                post_input_ui += 1
+                if post_input_ui == 1:
+                    io.screen = 2
+                    return fixtures.native(io.revision, **{
+                        **routes._main_tab('smash'), 'input.owner': 'foreign', 'dialog': 'confirmation',
+                    })
+            return sample
+
+        io.read = foreign_then_games
+        with self.assertRaisesRegex(RuntimeError, 'unexpected Training return focus'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
+    def test_held_then_newer_sss_before_older_games_is_rejected(self):
+        import test_native_picker as fixtures
+
+        io = self.IO('placed')
+        read = io.read
+        post_input_ui = 0
+
+        def sss_then_older_games(provider, cap):
+            nonlocal post_input_ui
+            sample = read(provider, cap)
+            if provider == routes.native_picker.UI and io.actions:
+                post_input_ui += 1
+                if post_input_ui == 1:
+                    io.screen = 2
+                    return fixtures.native(900, **{**routes.TRAINING_SSS, 'focus': 'stage_select'})
+            return sample
+
+        io.read = sss_then_older_games
+        with self.assertRaisesRegex(RuntimeError, 'ssbu.ui: no newer active observation'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
+    def test_held_then_loading_and_settling_games_is_accepted(self):
+        import test_native_picker as fixtures
+
+        io = self.IO('placed')
+        read = io.read
+        post_input_ui = 0
+
+        def loading_then_games(provider, cap):
+            nonlocal post_input_ui
+            sample = read(provider, cap)
+            if provider == routes.native_picker.UI and io.actions:
+                post_input_ui += 1
+                if post_input_ui == 1:
+                    io.screen = 2
+                    return fixtures.loading(io.revision)
+                if post_input_ui == 2:
+                    return fixtures.native(io.revision, **routes._GAMES_TRAINING_SETTLING)
+            return sample
+
+        io.read = loading_then_games
+        result = self.execute(io)
+        self.assertEqual(result['looks'], ['css', 'games_and_more'])
+        self.assertEqual(io.actions, ['leave-css', 'tap-b1'])
+
     def test_held_tile_then_foreign_main_dialog_is_rejected(self):
         io = self.IO('placed')
         read = io.read

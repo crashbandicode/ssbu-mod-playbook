@@ -1320,11 +1320,13 @@ def _take_back_training_token(io, state):
             raise RuntimeError('a tile step arrived while taking back the local token')
         if current.values.get('local.token') == 'held':
             native_picker.token_held(current, 'css')
-            ui = native_picker.wait_sample(io, native_picker.UI, until, before, in_flight=True)
-            if _fields_match(ui, TRAINING_CSS):
-                io.finish()
-                return 'css-token-back', ui
-            break
+            ui = native_picker.wait_scene_transition(
+                io, before, until, TRAINING_CSS, TRAINING_SSS, label='Training return',
+                pending_destinations=(*_TRAINING_SSS_SETTLING, _GAMES_TRAINING_SETTLING),
+                additional_targets=(GAMES_TRAINING,), accept_source=True,
+            )
+            io.finish()
+            return ('css-token-back' if _fields_match(ui, TRAINING_CSS) else 'css'), ui
         if (current.values.get('local.token') != 'placed'
                 or any(current.values.get(key) != tile_before.values.get(key)
                        for key in _PLACED_IDENTITY)):
