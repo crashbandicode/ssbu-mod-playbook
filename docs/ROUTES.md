@@ -92,11 +92,13 @@ Set the CPU with the lane's own fixture and assert it with `fixture {"cpu": …}
 **Release builds: the plugin's own text.** `trace_text.py` reads pane names and text from text-setter trace records;
 arm the point in a boot step with the stub off, `trace.configure` and the same-build ELF. A `text` gate matches the
 newest text for a pane in the instance's `trace_jsonl`, optionally bound to a `point_id`. By default it reads records
-written during the row; `"whole_file": true` includes earlier records. An unreadable newest sample of a non-empty text
-leaves the text unknown; an empty request is read as empty text. Transition `measured` has earlier different text on
-the same pane key; `unmeasured` has the same earlier text
-without a different observation; `sampled` has no earlier observation on that key and shows only that text was
-requested. This reader and gate are host-tested on a real trace excerpt, not yet proven in a live boot.
+written during the row; `"whole_file": true` includes earlier records. Any newer record that concerns the pane but
+cannot be read (text, length, sequence, address), and any trace loss line, leaves the pane's text unknown until a newer
+readable record. An empty request is read as empty text. Transition `measured` has earlier different text on the same
+pane key; `unmeasured` has the same earlier text without a different observation; `sampled` has no earlier observation
+on that key and shows only that text was requested. Transition and `previous` come from the gate's scope only, and
+`before_scope` gives the newest readable text on the same pane key before it. This reader and gate are host-tested on a
+real trace excerpt, not yet proven in a live boot.
 At the setter's entry, a text record is a request and proves neither that the text was written nor that the pane is
 visible or focused. Bind `point_id` to the game's write-call point when a write must be shown, and use a still or
 another state source for visibility, focus and positions.

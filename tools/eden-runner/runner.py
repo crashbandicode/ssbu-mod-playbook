@@ -1788,15 +1788,16 @@ class Runner:
                                                     point_id=gate.get('point_id'), keys=keys)
                     for latest in found:
                         history.append(latest)
-                        keys.add(latest['pane'])
+                        if isinstance(latest['pane'], str):
+                            keys.add(latest['pane'])
                         if whole_file or latest['at'] >= row_start:
                             record = latest
                 if record and record['known'] and pattern.search(record['text']) and time.monotonic() <= until:
-                    transition, previous = trace_text.transition(history)
+                    transition, previous, before_scope = trace_text.transition(history, row_start)
                     evidence = {'pane': gate['pane'], 'text': record['text'],
                                 'sequence': record['sequence'], 'frame': record['frame'],
                                 'pane_key': record['pane'], 'scope': 'whole_file' if whole_file else 'row',
-                                'transition': transition, 'previous': previous}
+                                'transition': transition, 'previous': previous, 'before_scope': before_scope}
                     if 'point_id' in gate:
                         evidence['point_id'] = record['point_id']
                     self.log({'gate': name, 'on': on, 'pass': True, **evidence})
@@ -1928,7 +1929,7 @@ class Runner:
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
         self.failure_evidence(on, name)
         missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
-        unreadable = (f'; newest sample unreadable (sequence {record["sequence"]})'
+        unreadable = (f'; newest sample unreadable (sequence {record["sequence"]}: {record["why"]})'
                       if kind == 'text' and record and not record['known'] else '')
         raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}{unreadable}')
 

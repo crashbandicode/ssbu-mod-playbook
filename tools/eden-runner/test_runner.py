@@ -384,6 +384,126 @@ class TextGateTests(unittest.TestCase):
     def write_records(self, *records):
         self.trace.write_text(''.join(json.dumps(record) + '\n' for record in records))
 
+    def run_row_records(self, *records):
+        r = self.make()
+
+        def append():
+            with self.trace.open('a') as f:
+                f.write(''.join(json.dumps(record) + '\n' for record in records))
+
+        with mock.patch.object(r, 'session_start', side_effect=append):
+            return r.run()
+
+    def test_row_unknown_length_invalidates_and_later_valid_recovers(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged.update(sequence='1732', frame='5524')
+        damaged['registers'].pop('x2')
+        damaged['captures'][1] = {'error': 'memory_unavailable'}
+        recovered = copy.deepcopy(valid)
+        recovered.update(sequence='1733', frame='5525')
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_row_records(valid, damaged)
+        self.assertIn('unreadable', str(caught.exception))
+        self.assertIn('1732', str(caught.exception))
+        self.assertIn('no length register', str(caught.exception))
+        (self.out / 'STOP-INPUT').unlink()
+        self.trace.write_bytes(b'')
+        self.run_row_records(valid, damaged, recovered)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], evidence['scope']), (1733, 'row'))
+
+    def test_row_missing_sequence_invalidates_earlier_match(self):
+        valid = self.fixture_record()
+        damaged = copy.deepcopy(valid)
+        damaged.pop('sequence')
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_row_records(valid, damaged)
+        self.assertIn('unreadable', str(caught.exception))
+        self.assertIn('no sequence or frame', str(caught.exception))
+
+    def test_row_missing_address_or_point_invalidates_earlier_match(self):
+        valid = self.fixture_record()
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        for missing, why in (('address', 'no pane address'), ('point', 'no point id')):
+            with self.subTest(missing=missing):
+                damaged = copy.deepcopy(valid)
+                damaged.update(sequence='1732', frame='5524')
+                if missing == 'address':
+                    damaged['registers'].pop('x0')
+                else:
+                    damaged.pop('point_id')
+                self.trace.write_bytes(b'')
+                with self.assertRaises(RuntimeError) as caught:
+                    self.run_row_records(valid, damaged)
+                self.assertIn('1732', str(caught.exception))
+                self.assertIn(why, str(caught.exception))
+                (self.out / 'STOP-INPUT').unlink()
+
+    def test_row_loss_marker_invalidates_and_later_valid_recovers(self):
+        valid = self.fixture_record()
+        recovered = copy.deepcopy(valid)
+        recovered.update(sequence='1733', frame='5525')
+        loss = {'schema': 1, 'event': 'loss', 'records': '7'}
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_row_records(valid, loss)
+        self.assertIn('trace loss (7 records)', str(caught.exception))
+        (self.out / 'STOP-INPUT').unlink()
+        self.trace.write_bytes(b'')
+        self.run_row_records(valid, loss, recovered)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['sequence'], evidence['scope']), (1733, 'row'))
+
+    def test_row_other_pane_name_does_not_invalidate_even_at_same_address(self):
+        lines = self.trace.read_bytes().splitlines()
+        valid, other = json.loads(lines[9]), json.loads(lines[5])
+        other.update(sequence='1732', frame='5524', point_id=valid['point_id'])
+        for same_address in (False, True):
+            with self.subTest(same_address=same_address):
+                other['registers']['x0'] = valid['registers']['x0'] if same_address else '0xdeadbeef'
+                self.trace.write_bytes(b'')
+                self.plan['gates']['pane'].pop('whole_file', None)
+                self.plan['gates']['pane'].update(point_id=1, cap=.03)
+                (self.out / 'r1.json').unlink(missing_ok=True)
+                self.run_row_records(valid, other)
+                evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+                self.assertEqual((evidence['sequence'], evidence['scope']), (1730, 'row'))
+
+    def test_row_transition_uses_only_row_and_reports_prior_scope(self):
+        lines = self.trace.read_bytes().splitlines()
+        empty, valid = json.loads(lines[1]), json.loads(lines[9])
+        repeat = copy.deepcopy(valid)
+        repeat.update(sequence='1732', frame='5524')
+        self.write_records(empty, valid)
+        self.plan['gates']['pane'].pop('whole_file')
+        self.plan['gates']['pane'].update(point_id=1, cap=.03)
+        self.run_row_records(repeat)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['transition'], evidence['previous']), ('row', 'sampled', None))
+        self.assertEqual(evidence['before_scope'],
+                         {'text': 'Fighters & Stages  >  CPU Character   page 1 of 1',
+                          'sequence': 1730, 'frame': 5523, 'pane': valid['registers']['x0']})
+
+        (self.out / 'r1.json').unlink()
+        self.write_records(empty, valid)
+        changed = copy.deepcopy(empty)
+        changed.update(sequence='1732', frame='5524')
+        repeat.update(sequence='1733', frame='5525')
+        self.run_row_records(changed, repeat)
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['transition'], evidence['previous']['sequence']), ('measured', 1732))
+        self.assertEqual(evidence['before_scope']['sequence'], 1730)
+
     def test_text_unknown_capture_fails_and_newer_good_record_recovers(self):
         valid = self.fixture_record()
         self.assertGreater(int(valid['registers']['x2'], 0), 0)
@@ -413,16 +533,16 @@ class TextGateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
             self.make().run()
 
-    def test_text_capture_error_without_length_is_not_a_sample(self):
+    def test_text_capture_error_without_length_is_unknown(self):
         valid = self.fixture_record()
         damaged = copy.deepcopy(valid)
         damaged['sequence'], damaged['frame'] = '1732', '5524'
         damaged['registers'].pop('x2')
         damaged['captures'][1] = {'error': 'memory_unavailable'}
-        self.assertIsNone(runner.trace_text.parse(json.dumps(damaged)))
+        self.assertEqual(runner.trace_text.parse(json.dumps(damaged))['why'], 'no length register')
         self.write_records(damaged)
         self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
-        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+        with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732.*no length register'):
             self.make().run()
 
     def test_unrelated_pane_capture_loss_does_not_invalidate(self):
@@ -454,7 +574,7 @@ class TextGateTests(unittest.TestCase):
         del valid['frame']
         self.write_records(valid)
         self.plan['gates']['pane'].update(whole_file=True, cap=.03)
-        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
+        with self.assertRaisesRegex(RuntimeError, 'unreadable.*no sequence or frame'):
             self.make().run()
 
     def test_text_gate_defaults_to_row_scope_and_whole_file_is_explicit(self):
@@ -509,7 +629,7 @@ class TextGateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
                 r.run()
 
-    def test_row_scope_uses_pre_row_observation_for_transition(self):
+    def test_row_scope_keeps_pre_row_observation_separate_from_transition(self):
         lines = self.trace.read_bytes().splitlines()
         empty, valid = json.loads(lines[1]), json.loads(lines[9])
         self.write_records(empty)
@@ -523,8 +643,8 @@ class TextGateTests(unittest.TestCase):
         with mock.patch.object(r, 'session_start', side_effect=append):
             r.run()
         evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
-        self.assertEqual((evidence['scope'], evidence['transition'], evidence['previous']['sequence']),
-                         ('row', 'measured', 82))
+        self.assertEqual((evidence['scope'], evidence['transition'], evidence['previous']), ('row', 'sampled', None))
+        self.assertEqual(evidence['before_scope']['sequence'], 82)
 
     def test_row_scope_captures_path_object_trace_offset(self):
         self.write_records(self.fixture_record())
@@ -595,7 +715,8 @@ class TextGateTests(unittest.TestCase):
                          {'pane': 'tr_crumb', 'text': 'Fighters & Stages  >  CPU Character   page 1 of 1',
                           'sequence': 1731, 'frame': 5523, 'pane_key': pane_key, 'scope': 'whole_file',
                           'transition': 'measured',
-                          'previous': {'text': '', 'sequence': 311, 'frame': 5285, 'pane': pane_key}})
+                          'previous': {'text': '', 'sequence': 311, 'frame': 5285, 'pane': pane_key},
+                          'before_scope': None})
         self.assertEqual(r.last_gate_outcome['role'], 'trace')
         self.assertEqual(runner.harness.assertion_role({'kind': 'text', 'asserts': 'effect'}), 'effect')
 

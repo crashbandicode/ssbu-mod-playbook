@@ -33,7 +33,7 @@ def decimal(value):
 
 
 def pane_name(captures, name_at):
-    if (not isinstance(captures, list) or len(captures) != 2 or
+    if (not isinstance(captures, list) or not captures or
             not isinstance(captures[0], dict) or captures[0].get('error')):
         return None
     try:
@@ -62,34 +62,50 @@ def parse_key(raw):
 def parse(raw, name_at=NAME_AT):
     try:
         record = json.loads(raw)
-        if not isinstance(record, dict):
-            return None
-        caps, regs = record.get('captures'), record.get('registers')
-        name = pane_name(caps, name_at)
-        if (name is None or not isinstance(regs, dict) or not isinstance(regs.get('x0'), str) or 'x2' not in regs):
-            return None
-        units = int(regs['x2'], 0) & 0xffffffff
-        result = {'name': name, 'sequence': decimal(record.get('sequence')), 'frame': decimal(record.get('frame')),
-                  'wall_time_ns': record.get('wall_time_ns'), 'pane': regs['x0'], 'pc': regs.get('pc'),
-                  'point_id': record.get('point_id')}
-        if units == 0:
-            if result['sequence'] is None or result['frame'] is None:
-                return None
-            return dict(result, text='', known=True)
-        if not isinstance(caps[1], dict):
-            return None
-        if caps[1].get('error'):
-            return dict(result, text=None, known=False, why=str(caps[1]['error']))
-        if units > MAX_UNITS:
-            return dict(result, text=None, known=False, why='text length exceeds limit')
-        data = bytes.fromhex(caps[1].get('hex', ''))
-        if len(data) < 2 * units:
-            return dict(result, text=None, known=False, why='text capture too short')
-        if result['sequence'] is None or result['frame'] is None:
-            return None
-        return dict(result, text=data[:2 * units].decode('utf-16-le', 'replace'), known=True)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
         return None
+    if not isinstance(record, dict):
+        return None
+    caps, regs = record.get('captures'), record.get('registers')
+    name = pane_name(caps, name_at)
+    if name is None:
+        return None
+    regs = regs if isinstance(regs, dict) else {}
+    pane = regs.get('x0') if isinstance(regs.get('x0'), str) else None
+    result = {'name': name, 'sequence': decimal(record.get('sequence')), 'frame': decimal(record.get('frame')),
+              'wall_time_ns': record.get('wall_time_ns'), 'pane': pane, 'pc': regs.get('pc'),
+              'point_id': record.get('point_id')}
+    try:
+        value = regs.get('x2')
+        units = (int(value, 0) if isinstance(value, str) else value if type(value) is int else None)
+        units = units & 0xffffffff if units is not None else None
+    except ValueError:
+        units = None
+    if pane is None:
+        return dict(result, text=None, known=False, why='no pane address')
+    if units is None:
+        return dict(result, text=None, known=False, why='no length register')
+    if units > MAX_UNITS:
+        return dict(result, text=None, known=False, why='text length exceeds limit')
+    text = ''
+    if units:
+        capture = caps[1] if len(caps) > 1 and isinstance(caps[1], dict) else {}
+        if capture.get('error'):
+            return dict(result, text=None, known=False, why=f'text capture error: {capture["error"]}')
+        try:
+            data = bytes.fromhex(capture.get('hex', ''))
+        except (TypeError, ValueError):
+            data = b''
+        if len(data) < 2 * units:
+            return dict(result, text=None, known=False, why='text capture too short')
+        text = data[:2 * units].decode('utf-16-le', 'replace')
+    if result['sequence'] is None or result['frame'] is None:
+        return dict(result, text=None, known=False, why='no sequence or frame')
+    return dict(result, text=text, known=True)
+
+
+def matches_point(record, point_id):
+    return point_id is None or record['point_id'] is None or str(record['point_id']) == str(point_id)
 
 
 def scan(path, name=None, since=0, name_at=NAME_AT, point_id=None, keys=()):
@@ -115,24 +131,36 @@ def scan(path, name=None, since=0, name_at=NAME_AT, point_id=None, keys=()):
             if not raw or not raw.endswith(b'\n'):
                 break
             offset = stream.tell()
-            if needle is not None and needle not in raw and not any(key in raw for key in key_needles):
+            if (needle is not None and needle not in raw and b'"loss"' not in raw
+                    and not any(key in raw for key in key_needles)):
                 continue
-            record = parse(raw, name_at)
+            record = None
+            if name is not None and b'"loss"' in raw:
+                try:
+                    source = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+                    source = None
+                if isinstance(source, dict) and source.get('event') == 'loss':
+                    record = {'name': name, 'text': None, 'known': False,
+                              'why': f'trace loss ({source.get("records")} records)', 'loss': True,
+                              'sequence': None, 'frame': None, 'pane': None, 'point_id': None,
+                              'wall_time_ns': None, 'pc': None}
+            if record is None:
+                record = parse(raw, name_at)
             if record is None and name is not None and keys:
                 key = parse_key(raw)
-                if key and key[0] in keys and (point_id is None or
-                                                (key[1] is not None and str(key[1]) == str(point_id))):
+                if key and key[0] in keys:
                     source = json.loads(raw)
                     if pane_name(source.get('captures'), name_at) is None:
                         record = {'name': name, 'text': None, 'known': False, 'why': 'pane capture unreadable',
                                   'sequence': decimal(source.get('sequence')), 'frame': decimal(source.get('frame')),
                                   'wall_time_ns': source.get('wall_time_ns'), 'pane': key[0],
                                   'pc': source['registers'].get('pc'), 'point_id': key[1]}
-            if (record and (name is None or record['name'] == name) and
-                    (point_id is None or (record['point_id'] is not None
-                                          and str(record['point_id']) == str(point_id)))):
+            if record and (name is None or record['name'] == name) and matches_point(record, point_id):
+                if point_id is not None and record['point_id'] is None and record['known']:
+                    record = dict(record, text=None, known=False, why='no point id')
                 found.append(dict(record, at=at))
-                if name is not None:
+                if name is not None and isinstance(record['pane'], str):
                     keys.add(record['pane'])
                     key_needles.add(record['pane'].encode())
     return found, offset
@@ -147,12 +175,15 @@ def current(path, name, *, name_at=NAME_AT, point_id=None):
     return found[-1] if found else None
 
 
-def transition(found):
+def transition(found, since=0):
     final = found[-1]
-    earlier = [record for record in found[:-1] if record['known'] and record['pane'] == final['pane']]
+    prior = [record for record in found[:-1] if record['known'] and record['pane'] == final['pane']]
+    earlier = [record for record in prior if record['at'] >= since]
+    older = [record for record in prior if record['at'] < since]
     previous = next((record for record in reversed(earlier) if record['text'] != final['text']), None)
     previous = ({key: previous[key] for key in ('text', 'sequence', 'frame', 'pane')} if previous else None)
-    return ('measured' if previous else 'unmeasured' if earlier else 'sampled'), previous
+    before_scope = ({key: older[-1][key] for key in ('text', 'sequence', 'frame', 'pane')} if older else None)
+    return ('measured' if previous else 'unmeasured' if earlier else 'sampled'), previous, before_scope
 
 
 def bound(path, name, since, wanted):
@@ -161,16 +192,16 @@ def bound(path, name, since, wanted):
     older = found[:len(found) - len(window)]
     older_known = [record for record in older if record['known']]
     out = {'pane': name, 'records_before': len(older), 'records': len(window), 'ok': False, 'transition': None,
-           'text_before': older_known[-1]['text'] if older_known else None}
+           'text_before': older_known[-1]['text'] if older_known else None, 'previous': None, 'before_scope': None}
     if not window:
         return dict(out, why='no record in the window')
     final = window[-1]
+    kind, previous, before_scope = transition(found, since)
     out.update(text=final['text'], sequences=[window[0]['sequence'], final['sequence']],
-               frames=[window[0]['frame'], final['frame']], pane_key=final['pane'], previous=None)
+               frames=[window[0]['frame'], final['frame']], pane_key=final['pane'], before_scope=before_scope)
     if not final['known']:
         return dict(out, why='the newest sample for this pane is unreadable',
                     unknown={key: final[key] for key in ('sequence', 'frame', 'why')})
-    kind, previous = transition(found)
     out['previous'] = previous
     if not wanted(final['text']):
         return dict(out, why='the newest text is not the expected one')

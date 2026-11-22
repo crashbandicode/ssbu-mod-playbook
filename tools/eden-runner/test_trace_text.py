@@ -71,17 +71,23 @@ class TraceTextTests(unittest.TestCase):
                 record['captures'][1] = capture
                 parsed = trace_text.parse(json.dumps(record))
                 self.assertEqual((parsed['known'], parsed['text'], parsed['sequence']), (True, '', 75))
+        record = copy.deepcopy(original)
+        record['captures'].pop()
+        parsed = trace_text.parse(json.dumps(record))
+        self.assertEqual((parsed['known'], parsed['text']), (True, ''))
         for field in ('sequence', 'frame'):
             record = copy.deepcopy(original)
             record.pop(field)
-            self.assertIsNone(trace_text.parse(json.dumps(record)))
+            parsed = trace_text.parse(json.dumps(record))
+            self.assertEqual((parsed['known'], parsed['why']), (False, 'no sequence or frame'))
         for x2 in (None, 'not-hex'):
             record = copy.deepcopy(original)
             if x2 is None:
                 record['registers'].pop('x2')
             else:
                 record['registers']['x2'] = x2
-            self.assertIsNone(trace_text.parse(json.dumps(record)))
+            parsed = trace_text.parse(json.dumps(record))
+            self.assertEqual((parsed['known'], parsed['why']), (False, 'no length register'))
 
     def test_parse_rejects_malformed_records(self):
         good = synthetic()
@@ -89,9 +95,6 @@ class TraceTextTests(unittest.TestCase):
         for change in (
             lambda r: r.update(captures=[]),
             lambda r: r['captures'][0].update(error='memory_unavailable'),
-            lambda r: r['registers'].pop('x0'),
-            lambda r: r['registers'].pop('x2'),
-            lambda r: r['registers'].update(x2='not-hex'),
             lambda r: r['captures'][0].update(hex='not-hex'),
         ):
             item = copy.deepcopy(good)
@@ -140,13 +143,16 @@ class TraceTextTests(unittest.TestCase):
 
     def test_bound_measured_unmeasured_and_failure_cases(self):
         crumb = trace_text.records(FIXTURE, 'tr_crumb')
-        measured = trace_text.bound(FIXTURE, 'tr_crumb', crumb[2]['at'], lambda text: text == CRUMB)
-        self.assertEqual((measured['ok'], measured['transition'], measured['text_before'], measured['text']),
-                         (True, 'measured', '', CRUMB))
-        self.assertEqual((measured['records_before'], measured['records']), (2, 2))
-        self.assertEqual((measured['sequences'], measured['frames']), ([1730, 1731], [5523, 5523]))
+        repeated_in_scope = trace_text.bound(FIXTURE, 'tr_crumb', crumb[2]['at'], lambda text: text == CRUMB)
+        self.assertEqual((repeated_in_scope['ok'], repeated_in_scope['transition'],
+                          repeated_in_scope['text_before'], repeated_in_scope['text']),
+                         (True, 'unmeasured', '', CRUMB))
+        self.assertEqual((repeated_in_scope['records_before'], repeated_in_scope['records']), (2, 2))
+        self.assertEqual((repeated_in_scope['sequences'], repeated_in_scope['frames']), ([1730, 1731], [5523, 5523]))
+        self.assertEqual(repeated_in_scope['before_scope']['sequence'], 311)
         repeated = trace_text.bound(FIXTURE, 'tr_crumb', crumb[3]['at'], lambda text: text == CRUMB)
-        self.assertEqual((repeated['ok'], repeated['transition'], repeated['text_before']), (True, 'measured', CRUMB))
+        self.assertEqual((repeated['ok'], repeated['transition'], repeated['text_before']), (True, 'sampled', CRUMB))
+        self.assertEqual(repeated['before_scope']['sequence'], 1730)
         empty = trace_text.bound(FIXTURE, 'tr_crumb', FIXTURE.stat().st_size, lambda text: True)
         self.assertEqual((empty['ok'], empty['transition'], empty['text_before'], empty['why']),
                          (False, None, CRUMB, 'no record in the window'))
@@ -214,6 +220,104 @@ class UnreadableTraceTests(unittest.TestCase):
         record['captures'][capture] = {'error': 'memory_unavailable'}
         return record
 
+    def test_identified_incomplete_records_are_unknown_with_reasons(self):
+        variants = []
+        no_length = copy.deepcopy(self.valid)
+        no_length['registers'].pop('x2')
+        variants.append((no_length, 'no length register'))
+        bad_length = copy.deepcopy(self.valid)
+        bad_length['registers']['x2'] = 'bad-length'
+        variants.append((bad_length, 'no length register'))
+        variants.append((self.damaged(), 'text capture error: memory_unavailable'))
+        short = copy.deepcopy(self.valid)
+        short['captures'][1] = {'hex': ''}
+        variants.append((short, 'text capture too short'))
+        invalid_hex = copy.deepcopy(self.valid)
+        invalid_hex['captures'][1] = {'hex': 'bad-hex'}
+        variants.append((invalid_hex, 'text capture too short'))
+        missing_capture = copy.deepcopy(self.valid)
+        missing_capture['captures'].pop()
+        variants.append((missing_capture, 'text capture too short'))
+        too_long = copy.deepcopy(self.valid)
+        too_long['registers']['x2'] = hex(trace_text.MAX_UNITS + 1)
+        variants.append((too_long, 'text length exceeds limit'))
+        no_sequence = copy.deepcopy(self.valid)
+        no_sequence.pop('sequence')
+        variants.append((no_sequence, 'no sequence or frame'))
+        no_frame = copy.deepcopy(self.valid)
+        no_frame.pop('frame')
+        variants.append((no_frame, 'no sequence or frame'))
+        no_address = copy.deepcopy(self.valid)
+        no_address['registers'].pop('x0')
+        variants.append((no_address, 'no pane address'))
+        for i, (item, why) in enumerate(variants):
+            with self.subTest(case=i, why=why):
+                sample = trace_text.parse(json.dumps(item))
+                self.assertIsNotNone(sample)
+                self.assertEqual((sample['name'], sample['known'], sample['text'], sample['why']),
+                                 ('tr_crumb', False, None, why))
+                self.assertEqual(sample['sequence'], trace_text.decimal(item.get('sequence')))
+                self.assertEqual(sample['frame'], trace_text.decimal(item.get('frame')))
+
+    def test_bound_scope_separates_in_window_transition_from_history(self):
+        repeat = copy.deepcopy(self.valid)
+        repeat.update(sequence='1732', frame='5524')
+        self.write(self.empty, self.valid)
+        since = self.path.stat().st_size
+        with self.path.open('a') as f:
+            f.write(json.dumps(repeat) + '\n')
+        result = trace_text.bound(self.path, 'tr_crumb', since, lambda text: text == CRUMB)
+        self.assertEqual((result['transition'], result['previous']), ('sampled', None))
+        self.assertEqual(result['before_scope'], {'text': CRUMB, 'sequence': 1730, 'frame': 5523,
+                                                   'pane': self.valid['registers']['x0']})
+        self.write(self.empty, self.valid)
+        since = self.path.stat().st_size
+        changed = copy.deepcopy(self.empty)
+        changed.update(sequence='1732', frame='5524')
+        repeat.update(sequence='1733', frame='5525')
+        with self.path.open('a') as f:
+            f.write(json.dumps(changed) + '\n' + json.dumps(repeat) + '\n')
+        result = trace_text.bound(self.path, 'tr_crumb', since, lambda text: text == CRUMB)
+        self.assertEqual((result['transition'], result['previous']['sequence']), ('measured', 1732))
+        self.assertEqual(result['before_scope']['sequence'], 1730)
+
+    def test_loss_marker_invalidates_until_newer_known_record(self):
+        loss = {'schema': 1, 'event': 'loss', 'records': '7'}
+        self.write(self.valid, loss)
+        found, _ = trace_text.scan(self.path, 'tr_crumb', point_id=1)
+        self.assertEqual(len(found), 2)
+        self.assertEqual((found[-1]['known'], found[-1]['why'], found[-1]['loss']),
+                         (False, 'trace loss (7 records)', True))
+        self.assertEqual([r['sequence'] for r in trace_text.records(self.path)], [1730])
+        self.assertFalse(trace_text.current(self.path, 'tr_crumb', point_id=1)['known'])
+        recovered = copy.deepcopy(self.valid)
+        recovered['sequence'] = '1733'
+        with self.path.open('a') as f:
+            f.write(json.dumps(recovered) + '\n')
+        self.assertEqual(trace_text.current(self.path, 'tr_crumb', point_id=1)['sequence'], 1733)
+
+    def test_point_binding_filters_other_points_and_invalidates_missing_point(self):
+        named_unknown = self.damaged()
+        keyed_unknown = self.damaged(capture=0)
+        for kind, sample in (('known', copy.deepcopy(self.valid)), ('named', named_unknown), ('keyed', keyed_unknown)):
+            with self.subTest(kind=kind):
+                sample['point_id'] = '2'
+                self.write(self.valid, sample)
+                self.assertEqual([r['sequence'] for r in trace_text.scan(self.path, 'tr_crumb', point_id=1)[0]],
+                                 [1730])
+                sample.pop('point_id')
+                self.write(self.valid, sample)
+                bound = trace_text.scan(self.path, 'tr_crumb', point_id=1)[0]
+                self.assertEqual(len(bound), 2)
+                self.assertFalse(bound[-1]['known'])
+                self.assertIsNone(bound[-1]['point_id'])
+                if kind == 'known':
+                    self.assertEqual((bound[-1]['text'], bound[-1]['why']), (None, 'no point id'))
+        no_point = copy.deepcopy(self.valid)
+        no_point.pop('point_id')
+        self.write(no_point)
+        self.assertTrue(trace_text.current(self.path, 'tr_crumb')['known'])
+
     def test_unreadable_text_is_a_named_unknown_even_without_metadata(self):
         record = self.damaged()
         self.assertGreater(int(record['registers']['x2'], 0), 0)
@@ -226,7 +330,7 @@ class UnreadableTraceTests(unittest.TestCase):
         parsed = trace_text.parse(json.dumps(record))
         self.assertEqual((parsed['known'], parsed['sequence'], parsed['frame']), (False, None, None))
         record['registers'].pop('x2')
-        self.assertIsNone(trace_text.parse(json.dumps(record)))
+        self.assertEqual(trace_text.parse(json.dumps(record))['why'], 'no length register')
         for update in ({'hex': ''},):
             short = copy.deepcopy(self.valid)
             short['captures'][1] = update
@@ -241,10 +345,12 @@ class UnreadableTraceTests(unittest.TestCase):
                 with self.subTest(field=field, value=value):
                     item = copy.deepcopy(self.valid)
                     item[field] = value
-                    self.assertIsNone(trace_text.parse(json.dumps(item)))
+                    sample = trace_text.parse(json.dumps(item))
+                    self.assertEqual((sample['known'], sample['why']), (False, 'no sequence or frame'))
             missing = copy.deepcopy(self.valid)
             del missing[field]
-            self.assertIsNone(trace_text.parse(json.dumps(missing)))
+            sample = trace_text.parse(json.dumps(missing))
+            self.assertEqual((sample['known'], sample['why']), (False, 'no sequence or frame'))
         parsed = trace_text.parse(json.dumps(self.valid))
         self.assertEqual((parsed['known'], parsed['sequence'], parsed['frame']), (True, 1730, 5523))
         self.valid.update(sequence=0, frame=7)
@@ -303,6 +409,13 @@ class UnreadableTraceTests(unittest.TestCase):
         self.write(foreign, self.valid)
         result = trace_text.bound(self.path, 'tr_crumb', 0, lambda text: text == CRUMB)
         self.assertEqual((result['transition'], result['previous']), ('sampled', None))
+        self.write(self.valid, foreign)
+        since = self.path.stat().st_size
+        with self.path.open('a') as f:
+            f.write(json.dumps(self.valid) + '\n')
+        result = trace_text.bound(self.path, 'tr_crumb', since, lambda text: text == CRUMB)
+        self.assertEqual((result['transition'], result['previous']), ('sampled', None))
+        self.assertEqual((result['text_before'], result['before_scope']['sequence']), ('', 1730))
 
     def test_bound_and_wait_report_unknown_latest_sample(self):
         self.write(self.valid, self.damaged())
