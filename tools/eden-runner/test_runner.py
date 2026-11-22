@@ -79,9 +79,9 @@ class ReviewClassTests(unittest.TestCase):
                        'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}],
             'recover': [{'run': 'routes:recover'}],
             'rows': [{'id': 'r1', 'start': 'menu', 'end': 'menu', 'start_gate': 'shared-gate',
-                      'recover': [{'run': 'routes_online:recover'}], 'on_failure_hook': 'routes:failure',
+                      'recover': [{'run': 'routes_online:recover'}],
                       'steps': [{'run': 'routes:to_main'}, {'play': 'shared'}, {'gate': 'shared-gate'},
-                                {'gif': {'steps': [{'run': 'routes_online:room'}]}}]}],
+                                {'shot': 'end'}]}],
         }
 
     def test_shared_hooks_segments_gates_and_reviewed_setup_are_library_only(self):
@@ -90,8 +90,8 @@ class ReviewClassTests(unittest.TestCase):
     def test_private_step_segment_gate_and_setup_are_listed(self):
         variants = [
             ('row r1 step 0', lambda p: p['rows'][0]['steps'][0].update(run='project.py:open')),
-            ('row r1 step 1', lambda p: p['segments']['shared'].pop('library')),
-            ('row r1 step 2', lambda p: p['gates']['shared-gate'].pop('library')),
+            ('segment shared', lambda p: p['segments']['shared'].pop('library')),
+            ('gate shared-gate', lambda p: p['gates']['shared-gate'].pop('library')),
             ('setup 0', lambda p: p.update(setup=[{'via': 'fixture'}])),
             ('setup 0', lambda p: p.update(setup=[{'via': 'record'}])),
         ]
@@ -105,14 +105,14 @@ class ReviewClassTests(unittest.TestCase):
                 self.assertTrue(all(item['what'] for item in report['private']))
 
     def test_nested_steps_recovery_and_failure_hook_are_listed(self):
-        self.plan['rows'][0]['steps'][3]['gif']['steps'].append({'run': 'project.py:nested'})
+        self.plan['rows'][0]['steps'][3] = {'gif': {'steps': [{'run': 'project.py:nested'}]}}
         self.plan['rows'][0]['recover'].append({'run': 'project.py:recover'})
         self.plan['rows'][0]['on_failure_hook'] = {'run': 'project.py:failure'}
         self.plan['recover'].append({'run': 'project.py:recover'})
         where = [item['where'] for item in runner.review_class(self.plan, Path('.'))['private']]
         self.assertIn('row r1 step 3', where)
         self.assertIn('row r1 recover 1', where)
-        self.assertIn('row r1 on_failure_hook', where)
+        self.assertIn('row r1', where)
         self.assertIn('plan recover 1', where)
 
     def test_segment_and_row_start_gates_are_reviewed(self):
@@ -120,8 +120,8 @@ class ReviewClassTests(unittest.TestCase):
         self.plan['segments']['shared']['start_gate'] = 'private'
         self.plan['rows'][0]['start_gate'] = 'private'
         where = [item['where'] for item in runner.review_class(self.plan, Path('.'))['private']]
-        self.assertIn('row r1 step 1', where)
-        self.assertIn('row r1 start_gate', where)
+        self.assertIn('segment shared', where)
+        self.assertIn('gate private', where)
 
     def test_dry_run_includes_review_without_changing_result(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -184,6 +184,55 @@ class ReviewAdmissionTests(unittest.TestCase):
         self.assertEqual(report['review'], {'class': 'library-only', 'private': []})
         self.assertEqual(report['roles_defaulted'], ['r1'])
 
+    def test_allowlist_rejects_reviewer_cases_and_unused_entries(self):
+        ref = self.dir / 'private-gate.png'
+        Image.new('RGB', (64, 36), RED).save(ref)
+
+        def private_gate(plan, name):
+            plan['gates'][name] = {'kind': 'image', 'reference': str(ref), 'sha256': sha(ref),
+                                   'roi': [0, 0, 64, 36], 'cap': 1}
+
+        def hook_gate(plan):
+            private_gate(plan, 'routes.main')
+            plan['rows'][0]['steps'].append({'run': 'routes:gate', 'args': {'name': 'main'}})
+
+        def retry_gate(plan):
+            private_gate(plan, 'menu')
+            plan['recover'] = [{'call': 'status'}]
+
+        def private_judge(plan):
+            plan['judge'] = {'cmd': 'custom.py'}
+            plan['rows'][0]['expected'] = 'a result'
+
+        def unused_segment(plan):
+            self.private_segment(plan)
+
+        def scaled(plan):
+            plan['segments'] = {}
+            plan['gates'] = {'main': {'library': 'main'}}
+            plan['rows'][0]['steps'] = [{'gate': 'main'}]
+            plan['scale'] = 'fit'
+
+        variants = [
+            ('gate routes.main', hook_gate),
+            ('gate menu', retry_gate),
+            ('plan key judge', private_judge),
+            ('plan key scale', scaled),
+            ('gate unused', lambda p: private_gate(p, 'unused')),
+            ('segment mine', unused_segment),
+            ('plan key surprise', lambda p: p.update(surprise=True)),
+            ('row r1 key surprise', lambda p: p['rows'][0].update(surprise=True)),
+            ('step 1 key unchecked', lambda p: p['rows'][0]['steps'][1].update(unchecked=True)),
+            ('step 5', lambda p: p['rows'][0]['steps'].append({'future_verb': 'x'})),
+        ]
+        for expected, change in variants:
+            with self.subTest(expected=expected):
+                plan = copy.deepcopy(self.plan)
+                change(plan)
+                review = self.report(plan)['review']
+                self.assertEqual(review['class'], 'full')
+                self.assertIn(expected, ' '.join(item['what'] for item in review['private']))
+
     def test_reviewer_cases_are_private(self):
         def raw_library_step(plan):
             self.private_segment(plan)
@@ -194,7 +243,7 @@ class ReviewAdmissionTests(unittest.TestCase):
             ('pattern', lambda p: p['gates']['installed'].update(pattern='.*')),
             ('custom.py:boot', lambda p: p['setup'][0].update(via='hook', ref='custom.py:boot')),
             ('fixture', lambda p: p['setup'][0].update(reviewed=None)),
-            ('custom.py:boot', lambda p: p.update(on_failure_hook='custom.py:boot')),
+            ('plan key on_failure_hook', lambda p: p.update(on_failure_hook='custom.py:boot')),
             ('settings.set', lambda p: p['rows'][0]['steps'].append({'call': 'settings.set'})),
             ('segment mine', raw_library_step),
         ]

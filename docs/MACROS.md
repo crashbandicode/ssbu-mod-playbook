@@ -182,8 +182,9 @@ The rules:
    saves (screenshots, log lines, a receipt per row). The dry run happens
    offline and checks that every file exists and matches its hash, that every
    gate loads, and that each row starts on the screen the row before it ends
-   on. Its `review` is `library-only` only for unchanged library entries,
-   shared hooks, read-only calls and a reviewed setup plan; otherwise it is
+   on. `library-only` means every plan, row and step key is on the runner's
+   allowlist and every gate and segment is an unchanged library import.
+   Shared hooks, read-only calls and a reviewed setup plan are also required; otherwise it is
    `full` with a list of private parts. This class does not change the
    dry-run result. No packet is admitted to light review by this class
    alone; the reviewers decide.

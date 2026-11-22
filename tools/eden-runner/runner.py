@@ -686,95 +686,82 @@ def publish_gif(raw_path, dest, spec, source_fps=None):
 
 def review_class(plan, base, raw_plan=None):
     private = []
-    segments, gates = plan.get('segments', {}), plan.get('gates', {})
+    segments = plan.get('segments', {})
     raw = plan if raw_plan is None else raw_plan
     raw_segments, raw_gates = raw.get('segments', {}), raw.get('gates', {})
     index = library_index()
-    active = set()
+    plan_keys = {'start', 'rows', 'segments', 'gates', 'setup', 'game_id', 'recover', 'on_failure', 'trace'}
+    row_keys = {'id', 'start', 'end', 'steps', 'role', 'evidence', 'budget_min', 'on_failure', 'recover', 'start_gate'}
+    step_keys = {'play': {'play', 'on'}, 'gate': {'gate', 'on'}, 'library': {'library', 'on'},
+                 'run': {'run', 'args', 'check', 'on'}, 'call': {'call', 'params', 'on', 'job_cap'},
+                 'shot': {'shot', 'on'}, 'mark': {'mark', 'on'}, 'copy': {'copy', 'on', 'as'},
+                 'json_diff': {'json_diff', 'on'}, 'wait_ms': {'wait_ms', 'on'}}
+    read_only = {'status', 'settings.get', 'trace.read', 'trace.counters', 'trace.list', 'modules.list',
+                 'tracepoint.status'}
 
     def add(where, what):
         private.append({'where': where, 'what': what})
 
     def imported(kind, name, entries, where):
         entry = entries.get(name, {})
-        if not isinstance(entry, dict) or entry.get('library') not in index.get(kind + 's', {}):
+        if (not isinstance(entry, dict) or not isinstance(entry.get('library'), str) or
+                entry['library'] not in index.get(kind + 's', {})):
             add(where, f'{kind} {name}')
         elif set(entry) != {'library'}:
             overrides = ', '.join(sorted(set(entry) - {'library'}))
             add(where, f'{kind} {name} overrides {overrides}')
 
-    def gate(name, where):
-        if ('gate', name) in active:
-            return
-        active.add(('gate', name))
-        entry = gates.get(name, {})
-        imported('gate', name, raw_gates, where)
-        if entry.get('recover'):
-            segment(entry['recover'], where)
-        active.remove(('gate', name))
-
-    def segment(name, where):
-        if ('segment', name) in active:
-            return
-        active.add(('segment', name))
-        entry = segments.get(name, {})
-        imported('segment', name, raw_segments, where)
-        if entry.get('start_gate'):
-            gate(entry['start_gate'], where)
-        active.remove(('segment', name))
-
     def library(name, where):
+        if not isinstance(name, str):
+            add(where, f'segment {name}')
+            return
         for seg_name, entry in segments.items():
             if seg_name == name or entry.get('library') == name:
-                segment(seg_name, where)
+                imported('segment', seg_name, raw_segments, where)
                 return
-        entry = index.get('segments', {}).get(name)
-        if entry is None:
+        if name not in index.get('segments', {}):
             add(where, f'segment {name}')
-        elif entry.get('start_gate') in gates:
-            gate(entry['start_gate'], where)
 
     def step(item, where):
         if not isinstance(item, dict):
+            add(where, f'{where} invalid step')
             return
-        if 'play' in item:
-            segment(item['play'], where)
-        if 'library' in item:
+        verbs = [key for key in STEP_KINDS if key in item]
+        if len(verbs) != 1:
+            add(where, f'{where} needs exactly one known verb')
+            return
+        verb = verbs[0]
+        if verb not in step_keys:
+            add(where, f'{verb} {item[verb]}')
+            return
+        for key in sorted(set(item) - step_keys[verb]):
+            add(where, f'{where} key {key}')
+        if verb == 'library':
             library(item['library'], where)
-        if 'gate' in item:
-            gate(item['gate'], where)
-        if 'run' in item:
-            hook(item['run'], where)
-        if 'call' in item and item['call'] not in ('status', 'settings.get', 'trace.read', 'trace.counters',
-                                                   'trace.list', 'modules.list', 'tracepoint.status'):
+        if verb == 'run' and (not isinstance(item['run'], str)
+                              or item['run'].partition(':')[0] not in SHARED_HOOKS):
+            add(where, f'hook {item["run"]}')
+        if verb == 'call' and (not isinstance(item['call'], str) or item['call'] not in read_only):
             add(where, f'call {item["call"]}')
-        if 'ui' in item:
-            add(where, f'ui {item["ui"]}')
-        if isinstance(item.get('gif'), dict):
-            for nested in item['gif'].get('steps') or []:
-                step(nested, where)
 
-    def hook(spec, where):
-        if isinstance(spec, dict):
-            spec = spec.get('run')
-        if isinstance(spec, str) and spec.partition(':')[0] not in SHARED_HOOKS:
-            add(where, f'hook {spec}')
-
-    for row in plan.get('rows', []):
+    for key in sorted(set(raw) - plan_keys):
+        add('plan', f'plan key {key}')
+    if 'on_failure' in raw and raw['on_failure'] not in ('continue', 'stop'):
+        add('plan', f'plan on_failure {raw["on_failure"]}')
+    for kind, entries in (('segment', raw_segments), ('gate', raw_gates)):
+        for name in entries:
+            imported(kind, name, entries, f'{kind} {name}')
+    for row in raw.get('rows', []):
         where = f'row {row["id"]}'
+        for key in sorted(set(row) - row_keys):
+            add(where, f'{where} key {key}')
         for i, item in enumerate(row.get('steps', [])):
             step(item, f'{where} step {i}')
         for i, item in enumerate(row.get('recover', []) if isinstance(row.get('recover', []), list) else []):
             step(item, f'{where} recover {i}')
-        if row.get('start_gate'):
-            gate(row['start_gate'], f'{where} start_gate')
-        if row.get('on_failure_hook'):
-            hook(row['on_failure_hook'], f'{where} on_failure_hook')
-    for i, item in enumerate(plan.get('recover', []) if isinstance(plan.get('recover', []), list) else []):
+    for i, item in enumerate(raw.get('recover', []) if isinstance(raw.get('recover', []), list) else []):
         step(item, f'plan recover {i}')
-    if plan.get('on_failure_hook'):
-        hook(plan['on_failure_hook'], 'plan on_failure_hook')
-    setup = plan.get('setup')
+    setup = raw.get('setup')
     if not isinstance(setup, list) or not setup:
         add('setup', 'no setup plan')
     else:
