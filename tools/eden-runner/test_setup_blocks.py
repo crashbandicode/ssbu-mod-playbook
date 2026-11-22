@@ -707,6 +707,33 @@ class SetTests(OpenCloseTests):
                                    kind=kind, value=value, cap=1)
         return result, waited.call_count, cursor.call_count, reads
 
+    def test_oversized_sdi_settings_cannot_certify_product_index(self):
+        io = SetIO(self.ctx, 'list', 'sdi_strength', [0] * 8 + [1])
+        data = json.dumps({'menu': io.stored}).encode()
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings', return_value=data),
+              patch.object(routes, 'LogCursor') as cursor):
+            with self.assertRaisesRegex(RuntimeError, r'unsupported: settings file menu.sdi_strength has 9 slots; product schema has 4'):
+                routes.tr_set(self.ctx, page='cpu', path=['sdi_strength'], kind='list', value=8, cap=.2)
+            cursor.assert_not_called()
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-set.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+
+    def test_product_width_list_index_three_is_accepted(self):
+        io = SetIO(self.ctx, 'list', 'sdi_strength', [0, 0, 0, 1])
+        result, writers, _, _ = self.run_set(io, 'list', 3)
+        self.assertEqual(result['verified']['width'], 4)
+        self.assertEqual(result['verified']['value_stored'], [0, 0, 0, 1])
+        self.assertEqual(writers, 0)
+
+    def test_product_widths_cover_every_menu_setting_kind(self):
+        kinds = json.loads((Path(routes.ROUTES) / 'tr-menu-kinds.json').read_text())
+        widths = json.loads((Path(routes.ROUTES) / 'tr-setting-widths.json').read_text())['widths']
+        for kind in ('toggle', 'list', 'checklist'):
+            self.assertFalse(set(kinds[kind]) - set(widths))
+        self.assertTrue(all(widths[row] == 2 for row in kinds['toggle']))
+
     def test_already_stored_skips_change_and_writer_and_rereads(self):
         io = SetIO(self.ctx, 'toggle', 'lra_reset', [1, 0])
         result, writers, cursors, reads = self.run_set(io, 'toggle', [1, 0])
