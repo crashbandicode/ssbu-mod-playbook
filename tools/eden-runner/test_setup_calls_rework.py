@@ -13,6 +13,12 @@ import native_picker as picker
 import routes
 
 
+SET_NO_BACKUP = '[Bridge] req set result=refused reason=no_backup frame=2627 wall=379784461'
+BACKUP_OK = '[Bridge] req backup result=ok files=4 bytes=45720 frame=591 wall=376821327'
+SET_OK = '[Bridge] req set result=ok frame=2628 wall=379784462'
+WRITER = '[TrainingRooms] settings.json written by the writer thread'
+
+
 def delayed_coin(*, action='a', pending='once'):
     from test_setup_calls import CoinReplay
 
@@ -263,6 +269,90 @@ class SetupReworkTests(unittest.TestCase):
         with patch.object(routes, '_wait_bridge_lines', return_value='[TrainingRooms] settings.json written'):
             routes._wait_writer(self.ctx, object(), time.monotonic() + 1)
         self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 7)
+
+    def bridge_spool(self, replies):
+        self.ctx.runner.setup_metrics = {'bridge_requests': 0}
+        calls = []
+        replies = iter(replies)
+
+        def spool(ctx, name, data):
+            expected, lines = next(replies)
+            self.assertEqual(name, expected)
+            self.assertEqual(data, b'' if name == 'bridge-backup.req' else b'settings')
+            calls.append(name)
+            ctx.runner.setup_metrics['bridge_requests'] += 1
+            with self.log.open('a') as stream:
+                stream.write('\n'.join(lines) + '\n')
+
+        return spool, calls
+
+    def test_apply_settings_opens_missing_backup_then_retries_once(self):
+        spool, calls = self.bridge_spool([
+            ('diag-settings-next.json', [SET_NO_BACKUP]),
+            ('bridge-backup.req', [BACKUP_OK]),
+            ('diag-settings-next.json', [SET_OK, WRITER]),
+        ])
+        with patch.object(routes, '_spool_file', side_effect=spool), \
+             patch.object(routes, '_fetch_settings', return_value=b'readback'):
+            readback, reply = routes._apply_settings(self.ctx, b'settings', cap=1)
+        self.assertEqual((readback, reply), (b'readback', SET_OK))
+        self.assertEqual(calls, ['diag-settings-next.json', 'bridge-backup.req', 'diag-settings-next.json'])
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 4)
+        receipt = json.loads((self.root / 'routes-bridge-backup.json').read_text())
+        self.assertEqual(receipt, {'refused': SET_NO_BACKUP, 'backup': BACKUP_OK,
+                                   'note': 'bridge had no open fixture backup; opened one and sent the set again'})
+        json.dumps(receipt)
+
+    def test_apply_settings_open_backup_does_not_send_backup(self):
+        spool, calls = self.bridge_spool([('diag-settings-next.json', [SET_OK, WRITER])])
+        with patch.object(routes, '_spool_file', side_effect=spool), \
+             patch.object(routes, '_fetch_settings', return_value=b'readback'):
+            self.assertEqual(routes._apply_settings(self.ctx, b'settings', cap=1), (b'readback', SET_OK))
+        self.assertEqual(calls, ['diag-settings-next.json'])
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 2)
+        self.assertFalse((self.root / 'routes-bridge-backup.json').exists())
+
+    def test_apply_settings_refused_backup_reports_expected_and_seen(self):
+        refused = '[Bridge] req backup result=refused reason=busy frame=2628 wall=379784462'
+        spool, calls = self.bridge_spool([
+            ('diag-settings-next.json', [SET_NO_BACKUP]), ('bridge-backup.req', [refused]),
+        ])
+        with patch.object(routes, '_spool_file', side_effect=spool), \
+             patch.object(routes, '_fetch_settings', return_value=b'readback'):
+            with self.assertRaises(RuntimeError) as error:
+                routes._apply_settings(self.ctx, b'settings', cap=1)
+        self.assertEqual(str(error.exception),
+                         f'settings set: the bridge has no open backup; expected "req backup result=ok", saw: {refused}')
+        self.assertEqual(calls, ['diag-settings-next.json', 'bridge-backup.req'])
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 2)
+
+    def test_apply_settings_second_missing_backup_does_not_retry_again(self):
+        second = '[Bridge] req set result=refused reason=no_backup frame=2629 wall=379784463'
+        spool, calls = self.bridge_spool([
+            ('diag-settings-next.json', [SET_NO_BACKUP]),
+            ('bridge-backup.req', [BACKUP_OK]),
+            ('diag-settings-next.json', [second]),
+        ])
+        with patch.object(routes, '_spool_file', side_effect=spool), \
+             patch.object(routes, '_fetch_settings', return_value=b'readback'):
+            with self.assertRaises(RuntimeError) as error:
+                routes._apply_settings(self.ctx, b'settings', cap=1)
+        self.assertEqual(str(error.exception), second)
+        self.assertEqual(calls, ['diag-settings-next.json', 'bridge-backup.req', 'diag-settings-next.json'])
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 3)
+        self.assertEqual(json.loads((self.root / 'routes-bridge-backup.json').read_text())['backup'], BACKUP_OK)
+
+    def test_apply_settings_other_refusal_does_not_open_backup(self):
+        refused = '[Bridge] req set result=refused reason=busy frame=2627 wall=379784461'
+        spool, calls = self.bridge_spool([('diag-settings-next.json', [refused])])
+        with patch.object(routes, '_spool_file', side_effect=spool), \
+             patch.object(routes, '_fetch_settings', return_value=b'readback'):
+            with self.assertRaises(RuntimeError) as error:
+                routes._apply_settings(self.ctx, b'settings', cap=1)
+        self.assertEqual(str(error.exception), refused)
+        self.assertEqual(calls, ['diag-settings-next.json'])
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 1)
+        self.assertFalse((self.root / 'routes-bridge-backup.json').exists())
 
     def test_tr_settings_file_readback_allows_added_keys_and_names_changed_paths(self):
         path = self.root / 'settings.json'
