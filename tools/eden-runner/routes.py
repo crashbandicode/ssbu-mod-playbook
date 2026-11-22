@@ -2713,10 +2713,10 @@ def _tr_set(ctx, page, path, targets, kind, value, cap, metrics):
         if (not isinstance(value, list) or not value
                 or any(type(item) is not int or item not in (0, 1) for item in value)):
             raise RuntimeError(f'expected a 0/1 integer array for value; saw {value!r}')
-        if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
-            raise RuntimeError(f'invalid {kind} value encoding')
         if len(value) != width:
             raise RuntimeError(f'expected settings menu.{row_id} array of length {width}; saw {value!r}')
+        if kind == 'toggle' and value not in ([1, 0], [0, 1]) or kind == 'list' and sum(value) != 1:
+            raise RuntimeError(f'invalid {kind} value encoding')
         wanted = {row_id: value}
     if time.monotonic() >= until:
         raise RuntimeError('Training Mod setting deadline expired before applying')

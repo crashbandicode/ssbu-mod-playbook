@@ -750,6 +750,14 @@ class SetTests(OpenCloseTests):
         self.assertEqual(result['verified']['value_stored'], [0, 0, 0, 1])
         self.assertEqual(writers, 0)
 
+    def test_product_width_rejects_bad_list_index_and_array_length(self):
+        io = SetIO(self.ctx, 'list', 'sdi_strength', [0, 0, 0, 1])
+        with self.assertRaisesRegex(RuntimeError, 'unsupported list index 8 for menu.sdi_strength: product schema has 4 options'):
+            self.run_set(io, 'list', 8)
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [1, 0])
+        with self.assertRaisesRegex(RuntimeError, r'expected settings menu.lra_reset array of length 2'):
+            self.run_set(io, 'toggle', [1, 0, 0])
+
     def test_product_widths_cover_every_menu_setting_kind(self):
         kinds = json.loads((Path(routes.ROUTES) / 'tr-menu-kinds.json').read_text())
         widths = json.loads((Path(routes.ROUTES) / 'tr-setting-widths.json').read_text())['widths']
