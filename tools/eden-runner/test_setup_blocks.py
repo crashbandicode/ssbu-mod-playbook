@@ -447,6 +447,28 @@ class WizardIO(RowsIO):
 
 
 class WizardTests(OpenCloseTests):
+    def test_preview_owner_scope_preserves_pause_and_unknown(self):
+        for owner in ('native.pause', 'unknown'):
+            with self.subTest(owner=owner):
+                io = WizardIO(self.ctx, step=4)
+                read = io.read
+
+                def read_owner(provider, cap):
+                    if provider == routes.native_picker.UI:
+                        return recorded.native(1, screen='training', focus='training',
+                                               **{'screen.context': 'training', 'input.owner': owner})
+                    return read(provider, cap)
+
+                io.read = read_owner
+                result = self.invoke('wizard_place', io, game='Guard the Edge', cap=.1, pulse_cap=.002)
+                self.assertTrue(result['ok'])
+                self.assertEqual(result['verified']['owners']['Edge · 4/4'], owner)
+                self.assertEqual(result['verified']['scope'],
+                                 'published coordinates only; input readiness is not certified')
+                self.assertEqual(result['verified']['limitations'], [
+                    'Edge · 4/4: input.owner=native.pause observed while this page was published'
+                ] if owner == 'native.pause' else [])
+
     def test_wrong_or_stopped_game_never_accepts_wizard_or_sends_input(self):
         for step in (2, 4):
             for game, running in (('Eggs-ercise', '1'), ('Guard the Edge', '0')):

@@ -3077,6 +3077,9 @@ def _wizard_place(ctx, args, targets, metrics):
         'verified': {'area_body': area_body, 'cpu_shown': cpu_shown, 'p1_shown': p1_shown,
                      'percent': page['percent'], 'preview_body': page['body'], 'pulses': moves,
                      'pages': pages, 'owners': owners,
+                     'scope': 'published coordinates only; input readiness is not certified',
+                     'limitations': [f'{header}: input.owner=native.pause observed while this page was published'
+                                     for header, owner in owners.items() if owner == 'native.pause'],
                      'unconfirmed_pulses': sum(not pulse['published'] for group in moves.values() for pulse in group),
                      'note': 'an unpublished pulse may have moved the point by less than a shown unit; '
                              "only the shown coordinates are verified here; exact position words are checked by "
