@@ -99,7 +99,7 @@ class Stream:
                 if (opened.st_dev, opened.st_ino) != self.identity or opened.st_size < self.offset:
                     raise RuntimeError('trace continuity changed')
                 if self.offset:
-                    source.seek(-1, os.SEEK_END)
+                    source.seek(self.offset - 1)
                     self.partial = source.read(1) != b'\n'
                 else:
                     self.partial = False
