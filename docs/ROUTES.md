@@ -418,12 +418,14 @@ These paths require independent runtime proof.
 
 `routes:tr_open(page=None, cap=20)` opens the Training Mod menu and optionally returns to its page ring
 and reaches the named page. `routes:tr_close(cap=20)` backs out through each depth and closes it; it does
-not read settings. Both check the bridge owner and each handled menu input and report skipped work.
+not read settings. Both check the bridge owner and each handled menu input and report skipped work. These
+blocks and the bridge-based navigation and drill blocks below are host-tested only, not yet proof-booted.
 
 `routes:tr_goto(page, path, cap=30)` opens the menu and walks action IDs, or objects containing `action` and/or
 the static `row` title, into nested Rows screens. It stops before activating the last row. At page depth a
 Down must move the published cursor; in a Rows screen it must change the published `(action,row,row_id)` identity
-with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed.
+with a handled ACK, because the outer cursor does not move there. A repeated identity fails closed. This does
+not read or establish the focused row's stored value.
 
 `routes:drill_stop(game, cap=30)` refuses a visible wizard and a different or stopped practice game. It opens
 the Guard the Edge Start row, presses A, requires a same-epoch `game.running=0`, and closes the menu. The
@@ -443,4 +445,5 @@ the trace, then checks `tr.menu.game.running`. It needs an armed records point t
 `edge_juggle_attempt` symbol and a trace file on the instance. It rejects trace loss, unreadable records,
 point changes and bridge epoch changes. File-loss and point-drop counters are recorded at entry and exit and
 must remain unchanged; nonzero initial counts are allowed. Zoom results have no terminal marker: use
-`count='releases'` for Zoom. A stopped game fails unless `allow_stopped` is true. The block performs no inputs.
+`count='releases'` for Zoom. A stopped game fails unless `allow_stopped` is true. The block performs no inputs;
+marker counts do not by themselves prove correct gameplay or a visibly rendered notice.
