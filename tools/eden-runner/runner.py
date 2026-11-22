@@ -1251,6 +1251,12 @@ class Runner:
         self.default = next(iter(instances))
         self.out = out
         self.out.mkdir(parents=True, exist_ok=True)
+        capture_path = self.out / 'bridge-run' / 'capture.json'
+        if capture_path.is_file():
+            capture = json.loads(capture_path.read_text())
+            instance = capture.get('instance')
+            if instance in self.instances and capture.get('bridge_log') and not self.instances[instance].get('bridge_log'):
+                self.instances[instance]['bridge_log'] = capture['bridge_log']
         self.row_dir = self.out
         self.on_failure_cli = on_failure
         self.outcomes = {}

@@ -11,20 +11,7 @@ from unittest.mock import patch
 import routes
 
 
-STOCK = {
-    'point_id': '3',
-    'registers': {'pc': '0x827a5104', 'x19': '0x11d7da0a00', 'x8': '0x11d47f4280'},
-    'locations': {'0x827a5104': 'main+0x1865104'},
-    'captures': [
-        {'expression': 'x19+0xc4', 'error': '', 'hex': '0000000003000000040000000200000000000000807082d51100000000b282cd1100000040d682cd1100000001'},
-        {'expression': '[x19+0xe0]', 'error': '', 'hex': 'a0cbfe8500000000'},
-        {'expression': '[x19+0xe8]', 'error': '', 'hex': '10c9fe8500000000'},
-        {'expression': '[[x19+0xe0]+0x80]+0xd4', 'error': '', 'hex': '000000000100000005000000ffffffff00'},
-        {'expression': 'x8+0xd4', 'error': '', 'hex': '0000000002000000060000000100000000'},
-        {'expression': '[x8+0xf8]', 'error': '', 'hex': '98630c8600000000'},
-        {'expression': '[[x8+0xf8]+8]+0x110', 'error': '', 'hex': '00010100'},
-    ],
-}
+STOCK = json.loads((Path(__file__).parent / 'test-data' / 'bridge-on-stock.json').read_text())
 BOOT = ('379690490 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=installed indicator=hooked '
         'native_ui=installed chord=deferred toggle=off reason=boot_default fixture=closed deluxe=absent '
         'heap_register=1 guards=0x7fffff tr_export=available server=started result=installed '
@@ -154,6 +141,13 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(receipt['capture']['port'], 6979)
         self.assertEqual(receipt['backup'], self.backup)
         self.assertFalse(receipt['backup_open'])
+
+    def test_bridge_on_missing_backup_reply_is_recorded_without_failure(self):
+        self.backup = ''
+        receipt = self.invoke(port=6979)
+        self.assertIsNone(receipt['backup'])
+        self.assertFalse(receipt['backup_open'])
+        self.assertGreaterEqual(self.seconds, 15)
 
 
 if __name__ == '__main__':

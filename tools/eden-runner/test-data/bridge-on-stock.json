@@ -1,0 +1,75 @@
+{
+  "backtrace": [],
+  "captures": [
+    {
+      "address": "0x11d7da0ac4",
+      "error": "",
+      "expression": "x19+0xc4",
+      "hex": "0000000003000000040000000200000000000000807082d51100000000b282cd1100000040d682cd1100000001",
+      "type": "bytes"
+    },
+    {
+      "address": "0x11cd82b200",
+      "error": "",
+      "expression": "[x19+0xe0]",
+      "hex": "a0cbfe8500000000",
+      "type": "u64",
+      "value": "2248068000"
+    },
+    {
+      "address": "0x11cd82d640",
+      "error": "",
+      "expression": "[x19+0xe8]",
+      "hex": "10c9fe8500000000",
+      "type": "u64",
+      "value": "2248067344"
+    },
+    {
+      "address": "0x11d47f3e54",
+      "error": "",
+      "expression": "[[x19+0xe0]+0x80]+0xd4",
+      "hex": "000000000100000005000000ffffffff00",
+      "type": "bytes"
+    },
+    {
+      "address": "0x11d47f4354",
+      "error": "",
+      "expression": "x8+0xd4",
+      "hex": "0000000002000000060000000100000000",
+      "type": "bytes"
+    },
+    {
+      "address": "0x1183057940",
+      "error": "",
+      "expression": "[x8+0xf8]",
+      "hex": "98630c8600000000",
+      "type": "u64",
+      "value": "2248958872"
+    },
+    {
+      "address": "0x11d47f44d0",
+      "error": "",
+      "expression": "[[x8+0xf8]+8]+0x110",
+      "hex": "00010100",
+      "type": "bytes"
+    }
+  ],
+  "core_id": 0,
+  "event": "entry",
+  "frame": "2762",
+  "locations": {
+    "0x827a5104": "main+0x1865104",
+    "0x827a66f8": "main+0x18666f8"
+  },
+  "point_id": "3",
+  "process_id": "81",
+  "registers": {
+    "pc": "0x827a5104",
+    "x19": "0x11d7da0a00",
+    "x8": "0x11d47f4280"
+  },
+  "schema": 1,
+  "sequence": "5",
+  "thread_id": "80",
+  "wall_time_ns": "1795382723341752108"
+}

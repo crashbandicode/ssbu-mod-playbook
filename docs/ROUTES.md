@@ -72,6 +72,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release after the fence when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, game, perfect, allow_stopped, count}` | named practice game with an armed attempt tracepoint | matching markers, CPU kinds, sequence/frame bounds, and running state |
+| `bridge_on` `{port, cap}` | title-screen trace or bridge already on | detached bridge capture, greeting and backup reply; backup refusal is recorded, not a block failure |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
 | `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded |

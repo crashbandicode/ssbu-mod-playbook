@@ -31,10 +31,17 @@ import math
 import os
 import re
 import socket
+import subprocess
+import sys
 import time
 import unicodedata
 from collections import deque
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 import native_picker
 import state_gate
@@ -2176,6 +2183,264 @@ def _fetch_settings(ctx, cap=20):
     return data
 
 
+_BRIDGE_ON_TITLE_MOVIE_READ = 0x1865104
+_BRIDGE_ON_TITLE_LAYOUT = "[[x19+0xe0]+0x80]"
+_BRIDGE_ON_TITLE_CONTEXT = "x19+0xc4"
+
+
+def _bridge_on_capture(row, expression):
+    for capture in row.get("captures", ()):
+        if capture["expression"] == expression and not capture["error"]:
+            return bytes.fromhex(capture["hex"])
+    return b""
+
+
+def _bridge_on_number(row, expression, width):
+    data = _bridge_on_capture(row, expression)
+    return int.from_bytes(data, "little") if len(data) == width else None
+
+
+def _bridge_on_settled_phase(data, phase):
+    if len(data) != 17:
+        return False
+    depth, current, age = (int.from_bytes(data[i:i + 4], "little") for i in (0, 4, 8))
+    return depth == 0 and current == phase and age >= 2 and data[16] == 0
+
+
+def _bridge_on_opening_owner(row):
+    registers = row["registers"]
+    pc = int(registers["pc"], 16)
+    context = int(registers["x19"], 16)
+    movie_layout = int(registers["x8"], 16)
+    base = pc - _BRIDGE_ON_TITLE_MOVIE_READ
+    context_bytes = _bridge_on_capture(row, _BRIDGE_ON_TITLE_CONTEXT)
+    return (
+        row["locations"].get(registers["pc"]) == f"main+0x{_BRIDGE_ON_TITLE_MOVIE_READ:x}"
+        and bool(context and movie_layout)
+        and len(context_bytes) == 45 and context_bytes[44] == 1
+        and _bridge_on_number(row, "[x19+0xe0]", 8) == base + 0x50ACBA0
+        and _bridge_on_number(row, "[x19+0xe8]", 8) == base + 0x50AC910
+        and _bridge_on_number(row, "[x8+0xf8]", 8) == base + 0x5186398
+        and _bridge_on_settled_phase(context_bytes[:17], 3)
+        and _bridge_on_settled_phase(_bridge_on_capture(row, _BRIDGE_ON_TITLE_LAYOUT + "+0xd4"), 1)
+        and _bridge_on_settled_phase(_bridge_on_capture(row, "x8+0xd4"), 2)
+        and _bridge_on_capture(row, "[[x8+0xf8]+8]+0x110") == bytes((0, 1, 1, 0))
+    )
+
+
+def _bridge_on_arm_opening(ctx):
+    expressions = (
+        (_BRIDGE_ON_TITLE_CONTEXT, "bytes", 45),
+        ("[x19+0xe0]", "u64", 0), ("[x19+0xe8]", "u64", 0),
+        (_BRIDGE_ON_TITLE_LAYOUT + "+0xd4", "bytes", 17),
+        ("x8+0xd4", "bytes", 17), ("[x8+0xf8]", "u64", 0),
+        ("[[x8+0xf8]+8]+0x110", "bytes", 4),
+    )
+    return ctx.call("trace.arm", {
+        "target": f"main+0x{_BRIDGE_ON_TITLE_MOVIE_READ:x}", "registers": ["pc", "x19", "x8"],
+        "condition": "thread == main", "max_hits": 256, "rate_limit": 120,
+        "captures": [{"expression": field, "type": type_, **({"size": size} if size else {})}
+                     for field, type_, size in expressions],
+    })
+
+
+def _bridge_on_events(ctx):
+    path = instance_path(ctx, "bridge_events")
+    return path.read_text().splitlines() if path.is_file() else []
+
+
+class BridgeOnChordHoldError(RuntimeError):
+    pass
+
+
+def _bridge_on_chord(ctx):
+    buttons = ("lstick", "rstick", "zl", "zr")
+    snapshot_ns = time.monotonic_ns()
+    before = _bridge_on_events(ctx)
+    press_wall = None
+    event = None
+    first_event_seen_s = None
+    try:
+        for button in buttons:
+            ctx.call("input.button", {"button": button, "state": "press",
+                                      "duration_ms": 10000, "lease_ms": 10000})
+        started = time.monotonic_ns()
+        press_wall = time.time()
+        last_no_event_ns = snapshot_ns - started
+        while True:
+            ctx.check_stop()
+            poll_ns = time.monotonic_ns()
+            after = _bridge_on_events(ctx)
+            if after[:len(before)] != before:
+                raise RuntimeError("Toggle event history changed")
+            elapsed_ns = time.monotonic_ns() - started
+            if event is None and elapsed_ns <= 6_000_000_000:
+                event = next((line for line in after[len(before):]
+                              if "[Bridge] toggle phase=" in line), None)
+                if event is not None:
+                    first_event_seen_s = elapsed_ns / 1_000_000_000
+                else:
+                    last_no_event_ns = poll_ns - started
+            if elapsed_ns >= 6_000_000_000 or (event is not None and elapsed_ns >= 3_200_000_000):
+                break
+            time.sleep(min(0.005, (6_000_000_000 - elapsed_ns) / 1_000_000_000))
+        release_wall = time.time()
+        held_s = (time.monotonic_ns() - started) / 1_000_000_000
+        for button in buttons:
+            ctx.call("input.button", {"button": button, "state": "release",
+                                      "duration_ms": 3200, "lease_ms": 1000})
+    except BaseException:
+        try:
+            ctx.call("input.reset", {})
+        except Exception:
+            pass
+        raise
+    last_no_event_s = last_no_event_ns / 1_000_000_000
+    suffix = 1
+    while (Path(ctx.row_dir) / f"chord-hold-{suffix}.json").exists():
+        suffix += 1
+    result = _save(ctx, f"chord-hold-{suffix}", {
+        "press_wall": press_wall, "release_wall": release_wall, "held_s": round(held_s, 3),
+        "last_no_event_s": last_no_event_s, "first_event_seen_s": first_event_seen_s,
+        "latency_bound_s": None if event is None else [last_no_event_s, first_event_seen_s], "event": event,
+    })
+    if event is None:
+        raise BridgeOnChordHoldError("no toggle within 6 s of the chord")
+    if last_no_event_ns < 3_000_000_000:
+        raise BridgeOnChordHoldError(f"chord toggle may have come before 3.0 s: no-event poll at {last_no_event_s:.3f} s, event seen at {first_event_seen_s:.3f} s")
+    return result
+
+
+def _bridge_on_cold_enable(ctx, trace):
+    before = _bridge_on_events(ctx)
+    existing = next((line for line in reversed(before) if "[Bridge] toggle phase=on " in line), None)
+    if existing is not None:
+        return {'chord': 'already on', 'event': existing}
+    armed = _bridge_on_arm_opening(ctx)
+    point = str(armed.get("id", armed.get("point_id")))
+    if point == "None":
+        raise RuntimeError(f"Opening owner trace did not arm: {armed!r}")
+    until = time.monotonic() + 54
+    witness = None
+    while time.monotonic() < until:
+        ctx.check_stop()
+        before = _bridge_on_events(ctx)
+        boot_off = any("toggle=off reason=boot_default" in line for line in before)
+        ready = any(re.fullmatch(r"\d+ \[Bridge\] chord ready", line) for line in before)
+        if any("[Bridge] toggle phase=on " in line for line in before):
+            event = next(line for line in reversed(before) if "[Bridge] toggle phase=on " in line)
+            return {'chord': 'already on', 'event': event}
+        if boot_off and ready and trace.is_file():
+            for line in reversed(trace.read_text().splitlines()):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("point_id")) == point:
+                    age = time.time_ns() - int(row["wall_time_ns"])
+                    if 0 <= age <= 500_000_000 and _bridge_on_opening_owner(row):
+                        witness = row
+                        break
+            if witness is not None:
+                break
+        time.sleep(0.05)
+    if witness is None:
+        raise RuntimeError("No live stock opening owner and boot-default chord readiness")
+    _bridge_on_chord(ctx)
+    until = time.monotonic() + 10
+    while time.monotonic() < until:
+        ctx.check_stop()
+        after = _bridge_on_events(ctx)
+        if after[:len(before)] != before:
+            raise RuntimeError("Cold-start toggle event history changed")
+        transitions = [line for line in after[len(before):] if "[Bridge] toggle phase=" in line]
+        if transitions:
+            if len(transitions) != 1 or not re.search(r"phase=on gen=1 .*\bsource=pad_chord\b", transitions[0]):
+                raise RuntimeError(f"Unexpected cold chord transition: {transitions!r}")
+            return _save(ctx, "cold-opening-chord", {"stock": witness, "event": transitions[0]})
+        time.sleep(0.05)
+    raise RuntimeError("No fresh pad-chord On event within 10 seconds")
+
+
+def bridge_on(ctx, port=None, cap=60):
+    """Turn the bridge on at the title screen and start its detached playbook capture."""
+    try:
+        if not ctx.instance.get('trace_jsonl'):
+            raise KeyError('trace_jsonl')
+        trace = instance_path(ctx, 'trace_jsonl')
+    except KeyError:
+        raise RuntimeError('bridge_on needs a trace run: the title-screen witness is a trace point '
+                           '(start Eden with a trace config and the GDB stub off)') from None
+    if port is None:
+        try:
+            port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())
+        except (KeyError, OSError, ValueError):
+            raise RuntimeError('bridge_on needs a port argument or an integer in profile port.txt') from None
+    chord = _bridge_on_cold_enable(ctx, trace)
+    run = Path(ctx.row_dir).parent / 'bridge-run'
+    (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
+    log = run / 'bridge.log'
+    log.touch()
+    if fcntl is None:
+        raise RuntimeError('bridge_on requires flock support for the detached capture')
+    with (run / 'bridge.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            reused = True
+        else:
+            reused = False
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    capture_path = run / 'capture.json'
+    if reused:
+        capture = json.loads(capture_path.read_text()) if capture_path.is_file() else {}
+        pid = capture.get('pid')
+    else:
+        with (run / 'capture.stderr.log').open('ab') as stderr:
+            process = subprocess.Popen(
+                [sys.executable, '-I', str(HERE / 'switch_hw.py'), 'capture-bridge', str(run),
+                 '--bridge-host', f'127.0.0.1:{port}', '--console', str(run / 'bridge-console.log')],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True)
+        pid = process.pid
+        capture_path.write_text(json.dumps({'pid': pid, 'port': port, 'instance': ctx.on,
+                                            'bridge_log': str(log), 'started': time.time()}) + '\n')
+    ctx.runner.instances.setdefault(ctx.on, {})['bridge_log'] = str(log)
+    text = ''
+    until = time.monotonic() + cap
+    while 'plugin=ssbu-hw-bridge/' not in text or 'tr_export=' not in text:
+        if time.monotonic() > until:
+            raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
+        time.sleep(0.2)
+        text = log.read_text(errors='replace')
+    hello = next(l for l in text.splitlines() if '[Bridge] hello' in l)
+    install = next(l for l in text.splitlines() if 'plugin=ssbu-hw-bridge/' in l and 'result=' in l)
+    guard = next((field for field in install.split() if field.startswith('guards=')), '')
+    if not guard or int(guard.split('=', 1)[1], 16) & 0x3fffff != 0x3fffff:
+        raise RuntimeError(f'bridge core guards incomplete: {install}')
+    fields = set(install.split())
+    for want in ('tr_export=available', 'toggle=off', 'reason=boot_default', 'chord=deferred',
+                 'server=started', 'result=installed', 'h1=installed',
+                 'h2=installed', 'h3=installed'):
+        if want not in fields:
+            raise RuntimeError(f'bridge install line lacks {want}: {install}')
+    if not re.search(r'\btoggle_gen=[1-9][0-9]*\b', hello):
+        raise RuntimeError(f'bridge greeting lacks a positive On generation: {hello}')
+    backup = None
+    until = time.monotonic() + 15
+    while time.monotonic() < until:
+        ctx.check_stop()
+        lines = log.read_text(errors='replace').splitlines()
+        backup = next((line for line in reversed(lines) if '[Bridge] req backup result=' in line), None)
+        if backup is not None:
+            break
+        time.sleep(0.1)
+    return _save(ctx, 'routes-bridge-on', {
+        'block': 'bridge_on', 'chord': chord, 'hello': hello, 'install': install, 'backup': backup,
+        'backup_open': bool(backup and re.search(r'\[Bridge\] req backup result=ok(?: |$)', backup)),
+        'capture': {'pid': pid, 'port': port, 'bridge_log': str(log)}, 'reused': reused,
+    })
+
+
 def _apply_settings(ctx, data, cap=30):
     log = instance_path(ctx, 'bridge_log')
     cursor = LogCursor(log, hold=False)
@@ -2189,6 +2454,10 @@ def _apply_settings(ctx, data, cap=30):
                 raise RuntimeError('bridge continuity changed while applying settings')
             if '[Bridge] req set result=' in line:
                 if not re.search(r'\[Bridge\] req set result=ok(?: |$)', line):
+                    if re.search(r'\[Bridge\] req set result=refused reason=no_backup(?: |$)', line):
+                        raise RuntimeError('settings set refused: the bridge has no open fixture backup. '
+                                           'Expected the capture to have opened one at connect '
+                                           '("[Bridge] req backup result=ok"; routes:bridge_on does). Saw: ' + line)
                     raise RuntimeError(line)
                 reply = line
             if reply and line.startswith('[TrainingRooms] settings.json written by the writer thread'):
