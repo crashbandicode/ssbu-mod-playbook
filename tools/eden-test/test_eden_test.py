@@ -16,6 +16,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eden_test  # noqa: E402
 
+TRACE_REQUIRED = (
+    "this base is a trace run: pass --elf <the build's libtraining_rooms.so> and at least one "
+    "--trace-point <module!symbol> (the lifecycle needs 1..256 trace points); the two the drill "
+    "blocks use are libtraining_rooms.nro!edge_juggle_attempt and libtraining_rooms.nro!planner_chose"
+)
+
 FAKE_LIFECYCLE = '''
 import json, sys
 from pathlib import Path
@@ -969,11 +975,66 @@ class EdenTestTests(unittest.TestCase):
         base = json.loads(self.previous.read_text())
         base['instances'][0].update(source=str(source.parent.parent), trace={'unmapped_access': 'log'})
         self.previous.write_text(json.dumps(base))
+        elf = self.dir / 'plugin.so'
+        elf.write_bytes(b'elf')
         with mock.patch.object(eden_test, 'lifecycle') as lifecycle:
             with self.assertRaises(SystemExit) as caught:
-                eden_test.main(self.go_args())
+                eden_test.main(self.go_args() + ['--elf', str(elf), '--trace-point', 'plugin.nro!attempt'])
         lifecycle.assert_not_called()
         self.assertIn(f'the source profile {source / "qt-config.ini"} has use_gdbstub=true', str(caught.exception))
+
+    def test_go_trace_base_requires_elf_and_trace_points_before_copy(self):
+        source = self.dir / 'profile'
+        source.mkdir()
+        base = json.loads(self.previous.read_text())
+        base['instances'][0].update(source=str(source), trace={'unmapped_access': 'log'})
+        self.previous.write_text(json.dumps(base))
+        elf = self.dir / 'plugin.so'
+        elf.write_bytes(b'elf')
+        for index, options in enumerate(([], ['--elf', str(elf)], ['--trace-point', 'plugin.nro!attempt'])):
+            label = f'missing-trace-{index}'
+            with self.subTest(options=options), \
+                 mock.patch.object(eden_test, 'cmd_up', side_effect=SystemExit('unexpected Up')) as up, \
+                 mock.patch.object(eden_test, 'sh') as sh, mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+                with self.assertRaises(SystemExit) as caught:
+                    eden_test.main(self.go_args(label=label) + options)
+                self.assertEqual(str(caught.exception), TRACE_REQUIRED)
+                up.assert_not_called()
+                sh.assert_not_called()
+                lifecycle.assert_not_called()
+                self.assertFalse((self.dir / 'runs' / label).exists())
+
+    def test_go_new_direct_rejects_trace_base_before_copy(self):
+        base = json.loads(self.previous.read_text())
+        base['instances'][0].update(source=str(self.dir), trace={'unmapped_access': 'log'})
+        self.previous.write_text(json.dumps(base))
+        args = types.SimpleNamespace(from_config=str(self.previous), host='yoga', label='direct-1',
+                                     owner='Claude test/direct', nro=[str(self.dir / 'plugin.nro')],
+                                     rows=str(self.rows), elf=None, trace_point=[])
+        with self.assertRaises(SystemExit) as caught:
+            eden_test.go_new(args)
+        self.assertEqual(str(caught.exception), TRACE_REQUIRED)
+        self.assertFalse((self.dir / 'runs/direct-1').exists())
+
+    def test_go_remote_surfaces_trace_refusal_without_report_copy(self):
+        output = io.StringIO()
+
+        def fake_sh(command, log=None):
+            if command[0] == 'ssh':
+                print(TRACE_REQUIRED)
+                return 1
+            if command[0] == 'scp':
+                return 1
+            return 0
+
+        with chdir(self.dir), mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh, \
+             redirect_stdout(output):
+            with self.assertRaisesRegex(SystemExit, 'remote go produced no result for this call'):
+                eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
+        self.assertIn(TRACE_REQUIRED, output.getvalue())
+        self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][1].endswith('/REPORT.md')
+                             for c in sh.call_args_list))
+        self.assertFalse((self.dir / 'REPORT-go-1.md').exists())
 
     def test_go_trace_point_requires_elf_and_elf_requires_matching_nro(self):
         elf = self.dir / 'other.so'
