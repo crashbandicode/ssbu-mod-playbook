@@ -92,8 +92,9 @@ Set the CPU with the lane's own fixture and assert it with `fixture {"cpu": …}
 **Release builds: the plugin's own text.** `trace_text.py` reads pane names and text from text-setter trace records;
 arm the point in a boot step with the stub off, `trace.configure` and the same-build ELF. A `text` gate matches the
 newest text for a pane in the instance's `trace_jsonl`, optionally bound to a `point_id`. By default it reads records
-written during the row; `"whole_file": true` includes earlier records. An unreadable newest sample leaves the text
-unknown. Transition `measured` has earlier different text on the same pane key; `unmeasured` has the same earlier text
+written during the row; `"whole_file": true` includes earlier records. An unreadable newest sample of a non-empty text
+leaves the text unknown; an empty request is read as empty text. Transition `measured` has earlier different text on
+the same pane key; `unmeasured` has the same earlier text
 without a different observation; `sampled` has no earlier observation on that key and shows only that text was
 requested. This reader and gate are host-tested on a real trace excerpt, not yet proven in a live boot.
 At the setter's entry, a text record is a request and proves neither that the text was written nor that the pane is

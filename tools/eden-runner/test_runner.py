@@ -277,6 +277,7 @@ class TextGateTests(unittest.TestCase):
 
     def test_text_unknown_capture_fails_and_newer_good_record_recovers(self):
         valid = self.fixture_record()
+        self.assertGreater(int(valid['registers']['x2'], 0), 0)
         damaged = copy.deepcopy(valid)
         damaged['sequence'], damaged['frame'] = '1732', '5524'
         damaged['captures'][1] = {'error': 'memory_unavailable'}
@@ -303,15 +304,16 @@ class TextGateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
             self.make().run()
 
-    def test_text_capture_error_without_length_is_still_unknown(self):
+    def test_text_capture_error_without_length_is_not_a_sample(self):
         valid = self.fixture_record()
         damaged = copy.deepcopy(valid)
         damaged['sequence'], damaged['frame'] = '1732', '5524'
         damaged['registers'].pop('x2')
         damaged['captures'][1] = {'error': 'memory_unavailable'}
-        self.write_records(valid, damaged)
+        self.assertIsNone(runner.trace_text.parse(json.dumps(damaged)))
+        self.write_records(damaged)
         self.plan['gates']['pane'].update(whole_file=True, point_id=1, cap=.03)
-        with self.assertRaisesRegex(RuntimeError, 'unreadable.*1732'):
+        with self.assertRaisesRegex(RuntimeError, 'did not pass within'):
             self.make().run()
 
     def test_unrelated_pane_capture_loss_does_not_invalidate(self):
@@ -368,6 +370,17 @@ class TextGateTests(unittest.TestCase):
             r.run()
         evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
         self.assertEqual((evidence['scope'], evidence['sequence']), ('row', 1730))
+
+    def test_empty_text_capture_error_written_during_row_passes(self):
+        empty = self.trace.read_bytes().splitlines(keepends=True)[0]
+        self.trace.write_bytes(b'')
+        self.plan['gates']['pane'].update(pane='tr_tab_00', pattern='^$', cap=.05)
+        del self.plan['gates']['pane']['whole_file']
+        r = self.make()
+        with mock.patch.object(r, 'session_start', side_effect=lambda: self.trace.write_bytes(empty)):
+            r.run()
+        evidence = json.loads((self.out / 'r1.json').read_text())['results'][0]['evidence']
+        self.assertEqual((evidence['scope'], evidence['sequence'], evidence['text']), ('row', 75, ''))
 
     def test_row_scope_uses_pre_row_key_for_unreadable_sample(self):
         valid = self.fixture_record()

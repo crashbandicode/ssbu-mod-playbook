@@ -66,17 +66,20 @@ def parse(raw, name_at=NAME_AT):
             return None
         caps, regs = record.get('captures'), record.get('registers')
         name = pane_name(caps, name_at)
-        if (name is None or not isinstance(caps[1], dict) or not isinstance(regs, dict) or
-                not isinstance(regs.get('x0'), str)):
+        if (name is None or not isinstance(regs, dict) or not isinstance(regs.get('x0'), str) or 'x2' not in regs):
             return None
+        units = int(regs['x2'], 0) & 0xffffffff
         result = {'name': name, 'sequence': decimal(record.get('sequence')), 'frame': decimal(record.get('frame')),
                   'wall_time_ns': record.get('wall_time_ns'), 'pane': regs['x0'], 'pc': regs.get('pc'),
                   'point_id': record.get('point_id')}
+        if units == 0:
+            if result['sequence'] is None or result['frame'] is None:
+                return None
+            return dict(result, text='', known=True)
+        if not isinstance(caps[1], dict):
+            return None
         if caps[1].get('error'):
             return dict(result, text=None, known=False, why=str(caps[1]['error']))
-        if 'x2' not in regs:
-            return None
-        units = int(regs['x2'], 0) & 0xffffffff
         if units > MAX_UNITS:
             return dict(result, text=None, known=False, why='text length exceeds limit')
         data = bytes.fromhex(caps[1].get('hex', ''))

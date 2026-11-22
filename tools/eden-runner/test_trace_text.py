@@ -52,14 +52,36 @@ class TraceTextTests(unittest.TestCase):
             'max_hits': 0, 'rate_limit': 1000})
 
     def test_real_fixture_names_text_and_error(self):
-        error = trace_text.parse(self.lines[0])
-        self.assertEqual((error['name'], error['known'], error['why']), ('tr_tab_00', False, 'memory_unavailable'))
+        empty = trace_text.parse(self.lines[0])
+        self.assertEqual((empty['sequence'], empty['name'], empty['known'], empty['text']),
+                         (75, 'tr_tab_00', True, ''))
         parsed = [trace_text.parse(line) for line in self.lines[1:]]
         self.assertEqual([(r['sequence'], r['name'], r['text']) for r in parsed], EXPECTED)
         self.assertEqual(trace_text.parse(self.lines[1].decode()), parsed[0])
         self.assertEqual((parsed[0]['frame'], parsed[0]['wall_time_ns']), (5284, '1795357858865109228'))
         self.assertIn('pane', parsed[0])
         self.assertIn('pc', parsed[0])
+
+    def test_zero_units_are_empty_regardless_of_text_capture(self):
+        original = json.loads(self.lines[0])
+        self.assertEqual((original['registers']['x1'], original['registers']['x2']), ('0x2', '0x0'))
+        for capture in ({'error': 'memory_unavailable'}, {}, {'hex': ''}, {'hex': 'bad-hex'}, None):
+            with self.subTest(capture=capture):
+                record = copy.deepcopy(original)
+                record['captures'][1] = capture
+                parsed = trace_text.parse(json.dumps(record))
+                self.assertEqual((parsed['known'], parsed['text'], parsed['sequence']), (True, '', 75))
+        for field in ('sequence', 'frame'):
+            record = copy.deepcopy(original)
+            record.pop(field)
+            self.assertIsNone(trace_text.parse(json.dumps(record)))
+        for x2 in (None, 'not-hex'):
+            record = copy.deepcopy(original)
+            if x2 is None:
+                record['registers'].pop('x2')
+            else:
+                record['registers']['x2'] = x2
+            self.assertIsNone(trace_text.parse(json.dumps(record)))
 
     def test_parse_rejects_malformed_records(self):
         good = synthetic()
@@ -95,7 +117,8 @@ class TraceTextTests(unittest.TestCase):
 
     def test_records_filter_since_and_missing(self):
         all_records = trace_text.records(FIXTURE)
-        self.assertEqual([(r['sequence'], r['name'], r['text']) for r in all_records], EXPECTED)
+        self.assertEqual([(r['sequence'], r['name'], r['text']) for r in all_records],
+                         [(75, 'tr_tab_00', '')] + EXPECTED)
         crumb = trace_text.records(FIXTURE, name='tr_crumb')
         self.assertEqual([r['sequence'] for r in crumb], [82, 311, 1730, 1731])
         self.assertEqual([r['sequence'] for r in trace_text.records(FIXTURE, 'tr_crumb', since=crumb[2]['at'])],
@@ -193,6 +216,7 @@ class UnreadableTraceTests(unittest.TestCase):
 
     def test_unreadable_text_is_a_named_unknown_even_without_metadata(self):
         record = self.damaged()
+        self.assertGreater(int(record['registers']['x2'], 0), 0)
         parsed = trace_text.parse(json.dumps(record))
         self.assertEqual((parsed['name'], parsed['text'], parsed['known'], parsed['sequence'], parsed['frame']),
                          ('tr_crumb', None, False, 1732, 5524))
@@ -202,7 +226,7 @@ class UnreadableTraceTests(unittest.TestCase):
         parsed = trace_text.parse(json.dumps(record))
         self.assertEqual((parsed['known'], parsed['sequence'], parsed['frame']), (False, None, None))
         record['registers'].pop('x2')
-        self.assertFalse(trace_text.parse(json.dumps(record))['known'])
+        self.assertIsNone(trace_text.parse(json.dumps(record)))
         for update in ({'hex': ''},):
             short = copy.deepcopy(self.valid)
             short['captures'][1] = update
