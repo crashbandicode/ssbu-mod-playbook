@@ -182,9 +182,11 @@ The rules:
    saves (screenshots, log lines, a receipt per row). The dry run happens
    offline and checks that every file exists and matches its hash, that every
    gate loads, and that each row starts on the screen the row before it ends
-   on. Its `review` is `library-only` when the packet uses only reviewed
-   library steps, or `full` with a list of private parts. This class guides
-   review and does not change the dry-run result.
+   on. Its `review` is `library-only` only for unchanged library entries,
+   shared hooks, read-only calls and a reviewed setup plan; otherwise it is
+   `full` with a list of private parts. This class does not change the
+   dry-run result. No packet is admitted to light review by this class
+   alone; the reviewers decide.
 2. **Chain rows on their end state.** Order the rows so each one starts
    where the last one ended. Restore state between rows only where the next
    row needs it. The full restore happens once, at `Down`.

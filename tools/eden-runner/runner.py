@@ -125,6 +125,7 @@ STOP-INPUT. Every control call goes to out/actions.jsonl; each row writes out/<r
 out/<row>/. Rerunning skips rows whose receipt passed and resumes at the next.
 """
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -683,32 +684,72 @@ def publish_gif(raw_path, dest, spec, source_fps=None):
     return receipt
 
 
-def review_class(plan, base):
+def review_class(plan, base, raw_plan=None):
     private = []
     segments, gates = plan.get('segments', {}), plan.get('gates', {})
+    raw = plan if raw_plan is None else raw_plan
+    raw_segments, raw_gates = raw.get('segments', {}), raw.get('gates', {})
+    index = library_index()
+    active = set()
 
     def add(where, what):
         private.append({'where': where, 'what': what})
 
+    def imported(kind, name, entries, where):
+        entry = entries.get(name, {})
+        if not isinstance(entry, dict) or entry.get('library') not in index.get(kind + 's', {}):
+            add(where, f'{kind} {name}')
+        elif set(entry) != {'library'}:
+            overrides = ', '.join(sorted(set(entry) - {'library'}))
+            add(where, f'{kind} {name} overrides {overrides}')
+
     def gate(name, where):
+        if ('gate', name) in active:
+            return
+        active.add(('gate', name))
         entry = gates.get(name, {})
-        if 'library' not in entry:
-            add(where, f'gate {name}')
+        imported('gate', name, raw_gates, where)
+        if entry.get('recover'):
+            segment(entry['recover'], where)
+        active.remove(('gate', name))
+
+    def segment(name, where):
+        if ('segment', name) in active:
+            return
+        active.add(('segment', name))
+        entry = segments.get(name, {})
+        imported('segment', name, raw_segments, where)
+        if entry.get('start_gate'):
+            gate(entry['start_gate'], where)
+        active.remove(('segment', name))
+
+    def library(name, where):
+        for seg_name, entry in segments.items():
+            if seg_name == name or entry.get('library') == name:
+                segment(seg_name, where)
+                return
+        entry = index.get('segments', {}).get(name)
+        if entry is None:
+            add(where, f'segment {name}')
+        elif entry.get('start_gate') in gates:
+            gate(entry['start_gate'], where)
 
     def step(item, where):
         if not isinstance(item, dict):
             return
         if 'play' in item:
-            name = item['play']
-            segment = segments.get(name, {})
-            if 'library' not in segment:
-                add(where, f'segment {name}')
-            if segment.get('start_gate'):
-                gate(segment['start_gate'], where)
+            segment(item['play'], where)
+        if 'library' in item:
+            library(item['library'], where)
         if 'gate' in item:
             gate(item['gate'], where)
         if 'run' in item:
             hook(item['run'], where)
+        if 'call' in item and item['call'] not in ('status', 'settings.get', 'trace.read', 'trace.counters',
+                                                   'trace.list', 'modules.list', 'tracepoint.status'):
+            add(where, f'call {item["call"]}')
+        if 'ui' in item:
+            add(where, f'ui {item["ui"]}')
         if isinstance(item.get('gif'), dict):
             for nested in item['gif'].get('steps') or []:
                 step(nested, where)
@@ -731,22 +772,40 @@ def review_class(plan, base):
             hook(row['on_failure_hook'], f'{where} on_failure_hook')
     for i, item in enumerate(plan.get('recover', []) if isinstance(plan.get('recover', []), list) else []):
         step(item, f'plan recover {i}')
-    for i, item in enumerate(plan.get('setup', []) if isinstance(plan.get('setup', []), list) else []):
-        if isinstance(item, dict) and (item.get('via') == 'record'
-                                       or (item.get('via') == 'fixture' and 'reviewed' not in item)):
-            add(f'setup {i}', 'record setup' if item.get('via') == 'record' else 'unreviewed fixture')
+    if plan.get('on_failure_hook'):
+        hook(plan['on_failure_hook'], 'plan on_failure_hook')
+    setup = plan.get('setup')
+    if not isinstance(setup, list) or not setup:
+        add('setup', 'no setup plan')
+    else:
+        for i, item in enumerate(setup):
+            via = item.get('via') if isinstance(item, dict) else None
+            ref = item.get('ref') if isinstance(item, dict) else None
+            reviewed = item.get('reviewed') if isinstance(item, dict) else None
+            valid = (via == 'fixture' and isinstance(reviewed, dict)
+                     and isinstance(reviewed.get('path'), str) and bool(reviewed['path'])
+                     and isinstance(reviewed.get('sha256'), str)
+                     and re.fullmatch(r'[0-9a-fA-F]{64}', reviewed['sha256']))
+            valid = valid or (via == 'hook' and isinstance(ref, str)
+                              and any(ref.startswith(module + ':') for module in SHARED_HOOKS))
+            valid = valid or (via == 'segment' and isinstance(ref, str) and ref.startswith('library:')
+                              and ref[len('library:'):] in index.get('segments', {}))
+            if not valid:
+                add(f'setup {i}', f'{via or "unknown"} setup {ref or ""}'.strip())
     return {'class': 'full' if private else 'library-only', 'private': private}
 
 
 def dry_run(manifest_path):
     """Offline only. Raises on a broken manifest; returns the report (missing segments are not an error)."""
     base = manifest_path.parent
+    raw = json.loads(manifest_path.read_text())
+    roles_defaulted = [row.get('id') for row in raw.get('rows', []) if 'role' not in row]
     try:
-        plan = expand_library(json.loads(manifest_path.read_text()))
+        plan = expand_library(copy.deepcopy(raw))
     except KeyError as error:
         return {'manifest': str(manifest_path), 'errors': [str(error)], 'result': 'BROKEN', 'rows': 0,
                 'missing_segments': [], 'references_to_acquire': [], 'available_segments': [],
-                'review': {'class': 'full', 'private': []}}
+                'review': {'class': 'full', 'private': []}, 'roles_defaulted': roles_defaulted}
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
@@ -952,7 +1011,8 @@ def dry_run(manifest_path):
     effects = effect_report(plan, base, errors)
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
-              'gates': len(plan.get('gates', {})), 'errors': errors, 'review': review_class(plan, base),
+              'gates': len(plan.get('gates', {})), 'errors': errors, 'review': review_class(plan, base, raw),
+              'roles_defaulted': roles_defaulted,
               'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing or to_acquire else 'READY')}
     report.update(effects)
     return report

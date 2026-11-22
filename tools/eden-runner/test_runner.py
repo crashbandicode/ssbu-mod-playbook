@@ -73,8 +73,10 @@ class FakeEden:
 class ReviewClassTests(unittest.TestCase):
     def setUp(self):
         self.plan = {
-            'segments': {'shared': {'library': 'shared', 'start_gate': 'shared-gate'}},
-            'gates': {'shared-gate': {'library': 'shared-gate', 'kind': 'status'}},
+            'segments': {'shared': {'library': 'smash-main'}},
+            'gates': {'shared-gate': {'library': 'main'}},
+            'setup': [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
+                       'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}],
             'recover': [{'run': 'routes:recover'}],
             'rows': [{'id': 'r1', 'start': 'menu', 'end': 'menu', 'start_gate': 'shared-gate',
                       'recover': [{'run': 'routes_online:recover'}], 'on_failure_hook': 'routes:failure',
@@ -82,7 +84,7 @@ class ReviewClassTests(unittest.TestCase):
                                 {'gif': {'steps': [{'run': 'routes_online:room'}]}}]}],
         }
 
-    def test_shared_hooks_segments_gates_and_no_setup_are_library_only(self):
+    def test_shared_hooks_segments_gates_and_reviewed_setup_are_library_only(self):
         self.assertEqual(runner.review_class(self.plan, Path('.')), {'class': 'library-only', 'private': []})
 
     def test_private_step_segment_gate_and_setup_are_listed(self):
@@ -128,8 +130,13 @@ class ReviewClassTests(unittest.TestCase):
                 {'id': 'r1', 'start': 'menu', 'end': 'menu', 'steps': [{'shot': 'x'}]}]}))
             report = runner.dry_run(path)
             self.assertEqual(report['result'], 'READY')
-            self.assertEqual(report['review'], {'class': 'library-only', 'private': []})
+            self.assertEqual(report['review']['class'], 'full')
+            self.assertEqual(report['review']['private'][0]['what'], 'no setup plan')
             plan = json.loads(path.read_text())
+            plan['setup'] = [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
+                              'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}]
+            path.write_text(json.dumps(plan))
+            self.assertEqual(runner.dry_run(path)['review'], {'class': 'library-only', 'private': []})
             plan['setup'] = [{'via': 'fixture'}]
             path.write_text(json.dumps(plan))
             report = runner.dry_run(path)
@@ -140,6 +147,89 @@ class ReviewClassTests(unittest.TestCase):
             report = runner.dry_run(path)
             self.assertEqual(report['result'], 'BROKEN')
             self.assertEqual(report['review'], {'class': 'full', 'private': []})
+
+
+class ReviewAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.manifest = self.dir / 'rows.json'
+        (self.dir / 'custom.py').write_text('def boot(ctx):\n    return True\n')
+        self.macro = self.dir / 'private.json'
+        self.macro.write_text(json.dumps({'events': [{'frame': 1, 'buttons': 1}]}))
+        self.plan = {
+            'start': 'menu',
+            'segments': {'route': {'library': 'smash-main'}},
+            'gates': {'main': {'library': 'main'}, 'installed': {'library': 'installed'},
+                      'smash-submenu': {'library': 'smash-submenu'}},
+            'setup': [{'state': 'training', 'via': 'fixture', 'ref': 'settings',
+                       'reviewed': {'path': 'reviewed.json', 'sha256': 'a' * 64}}],
+            'rows': [{'id': 'r1', 'start': 'menu', 'end': 'menu',
+                      'steps': [{'gate': 'main'}, {'play': 'route'}, {'gate': 'installed'},
+                                {'run': 'routes:to_main'}, {'call': 'status'}]}],
+        }
+
+    def report(self, plan):
+        self.manifest.write_text(json.dumps(plan))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual((report['result'], report['errors']), ('READY', []))
+        return report
+
+    def private_segment(self, plan):
+        plan['segments']['mine'] = {'file': str(self.macro), 'sha256': sha(self.macro)}
+
+    def test_clean_packet_is_library_only_and_reports_defaulted_roles(self):
+        report = self.report(self.plan)
+        self.assertEqual(report['review'], {'class': 'library-only', 'private': []})
+        self.assertEqual(report['roles_defaulted'], ['r1'])
+
+    def test_reviewer_cases_are_private(self):
+        def raw_library_step(plan):
+            self.private_segment(plan)
+            plan['rows'][0]['steps'].append({'library': 'mine'})
+
+        variants = [
+            ('tolerance', lambda p: p['gates']['main'].update(tolerance=255)),
+            ('pattern', lambda p: p['gates']['installed'].update(pattern='.*')),
+            ('custom.py:boot', lambda p: p['setup'][0].update(via='hook', ref='custom.py:boot')),
+            ('fixture', lambda p: p['setup'][0].update(reviewed=None)),
+            ('custom.py:boot', lambda p: p.update(on_failure_hook='custom.py:boot')),
+            ('settings.set', lambda p: p['rows'][0]['steps'].append({'call': 'settings.set'})),
+            ('segment mine', raw_library_step),
+        ]
+        for expected, change in variants:
+            with self.subTest(expected=expected):
+                plan = copy.deepcopy(self.plan)
+                change(plan)
+                report = self.report(plan)['review']
+                self.assertEqual(report['class'], 'full')
+                self.assertIn(expected, ' '.join(item['what'] for item in report['private']))
+
+    def test_nested_gate_recovery_start_gate_and_setup_policy(self):
+        plan = copy.deepcopy(self.plan)
+        self.private_segment(plan)
+        plan['gates']['main']['recover'] = 'mine'
+        plan['gates']['smash-submenu']['tolerance'] = 255
+        report = self.report(plan)['review']
+        messages = ' '.join(item['what'] for item in report['private'])
+        self.assertIn('segment mine', messages)
+        self.assertIn('tolerance', messages)
+        for setup in ([], [{'state': 'training', 'via': 'segment', 'ref': 'library:not-real'}],
+                      [{'state': 'training', 'via': 'record', 'ref': 'mine'}]):
+            with self.subTest(setup=setup):
+                plan = copy.deepcopy(self.plan)
+                plan['setup'] = setup
+                self.assertEqual(self.report(plan)['review']['class'], 'full')
+
+    def test_ui_is_private_and_shared_segment_setup_is_clean(self):
+        plan = copy.deepcopy(self.plan)
+        plan['setup'] = [{'state': 'training', 'via': 'segment', 'ref': 'library:smash-main'}]
+        self.assertEqual(self.report(plan)['review']['class'], 'library-only')
+        plan['rows'][0]['steps'].append({'ui': 'trigger'})
+        review = self.report(plan)['review']
+        self.assertEqual(review['class'], 'full')
+        self.assertIn('ui', ' '.join(item['what'] for item in review['private']))
 
 
 class RowRoleTests(unittest.TestCase):
