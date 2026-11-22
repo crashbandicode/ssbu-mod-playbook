@@ -183,12 +183,20 @@ def _go_trace(args):
     return match
 
 
+def _go_base_trace(config, args):
+    if any('trace' in item for item in config['instances']) and (not args.elf or not args.trace_point):
+        raise SystemExit("this base is a trace run: pass --elf <the build's libtraining_rooms.so> and at least one "
+                         "--trace-point <module!symbol> (the lifecycle needs 1..256 trace points); the two the drill "
+                         "blocks use are libtraining_rooms.nro!edge_juggle_attempt and libtraining_rooms.nro!planner_chose")
+
+
 def go_new(args):
-    module = _go_trace(args)
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
     if config.get('host') != args.host:
         raise SystemExit(f'base {base} is for host {config.get("host")!r}, not {args.host!r}')
+    _go_base_trace(config, args)
+    module = _go_trace(args)
     run = RUNS / args.label
     if run.exists():
         raise SystemExit(f'{run} exists; pick a new label')
@@ -1147,9 +1155,9 @@ def cmd_go(args):
     if not re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', args.owner):
         raise SystemExit('--owner must be "<Engine> <session>/<stream>" (OpenCode|Codex|Claude|Cursor), '
                          f'e.g. "Claude devin-<lane>/<label>"; got: {args.owner!r}')
-    _go_trace(args)
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
+        _go_trace(args)
         return _go_remote(args)
     run = go_new(args)
     try:
