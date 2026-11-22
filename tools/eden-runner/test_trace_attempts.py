@@ -589,6 +589,35 @@ class StartTests(ObserveTests):
         with self.assertRaisesRegex(RuntimeError, 'expected.*ordinal.*1.*saw.*2'):
             self.invoke_start(expect={'plan': 'none'})
 
+    def test_terminal_must_match_release_game_and_perfect_arm(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        terminal['registers']['x0'] = hex(int(terminal['registers']['x0'], 16) ^ (1 << 24) ^ (1 << 25))
+        self.pending = [contiguous([release, plan, terminal])]
+        with self.assertRaisesRegex(RuntimeError, r'terminal.*juggler.*expected.*saw'):
+            self.invoke_start(expect={'juggler': False, 'perfect': True, 'plan': [0, 38]})
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-drill-start.json').read_text())
+        self.assertFalse(receipt['ok'])
+        self.assertNotIn('verified', receipt)
+
+    def test_terminal_must_match_release_perfect_bit(self):
+        self.io = StartIO(self.ctx)
+        self.enable_planner()
+        release, plan, terminal = excerpt('cp1b-pyra-attempt.jsonl')
+        terminal['registers']['x0'] = hex(int(terminal['registers']['x0'], 16) ^ (1 << 25))
+        self.pending = [contiguous([release, plan, terminal])]
+        with self.assertRaisesRegex(RuntimeError, r'terminal.*perfect.*expected.*saw'):
+            self.invoke_start(expect={'plan': [0, 38]})
+
+    def test_first_release_must_match_requested_game(self):
+        self.io = StartIO(self.ctx)
+        release = excerpt('cp1b-hero-attempt.jsonl')[0]
+        release['registers']['x0'] = hex(int(release['registers']['x0'], 16) | (1 << 24))
+        self.pending = [json.dumps(release) + '\n']
+        with self.assertRaisesRegex(RuntimeError, r'release.*sequence.*expected.*juggler.*False.*saw.*True'):
+            self.invoke_start(expect={'cpu_kind': 0x53})
+
     def test_filtered_planner_hit_cannot_certify_none(self):
         self.io = StartIO(self.ctx)
         self.enable_planner()
