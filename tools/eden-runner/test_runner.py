@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline tests for runner.py with a fake Eden: no emulator, no input. Run: python3 -I test_runner.py"""
+import copy
 import hashlib
 import json
 import shutil
@@ -66,6 +67,78 @@ class FakeEden:
             Image.new('RGB', (64, 36), self.colour).save(params['path'])
             return {'ok': True, 'result': {}}
         return {'ok': True, 'result': {}}
+
+
+class ReviewClassTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = {
+            'segments': {'shared': {'library': 'shared', 'start_gate': 'shared-gate'}},
+            'gates': {'shared-gate': {'library': 'shared-gate', 'kind': 'status'}},
+            'recover': [{'run': 'routes:recover'}],
+            'rows': [{'id': 'r1', 'start': 'menu', 'end': 'menu', 'start_gate': 'shared-gate',
+                      'recover': [{'run': 'routes_online:recover'}], 'on_failure_hook': 'routes:failure',
+                      'steps': [{'run': 'routes:to_main'}, {'play': 'shared'}, {'gate': 'shared-gate'},
+                                {'gif': {'steps': [{'run': 'routes_online:room'}]}}]}],
+        }
+
+    def test_shared_hooks_segments_gates_and_no_setup_are_library_only(self):
+        self.assertEqual(runner.review_class(self.plan, Path('.')), {'class': 'library-only', 'private': []})
+
+    def test_private_step_segment_gate_and_setup_are_listed(self):
+        variants = [
+            ('row r1 step 0', lambda p: p['rows'][0]['steps'][0].update(run='project.py:open')),
+            ('row r1 step 1', lambda p: p['segments']['shared'].pop('library')),
+            ('row r1 step 2', lambda p: p['gates']['shared-gate'].pop('library')),
+            ('setup 0', lambda p: p.update(setup=[{'via': 'fixture'}])),
+            ('setup 0', lambda p: p.update(setup=[{'via': 'record'}])),
+        ]
+        for where, change in variants:
+            with self.subTest(where=where):
+                plan = copy.deepcopy(self.plan)
+                change(plan)
+                report = runner.review_class(plan, Path('.'))
+                self.assertEqual(report['class'], 'full')
+                self.assertIn(where, [item['where'] for item in report['private']])
+                self.assertTrue(all(item['what'] for item in report['private']))
+
+    def test_nested_steps_recovery_and_failure_hook_are_listed(self):
+        self.plan['rows'][0]['steps'][3]['gif']['steps'].append({'run': 'project.py:nested'})
+        self.plan['rows'][0]['recover'].append({'run': 'project.py:recover'})
+        self.plan['rows'][0]['on_failure_hook'] = {'run': 'project.py:failure'}
+        self.plan['recover'].append({'run': 'project.py:recover'})
+        where = [item['where'] for item in runner.review_class(self.plan, Path('.'))['private']]
+        self.assertIn('row r1 step 3', where)
+        self.assertIn('row r1 recover 1', where)
+        self.assertIn('row r1 on_failure_hook', where)
+        self.assertIn('plan recover 1', where)
+
+    def test_segment_and_row_start_gates_are_reviewed(self):
+        self.plan['gates']['private'] = {'kind': 'status'}
+        self.plan['segments']['shared']['start_gate'] = 'private'
+        self.plan['rows'][0]['start_gate'] = 'private'
+        where = [item['where'] for item in runner.review_class(self.plan, Path('.'))['private']]
+        self.assertIn('row r1 step 1', where)
+        self.assertIn('row r1 start_gate', where)
+
+    def test_dry_run_includes_review_without_changing_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'rows.json'
+            path.write_text(json.dumps({'start': 'menu', 'rows': [
+                {'id': 'r1', 'start': 'menu', 'end': 'menu', 'steps': [{'shot': 'x'}]}]}))
+            report = runner.dry_run(path)
+            self.assertEqual(report['result'], 'READY')
+            self.assertEqual(report['review'], {'class': 'library-only', 'private': []})
+            plan = json.loads(path.read_text())
+            plan['setup'] = [{'via': 'fixture'}]
+            path.write_text(json.dumps(plan))
+            report = runner.dry_run(path)
+            self.assertEqual((report['result'], report['errors']), ('READY', []))
+            self.assertEqual(report['review']['class'], 'full')
+            self.assertEqual(report['review']['private'][0]['where'], 'setup 0')
+            path.write_text(json.dumps({'segments': {'missing': {'library': 'not-an-entry'}}}))
+            report = runner.dry_run(path)
+            self.assertEqual(report['result'], 'BROKEN')
+            self.assertEqual(report['review'], {'class': 'full', 'private': []})
 
 
 class RowRoleTests(unittest.TestCase):
