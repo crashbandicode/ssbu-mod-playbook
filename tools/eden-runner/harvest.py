@@ -112,7 +112,7 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                 'from_run': label, 'row': row['id'],
             }
             added['segments'].append(name)
-    if not dry:
+    if not dry and (added['segments'] or added['gates']):
         index_path.write_text(json.dumps(index, indent=2) + '\n')
     return added
 

@@ -142,3 +142,6 @@ SSS and CSS held repeats exactly 0->1->2->3 plus shared 2-frame walks to Battlef
 Sole approved Surface-calibrated CSS transition deadline 180 s; same image/log discrimination. Earlier run 1 retained
 its native-loading timeout at 60 s. Source branch head 84211bc adds only evidence-checker tests after build 8f830a2.
 Full provenance and source patch: `smash-training-lobby/artifacts/harness-lib/{tile-frame-PROVENANCE.json,tile-frame-source.patch}`.
+
+2026-11-22: `eden-runner/test_harvest.py` tests no-op, new-segment, new-gate and dry-run harvests against a
+temporary library (5 host tests); `2eb13ee5204f28cc`.
