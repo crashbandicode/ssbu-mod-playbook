@@ -1263,6 +1263,9 @@ def select_screen(ctx, cap=2.5):
         cursor.close()
 
 
+_PLACED_IDENTITY = ('placed.at', 'placed.kind', 'placed.name', 'placed.form')
+
+
 def _take_back_training_token(io, state):
     until = time.monotonic() + 9
     tile = native_picker.wait_sample(io, native_picker.TILE, until)
@@ -1285,7 +1288,8 @@ def _take_back_training_token(io, state):
         native_picker.check_context(tile, tile_before, 'css')
         unchanged = (tile_before.values.get('local.token') == 'placed'
                      and tile_before.values.get('carried') == 'none'
-                     and native_picker.number(tile_before, 'placed.at') == placed_at)
+                     and native_picker.number(tile_before, 'placed.at') == placed_at
+                     and all(tile_before.values.get(key) == tile.values.get(key) for key in _PLACED_IDENTITY))
         before_ack = native_picker.number(tile_before, 'ack')
         before_applied = native_picker.number(tile_before, 'applied')
     except (RuntimeError, TypeError) as exc:
@@ -1317,14 +1321,13 @@ def _take_back_training_token(io, state):
         if current.values.get('local.token') == 'held':
             native_picker.token_held(current, 'css')
             ui = native_picker.wait_sample(io, native_picker.UI, until, before, in_flight=True)
-            if not _fields_match(ui, TRAINING_CSS):
-                raise _missing_navigation_state('Training return', ui,
-                                                'qualified Training CSS after the token came back')
-            io.finish()
-            return 'css-token-back', ui
+            if _fields_match(ui, TRAINING_CSS):
+                io.finish()
+                return 'css-token-back', ui
+            break
         if (current.values.get('local.token') != 'placed'
                 or any(current.values.get(key) != tile_before.values.get(key)
-                       for key in ('placed.at', 'placed.kind', 'placed.name', 'placed.form'))):
+                       for key in _PLACED_IDENTITY)):
             raise RuntimeError('local medal changed while taking it back')
     ui = native_picker.wait_scene_transition(
         io, before, until, TRAINING_CSS, TRAINING_SSS, label='Training return',

@@ -1669,6 +1669,61 @@ class TrainingReturnTests(unittest.TestCase):
             self.execute(io)
         self.assertEqual(io.actions, [])
 
+    def test_changed_placed_identity_before_b_sends_nothing(self):
+        for field, changed in (('placed.kind', '999'), ('placed.name', 'Other'), ('placed.form', 'other')):
+            with self.subTest(field=field):
+                io = self.IO('placed')
+                read = io.read
+                tile_reads = 0
+
+                def changed_identity(provider, cap):
+                    nonlocal tile_reads
+                    sample = read(provider, cap)
+                    if provider == routes.native_picker.TILE:
+                        tile_reads += 1
+                        if tile_reads == 2:
+                            sample.values[field] = changed
+                    return sample
+
+                io.read = changed_identity
+                with self.assertRaisesRegex(RuntimeError, 'local medal placement changed before B'):
+                    self.execute(io)
+                self.assertEqual(io.actions, [])
+
+    def test_held_tile_then_direct_return_is_accepted(self):
+        io = self.IO('placed')
+        read = io.read
+
+        def held_then_games(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE and io.actions and io.screen == 0:
+                self.assertEqual(sample.values['local.token'], 'held')
+                io.screen = 2
+            return sample
+
+        io.read = held_then_games
+        result = self.execute(io)
+        self.assertEqual(result['looks'], ['css', 'games_and_more'])
+        self.assertEqual(io.actions, ['leave-css', 'tap-b1'])
+
+    def test_held_tile_then_foreign_main_dialog_is_rejected(self):
+        io = self.IO('placed')
+        read = io.read
+
+        def held_then_foreign_main(provider, cap):
+            sample = read(provider, cap)
+            if provider == routes.native_picker.TILE and io.actions and io.screen == 0:
+                self.assertEqual(sample.values['local.token'], 'held')
+                io.screen = 3
+            elif provider == routes.native_picker.UI and io.actions:
+                sample.values.update({'input.owner': 'foreign', 'dialog': 'confirmation'})
+            return sample
+
+        io.read = held_then_foreign_main
+        with self.assertRaisesRegex(RuntimeError, 'unexpected Training return focus'):
+            self.execute(io)
+        self.assertEqual(io.actions, ['leave-css'])
+
     def test_token_back_does_not_send_after_source_deadline(self):
         from unittest.mock import patch
 
@@ -1719,7 +1774,7 @@ class TrainingReturnTests(unittest.TestCase):
             return sample
 
         io.read = changed_owner
-        with self.assertRaisesRegex(RuntimeError, 'qualified Training CSS after the token came back'):
+        with self.assertRaisesRegex(RuntimeError, 'unexpected Training return focus'):
             self.execute(io)
         self.assertEqual(io.actions, ['leave-css'])
 
