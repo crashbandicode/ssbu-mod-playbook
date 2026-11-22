@@ -1080,7 +1080,8 @@ class RunnerTests(unittest.TestCase):
         attempts = [json.loads(line) for line in before.splitlines()]
         self.assertEqual([(a['id'], a['role'], a['status']) for a in attempts],
                          [('r1', 'test', 'FAILED'), ('r1', 'test', 'PASS')])
-        self.assertTrue(all(set(a) == {'id', 'role', 'role_source', 'started', 'ended', 'status'} for a in attempts))
+        self.assertTrue(all(set(a) == {'id', 'role', 'role_source', 'manifest_sha256', 'start', 'end',
+                                       'started', 'ended', 'status'} for a in attempts))
         self.assertTrue(all(a['role_source'] == 'explicit' for a in attempts))
         self.assertLessEqual(attempts[0]['started'], attempts[0]['ended'])
         self.assertLess(attempts[0]['started'], attempts[1]['started'])
@@ -1102,6 +1103,17 @@ class RunnerTests(unittest.TestCase):
             receipt = json.loads((self.dir / 'out' / (attempt['id'] + '.json')).read_text())
             self.assertEqual((receipt['role'], receipt['role_source']), (attempt['role'], attempt['role_source']))
 
+    def test_attempt_journal_carries_receipt_manifest_and_screens(self):
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'one'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.make(FakeEden({})).run()
+        receipt = json.loads((self.dir / 'out/r1.json').read_text())
+        attempt = json.loads((self.dir / 'out/attempts.jsonl').read_text())
+        self.assertEqual({key: attempt[key] for key in ('manifest_sha256', 'start', 'end')},
+                         {key: receipt[key] for key in ('manifest_sha256', 'start', 'end')})
+        self.assertEqual(attempt['manifest_sha256'], sha(self.manifest))
+
     def test_attempt_journal_includes_refused_unexecuted_row(self):
         r = self.make(FakeEden({}))
         with mock.patch.object(r, 'session_start', side_effect=runner.StopRun('recording unavailable')):
@@ -1111,7 +1123,8 @@ class RunnerTests(unittest.TestCase):
         attempts = [json.loads(line) for line in (self.dir / 'out' / 'attempts.jsonl').read_text().splitlines()]
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0], {key: receipt[key] for key in
-                                      ('id', 'role', 'role_source', 'started', 'ended', 'status', 'not_executed')})
+                                      ('id', 'role', 'role_source', 'manifest_sha256', 'start', 'end',
+                                       'started', 'ended', 'status', 'not_executed')})
         self.assertEqual(attempts[0]['role_source'], 'default')
 
     def two_instances(self):

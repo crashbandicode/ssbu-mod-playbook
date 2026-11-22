@@ -2086,7 +2086,8 @@ class Runner:
         self.outcomes[row_id] = item
 
     def record_attempt(self, receipt):
-        attempt = {key: receipt[key] for key in ('id', 'role', 'role_source', 'started', 'ended', 'status')}
+        attempt = {key: receipt[key] for key in ('id', 'role', 'role_source', 'manifest_sha256', 'start', 'end',
+                                                 'started', 'ended', 'status')}
         if receipt.get('not_executed'):
             attempt['not_executed'] = True
         with (self.out / 'attempts.jsonl').open('a') as f:

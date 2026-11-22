@@ -297,7 +297,10 @@ The rules:
       `role_source` as `explicit` or `default`. The Timing line and
       `timing.json` report time not covered by Up, a row attempt or Down as
       unclassified, attempts with no recoverable role as unroled, and missing
-      window endpoints as incomplete timing.
+      window endpoints as incomplete timing. Timing includes matching legacy
+      receipts and journal entries even for superseded row IDs
+      (`attempt_ids_not_in_manifest`), and resolves missing roles from the
+      attempt's own manifest (`roles_from_manifest`) or its recorded screens.
     - `all` does new, up, run and down in one go, for a batch you don't
       expect to fix mid-boot.
     - `--plugin <new build>` on `new` swaps the pinned plugin with that file

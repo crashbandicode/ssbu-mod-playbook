@@ -576,6 +576,10 @@ def time_split(run):
     rows_by_id = {row['id']: row for row in rows}
     out = run / 'out'
     candidates = []
+
+    def numeric(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
     journal = out / 'attempts.jsonl'
     if journal.is_file():
         for line in journal.read_text().splitlines():
@@ -585,21 +589,17 @@ def time_split(run):
                 continue
             if isinstance(attempt, dict) and isinstance(attempt.get('id'), str):
                 candidates.append(attempt)
-    paths = list(out.iterdir()) if out.is_dir() else []
-    for row_id in rows_by_id:
-        for path in paths:
-            if (path.name != f'{row_id}.json' and
-                    not (path.name.startswith(f'{row_id}.FAILED.') and path.name.endswith('.json'))):
-                continue
-            try:
-                receipt = json.loads(path.read_text())
-            except (OSError, ValueError):
-                receipt = {}
-            if isinstance(receipt, dict) and receipt.get('id', row_id) == row_id:
-                candidates.append({'id': row_id, **receipt})
-
-    def numeric(value):
-        return type(value) in (int, float) and math.isfinite(value)
+    for path in sorted(out.glob('*.json')) if out.is_dir() else []:
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('id'), str):
+            continue
+        row_id = receipt['id']
+        if ((path.name == f'{row_id}.json' or path.name.startswith(f'{row_id}.FAILED.'))
+                and numeric(receipt.get('started')) and 'start' in receipt and 'end' in receipt):
+            candidates.append(receipt)
 
     def valid_interval(attempt):
         start, end = attempt.get('started'), attempt.get('ended')
@@ -614,16 +614,41 @@ def time_split(run):
         if prior is None or (not valid_interval(prior) and valid_interval(attempt)):
             attempts_by_start[key] = attempt
         elif valid_interval(prior) and valid_interval(attempt):
-            for field in ('role', 'role_source'):
+            for field in ('role', 'role_source', 'manifest_sha256', 'start', 'end'):
                 if prior.get(field) is None and attempt.get(field) is not None:
                     prior[field] = attempt[field]
+
+    current_sha = sha256(rows_path) if rows_path.is_file() else None
+    manifests = {}
+
+    def manifest_row(attempt):
+        manifest_sha = attempt.get('manifest_sha256')
+        if not isinstance(manifest_sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', manifest_sha):
+            return None
+        manifest_sha = manifest_sha.lower()
+        if manifest_sha == current_sha:
+            return rows_by_id.get(attempt['id'])
+        if manifest_sha not in manifests:
+            path = out / 'manifests' / f'{manifest_sha}.json'
+            try:
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != manifest_sha:
+                    raise ValueError('manifest hash mismatch')
+                manifest = json.loads(data)
+                manifest_rows = manifest.get('rows', []) if isinstance(manifest, dict) else manifest
+                manifests[manifest_sha] = {row['id']: row for row in manifest_rows
+                                           if isinstance(row, dict) and isinstance(row.get('id'), str)}
+            except (OSError, ValueError, TypeError):
+                manifests[manifest_sha] = {}
+        return manifests[manifest_sha].get(attempt['id'])
 
     intervals = []
     for kind in ('up', 'down'):
         start, end = timing.get(kind + '_start'), timing.get(kind + '_done')
         if numeric(start) and numeric(end) and end >= start:
             intervals.append((start, end, kind))
-    attempts, attempts_unroled, roles_defaulted = 0, 0, 0
+    attempts, attempts_unroled, roles_defaulted, roles_from_manifest = 0, 0, 0, 0
+    attempt_ids_not_in_manifest = set()
     for attempt in attempts_by_start.values():
         if not valid_interval(attempt):
             skipped += 1
@@ -631,22 +656,27 @@ def time_split(run):
         start, end = attempt['started'], attempt['ended']
         role = attempt.get('role')
         inferred = False
+        from_manifest = False
         if role is None:
-            row = rows_by_id.get(attempt['id'])
-            if row is None:
-                role = 'unroled'
-            elif 'role' in row:
+            row = manifest_row(attempt)
+            if row is not None and 'role' in row:
                 role = row['role']
-            else:
-                role = 'setup' if row.get('start') != row.get('end') else 'test'
+                from_manifest = True
+            elif isinstance(attempt.get('start'), str) and isinstance(attempt.get('end'), str):
+                role = 'setup' if attempt['start'] != attempt['end'] else 'test'
                 inferred = True
+            else:
+                role = 'unroled'
         if role not in ('setup', 'test', 'unroled'):
             skipped += 1
             continue
         if inferred or attempt.get('role_source') == 'default':
             roles_defaulted += 1
+        roles_from_manifest += from_manifest
         attempts += 1
         attempts_unroled += role == 'unroled'
+        if attempt['id'] not in rows_by_id:
+            attempt_ids_not_in_manifest.add(attempt['id'])
         intervals.append((start, end, role))
 
     first, last = timing.get('up_start'), timing.get('down_done')
@@ -683,6 +713,7 @@ def time_split(run):
     return {'window': window, **durations, 'unclassified': unclassified if window is not None else None,
             'incomplete': window is None, 'overlap': overlap, 'attempts': attempts, 'attempts_skipped': skipped,
             'attempts_unroled': attempts_unroled, 'roles_defaulted': roles_defaulted,
+            'roles_from_manifest': roles_from_manifest, 'attempt_ids_not_in_manifest': sorted(attempt_ids_not_in_manifest),
             'test_share': round(durations['test'] / total, 3) if total else 0}
 
 

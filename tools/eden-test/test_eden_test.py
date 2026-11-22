@@ -340,6 +340,63 @@ class IntervalAccountingTests(unittest.TestCase):
     def journal(self, values):
         (self.run / 'out/attempts.jsonl').write_text(''.join(json.dumps(value) + '\n' for value in values))
 
+    def test_superseded_receipt_and_current_journal_are_both_counted(self):
+        self.set_timing(up_start=0, up_done=5, down_start=26, down_done=31)
+        self.rows = [{'id': 'new-name', 'start': 'training', 'end': 'training'}]
+        self.set_rows()
+        self.receipt('old-name.json', {'id': 'old-name', 'role': 'test', 'start': 'training',
+                                       'end': 'training', 'started': 5, 'ended': 15})
+        self.journal([{'id': 'new-name', 'role': 'test', 'started': 15, 'ended': 25}])
+        self.receipt('summary.json', {'started': 6, 'start': 'x', 'end': 'x'})
+        self.receipt('not-a-receipt.json', {'id': 'different', 'start': 'x', 'end': 'x', 'started': 6, 'ended': 7})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['window'], split['test'], split['attempts'], split['unclassified']), (31, 20, 2, 1))
+        self.assertEqual(split['attempt_ids_not_in_manifest'], ['old-name'])
+
+    def test_old_receipt_role_uses_its_manifest_snapshot_not_current_rows(self):
+        snapshot_dir = self.run / 'out/manifests'
+        snapshot_dir.mkdir()
+        old = {'rows': [{'id': 'r1', 'start': 'menu', 'end': 'training', 'role': 'test'}]}
+        pending = snapshot_dir / 'pending'
+        pending.write_text(json.dumps(old))
+        old_sha = sha(pending)
+        pending.rename(snapshot_dir / f'{old_sha}.json')
+        self.rows[0]['role'] = 'setup'
+        self.set_rows()
+        self.receipt('r1.FAILED.old.json', {'id': 'r1', 'start': 'menu', 'end': 'training',
+                                          'started': 5, 'ended': 15, 'manifest_sha256': old_sha})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test']), (0, 10))
+        self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (1, 0))
+
+    def test_old_receipt_without_snapshot_defaults_from_own_screens(self):
+        self.rows[0]['role'] = 'test'
+        self.set_rows()
+        self.receipt('r1.json', {'id': 'r1', 'start': 'menu', 'end': 'training',
+                                 'started': 5, 'ended': 15, 'manifest_sha256': 'f' * 64})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test']), (10, 0))
+        self.assertEqual((split['roles_from_manifest'], split['roles_defaulted']), (0, 1))
+
+    def test_tampered_snapshot_is_not_used_as_role_provenance(self):
+        snapshot_dir = self.run / 'out/manifests'
+        snapshot_dir.mkdir()
+        (snapshot_dir / ('f' * 64 + '.json')).write_text(json.dumps(
+            {'rows': [{'id': 'r1', 'role': 'test'}]}))
+        self.receipt('r1.json', {'id': 'r1', 'start': 'menu', 'end': 'training',
+                                 'started': 5, 'ended': 15, 'manifest_sha256': 'f' * 64})
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['setup'], split['test'], split['roles_from_manifest'], split['roles_defaulted']),
+                         (10, 0, 0, 1))
+
+    def test_journal_without_own_role_or_screens_is_unroled_even_if_current_row_has_role(self):
+        self.rows[0]['role'] = 'setup'
+        self.set_rows()
+        self.journal([{'id': 'r1', 'started': 5, 'ended': 15}])
+        split = eden_test.time_split(self.run)
+        self.assertEqual((split['unroled'], split['setup']), (10, 0))
+        self.assertEqual((split['roles_from_manifest'], split['attempts_unroled']), (0, 1))
+
     def test_superseded_row_attempt_remains_in_the_journal_total(self):
         self.set_timing(up_start=0, up_done=5, down_start=26, down_done=31)
         self.journal([{'id': 'old-name', 'role': 'test', 'started': 5, 'ended': 15},
@@ -358,9 +415,11 @@ class IntervalAccountingTests(unittest.TestCase):
     def test_old_receipt_uses_explicit_same_screen_setup_role(self):
         self.rows[0]['role'] = 'setup'
         self.set_rows()
-        self.receipt('r1.json', {'id': 'r1', 'started': 5, 'ended': 15})
+        self.receipt('r1.json', {'id': 'r1', 'start': 'training', 'end': 'training',
+                                 'manifest_sha256': sha(self.run / 'rows/rows.json'), 'started': 5, 'ended': 15})
         split = eden_test.time_split(self.run)
-        self.assertEqual((split['setup'], split['test'], split['roles_defaulted']), (10, 0, 0))
+        self.assertEqual((split['setup'], split['test'], split['roles_defaulted'], split['roles_from_manifest']),
+                         (10, 0, 0, 1))
 
     def test_missing_endpoint_still_sweeps_overlapping_attempts(self):
         self.set_timing(up_start=0, up_done=2, down_start=20)
@@ -387,7 +446,7 @@ class IntervalAccountingTests(unittest.TestCase):
     def test_duplicate_receipt_supplies_missing_attempt_role(self):
         self.journal([{'id': 'r1', 'started': 5, 'ended': 15}])
         self.receipt('r1.json', {'id': 'r1', 'role': 'setup', 'role_source': 'explicit',
-                                 'started': 5, 'ended': 15})
+                                 'start': 'training', 'end': 'training', 'started': 5, 'ended': 15})
         split = eden_test.time_split(self.run)
         self.assertEqual((split['attempts'], split['setup'], split['test'], split['roles_defaulted']), (1, 10, 0, 0))
 
@@ -395,20 +454,25 @@ class IntervalAccountingTests(unittest.TestCase):
         failed = {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15, 'status': 'FAILED'}
         passed = {'id': 'r1', 'role': 'test', 'started': 15, 'ended': 25, 'status': 'PASS'}
         self.journal([failed, passed])
-        self.receipt('r1.json', passed)
+        self.receipt('r1.json', {**passed, 'start': 'training', 'end': 'training'})
         split = eden_test.time_split(self.run)
         self.assertEqual(split, {'window': 30, 'up': 5, 'setup': 0, 'test': 20, 'unroled': 0, 'down': 5,
                                  'unclassified': 0, 'incomplete': False, 'overlap': 0, 'attempts': 2,
                                  'attempts_skipped': 0, 'attempts_unroled': 0, 'roles_defaulted': 0,
+                                 'roles_from_manifest': 0, 'attempt_ids_not_in_manifest': [],
                                  'test_share': 0.667})
 
     def test_externally_retained_attempt_is_counted(self):
         self.receipt('r1.FAILED.before-fix.json',
-                     {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15, 'status': 'FAILED'})
-        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'started': 15, 'ended': 25, 'status': 'PASS'})
-        self.receipt('other.FAILED.outside.json', {'id': 'other', 'role': 'test', 'started': 5, 'ended': 25})
+                     {'id': 'r1', 'role': 'test', 'start': 'training', 'end': 'training',
+                      'started': 5, 'ended': 15, 'status': 'FAILED'})
+        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'start': 'training', 'end': 'training',
+                                 'started': 15, 'ended': 25, 'status': 'PASS'})
+        self.receipt('other.FAILED.outside.json', {'id': 'other', 'role': 'test', 'start': 'training',
+                                                   'end': 'training', 'started': 5, 'ended': 25})
         split = eden_test.time_split(self.run)
-        self.assertEqual((split['test'], split['attempts'], split['unclassified']), (20, 2, 0))
+        self.assertEqual((split['test'], split['attempts'], split['unclassified']), (20, 3, 0))
+        self.assertEqual(split['attempt_ids_not_in_manifest'], ['other'])
 
     def test_runner_window_gap_is_unclassified(self):
         self.set_timing(up_start=0, up_done=5, down_start=55, down_done=60, runs=[[10, 15], [45, 50]])
@@ -441,8 +505,9 @@ class IntervalAccountingTests(unittest.TestCase):
 
     def test_missing_window_defaults_role_and_skips_unfinished_attempt(self):
         self.set_timing(up_start=0, up_done=5, down_start=20)
-        self.journal([{'id': 'r1', 'started': 5, 'ended': 15}, {'id': 'r1', 'started': 20}])
-        self.receipt('r1.json', {'id': 'r1', 'started': 5, 'ended': 15})
+        self.journal([{'id': 'r1', 'start': 'training', 'end': 'training', 'started': 5, 'ended': 15},
+                      {'id': 'r1', 'started': 20}])
+        self.receipt('r1.json', {'id': 'r1', 'start': 'training', 'end': 'training', 'started': 5, 'ended': 15})
         split = eden_test.time_split(self.run)
         self.assertEqual((split['window'], split['unclassified'], split['up'], split['test'], split['down']),
                          (None, None, 5, 10, 0))
@@ -464,7 +529,8 @@ class IntervalAccountingTests(unittest.TestCase):
 
     def test_valid_duplicate_can_replace_incomplete_attempt(self):
         self.journal([{'id': 'r1', 'started': 5, 'ended': 4}])
-        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'started': 5, 'ended': 15})
+        self.receipt('r1.json', {'id': 'r1', 'role': 'test', 'start': 'training', 'end': 'training',
+                                 'started': 5, 'ended': 15})
         split = eden_test.time_split(self.run)
         self.assertEqual((split['attempts'], split['attempts_skipped'], split['test']), (1, 0, 10))
 
@@ -486,24 +552,31 @@ class TimeSplitTests(unittest.TestCase):
             {'up_start': 1, 'up_done': 11, 'runs': [[12, 62]], 'down_start': 70, 'down_done': 75}))
         for name, receipt in (
             ('setup', {'status': 'PASS', 'started': 10, 'ended': 18, 'role': 'setup'}),
-            ('test', {'status': 'PASS', 'started': 20, 'ended': 40}),
+            ('test', {'status': 'PASS', 'started': 20, 'ended': 40,
+                      'manifest_sha256': sha(self.run / 'rows/rows.json')}),
             ('unfinished', {'status': 'FAILED', 'started': 50, 'role': 'setup'}),
         ):
+            row = next(row for row in self.rows if row['id'] == name)
+            receipt.update(id=name, start=row['start'], end=row['end'])
             (self.run / 'out' / f'{name}.json').write_text(json.dumps(receipt))
 
     def test_split_uses_receipts_fallback_and_skips_unfinished(self):
         self.assertEqual(eden_test.time_split(self.run),
                          {'window': 74, 'up': 10, 'setup': 27, 'test': 0, 'unroled': 0, 'down': 5,
                           'unclassified': 32, 'incomplete': False, 'overlap': 1, 'attempts': 2,
-                          'attempts_skipped': 1, 'attempts_unroled': 0, 'roles_defaulted': 0, 'test_share': 0})
+                          'attempts_skipped': 1, 'attempts_unroled': 0, 'roles_defaulted': 0,
+                          'roles_from_manifest': 1, 'attempt_ids_not_in_manifest': [], 'test_share': 0})
 
     def test_missing_timing_and_receipts_are_zero(self):
         (self.run / 'timing.json').write_text('{}')
         (self.run / 'rows/rows.json').write_text('[]')
+        for receipt in (self.run / 'out').glob('*.json'):
+            receipt.unlink()
         self.assertEqual(eden_test.time_split(self.run),
                          {'window': None, 'up': 0, 'setup': 0, 'test': 0, 'unroled': 0, 'down': 0,
                           'unclassified': None, 'incomplete': True, 'overlap': 0, 'attempts': 0,
-                          'attempts_skipped': 0, 'attempts_unroled': 0, 'roles_defaulted': 0, 'test_share': 0})
+                          'attempts_skipped': 0, 'attempts_unroled': 0, 'roles_defaulted': 0,
+                          'roles_from_manifest': 0, 'attempt_ids_not_in_manifest': [], 'test_share': 0})
 
     def test_receipt_role_overrides_the_row_default(self):
         path = self.run / 'out/setup.json'
