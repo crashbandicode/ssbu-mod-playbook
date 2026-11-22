@@ -153,7 +153,72 @@ def lifecycle(run, mode, *extra):
 SETUP_VIA = ('fixture', 'segment', 'record', 'hook')
 
 
-def setup_plan_problems(spec):
+def fixture_diff(fixture, reviewed):
+    def diff(left, right, path):
+        if type(left) is not type(right):
+            return [path]
+        if isinstance(left, dict):
+            found = []
+            for key in left.keys() | right.keys():
+                child = f'{path}.{key}' if path else key
+                if key not in left or key not in right:
+                    found.append(child)
+                else:
+                    found.extend(diff(left[key], right[key], child))
+            return found
+        if isinstance(left, list):
+            if len(left) != len(right):
+                return [path]
+            return [item for i, (a, b) in enumerate(zip(left, right))
+                    for item in diff(a, b, f'{path}.{i}' if path else str(i))]
+        return [] if left == right else [path]
+    return sorted(diff(fixture, reviewed, ''))
+
+
+def fixture_comparison(item, base):
+    reviewed = item.get('reviewed')
+    result = {'state': item.get('state'), 'file': item.get('file'), 'reviewed': reviewed,
+              'differing_paths': [], 'differs_only': item.get('differs_only', []), 'ok': False}
+    problems = []
+    state = item.get('state', '?')
+    if not item.get('file'):
+        return result, [f'{state}: reviewed requires file']
+    if not isinstance(reviewed, dict) or not reviewed.get('path'):
+        return result, [f'{state}: reviewed needs path and sha256']
+    allowed = result['differs_only']
+    if not isinstance(allowed, list) or any(not isinstance(path, str) for path in allowed):
+        return result, [f'{state}: differs_only must be a list of paths']
+    missing = object()
+    values = []
+    for name, source in (('fixture', item['file']), ('reviewed', reviewed['path'])):
+        try:
+            path = Path(source)
+            data = (path if path.is_absolute() else Path(base) / path).read_bytes()
+            value = json.loads(data)
+        except (OSError, ValueError, TypeError) as error:
+            problems.append(f'{state}: {name} {source}: {type(error).__name__}')
+            values.append(missing)
+            continue
+        if name == 'reviewed' and (not isinstance(reviewed.get('sha256'), str)
+                                   or reviewed['sha256'].lower() != hashlib.sha256(data).hexdigest()):
+            problems.append(f'{state}: reviewed sha256 mismatch: {source}')
+        values.append(value)
+    if len(values) == 2 and all(value is not missing for value in values):
+        result['differing_paths'] = fixture_diff(*values)
+        offending = [path for path in result['differing_paths']
+                     if not any(path == allow or path.startswith(allow + '.') for allow in allowed)]
+        if offending:
+            problems.append(f'{state}: {len(offending)} differing paths: '
+                            + ', '.join(path or '<root>' for path in offending[:12]))
+    result['ok'] = not problems
+    return result, problems
+
+
+def fixture_problems(item, base):
+    return fixture_comparison(item, base)[1] if 'reviewed' in item else []
+
+
+def setup_plan_problems(spec, base=None):
     """MACROS rule 13: rows.json names how each starting state is reached, before Up.
     "setup": [{"state": "Training, P1 Kirby, CPU Kirby", "via": "fixture", "ref": "files: settings.json"}, ...]"""
     plan = spec.get('setup') if isinstance(spec, dict) else None
@@ -164,13 +229,22 @@ def setup_plan_problems(spec):
     for i, item in enumerate(plan):
         if not isinstance(item, dict) or not item.get('state') or item.get('via') not in SETUP_VIA or not item.get('ref'):
             problems.append(f'setup[{i}] needs "state", "via" ({"/".join(SETUP_VIA)}) and "ref"')
+        if base is not None and isinstance(item, dict):
+            problems.extend(f'setup[{i}]: {problem}' for problem in fixture_problems(item, base))
     return problems
 
 
 def cmd_up(run, skip_setup_plan=False):
     rows = run / 'rows' / 'rows.json'
-    problems = setup_plan_problems(json.loads(rows.read_text()))
-    if problems and not skip_setup_plan:
+    spec = json.loads(rows.read_text())
+    problems = setup_plan_problems(spec, rows.parent)
+    setup = spec.get('setup', []) if isinstance(spec, dict) else []
+    comparisons = [(i, fixture_comparison(item, rows.parent)) for i, item in enumerate(setup)
+                   if isinstance(item, dict) and 'reviewed' in item] if isinstance(setup, list) else []
+    (run / 'setup-fixtures.json').write_text(json.dumps([result for _, (result, _) in comparisons], indent=2) + '\n')
+    if skip_setup_plan:
+        problems = [f'setup[{i}]: {problem}' for i, (_, found) in comparisons for problem in found]
+    if problems:
         raise SystemExit('setup plan: ' + '; '.join(problems) + ' (MACROS rule 13; --skip-setup-plan only to re-run '
                          'rows that already have their segments)')
     if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eden_test  # noqa: E402
@@ -50,6 +51,93 @@ FAKE_HARVEST = 'print(\'{"segments": [], "gates": []}\')\n'
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class SetupFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name) / 'run'
+        self.rows = self.run / 'rows'
+        self.rows.mkdir(parents=True)
+        self.reviewed = self.rows / 'reviewed.json'
+        self.fixture = self.rows / 'fixture.json'
+        self.reviewed.write_text(json.dumps({'last_page': 2, 'menu': {'a': [0, 0], 'b': [5, 6]}}))
+        self.fixture.write_text(json.dumps({'menu': {'a': [1, 0], 'b': [5, 8]}}))
+        self.item = {'state': 'Training', 'via': 'fixture', 'ref': 'settings',
+                     'file': 'fixture.json', 'reviewed': {'path': 'reviewed.json', 'sha256': sha(self.reviewed)}}
+
+    def plan(self):
+        (self.rows / 'rows.json').write_text(json.dumps({'setup': [self.item], 'rows': []}))
+
+    def test_fixture_diff_nested_lists_types_and_root(self):
+        self.assertEqual(eden_test.fixture_diff(
+            {'nest': {'a': 1}, 'list': [0, {'x': 2}], 'old': 1},
+            {'nest': {'a': 3}, 'list': [0, {'x': 4}], 'new': 1}),
+            ['list.1.x', 'nest.a', 'new', 'old'])
+        self.assertEqual(eden_test.fixture_diff({'list': [1, 2]}, {'list': [1]}), ['list'])
+        self.assertEqual(eden_test.fixture_diff({'value': 1}, {'value': True}), ['value'])
+        self.assertEqual(eden_test.fixture_diff([1], {'one': 1}), [''])
+        self.assertEqual(eden_test.fixture_diff({'x': [1, 2]}, {'x': [1, 2]}), [])
+
+    def test_up_refuses_differences_and_writes_evidence(self):
+        self.plan()
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run)
+        self.assertIn('last_page', str(caught.exception))
+        self.assertIn('Training', str(caught.exception))
+        self.assertIn('3', str(caught.exception))
+        sh.assert_not_called()
+        evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertEqual(evidence[0]['differing_paths'], ['last_page', 'menu.a.0', 'menu.b.1'])
+        self.assertFalse(evidence[0]['ok'])
+
+    def test_skip_setup_plan_does_not_skip_reviewed_fixture(self):
+        self.plan()
+        with mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.cmd_up(self.run, skip_setup_plan=True)
+        self.assertIn('last_page', str(caught.exception))
+        sh.assert_not_called()
+
+    def test_allowed_exact_and_parent_paths_pass(self):
+        self.item['differs_only'] = ['last_page', 'menu.a', 'menu.b.1']
+        self.plan()
+        with mock.patch.object(eden_test, 'sh', return_value=0), \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0):
+            eden_test.cmd_up(self.run)
+        evidence = json.loads((self.run / 'setup-fixtures.json').read_text())
+        self.assertTrue(evidence[0]['ok'])
+        self.assertEqual(evidence[0]['reviewed'], self.item['reviewed'])
+        self.assertEqual(evidence[0]['file'], 'fixture.json')
+
+    def test_wrong_reviewed_hash_is_refused(self):
+        self.item['reviewed']['sha256'] = '0' * 64
+        problems = eden_test.fixture_problems(self.item, self.rows)
+        self.assertTrue(any('sha256' in p for p in problems))
+
+    def test_missing_fixture_is_refused(self):
+        self.item['file'] = 'missing.json'
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows))
+
+    def test_invalid_json_is_refused(self):
+        self.fixture.write_text('{')
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows))
+
+    def test_null_fixture_root_is_compared(self):
+        self.fixture.write_text('null')
+        self.assertIn('<root>', ' '.join(eden_test.fixture_problems(self.item, self.rows)))
+
+    def test_review_without_file_is_refused(self):
+        del self.item['file']
+        self.assertTrue(eden_test.fixture_problems(self.item, self.rows))
+
+    def test_unreviewed_item_is_untouched(self):
+        del self.item['reviewed']
+        self.assertEqual(eden_test.fixture_problems(self.item, self.rows), [])
+        self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}), [])
+        self.assertEqual(eden_test.setup_plan_problems({'setup': [self.item]}, self.rows), [])
 
 
 class EdenTestTests(unittest.TestCase):

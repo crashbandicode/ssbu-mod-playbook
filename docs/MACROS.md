@@ -336,6 +336,10 @@ The rules:
     boot steering the character select to make the CPU Kirby, 139 single
     inputs and no finished row, until the runtime cap stopped Eden; the
     plugin's settings fixture reached the same state in one step.)
+    A fixture may add `"file": "settings.json"`, `"reviewed":
+    {"path": "reviewed.json", "sha256": "..."}` and
+    `"differs_only": ["menu.cpu_percent"]`. `up` refuses missing or invalid
+    files, a wrong reviewed hash, or differences outside those paths.
 14. **Press a chord in one frame.** A plugin that reads a button combination
     (a menu chord such as `B`+`Up`, a shortcut such as `ZL`+`Left`, the
     `L`+`R`+`A` start) sees it only when every button goes down in the same
