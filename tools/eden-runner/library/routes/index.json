@@ -1,5 +1,17 @@
 {
  "about": "ROUTES macros (docs/ROUTES.md). Same-frame chords live in these files and are played with macro.play; never send a chord as separate presses. routes.play() checks each sha256 before playing. Status per entry: \"proven\" names the run that showed it working.",
+ "topologies": {
+  "css-training": {
+   "file": "topologies/css-training-entry-topology.json",
+   "sha256": "13b201bcbdfd335811e783970959e915dfc3f1d10371937be9a1e4f6ab71b915",
+   "source": "native Training CSS entry topology"
+  },
+  "sss-training": {
+   "file": "topologies/sss-settled-topology.json",
+   "sha256": "b2823df6e24a55f0fe8dc13c54a26299ba50b475b74ea57038de9cbd59c9e3a2",
+   "source": "bridge loads 8 and 9 settled Training SSS topology"
+  }
+ },
  "macros": {
   "main-menu-left": {
    "file": "macros/main-menu-left.edenmacro.json",
@@ -35,34 +47,34 @@
   },
   "tile-up": {
    "file": "macros/tile-up.edenmacro.json",
-   "sha256": "90804c2ba02737ac71172160edf0a5f17d9835a00bc48832466cb94f16337df9",
+   "sha256": "7415a3ec1ca20dc9d1bafa3fec5d301df823f80fa7fe42c82af3374a568ee3e9",
    "cap": 20,
-   "frames": 6,
-   "what": "L3, then L3+Up on frame 2, released frame 10: one tile-cursor step (CSS/SSS)",
+   "frames": 10,
+   "what": "L3, then L3+Up for 6 frames: one tile-cursor step (CSS/SSS)",
    "source": "authored 2026-11-16 harness-lib; mask shape of rc15-tech owned-chord-lstick-*40 (passed XPS chord1)"
   },
   "tile-down": {
    "file": "macros/tile-down.edenmacro.json",
-   "sha256": "ee10df82df7cb814c1e07d8e141f457ac0954bd00175f8ca8fa0c9daa239c662",
+   "sha256": "8e642aea7e7e93ba6f0c84fc923c21d65eefe8b5c2967e532bda86c851b74340",
    "cap": 20,
-   "frames": 6,
-   "what": "L3, then L3+Down: one tile-cursor step",
+   "frames": 10,
+   "what": "L3, then L3+Down for 6 frames: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
   "tile-left": {
    "file": "macros/tile-left.edenmacro.json",
-   "sha256": "1d95116973fd2d43e6a7fb85c50db14730184307005385791359eb12fb159ff9",
+   "sha256": "26e35f2c70110a75e0319721c07bb70f2cdec37cee5a91c9218fb9a9ebd0ee28",
    "cap": 20,
-   "frames": 6,
-   "what": "L3, then L3+Left: one tile-cursor step",
+   "frames": 10,
+   "what": "L3, then L3+Left for 6 frames: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
   "tile-right": {
    "file": "macros/tile-right.edenmacro.json",
-   "sha256": "b4b29ecf6f15719ee240af49cef2db723e344c4f01cb1bb80b232d6d94ec3525",
+   "sha256": "2da779c31657174cfb487af1e61c37d6dcab8cbf1e7ca5a03ec762783da7c8c5",
    "cap": 20,
-   "frames": 6,
-   "what": "L3, then L3+Right: one tile-cursor step",
+   "frames": 10,
+   "what": "L3, then L3+Right for 6 frames: one tile-cursor step",
    "source": "authored 2026-11-16 harness-lib"
   },
   "tap-a1": {

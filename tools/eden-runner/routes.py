@@ -31,6 +31,7 @@ import os
 import re
 import socket
 import time
+from collections import deque
 from pathlib import Path
 
 import native_picker
@@ -1065,9 +1066,26 @@ def _probe_step(ctx, walker, direction='left', cap=2.5):
 
 def pick_fighters(ctx, p1, cpu=None, coin_route=False, *, topology=None, form='default'):
     """Place the verified local fighter token in CSS."""
-    if cpu is not None or coin_route:
-        raise RuntimeError('CSS CPU placement needs a qualified tile.cursor CPU seat and token')
-    return pick_local_fighter(ctx, p1, topology=topology, form=form)
+    if coin_route:
+        raise RuntimeError('the stick-based coin route is not supported')
+    topology = topology or library_topology('css-training')
+    if cpu is None:
+        return pick_local_fighter(ctx, p1, topology=topology, form=form)
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    previous = getattr(ctx.runner, 'setup_metrics', None)
+    ctx.runner.setup_metrics = metrics
+    start = time.monotonic()
+    try:
+        p1_result = pick_local_fighter(ctx, p1, topology=topology, form=form)
+        p1_ms = round((time.monotonic() - start) * 1000)
+        cpu_result = pick_cpu(ctx, cpu, topology=topology, form=form)
+    finally:
+        ctx.runner.setup_metrics = previous
+    receipt = {'block': 'pick_fighters', 'args': {'p1': p1, 'cpu': cpu, 'form': form},
+               'verified': {'p1': p1_result, 'cpu': cpu_result}, **metrics,
+               'ms': {'p1': p1_ms, 'cpu': round((time.monotonic() - start) * 1000) - p1_ms},
+               'skipped': [], 'p1': p1_result, 'cpu': cpu_result}
+    return _save(ctx, 'routes-pick-fighters', receipt)
 
 
 # --- Training: game state ---------------------------------------------------------------------------------------------
@@ -1742,6 +1760,115 @@ def _tile_topology(pin):
     return native_picker.Topology(data['layout'], data['neighbors'],
                                   {index: native_picker.Target(**identity)
                                    for index, identity in data['targets'].items()})
+
+
+def library_topology(name):
+    try:
+        entry = routes_index()['topologies'][name]
+    except KeyError:
+        raise RuntimeError(f'no library topology pin for {name!r}') from None
+    path = ROUTES / entry['file']
+    if _sha256(path) != entry['sha256']:
+        raise RuntimeError(f'library topology SHA-256 changed: {name}')
+    return {'path': str(path), 'sha256': entry['sha256']}
+
+
+def _parking_tile(topology, start, target):
+    queue, visited = deque([(start, 0)]), {start}
+    while queue:
+        tile, distance = queue.popleft()
+        if distance >= 2 and tile in topology.targets and tile != target:
+            return tile
+        for dest in topology.neighbors.get(tile, {}).values():
+            if dest not in visited:
+                visited.add(dest)
+                queue.append((dest, distance + 1))
+    raise RuntimeError('no qualified parking tile at least two steps from P1')
+
+
+def pick_cpu(ctx, fighter, *, topology=None, form='default'):
+    """Place the CPU coin from a qualified Training fighter-select observation."""
+    entry = fighter_entry(fighter)
+    target = _native_target(entry, form)
+    topology = _tile_topology(topology or library_topology('css-training'))
+    io = BridgePickerIO(ctx)
+    started = time.monotonic()
+    timings = {}
+
+    def phase(name, function, *args, **kwargs):
+        begin = time.monotonic()
+        result = function(*args, **kwargs)
+        timings[name] = round((time.monotonic() - begin) * 1000)
+        return result
+
+    current, _ = native_picker._coin_baseline(io, 4, 'training')
+    native_picker._p1_placed(current)
+    if topology is None or topology.layout != current.values['layout']:
+        raise RuntimeError('CPU placement needs the qualified active CSS topology')
+    original = native_picker.p1_medal(current)
+    if topology.targets.get(original[1]) != native_picker.Target.read(current, 'placed.'):
+        raise RuntimeError('P1 medal identity disagrees with the qualified topology')
+    goals = [tile for tile, identity in topology.targets.items() if identity == target]
+    if len(goals) != 1:
+        raise RuntimeError('CPU target identity is absent or ambiguous in the active topology')
+    goal = goals[0]
+    already = (current.values.get('cpu.token') == 'placed'
+               and tuple(current.values.get('cpu.placed.' + key) for key in ('at', 'kind', 'name', 'form'))
+               == (goal, target.kind, target.name, target.form))
+    untangled, parked = False, None
+    final = current
+    skipped = []
+    if already:
+        skipped = ['reach', 'take', 'walk', 'place']
+    else:
+        try:
+            phase('reach', native_picker.reach_token, io, 1)
+        except native_picker.CoinBlocked as blocked:
+            if blocked.pointed != '0':
+                raise
+            untangled = True
+            phase('take_p1', native_picker.take_token, io, 0)
+            parked = _parking_tile(topology, original[1], goal)
+            prepared = phase('park_walk', native_picker.hover, io, 'css', topology.targets[parked], topology,
+                             expected_context='training')
+            phase('park_place', native_picker.confirm, io, 'css', prepared, expected_context='training')
+            parked_state, _ = native_picker._coin_baseline(io, 4, 'training')
+            native_picker._p1_placed(parked_state)
+            parked_medal = native_picker.p1_medal(parked_state)
+            if parked_medal[1] != parked:
+                raise RuntimeError('P1 parking placement did not reach the chosen tile')
+            phase('reach_after_parking', native_picker.reach_token, io, 1)
+        else:
+            parked_medal = original
+        phase('take', native_picker.take_token, io, 1)
+        _, reached = phase('walk', native_picker.walk_cpu, io, target, topology)
+        final = phase('place', native_picker.place_cpu, io, target, reached, parked_medal)
+        if untangled:
+            phase('reach_p1', native_picker.reach_token, io, 0)
+            phase('take_parked_p1', native_picker.take_token, io, 0)
+            prepared = phase('restore_walk', native_picker.hover, io, 'css', topology.targets[original[1]], topology,
+                             expected_context='training')
+            phase('restore_place', native_picker.confirm, io, 'css', prepared, expected_context='training')
+            final, _ = native_picker._coin_baseline(io, 4, 'training')
+            native_picker._p1_placed(final)
+            if native_picker.p1_medal(final) != original:
+                raise RuntimeError('P1 medal did not return to its original identity and tile')
+            if (final.values.get('cpu.token') != 'placed'
+                    or tuple(final.values.get('cpu.placed.' + key) for key in ('at', 'kind', 'name', 'form'))
+                    != (goal, target.kind, target.name, target.form)):
+                raise RuntimeError('CPU placement changed while restoring P1')
+    remember(ctx, cpu_kind=entry['kind'], cpu=entry['name'])
+    receipt = {
+        'block': 'pick_cpu', 'args': {'fighter': fighter, 'form': form},
+        'verified': {'cpu': {'tile': goal, 'kind': target.kind, 'name': target.name, 'form': target.form},
+                     'p1_medal': list(native_picker.p1_medal(final))},
+        'inputs': getattr(io, 'input_count', len(getattr(io, 'actions', ()))),
+        'bridge_requests': getattr(io, 'request_count', 0),
+        'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)},
+        'bridge_boot': final.block['boot'], 'revisions': getattr(io, 'revisions', {}),
+        'skipped': skipped, 'already': already, 'untangled': untangled, 'parked_at': parked,
+    }
+    return _save(ctx, 'routes-pick-cpu', receipt)
 
 
 def _native_target(entry, form):

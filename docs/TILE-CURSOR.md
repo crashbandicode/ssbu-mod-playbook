@@ -120,3 +120,5 @@ Destination 4, Peach's Castle 5, Kongo Jungle 6.
 
 The repo's `docs/EDEN-TEST.md` has the whole test procedure and pass
 criteria, and `docs/HOOKS.md` has the hook sites.
+
+2026-11-22: shared tile-direction macros hold L3 plus direction for six frames and release at frame 7.

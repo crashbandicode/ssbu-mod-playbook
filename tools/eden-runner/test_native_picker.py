@@ -1210,8 +1210,8 @@ class BridgeFramingTests(unittest.TestCase):
                 data = json.loads(macro.read_text())
                 self.assertEqual(data['player'], 0)
                 self.assertEqual([(e['frame'], e['buttons']) for e in data['events']],
-                                 [(0, 16), (1, 16 | bit), (3, 0)])
-                self.assertGreater(data['duration_frames'], 3)
+                                 [(0, 16), (1, 16 | bit), (7, 0)])
+                self.assertEqual(data['duration_frames'], 10)
 
 class TrainingStageProofTests(unittest.TestCase):
     boot = '0x0000000000000001'

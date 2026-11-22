@@ -513,6 +513,236 @@ def acquire_local_token(io, target, topology, cap=4, *, expected_context=None):
         if state.values.get('local.token') != 'placed' or Target.read(state, 'placed.') != wanted:
             raise RuntimeError('local medal changed while taking it back')
 
+CPU_FIELDS = (
+    'hand.token', 'p1.coin', 'p1.coin.at', 'cpu.token', 'cpu.placed.at',
+    'cpu.placed.kind', 'cpu.placed.name', 'cpu.placed.form', 'carried.kind',
+    'carried.name', 'carried.form', 'target.token', 'token.settled',
+)
+
+
+class CoinBlocked(RuntimeError):
+    def __init__(self, wanted, pointed):
+        self.wanted, self.pointed = str(wanted), str(pointed)
+        super().__init__(f"the game points at coin {self.pointed} at coin {self.wanted}'s position")
+
+
+def cpu_lines(state):
+    if any(key not in state.values for key in CPU_FIELDS):
+        raise RuntimeError("tile.cursor: this build does not report the CPU's coin (no hand.token line)")
+    return state
+
+
+def p1_medal(state):
+    return tuple(state.values.get(key) for key in ('local.token', 'placed.at', 'placed.kind', 'placed.name',
+                                                   'placed.form'))
+
+
+def _coin_baseline(io, cap, expected_context):
+    until = time.monotonic() + cap
+    io.arm(TILE, cap)
+    ui = wait_sample(io, UI, until)
+    native_input_owner(ui, 'css', expected_context=expected_context)
+    state = cpu_lines(wait_sample(io, TILE, until, stepping=True, pending_placement=True))
+    same_epoch(ui, state, in_flight=True)
+    if context(state, 'css')[2] != 0:
+        raise RuntimeError('CPU coin selection requires local seat 0')
+    return state, ui
+
+
+def _coin_finish(io, ui, until, expected_context):
+    after = wait_sample(io, UI, until, ui, in_flight=True)
+    native_input_owner(after, 'css', ui, expected_context=expected_context)
+    io.finish()
+
+
+def _p1_placed(state):
+    values = state.values
+    if (values.get('local.token') != 'placed' or values.get('carried') != 'none'
+            or values.get('p1.coin') != 'placed' or values.get('p1.coin.at') != values.get('placed.at')):
+        raise RuntimeError(f'P1 medal is not placed with an empty hand: {p1_medal(state)!r}')
+    number(state, 'p1.coin.at')
+    Target.read(state, 'placed.')
+
+
+def reach_token(io, slot, cap=4, *, expected_context='training'):
+    slot = str(slot)
+    if slot not in ('0', '1'):
+        raise RuntimeError(f'invalid coin slot {slot!r}')
+    before, ui = _coin_baseline(io, cap, expected_context)
+    _p1_placed(before)
+    hand = before.values.get('hand.token')
+    if hand not in ('none', '0', '1'):
+        raise RuntimeError(f'hand.token is not at rest: {hand!r}')
+    if hand == slot:
+        return before
+    direction = ('left' if slot == '1' else 'right') if hand == 'none' else (
+        'right' if slot == '1' else 'left')
+    medal, coin_at = p1_medal(before), before.values['p1.coin.at']
+    prior_ack, prior_applied = number(before, 'ack'), number(before, 'applied')
+    io.send('tile-' + direction)
+    until = time.monotonic() + cap
+    latest = before
+    while True:
+        latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
+                                       pending_placement=True))
+        check_context(before, latest, 'css')
+        values = latest.values
+        if (p1_medal(latest) != medal or values.get('p1.coin') != 'placed'
+                or values.get('p1.coin.at') != coin_at):
+            raise RuntimeError('P1 medal or coin position changed while reaching the coin')
+        ack, applied = number(latest, 'ack'), number(latest, 'applied')
+        if (ack, applied) == (prior_ack, prior_applied):
+            continue
+        if values.get('result') == 'edge':
+            raise RuntimeError(f'coin reach hit edge: {direction}')
+        if (ack, applied) != (prior_ack + 1, prior_applied + 1):
+            raise RuntimeError('a tile step arrived while reaching the coin')
+        if (values.get('ack.result'), values.get('result'), values.get('direction'),
+                values.get('target.token')) != ('handled', 'handled', direction, slot):
+            raise RuntimeError(f'coin reach response does not match {direction} to {slot}')
+        pointed = values.get('hand.token')
+        if pointed in ('none', '0', '1') and pointed != slot:
+            _coin_finish(io, ui, until, expected_context)
+            raise CoinBlocked(slot, pointed)
+        if pointed == slot and values.get('token.settled') == '1':
+            _coin_finish(io, ui, until, expected_context)
+            return latest
+
+
+def take_token(io, slot, cap=4, *, expected_context='training'):
+    slot = str(slot)
+    if slot not in ('0', '1'):
+        raise RuntimeError(f'invalid coin slot {slot!r}')
+    before, ui = _coin_baseline(io, cap, expected_context)
+    _p1_placed(before)
+    hand = before.values.get('hand.token')
+    if hand != slot:
+        raise RuntimeError(f'refusing A: hand.token is {hand}, not {slot}')
+    coin_at = before.values['p1.coin.at']
+    io.send('tap-a1')
+    until = time.monotonic() + cap
+    latest = before
+    while True:
+        latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
+                                       pending_placement=True))
+        check_context(before, latest, 'css')
+        if (number(latest, 'ack') != number(before, 'ack')
+                or number(latest, 'applied') != number(before, 'applied')):
+            raise RuntimeError('a tile step arrived while taking a coin')
+        values = latest.values
+        carried = values.get('p1.carried')
+        held = (values.get('cpu.token') == 'held' and values.get('p1.coin') == 'placed'
+                and values.get('p1.coin.at') == coin_at) if slot == '1' else (
+                    values.get('local.token') == 'held' and values.get('carried') == '0')
+        if carried == slot and held:
+            _coin_finish(io, ui, until, expected_context)
+            return latest
+        if ((values.get('hand.token') in ('none', '0', '1') and values.get('hand.token') != 'unknown')
+                or (carried in ('0', '1') and values.get('settled') == '1')):
+            raise RuntimeError(f'p1.carried is {carried} after A')
+
+
+def _cpu_held(state, p1_at):
+    values = state.values
+    if (values.get('p1.carried') != '1' or values.get('cpu.token') != 'held'
+            or values.get('p1.coin') != 'placed' or values.get('p1.coin.at') != p1_at):
+        raise RuntimeError(f'CPU coin or P1 coin changed while walking: {values.get("p1.carried")}, '
+                           f'{values.get("cpu.token")}, {values.get("p1.coin")}, {values.get("p1.coin.at")}')
+
+
+def walk_cpu(io, target, topology, cap=4, *, expected_context='training'):
+    before, ui = _coin_baseline(io, cap, expected_context)
+    if topology is None or topology.layout != before.values.get('layout'):
+        raise RuntimeError('active layout has no validated topology for CPU placement')
+    goals = [tile for tile, identity in topology.targets.items() if identity == target]
+    if len(goals) != 1:
+        raise RuntimeError('CPU target identity is absent or ambiguous in the active topology')
+    goal = goals[0]
+    p1_at = before.values.get('p1.coin.at')
+    _cpu_held(before, p1_at)
+    number(before, 'p1.coin.at')
+    probes = 0
+    while True:
+        at = settled(before)
+        if at == goal:
+            if Target.read(before, 'carried.') != target:
+                raise RuntimeError('CPU carried identity disagrees with target')
+            return before, goal
+        if at not in topology.neighbors:
+            probes += 1
+            if probes > 3:
+                raise RuntimeError('CPU coin could not enter the validated topology')
+            direction, expected = 'left', None
+        else:
+            if topology.targets.get(at) != Target.read(before, 'carried.'):
+                raise RuntimeError('CPU carried identity disagrees with the active topology')
+            direction, expected = topology.step(at, goal)
+        prior_ack, prior_applied = number(before, 'ack'), number(before, 'applied')
+        io.send('tile-' + direction)
+        until = time.monotonic() + cap
+        latest = before
+        while True:
+            latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True))
+            check_context(before, latest, 'css')
+            _cpu_held(latest, p1_at)
+            values = latest.values
+            ack, applied = number(latest, 'ack'), number(latest, 'applied')
+            if (ack, applied) == (prior_ack, prior_applied):
+                continue
+            if (ack, applied) != (prior_ack + 1, prior_applied + 1):
+                raise RuntimeError('wrong CPU tile step ACK/application delta')
+            dest = values.get('to')
+            if (values.get('direction'), values.get('from'), values.get('ack.result'), values.get('result')) != (
+                    direction, at, 'handled', 'handled') or (expected is not None and dest != expected):
+                raise RuntimeError(f'wrong CPU tile step: {direction} {at} -> {dest}')
+            if values.get('settled') != '1':
+                continue
+            if (dest not in topology.neighbors or settled(latest, after_step=True) != dest
+                    or Target.read(latest, 'carried.') != topology.targets.get(dest)):
+                raise RuntimeError('CPU tile step did not settle on a qualified topology identity')
+            _coin_finish(io, ui, until, expected_context)
+            break
+        before, ui = _coin_baseline(io, cap, expected_context)
+        _cpu_held(before, p1_at)
+        if (before.values.get('at') != latest.values.get('at')
+                or number(before, 'ack') != number(latest, 'ack')
+                or number(before, 'applied') != number(latest, 'applied')):
+            raise RuntimeError('CPU tile changed before the next input')
+
+
+def place_cpu(io, target, tile, p1_before, cap=4, *, expected_context='training'):
+    before, ui = _coin_baseline(io, cap, expected_context)
+    p1_at = before.values.get('p1.coin.at')
+    _cpu_held(before, p1_at)
+    if (p1_at != p1_before[1] or settled(before) != str(tile)
+            or Target.read(before, 'carried.') != target):
+        raise RuntimeError('pre-A carried identity changed')
+    io.send('tap-a1')
+    until = time.monotonic() + cap
+    latest = before
+    while True:
+        latest = cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True, stepping=True,
+                                       pending_placement=True))
+        check_context(before, latest, 'css')
+        if (number(latest, 'ack') != number(before, 'ack')
+                or number(latest, 'applied') != number(before, 'applied')):
+            raise RuntimeError('a tile step arrived while placing the CPU coin')
+        values = latest.values
+        if values.get('cpu.token') == 'placed':
+            identity = tuple(values.get('cpu.placed.' + key) for key in ('at', 'kind', 'name', 'form'))
+            if (identity != (str(tile), target.kind, target.name, target.form)
+                    or p1_medal(latest) != p1_before or values.get('carried') != 'none'
+                    or values.get('p1.coin') != 'placed' or values.get('p1.coin.at') != p1_at):
+                raise RuntimeError(f'cpu.placed is {identity!r}, not the target')
+            _coin_finish(io, ui, until, expected_context)
+            return latest
+        if values.get('settled') == '1':
+            raise RuntimeError(f'cpu.placed is {values.get("cpu.token")!r}, not the target')
+        if (values.get('p1.coin') not in ('placed', 'unknown')
+                or values.get('p1.coin.at') not in (p1_at, 'unknown')):
+            raise RuntimeError('P1 coin changed while placing the CPU coin')
+
+
 def verify_room_selection(current, expected_key, generation):
     values = check_sample(current, UI).values
     if (values.get('screen') != 'ldn.room_list' or values.get('input.owner') != 'native'

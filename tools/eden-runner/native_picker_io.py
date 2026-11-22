@@ -65,6 +65,9 @@ class BridgePickerIO:
         self.cursor = routes.LogCursor(path, hold=False)
         self.connection = 0
         self.boot = None
+        self.request_count = 0
+        self.input_count = 0
+        self.revisions = {}
         self.in_flight = False
         self.stage_window = None
         self.pending = getattr(ctx.runner, 'native_ui_pending', {})
@@ -100,6 +103,10 @@ class BridgePickerIO:
             until = time.monotonic() + cap
         if time.monotonic() < until:
             self.routes.bridge_v2(self.ctx, *requests)
+            self.request_count += len(requests)
+            metrics = getattr(self.ctx.runner, 'setup_metrics', None)
+            if metrics is not None:
+                metrics['bridge_requests'] += len(requests)
         while time.monotonic() < until:
             self.ctx.check_stop()
             answer = None
@@ -215,19 +222,28 @@ class BridgePickerIO:
 
         requests = ('providers', f'state {provider}')
         if not native_ui:
-            return self._request(requests, cap, consume)
+            return self._record(self._request(requests, cap, consume))
 
         until = time.monotonic() + cap
         while True:
             connection = None if retry_epoch is None else retry_epoch[1]
             answer = self._request(requests, cap, consume, until=until, connection=connection)
             if answer is not STALE_UI:
-                return answer
+                return self._record(answer)
             time.sleep(min(STALE_UI_RETRY_S, max(0, until - time.monotonic())))
             self.ctx.check_stop()
             awaiting_retry = False
             fence = None
             catalog_generation = fence_generation = None
+
+    def _record(self, state):
+        provider, rev = state.block['name'], state.block['rev']
+        self.revisions.setdefault(provider, [rev, rev])[1] = rev
+        metrics = getattr(self.ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics['revisions'].setdefault(provider, [rev, rev])[1] = rev
+            metrics['bridge_boot'] = state.block['boot']
+        return state
 
     def mark_training_stage(self, before, cap):
         """Fence the bridge event history while the checked native CSS still owns the route."""
@@ -298,6 +314,10 @@ class BridgePickerIO:
                 self.stage_window.observe_before_press(line)
         self.pending[self.ctx.on] = segment
         self.routes.play(self.ctx, segment)
+        self.input_count += 1
+        metrics = getattr(self.ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics['inputs'] += 1
 
     def finish(self):
         self.pending.pop(self.ctx.on, None)

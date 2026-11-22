@@ -381,3 +381,9 @@ Not shown in either boot:
 - the online blocks.
 
 Surface calibration (2026-11-16): `pick_stage` accepts `transition_cap` (default 60 seconds). The single approved tile-repeat retry uses 180 seconds for native SSS-to-CSS loading on the Surface. Only the transition deadline changes; CSS image discrimination and step/settled/hover checks are unchanged. A timeout at 180 seconds stops the proof without another extension.
+
+2026-11-22: tile direction macros hold L3 plus direction for six frames, releasing at frame 7.
+`routes:pick_cpu(fighter, topology=None, form='default')` places the CPU coin at Training CSS with P1 placed;
+`routes:pick_fighters(p1, cpu=..., topology=None, form='default')` places both. Omitted topology uses the checked
+`css-training` library pin; an older Tile Cursor without CPU lines is refused before a CPU input. Receipts include
+the verified fighters and input/request counts. These paths have offline modelled-block tests, not a game proof.

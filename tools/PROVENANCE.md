@@ -142,3 +142,9 @@ SSS and CSS held repeats exactly 0->1->2->3 plus shared 2-frame walks to Battlef
 Sole approved Surface-calibrated CSS transition deadline 180 s; same image/log discrimination. Earlier run 1 retained
 its native-loading timeout at 60 s. Source branch head 84211bc adds only evidence-checker tests after build 8f830a2.
 Full provenance and source patch: `smash-training-lobby/artifacts/harness-lib/{tile-frame-PROVENANCE.json,tile-frame-source.patch}`.
+
+2026-11-22 (fusion-g4), setup-call CPU coin runner: `tools/eden-runner/test_setup_calls.py` appends modelled
+`tile.cursor/1` CPU fields to the recorded l8w fixtures. `library/routes/topologies/sss-settled-topology.json` is a
+byte copy of bridge load 9's settled SSS topology, SHA-256
+`b2823df6e24a55f0fe8dc13c54a26299ba50b475b74ea57038de9cbd59c9e3a2`. The four existing tile macros hold their
+direction for six frames as approved by the operator; no runtime acceptance is claimed here.
