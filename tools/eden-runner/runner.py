@@ -687,6 +687,7 @@ def publish_gif(raw_path, dest, spec, source_fps=None):
 
 def review_class(plan, base, raw_plan=None):
     private = []
+    reasons = {}
     segments = plan.get('segments', {})
     raw = plan if raw_plan is None else raw_plan
     raw_segments = raw.get('segments') if isinstance(raw.get('segments'), dict) else {}
@@ -703,7 +704,12 @@ def review_class(plan, base, raw_plan=None):
                  'tracepoint.status'}
 
     def add(where, what):
-        private.append({'where': where, 'what': what})
+        private.append({'where': where, 'what': what, 'reason': reasons.get(where)})
+
+    def remember_reason(where, item):
+        reason = item.get('reason') if isinstance(item, dict) else None
+        if isinstance(reason, str) and reason.strip() and '\n' not in reason and '\r' not in reason:
+            reasons[where] = reason
 
     def imported(kind, name, entries, where):
         entry = entries.get(name, {})
@@ -726,6 +732,7 @@ def review_class(plan, base, raw_plan=None):
             add(where, f'segment {name}')
 
     def step(item, where):
+        remember_reason(where, item)
         if not isinstance(item, dict):
             add(where, f'{where} invalid step')
             return
@@ -737,7 +744,7 @@ def review_class(plan, base, raw_plan=None):
         if verb not in step_keys:
             add(where, f'{verb} {item[verb]}')
             return
-        for key in sorted(set(item) - step_keys[verb]):
+        for key in sorted(set(item) - step_keys[verb] - {'reason'}):
             add(where, f'{where} key {key}')
         if verb == 'library':
             library(item['library'], where)
@@ -796,6 +803,7 @@ def review_class(plan, base, raw_plan=None):
         add('setup', 'no setup plan')
     else:
         for i, item in enumerate(setup):
+            remember_reason(f'setup {i}', item)
             via = item.get('via') if isinstance(item, dict) else None
             ref = item.get('ref') if isinstance(item, dict) else None
             reviewed = item.get('reviewed') if isinstance(item, dict) else None
@@ -809,7 +817,9 @@ def review_class(plan, base, raw_plan=None):
                               and ref[len('library:'):] in index.get('segments', {}))
             if not valid:
                 add(f'setup {i}', f'{via or "unknown"} setup {ref or ""}'.strip())
-    return {'class': 'full' if private else 'library-only', 'private': private, 'composition': composition}
+    missing_reasons = list(dict.fromkeys(item['where'] for item in private if not item['reason']))
+    return {'class': 'full' if private else 'library-only', 'private': private,
+            'missing_reasons': missing_reasons, 'composition': composition}
 
 
 def dry_run(manifest_path):
@@ -822,7 +832,8 @@ def dry_run(manifest_path):
     except KeyError as error:
         return {'manifest': str(manifest_path), 'errors': [str(error)], 'result': 'BROKEN', 'rows': 0,
                 'missing_segments': [], 'references_to_acquire': [], 'available_segments': [],
-                'review': {'class': 'full', 'private': [], 'composition': []}, 'roles_defaulted': roles_defaulted}
+                'review': {'class': 'full', 'private': [], 'missing_reasons': [], 'composition': []},
+                'roles_defaulted': roles_defaulted}
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
