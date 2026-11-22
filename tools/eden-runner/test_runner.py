@@ -140,10 +140,11 @@ class ReviewClassTests(unittest.TestCase):
             self.assertEqual(runner.dry_run(path)['review'],
                              {'class': 'library-only', 'private': [],
                               'composition': [
-                                  {'where': 'plan', 'item': {'start': 'menu'}},
+                                  {'where': 'plan', 'item': {'start': 'menu', '_keys': ['rows', 'setup', 'start']}},
                                   {'where': 'imports', 'item': {'segments': {}, 'gates': {}}},
                                   {'where': 'setup 0', 'item': plan['setup'][0]},
-                                  {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu'}},
+                                  {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu',
+                                                              '_keys': ['end', 'id', 'start', 'steps']}},
                                   {'where': 'row r1 step 0', 'item': {'shot': 'x'}}]})
             plan['setup'] = [{'via': 'fixture'}]
             path.write_text(json.dumps(plan))
@@ -217,34 +218,110 @@ class ReviewAdmissionTests(unittest.TestCase):
             self.assertEqual(entries['row r1 step 1'], plan['rows'][0]['steps'][1])
             self.assertEqual(entries['row r1 step 2'], plan['rows'][0]['steps'][2])
 
+    def test_composition_distinguishes_empty_row_recovery_override(self):
+        first = copy.deepcopy(self.plan)
+        first['recover'] = [{'play': 'route'}]
+        first['rows'] = [
+            {'id': 'r1', 'start': 'menu', 'end': 'menu', 'on_failure': 'continue', 'steps': [{'gate': 'main'}]},
+            {'id': 'r2', 'start': 'menu', 'end': 'menu', 'start_gate': 'main', 'steps': [{'gate': 'main'}]}]
+        second = copy.deepcopy(first)
+        second['rows'][1]['recover'] = []
+        self.assertEqual(runner.recover_steps_of(first, first['rows'][1]), [{'play': 'route'}])
+        self.assertEqual(runner.recover_steps_of(second, second['rows'][1]), [])
+        reviews = [self.report(plan)['review'] for plan in (first, second)]
+        self.assertEqual([review['class'] for review in reviews], ['library-only', 'library-only'])
+        self.assertNotEqual(reviews[0]['composition'], reviews[1]['composition'])
+        first_row = next(e['item'] for e in reviews[0]['composition'] if e['where'] == 'row r2')
+        second_row = next(e['item'] for e in reviews[1]['composition'] if e['where'] == 'row r2')
+        self.assertNotIn('recover', first_row)
+        self.assertEqual(second_row['recover'], [])
+        self.assertNotIn('recover', first_row['_keys'])
+        self.assertIn('recover', second_row['_keys'])
+
     def test_composition_reconstructs_clean_packet(self):
         plan = copy.deepcopy(self.plan)
         plan['setup'][0]['differs_only'] = ['menu.cpu_percent']
         plan['rows'][0]['recover'] = [{'call': 'status', 'params': {'side': 'guest'}}]
+        plan['rows'].append({'id': 'r2', 'start': 'menu', 'end': 'menu',
+                             'steps': [{'gate': 'main'}], 'recover': []})
         plan['recover'] = [{'gate': 'main'}, {'library': 'smash-main'}]
-        review = self.report(plan)['review']
-        self.assertEqual(review['class'], 'library-only')
-        composition = review['composition']
-        self.assertEqual(composition[0], {'where': 'plan', 'item': {'start': 'menu'}})
-        imports = composition[1]['item']
-        rebuilt = {'segments': {key: {'library': value} for key, value in imports['segments'].items()},
-                   'gates': {key: {'library': value} for key, value in imports['gates'].items()},
-                   'setup': [], 'rows': [], 'recover': []}
-        row = None
-        for entry in composition[2:]:
-            where, item = entry['where'], entry['item']
-            if where.startswith('setup '):
-                rebuilt['setup'].append(item)
-            elif where == 'row r1':
-                row = {**item, 'steps': [], 'recover': []}
-                rebuilt['rows'].append(row)
-            elif where.startswith('row r1 step '):
-                row['steps'].append(item)
-            elif where.startswith('row r1 recover '):
-                row['recover'].append(item)
-            elif where.startswith('plan recover '):
-                rebuilt['recover'].append(item)
-        self.assertEqual(rebuilt, {key: plan[key] for key in rebuilt})
+        variants = [plan, copy.deepcopy(plan), copy.deepcopy(plan), copy.deepcopy(plan)]
+        variants[1]['recover'] = []
+        variants[1]['setup'] = []
+        del variants[2]['rows'][1]['recover']
+        del variants[2]['recover']
+        variants[3]['rows'][1]['steps'] = []
+        for variant in variants:
+            with self.subTest(keys=sorted(variant), second_row=variant['rows'][1]):
+                self.manifest.write_text(json.dumps(variant))
+                report = runner.dry_run(self.manifest)
+                if variant['rows'][1]['steps']:
+                    self.assertEqual((report['result'], report['errors']), ('READY', []))
+                else:
+                    self.assertEqual(report['result'], 'BROKEN')
+                    self.assertIn('row r2: no steps', report['errors'])
+                composition = report['review']['composition']
+                header = dict(composition[0]['item'])
+                plan_keys = header.pop('_keys')
+                self.assertEqual(plan_keys, sorted(variant))
+                imports = composition[1]['item']
+                rebuilt = header
+                for key in ('segments', 'gates'):
+                    if key in plan_keys and key not in rebuilt:
+                        rebuilt[key] = {alias: {'library': value} if isinstance(value, str) else value
+                                        for alias, value in imports[key].items()}
+                for key in ('setup', 'rows', 'recover'):
+                    if key in plan_keys and key not in rebuilt:
+                        rebuilt[key] = []
+                row = None
+                for entry in composition[2:]:
+                    where, item = entry['where'], entry['item']
+                    if where.startswith('setup '):
+                        rebuilt['setup'].append(item)
+                    elif where.startswith('row ') and ' step ' not in where and ' recover ' not in where:
+                        row = dict(item)
+                        row_keys = row.pop('_keys')
+                        for key in ('steps', 'recover'):
+                            if key in row_keys and key not in row:
+                                row[key] = []
+                        rebuilt['rows'].append(row)
+                    elif ' step ' in where:
+                        row['steps'].append(item)
+                    elif where.startswith('row ') and ' recover ' in where:
+                        row['recover'].append(item)
+                    elif where.startswith('plan recover '):
+                        rebuilt['recover'].append(item)
+                self.assertEqual(rebuilt, variant)
+
+    def test_composition_keeps_wrong_type_sections_and_empty_imports(self):
+        for section in ('rows', 'segments', 'gates', 'setup', 'recover'):
+            with self.subTest(section=section):
+                raw = copy.deepcopy(self.plan)
+                raw[section] = None
+                item = runner.review_class(self.plan, self.dir, raw)['composition'][0]['item']
+                self.assertIn(section, item['_keys'])
+                self.assertIsNone(item[section])
+        for section in ('steps', 'recover'):
+            with self.subTest(section=section):
+                raw = copy.deepcopy(self.plan)
+                raw['rows'][0][section] = None
+                composition = runner.review_class(self.plan, self.dir, raw)['composition']
+                item = next(entry['item'] for entry in composition if entry['where'] == 'row r1')
+                self.assertIn(section, item['_keys'])
+                self.assertIsNone(item[section])
+        raw = copy.deepcopy(self.plan)
+        raw['segments'], raw['gates'], raw['recover'] = {}, {}, []
+        raw['rows'][0]['steps'] = []
+        self.manifest.write_text(json.dumps(raw))
+        report = runner.dry_run(self.manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertIn('row r1: no steps', report['errors'])
+        review = report['review']
+        self.assertEqual(review['composition'][0]['item']['recover'], [])
+        self.assertNotIn('segments', review['composition'][0]['item'])
+        self.assertNotIn('gates', review['composition'][0]['item'])
+        self.assertEqual(review['composition'][1]['item'], {'segments': {}, 'gates': {}})
+        self.assertEqual(next(e['item'] for e in review['composition'] if e['where'] == 'row r1')['steps'], [])
 
     def test_full_composition_includes_raw_private_step_and_import_override(self):
         plan = copy.deepcopy(self.plan)
@@ -270,12 +347,13 @@ class ReviewAdmissionTests(unittest.TestCase):
         report = self.report(plan)['review']
         self.assertEqual(report['class'], 'library-only')
         self.assertEqual(report['composition'], [
-            {'where': 'plan', 'item': {'start': 'menu'}},
+            {'where': 'plan', 'item': {'start': 'menu', '_keys': sorted(plan)}},
             {'where': 'imports', 'item': {'segments': {'route': 'smash-main'},
                                            'gates': {'main': 'main', 'installed': 'installed',
                                                      'smash-submenu': 'smash-submenu'}}},
             {'where': 'setup 0', 'item': plan['setup'][0]},
-            {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu'}},
+            {'where': 'row r1', 'item': {'id': 'r1', 'start': 'menu', 'end': 'menu',
+                                        '_keys': sorted(plan['rows'][0])}},
             *[{'where': f'row r1 step {i}', 'item': step} for i, step in enumerate(plan['rows'][0]['steps'])],
             *[{'where': f'row r1 recover {i}', 'item': step} for i, step in enumerate(plan['rows'][0]['recover'])],
             *[{'where': f'plan recover {i}', 'item': step} for i, step in enumerate(plan['recover'])]])

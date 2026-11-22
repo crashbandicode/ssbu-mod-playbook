@@ -688,7 +688,9 @@ def review_class(plan, base, raw_plan=None):
     private = []
     segments = plan.get('segments', {})
     raw = plan if raw_plan is None else raw_plan
-    raw_segments, raw_gates = raw.get('segments', {}), raw.get('gates', {})
+    raw_segments = raw.get('segments') if isinstance(raw.get('segments'), dict) else {}
+    raw_gates = raw.get('gates') if isinstance(raw.get('gates'), dict) else {}
+    raw_rows = raw.get('rows') if isinstance(raw.get('rows'), list) else []
     index = library_index()
     plan_keys = {'start', 'rows', 'segments', 'gates', 'setup', 'game_id', 'recover', 'on_failure', 'trace'}
     row_keys = {'id', 'start', 'end', 'steps', 'role', 'evidence', 'budget_min', 'on_failure', 'recover', 'start_gate'}
@@ -744,9 +746,15 @@ def review_class(plan, base, raw_plan=None):
         if verb == 'call' and (not isinstance(item['call'], str) or item['call'] not in read_only):
             add(where, f'call {item["call"]}')
 
+    def composition_item(source, list_keys, dict_keys=()):
+        item = {key: value for key, value in source.items()
+                if not (key in list_keys and isinstance(value, list) and value)
+                and not (key in dict_keys and isinstance(value, dict))}
+        item['_keys'] = sorted(source)
+        return item
+
     composition = [
-        {'where': 'plan', 'item': {key: value for key, value in raw.items()
-                                   if key not in ('rows', 'segments', 'gates', 'setup', 'recover')}},
+        {'where': 'plan', 'item': composition_item(raw, ('rows', 'setup', 'recover'), ('segments', 'gates'))},
         {'where': 'imports', 'item': {
             kind: {name: entry['library'] if isinstance(entry, dict) and set(entry) == {'library'} else entry
                    for name, entry in entries.items()}
@@ -754,10 +762,9 @@ def review_class(plan, base, raw_plan=None):
     setup = raw.get('setup')
     if isinstance(setup, list):
         composition.extend({'where': f'setup {i}', 'item': item} for i, item in enumerate(setup))
-    for row in raw.get('rows', []):
+    for row in raw_rows:
         where = f'row {row["id"]}'
-        composition.append({'where': where, 'item': {key: value for key, value in row.items()
-                                                     if key not in ('steps', 'recover')}})
+        composition.append({'where': where, 'item': composition_item(row, ('steps', 'recover'))})
         for key, label in (('steps', 'step'), ('recover', 'recover')):
             if isinstance(row.get(key), list):
                 composition.extend({'where': f'{where} {label} {i}', 'item': item}
@@ -773,11 +780,11 @@ def review_class(plan, base, raw_plan=None):
     for kind, entries in (('segment', raw_segments), ('gate', raw_gates)):
         for name in entries:
             imported(kind, name, entries, f'{kind} {name}')
-    for row in raw.get('rows', []):
+    for row in raw_rows:
         where = f'row {row["id"]}'
         for key in sorted(set(row) - row_keys):
             add(where, f'{where} key {key}')
-        for i, item in enumerate(row.get('steps', [])):
+        for i, item in enumerate(row.get('steps', []) if isinstance(row.get('steps', []), list) else []):
             step(item, f'{where} step {i}')
         for i, item in enumerate(row.get('recover', []) if isinstance(row.get('recover', []), list) else []):
             step(item, f'{where} recover {i}')

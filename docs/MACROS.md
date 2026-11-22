@@ -185,8 +185,9 @@ The rules:
    on. `library-only` means every plan, row and step key is on the runner's
    allowlist and every gate and segment is an unchanged library import.
    `review.composition` lists the plan's keys, imports, setup items, rows and
-   every step verbatim and in order, as a reading aid; the sealed manifest
-   remains the authority and the class does not judge arguments.
+   every step verbatim and in order, as a reading aid; an explicitly empty
+   list is shown. The sealed manifest remains the authority and the class
+   does not judge arguments.
    Shared hooks, read-only calls and a reviewed setup plan are also required; otherwise it is
    `full` with a list of private parts. This class does not change the
    dry-run result. No packet is admitted to light review by this class
