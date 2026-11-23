@@ -215,6 +215,9 @@ class BridgePickerIO:
             if not state_gate.END.search(line):
                 return None
             found = state_gate.latest('\n'.join(frame), provider)
+            clock = re.search(r' frame=(\d+) wall=(\d+)$', frame[-1]) if frame else None
+            if found and clock:
+                found['frame'], found['wall'] = int(clock.group(1)), int(clock.group(2))
             frame.clear()
             if pending_reply:
                 pending_reply = False

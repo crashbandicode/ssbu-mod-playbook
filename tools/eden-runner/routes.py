@@ -7,7 +7,8 @@ where a state exists. Every block fails closed: a missing state raises with what
 
 Blocks (docs/ROUTES.md has what each guarantees on exit):
   host_network     select and read back a non-loopback interface and LAN mode before game.load
-  frontend_room    host or join a connected Eden frontend room before game.load
+  frontend_room    host or join a connected Eden frontend room
+  bridge_alive     verify bridge replies after the frontend room connects
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
   load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
   wait_lines       the boot lines the plugins print (instead of a fixed post-load sleep)
@@ -762,8 +763,7 @@ def _frontend_dismiss(ctx, tree, cap):
 
 
 def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip='127.0.0.1', members=1, cap=30):
-    if (ctx.call('status') or {}).get('running'):
-        raise RuntimeError('frontend_room runs before game.load')
+    game_running = bool((ctx.call('status') or {}).get('running'))
     if role not in ('host', 'join'):
         raise RuntimeError(f'frontend_room: unknown role {role!r}')
     nickname = ('TRHost' if role == 'host' else 'TRGuest') if nickname is None else nickname
@@ -780,7 +780,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             'role': role, 'port': port if port is not None else saved.get('port'), 'nickname': nickname,
             'room_name': room_name if room_name is not None else saved.get('room_name'), 'ip': ip,
             'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
-            'already_connected': True, 'reused_dialog': False, 'dismissed': None})
+            'already_connected': True, 'reused_dialog': False, 'dismissed': None, 'game_running': game_running})
     if port is None:
         port = free_udp_port() if role == 'host' else saved.get('port')
     if port is None:
@@ -799,7 +799,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         return _save(ctx, 'routes-frontend-room', {
             'role': role, 'port': port, 'nickname': nickname, 'room_name': room_name, 'ip': ip,
             'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
-            'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed})
+            'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed, 'game_running': game_running})
 
     evidence = {}
     dialog = {'class': 'QLineEdit', 'name': 'username' if role == 'host' else 'nickname'}
@@ -836,7 +836,45 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                                'room_name': room_name, 'ip': ip, 'evidence': evidence,
                                                'window_title': title, 'member_count': count,
                                                'already_connected': False, 'reused_dialog': reused_dialog,
-                                               'dismissed': dismissed})
+                                               'dismissed': dismissed, 'game_running': game_running})
+
+
+def bridge_alive(ctx, cap=10):
+    """Prove the bridge answers: UI observations advance; two fenced tr.menu replies may have equal revisions."""
+    until = time.monotonic() + cap
+    try:
+        io = BridgePickerIO(ctx)
+        first = native_picker.wait_sample(io, native_picker.UI, until)
+        second = native_picker.wait_sample(io, native_picker.UI, until, first)
+        if not second.values.get('screen'):
+            raise RuntimeError('missing screen')
+    except RuntimeError as error:
+        raise RuntimeError(f'bridge_alive: ssbu.ui did not provide two fresh replies within {cap} s: {error}') from error
+    try:
+        replies = []
+        for _ in range(2):
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('deadline reached')
+            sample = io.read('tr.menu', remaining)
+            block = sample.block
+            if (block['name'] != 'tr.menu' or block['schema'] != 'tr.menu/1' or block['filtered']
+                    or block['rev'] <= 0 or block['values'].get('schema') != 'tr.menu/1'):
+                raise RuntimeError('incomplete tr.menu/1 reply')
+            native_picker.same_epoch(second if not replies else replies[-1], sample, in_flight=False)
+            replies.append(sample)
+    except RuntimeError as error:
+        raise RuntimeError(f'bridge_alive: tr.menu did not provide two fresh replies within {cap} s: {error}') from error
+    menu = {'rev': [sample.block['rev'] for sample in replies]}
+    for key in ('frame', 'wall'):
+        if any(key in sample.block for sample in replies):
+            menu[key] = [sample.block.get(key) for sample in replies]
+    with instance_path(ctx, 'bridge_log').open(errors='replace') as log:
+        reconnects = sum('[Adapter] reconnect' in line for line in log)
+    return _save(ctx, 'routes-bridge-alive', {
+        'block': 'bridge_alive',
+        'ssbu.ui': {'rev': [first.block['rev'], second.block['rev']], 'screen': second.values['screen']},
+        'tr.menu': menu, 'reconnects': reconnects})
 
 
 def configure_boot(ctx, gdb_port=None, volume=0, memory_layout_mode=0):

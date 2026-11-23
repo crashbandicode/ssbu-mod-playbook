@@ -54,7 +54,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | Block | Starts on | Guarantees on exit |
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
-| `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, no game | hosts or joins an Eden frontend room and verifies the connected member count before game load |
+| `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
+| `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
 | `wait_lines` `{lines: [[source, regex]]}` | any | each boot line is present, for example TrainingRooms' `result=installed`. Use it instead of a fixed post-load sleep. A source may be `sdmc:<path>` |
