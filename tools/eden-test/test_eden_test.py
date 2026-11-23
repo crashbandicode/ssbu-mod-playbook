@@ -880,6 +880,7 @@ class EdenTestTests(unittest.TestCase):
 
     def test_go_allocates_and_records_distinct_displays(self):
         base = json.loads(self.previous.read_text())
+        base['display_helper'] = {'path': '/helper', 'sha256': '0' * 64}
         base['instances'][0]['display'] = ':60'
         second = json.loads(json.dumps(base['instances'][0]))
         second['key'] = 'b'
@@ -895,8 +896,33 @@ class EdenTestTests(unittest.TestCase):
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertEqual([item['display'] for item in config['instances']], [':62', ':63'])
         self.assertEqual(config['display_choice'], [
-            {'key': 'a', 'base': ':60', 'chosen': ':62'},
-            {'key': 'b', 'base': ':60', 'chosen': ':63'}])
+            {'key': 'a', 'base': ':60', 'chosen': ':62', 'reason': 'free display chosen (helper provisions it)'},
+            {'key': 'b', 'base': ':60', 'chosen': ':63', 'reason': 'free display chosen (helper provisions it)'}])
+
+    def test_go_without_display_helper_preserves_existing_display_and_lifecycle_readiness(self):
+        base = json.loads(self.previous.read_text())
+        base['instances'][0]['display'] = ':200'
+        self.previous.write_text(json.dumps(base))
+        sockets = self.dir / 'sockets'
+        sockets.mkdir()
+        (sockets / 'X200').touch()
+        lifecycle_path = Path(__file__).resolve().parent.parent / 'eden-lifecycle' / 'lifecycle.py'
+        spec = importlib.util.spec_from_file_location('lifecycle_for_display_test', lifecycle_path)
+        lifecycle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lifecycle)
+        with mock.patch.object(eden_test, 'X11_SOCKET_DIR', sockets), \
+             mock.patch.object(eden_test, 'cmd_up'), \
+             mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args()), 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        with mock.patch.object(lifecycle, 'Path', side_effect=lambda path: sockets / Path(path).name):
+            original = lifecycle.Host().display_ready(base['instances'][0], base)
+            selected = lifecycle.Host().display_ready(config['instances'][0], config)
+        self.assertTrue(original['ready'], original['detail'])
+        self.assertTrue(selected['ready'], selected['detail'])
+        self.assertEqual(config['instances'][0]['display'], ':200')
+        self.assertEqual(config['display_choice'], [
+            {'key': 'a', 'base': ':200', 'chosen': ':200', 'reason': 'kept: the base has no display_helper'}])
 
     def test_go_does_not_add_display_to_an_instance_without_one(self):
         with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
@@ -907,6 +933,7 @@ class EdenTestTests(unittest.TestCase):
 
     def test_go_display_exhaustion_refuses_before_any_copy_or_up(self):
         base = json.loads(self.previous.read_text())
+        base['display_helper'] = {'path': '/helper', 'sha256': '0' * 64}
         base['instances'][0]['display'] = ':200'
         self.previous.write_text(json.dumps(base))
         sockets = self.dir / 'sockets'
