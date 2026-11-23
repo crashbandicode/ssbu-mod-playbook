@@ -308,6 +308,7 @@ class LoadGameNetworkTests(unittest.TestCase):
 
 
 class FrontendRoomTests(unittest.TestCase):
+    DYNAMIC_ROOM = object()
     # p00-rooms.json in phase23/1f-save-hold/ldn-pair/rc15-ldn-xps-2/out.
     HOST_ACTION = {'id': 'o130', 'class': 'QAction', 'name': 'action_Start_Room', 'text': '&Create Room'}
     HOST_DIALOG = {'id': 'o217', 'class': 'QLineEdit', 'name': 'username', 'text': None}
@@ -358,7 +359,9 @@ class FrontendRoomTests(unittest.TestCase):
         self.actions = []
         self.running = False
         self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
-        self.room_node = self.ROOM
+        self.room_node = self.DYNAMIC_ROOM
+        self.room_after_dismiss = None
+        self.host_room_name = None
         self.modal_after_host = False
         self.warning_after_host = False
         self.repeat_warning = False
@@ -384,8 +387,12 @@ class FrontendRoomTests(unittest.TestCase):
         target = step.get('target', {})
         if step['ui'] == 'trigger':
             self.nodes.append(self.HOST_DIALOG if target['name'] == 'action_Start_Room' else self.PEER_DIALOG)
+        elif step['ui'] == 'set' and target.get('name') == 'room_name':
+            self.host_room_name = step['value']
         elif step['ui'] == 'click' and target.get('id') == self.OK['id']:
             self.nodes = [node for node in self.nodes if node not in (self.MESSAGE, self.OK)]
+            if self.room_after_dismiss is not None:
+                self.nodes.append(self.room_after_dismiss)
         elif step['ui'] == 'click' and target.get('id') == self.WARNING_OK['id']:
             self.nodes = [node for node in self.nodes if node not in
                           (self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL)]
@@ -394,7 +401,7 @@ class FrontendRoomTests(unittest.TestCase):
             else:
                 self.nodes.append(self.HOST_LEAVE)
                 if self.room_node is not None:
-                    self.nodes.append(self.room_node)
+                    self.nodes.append(self.connected_room())
         elif step['ui'] == 'click' and target.get('name') in ('host', 'connect'):
             if self.modal_after_host:
                 self.nodes.extend([self.MESSAGE, self.OK])
@@ -403,7 +410,17 @@ class FrontendRoomTests(unittest.TestCase):
             else:
                 self.nodes.append(self.HOST_LEAVE)
                 if self.room_node is not None:
-                    self.nodes.append(self.room_node)
+                    self.nodes.append(self.connected_room())
+
+    def connected_room(self):
+        if self.room_node is not self.DYNAMIC_ROOM:
+            return self.room_node
+        fields = [node for node in self.nodes if node.get('class') == 'QLineEdit' and node.get('name') == 'room_name']
+        dialog_name = routes._frontend_text(fields[0]) if len(fields) == 1 else None
+        room_file = self.out / 'frontend-room.json'
+        saved = json.loads(room_file.read_text()) if room_file.exists() else {}
+        name = self.host_room_name or dialog_name or saved.get('room_name') or 'TRB3Waiting'
+        return {**self.ROOM, 'title': self.ROOM['title'].replace('TRB3Waiting - ', f'{name} - ', 1)}
 
     def test_host_replays_real_sequence_and_saves_room_handoff(self):
         with mock.patch.object(routes, 'free_udp_port', return_value=24872):
@@ -420,7 +437,8 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(receipt['room_name'], 'TR24872')
         self.assertFalse(receipt['game_running'])
         self.assertEqual(receipt['member_count'], 1)
-        self.assertEqual(receipt['window_title'], self.ROOM['title'])
+        self.assertEqual(receipt['window_title'], 'TR24872 - Super Smash Bros. Ultimate (1/8 members) - connected')
+        self.assertTrue(receipt['room_matched'])
         self.assertEqual(receipt['evidence']['host_action'], self.HOST_ACTION)
         self.assertEqual(receipt['evidence']['host_dialog'], self.HOST_DIALOG)
         self.assertEqual(receipt['evidence']['frontend_leave'], self.HOST_LEAVE)
@@ -576,13 +594,13 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual((result['nickname'], result['port'], result['ip']), ('PeerName', 24902, '192.0.2.1'))
         self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
 
-    def test_existing_warning_without_dialog_fields_does_not_invent_host_port(self):
+    def test_existing_warning_without_dialog_fields_cannot_invent_host_room(self):
         self.running = True
         self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL]
         with mock.patch.object(routes, 'free_udp_port', side_effect=AssertionError('unexpected allocation')):
-            result = routes.frontend_room(self.ctx, cap=.2)
-        self.assertIsNone(result['port'])
-        self.assertIsNone(result['room_name'])
+            with self.assertRaisesRegex(RuntimeError, 'cannot read the room name of the open Create Room dialog'):
+                routes.frontend_room(self.ctx, cap=.2)
+        self.assertEqual(self.actions, [])
         self.assertFalse((self.out / 'frontend-room.json').exists())
 
     def test_repeated_running_warning_is_an_error_without_a_second_click(self):
@@ -648,7 +666,7 @@ class FrontendRoomTests(unittest.TestCase):
     def test_already_connected_returns_without_ui_or_port_allocation(self):
         self.nodes = [self.ROOM]
         with mock.patch.object(routes, 'free_udp_port', side_effect=AssertionError('allocated port')):
-            result = routes.frontend_room(self.ctx)
+            result = routes.frontend_room(self.ctx, room_name='TRB3Waiting')
         self.assertTrue(result['already_connected'])
         self.assertEqual((result['window_title'], result['member_count']), (self.ROOM['title'], 1))
         self.assertFalse(result['game_running'])
@@ -657,18 +675,153 @@ class FrontendRoomTests(unittest.TestCase):
 
     def test_already_connected_even_with_a_modal_has_no_ui_action(self):
         self.nodes = [{**self.ROOM, 'id': 'o300'}, self.MESSAGE, self.OK]
-        result = routes.frontend_room(self.ctx, port=24872)
+        result = routes.frontend_room(self.ctx, port=24872, room_name='TRB3Waiting')
         self.assertTrue(result['already_connected'])
         self.assertEqual(self.actions, [])
 
     def test_connected_room_with_too_few_members_is_not_accepted(self):
         self.nodes = [self.HOST_ACTION, self.PEER_ACTION, self.ROOM]
         self.room_node = {**self.ROOM, 'id': 'o400',
-                          'title': self.ROOM['title'].replace('(1/8 members)', '(2/8 members)')}
+                          'title': self.ROOM['title'].replace('TRB3Waiting - ', 'TR24872 - ')
+                          .replace('(1/8 members)', '(2/8 members)')}
         result = routes.frontend_room(self.ctx, port=24872, members=2)
         self.assertFalse(result['already_connected'])
         self.assertEqual(result['member_count'], 2)
         self.assertTrue(any(step['ui'] == 'trigger' for _, step in self.actions))
+
+    def test_reuse_rejects_another_room_without_action_or_receipt(self):
+        self.nodes = [self.ROOM]
+        with self.assertRaisesRegex(RuntimeError, r'another room: expected "WantedRoom", saw "TRB3Waiting - '):
+            routes.frontend_room(self.ctx, port=24872, room_name='WantedRoom')
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_reuse_accepts_requested_matching_room(self):
+        self.nodes = [self.ROOM]
+        result = routes.frontend_room(self.ctx, room_name='TRB3Waiting')
+        self.assertTrue(result['already_connected'])
+        self.assertEqual(result['room_name'], 'TRB3Waiting')
+        self.assertTrue(result['room_matched'])
+        self.assertEqual(result['window_title'], self.ROOM['title'])
+        self.assertEqual(self.actions, [])
+
+    def test_reuse_uses_saved_name_and_port(self):
+        self.nodes = [self.ROOM]
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'TRB3Waiting', 'instance': 'a'}))
+        result = routes.frontend_room(self.ctx)
+        self.assertTrue(result['already_connected'])
+        self.assertEqual((result['room_name'], result['port']), ('TRB3Waiting', 24872))
+        self.assertTrue(result['room_matched'])
+        self.assertEqual(self.actions, [])
+
+    def test_reuse_rejects_wrong_saved_name(self):
+        self.nodes = [self.ROOM]
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'TR24872', 'instance': 'a'}))
+        with self.assertRaisesRegex(RuntimeError, r'another room: expected "TR24872", saw "TRB3Waiting - '):
+            routes.frontend_room(self.ctx)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_reuse_requires_requested_or_saved_name(self):
+        self.nodes = [self.ROOM]
+        with self.assertRaisesRegex(RuntimeError, r'no room_name was given and this run has no frontend-room.json'):
+            routes.frontend_room(self.ctx, port=24872)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_reuse_does_not_accept_room_name_prefix(self):
+        self.nodes = [self.ROOM]
+        with self.assertRaisesRegex(RuntimeError, r'another room: expected "TRB3", saw "TRB3Waiting - '):
+            routes.frontend_room(self.ctx, port=24872, room_name='TRB3')
+        self.assertEqual(self.actions, [])
+
+    def test_fresh_host_rejects_wrong_connected_room_without_saving(self):
+        self.room_node = self.ROOM
+        with self.assertRaisesRegex(RuntimeError, r'for room "TR24872" with at least 1 member\(s\); saw: .*TRB3Waiting'):
+            routes.frontend_room(self.ctx, port=24872, cap=.05)
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_fresh_join_rejects_room_different_from_saved_name(self):
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
+        self.room_node = self.ROOM
+        with self.assertRaisesRegex(RuntimeError, r'for room "TR-proof" with at least 1 member\(s\); saw: .*TRB3Waiting'):
+            routes.frontend_room(self.ctx, role='join', cap=.05)
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_fresh_join_accepts_matching_saved_name(self):
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
+        self.room_node = {**self.ROOM, 'title': self.ROOM['title'].replace('TRB3Waiting - ', 'TR-proof - ')}
+        result = routes.frontend_room(self.ctx, role='join', cap=.05)
+        self.assertEqual(result['room_name'], 'TR-proof')
+        self.assertTrue(result['room_matched'])
+
+    def test_fresh_join_without_known_name_accepts_connected_window(self):
+        result = routes.frontend_room(self.ctx, role='join', port=24872, cap=.05)
+        self.assertIsNone(result['room_name'])
+        self.assertIsNone(result['room_matched'])
+        self.assertEqual(result['window_title'], self.ROOM['title'])
+
+    def test_existing_running_warning_rejects_another_connected_room(self):
+        self.running = True
+        self.room_node = self.ROOM
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(RuntimeError, r'for room "TR24872" with at least 1 member\(s\); saw: .*TRB3Waiting'):
+            routes.frontend_room(self.ctx, cap=.05)
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_existing_running_warning_accepts_dialog_matching_room(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        result = routes.frontend_room(self.ctx, cap=.05)
+        self.assertEqual(result['room_name'], 'TR24872')
+        self.assertEqual(result['window_title'], 'TR24872 - Super Smash Bros. Ultimate (1/8 members) - connected')
+        self.assertTrue(result['room_matched'])
+
+    def test_warning_host_falls_back_to_requested_or_saved_room_name(self):
+        self.running = True
+        fields = [n for n in self.RUNNING_HOST if n['name'] != 'room_name']
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        self.room_node = {**self.ROOM, 'title': self.ROOM['title'].replace('TRB3Waiting - ', 'WantedRoom - ')}
+        result = routes.frontend_room(self.ctx, room_name='WantedRoom', cap=.05)
+        self.assertEqual(result['room_name'], 'WantedRoom')
+        self.assertTrue(result['room_matched'])
+
+        self.actions.clear()
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'WantedRoom', 'instance': 'a'}))
+        result = routes.frontend_room(self.ctx, cap=.05)
+        self.assertEqual(result['room_name'], 'WantedRoom')
+        self.assertTrue(result['room_matched'])
+
+    def test_reuse_after_modal_refuses_mismatch(self):
+        self.nodes = [self.MESSAGE, self.OK]
+        self.room_after_dismiss = self.ROOM
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'TR24872', 'instance': 'a'}))
+        with mock.patch.object(routes, 'free_udp_port', return_value=24999):
+            with self.assertRaisesRegex(RuntimeError, r'another room: expected "TR24872", saw "TRB3Waiting - '):
+                routes.frontend_room(self.ctx)
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o261'])
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_reuse_after_modal_accepts_saved_name_and_port(self):
+        self.nodes = [self.MESSAGE, self.OK]
+        self.room_after_dismiss = self.ROOM
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'room_name': 'TRB3Waiting', 'instance': 'a'}))
+        with mock.patch.object(routes, 'free_udp_port', return_value=24999):
+            result = routes.frontend_room(self.ctx)
+        self.assertTrue(result['already_connected'])
+        self.assertEqual((result['room_name'], result['port']), ('TRB3Waiting', 24872))
+        self.assertTrue(result['room_matched'])
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o261'])
 
 
 class BridgeAliveTests(unittest.TestCase):
