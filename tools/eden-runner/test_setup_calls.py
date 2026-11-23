@@ -416,6 +416,37 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(result['fighters_checked'], {'p1': 'unchecked', 'cpu': 'unchecked'})
         self.assertEqual(result['roster'], state['roster'])
 
+    def test_enter_training_treats_a_none_fighter_as_unchecked(self):
+        remembered = self.ctx.runner.routes_expect
+        original = dict(remembered)
+        state = {'roster': {0: {'kind': 0}, 1: {'kind': 3}}, 'stage': 3}
+        fighters = {'p1': 'Mario', 'cpu': None}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.enter_training(self.ctx, cap=1, fighters=fighters)
+        self.assertEqual(result['fighters_checked'], {'p1': 'checked', 'cpu': 'unchecked'})
+        self.assertEqual(result['args']['fighters'], fighters)
+        self.assertIs(self.ctx.runner.routes_expect, remembered)
+        self.assertEqual(self.ctx.runner.routes_expect, original)
+
+    def test_enter_training_treats_a_none_p1_as_unchecked(self):
+        state = {'roster': {0: {'kind': 3}, 1: {'kind': 7}}, 'stage': 3}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.enter_training(self.ctx, cap=1, fighters={'p1': None, 'cpu': 'Fox'})
+        self.assertEqual(result['fighters_checked'], {'p1': 'unchecked', 'cpu': 'checked'})
+        self.assertEqual(self.ctx.runner.routes_expect, {'p1_kind': 0, 'cpu_kind': 7})
+
+    def test_enter_training_still_requires_both_roster_entries_when_a_seat_is_unchecked(self):
+        state = {'roster': {0: {'kind': 0}}, 'stage': 3}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'CPU kind None'):
+                routes.enter_training(self.ctx, cap=1, fighters={'p1': 'Mario', 'cpu': None})
+
     def test_enter_training_set_stage_ids_return_plain_json(self):
         state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}, 'stage': 3}
         with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
@@ -600,7 +631,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         json.dumps(result)
         self.assertEqual([item if isinstance(item, str) else item[0] for item in calls], ['quit', 'pick', 'enter'])
         self.assertIsNone(calls[1][1].get('cpu'))
-        self.assertEqual(calls[-1][1]['fighters'], {'p1': 'Mario'})
+        self.assertEqual(calls[-1][1]['fighters'], {'p1': 'Mario', 'cpu': None})
         self.assertEqual(calls[-1][1]['stage_ids'], {3})
         self.assertTrue({'to_main', 'main_to_stage', 'pick_stage'} <= set(result['skipped']))
         self.assertNotIn('quit_training', result['skipped'])
@@ -620,7 +651,7 @@ class SetupCallsR2Tests(unittest.TestCase):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
         json.dumps(result)
         self.assertEqual(result['phases']['enter_training']['args']['stage_ids'], [3])
-        self.assertEqual(result['phases']['enter_training']['args']['fighters'], {'p1': 'Mario'})
+        self.assertEqual(result['phases']['enter_training']['args']['fighters'], {'p1': 'Mario', 'cpu': None})
 
     def test_reach_training_rechecks_native_ownership_at_the_end(self):
         replay = MenuReplay()
@@ -655,7 +686,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         except TypeError as exc:
             self.fail(str(exc))
         self.assertEqual(result['phases']['enter_training']['args']['stage_ids'], [3])
-        self.assertEqual(result['phases']['enter_training']['args']['fighters'], {'p1': 'Mario'})
+        self.assertEqual(result['phases']['enter_training']['args']['fighters'], {'p1': 'Mario', 'cpu': None})
 
     def test_set_cpu_at_the_fighter_select_refuses_and_never_uses_the_tile_cursor(self):
         replay = MenuReplay()
@@ -714,6 +745,8 @@ class SetupCallsR2Tests(unittest.TestCase):
         tables = routes.tables()
         tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}, {'kind': 7, 'name': 'Fox'}]
         calls = []
+        remembered = self.ctx.runner.routes_expect
+        expected_before_entry = dict(remembered)
 
         def pick(*args, **kwargs):
             calls.append('pick_fighters')
@@ -721,7 +754,9 @@ class SetupCallsR2Tests(unittest.TestCase):
 
         def enter(*args, **kwargs):
             calls.append('enter_training')
-            self.assertEqual(kwargs['fighters'], {'p1': 'Mario'})
+            self.assertIs(self.ctx.runner.routes_expect, remembered)
+            self.assertEqual(self.ctx.runner.routes_expect, expected_before_entry)
+            self.assertEqual(kwargs['fighters'], {'p1': 'Mario', 'cpu': None})
 
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'tables', return_value=tables), \
@@ -796,6 +831,25 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(result['phases']['enter_training']['fighters_checked']['cpu'], 'unchecked')
         set_fighter.assert_called_once()
         self.assertEqual(self.ctx.runner.routes_expect['cpu_kind'], 0)
+
+    def test_reach_training_keeps_expectations_remembered_during_entry(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+
+        def enter(*args, **kwargs):
+            routes.remember(self.ctx, entry_marker='kept')
+            return {}
+
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, 'enter_training', side_effect=enter), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            routes.reach_training(self.ctx, 'Mario', cpu='Fox')
+        self.assertEqual(self.ctx.runner.routes_expect.get('entry_marker'), 'kept')
 
     def test_setup_state_reads_without_any_controller_input(self):
         replay = MenuReplay()
