@@ -230,6 +230,59 @@ class HostNetworkTests(unittest.TestCase):
             routes.host_network(self.ctx)
 
 
+class LoadGameNetworkTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        self.out = self.run / 'out'
+        self.row = self.out / 'r00'
+        self.row.mkdir(parents=True)
+        self.config = self.run / 'config.json'
+        self.calls = []
+        self.live = 'wifi0'
+        self.ctx = types.SimpleNamespace(
+            runner=types.SimpleNamespace(out=self.out), row_dir=self.row, instance={'game': '/fake/game.xci'},
+            call=self.call, check_stop=lambda: None)
+
+    def call(self, method, params=None, job_cap=15):
+        self.calls.append((method, params))
+        if method == 'settings.get':
+            return {'value': self.live}
+        if method == 'status':
+            return {'running': True, 'loading_complete': True, 'shaders_building': False, 'game_fps': 60}
+        return {}
+
+    def test_different_live_interface_refuses_before_game_load(self):
+        self.config.write_text(json.dumps({'network_check': {'interface': 'wifi0', 'no_lobby': False}}))
+        self.live = 'lo'
+        with self.assertRaises(RuntimeError) as caught:
+            routes.load_game(self.ctx)
+        self.assertEqual(str(caught.exception),
+                         'load_game: core.network_interface is "lo" but this run\'s checked interface is "wifi0"; '
+                         'a step changed it after host_network. No game was loaded.')
+        self.assertEqual([name for name, _ in self.calls], ['settings.get'])
+
+    def test_matching_interface_is_checked_and_recorded_before_load(self):
+        self.config.write_text(json.dumps({'network_check': {'interface': 'wifi0', 'no_lobby': False}}))
+        result = routes.load_game(self.ctx)
+        self.assertEqual([name for name, _ in self.calls], ['settings.get', 'game.load', 'status'])
+        self.assertEqual(result['network_interface'], 'wifi0')
+        self.assertEqual(json.loads((self.row / 'routes-load.json').read_text()), result)
+
+    def test_no_config_or_no_lobby_loads_without_network_check(self):
+        for config in (None, {}, {'network_check': {'interface': 'wifi0', 'no_lobby': True}}):
+            with self.subTest(config=config):
+                self.calls.clear()
+                if config is None:
+                    self.config.unlink(missing_ok=True)
+                else:
+                    self.config.write_text(json.dumps(config))
+                result = routes.load_game(self.ctx)
+                self.assertEqual([name for name, _ in self.calls], ['game.load', 'status'])
+                self.assertNotIn('network_interface', result)
+
+
 class NativeStateTests(unittest.TestCase):
     """routes.native_state / wait_native / frame_advancing over a bridge capture's bridge.log."""
 

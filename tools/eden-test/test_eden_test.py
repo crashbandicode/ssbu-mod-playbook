@@ -22,6 +22,17 @@ TRACE_REQUIRED = (
     "blocks use are libtraining_rooms.nro!edge_juggle_attempt and libtraining_rooms.nro!planner_chose"
 )
 
+# ib-practice-publisher/combined-yoga-main-1/rows/rows.json:932-966, cb-boot-and-bridge.
+REVIEWER_BOOT_STEPS = [
+    {'run': 'routes:_setting', 'args': {'key': 'core.use_gdbstub', 'value': False}},
+    {'run': 'routes:_setting', 'args': {'key': 'core.network_interface', 'value': 'lo'}},
+    {'run': 'routes:_setting', 'args': {'key': 'core.lan_online', 'value': False}},
+    {'run': 'routes:configure_boot'},
+    {'run': 'routes:load_game'},
+    {'run': 'routes:bridge_on'},
+    {'run': 'routes:to_main'},
+]
+
 FAKE_LIFECYCLE = '''
 import json, sys
 from pathlib import Path
@@ -1000,7 +1011,7 @@ class EdenTestTests(unittest.TestCase):
             config = json.loads((eden_test.RUNS / label / 'config.json').read_text())
             self.assertEqual(config['network_interface'], expected)
             self.assertEqual(config['network_check'], {
-                'interface': expected, 'usable': True, 'problem': None, 'no_lobby': False})
+                'interface': expected, 'usable': True, 'problem': None, 'no_lobby': False, 'row_overrides': []})
 
     def test_no_lobby_allows_and_records_unusable_network(self):
         base = json.loads(self.previous.read_text())
@@ -1011,7 +1022,7 @@ class EdenTestTests(unittest.TestCase):
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertIsNone(config['network_interface'])
         self.assertEqual(config['network_check'], {
-            'interface': None, 'usable': False, 'problem': 'the base names none', 'no_lobby': True})
+            'interface': None, 'usable': False, 'problem': 'the base names none', 'no_lobby': True, 'row_overrides': []})
 
     def test_no_lobby_retains_named_interface_failure(self):
         with mock.patch.object(eden_test, 'host_interface_problem', return_value='is down'), \
@@ -1019,7 +1030,78 @@ class EdenTestTests(unittest.TestCase):
             self.assertEqual(eden_test.main(self.go_args() + ['--no-lobby']), 0)
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertEqual(config['network_check'], {
-            'interface': 'test0', 'usable': False, 'problem': 'is down', 'no_lobby': True})
+            'interface': 'test0', 'usable': False, 'problem': 'is down', 'no_lobby': True, 'row_overrides': []})
+
+    def test_go_refuses_reviewers_original_boot_steps_before_staging(self):
+        example = Path(__file__).resolve().parent / 'example' / 'rows.json'
+        plan = json.loads(example.read_text())
+        plan['rows'][0]['steps'] = REVIEWER_BOOT_STEPS
+        (self.rows / 'rows.json').write_text(json.dumps(plan))
+        with mock.patch.object(eden_test.shutil, 'copy2') as copy, \
+             mock.patch.object(eden_test, 'sh') as sh, \
+             mock.patch.object(eden_test, '_go_sh') as remote, \
+             mock.patch.object(eden_test, 'lifecycle') as lifecycle, \
+             mock.patch.object(eden_test, 'cmd_up') as up:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args())
+            self.assertEqual(
+                str(caught.exception),
+                'rows set core.network_interface to "lo" in row r00 step 2 (routes:_setting), but this run\'s '
+                'checked interface is "test0": remove that step and use {"run": "routes:host_network"} '
+                '(or pass --network-interface <value> if that interface is meant; "lo" is never usable: '
+                'Eden does not list loopback)')
+            copy.assert_not_called()
+            sh.assert_not_called()
+            remote.assert_not_called()
+            lifecycle.assert_not_called()
+            up.assert_not_called()
+            self.assertFalse((eden_test.RUNS / 'go-1').exists())
+
+    def test_go_accepts_example_and_matching_host_network_interface(self):
+        example = Path(__file__).resolve().parent / 'example'
+        plan = json.loads((example / 'rows.json').read_text())
+        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args(label='example', rows=example)), 0)
+            plan['rows'][0]['steps'][1]['args'] = {'interface': 'test0'}
+            (self.rows / 'rows.json').write_text(json.dumps(plan))
+            self.assertEqual(eden_test.main(self.go_args(label='matching')), 0)
+        for label in ('example', 'matching'):
+            config = json.loads((eden_test.RUNS / label / 'config.json').read_text())
+            self.assertEqual(config['network_check']['row_overrides'], [])
+
+    def test_go_refuses_explicit_host_network_override(self):
+        plan = {'rows': [{'id': 'r1', 'steps': [
+            {'run': 'routes:host_network', 'args': {'interface': 'other0'}}]}]}
+        (self.rows / 'rows.json').write_text(json.dumps(plan))
+        with mock.patch.object(eden_test.shutil, 'copy2') as copy:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args())
+        self.assertIn('to "other0" in row r1 step 1 (routes:host_network)', str(caught.exception))
+        copy.assert_not_called()
+        self.assertFalse((eden_test.RUNS / 'go-1').exists())
+
+    def test_go_records_all_conflicts_including_gif_and_recover_for_no_lobby(self):
+        bad = lambda value: {'run': 'routes:_setting', 'args': {'key': 'core.network_interface', 'value': value}}
+        plan = {'recover': [bad('plan0')], 'rows': [
+            {'id': 'r1', 'steps': [bad('other0'), {'gif': {'name': 'clip', 'steps': [bad('gif0')]}}],
+             'recover': [bad('recover0')]}]}
+        (self.rows / 'rows.json').write_text(json.dumps(plan))
+        with mock.patch.object(eden_test.shutil, 'copy2') as copy:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args())
+            copy.assert_not_called()
+        for location in ('row r1 step 1', 'row r1 step 2 gif step 1',
+                         'row r1 step recover 1', 'row <plan recover> step 1'):
+            self.assertIn(location, str(caught.exception))
+        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args() + ['--no-lobby']), 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertEqual(config['network_check']['row_overrides'], [
+            {'row': 'r1', 'step': 1, 'run': 'routes:_setting', 'value': 'other0'},
+            {'row': 'r1', 'step': '2 gif step 1', 'run': 'routes:_setting', 'value': 'gif0'},
+            {'row': 'r1', 'step': 'recover 1', 'run': 'routes:_setting', 'value': 'recover0'},
+            {'row': '<plan recover>', 'step': 1, 'run': 'routes:_setting', 'value': 'plan0'}])
+        self.assertEqual(json.loads((eden_test.RUNS / 'go-1/rows/rows.json').read_text()), plan)
 
     def test_go_requires_owner_before_dispatch(self):
         error = io.StringIO()
