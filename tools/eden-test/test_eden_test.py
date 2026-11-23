@@ -1065,6 +1065,33 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(config['card_lineup']['dir'], str(card.resolve()))
         self.assertEqual(config['card_lineup']['origin'], '/original/card')
 
+    def test_card_lineup_rejects_duplicate_nro_names_before_copying(self):
+        card = self.make_lineup(self.dir / 'duplicate-card', {'one.nro': b'one'})
+        first = self.dir / 'plugin.nro'
+        second_dir = self.dir / 'second'
+        second_dir.mkdir()
+        second = second_dir / first.name
+        second.write_bytes(b'second')
+        message = self.assert_lineup_refused(
+            self.go_args(nro=first, lineup=True) + ['--card-lineup', str(card), '--nro', str(second)],
+            'go-1')
+        self.assertIn('each --nro must have a distinct file name', message)
+
+    def test_card_lineup_rejects_unsafe_folder_path_before_read_or_transport(self):
+        for host in ('yoga', 'xps'):
+            for index, suffix in enumerate(("has'apostrophe", 'has\nnewline', 'has\rcarriage-return')):
+                label = f'unsafe-{host}-{index}'
+                folder = self.dir / suffix
+                with self.subTest(host=host, suffix=suffix), \
+                     mock.patch.object(eden_test, 'read_card_lineup', create=True) as read:
+                    message = self.assert_lineup_refused(
+                        self.go_args(label=label, host=host, lineup=True) + [
+                            '--card-lineup', str(folder), '--ssh', 'xps-host'],
+                        label)
+                    read.assert_not_called()
+                    self.assertIn(str(folder), message)
+                    self.assertIn('without apostrophes or line breaks', message)
+
     def card_fixture(self, two_instances=False):
         card = self.make_lineup(self.dir / 'card', {
             'libtraining_rooms.nro': b'card training', 'libssbu_tile_cursor.nro': b'card tile',
