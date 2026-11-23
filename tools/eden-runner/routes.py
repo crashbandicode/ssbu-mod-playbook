@@ -1012,7 +1012,8 @@ def wireless_room(ctx, ready_cap=60):
     time.sleep(1.5)
     last = _wireless_read(ctx, io, 'ssbu.ui', 2, screens)
     if last.get('screen') not in ('unknown', 'ldn.create'):
-        raise RuntimeError(f'wireless_room: expected the Create form (ldn.create, or unpublished) after A; saw {last}')
+        seen = f'read error: {last["error"]}' if 'error' in last else str(last)
+        raise RuntimeError(f'wireless_room: expected the Create form (ldn.create, or unpublished) after A; saw {seen}')
     create_form = 'ldn.create' if last['screen'] == 'ldn.create' else 'unpublished'
 
     confirm_presses, room = 0, None
@@ -1029,6 +1030,10 @@ def wireless_room(ctx, ready_cap=60):
             io.finish()
             room = last
             break
+        if not ok and attempt == 0 and last.get('screen') is None:
+            seen = last.get('error', f'screen missing from {last}')
+            raise RuntimeError('wireless_room: no ssbu.ui reply after the Create confirm, so a second press would '
+                               f'have no screen witness; last read: {seen}')
         if ok or last.get('screen') not in (None, 'unknown', 'ldn.create') or attempt == 1:
             raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless after '
                                f'{confirm_presses} confirm press(es); saw {last}, screens {screens}')
@@ -1085,13 +1090,15 @@ def wireless_room(ctx, ready_cap=60):
         if not ok:
             raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before placement; saw {last}')
         tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+        if _wireless_placed(tile) and chord_sent:
+            placed_by = 'chord'
         if not _wireless_placed(tile):
             at = tile.get('at')
             if not (tile.get('screen') == 'css' and isinstance(at, str) and at.isdigit()
                     and tile.get('hovered') == at):
                 raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
             io.send('tap-a1')
-            placed_by = 'chord + A'
+            placed_by = 'chord + A' if chord_sent else 'A'
             ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, _wireless_placed, screens)
             if not ok:
                 raise RuntimeError(f'wireless_room: expected p1.token or local.token placed; saw {tile}')
