@@ -14,7 +14,7 @@
     {"id": "tk05", "start": "css.training", "end": "training", "role": "setup", "on_failure": "continue",
      "steps": [{"run": "routes:pick_local_fighter", "args": {"fighter": "Mario", "take_back": true, "expected_context": "training"}},
                {"run": "routes:place_cpu", "args": {"fighter": "Fox"}},
-               {"run": "routes:enter_training", "args": {"fighters": {"p1": "Mario"}}}]},
+               {"run": "routes:enter_training", "args": {"fighters": {"p1": "Mario", "cpu": null}}}]},
     {"id": "tk06", "start": "training", "end": "training", "role": "test", "on_failure": "continue",
      "steps": [{"run": "routes:expect_fighters", "args": {"p1": "Mario", "cpu": "Fox"}}]}
   ]

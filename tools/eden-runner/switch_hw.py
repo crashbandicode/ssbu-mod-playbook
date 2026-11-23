@@ -523,6 +523,7 @@ def roster_response(lines, entries=()):
 
 
 def fighters_response(lines):
+    """Return bodies bound to the newest complete fighters reply, or None."""
     reply = None
     start = 0
     for index, line in enumerate(lines):
@@ -552,6 +553,7 @@ def fighters_response(lines):
 
 
 def fighters_now(run, cap=6.0):
+    """Request and return fresh fighters bound to their reply."""
     run = Path(run)
     log = run / 'bridge.log'
     start = log.stat().st_size if log.exists() else 0

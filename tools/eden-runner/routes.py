@@ -1218,7 +1218,7 @@ def _enter_training(ctx, cap, stage_ids, fighters, metrics):
     for seat, name in (fighters or {}).items():
         if seat not in kinds:
             raise ValueError(f'unknown fighter seat {seat!r}')
-        kinds[seat] = fighter_entry(name)['kind']
+        kinds[seat] = fighter_entry(name)['kind'] if name is not None else None
     started = time.monotonic()
     result = _native_enter_training(ctx, cap, stage_ids)
     entry_ms = round((time.monotonic() - started) * 1000)
@@ -1966,6 +1966,7 @@ def pick_cpu(ctx, fighter, *, topology=None, form='default'):
 
 
 def take_cpu(ctx):
+    """Take the CPU's coin at Training fighter select."""
     started = time.monotonic()
     io = BridgePickerIO(ctx)
     before, _ = native_picker._coin_baseline(io, 4, 'training')
@@ -1985,6 +1986,7 @@ def take_cpu(ctx):
 
 
 def take_noop(ctx, holding):
+    """Check that L3 + B does nothing while the specified coin is held."""
     if holding not in ('cpu', 'p1'):
         raise ValueError(f'holding must be cpu or p1, not {holding!r}')
     started = time.monotonic()
@@ -2015,6 +2017,7 @@ def take_noop(ctx, holding):
 
 
 def place_cpu(ctx, fighter, must_move=False):
+    """Place the CPU's coin on a qualified fighter tile."""
     started = time.monotonic()
     entry = fighter_entry(fighter)
     target = _native_target(entry, 'default')
@@ -2079,6 +2082,7 @@ def place_cpu(ctx, fighter, must_move=False):
 
 
 def expect_fighters(ctx, p1=None, cpu=None):
+    """Confirm the requested Training fighters against roster and live bodies."""
     started = time.monotonic()
     io = BridgePickerIO(ctx)
     ui = native_picker.wait_sample(io, native_picker.UI, started + 6)
@@ -2746,6 +2750,7 @@ def _live_fighter(ctx, seat, kind, cap):
 
 
 def _live_body(ctx, seat, kind, cap):
+    """Wait for a fresh live body matching the requested seat and kind."""
     until = time.monotonic() + cap
     last = None
     while time.monotonic() < until:
@@ -4437,13 +4442,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         if screen == 'css.training':
             run('pick_fighters', pick_fighters, ctx, p1, topology=library_topology('css-training'),
                 take_back=True)
-            original_expect = getattr(ctx.runner, 'routes_expect', None)
-            ctx.runner.routes_expect = {**expected(ctx), 'cpu_kind': None}
-            try:
-                run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
-                    stage_ids={wanted_stage}, fighters={'p1': p1})
-            finally:
-                ctx.runner.routes_expect = original_expect
+            run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
+                stage_ids={wanted_stage}, fighters={'p1': p1, 'cpu': None})
             final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
                                  roster_entries=(0, 1))
         if wanted_cpu is not None and final.get('roster', {}).get(1, {}).get('kind') != wanted_cpu:

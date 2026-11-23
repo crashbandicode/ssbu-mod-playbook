@@ -493,6 +493,7 @@ TAKE_FIELDS = ('take.ack', 'take.applied')
 
 
 def take_lines(state):
+    """Require the Tile Cursor's L3 + B counter lines."""
     if any(key not in state.values for key in TAKE_FIELDS):
         raise RuntimeError('tile.cursor: this build has no L3 + B (no take.ack line)')
     for key in TAKE_FIELDS:
@@ -501,6 +502,7 @@ def take_lines(state):
 
 
 def take_cpu(io, cap=4, *, expected_context='training'):
+    """Take the CPU's placed coin into P1's empty hand."""
     before, ui = _coin_baseline(io, cap, expected_context)
     take_lines(before)
     _p1_placed(before)
@@ -548,6 +550,7 @@ def take_cpu(io, cap=4, *, expected_context='training'):
 
 
 def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
+    """Confirm L3 + B is read without changing a held coin."""
     if holding not in ('0', '1'):
         raise ValueError(f'invalid holding {holding!r}')
     before, ui = _coin_baseline(io, cap, expected_context)
@@ -599,6 +602,7 @@ def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
 
 
 def take_back_local_token(io, current, ui, cap=4, *, expected_context=None):
+    """Take back P1's placed medal with the game's B input."""
     until = time.monotonic() + cap
     wanted = Target.read(current, 'placed.')
     ui = wait_sample(io, UI, until, ui)
