@@ -1,11 +1,11 @@
 # Eden test: one command
 
 From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ssh`:
-`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --nro /path/libtraining_rooms.nro --rows tools/eden-test/example`
+`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 
 On the Eden host, run the same command with its local host name:
-`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --nro /path/libtraining_rooms.nro --rows tools/eden-test/example`
-Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga has one, XPS does not yet.
+`/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
+Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 
 What it does:
 1. Copies and pins the NROs and rows.
@@ -26,5 +26,6 @@ Old runs with recovery files directly in row folders cannot distinguish them fro
 
 For drill tracing, supply `--elf /path/libtraining_rooms.so` and both trace points:
 `--trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose`
+The bridge base enables trace, so it requires the matching ELF and at least one trace point.
 Every run gets its own bridge port; never hard-code 6979.
 The bridge lineup is a TRACE run: the stub is off so tracing is ready before game load.
