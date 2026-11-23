@@ -57,6 +57,7 @@ RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
 RUNS = Path('/home/intpa/eden-runs')
 NET_SYSFS = Path('/sys/class/net')
+X11_SOCKET_DIR = Path('/tmp/.X11-unix')
 
 
 def sha256(path):
@@ -233,6 +234,18 @@ def usable_interfaces():
     return [name for name in names if host_interface_problem(name) is None]
 
 
+def free_display(preferred, taken=()):
+    if not isinstance(preferred, str) or not re.fullmatch(r':\d{1,3}', preferred):
+        raise SystemExit(f'invalid base X display {preferred!r}; expected :<0..999>')
+    for number in range(int(preferred[1:]), int(preferred[1:]) + 40):
+        display = f':{number}'
+        socket_path = X11_SOCKET_DIR / f'X{number}'
+        if number <= 999 and number != 61 and display not in taken \
+                and not socket_path.exists() and not socket_path.is_symlink():
+            return display
+    raise SystemExit(f'no free X display from {preferred} upward (40 tried)')
+
+
 def go_new(args):
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
@@ -251,6 +264,14 @@ def go_new(args):
     config['network_interface'] = interface
     config['network_check'] = {'interface': interface, 'usable': problem is None,
                                'problem': problem, 'no_lobby': bool(args.no_lobby)}
+    choices = []
+    for item in config['instances']:
+        if 'display' in item:
+            original = item['display']
+            chosen = free_display(original, taken=[choice['chosen'] for choice in choices])
+            choices.append({'key': item['key'], 'base': original, 'chosen': chosen})
+            item['display'] = chosen
+    config['display_choice'] = choices
     run = RUNS / args.label
     if run.exists():
         raise SystemExit(f'{run} exists; pick a new label')

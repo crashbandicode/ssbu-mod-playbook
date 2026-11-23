@@ -6,9 +6,10 @@ From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ss
 On the Eden host, run the same command with its local host name:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
-The base names the host's network interface; `go` refuses an unusable interface unless `--no-lobby`.
-Never set `lo`: lobby rows must also open the room themselves. A no-lobby run without a usable interface
-needs boot rows that do not invoke `host_network`.
+Each run gets its own bridge port and its own X display.
+The base names the host's network interface ("network_interface"); go refuses when that interface is missing, down, loopback or has no IPv4 address, unless --no-lobby. Override with `--network-interface <name>`.
+Boot rows call routes:host_network (never set core.network_interface to "lo": Eden does not list loopback, so the game has no network and cannot open a local wireless room).
+A run with --no-lobby on a host without a usable interface must not call host_network.
 
 What it does:
 1. Copies and pins the NROs and rows.
@@ -30,5 +31,4 @@ Old runs with recovery files directly in row folders cannot distinguish them fro
 For drill tracing, supply `--elf /path/libtraining_rooms.so` and both trace points:
 `--trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose`
 The bridge base enables trace, so it requires the matching ELF and at least one trace point.
-Every run gets its own bridge port; never hard-code 6979.
 The bridge lineup is a TRACE run: the stub is off so tracing is ready before game load.
