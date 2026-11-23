@@ -11,6 +11,7 @@ import tempfile
 import time
 import types
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -380,6 +381,7 @@ class FrontendRoomTests(unittest.TestCase):
             {'ui': 'click', 'target': target('QPushButton', 'host')}]])
         self.assertEqual(receipt['port'], 24872)
         self.assertEqual(receipt['room_name'], 'TR24872')
+        self.assertFalse(receipt['game_running'])
         self.assertEqual(receipt['member_count'], 1)
         self.assertEqual(receipt['window_title'], self.ROOM['title'])
         self.assertEqual(receipt['evidence']['host_action'], self.HOST_ACTION)
@@ -425,11 +427,15 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual((result['nickname'], result['port'], result['member_count'], result['window_title']),
                          ('TRGuest', 24890, 2, title))
 
-    def test_running_join_without_port_and_unknown_role_refuse_before_ui(self):
+    def test_running_game_is_allowed_and_recorded(self):
         self.running = True
-        with self.assertRaisesRegex(RuntimeError, 'frontend_room runs before game.load'):
-            routes.frontend_room(self.ctx, port=24872)
-        self.running = False
+        result = routes.frontend_room(self.ctx, port=24872)
+        self.assertTrue(result['game_running'])
+        result = routes.frontend_room(self.ctx, port=24872)
+        self.assertTrue(result['already_connected'])
+        self.assertTrue(result['game_running'])
+
+    def test_join_without_port_and_unknown_role_refuse_before_ui(self):
         with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*port'):
             routes.frontend_room(self.ctx, role='join')
         with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*role'):
@@ -510,6 +516,7 @@ class FrontendRoomTests(unittest.TestCase):
             result = routes.frontend_room(self.ctx)
         self.assertTrue(result['already_connected'])
         self.assertEqual((result['window_title'], result['member_count']), (self.ROOM['title'], 1))
+        self.assertFalse(result['game_running'])
         self.assertEqual(self.actions, [])
         self.assertEqual(json.loads((self.row / 'routes-frontend-room.json').read_text()), result)
 
@@ -527,6 +534,83 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertFalse(result['already_connected'])
         self.assertEqual(result['member_count'], 2)
         self.assertTrue(any(step['ui'] == 'trigger' for _, step in self.actions))
+
+
+class BridgeAliveTests(unittest.TestCase):
+    BOOT = '0x901afdfc49eabde3'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.log = self.root / 'bridge.log'
+        self.log.write_text('[Adapter] reconnect same_boot=1\n[Adapter] reconnect same_boot=1\n')
+        self.ctx = types.SimpleNamespace(instance={'bridge_log': str(self.log)}, on='a',
+                                         runner=types.SimpleNamespace(), row_dir=self.root,
+                                         check_stop=lambda: None)
+        self.requests = []
+        self.orphan_end = False
+        self.supply = [self.wire('ssbu.ui', 5, 200, 1000), self.wire('ssbu.ui', 6, 201, 1010),
+                       self.wire('tr.menu', 1, 202, 1020), self.wire('tr.menu', 1, 203, 1030)]
+
+    @classmethod
+    def wire(cls, provider, rev, frame, wall):
+        schema = provider + '/1'
+        # tr.menu keys and framing follow rc15-intermediate-next/runtime-17060a5e/xps/bridge.log:4077.
+        payload = ([f'schema={schema}', f'rev={rev}', f'boot={cls.BOOT}', f'observation={rev}',
+                    'observation.active=yes', 'focus=main_menu', 'screen=main_menu'] if provider == 'ssbu.ui' else
+                   [f'schema={schema}', 'ack=0', 'ack.result="handled"', 'focus=/-/0/row', 'open=0'])
+        suffix = f' frame={frame} wall={wall}\n'
+        begin = (f'[Bridge] state begin name={provider} schema={schema} rev={rev} boot={cls.BOOT} '
+                 f'lines={len(payload)} filtered=0' + suffix)
+        body = ''.join(f'[Bridge] state.{i} {line}' + suffix for i, line in enumerate(payload))
+        crc = zlib.crc32('\n'.join(payload).encode())
+        return begin + body + f'[Bridge] state end name={provider} rev={rev} crc={crc:08x}' + suffix
+
+    def spool(self, ctx, *requests):
+        self.assertEqual(ctx, self.ctx)
+        self.requests.append(requests)
+        if self.supply:
+            with self.log.open('a') as f:
+                f.write(f'[Bridge] req providers result=ok count=2 boot={self.BOOT}\n')
+                if self.orphan_end:
+                    f.write('[Bridge] state end name=ssbu.ui rev=4 crc=00000000 frame=199 wall=990\n')
+                f.write(self.supply.pop(0))
+
+    def test_fenced_replies_allow_equal_menu_revision_and_save_reply_clocks(self):
+        with mock.patch.object(routes, 'bridge_v2', self.spool):
+            result = routes.bridge_alive(self.ctx, cap=2)
+        self.assertEqual(result['block'], 'bridge_alive')
+        self.assertEqual(result['ssbu.ui'], {'rev': [5, 6], 'screen': 'main_menu'})
+        self.assertEqual(result['tr.menu'], {'rev': [1, 1], 'frame': [202, 203], 'wall': [1020, 1030]})
+        self.assertEqual(result['reconnects'], 2)
+        self.assertEqual(self.requests, [('providers', 'state ssbu.ui')] * 2 +
+                         [('providers', 'state tr.menu')] * 2)
+        self.assertEqual(json.loads((self.root / 'routes-bridge-alive.json').read_text()), result)
+
+    def test_orphan_end_before_reply_is_ignored(self):
+        self.orphan_end = True
+        with mock.patch.object(routes, 'bridge_v2', self.spool):
+            result = routes.bridge_alive(self.ctx, cap=2)
+        self.assertEqual(result['tr.menu']['rev'], [1, 1])
+
+    def test_missing_second_menu_reply_names_provider_and_cap(self):
+        self.supply.pop()
+        with mock.patch.object(routes, 'bridge_v2', self.spool):
+            with self.assertRaisesRegex(RuntimeError, r'bridge_alive: tr\.menu.*0\.1'):
+                routes.bridge_alive(self.ctx, cap=.1)
+
+    def test_missing_newer_ui_sample_names_provider_and_cap(self):
+        self.supply = [self.wire('ssbu.ui', 5, 200, 1000), self.wire('ssbu.ui', 5, 201, 1010)]
+        with mock.patch.object(routes, 'bridge_v2', self.spool):
+            with self.assertRaisesRegex(RuntimeError, r'bridge_alive: ssbu\.ui.*0\.1'):
+                routes.bridge_alive(self.ctx, cap=.1)
+
+    def test_wrong_boot_on_second_menu_reply_is_refused(self):
+        self.supply[3] = self.supply[3].replace(self.BOOT, '0x0000000000000002')
+        with mock.patch.object(routes, 'bridge_v2', self.spool):
+            with self.assertRaisesRegex(RuntimeError, r'bridge_alive: tr\.menu.*0\.1'):
+                routes.bridge_alive(self.ctx, cap=.1)
 
 
 class NativeStateTests(unittest.TestCase):
