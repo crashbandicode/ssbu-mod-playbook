@@ -2851,13 +2851,22 @@ class WirelessRoomTests(unittest.TestCase):
             self.form_script = []
             self.form_screen = 'unknown'
             self.confirm_form_reads = 0
+            self.confirm_form_only_first = False
             self.confirm_reads = 0
             self.stage_context_unknown_reads = 0
             self.unpublished_confirms = 0
+            self.confirm_errors_before_unknown = 0
+            self.confirm_unknown_before_errors = 0
+            self.unpublished_reads = 0
+            self.ui_fault_at = None
+            self.ui_fault_kind = 'error'
+            self.form_reads = 0
+            self.tile_reads = 0
             self.wrong_confirm_screen = False
             self.direct_css = False
             self.stuck_stage = False
             self.stuck_tile = False
+            self.place_on_chord = False
             self.stuck_placement = False
             self.waiting_role = 'host'
             self.never_waiting = False
@@ -2875,8 +2884,31 @@ class WirelessRoomTests(unittest.TestCase):
         def read(self, provider, cap):
             self.revision += 1
             if provider == 'tile.cursor':
+                self.tile_reads += 1
                 values = dict(self.tile)
             else:
+                if self.phase == 'form':
+                    self.form_reads += 1
+                if self.phase == 'unpublished' and self.confirm_count == 1:
+                    self.unpublished_reads += 1
+                fault = (
+                    (self.ui_fault_at == 'form_settle' and self.phase == 'form' and self.form_reads >= 4)
+                    or (self.ui_fault_at == 'confirm' and self.phase == 'unpublished' and self.confirm_count == 1)
+                    or (self.ui_fault_at == 'stage_retry' and self.phase == 'stage' and self.stage_count >= 1)
+                    or (self.ui_fault_at == 'chord' and self.phase == 'css' and self.tile_reads >= 1
+                        and 'tile-up' not in self.actions and self.tile['p1.token'] != 'placed')
+                    or (self.ui_fault_at == 'placement' and self.phase == 'css' and 'tile-up' in self.actions
+                        and self.tile['p1.token'] != 'placed')
+                    or (self.ui_fault_at == 'ready' and self.phase == 'css' and self.tile['p1.token'] == 'placed')
+                )
+                mixed_error = (self.phase == 'unpublished' and self.confirm_count == 1
+                               and (self.unpublished_reads <= self.confirm_errors_before_unknown
+                                    or (self.confirm_unknown_before_errors
+                                        and self.unpublished_reads > self.confirm_unknown_before_errors)))
+                if mixed_error or (fault and self.ui_fault_kind == 'error'):
+                    error = 'no fenced bridge reply for state ssbu.ui'
+                    self.events.append(('read_error', provider, error))
+                    raise RuntimeError(error)
                 if self.phase == 'confirm_form':
                     if self.confirm_reads >= self.confirm_form_reads:
                         self.phase = 'css' if self.direct_css else 'stage'
@@ -2904,6 +2936,8 @@ class WirelessRoomTests(unittest.TestCase):
                     'observation.active': 'no' if screen == 'unknown' else 'yes',
                     'ldn.role': role, 'ldn.members': 'unknown',
                 }
+                if fault and self.ui_fault_kind == 'missing':
+                    values.pop('screen')
             block = {'name': provider, 'schema': provider + '/1', 'filtered': False, 'rev': self.revision,
                      'boot': '0xe54e9b821337ecd1', 'values': values}
             self.events.append(('read', provider, dict(values)))
@@ -2924,7 +2958,7 @@ class WirelessRoomTests(unittest.TestCase):
                     self.phase = 'wrong'
                 elif self.confirm_count <= self.unpublished_confirms:
                     self.phase = 'unpublished'
-                elif self.confirm_form_reads:
+                elif self.confirm_form_reads and (not self.confirm_form_only_first or self.confirm_count == 1):
                     self.phase = 'confirm_form'
                     self.confirm_reads = 0
                 else:
@@ -2936,6 +2970,8 @@ class WirelessRoomTests(unittest.TestCase):
             elif macro == 'tile-up' and self.phase == 'css':
                 if not self.stuck_tile:
                     self.tile.update({'at': '66', 'hovered': '66', 'phase': 'settled'})
+                if self.place_on_chord:
+                    self.tile.update({'p1.token': 'placed', 'p1.placed.at': '66', 'p1.placed.name': 'Simon'})
             elif macro == 'tap-a1' and self.phase == 'css':
                 if not self.stuck_placement:
                     self.tile.update({'at': '45', 'hovered': 'unknown', 'p1.token': 'placed',
@@ -3081,6 +3117,76 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(result['confirm_presses'], 2)
         self.assertEqual(self.io.actions.count('tap-plus1'), 3)
 
+    def test_confirm_read_errors_never_authorize_a_second_press(self):
+        self.io.unpublished_confirms = 1
+        self.io.ui_fault_at = 'confirm'
+        with self.assertRaisesRegex(RuntimeError, 'no ssbu.ui reply after the Create confirm.*'
+                                    'no screen witness.*no fenced bridge reply for state ssbu.ui'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1'])
+        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+
+    def test_confirm_missing_screen_never_authorizes_a_second_press(self):
+        self.io.unpublished_confirms = 1
+        self.io.ui_fault_at = 'confirm'
+        self.io.ui_fault_kind = 'missing'
+        with self.assertRaisesRegex(RuntimeError, 'no ssbu.ui reply after the Create confirm.*no screen witness'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1'])
+        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+
+    def test_last_error_at_cap_after_unknowns_never_authorizes_retry(self):
+        self.io.unpublished_confirms = 1
+        self.io.confirm_unknown_before_errors = 4
+        with self.assertRaisesRegex(RuntimeError, 'no ssbu.ui reply after the Create confirm.*no screen witness'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1'])
+        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+
+    def test_errors_then_last_complete_unknown_at_cap_allow_one_retry(self):
+        self.io.unpublished_confirms = 1
+        self.io.confirm_errors_before_unknown = 4
+        result = self.run_room()
+        self.assertEqual(result['confirm_presses'], 2)
+        pluses = [i for i, event in enumerate(self.io.events) if event == ('send', 'tap-plus1')]
+        between = self.io.events[pluses[0] + 1:pluses[1]]
+        self.assertTrue(any(event[0] == 'read_error' for event in between))
+        reads = [event for event in between if event[0] == 'read' and event[1] == 'ssbu.ui']
+        self.assertEqual(reads[-1][2]['screen'], 'unknown')
+
+    def test_complete_published_create_at_cap_allows_one_retry(self):
+        self.io.form_screen = 'ldn.create'
+        self.io.confirm_form_reads = 1000
+        self.io.confirm_form_only_first = True
+        result = self.run_room()
+        self.assertEqual(result['create_form'], 'ldn.create')
+        self.assertEqual(result['confirm_presses'], 2)
+        self.assertEqual(self.io.actions.count('tap-plus1'), 3)
+
+    def test_form_settle_read_error_names_the_error_and_sends_no_confirm(self):
+        self.io.ui_fault_at = 'form_settle'
+        with self.assertRaisesRegex(RuntimeError, 'Create form.*no fenced bridge reply for state ssbu.ui'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1'])
+
+    def test_screen_read_error_or_missing_screen_refuses_other_inputs(self):
+        prefix = ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-a1']
+        for gate, expected, message in (
+                ('stage_retry', prefix, 'expected css.smash'),
+                ('chord', prefix, 'before tile-up'),
+                ('placement', prefix + ['tile-up'], 'before placement'),
+                ('ready', prefix + ['tile-up', 'tap-a1'], 'before Ready')):
+            for kind in ('error', 'missing'):
+                with self.subTest(gate=gate, kind=kind):
+                    self.io = self.IO()
+                    self.io.ui_fault_at = gate
+                    self.io.ui_fault_kind = kind
+                    self.io.stuck_stage = gate == 'stage_retry'
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        self.run_room()
+                    self.assertEqual(self.io.actions, expected)
+                    self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+
     def test_unpublished_after_second_confirm_fails_without_third(self):
         self.io.unpublished_confirms = 3
         with self.assertRaisesRegex(RuntimeError, 'stage_select|css.smash'):
@@ -3123,6 +3229,13 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.actions[-2:], ['tile-up', 'tap-a1'])
         self.assertEqual(self.io.actions.count('tap-plus1'), 1)
 
+    def test_token_placed_after_chord_without_a_does_not_claim_already_placed(self):
+        self.io.place_on_chord = True
+        result = self.run_room()
+        self.assertEqual((result['placed_by'], result['chord_sent']), ('chord', True))
+        self.assertEqual(self.io.actions,
+                         ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-a1', 'tile-up', 'tap-plus1'])
+
     def test_waiting_role_must_be_host(self):
         for role in ('unknown', 'guest'):
             with self.subTest(role=role):
@@ -3144,7 +3257,9 @@ class WirelessRoomTests(unittest.TestCase):
 
     def test_already_hovering_numeric_tile_skips_chord_but_places(self):
         self.io.tile.update({'at': '42', 'hovered': '42', 'phase': 'settled'})
-        self.run_room()
+        result = self.run_room()
+        self.assertEqual(result['placed_by'], 'A')
+        self.assertFalse(result['chord_sent'])
         self.assertNotIn('tile-up', self.io.actions)
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
                                            'tap-a1', 'tap-a1', 'tap-plus1'])
