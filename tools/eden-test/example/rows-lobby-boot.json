@@ -27,6 +27,16 @@
         {"run": "routes:to_main"},
         {"run": "routes:bridge_alive"}
       ]
+    },
+    {
+      "id": "lobby-waiting",
+      "start": "main",
+      "end": "lobby",
+      "role": "setup",
+      "on_failure": "stop",
+      "steps": [
+        {"run": "routes:wireless_room"}
+      ]
     }
   ]
 }
