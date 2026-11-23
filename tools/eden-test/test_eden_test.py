@@ -889,6 +889,12 @@ class EdenTestTests(unittest.TestCase):
                 '--rows', str(rows or self.rows), *(['--owner', owner] if owner is not None else []),
                 '--from', str(self.previous)]
 
+    def go_new_args(self, label='go-1', rows=None, no_lobby=False):
+        return types.SimpleNamespace(from_config=str(self.previous), host='yoga', label=label,
+                                     owner='Claude devin-test/go-1', nro=[str(self.dir / 'plugin.nro')],
+                                     rows=str(rows or self.rows), elf=None, trace_point=[],
+                                     network_interface=None, no_lobby=no_lobby)
+
     def test_go_allocates_and_records_distinct_displays(self):
         base = json.loads(self.previous.read_text())
         base['display_helper'] = {'path': '/helper', 'sha256': '0' * 64}
@@ -1060,11 +1066,10 @@ class EdenTestTests(unittest.TestCase):
     def test_go_accepts_example_and_matching_host_network_interface(self):
         example = Path(__file__).resolve().parent / 'example'
         plan = json.loads((example / 'rows.json').read_text())
-        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
-            self.assertEqual(eden_test.main(self.go_args(label='example', rows=example)), 0)
-            plan['rows'][0]['steps'][1]['args'] = {'interface': 'test0'}
-            (self.rows / 'rows.json').write_text(json.dumps(plan))
-            self.assertEqual(eden_test.main(self.go_args(label='matching')), 0)
+        self.assertEqual(eden_test.go_new(self.go_new_args(label='example', rows=example)), eden_test.RUNS / 'example')
+        plan['rows'][0]['steps'][1]['args'] = {'interface': 'test0'}
+        (self.rows / 'rows.json').write_text(json.dumps(plan))
+        self.assertEqual(eden_test.go_new(self.go_new_args(label='matching')), eden_test.RUNS / 'matching')
         for label in ('example', 'matching'):
             config = json.loads((eden_test.RUNS / label / 'config.json').read_text())
             self.assertEqual(config['network_check']['row_overrides'], [])
@@ -1093,8 +1098,7 @@ class EdenTestTests(unittest.TestCase):
         for location in ('row r1 step 1', 'row r1 step 2 gif step 1',
                          'row r1 step recover 1', 'row <plan recover> step 1'):
             self.assertIn(location, str(caught.exception))
-        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
-            self.assertEqual(eden_test.main(self.go_args() + ['--no-lobby']), 0)
+        self.assertEqual(eden_test.go_new(self.go_new_args(no_lobby=True)), eden_test.RUNS / 'go-1')
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertEqual(config['network_check']['row_overrides'], [
             {'row': 'r1', 'step': 1, 'run': 'routes:_setting', 'value': 'other0'},
