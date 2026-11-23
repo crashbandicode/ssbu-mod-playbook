@@ -705,13 +705,17 @@ def _frontend_connected(ctx, tree, members):
     return None
 
 
+def _frontend_room_matches(title, room_name):
+    return title.startswith(f'{room_name} - ')
+
+
 def _frontend_name(field, value):
     if not isinstance(value, str) or not re.fullmatch(r'[a-zA-Z0-9._ -]{4,20}', value):
         raise RuntimeError(f'frontend_room: {field} "{value}" is not valid for Eden: 4 to 20 characters of '
                            'letters, digits, ".", "_", " " or "-" (yuzu/multiplayer/validation.h)')
 
 
-def _frontend_wait(ctx, match, cap, members=None, confirmation=None):
+def _frontend_wait(ctx, match, cap, members=None, confirmation=None, room_name=None):
     until = time.monotonic() + cap
     titles = []
     while time.monotonic() < until:
@@ -737,12 +741,15 @@ def _frontend_wait(ctx, match, cap, members=None, confirmation=None):
                     count = re.search(r'\((\d+)/\d+ members\).* - connected$', title)
                     if not count or int(count.group(1)) < members:
                         continue
+                    if room_name is not None and not _frontend_room_matches(title, room_name):
+                        continue
                     return {k: node.get(k) for k in ('id', 'class', 'name', 'text')}, title, int(count.group(1))
                 return {k: node.get(k) for k in ('id', 'class', 'name', 'text')}
             time.sleep(min(.5, max(0, until - time.monotonic())))
     if members is not None:
         seen = ', '.join(repr(title) for title in titles) if titles else 'no room window'
-        raise RuntimeError(f'frontend_room: expected a connected room window with at least {members} member(s); '
+        room = f' for room "{room_name}"' if room_name is not None else ''
+        raise RuntimeError(f'frontend_room: expected a connected room window{room} with at least {members} member(s); '
                            f'saw: {seen}')
     raise RuntimeError(f'frontend_room: widget {match} did not appear within {cap} s')
 
@@ -790,6 +797,24 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         _frontend_name('room_name', room_name)
     room_file = Path(ctx.runner.out) / 'frontend-room.json'
     saved = json.loads(room_file.read_text()) if room_file.is_file() else {}
+    expected_name = room_name if room_name is not None else saved.get('room_name')
+    requested_port = port
+
+    def reuse(connected, dismissed):
+        widget, title, count = connected
+        if expected_name is None:
+            raise RuntimeError(f'frontend_room: this Eden is already connected to "{title}", but no room_name was '
+                               'given and this run has no frontend-room.json to check it against')
+        if not _frontend_room_matches(title, expected_name):
+            raise RuntimeError(f'frontend_room: this Eden is connected to another room: expected "{expected_name}", '
+                               f'saw "{title}"')
+        return _save(ctx, 'routes-frontend-room', {
+            'role': role, 'port': requested_port if requested_port is not None else saved.get('port'),
+            'nickname': nickname, 'room_name': expected_name, 'ip': ip,
+            'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
+            'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed, 'game_running': game_running,
+            'confirmed_running_game': None, 'room_matched': True})
+
     tree = ctx.call('ui.tree', {}) or []
     confirmation = {'game_running': game_running, 'text': None}
     boxes = [n for n in tree if ctx.runner.ui_matches(n, {'class': 'QMessageBox'})]
@@ -798,23 +823,20 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         raise RuntimeError(f'frontend_room: Eden showed "{_frontend_text(warning)}" while waiting for connected room')
     connected = _frontend_connected(ctx, tree, members)
     if connected and not warning:
-        widget, title, count = connected
-        return _save(ctx, 'routes-frontend-room', {
-            'role': role, 'port': port if port is not None else saved.get('port'), 'nickname': nickname,
-            'room_name': room_name if room_name is not None else saved.get('room_name'), 'ip': ip,
-            'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
-            'already_connected': True, 'reused_dialog': False, 'dismissed': None, 'game_running': game_running,
-            'confirmed_running_game': None})
+        return reuse(connected, None)
     if warning:
         anchor = 'username' if role == 'host' else 'nickname'
         actual_port = _frontend_dialog_value(ctx, tree, anchor, 'port')
         port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
         nickname = _frontend_dialog_value(ctx, tree, anchor, anchor) or nickname
         _frontend_name('nickname', nickname)
-        room_name = _frontend_dialog_value(ctx, tree, anchor, 'room_name') if role == 'host' else saved.get('room_name')
+        room_name = (_frontend_dialog_value(ctx, tree, anchor, 'room_name') or expected_name
+                     if role == 'host' else expected_name)
         if role == 'join':
             ip = _frontend_dialog_value(ctx, tree, anchor, 'ip') or ip
-        if role == 'host' and room_name is not None:
+        if role == 'host':
+            if room_name is None:
+                raise RuntimeError('frontend_room: cannot read the room name of the open Create Room dialog')
             _frontend_name('room_name', room_name)
         tree, confirmation['text'] = _frontend_dismiss(ctx, tree, cap, ok_pattern='^&?OK$')
         dismissed = None
@@ -833,12 +855,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         tree, dismissed = _frontend_dismiss(ctx, tree, cap)
     connected = _frontend_connected(ctx, tree, members)
     if connected and not warning:
-        widget, title, count = connected
-        return _save(ctx, 'routes-frontend-room', {
-            'role': role, 'port': port, 'nickname': nickname, 'room_name': room_name, 'ip': ip,
-            'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
-            'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed, 'game_running': game_running,
-            'confirmed_running_game': None})
+        return reuse(connected, dismissed)
 
     evidence = {}
     dialog = {'class': 'QLineEdit', 'name': 'username' if role == 'host' else 'nickname'}
@@ -870,7 +887,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'connect'}})
     evidence['frontend_connected'], title, count = _frontend_wait(
         ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, members,
-        confirmation=confirmation)
+        confirmation=confirmation, room_name=room_name)
     if role == 'host' and port is not None and room_name is not None:
         room_file.write_text(json.dumps({'port': port, 'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
     return _save(ctx, 'routes-frontend-room', {'role': role, 'port': port, 'nickname': nickname,
@@ -878,7 +895,8 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                                'window_title': title, 'member_count': count,
                                                'already_connected': False, 'reused_dialog': reused_dialog,
                                                'dismissed': dismissed, 'game_running': game_running,
-                                               'confirmed_running_game': confirmation['text']})
+                                               'confirmed_running_game': confirmation['text'],
+                                               'room_matched': True if room_name is not None else None})
 
 
 def bridge_alive(ctx, cap=10):
