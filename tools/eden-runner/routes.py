@@ -705,8 +705,25 @@ def _frontend_connected(ctx, tree, members):
     return None
 
 
+def _frontend_room_head(title):
+    match = re.fullmatch(r'(.+) \(\d+/\d+ members\) - connected', title, flags=re.DOTALL)
+    return match.group(1) if match else None
+
+
 def _frontend_room_matches(title, room_name):
-    return title.startswith(f'{room_name} - ')
+    """Eden: "<room> - <game> (n/m members) - connected" (client_room.cpp:102)."""
+    head = _frontend_room_head(title)
+    if head is None:
+        return False
+    i = head.find(' - ')
+    return i != -1 and i == head.rfind(' - ') and head[:i] == room_name and bool(head[i + 3:])
+
+
+def _frontend_confirmable_room_name(room_name):
+    if isinstance(room_name, str) and (' - ' in room_name or room_name.endswith(' -')):
+        raise RuntimeError(f'frontend_room: room_name "{room_name}" contains " - ", so Eden\'s room window title '
+                           '("<room> - <game> (n/m members) - connected") could not confirm it; '
+                           'use a name without " - "')
 
 
 def _frontend_name(field, value):
@@ -798,6 +815,8 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     room_file = Path(ctx.runner.out) / 'frontend-room.json'
     saved = json.loads(room_file.read_text()) if room_file.is_file() else {}
     expected_name = room_name if room_name is not None else saved.get('room_name')
+    _frontend_confirmable_room_name(expected_name)
+    requested_name = room_name
     requested_port = port
 
     def reuse(connected, dismissed):
@@ -806,8 +825,11 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             raise RuntimeError(f'frontend_room: this Eden is already connected to "{title}", but no room_name was '
                                'given and this run has no frontend-room.json to check it against')
         if not _frontend_room_matches(title, expected_name):
+            head = _frontend_room_head(title)
+            ambiguous = ('; the title has more than one " - ", so its room name is ambiguous'
+                         if head is not None and head.find(' - ') != head.rfind(' - ') else '')
             raise RuntimeError(f'frontend_room: this Eden is connected to another room: expected "{expected_name}", '
-                               f'saw "{title}"')
+                               f'saw "{title}"{ambiguous}')
         return _save(ctx, 'routes-frontend-room', {
             'role': role, 'port': requested_port if requested_port is not None else saved.get('port'),
             'nickname': nickname, 'room_name': expected_name, 'ip': ip,
@@ -828,16 +850,30 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         anchor = 'username' if role == 'host' else 'nickname'
         actual_port = _frontend_dialog_value(ctx, tree, anchor, 'port')
         port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
+        dialog_name = _frontend_dialog_value(ctx, tree, anchor, 'room_name') if role == 'host' else None
+        comparable_port = (int(requested_port) if isinstance(requested_port, str) and requested_port.isascii()
+                           and requested_port.isdecimal() else requested_port)
+        if ((role == 'host' and requested_name is not None and dialog_name is not None
+             and requested_name != dialog_name)
+                or (requested_port is not None and port is not None and comparable_port != port)):
+            if role == 'join':
+                raise RuntimeError(f'frontend_room: the open Direct Connect dialog is on port {port}, '
+                                   f'not the requested port {requested_port}')
+            raise RuntimeError(f'frontend_room: the open Create Room dialog is for room "{dialog_name}" on port '
+                               f'{port}, not the requested room "{requested_name}" on port {requested_port}')
         nickname = _frontend_dialog_value(ctx, tree, anchor, anchor) or nickname
         _frontend_name('nickname', nickname)
-        room_name = (_frontend_dialog_value(ctx, tree, anchor, 'room_name') or expected_name
-                     if role == 'host' else expected_name)
+        if role == 'host':
+            room_name = requested_name if requested_name is not None else dialog_name or saved.get('room_name')
+        else:
+            room_name = expected_name
         if role == 'join':
             ip = _frontend_dialog_value(ctx, tree, anchor, 'ip') or ip
         if role == 'host':
             if room_name is None:
                 raise RuntimeError('frontend_room: cannot read the room name of the open Create Room dialog')
             _frontend_name('room_name', room_name)
+        _frontend_confirmable_room_name(room_name)
         tree, confirmation['text'] = _frontend_dismiss(ctx, tree, cap, ok_pattern='^&?OK$')
         dismissed = None
     else:
@@ -851,6 +887,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             room_name = saved.get('room_name')
         if role == 'host':
             _frontend_name('room_name', room_name)
+        _frontend_confirmable_room_name(room_name)
 
         tree, dismissed = _frontend_dismiss(ctx, tree, cap)
     connected = _frontend_connected(ctx, tree, members)
