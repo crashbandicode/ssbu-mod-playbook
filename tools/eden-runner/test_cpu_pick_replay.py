@@ -1,5 +1,6 @@
 """Replay the Tile Cursor Publisher's CPU-pick blocks through the real routes."""
 
+import copy
 import hashlib
 import json
 import sys
@@ -80,6 +81,60 @@ class ProducerReplay:
         if transition is None:
             raise AssertionError((self.phase, segment))
         self.pending.extend(transition)
+
+    def log(self, evidence):
+        self.evidence.append(evidence)
+
+    def finish(self):
+        pass
+
+
+class HeldRichterReplay:
+    def __init__(self, topology):
+        self.topology = topology
+        self.tile = recorded.recorded_training_tile(551)
+        self.first_tile = True
+        self.ui_rev = 550
+        self.actions = []
+        self.moves = []
+        self.evidence = []
+
+    def arm(self, provider, cap):
+        pass
+
+    def read(self, provider, cap):
+        if provider == picker.UI:
+            self.ui_rev += 1
+            return recorded.recorded_native(self.ui_rev)
+        if self.first_tile:
+            self.first_tile = False
+        else:
+            self.tile.block['rev'] += 1
+            self.tile.values['rev'] = str(self.tile.block['rev'])
+            self.tile.values['observation'] = str(int(self.tile.values['observation']) + 1)
+        return copy.deepcopy(self.tile)
+
+    def send(self, segment):
+        self.actions.append(segment)
+        values = self.tile.values
+        if segment.startswith('tile-'):
+            direction = segment.removeprefix('tile-')
+            source = values['at']
+            dest = self.topology.neighbors[source][direction]
+            identity = self.topology.targets[dest]
+            ack = str(int(values['ack']) + 1)
+            values.update({'at': dest, 'hovered': dest, 'kind': identity.kind, 'name': identity.name,
+                           'form': identity.form, 'focus': f'css.grid.{dest}', 'settled': '1',
+                           'ack': ack, 'applied': ack, 'settled.ack': ack, 'ack.result': 'handled',
+                           'direction': direction, 'from': source, 'to': dest, 'result': 'handled'})
+            self.moves.append((source, direction, dest))
+        elif segment == 'tap-a1':
+            values.update({'local.token': 'placed', 'p1.token': 'placed', 'carried': 'none',
+                           'p1.carried': 'none', 'placed.at': values['at'], 'placed.kind': values['kind'],
+                           'placed.name': values['name'], 'placed.form': values['form'],
+                           'focus': 'css.grid.placed'})
+        else:
+            raise AssertionError(f'unexpected input {segment}')
 
     def log(self, evidence):
         self.evidence.append(evidence)
@@ -208,6 +263,39 @@ class ProducerReplayTests(unittest.TestCase):
             receipt = routes.setup_state(self.ctx)
         self.assertEqual(receipt['verified']['stage_id'], 5)
         self.assertEqual(receipt['remembered']['stage_id'], 3)
+
+    def test_tk05_first_step_reaches_mario_from_a_held_non_mario_coin(self):
+        fragment = Path(__file__).resolve().parent.parent / 'eden-test' / 'example' / 'rows-tile-take.json'
+        rows = json.loads(fragment.read_text())['rows']
+        step = next(row for row in rows if row['id'] == 'tk05')['steps'][0]
+        module, name = step['run'].split(':', 1)
+        self.assertEqual(module, 'routes')
+        function = getattr(routes, name)
+        topology = routes._tile_topology(routes.library_topology('css-training'))
+        replay = HeldRichterReplay(topology)
+        self.assertEqual((replay.tile.block['rev'], replay.tile.values['at'], replay.tile.values['name'],
+                          replay.tile.values['local.token']), (551, '67', 'Richter', 'held'))
+        goal = next(tile for tile, identity in topology.targets.items()
+                    if identity == picker.Target('0', 'Mario', 'default'))
+        expected = []
+        at = '67'
+        while at != goal:
+            direction, dest = topology.step(at, goal)
+            expected.append((at, direction, dest))
+            at = dest
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'pick_cpu') as pick_cpu, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            try:
+                result = function(self.ctx, **step.get('args', {}))
+            except RuntimeError:
+                print(f'replay actions before error: {replay.actions!r}', file=sys.stderr)
+                raise
+        self.assertTrue(expected)
+        self.assertEqual(replay.moves, expected)
+        self.assertEqual(replay.actions, ['tile-' + direction for _, direction, _ in expected] + ['tap-a1'])
+        self.assertEqual((result['name'], result['kind']), ('Mario', '0'))
+        pick_cpu.assert_not_called()
 
 
 if __name__ == '__main__':
