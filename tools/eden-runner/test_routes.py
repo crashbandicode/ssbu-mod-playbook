@@ -5,12 +5,14 @@ Run: python3 -I test_routes.py
 """
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -180,6 +182,7 @@ class HostNetworkTests(unittest.TestCase):
         self.calls = []
         self.running = False
         self.wrong_readback = False
+        self.ldn_error = None
         self.ctx = types.SimpleNamespace(runner=types.SimpleNamespace(out=self.out),
                                          row_dir=self.row, call=self.call)
 
@@ -190,24 +193,44 @@ class HostNetworkTests(unittest.TestCase):
         if method == 'settings.set':
             self.values[params['key']] = params['value']
         if method == 'settings.get':
+            if params['key'] == 'core.ldn_mitm' and self.ldn_error:
+                raise RuntimeError(self.ldn_error)
+            if params['key'] == 'core.ldn_mitm' and params['key'] not in self.values:
+                return {'value': True}
             value = self.values[params['key']]
             return {'value': 'wrong' if self.wrong_readback else value}
         return {}
 
-    def test_reads_base_and_sets_and_reads_both_without_saving(self):
+    def test_reads_base_and_sets_and_reads_network_settings_without_saving(self):
         result = routes.host_network(self.ctx)
         self.assertEqual(result, {
-            'block': 'host_network', 'interface': 'wifi0', 'lan_online': False,
-            'readback': {'core.network_interface': 'wifi0', 'core.lan_online': False}})
+            'block': 'host_network', 'interface': 'wifi0', 'lan_online': False, 'ldn_mitm': False,
+            'readback': {'core.network_interface': 'wifi0', 'core.lan_online': False, 'core.ldn_mitm': False}})
         self.assertEqual(json.loads((self.row / 'routes-host-network.json').read_text()), result)
         self.assertEqual([name for name, _ in self.calls],
-                         ['status', 'settings.set', 'settings.get', 'settings.set', 'settings.get'])
+                         ['status', 'settings.set', 'settings.get', 'settings.set', 'settings.get',
+                          'settings.get', 'settings.set', 'settings.get'])
 
     def test_argument_overrides_config_and_lan_online(self):
         result = routes.host_network(self.ctx, interface='ethernet0', lan_online=True)
         self.assertEqual(result['interface'], 'ethernet0')
         self.assertEqual(result['readback'], {
-            'core.network_interface': 'ethernet0', 'core.lan_online': True})
+            'core.network_interface': 'ethernet0', 'core.lan_online': True, 'core.ldn_mitm': False})
+
+    def test_absent_ldn_mitm_is_recorded_but_other_errors_propagate(self):
+        self.ldn_error = "settings.get on a: {'ok': False, 'error': {'code': 'unknown_setting'}}"
+        result = routes.host_network(self.ctx)
+        self.assertEqual(result['readback']['core.ldn_mitm'], 'absent')
+        self.assertNotIn('core.ldn_mitm', self.values)
+        self.ldn_error = 'settings.get on a: connection lost'
+        with self.assertRaisesRegex(RuntimeError, 'connection lost'):
+            routes.host_network(self.ctx)
+
+    def test_explicit_ldn_mitm_is_set_and_read_back(self):
+        result = routes.host_network(self.ctx, ldn_mitm=True)
+        self.assertTrue(result['ldn_mitm'])
+        self.assertTrue(result['readback']['core.ldn_mitm'])
+        self.assertTrue(self.values['core.ldn_mitm'])
 
     def test_rejects_loopback_missing_interface_and_running_game_before_setting(self):
         for interface, running, expected in (
@@ -281,6 +304,119 @@ class LoadGameNetworkTests(unittest.TestCase):
                 result = routes.load_game(self.ctx)
                 self.assertEqual([name for name, _ in self.calls], ['game.load', 'status'])
                 self.assertNotIn('network_interface', result)
+
+
+class FrontendRoomTests(unittest.TestCase):
+    # p00-rooms.json in phase23/1f-save-hold/ldn-pair/rc15-ldn-xps-2/out.
+    HOST_ACTION = {'id': 'o130', 'class': 'QAction', 'name': 'action_Start_Room', 'text': '&Create Room'}
+    HOST_DIALOG = {'id': 'o217', 'class': 'QLineEdit', 'name': 'username', 'text': None}
+    HOST_LEAVE = {'id': 'o272', 'class': 'QPushButton', 'name': 'disconnect', 'text': 'Leave Room'}
+    PEER_ACTION = {'id': 'o53', 'class': 'QAction', 'name': 'action_Connect_To_Room',
+                   'text': '&Direct Connect to Room'}
+    PEER_DIALOG = {'id': 'o220', 'class': 'QLineEdit', 'name': 'nickname', 'text': None}
+    ROOM = {'id': 'o259', 'class': 'ClientRoomWindow', 'name': 'ClientRoom', 'text': None,
+            # xps-1/out/c2-match-end/a-GATE-FAILED-trace-sched-tree.json, 2 changed to 1.
+            'title': 'TRB3Waiting - Super Smash Bros. Ultimate (1/8 members) - connected'}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        self.out = self.run / 'out'
+        self.row = self.out / 'r00'
+        self.row.mkdir(parents=True)
+        (self.run / 'config.json').write_text(json.dumps({'label': 'proof'}))
+        self.actions = []
+        self.running = False
+        self.nodes = [self.HOST_ACTION, self.HOST_DIALOG, self.HOST_LEAVE,
+                      self.PEER_ACTION, self.PEER_DIALOG, self.ROOM]
+        self.runner = types.SimpleNamespace(out=self.out, ui=self.ui, ui_matches=runner.Runner.ui_matches)
+        self.ctx = types.SimpleNamespace(runner=self.runner, on='a', row_dir=self.row,
+                                         call=self.call, check_stop=lambda: None)
+
+    def call(self, method, params=None, job_cap=15):
+        if method == 'status':
+            return {'running': self.running}
+        if method == 'ui.tree':
+            return self.nodes
+        raise AssertionError(method)
+
+    def ui(self, on, step):
+        self.actions.append((on, step))
+
+    def test_host_replays_real_sequence_and_saves_room_handoff(self):
+        with mock.patch.object(routes, 'free_udp_port', return_value=24872):
+            receipt = routes.frontend_room(self.ctx)
+        target = lambda cls, name: {'class': cls, 'name': name}
+        self.assertEqual(self.actions, [('a', step) for step in [
+            {'ui': 'trigger', 'target': target('QAction', 'action_Start_Room')},
+            {'ui': 'set', 'target': target('QLineEdit', 'username'), 'property': 'text', 'value': 'TRHost'},
+            {'ui': 'set', 'target': target('QLineEdit', 'room_name'), 'property': 'text', 'value': 'TR-proof'},
+            {'ui': 'set', 'target': target('QLineEdit', 'port'), 'property': 'text', 'value': '24872'},
+            {'ui': 'set', 'target': target('QComboBox', 'host_type'), 'property': 'currentIndex', 'value': 1},
+            {'ui': 'click', 'target': target('QPushButton', 'host')}]])
+        self.assertEqual(receipt['port'], 24872)
+        self.assertEqual(receipt['room_name'], 'TR-proof')
+        self.assertEqual(receipt['member_count'], 1)
+        self.assertEqual(receipt['window_title'], self.ROOM['title'])
+        self.assertEqual(receipt['evidence']['host_action'], self.HOST_ACTION)
+        self.assertEqual(receipt['evidence']['host_dialog'], self.HOST_DIALOG)
+        self.assertEqual(receipt['evidence']['frontend_leave'], self.HOST_LEAVE)
+        self.assertEqual(json.loads((self.row / 'routes-frontend-room.json').read_text()), receipt)
+        self.assertEqual(json.loads((self.out / 'frontend-room.json').read_text()),
+                         {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'})
+
+    def test_join_replays_peer_sequence_and_reads_host_port(self):
+        (self.out / 'frontend-room.json').write_text(json.dumps({'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
+        self.ctx.on = 'b'
+        receipt = routes.frontend_room(self.ctx, role='join', nickname='Guest', ip='127.0.0.1')
+        target = lambda cls, name: {'class': cls, 'name': name}
+        self.assertEqual(self.actions, [('b', step) for step in [
+            {'ui': 'trigger', 'target': target('QAction', 'action_Connect_To_Room')},
+            {'ui': 'set', 'target': target('QLineEdit', 'nickname'), 'property': 'text', 'value': 'Guest'},
+            {'ui': 'set', 'target': target('QLineEdit', 'ip'), 'property': 'text', 'value': '127.0.0.1'},
+            {'ui': 'set', 'target': target('QLineEdit', 'port'), 'property': 'text', 'value': '24872'},
+            {'ui': 'click', 'target': target('QPushButton', 'connect')}]])
+        self.assertEqual(receipt['port'], 24872)
+        self.assertEqual(receipt['evidence']['peer_action'], self.PEER_ACTION)
+        self.assertEqual(receipt['evidence']['peer_dialog'], self.PEER_DIALOG)
+
+    def test_no_connected_window_and_insufficient_members_fail_with_observed_titles(self):
+        self.nodes = self.nodes[:-1]
+        with self.assertRaisesRegex(RuntimeError, 'at least 1 member\\(s\\); saw: no room window'):
+            routes.frontend_room(self.ctx, port=24872, cap=.01)
+        self.nodes.append(self.ROOM)
+        with self.assertRaisesRegex(RuntimeError, r'at least 2 member\(s\); saw: .*1/8 members'):
+            routes.frontend_room(self.ctx, port=24872, members=2, cap=.01)
+        self.nodes[-1] = {**self.ROOM, 'title': self.ROOM['title'].replace(' - connected', ' - disconnected')}
+        with self.assertRaisesRegex(RuntimeError, r'at least 1 member\(s\); saw: .*disconnected'):
+            routes.frontend_room(self.ctx, port=24872, cap=.01)
+
+    def test_explicit_join_port_and_nested_two_member_title(self):
+        title = self.ROOM['title'].replace('(1/8 members)', '(2/8 members)')
+        self.nodes[-1] = {key: value for key, value in self.ROOM.items() if key != 'title'}
+        self.nodes[-1]['properties'] = {'windowTitle': {'value': title}}
+        result = routes.frontend_room(self.ctx, role='join', port=24890, members=2)
+        self.assertEqual((result['nickname'], result['port'], result['member_count'], result['window_title']),
+                         ('TRGuest', 24890, 2, title))
+
+    def test_running_join_without_port_and_unknown_role_refuse_before_ui(self):
+        self.running = True
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room runs before game.load'):
+            routes.frontend_room(self.ctx, port=24872)
+        self.running = False
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*port'):
+            routes.frontend_room(self.ctx, role='join')
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*role'):
+            routes.frontend_room(self.ctx, role='invalid', port=24872)
+        self.assertEqual(self.actions, [])
+
+    def test_udp_selection_skips_a_bound_port(self):
+        first = routes.free_udp_port(first=24872, last=24960)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserved:
+            reserved.bind(('0.0.0.0', first))
+            chosen = routes.free_udp_port(first=first, last=24971)
+        self.assertGreater(chosen, first)
 
 
 class NativeStateTests(unittest.TestCase):
