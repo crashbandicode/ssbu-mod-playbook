@@ -761,6 +761,42 @@ class SetupCallsR2Tests(unittest.TestCase):
         result = self.set_cpu(MenuReplay(), roster, settings, {'kind': 0})
         self.assertEqual(result['verified']['fighter']['kind'], 0)
 
+    def test_live_body_counts_requests_and_waits_for_the_requested_kind(self):
+        self.ctx.runner.setup_metrics = {'bridge_requests': 0}
+        replies = iter(({1: {'kind': 7}}, {1: {'kind': 0, 'x': 1.0}}))
+        calls = []
+
+        def fighters_now(run, cap):
+            calls.append((run, cap))
+            return next(replies)
+
+        with patch.object(routes, '_switch_hw', return_value=SimpleNamespace(fighters_now=fighters_now)), \
+             patch.object(routes.time, 'sleep'):
+            body = routes._live_body(self.ctx, 1, 0, 1)
+        self.assertEqual(body, {'kind': 0, 'x': 1.0})
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 2)
+        self.assertEqual([call[0] for call in calls], [self.log.parent, self.log.parent])
+
+    def test_reach_training_does_not_prejudge_the_remembered_cpu_at_entry(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        self.ctx.runner.routes_expect['cpu_kind'] = 0
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        entered = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, entered, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=entered), \
+             patch.object(routes, '_set_fighter', return_value={}) as set_fighter, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Mario')
+        self.assertEqual(result['phases']['enter_training']['fighters_checked']['cpu'], 'unchecked')
+        set_fighter.assert_called_once()
+        self.assertEqual(self.ctx.runner.routes_expect['cpu_kind'], 0)
+
     def test_setup_state_reads_without_any_controller_input(self):
         replay = MenuReplay()
         replay.menu['open'] = '0'

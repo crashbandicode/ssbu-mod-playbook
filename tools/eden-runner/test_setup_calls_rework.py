@@ -320,6 +320,7 @@ class SetupReworkTests(unittest.TestCase):
                      patch.object(routes, '_wait_writer', return_value='writer'), \
                      patch.object(routes, '_fetch_settings', return_value=b'{"menu":{"cpu_character":[1]}}'), \
                      patch.object(routes, 'wait_native', return_value={'roster': {0: {'kind': 0}, 1: {'kind': 0}}}), \
+                     patch.object(routes, '_live_body', return_value={'kind': 0}), \
                      patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
                     result = routes.set_cpu(self.ctx, 'Mario', cap=.1)
                 json.dumps(result)
@@ -482,8 +483,24 @@ class SetupReworkTests(unittest.TestCase):
         self.assertEqual({k: v['kind'] for k, v in result.items()}, {0: 0, 1: 3})
         self.assertIsNone(switch_hw.fighters_response(lines[:-1]))
         self.assertIsNone(switch_hw.fighters_response([old, reply, body0, summary]))
+        self.assertIsNone(switch_hw.fighters_response(lines + [reply, body0]))
         with self.assertRaisesRegex(RuntimeError, 'fighters'):
             switch_hw.fighters_now(self.root, cap=0.01)
+
+        self.log.write_text(old + '\n')
+        clock = [0.0]
+
+        def wait(seconds):
+            if clock[0] == 0:
+                with self.log.open('a') as stream:
+                    stream.write('\n'.join(lines[1:]) + '\n')
+            clock[0] += seconds
+
+        with patch.object(switch_hw.time, 'sleep', side_effect=wait), \
+             patch.object(switch_hw.time, 'monotonic', side_effect=lambda: clock[0]):
+            fresh = switch_hw.fighters_now(self.root, cap=1)
+        self.assertEqual({k: v['kind'] for k, v in fresh.items()}, {0: 0, 1: 3})
+        self.assertEqual((self.bridge / switch_hw.FRESH['fighters'][0]).read_bytes(), b'fighters')
 
     def test_set_player_requests_take_back_at_training_character_select(self):
         import test_native_picker as recorded

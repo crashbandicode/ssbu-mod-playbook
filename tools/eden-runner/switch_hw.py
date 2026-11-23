@@ -523,11 +523,52 @@ def roster_response(lines, entries=()):
 
 
 def fighters_response(lines):
+    reply = None
+    start = 0
+    for index, line in enumerate(lines):
+        match = re.search(r'\[Bridge\] req fighters result=ok frame=(\d+)(?: |$)', line)
+        if match:
+            reply, start = int(match.group(1)), index + 1
+    if reply is None:
+        return None
+    bodies = {}
+    for line in lines[start:]:
+        tail = SUFFIX.search(line)
+        frame = int(tail.group(1)) if tail else None
+        if (summary := re.search(r'\[Bridge\] fighters entries=0x([0-9a-f]+)(?: |$)', line)):
+            if frame is None or frame < reply:
+                return None
+            mask = int(summary.group(1), 16)
+            required = {bit for bit in range(mask.bit_length()) if mask & (1 << bit)}
+            if not required.issubset(bodies):
+                return None
+            return {entry: bodies[entry] for entry in sorted(required)}
+        match = FIGHTER.search(line)
+        if match and frame is not None and frame >= reply:
+            values = match.groups()
+            bodies[int(values[0])] = {'kind': int(values[1]), 'x': float(values[2]), 'y': float(values[3]),
+                                      'lr': float(values[4]), 'dmg': float(values[5]), 'status': int(values[6])}
     return None
 
 
 def fighters_now(run, cap=6.0):
-    return None
+    run = Path(run)
+    log = run / 'bridge.log'
+    start = log.stat().st_size if log.exists() else 0
+    filename, _, payload = FRESH['fighters']
+    (run / 'bridge' / filename).write_bytes(payload)
+    until = time.monotonic() + cap
+    while True:
+        if log.exists():
+            with log.open('rb') as stream:
+                stream.seek(start)
+                lines = stream.read().decode(errors='replace').splitlines()
+            result = fighters_response(lines)
+            if result is not None:
+                return result
+        if time.monotonic() >= until:
+            raise RuntimeError(f'bridge fighters: no complete answer within {cap} s')
+        time.sleep(min(.1, max(0, until - time.monotonic())))
 
 
 def bridge_state(run, fresh=(), cap=6.0, *, roster_entries=()):

@@ -1880,6 +1880,7 @@ def _parking_tile(topology, start, target):
 
 
 def pick_cpu(ctx, fighter, *, topology=None, form='default'):
+    # Setup blocks set the CPU in Training; this remains for Tile Cursor rows.
     """Place the CPU coin from a qualified Training fighter-select observation."""
     entry = fighter_entry(fighter)
     target = _native_target(entry, form)
@@ -2607,7 +2608,25 @@ def _live_fighter(ctx, seat, kind, cap):
 
 
 def _live_body(ctx, seat, kind, cap):
-    return None
+    until = time.monotonic() + cap
+    last = None
+    while time.monotonic() < until:
+        ctx.check_stop()
+        metrics = getattr(ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics['bridge_requests'] += 1
+        try:
+            bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent,
+                                               cap=max(.01, min(6.0, until - time.monotonic())))
+            last = bodies.get(seat)
+            if last is not None and last.get('kind') == kind:
+                return last
+        except RuntimeError:
+            last = None
+        remaining = until - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(.25, remaining))
+    raise RuntimeError(f'live fighter does not confirm entry {seat} kind {kind}: {last!r}')
 
 
 def _with_setup_metrics(ctx, action):
@@ -3985,9 +4004,11 @@ def _set_fighter(ctx, fighter, seat, cap, metrics):
     if not _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
         raise RuntimeError('fighter setup needs the Training context without a modal dialog')
     if _fields_match(ui, TRAINING_CSS):
-        nested = (pick_cpu(ctx, fighter) if seat == 1 else
-                  pick_local_fighter(ctx, fighter, topology=library_topology('css-training'),
-                                     take_back=True, expected_context='training'))
+        if seat == 1:
+            raise RuntimeError('set_cpu works in Training: the CPU is set through the Training Rooms menu; '
+                               'call reach_training first')
+        nested = pick_local_fighter(ctx, fighter, topology=library_topology('css-training'),
+                                    take_back=True, expected_context='training')
         return _save(ctx, f'routes-set-{"cpu" if seat else "player"}', {
             'block': 'set_cpu' if seat else 'set_player', 'args': {'fighter': fighter},
             'verified': nested, 'skipped': ['tr_menu'], **metrics,
@@ -4090,11 +4111,14 @@ def _set_fighter(ctx, fighter, seat, cap, metrics):
     phase = time.monotonic()
     roster = _live_fighter(ctx, seat, entry['kind'], max(.01, until - time.monotonic()))
     timings['roster'] = round((time.monotonic() - phase) * 1000)
+    phase = time.monotonic()
+    fighter_body = _live_body(ctx, seat, entry['kind'], max(.01, until - time.monotonic()))
+    timings['fighter'] = round((time.monotonic() - phase) * 1000)
     remember(ctx, **{f'{"cpu" if seat else "p1"}_kind': entry['kind'],
                      'cpu' if seat else 'p1': entry['name']})
     return _save(ctx, f'routes-set-{"cpu" if seat else "player"}', {
         'block': 'set_cpu' if seat else 'set_player', 'args': {'fighter': fighter},
-        'verified': {'kind': entry['kind'], 'roster': roster, 'one_hot': picked},
+        'verified': {'kind': entry['kind'], 'roster': roster, 'one_hot': picked, 'fighter': fighter_body},
         'grid_named': named, 'writer': writer_line, **metrics,
         'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],
     })
@@ -4217,7 +4241,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     phases = ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
-              'pick_fighters', 'enter_training')
+              'pick_fighters', 'enter_training', 'set_cpu')
     skipped, timings, receipts = list(phases), {}, {}
 
     def run(name, function, *args, **kwargs):
@@ -4249,9 +4273,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
             known_stage = state.get('stage')
             roster = state.get('roster', {})
             stage_matches = state.get('stage') == wanted_stage
-            fighters_match = (roster.get(0, {}).get('kind') == wanted_p1
-                              and 1 in roster and (wanted_cpu is None or roster[1].get('kind') == wanted_cpu))
-            if stage_matches and fighters_match:
+            p1_matches = roster.get(0, {}).get('kind') == wanted_p1 and 1 in roster
+            if stage_matches and p1_matches:
                 final = state
                 screen = 'done'
             elif stage_matches:
@@ -4274,10 +4297,19 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
             run('pick_stage', pick_stage, ctx, stage, topology=library_topology('sss-training'), form=form)
             screen = 'css.training'
         if screen == 'css.training':
-            run('pick_fighters', pick_fighters, ctx, p1, cpu=cpu, topology=library_topology('css-training'),
+            run('pick_fighters', pick_fighters, ctx, p1, topology=library_topology('css-training'),
                 take_back=True)
-            run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
-                stage_ids={wanted_stage}, fighters={'p1': p1, **({'cpu': cpu} if cpu is not None else {})})
+            original_expect = getattr(ctx.runner, 'routes_expect', None)
+            ctx.runner.routes_expect = {**expected(ctx), 'cpu_kind': None}
+            try:
+                run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
+                    stage_ids={wanted_stage}, fighters={'p1': p1})
+            finally:
+                ctx.runner.routes_expect = original_expect
+            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
+                                 roster_entries=(0, 1))
+        if wanted_cpu is not None and final.get('roster', {}).get(1, {}).get('kind') != wanted_cpu:
+            run('set_cpu', _set_fighter, ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
             final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
                                  roster_entries=(0, 1))
         final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)

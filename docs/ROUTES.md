@@ -62,8 +62,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `pick_fighters` `{p1, cpu, take_back}` | character select | P1 placed; when `cpu` is supplied, the CPU coin is placed too. `take_back` defaults to false for P1-only callers |
 | `pick_cpu` `{fighter, topology, form}` | Training character select, P1 placed | the CPU coin placed on the target; P1's original medal unchanged |
 | `enter_training` `{cap, stage_ids, fighters}` | both placed | Training and the verified stage; fresh roster entries 0 and 1, checked against remembered or supplied fighters where known |
-| `set_cpu` `{fighter, cap}` | Training character select or Training | the CPU selected; in Training, settings and live roster both verified |
-| `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings and live roster both verified |
+| `set_cpu` `{fighter, cap}` | Training | the CPU selected through the Training Mod menu; settings, roster and live body verified |
+| `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings, roster and live body verified |
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_idle` `{cap}` | Training | back out of the wizard, close the menu or stop Guard the Edge; verify plain idle Training |
@@ -421,8 +421,13 @@ Surface calibration (2026-11-16): `pick_stage` accepts `transition_cap` (default
 the verified fighters and input/request counts. A carried CPU coin has no focus in the Tile Cursor's old fields.
 These paths have offline modelled-block tests, not a game proof.
 
-2026-11-22: `routes:set_cpu` and `routes:set_player` select fighters in Training CSS or the Training Mod menu;
-the latter verifies the settings one-hot value and live roster. `routes:tr_settings(values=... | file=...)`
+### CPU = &lt;fighter&gt;
+
+`routes:reach_training(p1, cpu=..., stage=...)` or `routes:set_cpu(fighter)` sets the CPU in Training.
+Setup never picks the CPU with the Tile Cursor. The route opens the Training Rooms menu, selects Fighters &
+Stages and CPU Character, checks the grid identity when published, then verifies the settings one-hot,
+fresh live roster and live fighter body. `set_cpu` at fighter select refuses before input; `set_player`
+still picks P1 there. `routes:tr_settings(values=... | file=...)`
 checks the bridge set reply, writer and file readback (20-second default cap); fighter keys do not prove the live
 fighter unless `verify_roster=True`; fresh rosters come from lines after the request's reply.
 `routes:setup_state` is read-only: `verified.stage_id` is the live Training stage or `unknown` elsewhere, with
