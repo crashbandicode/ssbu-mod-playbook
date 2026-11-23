@@ -917,8 +917,8 @@ class EdenTestTests(unittest.TestCase):
                 lineup=False):
         return ['go', '--host', host, '--label', label, '--nro', str(nro or self.dir / 'plugin.nro'),
                 '--rows', str(rows or self.rows), *(['--owner', owner] if owner is not None else []),
-                '--from', str(self.previous),
-                *([] if lineup else ['--no-card-lineup', 'test without the card lineup'])]
+                *([] if lineup else ['--no-card-lineup', 'test without the card lineup']),
+                '--from', str(self.previous)]
 
     def go_new_args(self, label='go-1', rows=None, no_lobby=False):
         return types.SimpleNamespace(from_config=str(self.previous), host='yoga', label=label,
