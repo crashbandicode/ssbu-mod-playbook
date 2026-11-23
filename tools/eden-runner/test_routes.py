@@ -328,6 +328,24 @@ class FrontendRoomTests(unittest.TestCase):
                  'visible': True, 'enabled': True, 'parent': 'o214', 'window': 'o235'}
     OK = {'id': 'o261', 'class': 'QPushButton', 'name': '', 'text': 'OK', 'title': '', 'visible': True,
           'enabled': True, 'parent': 'o262', 'window': 'o259'}
+    # tss-lobby-17060a5e-2: final-L4-live-widgets.json.log / final-L4-live-host-fields.json.log.
+    RUNNING_WARNING = {'id': 'o277', 'class': 'QMessageBox', 'name': '',
+                       'title': 'Game already running', 'visible': True, 'enabled': True, 'parent': '',
+                       'window': 'o277', 'properties': {'text': {'type': 'QString', 'value':
+                           'Joining a room when the game is already running is discouraged and can cause '
+                           'the room feature not to work correctly.\nProceed anyway?', 'writable': True}}}
+    WARNING_OK = {'id': 'o276', 'class': 'QPushButton', 'name': '', 'text': 'OK', 'title': '', 'visible': True,
+                  'enabled': True, 'parent': 'o278', 'window': 'o277'}
+    WARNING_CANCEL = {'id': 'o280', 'class': 'QPushButton', 'name': '', 'text': 'Cancel', 'title': '', 'visible': True,
+                      'enabled': True, 'parent': 'o278', 'window': 'o277'}
+    RUNNING_HOST = [
+        {'id': 'o250', 'class': 'QLineEdit', 'name': 'username', 'visible': True, 'enabled': True,
+         'window': 'o240', 'properties': {'text': {'type': 'QString', 'value': 'TRHost', 'writable': True}}},
+        {'id': 'o251', 'class': 'QLineEdit', 'name': 'port', 'visible': True, 'enabled': True,
+         'window': 'o240', 'properties': {'text': {'type': 'QString', 'value': '24872', 'writable': True}}},
+        {'id': 'o268', 'class': 'QLineEdit', 'name': 'room_name', 'visible': True, 'enabled': True,
+         'window': 'o240', 'properties': {'text': {'type': 'QString', 'value': 'TR24872', 'writable': True}}},
+    ]
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -342,6 +360,9 @@ class FrontendRoomTests(unittest.TestCase):
         self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
         self.room_node = self.ROOM
         self.modal_after_host = False
+        self.warning_after_host = False
+        self.repeat_warning = False
+        self.queued_warning = -1
         self.runner = types.SimpleNamespace(out=self.out, ui=self.ui, ui_matches=runner.Runner.ui_matches)
         self.ctx = types.SimpleNamespace(runner=self.runner, on='a', row_dir=self.row,
                                          call=self.call, check_stop=lambda: None)
@@ -350,6 +371,11 @@ class FrontendRoomTests(unittest.TestCase):
         if method == 'status':
             return {'running': self.running}
         if method == 'ui.tree':
+            if self.queued_warning == 0:
+                self.nodes.extend([self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL])
+                self.queued_warning = -1
+            elif self.queued_warning > 0:
+                self.queued_warning -= 1
             return self.nodes
         raise AssertionError(method)
 
@@ -360,9 +386,20 @@ class FrontendRoomTests(unittest.TestCase):
             self.nodes.append(self.HOST_DIALOG if target['name'] == 'action_Start_Room' else self.PEER_DIALOG)
         elif step['ui'] == 'click' and target.get('id') == self.OK['id']:
             self.nodes = [node for node in self.nodes if node not in (self.MESSAGE, self.OK)]
+        elif step['ui'] == 'click' and target.get('id') == self.WARNING_OK['id']:
+            self.nodes = [node for node in self.nodes if node not in
+                          (self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL)]
+            if self.repeat_warning:
+                self.queued_warning = 1
+            else:
+                self.nodes.append(self.HOST_LEAVE)
+                if self.room_node is not None:
+                    self.nodes.append(self.room_node)
         elif step['ui'] == 'click' and target.get('name') in ('host', 'connect'):
             if self.modal_after_host:
                 self.nodes.extend([self.MESSAGE, self.OK])
+            elif self.warning_after_host:
+                self.nodes.extend([self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL])
             else:
                 self.nodes.append(self.HOST_LEAVE)
                 if self.room_node is not None:
@@ -478,6 +515,104 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertIn('frontend_room: Eden showed "Room name is not valid. Must be 4 to 20 alphanumeric characters."',
                       str(caught.exception))
         self.assertIn('while waiting for', str(caught.exception))
+
+    def test_running_warning_after_host_is_confirmed_once_and_saved(self):
+        self.running = self.warning_after_host = True
+        result = routes.frontend_room(self.ctx, port=24872, cap=.2)
+        self.assertEqual(result['confirmed_running_game'], self.RUNNING_WARNING['properties']['text']['value'])
+        clicks = [step for _, step in self.actions if step['ui'] == 'click']
+        self.assertEqual(sum(step['target'].get('id') == 'o276' for step in clicks), 1)
+        self.assertFalse(any(step['target'].get('id') == 'o280' for step in clicks))
+        self.assertEqual(json.loads((self.row / 'routes-frontend-room.json').read_text()), result)
+
+    def test_running_warning_without_running_game_is_an_error(self):
+        self.warning_after_host = True
+        with self.assertRaisesRegex(RuntimeError, 'Eden showed .*game is already running'):
+            routes.frontend_room(self.ctx, port=24872, cap=.1)
+        self.assertFalse(any(step['target'].get('id') in ('o276', 'o280') for _, step in self.actions))
+
+    def test_join_confirms_running_warning_after_connect(self):
+        self.running = self.warning_after_host = True
+        result = routes.frontend_room(self.ctx, role='join', port=24872, cap=.2)
+        self.assertEqual(result['confirmed_running_game'], self.RUNNING_WARNING['properties']['text']['value'])
+        self.assertEqual(sum(step.get('target', {}).get('id') == 'o276' for _, step in self.actions), 1)
+        self.assertFalse(any(step.get('target', {}).get('id') == 'o280' for _, step in self.actions))
+
+    def test_existing_warning_resumes_only_connected_wait_with_actual_host_fields(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with mock.patch.object(routes, 'free_udp_port', side_effect=AssertionError('unexpected allocation')):
+            result = routes.frontend_room(self.ctx, cap=.2)
+        self.assertEqual(result['confirmed_running_game'], self.RUNNING_WARNING['properties']['text']['value'])
+        self.assertEqual((result['port'], result['room_name'], result['nickname']), (24872, 'TR24872', 'TRHost'))
+        self.assertEqual(len(self.actions), 1)
+        self.assertEqual(self.actions[0][1]['ui'], 'click')
+        self.assertEqual(self.actions[0][1]['target']['id'], 'o276')
+        self.assertEqual(json.loads((self.out / 'frontend-room.json').read_text()),
+                         {'port': 24872, 'room_name': 'TR24872', 'instance': 'a'})
+
+    def test_existing_warning_without_running_game_is_an_error(self):
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(RuntimeError, 'Eden showed .*game is already running'):
+            routes.frontend_room(self.ctx, port=24872, cap=.1)
+        self.assertEqual(self.actions, [])
+
+    def test_existing_warning_with_connected_window_is_confirmed_without_other_ui(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST, self.ROOM]
+        result = routes.frontend_room(self.ctx, cap=.2)
+        self.assertEqual(result['confirmed_running_game'], self.RUNNING_WARNING['properties']['text']['value'])
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_join_existing_warning_reads_the_pending_peer_dialog(self):
+        self.running = True
+        fields = [
+            {'class': 'QLineEdit', 'name': name, 'id': 'peer-' + name, 'window': 'peer-window',
+             'visible': True, 'properties': {'text': {'value': value}}}
+            for name, value in (('nickname', 'PeerName'), ('port', '24902'), ('ip', '192.0.2.1'))
+        ]
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        result = routes.frontend_room(self.ctx, role='join', cap=.2)
+        self.assertEqual((result['nickname'], result['port'], result['ip']), ('PeerName', 24902, '192.0.2.1'))
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_existing_warning_without_dialog_fields_does_not_invent_host_port(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL]
+        with mock.patch.object(routes, 'free_udp_port', side_effect=AssertionError('unexpected allocation')):
+            result = routes.frontend_room(self.ctx, cap=.2)
+        self.assertIsNone(result['port'])
+        self.assertIsNone(result['room_name'])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_repeated_running_warning_is_an_error_without_a_second_click(self):
+        self.running = self.warning_after_host = self.repeat_warning = True
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*(again|second|repeated)'):
+            routes.frontend_room(self.ctx, port=24872, cap=.2)
+        self.assertEqual(sum(step.get('target', {}).get('id') == 'o276' for _, step in self.actions), 1)
+
+    def test_warning_repeated_after_entry_confirmation_is_an_error(self):
+        self.running = self.repeat_warning = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*(again|second|repeated)'):
+            routes.frontend_room(self.ctx, port=24872, cap=.2)
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_existing_warning_without_room_reports_connected_timeout(self):
+        self.running = True
+        self.room_node = None
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(RuntimeError, r'at least 1 member\(s\); saw: no room window'):
+            routes.frontend_room(self.ctx, port=24872, cap=.02)
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_existing_warning_with_ambiguous_ok_is_never_clicked(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, {**self.WARNING_OK, 'id': 'o999'},
+                      self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*OK'):
+            routes.frontend_room(self.ctx, port=24872, cap=.1)
+        self.assertEqual(self.actions, [])
 
     def test_captured_modal_is_dismissed_and_host_dialog_reused(self):
         self.nodes = [self.MESSAGE, self.OK, self.OPEN_HOST]
