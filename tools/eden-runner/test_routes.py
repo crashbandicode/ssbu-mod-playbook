@@ -823,6 +823,216 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertTrue(result['room_matched'])
         self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o261'])
 
+    def test_existing_warning_rejects_requested_name_different_from_dialog(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(
+                RuntimeError, r'open Create Room dialog is for room "TR24872".*not the requested room "WantedRoom"'):
+            routes.frontend_room(self.ctx, room_name='WantedRoom', cap=.05)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_existing_warning_accepts_requested_matching_name(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        result = routes.frontend_room(self.ctx, room_name='TR24872', cap=.05)
+        self.assertEqual(result['room_name'], 'TR24872')
+        self.assertTrue(result['room_matched'])
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_existing_warning_accepts_requested_matching_port(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        result = routes.frontend_room(self.ctx, port=24872, cap=.05)
+        self.assertEqual((result['room_name'], result['port']), ('TR24872', 24872))
+        self.assertTrue(result['room_matched'])
+
+    def test_existing_warning_rejects_requested_host_port_mismatch(self):
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
+        with self.assertRaisesRegex(
+                RuntimeError, r'for room "TR24872" on port 24872, not the requested room "None" on port 24999'):
+            routes.frontend_room(self.ctx, port=24999, cap=.05)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_existing_warning_rejects_requested_join_port_mismatch(self):
+        self.running = True
+        fields = [
+            {'class': 'QLineEdit', 'name': name, 'id': 'peer-' + name, 'window': 'peer-window',
+             'visible': True, 'properties': {'text': {'value': value}}}
+            for name, value in (('nickname', 'PeerName'), ('port', '24902'), ('ip', '192.0.2.1'))
+        ]
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        with self.assertRaisesRegex(
+                RuntimeError, r'the open Direct Connect dialog is on port 24902, not the requested port 24999'):
+            routes.frontend_room(self.ctx, role='join', port=24999, cap=.05)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_existing_warning_with_unreadable_dialog_values_uses_requested_name(self):
+        self.running = True
+        fields = [node for node in self.RUNNING_HOST if node['name'] not in ('room_name', 'port')]
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        self.room_node = {**self.ROOM, 'title': self.ROOM['title'].replace('TRB3Waiting - ', 'WantedRoom - ')}
+        result = routes.frontend_room(self.ctx, port=24872, room_name='WantedRoom', cap=.05)
+        self.assertEqual(result['room_name'], 'WantedRoom')
+        self.assertTrue(result['room_matched'])
+
+    def test_reuse_rejects_ambiguous_longer_room_name_without_receipt(self):
+        title = 'WantedRoom - Other - Super Smash Bros. Ultimate (1/8 members) - connected'
+        self.nodes = [{**self.ROOM, 'title': title}]
+        with self.assertRaisesRegex(RuntimeError, r'another room: expected "WantedRoom".*ambiguous') as caught:
+            routes.frontend_room(self.ctx, room_name='WantedRoom', cap=.05)
+        self.assertIn('; the title has more than one " - ", so its room name is ambiguous',
+                      str(caught.exception))
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_reuse_reports_ambiguity_without_prefix_and_with_overlapping_separators(self):
+        titles = ('A - B - X (1/8 members) - connected', 'A - - B (1/8 members) - connected')
+        for title in titles:
+            with self.subTest(title=title):
+                self.nodes = [{**self.ROOM, 'title': title}]
+                with self.assertRaisesRegex(RuntimeError, r'another room: expected "WrongRoom".*ambiguous') as caught:
+                    routes.frontend_room(self.ctx, room_name='WrongRoom', cap=.05)
+                self.assertIn('; the title has more than one " - ", so its room name is ambiguous',
+                              str(caught.exception))
+                self.assertEqual(self.actions, [])
+                self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_reuse_rejects_long_room_name_before_tree(self):
+        title = 'WantedRoom - Other - Super Smash Bros. Ultimate (1/8 members) - connected'
+        self.nodes = [{**self.ROOM, 'title': title}]
+        calls = []
+        def call(method, *args):
+            calls.append(method)
+            return self.call(method, *args)
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, r'room_name "WantedRoom - Other" contains " - "'):
+            routes.frontend_room(self.ctx, room_name='WantedRoom - Other', cap=.05)
+        self.assertEqual(calls, ['status'])
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_fresh_host_rejects_ambiguous_longer_room_without_saving(self):
+        title = 'TR24872 - Other - Super Smash Bros. Ultimate (1/8 members) - connected'
+        self.room_node = {**self.ROOM, 'title': title}
+        with self.assertRaisesRegex(RuntimeError, r'for room "TR24872"'):
+            routes.frontend_room(self.ctx, port=24872, cap=.05)
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_fresh_host_rejects_long_room_name_before_tree(self):
+        title = 'TR24872 - Other - Super Smash Bros. Ultimate (1/8 members) - connected'
+        self.room_node = {**self.ROOM, 'title': title}
+        calls = []
+        def call(method, *args):
+            calls.append(method)
+            return self.call(method, *args)
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, r'room_name "TR24872 - Other" contains " - "'):
+            routes.frontend_room(self.ctx, port=24872, room_name='TR24872 - Other', cap=.05)
+        self.assertEqual(calls, ['status'])
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_host_and_join_reject_room_name_ending_space_hyphen_before_tree(self):
+        calls = []
+        def call(method, *args):
+            calls.append(method)
+            return self.call(method, *args)
+        self.ctx.call = call
+        for role in ('host', 'join'):
+            with self.subTest(role=role):
+                calls.clear()
+                with self.assertRaisesRegex(RuntimeError, r'room_name "Room -" contains " - "') as caught:
+                    routes.frontend_room(self.ctx, role=role, port=24872, room_name='Room -', cap=.05)
+                self.assertEqual(str(caught.exception), 'frontend_room: room_name "Room -" contains " - ", so '
+                                 'Eden\'s room window title ("<room> - <game> (n/m members) - connected") could '
+                                 'not confirm it; use a name without " - "')
+                self.assertEqual(calls, ['status'])
+                self.assertEqual(self.actions, [])
+                self.assertFalse((self.out / 'frontend-room.json').exists())
+                self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_saved_unconfirmable_room_name_refused_before_tree(self):
+        room_file = self.out / 'frontend-room.json'
+        data = {'port': 24872, 'room_name': 'A - B', 'instance': 'a'}
+        room_file.write_text(json.dumps(data))
+        calls = []
+        def call(method, *args):
+            calls.append(method)
+            return self.call(method, *args)
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, r'room_name "A - B" contains " - "'):
+            routes.frontend_room(self.ctx, cap=.05)
+        self.assertEqual(calls, ['status'])
+        self.assertEqual(self.actions, [])
+        self.assertEqual(json.loads(room_file.read_text()), data)
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_dialog_unconfirmable_room_name_refused_before_warning_click(self):
+        self.running = True
+        fields = [
+            {**node, 'properties': {'text': {'value': 'A - B'}}} if node['name'] == 'room_name' else node
+            for node in self.RUNNING_HOST
+        ]
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        with self.assertRaisesRegex(RuntimeError, r'room_name "A - B" contains " - "'):
+            routes.frontend_room(self.ctx, cap=.05)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_dialog_invalid_name_keeps_character_validation_before_ambiguity(self):
+        self.running = True
+        fields = [
+            {**node, 'properties': {'text': {'value': 'A - B!'}}} if node['name'] == 'room_name' else node
+            for node in self.RUNNING_HOST
+        ]
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        with self.assertRaisesRegex(RuntimeError, r'room_name "A - B!" is not valid for Eden'):
+            routes.frontend_room(self.ctx, cap=.05)
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_join_rejects_unconfirmable_requested_name_before_tree(self):
+        calls = []
+        def call(method, *args):
+            calls.append(method)
+            return self.call(method, *args)
+        self.ctx.call = call
+        with self.assertRaisesRegex(RuntimeError, r'room_name "A - B" contains " - "'):
+            routes.frontend_room(self.ctx, role='join', port=24872, room_name='A - B', cap=.05)
+        self.assertEqual(calls, ['status'])
+        self.assertEqual(self.actions, [])
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
+
+    def test_room_title_matches_only_complete_unambiguous_room(self):
+        cases = [
+            ('TRB3Waiting - Super Smash Bros. Ultimate (1/8 members) - connected', 'TRB3Waiting', True),
+            ('TRB3Waiting - Super Smash Bros. Ultimate (1/8 members) - connected', 'TRB3', False),
+            ('TR-proof - Super Smash Bros. Ultimate (2/8 members) - connected', 'TR-proof', True),
+            ('WantedRoom - Other - Super Smash Bros. Ultimate (1/8 members) - connected', 'WantedRoom', False),
+            ('WantedRoom - Other - Super Smash Bros. Ultimate (1/8 members) - connected', 'WantedRoom - Other', False),
+            ('A - B - X (1/8 members) - connected', 'A - B', False),
+            ('A - B - X (1/8 members) - connected', 'A', False),
+            ('A - - B (1/8 members) - connected', 'A', False),
+            ('A - - B (1/8 members) - connected', 'A -', False),
+            ('WantedRoom - Super Smash Bros. Ultimate', 'WantedRoom', False),
+            ('WantedRoom -  (1/8 members) - connected', 'WantedRoom', False),
+        ]
+        for title, room_name, expected in cases:
+            with self.subTest(title=title, room_name=room_name):
+                self.assertEqual(routes._frontend_room_matches(title, room_name), expected)
+
 
 class BridgeAliveTests(unittest.TestCase):
     BOOT = '0x901afdfc49eabde3'
