@@ -975,13 +975,20 @@ class EdenTestTests(unittest.TestCase):
                     self.make_lineup(self.lineups / '20260101-1000Z/plugins', {'old.nro': b'old'})
                     (self.lineups / '20261231-2359Z').mkdir()
                 message = self.assert_lineup_refused(self.go_args(label=label, lineup=True), label)
-                self.assertIn('--card-lineup <dir>', message)
-                self.assertIn('--no-card-lineup <reason>', message)
+                if older:
+                    self.assertEqual(
+                        message, f'newest card lineup {self.lineups / "20261231-2359Z"} has no plugins folder '
+                        '(older stamps are not used); pass --card-lineup <dir> or --no-card-lineup <reason>')
+                else:
+                    self.assertEqual(
+                        message, f'no card lineup under {self.lineups} (no <YYYYMMDD-HHMM>Z folder; '
+                        'on an Eden host that folder does not exist: run go from the workspace machine or copy '
+                        'a lineup and pass --card-lineup <dir>); or pass --no-card-lineup <reason>')
 
     def test_card_lineup_validation_refuses_all_bad_inputs_before_staging(self):
         for kind in ('missing-folder', 'not-directory', 'mismatch', 'missing-file', 'unlisted-nro',
                      'subfolder', 'stray-file', 'missing-sums', 'empty-sums', 'malformed',
-                     'duplicate', 'path-separator', 'backslash', 'not-nro', 'symlink'):
+                     'duplicate', 'path-separator', 'backslash', 'not-nro', 'symlink', 'symlink-sums'):
             with self.subTest(kind=kind):
                 folder = self.dir / f'bad-{kind}'
                 if kind == 'not-directory':
@@ -1016,6 +1023,10 @@ class EdenTestTests(unittest.TestCase):
                     elif kind == 'symlink':
                         (folder / 'one.nro').unlink()
                         (folder / 'one.nro').symlink_to(self.dir / 'plugin.nro')
+                    elif kind == 'symlink-sums':
+                        target = self.dir / 'original-sums.txt'
+                        sums.replace(target)
+                        sums.symlink_to(target)
                 label = f'refuse-{kind}'
                 message = self.assert_lineup_refused(
                     self.go_args(label=label, lineup=True) + ['--card-lineup', str(folder)], label)
@@ -1023,6 +1034,9 @@ class EdenTestTests(unittest.TestCase):
                 if kind == 'mismatch':
                     self.assertIn(sha(folder / 'one.nro')[:12], message)
                     self.assertIn(hashlib.sha256(b'one').hexdigest()[:12], message)
+                if kind == 'symlink-sums':
+                    self.assertIn('SHA256SUMS.txt', message)
+                    self.assertIn('symlink', message)
 
     def test_card_lineup_validation_collects_simultaneous_problems(self):
         folder = self.make_lineup(self.dir / 'bad-both', {'one.nro': b'one'})
@@ -1198,7 +1212,8 @@ class EdenTestTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 message = self.assert_lineup_refused(
                     self.go_args(label=label, lineup=True) + ['--no-card-lineup', reason], label)
-                self.assertIn('write the reason on one line without apostrophes', message)
+                self.assertEqual(message, '--no-card-lineup needs a reason on one line without apostrophes; '
+                                 f'got: {reason!r}')
         err = io.StringIO()
         with redirect_stderr(err), mock.patch.object(eden_test, 'cmd_up') as up:
             with self.assertRaises(SystemExit) as caught:
