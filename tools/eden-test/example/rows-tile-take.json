@@ -1,0 +1,21 @@
+{
+  "about": "Tile Cursor L3 + B and L3 + D-pad rows (fusion-g4). Needs the Tile Cursor build with take.ack / take.applied (e68d8adc or later) and runner branch setup-cpu-block. Starts in Training with native input, ends in Training. Every check reads bridge state.",
+  "rows": [
+    {"id": "tk00", "start": "training", "end": "css.training", "role": "setup", "on_failure": "continue",
+     "steps": [{"run": "routes:quit_training"}]},
+    {"id": "tk01", "start": "css.training", "end": "css.training", "role": "test", "on_failure": "continue",
+     "steps": [{"run": "routes:take_cpu"}]},
+    {"id": "tk02", "start": "css.training", "end": "css.training", "role": "test", "on_failure": "continue",
+     "steps": [{"run": "routes:take_noop", "args": {"holding": "cpu"}}]},
+    {"id": "tk03", "start": "css.training", "end": "css.training", "role": "test", "on_failure": "continue",
+     "steps": [{"run": "routes:place_cpu", "args": {"fighter": "Fox", "must_move": true}}]},
+    {"id": "tk04", "start": "css.training", "end": "css.training", "role": "test", "on_failure": "continue",
+     "steps": [{"run": "routes:take_noop", "args": {"holding": "p1"}}]},
+    {"id": "tk05", "start": "css.training", "end": "training", "role": "setup", "on_failure": "continue",
+     "steps": [{"run": "routes:pick_local_fighter", "args": {"fighter": "Mario", "take_back": true, "expected_context": "training"}},
+               {"run": "routes:place_cpu", "args": {"fighter": "Fox"}},
+               {"run": "routes:enter_training", "args": {"fighters": {"p1": "Mario"}}}]},
+    {"id": "tk06", "start": "training", "end": "training", "role": "test", "on_failure": "continue",
+     "steps": [{"run": "routes:expect_fighters", "args": {"p1": "Mario", "cpu": "Fox"}}]}
+  ]
+}
