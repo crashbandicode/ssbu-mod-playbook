@@ -12,7 +12,7 @@
     {"id": "tk04", "start": "css.training", "end": "css.training", "role": "test", "on_failure": "continue",
      "steps": [{"run": "routes:take_noop", "args": {"holding": "p1"}}]},
     {"id": "tk05", "start": "css.training", "end": "training", "role": "setup", "on_failure": "continue",
-     "steps": [{"run": "routes:pick_local_fighter", "args": {"fighter": "Mario", "take_back": true, "expected_context": "training"}},
+     "steps": [{"run": "routes:pick_fighters", "args": {"p1": "Mario", "take_back": true}},
                {"run": "routes:place_cpu", "args": {"fighter": "Fox"}},
                {"run": "routes:enter_training", "args": {"fighters": {"p1": "Mario", "cpu": null}}}]},
     {"id": "tk06", "start": "training", "end": "training", "role": "test", "on_failure": "continue",
