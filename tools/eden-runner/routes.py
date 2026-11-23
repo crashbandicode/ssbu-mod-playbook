@@ -8,6 +8,7 @@ where a state exists. Every block fails closed: a missing state raises with what
 Blocks (docs/ROUTES.md has what each guarantees on exit):
   host_network     select and read back a non-loopback interface and LAN mode before game.load
   frontend_room    host or join a connected Eden frontend room
+  wireless_room    create a Local Wireless room and reach its waiting room as host
   bridge_alive     verify bridge replies after the frontend room connects
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
   load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
@@ -934,6 +935,197 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                                'dismissed': dismissed, 'game_running': game_running,
                                                'confirmed_running_game': confirmation['text'],
                                                'room_matched': True if room_name is not None else None})
+
+
+def _wireless_read(ctx, io, provider, cap, screens):
+    ctx.check_stop()
+    try:
+        sample = io.read(provider, cap)
+    except RuntimeError as error:
+        if any(word in str(error).lower() for word in ('continuity', 'boot changed', 'malformed', 'overlapping')):
+            raise
+        return {'error': str(error)}
+    block = sample.block
+    if (block.get('name') != provider or block.get('schema') != provider + '/1'
+            or block.get('filtered') or block.get('rev', 0) <= 0):
+        raise RuntimeError(f'{provider}: incomplete bridge state: {block}')
+    values = dict(block['values'])
+    if provider == 'ssbu.ui':
+        screen = values.get('screen', 'unknown')
+        if not screens or screens[-1] != screen:
+            screens.append(screen)
+    return values
+
+
+def _wireless_wait(ctx, io, provider, cap, accept, screens):
+    until = time.monotonic() + cap
+    last = {}
+    while True:
+        remaining = max(0, until - time.monotonic())
+        last = _wireless_read(ctx, io, provider, min(2, max(.001, remaining)), screens)
+        if accept(last):
+            return True, last
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return False, last
+        time.sleep(min(.3, remaining))
+
+
+def _wireless_placed(tile):
+    return tile.get('screen') == 'css' and (tile.get('p1.token') == 'placed'
+                                             or tile.get('local.token') == 'placed')
+
+
+def wireless_room(ctx, ready_cap=60):
+    """Create a Local Wireless room from the main menu and reach its waiting room as host (one member)."""
+    if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
+        raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
+    started, screens = time.monotonic(), []
+    io = BridgePickerIO(ctx)
+
+    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 20,
+                              lambda v: v.get('screen') == 'main_menu' and v.get('observation.active') == 'yes'
+                              and v.get('input.owner') == 'native', screens)
+    if not ok:
+        raise RuntimeError(f'wireless_room: expected main_menu with input.owner native; saw {last}')
+    io.send('lobby-open-room-list')
+    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 25,
+                              lambda v: v.get('screen') == 'ldn.room_list'
+                              and v.get('observation.active') == 'yes', screens)
+    if not ok:
+        raise RuntimeError(f'wireless_room: expected ldn.room_list; saw {last}')
+    io.finish()
+    io.send('tap-a1')
+
+    away, until = 0, time.monotonic() + 15
+    while away < 3:
+        remaining = max(.001, until - time.monotonic())
+        last = _wireless_read(ctx, io, 'ssbu.ui', min(2, remaining), screens)
+        screen = last.get('screen')
+        away = away + 1 if screen is not None and screen != 'ldn.room_list' else 0
+        if away < 3:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f'wireless_room: expected ssbu.ui to leave ldn.room_list; saw {last}')
+            time.sleep(min(.3, remaining))
+    io.finish()
+    time.sleep(1.5)
+    last = _wireless_read(ctx, io, 'ssbu.ui', 2, screens)
+    if last.get('screen') not in ('unknown', 'ldn.create'):
+        raise RuntimeError(f'wireless_room: expected the Create form (ldn.create, or unpublished) after A; saw {last}')
+    create_form = 'ldn.create' if last['screen'] == 'ldn.create' else 'unpublished'
+
+    confirm_presses, room = 0, None
+    for attempt in range(2):
+        io.send('tap-plus1')
+        confirm_presses += 1
+        ok, last = _wireless_wait(
+            ctx, io, 'ssbu.ui', 20,
+            lambda v: (v.get('screen') in ('stage_select', 'css.smash')
+                       and v.get('screen.context') == 'local_wireless' and v.get('observation.active') == 'yes')
+            or v.get('screen') not in (None, 'unknown', 'ldn.create', 'stage_select', 'css.smash'), screens)
+        if (ok and last.get('screen') in ('stage_select', 'css.smash')
+                and last.get('screen.context') == 'local_wireless' and last.get('observation.active') == 'yes'):
+            io.finish()
+            room = last
+            break
+        if ok or last.get('screen') not in (None, 'unknown', 'ldn.create') or attempt == 1:
+            raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless after '
+                               f'{confirm_presses} confirm press(es); saw {last}, screens {screens}')
+        io.finish()
+    stage_presses = 0
+    if room['screen'] == 'stage_select':
+        for attempt in range(2):
+            ok, last = _wireless_wait(
+                ctx, io, 'ssbu.ui', 5,
+                lambda v: v.get('screen') in ('stage_select', 'css.smash')
+                and v.get('observation.active') == 'yes' and v.get('screen.context') == 'local_wireless', screens)
+            if not ok:
+                raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless; saw {last}')
+            if last['screen'] == 'css.smash':
+                break
+            io.send('tap-a1')
+            stage_presses += 1
+            ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 15,
+                                      lambda v: v.get('screen') == 'css.smash'
+                                      and v.get('observation.active') == 'yes'
+                                      and v.get('screen.context') == 'local_wireless', screens)
+            if ok:
+                io.finish()
+                break
+            if (attempt == 1 or last.get('screen') != 'stage_select'
+                    or last.get('observation.active') != 'yes' or last.get('screen.context') != 'local_wireless'):
+                raise RuntimeError(f'wireless_room: expected css.smash in local_wireless; saw {last}, screens {screens}')
+            io.finish()
+
+    ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, lambda v: v.get('screen') == 'css', screens)
+    if not ok:
+        raise RuntimeError(f'wireless_room: expected tile.cursor screen css; saw {tile}')
+    placed_by, chord_sent = 'already placed', False
+    if not _wireless_placed(tile):
+        at = tile.get('at')
+        if not (isinstance(at, str) and at.isdigit() and tile.get('hovered') == at):
+            ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
+                                      lambda v: v.get('screen') == 'css.smash'
+                                      and v.get('observation.active') == 'yes'
+                                      and v.get('screen.context') == 'local_wireless', screens)
+            if not ok:
+                raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before tile-up; saw {last}')
+            io.send('tile-up')
+            chord_sent = True
+            ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 5,
+                                      lambda v: v.get('screen') == 'css' and isinstance(v.get('at'), str)
+                                      and v['at'].isdigit() and v.get('hovered') == v['at'], screens)
+            if not ok:
+                raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
+            io.finish()
+        ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
+                                  lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
+                                  and v.get('screen.context') == 'local_wireless', screens)
+        if not ok:
+            raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before placement; saw {last}')
+        tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+        if not _wireless_placed(tile):
+            at = tile.get('at')
+            if not (tile.get('screen') == 'css' and isinstance(at, str) and at.isdigit()
+                    and tile.get('hovered') == at):
+                raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
+            io.send('tap-a1')
+            placed_by = 'chord + A'
+            ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, _wireless_placed, screens)
+            if not ok:
+                raise RuntimeError(f'wireless_room: expected p1.token or local.token placed; saw {tile}')
+            io.finish()
+
+    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
+                              lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
+                              and v.get('screen.context') == 'local_wireless', screens)
+    if not ok:
+        raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before Ready; saw {last}')
+    tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+    if not _wireless_placed(tile):
+        raise RuntimeError(f'wireless_room: expected p1.token or local.token placed before Ready; saw {tile}')
+    io.send('tap-plus1')
+    ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', ready_cap,
+                                 lambda v: v.get('screen') == 'ldn.waiting'
+                                 and v.get('observation.active') == 'yes', screens)
+    if not ok:
+        raise RuntimeError(f'wireless_room: expected ldn.waiting; screens seen {screens}, last {waiting}')
+    if waiting.get('ldn.role') != 'host':
+        ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', 10,
+                                     lambda v: v.get('screen') == 'ldn.waiting'
+                                     and v.get('observation.active') == 'yes' and v.get('ldn.role') == 'host',
+                                     screens)
+        if not ok:
+            raise RuntimeError(f'wireless_room: expected ldn.role host; screens seen {screens}, last {waiting}')
+    io.finish()
+    return _save(ctx, 'routes-wireless-room', {
+        'block': 'wireless_room', 'screens': screens, 'create_form': create_form, 'confirm_presses': confirm_presses,
+        'stage_presses': stage_presses, 'tile': tile, 'placed_by': placed_by, 'chord_sent': chord_sent,
+        'waiting': {key: waiting.get(key, 'unknown')
+                    for key in ('screen', 'ldn.role', 'ldn.members', 'observation.active')},
+        'ldn.members': waiting.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),
+    })
 
 
 def bridge_alive(ctx, cap=10):

@@ -13,6 +13,14 @@
   }
  },
  "macros": {
+  "lobby-open-room-list": {
+   "file": "macros/lobby-open-room-list.edenmacro.json",
+   "sha256": "b7ab6d9eaca975a2db8b7fb21864ae3157ffaf6bb3bea446a5458b0e9e471bd0",
+   "cap": 15,
+   "frames": 196,
+   "what": "ZR, Down, Down, A to open the Local Wireless room list",
+   "source": "recipe flown in tss-lobby-17060a5e-3 b03"
+  },
   "main-menu-left": {
    "file": "macros/main-menu-left.edenmacro.json",
    "sha256": "0c0ed5acbecf8b42e5225f2e2f48855922e69bf9b5da7c47559d8671edd428a1",
