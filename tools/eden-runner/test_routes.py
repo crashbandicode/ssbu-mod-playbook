@@ -3262,12 +3262,41 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
         self.assertFalse((self.row / 'routes-wireless-room.json').exists())
 
-    def test_local_held_token_can_authorize_chord(self):
+    def test_local_held_without_p1_held_never_authorizes_chord(self):
         self.io.tile.update({'p1.token': 'unknown', 'local.token': 'held'})
+        with self.assertRaisesRegex(RuntimeError,
+                                    r'expected tile.cursor screen css with p1.token held before the chord'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
+        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+
+    def test_local_held_without_p1_held_on_tile_never_authorizes_placement(self):
+        self.io.tile.update({'p1.token': 'unknown', 'local.token': 'held', 'at': '42', 'hovered': '42'})
+        with self.assertRaisesRegex(RuntimeError,
+                                    r'expected tile.cursor screen css with p1.token held before the chord'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
+        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+
+    def test_local_held_waits_until_p1_held_before_chord(self):
+        self.io.tile_script = [
+            {'p1.token': 'unknown', 'local.token': 'held'},
+            {'p1.token': 'held', 'local.token': 'held'},
+        ]
         result = self.run_room()
-        self.assertEqual(result['chord_fence'], {'screen': 'css', 'p1.token': 'unknown', 'local.token': 'held',
-                                                  'at': 'unknown', 'hovered': 'unknown'})
+        chord = self.io.events.index(('send', 'lobby-first-tile'))
+        witness = self.io.events[chord - 1]
+        self.assertEqual(witness[:2], ('read', 'tile.cursor'))
+        self.assertEqual((witness[2]['p1.token'], witness[2]['local.token']), ('held', 'held'))
+        self.assertEqual(result['chord_fence']['p1.token'], 'held')
         self.assertEqual(self.io.actions.count('lobby-first-tile'), 1)
+
+    def test_local_placed_with_p1_unknown_still_skips_placement(self):
+        self.io.tile.update({'p1.token': 'unknown', 'local.token': 'placed'})
+        result = self.run_room()
+        self.assertEqual(result['placed_by'], 'already placed')
+        self.assertIsNone(result['chord_fence'])
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a', 'lobby-ready'])
 
     def test_already_hovered_tile_waits_until_token_is_held(self):
         self.io.tile_script = [
