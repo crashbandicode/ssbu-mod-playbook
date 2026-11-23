@@ -56,6 +56,7 @@ LIFECYCLE = PLAYBOOK / 'tools/eden-lifecycle/lifecycle.py'
 RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
 RUNS = Path('/home/intpa/eden-runs')
+CARD_LINEUPS = Path('/home/intpa/smash-training-lobby/artifacts/phase23/card-lineup')
 NET_SYSFS = Path('/sys/class/net')
 X11_SOCKET_DIR = Path('/tmp/.X11-unix')
 
@@ -199,6 +200,87 @@ def _go_base_trace(config, args):
                          "blocks use are libtraining_rooms.nro!edge_juggle_attempt and libtraining_rooms.nro!planner_chose")
 
 
+def default_card_lineup():
+    stamps = sorted(path for path in CARD_LINEUPS.iterdir()
+                    if path.is_dir() and re.fullmatch(r'\d{8}-\d{4}Z', path.name)) if CARD_LINEUPS.is_dir() else []
+    folder = stamps[-1] / 'plugins' if stamps else None
+    if folder is None or not folder.is_dir():
+        raise SystemExit('no usable newest card lineup; pass --card-lineup <dir> '
+                         'or --no-card-lineup <reason>')
+    return folder
+
+
+def read_card_lineup(folder):
+    folder = Path(folder).resolve()
+    if not folder.is_dir():
+        raise SystemExit(f'card lineup folder missing or not a directory: {folder}')
+    errors = []
+    sums = folder / 'SHA256SUMS.txt'
+    lines = []
+    sums_digest = None
+    if not sums.is_file():
+        errors.append(f'SHA256SUMS.txt missing or not a regular file: {sums}')
+    else:
+        try:
+            data = sums.read_bytes()
+            sums_digest = hashlib.sha256(data).hexdigest()
+            lines = data.decode('utf-8').splitlines()
+        except (OSError, UnicodeError) as error:
+            errors.append(f'cannot read {sums}: {error}')
+    listed = {}
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        match = re.fullmatch(r'([0-9a-f]{64}) {1,2}\*?(.+)', line)
+        if not match:
+            errors.append(f'malformed SHA256SUMS.txt line {number}: {line!r}')
+            continue
+        digest, name = match.groups()
+        if (name != Path(name).name or '/' in name or '\\' in name
+                or not name.endswith('.nro') or name in ('.', '..')):
+            errors.append(f'invalid plugin name on line {number}: {name!r}')
+            continue
+        if name in listed:
+            errors.append(f'duplicate plugin name: {name}')
+            continue
+        listed[name] = digest
+    if not listed:
+        errors.append('SHA256SUMS.txt has no entries')
+    for name, digest in listed.items():
+        path = folder / name
+        if path.is_symlink() or not path.is_file():
+            errors.append(f'listed plugin missing, not a regular file, or a symlink: {path}')
+            continue
+        try:
+            actual = sha256(path)
+            if actual != digest:
+                errors.append(f'hash mismatch for {name}: expected {digest[:12]}…, actual {actual[:12]}…')
+        except OSError as error:
+            errors.append(f'cannot read plugin {path}: {error}')
+    try:
+        for path in sorted(folder.iterdir()):
+            if path.name != 'SHA256SUMS.txt' and path.name not in listed:
+                errors.append(f'unlisted card lineup entry: {path.name}')
+    except OSError as error:
+        errors.append(f'cannot list card lineup {folder}: {error}')
+    if errors:
+        raise SystemExit('invalid card lineup:\n' + '\n'.join(errors))
+    return {'dir': str(folder), 'sums_sha256': sums_digest,
+            'plugins': [{'name': name, 'sha256': listed[name]} for name in sorted(listed)]}
+
+
+def _go_card_lineup(args):
+    reason = getattr(args, 'no_card_lineup', None)
+    if reason is not None:
+        if not reason.strip() or any(char in reason for char in "'\r\n"):
+            raise SystemExit('write the reason on one line without apostrophes')
+        return None
+    folder = Path(args.card_lineup).resolve() if getattr(args, 'card_lineup', None) else default_card_lineup().resolve()
+    if any(char in str(folder) for char in "'\r\n"):
+        raise SystemExit(f'card lineup path {folder}: use a folder without apostrophes or line breaks')
+    return read_card_lineup(folder)
+
+
 def host_interface_problem(name):
     if not isinstance(name, str) or not name or name in ('.', '..') or '/' in name or '\0' in name:
         return 'no such interface'
@@ -288,6 +370,7 @@ def go_new(args):
     config = copy.deepcopy(json.loads(base.read_text()))
     if config.get('host') != args.host:
         raise SystemExit(f'base {base} is for host {config.get("host")!r}, not {args.host!r}')
+    lineup = _go_card_lineup(args)
     _go_base_trace(config, args)
     module = _go_trace(args)
     interface = args.network_interface or config.get('network_interface')
@@ -348,6 +431,41 @@ def go_new(args):
         'no trace section: stub left to the rows (routes:configure_boot)')
     inputs = run / 'inputs'
     inputs.mkdir(parents=True)
+    cards = lineup['plugins'] if lineup else []
+    if lineup:
+        card_inputs = inputs / 'card-lineup'
+        card_inputs.mkdir()
+        for name, digest in [('SHA256SUMS.txt', lineup['sums_sha256']),
+                             *((pin['name'], pin['sha256']) for pin in cards)]:
+            source, target = Path(lineup['dir']) / name, card_inputs / name
+            shutil.copy2(source, target)
+            actual = sha256(target)
+            if actual != digest:
+                raise SystemExit(f'card lineup copy changed: {target} is {actual[:12]}…, expected {digest[:12]}…')
+        config['card_lineup'] = {'staged': True, 'dir': lineup['dir'],
+                                 'origin': getattr(args, 'card_lineup_origin', None) or lineup['dir'],
+                                 'sums_sha256': lineup['sums_sha256'], 'files': len(cards)}
+        config['superseded_base_pins'] = []
+    else:
+        config['card_lineup'] = {'staged': False, 'reason': args.no_card_lineup}
+        config.pop('superseded_base_pins', None)
+    config['staged_plugins'] = {}
+    card_by_name = {pin['name']: pin for pin in cards}
+    for item in config['instances']:
+        pins = [{'name': pin['name'], 'path': str(inputs / 'card-lineup' / pin['name']), 'sha256': pin['sha256']}
+                for pin in cards]
+        staged = [{'name': pin['name'], 'sha256': pin['sha256'], 'source': 'card'} for pin in cards]
+        for pin in item.get('plugins', []):
+            name = pin.get('name', Path(pin['path']).name)
+            if name in card_by_name:
+                config['superseded_base_pins'].append({
+                    'instance': item['key'], 'name': name, 'base_path': pin['path'],
+                    'base_sha256': pin['sha256'], 'card_sha256': card_by_name[name]['sha256']})
+            else:
+                pins.append(pin)
+                staged.append({'name': name, 'sha256': pin['sha256'], 'source': 'base'})
+        item['plugins'] = pins
+        config['staged_plugins'][item['key']] = staged
     swapped = []
     for nro in args.nro:
         original = Path(nro).resolve()
@@ -356,12 +474,18 @@ def go_new(args):
         digest = sha256(target)
         for item in config['instances']:
             pins = item.setdefault('plugins', [])
-            hits = [pin for pin in pins if pin.get('name', Path(pin['path']).name) == original.name]
-            for pin in hits:
+            staged = config['staged_plugins'][item['key']]
+            hits = [index for index, pin in enumerate(pins)
+                    if pin.get('name', Path(pin['path']).name) == original.name]
+            for index in hits:
+                pin = pins[index]
                 swapped.append({'from': pin['path'], 'from_sha256': pin['sha256'], 'to': str(target)})
+                replaces = {'source': staged[index]['source'], 'sha256': pin['sha256']}
                 pin.update(path=str(target), sha256=digest)
+                staged[index] = {'name': original.name, 'sha256': digest, 'source': 'nro', 'replaces': replaces}
             if not hits:
                 pins.append({'name': original.name, 'path': str(target), 'sha256': digest})
+                staged.append({'name': original.name, 'sha256': digest, 'source': 'nro'})
     if swapped:
         config['plugin_swaps'] = swapped
     for item in config['instances']:
@@ -1057,20 +1181,61 @@ def nro_lines(run, config):
     lines = []
     for item in config.get('instances', []):
         pins = {pin.get('name', Path(pin['path']).name): pin['sha256'] for pin in item.get('plugins', [])}
+        sources = {pin['name']: pin for pin in config.get('staged_plugins', {}).get(item.get('key'), [])}
+
+        def suffix(name):
+            entry = sources.get(name)
+            if not entry:
+                return ''
+            if entry['source'] == 'card':
+                return '; from the card lineup'
+            if entry['source'] == 'base':
+                return '; from the base (not on the card)'
+            replaced = entry.get('replaces')
+            if replaced:
+                kind = 'card file' if replaced['source'] == 'card' else 'base pin'
+                return f'; --nro, replaces the {kind} {replaced["sha256"]}'
+            return '; --nro, added (no card or base file of this name)'
+
         profile = (instances.get(item.get('key')) or {}).get('profile')
         folder = Path(profile) / PLUGINS if profile else None
         if folder is None or not folder.is_dir():
             lines += [f'  - {name} `{digest}` as pinned in config.json (the profile is gone or not on this machine, '
-                      'so the loaded file was not re-hashed)' for name, digest in pins.items()]
+                      f'so the loaded file was not re-hashed){suffix(name)}' for name, digest in pins.items()]
             continue
         for path in sorted(folder.glob('*.nro')):
             digest = sha256(path)
             verdict = ('NOT in the config' if path.name not in pins else 'matches the config pin'
                        if pins[path.name] == digest else f'DIFFERS from the config pin {pins[path.name]}')
-            lines.append(f'  - {path.name} `{digest}` in the profile; {verdict}')
-        lines += [f'  - {name}: pinned `{digest}` but MISSING from the profile' for name, digest in pins.items()
+            lines.append(f'  - {path.name} `{digest}` in the profile; {verdict}{suffix(path.name)}')
+        lines += [f'  - {name}: pinned `{digest}` but MISSING from the profile{suffix(name)}' for name, digest in pins.items()
                   if not (folder / name).exists()]
     return lines
+
+
+def card_lineup_report(config):
+    lineup = config.get('card_lineup')
+    if lineup is None:
+        return '- Card lineup: not recorded (run made before the card-lineup default)'
+    if not lineup['staged']:
+        return f'- Card lineup: NOT STAGED — reason: {lineup["reason"]}'
+    replacements, additions = [], []
+    for entries in config.get('staged_plugins', {}).values():
+        for entry in entries:
+            replaced = entry.get('replaces')
+            if replaced:
+                text = (f'{entry["name"]} ({replaced["source"]} {replaced["sha256"][:12]}…'
+                        f' → {entry["sha256"][:12]}…)')
+                if text not in replacements:
+                    replacements.append(text)
+            elif entry['source'] in ('base', 'nro'):
+                kind = 'base' if entry['source'] == 'base' else '--nro'
+                text = f'{entry["name"]} ({kind})'
+                if text not in additions:
+                    additions.append(text)
+    return (f'- Card lineup: {lineup["origin"]} (SHA256SUMS {lineup["sums_sha256"][:12]}…, '
+            f'{lineup["files"]} files verified); replaced by --nro: {", ".join(replacements) or "none"}; '
+            f'added: {", ".join(additions) or "none"}')
 
 
 def row_report(run, row, history):
@@ -1187,6 +1352,7 @@ def report_md(run):
     lines = [f'# {config.get("label", run.name)}: test report',
              f'- State: {state}',
              f'- Runner: {len(ends)} call(s) ended: ' + ('; '.join(ends) if ends else 'no end line in runner.log'),
+             card_lineup_report(config),
              '- NROs:', *nro_lines(run, config),
              f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)} '
              f'(proof paths are relative to `{run}`)',
@@ -1219,7 +1385,7 @@ def _pwsh_arg(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def _go_remote(args):
+def _go_remote(args, lineup):
     hosts = RUNS / '_eden-test' / 'hosts.json'
     mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
     host = args.ssh or mapping.get(args.host)
@@ -1230,8 +1396,10 @@ def _go_remote(args):
     stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
     commands = [
         ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
-        *[['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro],
     ]
+    if lineup:
+        commands.append(['rsync', '-a', '--delete', '--mkpath', lineup['dir'] + '/', f'{host}:{stage}/card-lineup/'])
+    commands.extend([['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro])
     if args.elf:
         commands.append(['rsync', '-a', '--mkpath', str(args.elf), f'{host}:{stage}/elf/'])
     rows = Path(args.rows)
@@ -1247,6 +1415,10 @@ def _go_remote(args):
     for nro in args.nro:
         remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
     remote.extend(('--rows', f'{stage}/rows'))
+    if lineup:
+        remote.extend(('--card-lineup', f'{stage}/card-lineup', '--card-lineup-origin', lineup['dir']))
+    else:
+        remote.extend(('--no-card-lineup', args.no_card_lineup))
     if args.elf:
         remote.extend(('--elf', f'{stage}/elf/{Path(args.elf).name}'))
     for point in args.trace_point:
@@ -1291,8 +1463,21 @@ def cmd_go(args):
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
         _go_trace(args)
-        return _go_remote(args)
+        lineup = _go_card_lineup(args)
+        return _go_remote(args, lineup)
     run = go_new(args)
+    config = json.loads((run / 'config.json').read_text())
+    for key, entries in config['staged_plugins'].items():
+        lineup = config['card_lineup']
+        if lineup['staged']:
+            replaced = ', '.join(entry['name'] for entry in entries if entry.get('replaces')) or 'none'
+            added = ', '.join(f'{entry["name"]} ({entry["source"]})' for entry in entries
+                              if entry['source'] in ('base', 'nro') and not entry.get('replaces')) or 'none'
+            detail = (f'card lineup {lineup["origin"]} ({lineup["files"]} files verified); '
+                      f'--nro replaced: {replaced}; added: {added}')
+        else:
+            detail = f'card lineup NOT STAGED, reason: {lineup["reason"]}'
+        print(f'Staged plugins [{key}]: {len(entries)} — {detail}')
     try:
         cmd_up(run, skip_setup_plan=True, allow_volatile_pins=True)
     except BaseException:
@@ -1394,6 +1579,10 @@ def main(argv=None):
     p.add_argument('--host', required=True)
     p.add_argument('--label', required=True)
     p.add_argument('--nro', action='append', required=True)
+    lineup = p.add_mutually_exclusive_group()
+    lineup.add_argument('--card-lineup', help='folder containing card plugin NROs and SHA256SUMS.txt')
+    lineup.add_argument('--no-card-lineup', metavar='REASON', help='do not stage the card lineup; record why')
+    p.add_argument('--card-lineup-origin', help=argparse.SUPPRESS)
     p.add_argument('--rows', required=True, help='rows.json or a folder containing rows.json')
     p.add_argument('--elf')
     p.add_argument('--trace-point', action='append', default=[])
