@@ -685,12 +685,40 @@ def _frontend_title(node):
     return '' if title is None else str(title)
 
 
+def _frontend_text(node):
+    text = node.get('text')
+    if text in (None, ''):
+        entry = (node.get('properties') or {}).get('text')
+        text = entry.get('value') if isinstance(entry, dict) else entry
+    return '' if text is None else str(text)
+
+
+def _frontend_connected(ctx, tree, members):
+    for node in tree:
+        if not ctx.runner.ui_matches(node, {'class': 'ClientRoomWindow'}):
+            continue
+        title = _frontend_title(node)
+        count = re.search(r'\((\d+)/\d+ members\).* - connected$', title)
+        if count and int(count.group(1)) >= members:
+            return {k: node.get(k) for k in ('id', 'class', 'name', 'text')}, title, int(count.group(1))
+    return None
+
+
+def _frontend_name(field, value):
+    if not isinstance(value, str) or not re.fullmatch(r'[a-zA-Z0-9._ -]{4,20}', value):
+        raise RuntimeError(f'frontend_room: {field} "{value}" is not valid for Eden: 4 to 20 characters of '
+                           'letters, digits, ".", "_", " " or "-" (yuzu/multiplayer/validation.h)')
+
+
 def _frontend_wait(ctx, match, cap, members=None):
     until = time.monotonic() + cap
     titles = []
     while time.monotonic() < until:
         ctx.check_stop()
         tree = ctx.call('ui.tree', {}) or []
+        for node in tree:
+            if ctx.runner.ui_matches(node, {'class': 'QMessageBox'}):
+                raise RuntimeError(f'frontend_room: Eden showed "{_frontend_text(node)}" while waiting for {match}')
         titles = [_frontend_title(node) for node in tree if node.get('class') == 'ClientRoomWindow']
         for node in tree:
             if not ctx.runner.ui_matches(node, match):
@@ -710,31 +738,77 @@ def _frontend_wait(ctx, match, cap, members=None):
     raise RuntimeError(f'frontend_room: widget {match} did not appear within {cap} s')
 
 
+def _frontend_dismiss(ctx, tree, cap):
+    boxes = [n for n in tree if ctx.runner.ui_matches(n, {'class': 'QMessageBox'})]
+    if not boxes:
+        return tree, None
+    if len(boxes) != 1:
+        raise RuntimeError('frontend_room: multiple visible message boxes; cannot choose an OK button')
+    box = boxes[0]
+    buttons = [n for n in tree if n.get('window') == box.get('id')
+               and ctx.runner.ui_matches(n, {'class': 'QPushButton', 'text': '^OK$', 'enabled': True})]
+    if len(buttons) != 1 or not buttons[0].get('id'):
+        raise RuntimeError('frontend_room: message box has no uniquely identifiable OK button')
+    text = _frontend_text(box)
+    ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'id': buttons[0]['id'], 'text': '^OK$'}})
+    until = time.monotonic() + cap
+    while time.monotonic() < until:
+        ctx.check_stop()
+        tree = ctx.call('ui.tree', {}) or []
+        if not any(n.get('id') == box.get('id') and ctx.runner.ui_matches(n, {'class': 'QMessageBox'}) for n in tree):
+            return tree, text
+        time.sleep(min(.5, max(0, until - time.monotonic())))
+    raise RuntimeError(f'frontend_room: message box "{text}" did not close after OK')
+
+
 def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip='127.0.0.1', members=1, cap=30):
     if (ctx.call('status') or {}).get('running'):
         raise RuntimeError('frontend_room runs before game.load')
     if role not in ('host', 'join'):
         raise RuntimeError(f'frontend_room: unknown role {role!r}')
+    nickname = ('TRHost' if role == 'host' else 'TRGuest') if nickname is None else nickname
+    _frontend_name('nickname', nickname)
+    if role == 'host' and room_name is not None:
+        _frontend_name('room_name', room_name)
     room_file = Path(ctx.runner.out) / 'frontend-room.json'
-    saved = json.loads(room_file.read_text()) if role == 'join' and port is None and room_file.is_file() else {}
+    saved = json.loads(room_file.read_text()) if room_file.is_file() else {}
+    tree = ctx.call('ui.tree', {}) or []
+    connected = _frontend_connected(ctx, tree, members)
+    if connected:
+        widget, title, count = connected
+        return _save(ctx, 'routes-frontend-room', {
+            'role': role, 'port': port if port is not None else saved.get('port'), 'nickname': nickname,
+            'room_name': room_name if room_name is not None else saved.get('room_name'), 'ip': ip,
+            'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
+            'already_connected': True, 'reused_dialog': False, 'dismissed': None})
     if port is None:
         port = free_udp_port() if role == 'host' else saved.get('port')
     if port is None:
         raise RuntimeError('frontend_room: join needs a port or the frontend-room.json of this run')
-    nickname = nickname or ('TRHost' if role == 'host' else 'TRGuest')
-    if role == 'host' and not room_name:
-        config = Path(ctx.runner.out).parent / 'config.json'
-        label = json.loads(config.read_text()).get('label') if config.is_file() else None
-        room_name = f'TR-{label or "run"}'
+    if role == 'host' and room_name is None:
+        room_name = f'TR{port}'
     elif role == 'join' and room_name is None:
         room_name = saved.get('room_name')
+    if role == 'host':
+        _frontend_name('room_name', room_name)
+
+    tree, dismissed = _frontend_dismiss(ctx, tree, cap)
+    connected = _frontend_connected(ctx, tree, members)
+    if connected:
+        widget, title, count = connected
+        return _save(ctx, 'routes-frontend-room', {
+            'role': role, 'port': port, 'nickname': nickname, 'room_name': room_name, 'ip': ip,
+            'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
+            'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed})
 
     evidence = {}
+    dialog = {'class': 'QLineEdit', 'name': 'username' if role == 'host' else 'nickname'}
+    reused_dialog = any(ctx.runner.ui_matches(n, dialog) for n in tree)
     if role == 'host':
         action = {'class': 'QAction', 'name': 'action_Start_Room'}
-        evidence['host_action'] = _frontend_wait(ctx, action, cap)
-        ctx.runner.ui(ctx.on, {'ui': 'trigger', 'target': action})
-        dialog = {'class': 'QLineEdit', 'name': 'username'}
+        if not reused_dialog:
+            evidence['host_action'] = _frontend_wait(ctx, action, cap)
+            ctx.runner.ui(ctx.on, {'ui': 'trigger', 'target': action})
         evidence['host_dialog'] = _frontend_wait(ctx, dialog, cap)
         for name, value in (('username', nickname), ('room_name', room_name), ('port', str(port))):
             ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
@@ -746,9 +820,9 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             ctx, {'class': 'QPushButton', 'name': 'disconnect', 'text': '^Leave Room$'}, cap)
     else:
         action = {'class': 'QAction', 'name': 'action_Connect_To_Room'}
-        evidence['peer_action'] = _frontend_wait(ctx, action, cap)
-        ctx.runner.ui(ctx.on, {'ui': 'trigger', 'target': action})
-        dialog = {'class': 'QLineEdit', 'name': 'nickname'}
+        if not reused_dialog:
+            evidence['peer_action'] = _frontend_wait(ctx, action, cap)
+            ctx.runner.ui(ctx.on, {'ui': 'trigger', 'target': action})
         evidence['peer_dialog'] = _frontend_wait(ctx, dialog, cap)
         for name, value in (('nickname', nickname), ('ip', ip), ('port', str(port))):
             ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
@@ -760,7 +834,9 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         room_file.write_text(json.dumps({'port': port, 'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
     return _save(ctx, 'routes-frontend-room', {'role': role, 'port': port, 'nickname': nickname,
                                                'room_name': room_name, 'ip': ip, 'evidence': evidence,
-                                               'window_title': title, 'member_count': count})
+                                               'window_title': title, 'member_count': count,
+                                               'already_connected': False, 'reused_dialog': reused_dialog,
+                                               'dismissed': dismissed})
 
 
 def configure_boot(ctx, gdb_port=None, volume=0, memory_layout_mode=0):
