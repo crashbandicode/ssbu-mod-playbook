@@ -854,5 +854,96 @@ class SetupCallsR2Tests(unittest.TestCase):
             routes._fetch_settings(self.ctx, cap=1)
 
 
+class TakeRouteReplay(CoinReplay):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.values.update({'take.ack': '0', 'take.applied': '0'})
+
+    def send(self, segment):
+        if segment == 'tile-take':
+            self.actions.append(segment)
+            self.values['take.ack'] = str(int(self.values['take.ack']) + 1)
+            if self.values.get('p1.carried', 'unknown') in ('none', 'unknown'):
+                self.values['take.applied'] = str(int(self.values['take.applied']) + 1)
+                self._take('1')
+            return
+        if segment == 'tap-b1':
+            self.actions.append(segment)
+            self._take('0')
+            return
+        return super().send(segment)
+
+
+class TileTakeRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.io = TakeRouteReplay()
+        self.ctx = SimpleNamespace(runner=SimpleNamespace(routes_expect={}), on='s',
+                                   instance={'bridge_log': '/fake/bridge.log'}, row_dir='.',
+                                   check_stop=lambda: None)
+
+    def test_tile_take_macro_is_l3_then_l3_b(self):
+        entry = routes.routes_index()['macros'].get('tile-take')
+        self.assertIsNotNone(entry)
+        path = routes.ROUTES / entry['file']
+        macro = json.loads(path.read_text())
+        self.assertEqual(entry['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual((entry['frames'], macro['duration_frames']), (8, 8))
+        self.assertEqual([(e['frame'], e['buttons']) for e in macro['events']], [(0, 16), (1, 18), (5, 0)])
+
+    def test_place_cpu_takes_walks_at_least_one_step_and_places(self):
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.place_cpu(self.ctx, 'Fox', must_move=True)
+            self.assertEqual(self.io.actions, ['tile-take', 'tile-left', 'tap-a1'])
+            self.assertEqual(result['verified']['cpu']['name'], 'Fox')
+            self.assertGreaterEqual(result['verified']['steps'], 1)
+            with self.assertRaisesRegex(RuntimeError, "already on Fox: this row cannot show a move"):
+                routes.place_cpu(self.ctx, 'Fox', must_move=True)
+
+    def test_take_noop_route_reaches_its_own_start(self):
+        def noop(io, holding, **kwargs):
+            io.send('tile-take')
+            return {'unchanged': {}, 'take.ack': [1, 2], 'take.applied': [1, 1], 'blocks': 5}
+
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(picker, 'take_noop', side_effect=noop), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.take_noop(self.ctx, 'cpu')
+            self.assertEqual(self.io.actions, ['tile-take', 'tile-take'])
+            self.assertEqual(result['verified']['reached_by'], 'take_cpu')
+        p1 = TakeRouteReplay()
+        with patch.object(routes, 'BridgePickerIO', return_value=p1), \
+             patch.object(picker, 'take_noop', side_effect=noop), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.take_noop(self.ctx, 'p1')
+            self.assertEqual(p1.actions, ['tap-b1', 'tile-take'])
+            self.assertEqual(result['verified']['reached_by'], 'b')
+        held = TakeRouteReplay()
+        held._take('1')
+        with patch.object(routes, 'BridgePickerIO', return_value=held), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'P1'):
+                routes.take_noop(self.ctx, 'p1')
+        self.assertEqual(held.actions, [])
+
+    def test_expect_fighters_needs_roster_and_body_to_agree(self):
+        io = recorded.Replay(native_blocks=[recorded.l8w_native(1)])
+        ui = recorded.native(1, screen='training', **{'screen.context': 'training'})
+        state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        bodies = {0: {'kind': 0}, 1: {'kind': 3}}
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+             patch.object(picker, 'wait_sample', return_value=ui), \
+             patch.object(routes, 'native_state', return_value=state), \
+             patch.object(routes, '_switch_hw', return_value=SimpleNamespace(fighters_now=lambda *a, **k: bodies)), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'entry 1.*Fox.*7.*3'):
+                routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
+            bodies[1]['kind'] = 7
+            result = routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
+        self.assertEqual(result['verified']['bodies'][1], 7)
+        self.assertEqual(io.actions, [])
+
+
 if __name__ == '__main__':
     unittest.main()

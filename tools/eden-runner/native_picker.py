@@ -523,6 +523,24 @@ CPU_FIELDS = (
     'carried.name', 'carried.form', 'target.token', 'token.settled',
 )
 
+TAKE_FIELDS = ('take.ack', 'take.applied')
+
+
+def take_lines(state):
+    return state
+
+
+def take_cpu(io, cap=4, *, expected_context='training'):
+    return None
+
+
+def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
+    return {}
+
+
+def take_back_local_token(io, current, ui, cap=4, *, expected_context=None):
+    return None
+
 
 class CoinBlocked(RuntimeError):
     def __init__(self, wanted, pointed):

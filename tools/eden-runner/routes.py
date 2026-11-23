@@ -1965,6 +1965,22 @@ def pick_cpu(ctx, fighter, *, topology=None, form='default'):
     return _save(ctx, 'routes-pick-cpu', receipt)
 
 
+def take_cpu(ctx):
+    return {}
+
+
+def take_noop(ctx, holding):
+    return {}
+
+
+def place_cpu(ctx, fighter, must_move=False):
+    return {}
+
+
+def expect_fighters(ctx, p1=None, cpu=None):
+    return {}
+
+
 def _native_target(entry, form):
     return native_picker.Target(str(entry.get('kind', entry.get('id'))), entry['name'], form)
 
