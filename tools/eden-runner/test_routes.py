@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -163,6 +164,70 @@ class FakeCtx:
 
     def shot(self, name):
         return f'{name}.png'
+
+
+class HostNetworkTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        self.out = self.run / 'out'
+        self.row = self.out / 'r00'
+        self.row.mkdir(parents=True)
+        self.config = self.run / 'config.json'
+        self.config.write_text(json.dumps({'network_interface': 'wifi0'}))
+        self.values = {}
+        self.calls = []
+        self.running = False
+        self.wrong_readback = False
+        self.ctx = types.SimpleNamespace(runner=types.SimpleNamespace(out=self.out),
+                                         row_dir=self.row, call=self.call)
+
+    def call(self, method, params=None):
+        self.calls.append((method, params))
+        if method == 'status':
+            return {'running': self.running}
+        if method == 'settings.set':
+            self.values[params['key']] = params['value']
+        if method == 'settings.get':
+            value = self.values[params['key']]
+            return {'value': 'wrong' if self.wrong_readback else value}
+        return {}
+
+    def test_reads_base_and_sets_and_reads_both_without_saving(self):
+        result = routes.host_network(self.ctx)
+        self.assertEqual(result, {
+            'block': 'host_network', 'interface': 'wifi0', 'lan_online': False,
+            'readback': {'core.network_interface': 'wifi0', 'core.lan_online': False}})
+        self.assertEqual(json.loads((self.row / 'routes-host-network.json').read_text()), result)
+        self.assertEqual([name for name, _ in self.calls],
+                         ['status', 'settings.set', 'settings.get', 'settings.set', 'settings.get'])
+
+    def test_argument_overrides_config_and_lan_online(self):
+        result = routes.host_network(self.ctx, interface='ethernet0', lan_online=True)
+        self.assertEqual(result['interface'], 'ethernet0')
+        self.assertEqual(result['readback'], {
+            'core.network_interface': 'ethernet0', 'core.lan_online': True})
+
+    def test_rejects_loopback_missing_interface_and_running_game_before_setting(self):
+        for interface, running, expected in (
+            ('lo', False, 'host_network: Eden never lists loopback, so "lo" means no network and no local wireless room; name a real interface'),
+            (None, False, 'host_network: no interface: pass "interface" or use a base that names "network_interface"'),
+            ('wifi0', True, 'host_network runs before game.load: core.network_interface is not changeable at run time'),
+        ):
+            with self.subTest(interface=interface, running=running):
+                self.config.write_text('{}')
+                self.running = running
+                self.calls.clear()
+                with self.assertRaises(RuntimeError) as caught:
+                    routes.host_network(self.ctx, interface=interface)
+                self.assertEqual(str(caught.exception), expected)
+                self.assertFalse(any(name == 'settings.set' for name, _ in self.calls))
+
+    def test_readback_mismatch_refuses(self):
+        self.wrong_readback = True
+        with self.assertRaisesRegex(RuntimeError, 'setting core.network_interface reads'):
+            routes.host_network(self.ctx)
 
 
 class NativeStateTests(unittest.TestCase):

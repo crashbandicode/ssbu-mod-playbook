@@ -778,6 +778,31 @@ class ActivePinTests(unittest.TestCase):
         down.assert_not_called()
 
 
+class HostInterfaceTests(unittest.TestCase):
+    def test_flags_address_and_usable_interface_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, flags in (('lo', '0x9'), ('down0', '0x0'),
+                                ('ipless0', '0x1'), ('wifi0', '0x1001')):
+                folder = root / name
+                folder.mkdir()
+                (folder / 'flags').write_text(flags)
+            with mock.patch.object(eden_test, 'NET_SYSFS', root, create=True), \
+                 mock.patch.object(eden_test, 'socket', create=True), \
+                 mock.patch.object(eden_test, 'fcntl', create=True) as fcntl:
+                def ioctl(fd, request, data):
+                    if data.startswith(b'ipless0'):
+                        raise OSError('no IPv4')
+                    return b'\0' * 256
+                fcntl.ioctl.side_effect = ioctl
+                self.assertEqual(eden_test.host_interface_problem('missing0'), 'no such interface')
+                self.assertEqual(eden_test.host_interface_problem('down0'), 'is down')
+                self.assertEqual(eden_test.host_interface_problem('lo'), 'is loopback')
+                self.assertEqual(eden_test.host_interface_problem('ipless0'), 'has no IPv4 address')
+                self.assertIsNone(eden_test.host_interface_problem('wifi0'))
+                self.assertEqual(eden_test.usable_interfaces(), ['wifi0'])
+
+
 class EdenTestTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix='eden-test-test-'))
@@ -794,12 +819,16 @@ class EdenTestTests(unittest.TestCase):
         self.previous = self.dir / 'prev-config.json'
         self.previous.write_text(json.dumps({
             'owner': 'OpenCode x/y', 'label': 'lr-13', 'host': 'yoga', 'state_dir': '/old/state', 'work_root': '/old/work',
+            'network_interface': 'test0',
             'runner': {'path': '/old/runner.py', 'sha256': '0' * 64},
             'instances': [{'key': 'a', 'app': {'path': str(app), 'sha256': sha(app)},
                            'plugins': [{'path': str(nro), 'sha256': sha(nro)}], 'game': '/games/x.xci'}]}))
         self.rows = self.dir / 'rows-src'
         self.rows.mkdir()
         (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[]}')
+        self.interface_check = mock.patch.object(eden_test, 'host_interface_problem', return_value=None, create=True)
+        self.interface_check.start()
+        self.addCleanup(self.interface_check.stop)
 
     def tearDown(self):
         eden_test.LIFECYCLE, eden_test.RUNNER, eden_test.HARVEST, eden_test.RUNS = self.saved
@@ -812,6 +841,65 @@ class EdenTestTests(unittest.TestCase):
         return ['go', '--host', host, '--label', label, '--nro', str(nro or self.dir / 'plugin.nro'),
                 '--rows', str(rows or self.rows), *(['--owner', owner] if owner is not None else []),
                 '--from', str(self.previous)]
+
+    def test_go_refuses_missing_down_and_loopback_before_staging(self):
+        for index, (interface, problem, description) in enumerate((
+            (None, None, 'the base names none'),
+            ('missing0', 'no such interface', '"missing0" no such interface'),
+            ('down0', 'is down', '"down0" is down'),
+            ('lo', 'is loopback', '"lo" is loopback'),
+        )):
+            label = f'network-refuse-{index}'
+            base = json.loads(self.previous.read_text())
+            if interface is None:
+                base.pop('network_interface', None)
+            else:
+                base['network_interface'] = interface
+            self.previous.write_text(json.dumps(base))
+            with self.subTest(interface=interface), \
+                 mock.patch.object(eden_test, 'host_interface_problem', return_value=problem, create=True), \
+                 mock.patch.object(eden_test, 'usable_interfaces', return_value=['wifi0', 'eth0'], create=True), \
+                 mock.patch.object(eden_test.shutil, 'copy2') as copy, \
+                 mock.patch.object(eden_test, 'sh') as sh, \
+                 mock.patch.object(eden_test, '_go_sh') as remote, \
+                 mock.patch.object(eden_test, 'lifecycle') as lifecycle, \
+                 mock.patch.object(eden_test, 'cmd_up') as up:
+                with self.assertRaises(SystemExit) as caught:
+                    eden_test.main(self.go_args(label=label))
+                self.assertEqual(
+                    str(caught.exception),
+                    f'lobby rows need a usable host network interface: {description}; usable here: wifi0, eth0. '
+                    f'Set "network_interface" in {self.previous} or pass --network-interface; '
+                    'pass --no-lobby only for a run without lobby rows')
+                copy.assert_not_called()
+                sh.assert_not_called()
+                remote.assert_not_called()
+                lifecycle.assert_not_called()
+                up.assert_not_called()
+                self.assertFalse((eden_test.RUNS / label).exists())
+
+    def test_go_records_usable_interface_and_override(self):
+        for label, extra, expected in (('network-base', [], 'test0'),
+                                       ('network-override', ['--network-interface', 'wifi0'], 'wifi0')):
+            with self.subTest(label=label), \
+                 mock.patch.object(eden_test, 'cmd_up'), \
+                 mock.patch.object(eden_test, 'cmd_run', return_value=0):
+                self.assertEqual(eden_test.main(self.go_args(label=label) + extra), 0)
+            config = json.loads((eden_test.RUNS / label / 'config.json').read_text())
+            self.assertEqual(config['network_interface'], expected)
+            self.assertEqual(config['network_check'], {
+                'interface': expected, 'usable': True, 'problem': None, 'no_lobby': False})
+
+    def test_no_lobby_allows_and_records_unusable_network(self):
+        base = json.loads(self.previous.read_text())
+        base.pop('network_interface')
+        self.previous.write_text(json.dumps(base))
+        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args() + ['--no-lobby']), 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertIsNone(config['network_interface'])
+        self.assertEqual(config['network_check'], {
+            'interface': None, 'usable': False, 'problem': 'the base names none', 'no_lobby': True})
 
     def test_go_requires_owner_before_dispatch(self):
         error = io.StringIO()
@@ -1088,7 +1176,8 @@ class EdenTestTests(unittest.TestCase):
         stage = f'/home/intpa/eden-runs/_eden-test/stage/{label}'
         argv = self.go_args(label=label, nro=nro, host='xps') + [
             '--nro', str(second), '--elf', str(elf), '--trace-point', 'plugin.nro!attempt',
-            '--owner', 'Claude devin-test/remote-1', '--ssh', host]
+            '--owner', 'Claude devin-test/remote-1', '--ssh', host,
+            '--network-interface', 'wlp114s0', '--no-lobby']
         output = io.StringIO()
         token = 'a' * 32
         def fake_sh(command, log=None):
@@ -1116,11 +1205,13 @@ class EdenTestTests(unittest.TestCase):
              f'{stage}/tools/eden-test/eden_test.py', 'go', '--host', 'xps', '--label', label,
              '--nro', f'{stage}/nro/plugin.nro', '--nro', f'{stage}/nro/extra.nro',
              '--rows', f'{stage}/rows', '--elf', f'{stage}/elf/plugin.so',
-             '--trace-point', 'plugin.nro!attempt', '--owner', "'Claude devin-test/remote-1'", '--token', token],
+             '--trace-point', 'plugin.nro!attempt', '--network-interface', 'wlp114s0', '--no-lobby',
+             '--owner', "'Claude devin-test/remote-1'", '--token', token],
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/go-result.json', mock.ANY],
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/REPORT.md', f'./REPORT-{label}.md'],
         ]
         self.assertEqual([call.args[0] for call in sh.call_args_list], expected)
+        self.interface_check.assert_not_called()
         temp = Path(sh.call_args_list[-2].args[0][-1])
         self.assertTrue(temp.is_absolute())
         self.assertFalse(temp.exists())
