@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One command for an Eden test run: eden-lifecycle + eden-runner + harvest + a short RESULTS.md.
 
-  eden_test.py go --host <host> --label <label> --nro <file> --rows <rows>  stage, Up, run, report (no Down)
+  eden_test.py go --host <host> --label <label> --nro <file> --rows <rows> [--card-lineup <dir> | --no-card-lineup <reason>]  stage, Up, run, report (no Down)
   eden_test.py run <run> --rows <id>   rerun one row; eden_test.py report <run>   show the updated report
 
 Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh yoga python3 ~/ssbu-mod-playbook/...`,
