@@ -778,6 +778,41 @@ class ActivePinTests(unittest.TestCase):
         down.assert_not_called()
 
 
+class FreeDisplayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sockets = Path(self.tmp.name)
+        patcher = mock.patch.object(eden_test, 'X11_SOCKET_DIR', self.sockets, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_preferred_free_and_occupied(self):
+        self.assertEqual(eden_test.free_display(':298'), ':298')
+        (self.sockets / 'X298').touch()
+        self.assertEqual(eden_test.free_display(':298'), ':299')
+
+    def test_skips_forbidden_and_taken_displays(self):
+        (self.sockets / 'X60').touch()
+        self.assertEqual(eden_test.free_display(':60'), ':62')
+        self.assertEqual(eden_test.free_display(':60', taken=(':62',)), ':63')
+
+    def test_dangling_socket_alias_is_not_free(self):
+        (self.sockets / 'X183').symlink_to('missing')
+        self.assertEqual(eden_test.free_display(':183'), ':184')
+
+    def test_exhaustion_and_display_number_boundary(self):
+        for number in range(200, 240):
+            (self.sockets / f'X{number}').touch()
+        with self.assertRaises(SystemExit) as caught:
+            eden_test.free_display(':200')
+        self.assertEqual(str(caught.exception), 'no free X display from :200 upward (40 tried)')
+        (self.sockets / 'X999').touch()
+        with self.assertRaises(SystemExit) as caught:
+            eden_test.free_display(':999')
+        self.assertEqual(str(caught.exception), 'no free X display from :999 upward (40 tried)')
+
+
 class HostInterfaceTests(unittest.TestCase):
     def test_flags_address_and_usable_interface_listing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -842,6 +877,55 @@ class EdenTestTests(unittest.TestCase):
         return ['go', '--host', host, '--label', label, '--nro', str(nro or self.dir / 'plugin.nro'),
                 '--rows', str(rows or self.rows), *(['--owner', owner] if owner is not None else []),
                 '--from', str(self.previous)]
+
+    def test_go_allocates_and_records_distinct_displays(self):
+        base = json.loads(self.previous.read_text())
+        base['instances'][0]['display'] = ':60'
+        second = json.loads(json.dumps(base['instances'][0]))
+        second['key'] = 'b'
+        base['instances'].append(second)
+        self.previous.write_text(json.dumps(base))
+        sockets = self.dir / 'sockets'
+        sockets.mkdir()
+        (sockets / 'X60').touch()
+        with mock.patch.object(eden_test, 'X11_SOCKET_DIR', sockets, create=True), \
+             mock.patch.object(eden_test, 'cmd_up'), \
+             mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args()), 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertEqual([item['display'] for item in config['instances']], [':62', ':63'])
+        self.assertEqual(config['display_choice'], [
+            {'key': 'a', 'base': ':60', 'chosen': ':62'},
+            {'key': 'b', 'base': ':60', 'chosen': ':63'}])
+
+    def test_go_does_not_add_display_to_an_instance_without_one(self):
+        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args()), 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertNotIn('display', config['instances'][0])
+        self.assertEqual(config['display_choice'], [])
+
+    def test_go_display_exhaustion_refuses_before_any_copy_or_up(self):
+        base = json.loads(self.previous.read_text())
+        base['instances'][0]['display'] = ':200'
+        self.previous.write_text(json.dumps(base))
+        sockets = self.dir / 'sockets'
+        sockets.mkdir()
+        for number in range(200, 240):
+            (sockets / f'X{number}').touch()
+        with mock.patch.object(eden_test, 'X11_SOCKET_DIR', sockets, create=True), \
+             mock.patch.object(eden_test.shutil, 'copy2') as copy, \
+             mock.patch.object(eden_test, 'sh') as sh, \
+             mock.patch.object(eden_test, 'lifecycle') as lifecycle, \
+             mock.patch.object(eden_test, 'cmd_up') as up:
+            with self.assertRaises(SystemExit) as caught:
+                eden_test.main(self.go_args())
+            self.assertEqual(str(caught.exception), 'no free X display from :200 upward (40 tried)')
+            copy.assert_not_called()
+            sh.assert_not_called()
+            lifecycle.assert_not_called()
+            up.assert_not_called()
+            self.assertFalse((eden_test.RUNS / 'go-1').exists())
 
     def test_go_refuses_missing_down_and_loopback_before_staging(self):
         for index, (interface, problem, description) in enumerate((
