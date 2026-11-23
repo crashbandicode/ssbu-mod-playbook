@@ -2838,6 +2838,318 @@ class TrainingReturnTests(unittest.TestCase):
         self.assertEqual(io.actions, ['leave-css'])
 
 
+class WirelessRoomTests(unittest.TestCase):
+    class IO:
+        def __init__(self):
+            self.phase = 'main'
+            self.actions = []
+            self.events = []
+            self.main_screen = 'main_menu'
+            self.main_owner = 'native'
+            self.room_list_missing = False
+            self.stuck_in_list = False
+            self.form_script = []
+            self.form_screen = 'unknown'
+            self.confirm_form_reads = 0
+            self.confirm_reads = 0
+            self.stage_context_unknown_reads = 0
+            self.unpublished_confirms = 0
+            self.wrong_confirm_screen = False
+            self.direct_css = False
+            self.stuck_stage = False
+            self.stuck_tile = False
+            self.stuck_placement = False
+            self.waiting_role = 'host'
+            self.never_waiting = False
+            self.confirm_count = 0
+            self.stage_count = 0
+            self.role_reads = 0
+            self.host_after = 0
+            self.revision = 0
+            self.tile = {
+                'screen': 'css', 'at': 'unknown', 'hovered': 'unknown', 'local.token': 'unknown',
+                'p1.token': 'held', 'p1.coin': 'held', 'p1.coin.at': 'unknown',
+                'p1.placed.at': 'unknown', 'p1.placed.name': 'unknown', 'phase': 'resting',
+            }
+
+        def read(self, provider, cap):
+            self.revision += 1
+            if provider == 'tile.cursor':
+                values = dict(self.tile)
+            else:
+                if self.phase == 'confirm_form':
+                    if self.confirm_reads >= self.confirm_form_reads:
+                        self.phase = 'css' if self.direct_css else 'stage'
+                    else:
+                        self.confirm_reads += 1
+                screen = {
+                    'main': self.main_screen, 'rooms': 'ldn.room_list', 'form': self.form_screen,
+                    'confirm_form': 'ldn.create',
+                    'unpublished': 'unknown', 'wrong': 'ldn.room_list', 'stage': 'stage_select',
+                    'css': 'css.smash', 'waiting': 'ldn.waiting', 'not_waiting': 'css.smash',
+                }[self.phase]
+                if self.phase == 'form' and self.form_script:
+                    screen = self.form_script.pop(0)
+                role = 'unknown'
+                if self.phase == 'waiting':
+                    self.role_reads += 1
+                    role = 'unknown' if self.role_reads <= self.host_after else self.waiting_role
+                context = 'local_wireless' if screen in ('stage_select', 'css.smash') else 'unknown'
+                if self.phase == 'stage' and self.stage_context_unknown_reads:
+                    self.stage_context_unknown_reads -= 1
+                    context = 'unknown'
+                values = {
+                    'screen': screen, 'screen.context': context,
+                    'input.owner': self.main_owner if self.phase == 'main' else 'unknown',
+                    'observation.active': 'no' if screen == 'unknown' else 'yes',
+                    'ldn.role': role, 'ldn.members': 'unknown',
+                }
+            block = {'name': provider, 'schema': provider + '/1', 'filtered': False, 'rev': self.revision,
+                     'boot': '0xe54e9b821337ecd1', 'values': values}
+            self.events.append(('read', provider, dict(values)))
+            return types.SimpleNamespace(block=block, values=values, connection=1)
+
+        def send(self, macro):
+            self.events.append(('send', macro))
+            self.actions.append(macro)
+            if macro == 'lobby-open-room-list' and self.phase == 'main':
+                if not self.room_list_missing:
+                    self.phase = 'rooms'
+            elif macro == 'tap-a1' and self.phase == 'rooms':
+                if not self.stuck_in_list:
+                    self.phase = 'form'
+            elif macro == 'tap-plus1' and self.phase in ('form', 'confirm_form', 'unpublished', 'wrong'):
+                self.confirm_count += 1
+                if self.wrong_confirm_screen:
+                    self.phase = 'wrong'
+                elif self.confirm_count <= self.unpublished_confirms:
+                    self.phase = 'unpublished'
+                elif self.confirm_form_reads:
+                    self.phase = 'confirm_form'
+                    self.confirm_reads = 0
+                else:
+                    self.phase = 'css' if self.direct_css else 'stage'
+            elif macro == 'tap-a1' and self.phase == 'stage':
+                self.stage_count += 1
+                if not self.stuck_stage:
+                    self.phase = 'css'
+            elif macro == 'tile-up' and self.phase == 'css':
+                if not self.stuck_tile:
+                    self.tile.update({'at': '66', 'hovered': '66', 'phase': 'settled'})
+            elif macro == 'tap-a1' and self.phase == 'css':
+                if not self.stuck_placement:
+                    self.tile.update({'at': '45', 'hovered': 'unknown', 'p1.token': 'placed',
+                                      'p1.coin': 'placed', 'p1.coin.at': '66',
+                                      'p1.placed.at': '66', 'p1.placed.name': 'Simon',
+                                      'phase': 'resting'})
+            elif macro == 'tap-plus1' and self.phase == 'css':
+                self.phase = 'not_waiting' if self.never_waiting else 'waiting'
+            else:
+                raise AssertionError(f'unexpected input {macro!r} on {self.phase!r}')
+
+        def finish(self):
+            pass
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.row = Path(self.temp.name)
+        self.ctx = types.SimpleNamespace(row_dir=self.row, check_stop=lambda: None)
+        self.io = self.IO()
+        self.now = 0.0
+
+    def run_room(self):
+        def sleep(seconds):
+            self.now += seconds
+
+        with mock.patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+                mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
+                mock.patch.object(routes.time, 'sleep', side_effect=sleep):
+            return routes.wireless_room(self.ctx, ready_cap=3)
+
+    def test_full_room_route_and_saved_receipt(self):
+        result = self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-a1',
+                                           'tile-up', 'tap-a1', 'tap-plus1'])
+        self.assertEqual(result['block'], 'wireless_room')
+        self.assertEqual(result['confirm_presses'], 1)
+        self.assertEqual(result['stage_presses'], 1)
+        self.assertEqual(result['placed_by'], 'chord + A')
+        self.assertEqual(result['tile']['p1.placed.name'], 'Simon')
+        self.assertEqual(result['waiting']['screen'], 'ldn.waiting')
+        self.assertEqual(result['waiting']['ldn.role'], 'host')
+        self.assertEqual(result['ldn.members'], 'unknown')
+        screens = result['screens']
+        expected = ['main_menu', 'ldn.room_list', 'stage_select', 'css.smash', 'ldn.waiting']
+        self.assertEqual([s for s in screens if s in expected], expected)
+        self.assertEqual(json.loads((self.row / 'routes-wireless-room.json').read_text()), result)
+        required = ['main_menu', 'ldn.room_list', 'unknown', 'stage_select',
+                    'css.smash', 'css.smash', 'css.smash']
+        reads = []
+        for event in self.io.events:
+            if event[0] == 'read' and event[1] == 'ssbu.ui':
+                reads.append(event[2]['screen'])
+            elif event[0] == 'send':
+                self.assertTrue(reads, f'no fresh ssbu.ui read before {event}')
+                self.assertEqual(reads[-1], required.pop(0))
+                reads.clear()
+        self.assertEqual(required, [])
+
+    def test_direct_css_skips_stage_a(self):
+        self.io.direct_css = True
+        result = self.run_room()
+        self.assertEqual(result['stage_presses'], 0)
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
+                                           'tile-up', 'tap-a1', 'tap-plus1'])
+
+    def test_main_screen_and_owner_gate_before_any_input(self):
+        for screen, owner in (('unknown', 'native'), ('main_menu', 'unknown'), ('main_menu', 'foreign')):
+            with self.subTest(screen=screen, owner=owner):
+                self.io.main_screen, self.io.main_owner = screen, owner
+                with self.assertRaisesRegex(RuntimeError, 'main_menu'):
+                    self.run_room()
+                self.assertEqual(self.io.actions, [])
+
+    def test_room_list_timeout_names_expected_and_seen(self):
+        self.io.room_list_missing = True
+        with self.assertRaisesRegex(RuntimeError, 'ldn.room_list.*main_menu'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list'])
+
+    def test_create_form_never_leaves_list_sends_no_confirm(self):
+        self.io.stuck_in_list = True
+        with self.assertRaisesRegex(RuntimeError, 'leave.*ldn.room_list'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1'])
+
+    def test_form_requires_three_consecutive_samples_away_from_list(self):
+        self.io.form_script = ['unknown', 'unknown', 'ldn.room_list', 'unknown', 'unknown', 'unknown']
+        self.run_room()
+        first_a = next(i for i, e in enumerate(self.io.events) if e == ('send', 'tap-a1'))
+        confirm = next(i for i, e in enumerate(self.io.events) if e == ('send', 'tap-plus1'))
+        screens = [e[2]['screen'] for e in self.io.events[first_a + 1:confirm]
+                   if e[0] == 'read' and e[1] == 'ssbu.ui']
+        self.assertEqual(screens[:6], ['unknown', 'unknown', 'ldn.room_list',
+                                       'unknown', 'unknown', 'unknown'])
+
+    def test_published_create_form_before_and_after_confirm_succeeds(self):
+        self.io.form_screen = 'ldn.create'
+        self.io.confirm_form_reads = 1
+        result = self.run_room()
+        self.assertEqual(result['create_form'], 'ldn.create')
+        self.assertEqual(result['confirm_presses'], 1)
+        confirm = next(i for i, e in enumerate(self.io.events) if e == ('send', 'tap-plus1'))
+        after = self.io.events[confirm + 1:]
+        self.assertTrue(any(e[0] == 'read' and e[1] == 'ssbu.ui'
+                            and e[2]['screen'] == 'ldn.create' and e[2]['observation.active'] == 'yes'
+                            for e in after))
+
+    def test_unpublished_create_form_is_named_in_receipt(self):
+        self.assertEqual(self.run_room()['create_form'], 'unpublished')
+
+    def test_published_create_form_stuck_retries_once_then_fails(self):
+        self.io.form_screen = 'ldn.create'
+        self.io.confirm_form_reads = 1000
+        with self.assertRaisesRegex(RuntimeError, 'stage_select|css.smash'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-plus1'])
+
+    def test_wrong_published_screen_after_a_refuses_without_confirm(self):
+        self.io.form_screen = 'main_menu'
+        with self.assertRaisesRegex(RuntimeError,
+                                    r'expected the Create form \(ldn\.create, or unpublished\) after A.*main_menu'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1'])
+
+    def test_stage_context_can_arrive_after_stage_screen(self):
+        self.io.stage_context_unknown_reads = 1
+        result = self.run_room()
+        self.assertEqual(result['confirm_presses'], 1)
+        stages = [e[2]['screen.context'] for e in self.io.events
+                  if e[0] == 'read' and e[1] == 'ssbu.ui' and e[2]['screen'] == 'stage_select']
+        self.assertEqual(stages[:2], ['unknown', 'local_wireless'])
+
+    def test_stage_wrong_context_at_cap_fails_without_confirm_retry(self):
+        self.io.stage_context_unknown_reads = 1000
+        with self.assertRaisesRegex(RuntimeError, r'stage_select.*unknown'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1'])
+
+    def test_unpublished_confirm_retries_once_then_succeeds(self):
+        self.io.unpublished_confirms = 1
+        result = self.run_room()
+        self.assertEqual(result['confirm_presses'], 2)
+        self.assertEqual(self.io.actions.count('tap-plus1'), 3)
+
+    def test_unpublished_after_second_confirm_fails_without_third(self):
+        self.io.unpublished_confirms = 3
+        with self.assertRaisesRegex(RuntimeError, 'stage_select|css.smash'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-plus1'])
+
+    def test_other_published_screen_never_retries_confirm(self):
+        self.io.wrong_confirm_screen = True
+        with self.assertRaisesRegex(RuntimeError, 'stage_select|css.smash'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1'])
+
+    def test_stage_still_selected_after_a_retries_once(self):
+        self.io.stuck_stage = True
+        with self.assertRaisesRegex(RuntimeError, 'css.smash.*stage_select'):
+            self.run_room()
+        self.assertEqual(self.io.stage_count, 2)
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-a1', 'tap-a1'])
+
+    def test_unknown_equals_unknown_is_not_a_tile_and_never_sends_a(self):
+        self.io.stuck_tile = True
+        with self.assertRaisesRegex(RuntimeError, 'expected the hand on a tile'):
+            self.run_room()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'tap-a1', 'tile-up'])
+
+    def test_existing_p1_or_local_placement_needs_no_placement_input(self):
+        for field in ('p1.token', 'local.token'):
+            with self.subTest(field=field):
+                self.io = self.IO()
+                self.io.tile[field] = 'placed'
+                result = self.run_room()
+                self.assertEqual(result['placed_by'], 'already placed')
+                self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
+                                                   'tap-a1', 'tap-plus1'])
+
+    def test_unconfirmed_a_reports_last_tile(self):
+        self.io.stuck_placement = True
+        with self.assertRaisesRegex(RuntimeError, 'placed.*66'):
+            self.run_room()
+        self.assertEqual(self.io.actions[-2:], ['tile-up', 'tap-a1'])
+        self.assertEqual(self.io.actions.count('tap-plus1'), 1)
+
+    def test_waiting_role_must_be_host(self):
+        for role in ('unknown', 'guest'):
+            with self.subTest(role=role):
+                self.io = self.IO()
+                self.io.waiting_role = role
+                with self.assertRaisesRegex(RuntimeError, 'expected ldn.role host'):
+                    self.run_room()
+                self.assertEqual(self.io.actions[-1], 'tap-plus1')
+
+    def test_waiting_role_can_arrive_after_waiting_screen(self):
+        self.io.host_after = 3
+        self.assertEqual(self.run_room()['waiting']['ldn.role'], 'host')
+
+    def test_waiting_timeout_reports_screens_seen(self):
+        self.io.never_waiting = True
+        with self.assertRaisesRegex(RuntimeError, 'ldn.waiting.*css.smash'):
+            self.run_room()
+        self.assertEqual(self.io.actions[-1], 'tap-plus1')
+
+    def test_already_hovering_numeric_tile_skips_chord_but_places(self):
+        self.io.tile.update({'at': '42', 'hovered': '42', 'phase': 'settled'})
+        self.run_room()
+        self.assertNotIn('tile-up', self.io.actions)
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
+                                           'tap-a1', 'tap-a1', 'tap-plus1'])
+
+
 class SwitchBootTests(unittest.TestCase):
     def test_launched_switch_uses_the_same_title_gate_and_deadline(self):
         from unittest.mock import Mock, patch
