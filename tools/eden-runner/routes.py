@@ -1071,7 +1071,7 @@ def wireless_room(ctx, ready_cap=60):
     ok, tile = _wireless_wait(
         ctx, io, 'tile.cursor', 8,
         lambda v: v.get('screen') == 'css' and (_wireless_placed(v)
-                                                 or v.get('p1.token') == 'held' or v.get('local.token') == 'held'),
+                                                 or v.get('p1.token') == 'held'),
         screens)
     if not ok:
         raise RuntimeError(f'wireless_room: expected tile.cursor screen css with p1.token held before the chord; '
