@@ -203,10 +203,14 @@ def _go_base_trace(config, args):
 def default_card_lineup():
     stamps = sorted(path for path in CARD_LINEUPS.iterdir()
                     if path.is_dir() and re.fullmatch(r'\d{8}-\d{4}Z', path.name)) if CARD_LINEUPS.is_dir() else []
-    folder = stamps[-1] / 'plugins' if stamps else None
-    if folder is None or not folder.is_dir():
-        raise SystemExit('no usable newest card lineup; pass --card-lineup <dir> '
-                         'or --no-card-lineup <reason>')
+    if not stamps:
+        raise SystemExit(f'no card lineup under {CARD_LINEUPS} (no <YYYYMMDD-HHMM>Z folder; on an Eden host '
+                         'that folder does not exist: run go from the workspace machine or copy a lineup and pass '
+                         '--card-lineup <dir>); or pass --no-card-lineup <reason>')
+    folder = stamps[-1] / 'plugins'
+    if not folder.is_dir():
+        raise SystemExit(f'newest card lineup {stamps[-1]} has no plugins folder (older stamps are not used); '
+                         'pass --card-lineup <dir> or --no-card-lineup <reason>')
     return folder
 
 
@@ -218,7 +222,9 @@ def read_card_lineup(folder):
     sums = folder / 'SHA256SUMS.txt'
     lines = []
     sums_digest = None
-    if not sums.is_file():
+    if sums.is_symlink():
+        errors.append(f'SHA256SUMS.txt is a symlink: {sums}')
+    elif not sums.is_file():
         errors.append(f'SHA256SUMS.txt missing or not a regular file: {sums}')
     else:
         try:
@@ -273,7 +279,7 @@ def _go_card_lineup(args):
     reason = getattr(args, 'no_card_lineup', None)
     if reason is not None:
         if not reason.strip() or any(char in reason for char in "'\r\n"):
-            raise SystemExit('write the reason on one line without apostrophes')
+            raise SystemExit(f'--no-card-lineup needs a reason on one line without apostrophes; got: {reason!r}')
         return None
     folder = Path(args.card_lineup).resolve() if getattr(args, 'card_lineup', None) else default_card_lineup().resolve()
     if any(char in str(folder) for char in "'\r\n"):

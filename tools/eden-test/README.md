@@ -10,6 +10,7 @@ Each `--nro` replaces the card file of the same name; a new name is added.
 Base plugins not on the card, including the bridge, are added; card files supersede matching base pins.
 Use `--card-lineup <dir>` for another lineup or `--no-card-lineup <reason>` to opt out with a recorded reason.
 The receipt is in `config.json` (`card_lineup`, `staged_plugins`, `superseded_base_pins`) and `REPORT.md`.
+On an Eden host the default folder does not exist, so `go` needs `--card-lineup <dir>`; remote dispatch copies the lineup and passes it.
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 Each run gets its own bridge port and its own X display (when the base has a display helper; otherwise the base's display is kept).
 The base names the host's network interface ("network_interface"); go refuses when that interface is missing, down, loopback or has no IPv4 address, unless --no-lobby. Override with `--network-interface <name>`.
