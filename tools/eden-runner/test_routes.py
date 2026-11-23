@@ -317,6 +317,16 @@ class FrontendRoomTests(unittest.TestCase):
     ROOM = {'id': 'o259', 'class': 'ClientRoomWindow', 'name': 'ClientRoom', 'text': None,
             # xps-1/out/c2-match-end/a-GATE-FAILED-trace-sched-tree.json, 2 changed to 1.
             'title': 'TRB3Waiting - Super Smash Bros. Ultimate (1/8 members) - connected'}
+    # tss-lobby-17060a5e-1: final-L2-live-widgets.json.log, captured before any recovery.
+    MESSAGE = {'id': 'o259', 'class': 'QMessageBox', 'name': '', 'text': None, 'title': 'Error',
+               'visible': True, 'enabled': True, 'parent': '', 'window': 'o259',
+               'properties': {'text': {'type': 'QString', 'value':
+                                       'Room name is not valid. Must be 4 to 20 alphanumeric characters.',
+                                       'writable': True}}}
+    OPEN_HOST = {'id': 'o244', 'class': 'QLineEdit', 'name': 'username', 'text': None, 'title': '',
+                 'visible': True, 'enabled': True, 'parent': 'o214', 'window': 'o235'}
+    OK = {'id': 'o261', 'class': 'QPushButton', 'name': '', 'text': 'OK', 'title': '', 'visible': True,
+          'enabled': True, 'parent': 'o262', 'window': 'o259'}
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -328,8 +338,9 @@ class FrontendRoomTests(unittest.TestCase):
         (self.run / 'config.json').write_text(json.dumps({'label': 'proof'}))
         self.actions = []
         self.running = False
-        self.nodes = [self.HOST_ACTION, self.HOST_DIALOG, self.HOST_LEAVE,
-                      self.PEER_ACTION, self.PEER_DIALOG, self.ROOM]
+        self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+        self.room_node = self.ROOM
+        self.modal_after_host = False
         self.runner = types.SimpleNamespace(out=self.out, ui=self.ui, ui_matches=runner.Runner.ui_matches)
         self.ctx = types.SimpleNamespace(runner=self.runner, on='a', row_dir=self.row,
                                          call=self.call, check_stop=lambda: None)
@@ -343,6 +354,18 @@ class FrontendRoomTests(unittest.TestCase):
 
     def ui(self, on, step):
         self.actions.append((on, step))
+        target = step.get('target', {})
+        if step['ui'] == 'trigger':
+            self.nodes.append(self.HOST_DIALOG if target['name'] == 'action_Start_Room' else self.PEER_DIALOG)
+        elif step['ui'] == 'click' and target.get('id') == self.OK['id']:
+            self.nodes = [node for node in self.nodes if node not in (self.MESSAGE, self.OK)]
+        elif step['ui'] == 'click' and target.get('name') in ('host', 'connect'):
+            if self.modal_after_host:
+                self.nodes.extend([self.MESSAGE, self.OK])
+            else:
+                self.nodes.append(self.HOST_LEAVE)
+                if self.room_node is not None:
+                    self.nodes.append(self.room_node)
 
     def test_host_replays_real_sequence_and_saves_room_handoff(self):
         with mock.patch.object(routes, 'free_udp_port', return_value=24872):
@@ -351,12 +374,12 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(self.actions, [('a', step) for step in [
             {'ui': 'trigger', 'target': target('QAction', 'action_Start_Room')},
             {'ui': 'set', 'target': target('QLineEdit', 'username'), 'property': 'text', 'value': 'TRHost'},
-            {'ui': 'set', 'target': target('QLineEdit', 'room_name'), 'property': 'text', 'value': 'TR-proof'},
+            {'ui': 'set', 'target': target('QLineEdit', 'room_name'), 'property': 'text', 'value': 'TR24872'},
             {'ui': 'set', 'target': target('QLineEdit', 'port'), 'property': 'text', 'value': '24872'},
             {'ui': 'set', 'target': target('QComboBox', 'host_type'), 'property': 'currentIndex', 'value': 1},
             {'ui': 'click', 'target': target('QPushButton', 'host')}]])
         self.assertEqual(receipt['port'], 24872)
-        self.assertEqual(receipt['room_name'], 'TR-proof')
+        self.assertEqual(receipt['room_name'], 'TR24872')
         self.assertEqual(receipt['member_count'], 1)
         self.assertEqual(receipt['window_title'], self.ROOM['title'])
         self.assertEqual(receipt['evidence']['host_action'], self.HOST_ACTION)
@@ -364,7 +387,7 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(receipt['evidence']['frontend_leave'], self.HOST_LEAVE)
         self.assertEqual(json.loads((self.row / 'routes-frontend-room.json').read_text()), receipt)
         self.assertEqual(json.loads((self.out / 'frontend-room.json').read_text()),
-                         {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'})
+                         {'port': 24872, 'room_name': 'TR24872', 'instance': 'a'})
 
     def test_join_replays_peer_sequence_and_reads_host_port(self):
         (self.out / 'frontend-room.json').write_text(json.dumps({'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
@@ -382,20 +405,22 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(receipt['evidence']['peer_dialog'], self.PEER_DIALOG)
 
     def test_no_connected_window_and_insufficient_members_fail_with_observed_titles(self):
-        self.nodes = self.nodes[:-1]
+        self.room_node = None
         with self.assertRaisesRegex(RuntimeError, 'at least 1 member\\(s\\); saw: no room window'):
             routes.frontend_room(self.ctx, port=24872, cap=.01)
-        self.nodes.append(self.ROOM)
+        self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+        self.room_node = self.ROOM
         with self.assertRaisesRegex(RuntimeError, r'at least 2 member\(s\); saw: .*1/8 members'):
             routes.frontend_room(self.ctx, port=24872, members=2, cap=.01)
-        self.nodes[-1] = {**self.ROOM, 'title': self.ROOM['title'].replace(' - connected', ' - disconnected')}
+        self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+        self.room_node = {**self.ROOM, 'title': self.ROOM['title'].replace(' - connected', ' - disconnected')}
         with self.assertRaisesRegex(RuntimeError, r'at least 1 member\(s\); saw: .*disconnected'):
             routes.frontend_room(self.ctx, port=24872, cap=.01)
 
     def test_explicit_join_port_and_nested_two_member_title(self):
         title = self.ROOM['title'].replace('(1/8 members)', '(2/8 members)')
-        self.nodes[-1] = {key: value for key, value in self.ROOM.items() if key != 'title'}
-        self.nodes[-1]['properties'] = {'windowTitle': {'value': title}}
+        self.room_node = {key: value for key, value in self.ROOM.items() if key != 'title'}
+        self.room_node['properties'] = {'windowTitle': {'value': title}}
         result = routes.frontend_room(self.ctx, role='join', port=24890, members=2)
         self.assertEqual((result['nickname'], result['port'], result['member_count'], result['window_title']),
                          ('TRGuest', 24890, 2, title))
@@ -417,6 +442,91 @@ class FrontendRoomTests(unittest.TestCase):
             reserved.bind(('0.0.0.0', first))
             chosen = routes.free_udp_port(first=first, last=24971)
         self.assertGreater(chosen, first)
+
+    def test_names_default_from_port_and_invalid_values_refuse_before_ui(self):
+        (self.run / 'config.json').write_text(json.dumps({'label': 'tss-lobby-17060a5e-1'}))
+        with mock.patch.object(routes, 'free_udp_port', return_value=24872):
+            result = routes.frontend_room(self.ctx)
+        self.assertEqual(result['room_name'], 'TR24872')
+        for field, value in (('room_name', 'TR-tss-lobby-17060a5e-1'), ('room_name', ''),
+                             ('room_name', 'a' * 21), ('nickname', ''), ('nickname', 'Bob'),
+                             ('nickname', 'åUser'), ('nickname', 'bad/name')):
+            with self.subTest(field=field, value=value):
+                self.actions.clear()
+                with self.assertRaises(RuntimeError) as caught:
+                    routes.frontend_room(self.ctx, port=24872, **{field: value})
+                self.assertEqual(str(caught.exception), f'frontend_room: {field} "{value}" is not valid for Eden: '
+                                 '4 to 20 characters of letters, digits, ".", "_", " " or "-" '
+                                 '(yuzu/multiplayer/validation.h)')
+                self.assertEqual(self.actions, [])
+
+    def test_names_allow_full_boundaries_and_eden_punctuation(self):
+        result = routes.frontend_room(self.ctx, port=24872, nickname='A._-', room_name='A._ -123456789012345')
+        self.assertEqual(result['nickname'], 'A._-')
+        self.assertEqual(result['room_name'], 'A._ -123456789012345')
+
+    def test_message_during_wait_aborts_with_real_text(self):
+        self.modal_after_host = True
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24872, cap=.05)
+        self.assertIn('frontend_room: Eden showed "Room name is not valid. Must be 4 to 20 alphanumeric characters."',
+                      str(caught.exception))
+        self.assertIn('while waiting for', str(caught.exception))
+
+    def test_captured_modal_is_dismissed_and_host_dialog_reused(self):
+        self.nodes = [self.MESSAGE, self.OK, self.OPEN_HOST]
+        result = routes.frontend_room(self.ctx, port=24872)
+        self.assertEqual(result['dismissed'], self.MESSAGE['properties']['text']['value'])
+        self.assertTrue(result['reused_dialog'])
+        self.assertEqual(self.actions[0], ('a', {'ui': 'click',
+                                                'target': {'class': 'QPushButton', 'id': 'o261', 'text': '^OK$'}}))
+        self.assertFalse(any(step['ui'] == 'trigger' for _, step in self.actions))
+        self.assertTrue(any(step['ui'] == 'set' and step['target']['name'] == 'room_name'
+                            and step['value'] == 'TR24872' for _, step in self.actions))
+        self.assertEqual(result['member_count'], 1)
+
+    def test_modal_without_matching_ok_fails_without_clicking_unrelated_button(self):
+        self.nodes = [self.MESSAGE, {**self.OK, 'window': 'other'}, self.OPEN_HOST]
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room:.*OK'):
+            routes.frontend_room(self.ctx, port=24872)
+        self.assertEqual(self.actions, [])
+
+    def test_invalid_name_does_not_dismiss_existing_modal(self):
+        self.nodes = [self.MESSAGE, self.OK, self.OPEN_HOST]
+        with self.assertRaisesRegex(RuntimeError, 'frontend_room: room_name .* not valid'):
+            routes.frontend_room(self.ctx, port=24872, room_name='bad/name')
+        self.assertEqual(self.actions, [])
+
+    def test_join_reuses_open_dialog(self):
+        self.nodes = [self.PEER_DIALOG]
+        result = routes.frontend_room(self.ctx, role='join', port=24872)
+        self.assertTrue(result['reused_dialog'])
+        self.assertFalse(any(step['ui'] == 'trigger' for _, step in self.actions))
+        self.assertEqual(result['member_count'], 1)
+
+    def test_already_connected_returns_without_ui_or_port_allocation(self):
+        self.nodes = [self.ROOM]
+        with mock.patch.object(routes, 'free_udp_port', side_effect=AssertionError('allocated port')):
+            result = routes.frontend_room(self.ctx)
+        self.assertTrue(result['already_connected'])
+        self.assertEqual((result['window_title'], result['member_count']), (self.ROOM['title'], 1))
+        self.assertEqual(self.actions, [])
+        self.assertEqual(json.loads((self.row / 'routes-frontend-room.json').read_text()), result)
+
+    def test_already_connected_even_with_a_modal_has_no_ui_action(self):
+        self.nodes = [{**self.ROOM, 'id': 'o300'}, self.MESSAGE, self.OK]
+        result = routes.frontend_room(self.ctx, port=24872)
+        self.assertTrue(result['already_connected'])
+        self.assertEqual(self.actions, [])
+
+    def test_connected_room_with_too_few_members_is_not_accepted(self):
+        self.nodes = [self.HOST_ACTION, self.PEER_ACTION, self.ROOM]
+        self.room_node = {**self.ROOM, 'id': 'o400',
+                          'title': self.ROOM['title'].replace('(1/8 members)', '(2/8 members)')}
+        result = routes.frontend_room(self.ctx, port=24872, members=2)
+        self.assertFalse(result['already_connected'])
+        self.assertEqual(result['member_count'], 2)
+        self.assertTrue(any(step['ui'] == 'trigger' for _, step in self.actions))
 
 
 class NativeStateTests(unittest.TestCase):
