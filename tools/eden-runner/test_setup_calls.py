@@ -944,6 +944,18 @@ class TileTakeRouteTests(unittest.TestCase):
         self.assertEqual((entry['frames'], macro['duration_frames']), (8, 8))
         self.assertEqual([(e['frame'], e['buttons']) for e in macro['events']], [(0, 16), (1, 18), (5, 0)])
 
+    def test_tile_take_hold_macro_holds_b_under_l3_past_the_back_hold(self):
+        entry = routes.routes_index()['macros'].get('tile-take-hold')
+        self.assertIsNotNone(entry)
+        path = routes.ROUTES / entry['file']
+        macro = json.loads(path.read_text())
+        self.assertEqual(entry['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual((entry['frames'], macro['duration_frames']), (124, 124))
+        events = [(event['frame'], event['buttons']) for event in macro['events']]
+        self.assertEqual(events, [(0, 16), (1, 18), (121, 0)])
+        self.assertGreaterEqual(events[2][0] - events[1][0], 100)
+        self.assertEqual(events[2][1] & 18, 0)
+
     def test_place_cpu_takes_walks_at_least_one_step_and_places(self):
         with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
              patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
@@ -999,6 +1011,19 @@ class TileTakeRouteTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'P1'):
                 routes.take_noop(self.ctx, 'p1')
         self.assertEqual(held.actions, [])
+
+    def test_take_noop_route_passes_hold_through(self):
+        self.io._take('0')
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(picker, 'take_noop', side_effect=lambda *a, **k: {}) as noop, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            held = routes.take_noop(self.ctx, 'p1', hold=True)
+            noop.assert_called_once_with(self.io, '0', hold=True)
+            self.assertEqual(held['args'], {'holding': 'p1', 'hold': True})
+            noop.reset_mock()
+            normal = routes.take_noop(self.ctx, 'p1')
+            noop.assert_called_once_with(self.io, '0', hold=False)
+            self.assertEqual(normal['args'], {'holding': 'p1'})
 
     def test_expect_fighters_needs_roster_and_body_to_agree(self):
         io = recorded.Replay(native_blocks=[recorded.l8w_native(1)])

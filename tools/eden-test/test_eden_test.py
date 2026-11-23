@@ -72,7 +72,11 @@ class TileTakeRowsTests(unittest.TestCase):
 
         plan = json.loads((folder / 'example' / 'rows-tile-take.json').read_text())
         self.assertEqual([row['id'] for row in plan['rows']],
-                         ['tk00', 'tk01', 'tk02', 'tk03', 'tk04', 'tk05', 'tk06'])
+                         ['tk00', 'tk01', 'tk02', 'tk03', 'tk04', 'tk04b', 'tk05', 'tk06'])
+        hold = next(row for row in plan['rows'] if row['id'] == 'tk04b')
+        self.assertEqual(hold['steps'], [
+            {'run': 'routes:take_noop', 'args': {'holding': 'p1', 'hold': True}},
+        ])
         for row in plan['rows']:
             for step in row['steps']:
                 with self.subTest(row=row['id'], step=step['run']):

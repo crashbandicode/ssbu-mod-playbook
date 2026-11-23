@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import inspect
 import json
 import sys
 import unittest
@@ -296,6 +297,19 @@ class ProducerReplayTests(unittest.TestCase):
         self.assertEqual(replay.actions, ['tile-' + direction for _, direction, _ in expected] + ['tap-a1'])
         self.assertEqual((result['name'], result['kind']), ('Mario', '0'))
         pick_cpu.assert_not_called()
+
+    def test_tk04b_resolves_to_the_hold_noop_route(self):
+        fragment = Path(__file__).resolve().parent.parent / 'eden-test' / 'example' / 'rows-tile-take.json'
+        rows = json.loads(fragment.read_text())['rows']
+        row = next(row for row in rows if row['id'] == 'tk04b')
+        self.assertEqual(row['steps'], [
+            {'run': 'routes:take_noop', 'args': {'holding': 'p1', 'hold': True}},
+        ])
+        module, name = row['steps'][0]['run'].split(':', 1)
+        self.assertEqual(module, 'routes')
+        function = getattr(routes, name)
+        self.assertTrue(callable(function))
+        inspect.signature(function).bind(self.ctx, **row['steps'][0]['args'])
 
 
 if __name__ == '__main__':

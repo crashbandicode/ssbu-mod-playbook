@@ -2168,6 +2168,30 @@ class TakeTests(unittest.TestCase):
                 self.assertGreaterEqual(result['blocks'], 5)
                 self.assertEqual(io.actions, ['tile-take'])
 
+    def test_take_noop_with_hold_plays_the_hold_macro_and_passes_when_nothing_changes(self):
+        clock = TakeClock()
+        io = TakeReplay(clock, holding='0')
+        with patch.object(picker, 'time', clock):
+            result = picker.take_noop(io, '0', cap=.7, quiet=.25, hold=True)
+        self.assertEqual(io.actions, ['tile-take-hold'])
+        self.assertEqual(result['macro'], 'tile-take-hold')
+        self.assertEqual(result['take.ack'], [2, 3])
+        self.assertEqual(result['take.applied'], [1, 1])
+
+    def test_take_noop_with_hold_fails_when_the_fighter_select_was_left(self):
+        class LeftSelectReplay(TakeReplay):
+            def read(self, provider, cap):
+                state = super().read(provider, cap)
+                if self.sent:
+                    state.values.update(screen='training', focus='training')
+                return state
+
+        clock = TakeClock()
+        io = LeftSelectReplay(clock, holding='0')
+        with patch.object(picker, 'time', clock), self.assertRaises(RuntimeError):
+            picker.take_noop(io, '0', cap=.7, quiet=.25, hold=True)
+        self.assertEqual(io.actions, ['tile-take-hold'])
+
     def test_take_noop_fails_on_any_changed_field_or_an_unread_press(self):
         for fault in ('p1.carried', 'cpu.placed.at', 'take.applied', 'unread', 'duplicate'):
             with self.subTest(fault=fault), self.assertRaisesRegex(
