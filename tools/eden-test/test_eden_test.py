@@ -2201,6 +2201,21 @@ class ReportTests(unittest.TestCase):
                     self.assertIn(spec[4], line)
         self.assertIn('- Card lineup:', top[:top.index('- NROs:')])
 
+    def test_opt_out_report_says_from_base_without_claiming_card_membership(self):
+        self.config['card_lineup'] = {'staged': False, 'reason': 'test without the card lineup'}
+        self.config['staged_plugins'] = {'a': [{'name': 'libx.nro', 'sha256': self.pin, 'source': 'base'}]}
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+        for pruned in (False, True):
+            if pruned:
+                shutil.rmtree(self.run / 'work')
+            with self.subTest(pruned=pruned):
+                report = eden_test.report_md(self.run)
+                line = next(line for line in report.splitlines() if line.startswith('  - libx.nro '))
+                self.assertIn(self.pin, line)
+                self.assertTrue(line.endswith('; from the base'), line)
+                self.assertNotIn('not on the card', report)
+                self.assertIn('- Card lineup: NOT STAGED — reason: test without the card lineup', report)
+
     def test_card_lineup_report_old_config_says_not_recorded_without_source_suffixes(self):
         top = eden_test.report_md(self.run).split('| Row |')[0]
         self.assertIn('- Card lineup: not recorded (run made before the card-lineup default)', top)
