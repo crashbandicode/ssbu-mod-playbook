@@ -24,6 +24,7 @@
       "on_failure": "stop",
       "steps": [
         {"run": "routes:frontend_room"},
+        {"run": "routes:to_main"},
         {"run": "routes:bridge_alive"}
       ]
     }
