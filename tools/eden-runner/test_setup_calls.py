@@ -3,12 +3,14 @@
 import copy
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
 import routes
 import test_native_picker as recorded
@@ -102,15 +104,18 @@ class CoinReplay:
                                 **self._identity(TOPOLOGY.targets[self.p1_tile], 'carried.')})
         else:
             self.values.update({'cpu.token': 'held', 'at': self.cpu_tile, 'hovered': self.cpu_tile,
-                                'focus': 'css.grid.cpu'})
+                                'focus': 'unknown', 'carried': 'unknown', 'kind': 'unknown',
+                                'name': 'unknown', 'form': 'unknown', 'settled.ack': 'unknown',
+                                'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
+                                'from': 'unknown', 'to': 'unknown'})
             target = TOPOLOGY.targets.get(self.cpu_tile)
             if target:
-                self.values.update({**self._identity(target), **self._identity(target, 'carried.')})
+                self.values.update(self._identity(target, 'carried.'))
             else:
-                self.values.update({'kind': 'unknown', 'name': 'unknown', 'form': 'unknown',
-                                    'carried.kind': 'unknown', 'carried.name': 'unknown',
-                                    'carried.form': 'unknown'})
-        self.values['settled.ack'] = self.values['ack']
+                self.values.update({'carried.kind': 'unknown', 'carried.name': 'Random',
+                                    'carried.form': 'default'})
+        if slot == '0':
+            self.values['settled.ack'] = self.values['ack']
 
     def _place(self, slot):
         at = self.values['at']
@@ -127,11 +132,18 @@ class CoinReplay:
         self.values.update({'carried': 'none', 'p1.carried': 'unknown', 'hand.token': slot,
                             'token.settled': '0', 'focus': 'css.medal.' + slot,
                             'settled': '0', 'settled.ack': 'unknown'})
+        if slot == '1':
+            self.values.update({'hand.token': 'none', 'focus': 'css.medal.mario',
+                                'kind': 'unknown', 'name': 'unknown', 'form': 'unknown',
+                                'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
+                                'from': 'unknown', 'to': 'unknown'})
 
     def send(self, segment):
         self.actions.append(segment)
         if segment == 'tap-a1':
-            held = self.values.get('carried', 'none')
+            held = self.values.get('p1.carried', self.values.get('carried', 'none'))
+            if held == 'unknown':
+                held = 'none'
             if held == 'none':
                 slot = self.values['hand.token']
                 self._take('0' if self.fault == 'wrong_carried' else slot)
@@ -141,7 +153,9 @@ class CoinReplay:
         if not segment.startswith('tile-'):
             raise AssertionError(segment)
         direction = segment[5:]
-        carried = self.values.get('carried', 'none')
+        carried = self.values.get('p1.carried', self.values.get('carried', 'none'))
+        if carried == 'unknown':
+            carried = 'none'
         before = self.values.get('at', 'none')
         ack = int(self.values['ack']) + (2 if self.fault == 'second_step' else 1)
         applied = int(self.values['applied']) + (2 if self.fault == 'second_step' else 1)
@@ -159,8 +173,11 @@ class CoinReplay:
             to = '85' if before == '86' and direction == 'left' else TOPOLOGY.neighbors[before][direction]
             target = TOPOLOGY.targets[to]
             self.values.update({'at': to, 'hovered': to, 'settled': '1', 'settled.ack': str(ack),
-                                'focus': 'css.grid.' + to, 'target.token': 'none', 'token.settled': '0',
-                                **self._identity(target), **self._identity(target, 'carried.')})
+                                'focus': 'unknown' if carried == '1' else 'css.grid.' + to,
+                                'target.token': 'none', 'token.settled': '0',
+                                **self._identity(target, 'carried.')})
+            if carried != '1':
+                self.values.update(self._identity(target))
         self.values.update({'ack': str(ack), 'applied': str(applied), 'ack.result': 'handled',
                             'result': 'handled', 'direction': direction,
                             'from': before if before != 'unknown' else 'none', 'to': to})
@@ -399,13 +416,47 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(result['fighters_checked'], {'p1': 'unchecked', 'cpu': 'unchecked'})
         self.assertEqual(result['roster'], state['roster'])
 
+    def test_enter_training_treats_a_none_fighter_as_unchecked(self):
+        remembered = self.ctx.runner.routes_expect
+        original = dict(remembered)
+        state = {'roster': {0: {'kind': 0}, 1: {'kind': 3}}, 'stage': 3}
+        fighters = {'p1': 'Mario', 'cpu': None}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.enter_training(self.ctx, cap=1, fighters=fighters)
+        self.assertEqual(result['fighters_checked'], {'p1': 'checked', 'cpu': 'unchecked'})
+        self.assertEqual(result['args']['fighters'], fighters)
+        self.assertIs(self.ctx.runner.routes_expect, remembered)
+        self.assertEqual(self.ctx.runner.routes_expect, original)
+
+    def test_enter_training_treats_a_none_p1_as_unchecked(self):
+        state = {'roster': {0: {'kind': 3}, 1: {'kind': 7}}, 'stage': 3}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.enter_training(self.ctx, cap=1, fighters={'p1': None, 'cpu': 'Fox'})
+        self.assertEqual(result['fighters_checked'], {'p1': 'unchecked', 'cpu': 'checked'})
+        self.assertEqual(self.ctx.runner.routes_expect, {'p1_kind': 0, 'cpu_kind': 7})
+
+    def test_enter_training_still_requires_both_roster_entries_when_a_seat_is_unchecked(self):
+        state = {'roster': {0: {'kind': 0}}, 'stage': 3}
+        with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=state), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'CPU kind None'):
+                routes.enter_training(self.ctx, cap=1, fighters={'p1': 'Mario', 'cpu': None})
+
     def test_enter_training_set_stage_ids_return_plain_json(self):
         state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}, 'stage': 3}
         with patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
              patch.object(routes, 'wait_native', return_value=state), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.enter_training(self.ctx, cap=1, stage_ids={3})
-        json.dumps(result)
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            self.fail(str(exc))
         self.assertEqual(result['args']['stage_ids'], [3])
 
     def test_tr_grid_path_matches_trainingrooms_step_rule(self):
@@ -423,14 +474,17 @@ class SetupCallsR2Tests(unittest.TestCase):
                 cell = routes.tr_grid_step(cell, direction)
             self.assertEqual(cell, goal)
 
-    def set_cpu(self, replay, roster, settings):
+    def set_cpu(self, replay, roster, settings, body=None):
         replay.writer_log = self.log
         tables = routes.tables()
         tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}, {'kind': 7, 'name': 'Fox'}]
+        body = body if body is not None else {'kind': 0}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'tables', return_value=tables), \
              patch.object(routes, '_fetch_settings', return_value=json.dumps(settings).encode(), create=True), \
              patch.object(routes, 'wait_native', return_value={'roster': roster, 'stage': 3}), \
+             patch.object(routes, '_live_body', side_effect=body if isinstance(body, Exception) else None,
+                          return_value=body), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.set_cpu(self.ctx, 'Mario')
         json.dumps(result)
@@ -473,7 +527,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         self.assertEqual(saved, ['routes-reach-training'])
         self.assertEqual(replay.actions, [])
         self.assertEqual(set(receipt['skipped']), {'to_main', 'back_to_main', 'main_to_stage', 'pick_stage',
-                                                   'quit_training', 'pick_fighters', 'enter_training'})
+                                                   'quit_training', 'pick_fighters', 'enter_training', 'set_cpu'})
 
     def test_set_cpu_needs_the_live_roster_not_only_the_file(self):
         replay = MenuReplay()
@@ -486,7 +540,8 @@ class SetupCallsR2Tests(unittest.TestCase):
         import switch_hw
 
         self.log.write_text('[Bridge] roster entry=1 kind=7 nana=false frame=1 wall=1\n')
-        lines = iter(('[Bridge] roster entry=0 kind=0 nana=false frame=2 wall=2\n',
+        lines = iter(('[Bridge] req roster result=ok entries=0x3 frame=2 wall=2\n'
+                      '[Bridge] roster entry=0 kind=0 nana=false frame=2 wall=2\n',
                       '[Bridge] roster entry=1 kind=3 nana=false frame=2 wall=2\n'))
         writes = []
 
@@ -563,18 +618,20 @@ class SetupCallsR2Tests(unittest.TestCase):
     def test_reach_training_uses_the_suffix_for_a_live_matching_stage(self):
         replay = MenuReplay()
         replay.menu['open'] = '0'
-        initial = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 3}}}
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         calls = []
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: calls.append('quit')), \
-             patch.object(routes, 'pick_fighters', side_effect=lambda *a, **k: calls.append('pick')), \
+             patch.object(routes, 'pick_fighters', side_effect=lambda *a, **k: calls.append(('pick', k))), \
              patch.object(routes, 'enter_training', side_effect=lambda *a, **k: calls.append(('enter', k))), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
         json.dumps(result)
         self.assertEqual([item if isinstance(item, str) else item[0] for item in calls], ['quit', 'pick', 'enter'])
+        self.assertIsNone(calls[1][1].get('cpu'))
+        self.assertEqual(calls[-1][1]['fighters'], {'p1': 'Mario', 'cpu': None})
         self.assertEqual(calls[-1][1]['stage_ids'], {3})
         self.assertTrue({'to_main', 'main_to_stage', 'pick_stage'} <= set(result['skipped']))
         self.assertNotIn('quit_training', result['skipped'])
@@ -582,7 +639,7 @@ class SetupCallsR2Tests(unittest.TestCase):
     def test_reach_training_css_suffix_return_is_plain_json(self):
         replay = MenuReplay()
         replay.menu['open'] = '0'
-        initial = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 3}}}
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
@@ -594,6 +651,7 @@ class SetupCallsR2Tests(unittest.TestCase):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
         json.dumps(result)
         self.assertEqual(result['phases']['enter_training']['args']['stage_ids'], [3])
+        self.assertEqual(result['phases']['enter_training']['args']['fighters'], {'p1': 'Mario', 'cpu': None})
 
     def test_reach_training_rechecks_native_ownership_at_the_end(self):
         replay = MenuReplay()
@@ -609,6 +667,189 @@ class SetupCallsR2Tests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'not owned by native'):
                 routes.reach_training(self.ctx, 'Mario', cpu='Fox')
         self.assertEqual(replay.actions, [])
+
+    def test_reach_training_css_suffix_return_is_plain_json(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=final), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            self.fail(str(exc))
+        self.assertEqual(result['phases']['enter_training']['args']['stage_ids'], [3])
+        self.assertEqual(result['phases']['enter_training']['args']['fighters'], {'p1': 'Mario', 'cpu': None})
+
+    def test_set_cpu_at_the_fighter_select_refuses_and_never_uses_the_tile_cursor(self):
+        replay = MenuReplay()
+        replay.read = lambda provider, cap: recorded.l8w_native(2)
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'pick_cpu', return_value={}) as pick, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'set_cpu works in Training'):
+                routes.set_cpu(self.ctx, 'Mario')
+        pick.assert_not_called()
+        self.assertEqual(replay.actions, [])
+
+    def test_set_player_at_the_fighter_select_still_picks_p1(self):
+        replay = MenuReplay()
+        replay.read = lambda provider, cap: recorded.l8w_native(2)
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'pick_local_fighter', return_value={}) as pick, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            routes.set_player(self.ctx, 'Mario')
+        pick.assert_called_once()
+
+    def test_reach_training_sets_a_wrong_cpu_through_the_tr_menu_without_leaving_training(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        replay.writer_log = self.log
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 0}}}
+        tables = routes.tables()
+        tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}, {'kind': 7, 'name': 'Fox'}]
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'tables', return_value=tables), \
+             patch.object(routes, 'native_state', side_effect=[initial, final, final]), \
+             patch.object(routes, 'wait_native', return_value=final), \
+             patch.object(routes, '_fetch_settings', return_value=b'{"menu":{"cpu_character":[1,0]}}'), \
+             patch.object(routes, '_live_body', return_value={'kind': 0}), \
+             patch.object(routes, 'quit_training', return_value={}) as quit_training, \
+             patch.object(routes, 'pick_fighters', return_value={}) as pick, \
+             patch.object(routes, 'enter_training', return_value={}) as enter, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Fox', cpu='Mario')
+        self.assertEqual(replay.actions, ['tr-menu-open', 'tap-a1', 'tap-a1', 'tap-b1', 'tap-b1'])
+        quit_training.assert_not_called()
+        pick.assert_not_called()
+        enter.assert_not_called()
+        self.assertIn('set_cpu', result['phases'])
+        self.assertTrue({'quit_training', 'pick_fighters', 'enter_training'} <= set(result['skipped']))
+        self.assertEqual(result['verified']['roster'], final['roster'])
+
+    def test_reach_training_repicks_p1_at_the_fighter_select_and_sets_the_cpu_in_training(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        replay.writer_log = self.log
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        entered = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
+        tables = routes.tables()
+        tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}, {'kind': 7, 'name': 'Fox'}]
+        calls = []
+        remembered = self.ctx.runner.routes_expect
+        expected_before_entry = dict(remembered)
+
+        def pick(*args, **kwargs):
+            calls.append('pick_fighters')
+            self.assertIsNone(kwargs.get('cpu'))
+
+        def enter(*args, **kwargs):
+            calls.append('enter_training')
+            self.assertIs(self.ctx.runner.routes_expect, remembered)
+            self.assertEqual(self.ctx.runner.routes_expect, expected_before_entry)
+            self.assertEqual(kwargs['fighters'], {'p1': 'Mario', 'cpu': None})
+
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'tables', return_value=tables), \
+             patch.object(routes, 'native_state', side_effect=[initial, entered, final]), \
+             patch.object(routes, 'wait_native', return_value=final), \
+             patch.object(routes, '_fetch_settings', return_value=b'{"menu":{"cpu_character":[1,0]}}'), \
+             patch.object(routes, '_live_body', return_value={'kind': 0}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: calls.append('quit_training')), \
+             patch.object(routes, 'pick_fighters', side_effect=pick), \
+             patch.object(routes, 'enter_training', side_effect=enter), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Mario')
+        self.assertEqual(calls, ['quit_training', 'pick_fighters', 'enter_training'])
+        self.assertEqual(replay.actions, ['tr-menu-open', 'tap-a1', 'tap-a1', 'tap-b1', 'tap-b1'])
+        self.assertIn('set_cpu', result['phases'])
+
+    def test_reach_training_leaves_a_matching_cpu_alone(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 0}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, 'enter_training', return_value={}), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Mario')
+        self.assertIn('set_cpu', result['skipped'])
+        self.assertEqual(replay.actions, [])
+
+    def test_set_cpu_confirms_the_live_body_after_the_roster(self):
+        roster = {0: {'kind': 0}, 1: {'kind': 0}}
+        settings = {'menu': {'cpu_character': [1, 0]}}
+        with self.assertRaisesRegex(RuntimeError, 'live fighter'):
+            self.set_cpu(MenuReplay(), roster, settings, RuntimeError('live fighter missing'))
+        result = self.set_cpu(MenuReplay(), roster, settings, {'kind': 0})
+        self.assertEqual(result['verified']['fighter']['kind'], 0)
+
+    def test_live_body_counts_requests_and_waits_for_the_requested_kind(self):
+        self.ctx.runner.setup_metrics = {'bridge_requests': 0}
+        replies = iter(({1: {'kind': 7}}, {1: {'kind': 0, 'x': 1.0}}))
+        calls = []
+
+        def fighters_now(run, cap):
+            calls.append((run, cap))
+            return next(replies)
+
+        with patch.object(routes, '_switch_hw', return_value=SimpleNamespace(fighters_now=fighters_now)), \
+             patch.object(routes.time, 'sleep'):
+            body = routes._live_body(self.ctx, 1, 0, 1)
+        self.assertEqual(body, {'kind': 0, 'x': 1.0})
+        self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 2)
+        self.assertEqual([call[0] for call in calls], [self.log.parent, self.log.parent])
+
+    def test_reach_training_does_not_prejudge_the_remembered_cpu_at_entry(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        self.ctx.runner.routes_expect['cpu_kind'] = 0
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        entered = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, entered, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, 'wait_native', return_value=entered), \
+             patch.object(routes, '_set_fighter', return_value={}) as set_fighter, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.reach_training(self.ctx, 'Mario', cpu='Mario')
+        self.assertEqual(result['phases']['enter_training']['fighters_checked']['cpu'], 'unchecked')
+        set_fighter.assert_called_once()
+        self.assertEqual(self.ctx.runner.routes_expect['cpu_kind'], 0)
+
+    def test_reach_training_keeps_expectations_remembered_during_entry(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
+        final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+
+        def enter(*args, **kwargs):
+            routes.remember(self.ctx, entry_marker='kept')
+            return {}
+
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'pick_fighters', return_value={}), \
+             patch.object(routes, 'enter_training', side_effect=enter), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            routes.reach_training(self.ctx, 'Mario', cpu='Fox')
+        self.assertEqual(self.ctx.runner.routes_expect.get('entry_marker'), 'kept')
 
     def test_setup_state_reads_without_any_controller_input(self):
         replay = MenuReplay()
@@ -665,6 +906,145 @@ class SetupCallsR2Tests(unittest.TestCase):
         corrupt[0] = True
         with self.assertRaisesRegex(RuntimeError, 'does not match the bridge receipt'):
             routes._fetch_settings(self.ctx, cap=1)
+
+
+class TakeRouteReplay(CoinReplay):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.values.update({'take.ack': '0', 'take.applied': '0'})
+
+    def send(self, segment):
+        if segment == 'tile-take':
+            self.actions.append(segment)
+            self.values['take.ack'] = str(int(self.values['take.ack']) + 1)
+            if self.values.get('p1.carried', 'unknown') in ('none', 'unknown'):
+                self.values['take.applied'] = str(int(self.values['take.applied']) + 1)
+                self._take('1')
+            return
+        if segment == 'tap-b1':
+            self.actions.append(segment)
+            self._take('0')
+            return
+        return super().send(segment)
+
+
+class TileTakeRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.io = TakeRouteReplay()
+        self.ctx = SimpleNamespace(runner=SimpleNamespace(routes_expect={}), on='s',
+                                   instance={'bridge_log': '/fake/bridge.log'}, row_dir='.',
+                                   check_stop=lambda: None)
+
+    def test_tile_take_macro_is_l3_then_l3_b(self):
+        entry = routes.routes_index()['macros'].get('tile-take')
+        self.assertIsNotNone(entry)
+        path = routes.ROUTES / entry['file']
+        macro = json.loads(path.read_text())
+        self.assertEqual(entry['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual((entry['frames'], macro['duration_frames']), (8, 8))
+        self.assertEqual([(e['frame'], e['buttons']) for e in macro['events']], [(0, 16), (1, 18), (5, 0)])
+
+    def test_tile_take_hold_macro_holds_b_under_l3_past_the_back_hold(self):
+        entry = routes.routes_index()['macros'].get('tile-take-hold')
+        self.assertIsNotNone(entry)
+        path = routes.ROUTES / entry['file']
+        macro = json.loads(path.read_text())
+        self.assertEqual(entry['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual((entry['frames'], macro['duration_frames']), (124, 124))
+        events = [(event['frame'], event['buttons']) for event in macro['events']]
+        self.assertEqual(events, [(0, 16), (1, 18), (121, 0)])
+        self.assertGreaterEqual(events[2][0] - events[1][0], 100)
+        self.assertEqual(events[2][1] & 18, 0)
+
+    def test_place_cpu_takes_walks_at_least_one_step_and_places(self):
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.place_cpu(self.ctx, 'Fox', must_move=True)
+            self.assertEqual(self.io.actions, ['tile-take', 'tile-left', 'tap-a1'])
+            self.assertEqual(result['verified']['cpu']['name'], 'Fox')
+            self.assertGreaterEqual(result['verified']['steps'], 1)
+            with self.assertRaisesRegex(RuntimeError, "already on Fox: this row cannot show a move"):
+                routes.place_cpu(self.ctx, 'Fox', must_move=True)
+
+    def test_place_cpu_uses_an_already_held_coin_without_taking_again(self):
+        self.io._take('1')
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.place_cpu(self.ctx, 'Fox', must_move=True)
+        self.assertEqual(self.io.actions, ['tile-left', 'tap-a1'])
+        self.assertFalse(result['taken_here'])
+        self.assertEqual(result['verified']['p1_medal'], ['placed', '0', '0', 'Mario', 'default'])
+
+    def test_take_cpu_route_reports_the_counter_fence(self):
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.take_cpu(self.ctx)
+        self.assertEqual(self.io.actions, ['tile-take'])
+        self.assertEqual(result['verified']['take.ack'], [0, 1])
+        self.assertEqual(result['verified']['take.applied'], [0, 1])
+        self.assertEqual(result['verified']['p1.carried'], '1')
+
+    def test_take_noop_route_reaches_its_own_start(self):
+        def noop(io, holding, **kwargs):
+            io.send('tile-take')
+            return {'unchanged': {}, 'take.ack': [1, 2], 'take.applied': [1, 1], 'blocks': 5}
+
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(picker, 'take_noop', side_effect=noop), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.take_noop(self.ctx, 'cpu')
+            self.assertEqual(self.io.actions, ['tile-take', 'tile-take'])
+            self.assertEqual(result['verified']['reached_by'], 'take_cpu')
+        p1 = TakeRouteReplay()
+        with patch.object(routes, 'BridgePickerIO', return_value=p1), \
+             patch.object(picker, 'take_noop', side_effect=noop), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.take_noop(self.ctx, 'p1')
+            self.assertEqual(p1.actions, ['tap-b1', 'tile-take'])
+            self.assertEqual(result['verified']['reached_by'], 'b')
+        held = TakeRouteReplay()
+        held._take('1')
+        with patch.object(routes, 'BridgePickerIO', return_value=held), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'P1'):
+                routes.take_noop(self.ctx, 'p1')
+        self.assertEqual(held.actions, [])
+
+    def test_take_noop_route_passes_hold_through(self):
+        self.io._take('0')
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(picker, 'take_noop', side_effect=lambda *a, **k: {}) as noop, \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            held = routes.take_noop(self.ctx, 'p1', hold=True)
+            noop.assert_called_once_with(self.io, '0', hold=True)
+            self.assertEqual(held['args'], {'holding': 'p1', 'hold': True})
+            noop.reset_mock()
+            normal = routes.take_noop(self.ctx, 'p1')
+            noop.assert_called_once_with(self.io, '0', hold=False)
+            self.assertEqual(normal['args'], {'holding': 'p1'})
+
+    def test_expect_fighters_needs_roster_and_body_to_agree(self):
+        io = recorded.Replay(native_blocks=[recorded.l8w_native(1)])
+        ui = recorded.native(1, screen='training', **{'screen.context': 'training'})
+        state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+        bodies = {0: {'kind': 0}, 1: {'kind': 3}}
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+             patch.object(picker, 'wait_sample', return_value=ui), \
+             patch.object(routes, 'native_state', return_value=state), \
+             patch.object(routes, '_switch_hw', return_value=SimpleNamespace(fighters_now=lambda *a, **k: bodies)), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'entry 1.*Fox.*7.*3'):
+                routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
+            bodies[1]['kind'] = 7
+            state['roster'][1]['kind'] = 3
+            with self.assertRaisesRegex(RuntimeError, 'entry 1.*Fox.*7.*3'):
+                routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
+            state['roster'][1]['kind'] = 7
+            result = routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
+        self.assertEqual(result['verified']['bodies'][1], 7)
+        self.assertEqual(io.actions, [])
 
 
 if __name__ == '__main__':

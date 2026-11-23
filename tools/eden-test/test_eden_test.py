@@ -2,6 +2,7 @@
 """Offline tests for eden_test.py: fake lifecycle/runner/harvest scripts, temp run folders, no Eden."""
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import shutil
@@ -72,6 +73,29 @@ FAKE_HARVEST = 'print(\'{"segments": [], "gates": []}\')\n'
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class TileTakeRowsTests(unittest.TestCase):
+    def test_the_tile_take_rows_resolve_to_library_steps(self):
+        folder = Path(__file__).resolve().parent
+        with mock.patch.object(sys, 'path', [str(folder.parent / 'eden-runner'), *sys.path]):
+            import routes
+
+        plan = json.loads((folder / 'example' / 'rows-tile-take.json').read_text())
+        self.assertEqual([row['id'] for row in plan['rows']],
+                         ['tk00', 'tk01', 'tk02', 'tk03', 'tk04', 'tk04b', 'tk05', 'tk06'])
+        hold = next(row for row in plan['rows'] if row['id'] == 'tk04b')
+        self.assertEqual(hold['steps'], [
+            {'run': 'routes:take_noop', 'args': {'holding': 'p1', 'hold': True}},
+        ])
+        for row in plan['rows']:
+            for step in row['steps']:
+                with self.subTest(row=row['id'], step=step['run']):
+                    module, name = step['run'].split(':', 1)
+                    self.assertEqual(module, 'routes')
+                    function = getattr(routes, name, None)
+                    self.assertTrue(callable(function), step['run'])
+                    inspect.signature(function).bind(object(), **step.get('args', {}))
 
 
 class SetupFixtureTests(unittest.TestCase):

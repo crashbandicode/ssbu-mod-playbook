@@ -63,8 +63,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `pick_fighters` `{p1, cpu, take_back}` | character select | P1 placed; when `cpu` is supplied, the CPU coin is placed too. `take_back` defaults to false for P1-only callers |
 | `pick_cpu` `{fighter, topology, form}` | Training character select, P1 placed | the CPU coin placed on the target; P1's original medal unchanged |
 | `enter_training` `{cap, stage_ids, fighters}` | both placed | Training and the verified stage; fresh roster entries 0 and 1, checked against remembered or supplied fighters where known |
-| `set_cpu` `{fighter, cap}` | Training character select or Training | the CPU selected; in Training, settings and live roster both verified |
-| `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings and live roster both verified |
+| `set_cpu` `{fighter, cap}` | Training | the CPU selected through the Training Mod menu; settings, roster and live body verified |
+| `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings, roster and live body verified |
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_idle` `{cap}` | Training | back out of the wizard, close the menu or stop Guard the Edge; verify plain idle Training |
@@ -419,14 +419,32 @@ Surface calibration (2026-11-16): `pick_stage` accepts `transition_cap` (default
 `routes:pick_cpu(fighter, topology=None, form='default')` places the CPU coin at Training CSS with P1 placed;
 `routes:pick_fighters(p1, cpu=..., topology=None, form='default', take_back=False)` places both. Omitted topology uses the checked
 `css-training` library pin; an older Tile Cursor without CPU lines is refused before a CPU input. Receipts include
-the verified fighters and input/request counts. These paths have offline modelled-block tests, not a game proof.
+the verified fighters and input/request counts. A carried CPU coin has no focus in the Tile Cursor's old fields.
+These paths have offline modelled-block tests, not a game proof.
 
-2026-11-22: `routes:set_cpu` and `routes:set_player` select fighters in Training CSS or the Training Mod menu;
-the latter verifies the settings one-hot value and live roster. `routes:tr_settings(values=... | file=...)`
+### CPU = &lt;fighter&gt;
+
+`routes:reach_training(p1, cpu=..., stage=...)` or `routes:set_cpu(fighter)` sets the CPU in Training.
+Setup never picks the CPU with the Tile Cursor. The route opens the Training Rooms menu, selects Fighters &
+Stages and CPU Character, checks the grid identity when published, then verifies the settings one-hot,
+fresh live roster and live fighter body. `set_cpu` at fighter select refuses before input; `set_player`
+still picks P1 there. `routes:tr_settings(values=... | file=...)`
 checks the bridge set reply, writer and file readback (20-second default cap); fighter keys do not prove the live
-fighter unless `verify_roster=True`. `routes:setup_state` is read-only; `routes:reach_training(p1, cpu=None,
+fighter unless `verify_roster=True`; fresh rosters come from lines after the request's reply.
+`routes:setup_state` is read-only: `verified.stage_id` is the live Training stage or `unknown` elsewhere, with
+the remembered stage separate. `routes:reach_training(p1, cpu=None,
 stage='Final Destination', form='normal', cap=180)` uses the shortest checked suffix and reports skipped phases.
 These paths require independent runtime proof.
+
+### Tile Cursor: L3 + B
+
+The `tile-take` macro holds L3 then L3+B. `routes:take_cpu` takes the CPU coin with an empty hand;
+`routes:take_noop(holding='cpu' | 'p1')` checks that the chord is read but does nothing when a coin is held.
+`hold=True` plays `tile-take-hold` (L3 + B for 120 frames): with the Back-hold hook the fighter select is still up and nothing changed; without it the game backs out.
+`routes:place_cpu(fighter, must_move=False)` takes and moves the CPU coin to the named fighter, and
+`routes:expect_fighters(p1=None, cpu=None)` checks a fresh Training roster and live bodies without input.
+The take steps fence `take.ack` and `take.applied`; a build without both lines is refused before input.
+These paths have host replays, not runtime proof.
 
 `routes:tr_open(page=None, cap=20)` opens the Training Mod menu and optionally returns to its page ring
 and reaches the named page. `routes:tr_close(cap=20)` backs out through each depth and closes it; it does

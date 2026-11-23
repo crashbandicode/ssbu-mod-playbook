@@ -1,9 +1,12 @@
 """state_gate: framed bridge state blocks and the gate's freshness/transition rules (no Eden, no console)."""
 import re
+import sys
 import time
 import unittest
 import zlib
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state_gate as sg
 
 

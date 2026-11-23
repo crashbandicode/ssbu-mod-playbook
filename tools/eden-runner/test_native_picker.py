@@ -1,7 +1,11 @@
 """Replay exact tile and native state facts without controller or bridge I/O."""
 
+import sys
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
 
 
@@ -2034,6 +2038,166 @@ class TrainingSceneTransitionTests(unittest.TestCase):
                               (loading(3, **{'observation': 'bad'}), 'invalid observation')):
             with self.subTest(frame=frame), self.assertRaisesRegex(RuntimeError, reason):
                 self.run_wait(frame, ready)
+
+
+class TakeClock:
+    def __init__(self):
+        self.now = 0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class TakeReplay:
+    def __init__(self, clock, *, holding=None, fault=None, old=False):
+        self.clock, self.holding, self.fault, self.old = clock, holding, fault, old
+        self.rev = 1
+        self.actions = []
+        self.sent = False
+
+    def arm(self, provider, cap):
+        pass
+
+    def read(self, provider, cap):
+        self.clock.now += .04
+        self.rev += 1
+        if provider == picker.UI:
+            return l8w_native(self.rev)
+        from test_cpu_pick_replay import sample
+        if self.sent and self.holding is None and self.fault == 'unsettled':
+            state = sample('held-moving', self.rev)
+        elif self.holding == '1' or (self.sent and self.holding is None
+                                   and self.fault not in ('unread', 'not_taken', 'own_coin')):
+            state = sample('held', self.rev)
+        elif self.holding == '0' or (self.sent and self.fault == 'own_coin'):
+            state = l8w_tile(1796)
+            state.block['rev'] = self.rev
+            state.values.update(rev=str(self.rev), observation=str(10000 + self.rev), generation='28')
+            state.values.update({'hand.token': 'unknown', 'p1.coin': 'held', 'p1.coin.at': 'unknown',
+                                 'cpu.token': 'placed', 'cpu.placed.at': '86',
+                                 'cpu.placed.kind': 'unknown', 'cpu.placed.name': 'Random',
+                                 'cpu.placed.form': 'default', 'carried.kind': '0', 'carried.name': 'Mario',
+                                 'carried.form': 'default', 'target.token': 'none', 'token.settled': '0'})
+        else:
+            state = sample('rest', self.rev)
+        values = state.values
+        values.update({'ack': '13', 'applied': '13', 'blocked': '0', 'take.ack': '2', 'take.applied': '1'})
+        if self.sent and self.fault != 'unread':
+            values['take.ack'] = '3'
+            if self.holding is None and self.fault not in ('not_taken', 'own_coin'):
+                values['take.applied'] = '2'
+        if self.sent and self.fault == 'p1.carried':
+            values['p1.carried'] = '0' if self.holding == '1' else '1'
+            values['focus'] = 'css.grid.mario'
+        if self.sent and self.fault == 'cpu.placed.at':
+            values['cpu.placed.at'] = '44'
+        if self.sent and self.fault == 'take.applied':
+            values['take.applied'] = '2'
+        if self.sent and self.fault == 'duplicate':
+            values['take.ack'] = '4'
+        if self.sent and self.fault == 'tile_step':
+            values['ack'] = '14'
+        if self.sent and self.fault == 'p1_moved':
+            values['p1.coin.at'] = '1'
+        if self.old:
+            values.pop('take.ack')
+            values.pop('take.applied')
+        return state
+
+    def send(self, segment):
+        self.actions.append(segment)
+        self.sent = True
+
+    def finish(self):
+        pass
+
+
+class TakeTests(unittest.TestCase):
+    def run_take(self, *, holding=None, fault=None, old=False, noop=False):
+        clock = TakeClock()
+        io = TakeReplay(clock, holding=holding, fault=fault, old=old)
+        with patch.object(picker, 'time', clock):
+            result = (picker.take_noop(io, holding, cap=.7, quiet=.25) if noop
+                      else picker.take_cpu(io, cap=.7))
+        return io, result
+
+    def test_take_cpu_sends_l3_b_once_and_returns_on_the_settled_held_coin(self):
+        io, result = self.run_take()
+        self.assertIsNotNone(result)
+        self.assertEqual(io.actions, ['tile-take'])
+        self.assertEqual((result.values['take.ack'], result.values['take.applied']), ('3', '2'))
+        self.assertEqual((result.values['p1.carried'], result.values['settled']), ('1', '1'))
+
+    def test_take_cpu_refuses_a_build_without_take_lines_before_any_input(self):
+        clock = TakeClock()
+        io = TakeReplay(clock, old=True)
+        with patch.object(picker, 'time', clock), self.assertRaisesRegex(RuntimeError, 'no take.ack line'):
+            picker.take_cpu(io, cap=.7)
+        self.assertEqual(io.actions, [])
+
+    def test_take_cpu_fails_when_the_press_is_not_read(self):
+        with self.assertRaisesRegex(RuntimeError, 'was not read within .*take.ack unchanged'):
+            self.run_take(fault='unread')
+
+    def test_take_cpu_fails_when_the_press_is_read_but_no_coin_is_taken(self):
+        with self.assertRaisesRegex(RuntimeError, "was read but the CPU's coin was not taken"):
+            self.run_take(fault='not_taken')
+
+    def test_take_cpu_fails_when_p1s_own_coin_is_taken(self):
+        with self.assertRaisesRegex(RuntimeError, "took P1's own coin"):
+            self.run_take(fault='own_coin')
+
+    def test_take_cpu_rejects_concurrent_steps_multiple_reads_and_p1_motion(self):
+        for fault, error in (('duplicate', 'read more than once'),
+                             ('tile_step', 'a tile step arrived'),
+                             ('p1_moved', "P1's coin changed"),
+                             ('unsettled', 'taken but its hover did not settle')):
+            with self.subTest(fault=fault), self.assertRaisesRegex(RuntimeError, error):
+                self.run_take(fault=fault)
+
+    def test_take_noop_passes_when_the_press_is_read_and_nothing_changes(self):
+        for holding in ('1', '0'):
+            with self.subTest(holding=holding):
+                io, result = self.run_take(holding=holding, noop=True)
+                self.assertIn('take.ack', result)
+                self.assertEqual(result['take.ack'], [2, 3])
+                self.assertEqual(result['take.applied'], [1, 1])
+                self.assertGreaterEqual(result['blocks'], 5)
+                self.assertEqual(io.actions, ['tile-take'])
+
+    def test_take_noop_with_hold_plays_the_hold_macro_and_passes_when_nothing_changes(self):
+        clock = TakeClock()
+        io = TakeReplay(clock, holding='0')
+        with patch.object(picker, 'time', clock):
+            result = picker.take_noop(io, '0', cap=.7, quiet=.25, hold=True)
+        self.assertEqual(io.actions, ['tile-take-hold'])
+        self.assertEqual(result['macro'], 'tile-take-hold')
+        self.assertEqual(result['take.ack'], [2, 3])
+        self.assertEqual(result['take.applied'], [1, 1])
+
+    def test_take_noop_with_hold_fails_when_the_fighter_select_was_left(self):
+        class LeftSelectReplay(TakeReplay):
+            def read(self, provider, cap):
+                state = super().read(provider, cap)
+                if self.sent:
+                    state.values.update(screen='training', focus='training')
+                return state
+
+        clock = TakeClock()
+        io = LeftSelectReplay(clock, holding='0')
+        with patch.object(picker, 'time', clock), self.assertRaises(RuntimeError):
+            picker.take_noop(io, '0', cap=.7, quiet=.25, hold=True)
+        self.assertEqual(io.actions, ['tile-take-hold'])
+
+    def test_take_noop_fails_on_any_changed_field_or_an_unread_press(self):
+        for fault in ('p1.carried', 'cpu.placed.at', 'take.applied', 'unread', 'duplicate'):
+            with self.subTest(fault=fault), self.assertRaisesRegex(
+                    RuntimeError, 'was not read' if fault == 'unread' else
+                    'read more than once' if fault == 'duplicate' else f'changed {fault}'):
+                self.run_take(holding='1', fault=fault, noop=True)
 
 
 if __name__ == '__main__':

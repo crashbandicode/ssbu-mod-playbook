@@ -425,6 +425,7 @@ STATE_POS = re.compile(r'\[TrainingRooms\] state pos entry=(\d+) kind=(-?\d+) x=
                        r'status=(-?\d+) situation=(-?\d+)')
 STAGE = re.compile(r'\[Bridge\] stage id=(-?\d+)')
 ROSTER = re.compile(r'\[Bridge\] roster entry=(\d+) kind=(-?\d+) nana=(true|false)')
+ROSTER_REPLY = re.compile(r'\[Bridge\] req roster result=ok(?: entries=0x([0-9a-f]+))? frame=(\d+) wall=')
 ITEM = re.compile(r'\[Bridge\] item entry=(\d+) held=(true|false) kind=(-?\d+)')
 SPEED = re.compile(r'\[Bridge\] speed fps=(\S+) ratio=(\S+) frames=(\d+) ms=(\d+)')
 STATUS_ID = re.compile(r'(FIGHTER_STATUS_KIND_[A-Z0-9_]+)=(-?\d+)')
@@ -498,6 +499,80 @@ def parse_bridge_state(lines):
     return out
 
 
+def roster_response(lines, entries=()):
+    """The roster that answers the newest request reply in this request's log lines."""
+    reply = None
+    start = 0
+    for index, line in enumerate(lines):
+        match = ROSTER_REPLY.search(line)
+        if match:
+            reply, start = match, index + 1
+    if reply is None:
+        return None
+    mask, frame = reply.group(1), int(reply.group(2))
+    required = {bit for bit in range(int(mask, 16).bit_length()) if int(mask, 16) & (1 << bit)} \
+        if mask is not None else set(entries)
+    roster = {}
+    for line in lines[start:]:
+        match, tail = ROSTER.search(line), SUFFIX.search(line)
+        if match and tail and int(tail.group(1)) >= frame:
+            roster[int(match.group(1))] = {'kind': int(match.group(2)), 'nana': match.group(3) == 'true'}
+    if not required.issubset(roster) or (mask is None and not required and not roster):
+        return None
+    return {entry: value for entry, value in roster.items() if mask is None or entry in required}
+
+
+def fighters_response(lines):
+    """Return bodies bound to the newest complete fighters reply, or None."""
+    reply = None
+    start = 0
+    for index, line in enumerate(lines):
+        match = re.search(r'\[Bridge\] req fighters result=ok frame=(\d+)(?: |$)', line)
+        if match:
+            reply, start = int(match.group(1)), index + 1
+    if reply is None:
+        return None
+    bodies = {}
+    for line in lines[start:]:
+        tail = SUFFIX.search(line)
+        frame = int(tail.group(1)) if tail else None
+        if (summary := re.search(r'\[Bridge\] fighters entries=0x([0-9a-f]+)(?: |$)', line)):
+            if frame is None or frame < reply:
+                return None
+            mask = int(summary.group(1), 16)
+            required = {bit for bit in range(mask.bit_length()) if mask & (1 << bit)}
+            if not required.issubset(bodies):
+                return None
+            return {entry: bodies[entry] for entry in sorted(required)}
+        match = FIGHTER.search(line)
+        if match and frame is not None and frame >= reply:
+            values = match.groups()
+            bodies[int(values[0])] = {'kind': int(values[1]), 'x': float(values[2]), 'y': float(values[3]),
+                                      'lr': float(values[4]), 'dmg': float(values[5]), 'status': int(values[6])}
+    return None
+
+
+def fighters_now(run, cap=6.0):
+    """Request and return fresh fighters bound to their reply."""
+    run = Path(run)
+    log = run / 'bridge.log'
+    start = log.stat().st_size if log.exists() else 0
+    filename, _, payload = FRESH['fighters']
+    (run / 'bridge' / filename).write_bytes(payload)
+    until = time.monotonic() + cap
+    while True:
+        if log.exists():
+            with log.open('rb') as stream:
+                stream.seek(start)
+                lines = stream.read().decode(errors='replace').splitlines()
+            result = fighters_response(lines)
+            if result is not None:
+                return result
+        if time.monotonic() >= until:
+            raise RuntimeError(f'bridge fighters: no complete answer within {cap} s')
+        time.sleep(min(.1, max(0, until - time.monotonic())))
+
+
 def bridge_state(run, fresh=(), cap=6.0, *, roster_entries=()):
     """The console's state from a bridge run (`up --bridge-host`): `fresh` names (pos, speed, roster, status) are asked
     for first through the spool and must answer within `cap` s; everything else is the newest line already seen."""
@@ -515,14 +590,20 @@ def bridge_state(run, fresh=(), cap=6.0, *, roster_entries=()):
         seen = {name for name, regex in want.items() if any(regex.search(line) for line in new)}
         if 'pos' in want and len({int(m.group(1)) for line in new if (m := STATE_POS.search(line))}) < 2:
             seen.discard('pos')
-        if ('roster' in want and roster_entries
-                and not set(roster_entries).issubset({int(m.group(1)) for line in new if (m := ROSTER.search(line))})):
-            seen.discard('roster')
+        if 'roster' in want:
+            response = roster_response(new, roster_entries)
+            if response is None:
+                seen.discard('roster')
+            else:
+                seen.add('roster')
         if len(seen) < len(want):
             if time.monotonic() > until:
                 raise RuntimeError(f'bridge state: no answer for {sorted(set(want) - seen)} within {cap} s')
             time.sleep(0.1)
-    return parse_bridge_state(log.read_text(errors='replace').splitlines())
+    state = parse_bridge_state(log.read_text(errors='replace').splitlines())
+    if 'roster' in want:
+        state['roster'] = response
+    return state
 
 
 def bridge_bodies(run, cap=1.5):

@@ -1248,7 +1248,7 @@ def _enter_training(ctx, cap, stage_ids, fighters, metrics):
     for seat, name in (fighters or {}).items():
         if seat not in kinds:
             raise ValueError(f'unknown fighter seat {seat!r}')
-        kinds[seat] = fighter_entry(name)['kind']
+        kinds[seat] = fighter_entry(name)['kind'] if name is not None else None
     started = time.monotonic()
     result = _native_enter_training(ctx, cap, stage_ids)
     entry_ms = round((time.monotonic() - started) * 1000)
@@ -1910,6 +1910,7 @@ def _parking_tile(topology, start, target):
 
 
 def pick_cpu(ctx, fighter, *, topology=None, form='default'):
+    # Setup blocks set the CPU in Training; this remains for Tile Cursor rows.
     """Place the CPU coin from a qualified Training fighter-select observation."""
     entry = fighter_entry(fighter)
     target = _native_target(entry, form)
@@ -1992,6 +1993,151 @@ def pick_cpu(ctx, fighter, *, topology=None, form='default'):
         'skipped': skipped, 'already': already, 'untangled': untangled, 'parked_at': parked,
     }
     return _save(ctx, 'routes-pick-cpu', receipt)
+
+
+def take_cpu(ctx):
+    """Take the CPU's coin at Training fighter select."""
+    started = time.monotonic()
+    io = BridgePickerIO(ctx)
+    before, _ = native_picker._coin_baseline(io, 4, 'training')
+    native_picker.take_lines(before)
+    ack = native_picker.number(before, 'take.ack')
+    applied = native_picker.number(before, 'take.applied')
+    after = native_picker.take_cpu(io)
+    if (native_picker.number(after, 'take.ack'), native_picker.number(after, 'take.applied')) != (ack + 1, applied + 1):
+        raise RuntimeError('L3 + B counters changed before the take')
+    return _save(ctx, 'routes-take-cpu', {
+        'block': 'take_cpu', 'args': {},
+        'verified': {'take.ack': [ack, ack + 1], 'take.applied': [applied, applied + 1],
+                     **{key: after.values[key] for key in ('p1.carried', 'cpu.token', 'p1.coin.at', 'at')}},
+        'inputs': getattr(io, 'input_count', len(getattr(io, 'actions', ()))),
+        'ms': {'total': round((time.monotonic() - started) * 1000)},
+    })
+
+
+def take_noop(ctx, holding, hold=False):
+    """Check that L3 + B does nothing while the specified coin is held."""
+    if holding not in ('cpu', 'p1'):
+        raise ValueError(f'holding must be cpu or p1, not {holding!r}')
+    started = time.monotonic()
+    io = BridgePickerIO(ctx)
+    current, ui = native_picker._coin_baseline(io, 4, 'training')
+    native_picker.take_lines(current)
+    carried = current.values.get('p1.carried')
+    wanted = '1' if holding == 'cpu' else '0'
+    if carried == wanted:
+        reached_by = 'already'
+    elif carried in ('none', 'unknown') and current.values.get('carried') == 'none':
+        native_picker._p1_placed(current)
+        if holding == 'cpu':
+            native_picker.take_cpu(io)
+            reached_by = 'take_cpu'
+        else:
+            native_picker.take_back_local_token(io, current, ui, expected_context='training')
+            reached_by = 'b'
+    else:
+        raise RuntimeError(f'{holding.upper()} no-op requires its coin or an empty hand; p1.carried={carried!r}')
+    verified = native_picker.take_noop(io, wanted, hold=hold)
+    verified['reached_by'] = reached_by
+    args = {'holding': holding}
+    if hold:
+        args['hold'] = True
+    return _save(ctx, 'routes-take-noop', {
+        'block': 'take_noop', 'args': args, 'verified': verified,
+        'inputs': getattr(io, 'input_count', len(getattr(io, 'actions', ()))),
+        'ms': {'total': round((time.monotonic() - started) * 1000)},
+    })
+
+
+def place_cpu(ctx, fighter, must_move=False):
+    """Place the CPU's coin on a qualified fighter tile."""
+    started = time.monotonic()
+    entry = fighter_entry(fighter)
+    target = _native_target(entry, 'default')
+    topology = _tile_topology(library_topology('css-training'))
+    io = BridgePickerIO(ctx)
+    current, _ = native_picker._coin_baseline(io, 4, 'training')
+    native_picker.take_lines(current)
+    if topology is None or topology.layout != current.values.get('layout'):
+        raise RuntimeError('CPU placement needs the qualified active CSS topology')
+    goals = [tile for tile, identity in topology.targets.items() if identity == target]
+    if len(goals) != 1:
+        raise RuntimeError('CPU target identity is absent or ambiguous in the active topology')
+    goal = goals[0]
+    p1_at = str(native_picker.number(current, 'p1.coin.at'))
+    p1_identity = topology.targets.get(p1_at)
+    if current.values.get('p1.coin') != 'placed' or p1_identity is None:
+        raise RuntimeError('P1 coin is not placed on a qualified tile')
+    p1_before = ('placed', p1_at, p1_identity.kind, p1_identity.name, p1_identity.form)
+    already = (current.values.get('cpu.token') == 'placed'
+               and tuple(current.values.get('cpu.placed.' + key) for key in ('at', 'kind', 'name', 'form'))
+               == (goal, target.kind, target.name, target.form))
+    taken_here = False
+    steps = 0
+    if already:
+        native_picker._p1_placed(current)
+        if native_picker.p1_medal(current) != p1_before:
+            raise RuntimeError('P1 medal identity disagrees with the qualified topology')
+        if must_move:
+            raise RuntimeError(f"the CPU's coin is already on {fighter}: this row cannot show a move")
+        final = current
+        skipped = ['take', 'walk', 'place']
+    else:
+        carried = current.values.get('p1.carried')
+        if carried == '1' and current.values.get('cpu.token') == 'held':
+            skipped = ['take']
+        elif carried in ('none', 'unknown') and current.values.get('carried') == 'none':
+            native_picker._p1_placed(current)
+            if native_picker.p1_medal(current) != p1_before:
+                raise RuntimeError('P1 medal identity disagrees with the qualified topology')
+            current = native_picker.take_cpu(io)
+            taken_here = True
+            skipped = []
+        else:
+            raise RuntimeError(f"CPU placement requires its coin held or an empty hand: {carried!r}")
+        ack, applied = native_picker.number(current, 'ack'), native_picker.number(current, 'applied')
+        walked, reached = native_picker.walk_cpu(io, target, topology)
+        steps = native_picker.number(walked, 'ack') - ack
+        if steps < 0 or native_picker.number(walked, 'applied') - applied != steps:
+            raise RuntimeError('CPU tile step counters disagree')
+        if must_move and steps < 1:
+            raise RuntimeError(f"the CPU's coin is already on {fighter}: this row cannot show a move")
+        final = native_picker.place_cpu(io, target, reached, p1_before)
+    remember(ctx, cpu_kind=entry['kind'], cpu=entry['name'])
+    return _save(ctx, 'routes-place-cpu', {
+        'block': 'place_cpu', 'args': {'fighter': fighter, 'must_move': must_move},
+        'verified': {'cpu': {'tile': goal, 'kind': target.kind, 'name': target.name, 'form': target.form},
+                     'p1_medal': list(native_picker.p1_medal(final)), 'steps': steps},
+        'inputs': getattr(io, 'input_count', len(getattr(io, 'actions', ()))),
+        'ms': {'total': round((time.monotonic() - started) * 1000)},
+        'skipped': skipped, 'already': already, 'taken_here': taken_here,
+    })
+
+
+def expect_fighters(ctx, p1=None, cpu=None):
+    """Confirm the requested Training fighters against roster and live bodies."""
+    started = time.monotonic()
+    io = BridgePickerIO(ctx)
+    ui = native_picker.wait_sample(io, native_picker.UI, started + 6)
+    if not _fields_match(ui, TRAINING_SCREEN):
+        raise RuntimeError('expect_fighters needs Training with native input')
+    state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
+    bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent)
+    roster = state.get('roster', {})
+    for seat, name in ((0, p1), (1, cpu)):
+        if name is not None:
+            wanted = fighter_entry(name)['kind']
+            roster_kind = roster.get(seat, {}).get('kind')
+            body_kind = bodies.get(seat, {}).get('kind')
+            if roster_kind != wanted or body_kind != wanted:
+                raise RuntimeError(f'entry {seat} wanted {name} kind {wanted}: '
+                                   f'roster kind {roster_kind}, body kind {body_kind}')
+    return _save(ctx, 'routes-expect-fighters', {
+        'block': 'expect_fighters', 'args': {'p1': p1, 'cpu': cpu},
+        'verified': {'roster': {seat: value.get('kind') for seat, value in roster.items()},
+                     'bodies': {seat: value.get('kind') for seat, value in bodies.items()}},
+        'inputs': 0, 'ms': {'total': round((time.monotonic() - started) * 1000)},
+    })
 
 
 def _native_target(entry, form):
@@ -2634,6 +2780,29 @@ def _live_fighter(ctx, seat, kind, cap):
     if (0 not in roster or 1 not in roster or roster[seat].get('kind') != kind):
         raise RuntimeError(f'live roster does not confirm entry {seat} kind {kind}: {roster}')
     return roster
+
+
+def _live_body(ctx, seat, kind, cap):
+    """Wait for a fresh live body matching the requested seat and kind."""
+    until = time.monotonic() + cap
+    last = None
+    while time.monotonic() < until:
+        ctx.check_stop()
+        metrics = getattr(ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics['bridge_requests'] += 1
+        try:
+            bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent,
+                                               cap=max(.01, min(6.0, until - time.monotonic())))
+            last = bodies.get(seat)
+            if last is not None and last.get('kind') == kind:
+                return last
+        except RuntimeError:
+            last = None
+        remaining = until - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(.25, remaining))
+    raise RuntimeError(f'live fighter does not confirm entry {seat} kind {kind}: {last!r}')
 
 
 def _with_setup_metrics(ctx, action):
@@ -4011,9 +4180,11 @@ def _set_fighter(ctx, fighter, seat, cap, metrics):
     if not _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
         raise RuntimeError('fighter setup needs the Training context without a modal dialog')
     if _fields_match(ui, TRAINING_CSS):
-        nested = (pick_cpu(ctx, fighter) if seat == 1 else
-                  pick_local_fighter(ctx, fighter, topology=library_topology('css-training'),
-                                     take_back=True, expected_context='training'))
+        if seat == 1:
+            raise RuntimeError('set_cpu works in Training: the CPU is set through the Training Rooms menu; '
+                               'call reach_training first')
+        nested = pick_local_fighter(ctx, fighter, topology=library_topology('css-training'),
+                                    take_back=True, expected_context='training')
         return _save(ctx, f'routes-set-{"cpu" if seat else "player"}', {
             'block': 'set_cpu' if seat else 'set_player', 'args': {'fighter': fighter},
             'verified': nested, 'skipped': ['tr_menu'], **metrics,
@@ -4116,11 +4287,14 @@ def _set_fighter(ctx, fighter, seat, cap, metrics):
     phase = time.monotonic()
     roster = _live_fighter(ctx, seat, entry['kind'], max(.01, until - time.monotonic()))
     timings['roster'] = round((time.monotonic() - phase) * 1000)
+    phase = time.monotonic()
+    fighter_body = _live_body(ctx, seat, entry['kind'], max(.01, until - time.monotonic()))
+    timings['fighter'] = round((time.monotonic() - phase) * 1000)
     remember(ctx, **{f'{"cpu" if seat else "p1"}_kind': entry['kind'],
                      'cpu' if seat else 'p1': entry['name']})
     return _save(ctx, f'routes-set-{"cpu" if seat else "player"}', {
         'block': 'set_cpu' if seat else 'set_player', 'args': {'fighter': fighter},
-        'verified': {'kind': entry['kind'], 'roster': roster, 'one_hot': picked},
+        'verified': {'kind': entry['kind'], 'roster': roster, 'one_hot': picked, 'fighter': fighter_body},
         'grid_named': named, 'writer': writer_line, **metrics,
         'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],
     })
@@ -4204,7 +4378,7 @@ def setup_state(ctx):
     ui = native_picker.wait_sample(io, native_picker.UI, time.monotonic() + 6)
     screen = ui.values.get('screen', 'unknown')
     p1 = cpu = 'unknown'
-    stage = expected(ctx).get('stage_id', 'unknown')
+    stage = 'unknown'
     if screen == 'training':
         state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
         roster = state.get('roster', {})
@@ -4227,6 +4401,7 @@ def setup_state(ctx):
                                                          'settings_sha256': hashlib.sha256(settings).hexdigest(),
                                                          'settings_source': source},
         'inputs': 0, 'bridge_requests': getattr(io, 'request_count', 0) + 1 + int(screen == 'training'),
+        'remembered': {'stage_id': expected(ctx).get('stage_id')},
         'bridge_boot': ui.block['boot'], 'revisions': getattr(io, 'revisions', {}),
         'ms': {'total': round((time.monotonic() - started) * 1000)}, 'skipped': [],
     })
@@ -4242,7 +4417,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     phases = ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
-              'pick_fighters', 'enter_training')
+              'pick_fighters', 'enter_training', 'set_cpu')
     skipped, timings, receipts = list(phases), {}, {}
 
     def run(name, function, *args, **kwargs):
@@ -4274,9 +4449,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
             known_stage = state.get('stage')
             roster = state.get('roster', {})
             stage_matches = state.get('stage') == wanted_stage
-            fighters_match = (roster.get(0, {}).get('kind') == wanted_p1
-                              and 1 in roster and (wanted_cpu is None or roster[1].get('kind') == wanted_cpu))
-            if stage_matches and fighters_match:
+            p1_matches = roster.get(0, {}).get('kind') == wanted_p1 and 1 in roster
+            if stage_matches and p1_matches:
                 final = state
                 screen = 'done'
             elif stage_matches:
@@ -4299,10 +4473,14 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
             run('pick_stage', pick_stage, ctx, stage, topology=library_topology('sss-training'), form=form)
             screen = 'css.training'
         if screen == 'css.training':
-            run('pick_fighters', pick_fighters, ctx, p1, cpu=cpu, topology=library_topology('css-training'),
+            run('pick_fighters', pick_fighters, ctx, p1, topology=library_topology('css-training'),
                 take_back=True)
             run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
-                stage_ids={wanted_stage}, fighters={'p1': p1, **({'cpu': cpu} if cpu is not None else {})})
+                stage_ids={wanted_stage}, fighters={'p1': p1, 'cpu': None})
+            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
+                                 roster_entries=(0, 1))
+        if wanted_cpu is not None and final.get('roster', {}).get(1, {}).get('kind') != wanted_cpu:
+            run('set_cpu', _set_fighter, ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
             final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
                                  roster_entries=(0, 1))
         final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
