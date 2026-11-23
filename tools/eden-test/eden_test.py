@@ -1196,7 +1196,8 @@ def nro_lines(run, config):
             if entry['source'] == 'card':
                 return '; from the card lineup'
             if entry['source'] == 'base':
-                return '; from the base (not on the card)'
+                return ('; from the base (not on the card)' if config.get('card_lineup', {}).get('staged')
+                        else '; from the base')
             replaced = entry.get('replaces')
             if replaced:
                 kind = 'card file' if replaced['source'] == 'card' else 'base pin'
