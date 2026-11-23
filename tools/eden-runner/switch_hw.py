@@ -522,6 +522,14 @@ def roster_response(lines, entries=()):
     return {entry: value for entry, value in roster.items() if mask is None or entry in required}
 
 
+def fighters_response(lines):
+    return None
+
+
+def fighters_now(run, cap=6.0):
+    return None
+
+
 def bridge_state(run, fresh=(), cap=6.0, *, roster_entries=()):
     """The console's state from a bridge run (`up --bridge-host`): `fresh` names (pos, speed, roster, status) are asked
     for first through the spool and must answer within `cap` s; everything else is the newest line already seen."""

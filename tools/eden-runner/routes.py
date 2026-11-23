@@ -2606,6 +2606,10 @@ def _live_fighter(ctx, seat, kind, cap):
     return roster
 
 
+def _live_body(ctx, seat, kind, cap):
+    return None
+
+
 def _with_setup_metrics(ctx, action):
     metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
     previous = getattr(ctx.runner, 'setup_metrics', None)

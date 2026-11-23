@@ -456,7 +456,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_reach_training_requests_take_back_on_the_css_suffix(self):
         io = menu_replay()
         io.menu['open'] = '0'
-        initial = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 3}}}
+        initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
@@ -466,6 +466,24 @@ class SetupReworkTests(unittest.TestCase):
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             json.dumps(routes.reach_training(self.ctx, 'Mario', cpu='Fox'))
         self.assertIs(fighters.call_args.kwargs['take_back'], True)
+
+    def test_fighters_now_binds_the_bodies_to_their_reply(self):
+        def fighter(entry, kind, frame):
+            return (f'[Bridge] fighter entry={entry} kind={kind} x=0 y=0 lr=1 dmg=0 status=0 '
+                    f'situation=0 stock=3 dead=0 item=0 frame={frame} wall=1')
+
+        old = fighter(1, 7, 10)
+        reply = '[Bridge] req fighters result=ok frame=20 wall=1'
+        body0, body1 = fighter(0, 0, 21), fighter(1, 3, 21)
+        summary = '[Bridge] fighters entries=0x3 count=4 frame=21 wall=1'
+        lines = [old, reply, body0, body1, summary]
+        result = switch_hw.fighters_response(lines)
+        self.assertIsNotNone(result)
+        self.assertEqual({k: v['kind'] for k, v in result.items()}, {0: 0, 1: 3})
+        self.assertIsNone(switch_hw.fighters_response(lines[:-1]))
+        self.assertIsNone(switch_hw.fighters_response([old, reply, body0, summary]))
+        with self.assertRaisesRegex(RuntimeError, 'fighters'):
+            switch_hw.fighters_now(self.root, cap=0.01)
 
     def test_set_player_requests_take_back_at_training_character_select(self):
         import test_native_picker as recorded
