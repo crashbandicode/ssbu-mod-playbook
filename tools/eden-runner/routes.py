@@ -1985,7 +1985,7 @@ def take_cpu(ctx):
     })
 
 
-def take_noop(ctx, holding):
+def take_noop(ctx, holding, hold=False):
     """Check that L3 + B does nothing while the specified coin is held."""
     if holding not in ('cpu', 'p1'):
         raise ValueError(f'holding must be cpu or p1, not {holding!r}')
@@ -2007,10 +2007,13 @@ def take_noop(ctx, holding):
             reached_by = 'b'
     else:
         raise RuntimeError(f'{holding.upper()} no-op requires its coin or an empty hand; p1.carried={carried!r}')
-    verified = native_picker.take_noop(io, wanted)
+    verified = native_picker.take_noop(io, wanted, hold=hold)
     verified['reached_by'] = reached_by
+    args = {'holding': holding}
+    if hold:
+        args['hold'] = True
     return _save(ctx, 'routes-take-noop', {
-        'block': 'take_noop', 'args': {'holding': holding}, 'verified': verified,
+        'block': 'take_noop', 'args': args, 'verified': verified,
         'inputs': getattr(io, 'input_count', len(getattr(io, 'actions', ()))),
         'ms': {'total': round((time.monotonic() - started) * 1000)},
     })

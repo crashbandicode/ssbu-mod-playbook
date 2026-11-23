@@ -117,6 +117,14 @@
    "what": "L3, then L3+B for 4 frames: the tile cursor takes the CPU's coin",
    "source": "authored 2026-11-22 fusion-g4"
   },
+  "tile-take-hold": {
+   "file": "macros/tile-take-hold.edenmacro.json",
+   "sha256": "9be8d5ced74de1f446b6f38c7809572b7c63af384b9fe297e9586bcf186ebb8f",
+   "cap": 20,
+   "frames": 124,
+   "what": "L3, then L3+B for 120 frames: longer than the game's Back hold",
+   "source": "authored 2026-11-23 fusion-g4"
+  },
   "tap-plus1": {
    "file": "macros/tap-plus1.edenmacro.json",
    "sha256": "425bc0e0d6d6a4f7e659575d926a46ec2d1157ac301d18db4a26cc6415ae9b1d",

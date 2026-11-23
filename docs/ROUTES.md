@@ -439,6 +439,7 @@ These paths require independent runtime proof.
 
 The `tile-take` macro holds L3 then L3+B. `routes:take_cpu` takes the CPU coin with an empty hand;
 `routes:take_noop(holding='cpu' | 'p1')` checks that the chord is read but does nothing when a coin is held.
+`hold=True` plays `tile-take-hold` (L3 + B for 120 frames): with the Back-hold hook the fighter select is still up and nothing changed; without it the game backs out.
 `routes:place_cpu(fighter, must_move=False)` takes and moves the CPU coin to the named fighter, and
 `routes:expect_fighters(p1=None, cpu=None)` checks a fresh Training roster and live bodies without input.
 The take steps fence `take.ack` and `take.applied`; a build without both lines is refused before input.

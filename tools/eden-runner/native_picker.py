@@ -549,7 +549,7 @@ def take_cpu(io, cap=4, *, expected_context='training'):
     raise RuntimeError(f"the CPU's coin was taken but its hover did not settle within {cap} s")
 
 
-def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
+def take_noop(io, holding, cap=4, quiet=1.0, *, hold=False, expected_context='training'):
     """Confirm L3 + B is read without changing a held coin."""
     if holding not in ('0', '1'):
         raise ValueError(f'invalid holding {holding!r}')
@@ -566,7 +566,8 @@ def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
         raise RuntimeError('tile.cursor: incomplete L3 + B no-op observation')
     unchanged = {field: values[field] for field in watched}
     ack, applied = number(before, 'take.ack'), number(before, 'take.applied')
-    io.send('tile-take')
+    macro = 'tile-take-hold' if hold else 'tile-take'
+    io.send(macro)
     until = time.monotonic() + cap + quiet
     latest, first, blocks = before, None, 0
     while True:
@@ -595,7 +596,7 @@ def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
                 if blocks >= 5 and time.monotonic() - first >= quiet:
                     _coin_finish(io, ui, until, expected_context)
                     return {'take.ack': [ack, current], 'take.applied': [applied, applied],
-                            'unchanged': unchanged, 'blocks': blocks}
+                            'unchanged': unchanged, 'blocks': blocks, 'macro': macro}
     if first is None:
         raise RuntimeError(f'L3 + B was not read within {cap + quiet} s (take.ack unchanged)')
     raise RuntimeError(f'L3 + B did not remain unchanged for {quiet} s within the deadline')
