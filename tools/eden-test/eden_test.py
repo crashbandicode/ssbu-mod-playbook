@@ -268,8 +268,13 @@ def go_new(args):
     for item in config['instances']:
         if 'display' in item:
             original = item['display']
-            chosen = free_display(original, taken=[choice['chosen'] for choice in choices])
-            choices.append({'key': item['key'], 'base': original, 'chosen': chosen})
+            if config.get('display_helper'):
+                chosen = free_display(original, taken=[choice['chosen'] for choice in choices])
+                reason = 'free display chosen (helper provisions it)'
+            else:
+                chosen = original
+                reason = 'kept: the base has no display_helper'
+            choices.append({'key': item['key'], 'base': original, 'chosen': chosen, 'reason': reason})
             item['display'] = chosen
     config['display_choice'] = choices
     run = RUNS / args.label

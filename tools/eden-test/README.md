@@ -6,7 +6,7 @@ From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ss
 On the Eden host, run the same command with its local host name:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
-Each run gets its own bridge port and its own X display.
+Each run gets its own bridge port and its own X display (when the base has a display helper; otherwise the base's display is kept).
 The base names the host's network interface ("network_interface"); go refuses when that interface is missing, down, loopback or has no IPv4 address, unless --no-lobby. Override with `--network-interface <name>`.
 Boot rows call routes:host_network (never set core.network_interface to "lo": Eden does not list loopback, so the game has no network and cannot open a local wireless room).
 A run with --no-lobby on a host without a usable interface must not call host_network.
