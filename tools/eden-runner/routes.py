@@ -1049,7 +1049,7 @@ def wireless_room(ctx, ready_cap=60):
                 raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless; saw {last}')
             if last['screen'] == 'css.smash':
                 break
-            io.send('tap-a1')
+            io.send('lobby-a')
             stage_presses += 1
             ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 15,
                                       lambda v: v.get('screen') == 'css.smash'
@@ -1063,20 +1063,25 @@ def wireless_room(ctx, ready_cap=60):
                 raise RuntimeError(f'wireless_room: expected css.smash in local_wireless; saw {last}, screens {screens}')
             io.finish()
 
-    ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, lambda v: v.get('screen') == 'css', screens)
+    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
+                              lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
+                              and v.get('screen.context') == 'local_wireless', screens)
     if not ok:
-        raise RuntimeError(f'wireless_room: expected tile.cursor screen css; saw {tile}')
-    placed_by, chord_sent = 'already placed', False
+        raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before tile-up; saw {last}')
+    ok, tile = _wireless_wait(
+        ctx, io, 'tile.cursor', 8,
+        lambda v: v.get('screen') == 'css' and (_wireless_placed(v)
+                                                 or v.get('p1.token') == 'held' or v.get('local.token') == 'held'),
+        screens)
+    if not ok:
+        raise RuntimeError(f'wireless_room: expected tile.cursor screen css with p1.token held before the chord; '
+                           f'saw {tile}')
+    placed_by, chord_sent, chord_fence = 'already placed', False, None
     if not _wireless_placed(tile):
         at = tile.get('at')
         if not (isinstance(at, str) and at.isdigit() and tile.get('hovered') == at):
-            ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                                      lambda v: v.get('screen') == 'css.smash'
-                                      and v.get('observation.active') == 'yes'
-                                      and v.get('screen.context') == 'local_wireless', screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before tile-up; saw {last}')
-            io.send('tile-up')
+            chord_fence = {key: tile.get(key) for key in ('screen', 'p1.token', 'local.token', 'at', 'hovered')}
+            io.send('lobby-first-tile')
             chord_sent = True
             ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 5,
                                       lambda v: v.get('screen') == 'css' and isinstance(v.get('at'), str)
@@ -1097,7 +1102,7 @@ def wireless_room(ctx, ready_cap=60):
             if not (tile.get('screen') == 'css' and isinstance(at, str) and at.isdigit()
                     and tile.get('hovered') == at):
                 raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
-            io.send('tap-a1')
+            io.send('lobby-a')
             placed_by = 'chord + A' if chord_sent else 'A'
             ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, _wireless_placed, screens)
             if not ok:
@@ -1112,7 +1117,7 @@ def wireless_room(ctx, ready_cap=60):
     tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
     if not _wireless_placed(tile):
         raise RuntimeError(f'wireless_room: expected p1.token or local.token placed before Ready; saw {tile}')
-    io.send('tap-plus1')
+    io.send('lobby-ready')
     ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', ready_cap,
                                  lambda v: v.get('screen') == 'ldn.waiting'
                                  and v.get('observation.active') == 'yes', screens)
@@ -1129,6 +1134,7 @@ def wireless_room(ctx, ready_cap=60):
     return _save(ctx, 'routes-wireless-room', {
         'block': 'wireless_room', 'screens': screens, 'create_form': create_form, 'confirm_presses': confirm_presses,
         'stage_presses': stage_presses, 'tile': tile, 'placed_by': placed_by, 'chord_sent': chord_sent,
+        'chord_fence': chord_fence,
         'waiting': {key: waiting.get(key, 'unknown')
                     for key in ('screen', 'ldn.role', 'ldn.members', 'observation.active')},
         'ldn.members': waiting.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),

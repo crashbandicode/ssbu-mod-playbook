@@ -21,6 +21,30 @@
    "what": "ZR, Down, Down, A to open the Local Wireless room list",
    "source": "recipe flown in tss-lobby-17060a5e-3 b03"
   },
+  "lobby-a": {
+   "file": "macros/lobby-a.edenmacro.json",
+   "sha256": "d640b85c63b60d7b845565b9adfb2fb1cea64061e073b556236c2427cbbda3e6",
+   "cap": 15,
+   "frames": 46,
+   "what": "A hold 9 frames, gap 37, for Local Wireless stage and placement",
+   "source": "recipe flown in tss-lobby-17060a5e-3"
+  },
+  "lobby-first-tile": {
+   "file": "macros/lobby-first-tile.edenmacro.json",
+   "sha256": "66dcfa1471b3236e9a1074dff60a03f1f4ffb6af6c87e5cb2d3e3d5e11609c1f",
+   "cap": 15,
+   "frames": 45,
+   "what": "L3+Up hold 9 frames, gap 36, for the first Local Wireless tile",
+   "source": "recipe flown in tss-lobby-17060a5e-3"
+  },
+  "lobby-ready": {
+   "file": "macros/lobby-ready.edenmacro.json",
+   "sha256": "dca26dab31eacbcafb68f3fdbb554be31d9346edf75577b40e660956610c6ac5",
+   "cap": 15,
+   "frames": 52,
+   "what": "Plus hold 9 frames, gap 43, for Local Wireless Ready",
+   "source": "recipe flown in tss-lobby-17060a5e-3"
+  },
   "main-menu-left": {
    "file": "macros/main-menu-left.edenmacro.json",
    "sha256": "0c0ed5acbecf8b42e5225f2e2f48855922e69bf9b5da7c47559d8671edd428a1",
