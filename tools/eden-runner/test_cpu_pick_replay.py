@@ -17,8 +17,8 @@ import test_native_picker as recorded
 from test_setup_calls import CoinReplay, modelled_block
 
 FIXTURE = Path(__file__).resolve().parent / 'fixtures/tile-cursor-cpu-pick-wire.txt'
-FIXTURE_SHA256 = '723115256380789c1d64af390e719fe8601c320db76c2ecd8d7ea8dea4da8dd5'
-TILE_COMMIT = 'fad1e5c3754bba4516e79a028c522cdfeb27012b'
+FIXTURE_SHA256 = 'e6e5036b2c53a9eea39ccbc9cbd16341231f590e3b21174fd9d873e796b8011c'
+TILE_COMMIT = 'e68d8adce1a7ff721d8cd0490db0ee95f3cfa88b'
 
 
 def blocks():

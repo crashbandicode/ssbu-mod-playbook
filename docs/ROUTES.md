@@ -435,6 +435,15 @@ the remembered stage separate. `routes:reach_training(p1, cpu=None,
 stage='Final Destination', form='normal', cap=180)` uses the shortest checked suffix and reports skipped phases.
 These paths require independent runtime proof.
 
+### Tile Cursor: L3 + B
+
+The `tile-take` macro holds L3 then L3+B. `routes:take_cpu` takes the CPU coin with an empty hand;
+`routes:take_noop(holding='cpu' | 'p1')` checks that the chord is read but does nothing when a coin is held.
+`routes:place_cpu(fighter, must_move=False)` takes and moves the CPU coin to the named fighter, and
+`routes:expect_fighters(p1=None, cpu=None)` checks a fresh Training roster and live bodies without input.
+The take steps fence `take.ack` and `take.applied`; a build without both lines is refused before input.
+These paths have host replays, not runtime proof.
+
 `routes:tr_open(page=None, cap=20)` opens the Training Mod menu and optionally returns to its page ring
 and reaches the named page. `routes:tr_close(cap=20)` backs out through each depth and closes it; it does
 not read settings. Both check the bridge owner after their last input, record the observed owner from a

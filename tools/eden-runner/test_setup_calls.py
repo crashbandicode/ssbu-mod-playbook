@@ -901,6 +901,25 @@ class TileTakeRouteTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already on Fox: this row cannot show a move"):
                 routes.place_cpu(self.ctx, 'Fox', must_move=True)
 
+    def test_place_cpu_uses_an_already_held_coin_without_taking_again(self):
+        self.io._take('1')
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(routes, '_tile_topology', return_value=TOPOLOGY), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.place_cpu(self.ctx, 'Fox', must_move=True)
+        self.assertEqual(self.io.actions, ['tile-left', 'tap-a1'])
+        self.assertFalse(result['taken_here'])
+        self.assertEqual(result['verified']['p1_medal'], ['placed', '0', '0', 'Mario', 'default'])
+
+    def test_take_cpu_route_reports_the_counter_fence(self):
+        with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            result = routes.take_cpu(self.ctx)
+        self.assertEqual(self.io.actions, ['tile-take'])
+        self.assertEqual(result['verified']['take.ack'], [0, 1])
+        self.assertEqual(result['verified']['take.applied'], [0, 1])
+        self.assertEqual(result['verified']['p1.carried'], '1')
+
     def test_take_noop_route_reaches_its_own_start(self):
         def noop(io, holding, **kwargs):
             io.send('tile-take')
@@ -940,6 +959,10 @@ class TileTakeRouteTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'entry 1.*Fox.*7.*3'):
                 routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
             bodies[1]['kind'] = 7
+            state['roster'][1]['kind'] = 3
+            with self.assertRaisesRegex(RuntimeError, 'entry 1.*Fox.*7.*3'):
+                routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
+            state['roster'][1]['kind'] = 7
             result = routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
         self.assertEqual(result['verified']['bodies'][1], 7)
         self.assertEqual(io.actions, [])

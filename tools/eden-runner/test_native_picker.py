@@ -2067,12 +2067,15 @@ class TakeReplay:
         if provider == picker.UI:
             return l8w_native(self.rev)
         from test_cpu_pick_replay import sample
-        if self.holding == '1' or (self.sent and self.holding is None and self.fault not in ('unread', 'not_taken')):
+        if self.sent and self.holding is None and self.fault == 'unsettled':
+            state = sample('held-moving', self.rev)
+        elif self.holding == '1' or (self.sent and self.holding is None
+                                   and self.fault not in ('unread', 'not_taken', 'own_coin')):
             state = sample('held', self.rev)
         elif self.holding == '0' or (self.sent and self.fault == 'own_coin'):
             state = l8w_tile(1796)
             state.block['rev'] = self.rev
-            state.values.update(rev=str(self.rev), observation=str(10000 + self.rev))
+            state.values.update(rev=str(self.rev), observation=str(10000 + self.rev), generation='28')
             state.values.update({'hand.token': 'unknown', 'p1.coin': 'held', 'p1.coin.at': 'unknown',
                                  'cpu.token': 'placed', 'cpu.placed.at': '86',
                                  'cpu.placed.kind': 'unknown', 'cpu.placed.name': 'Random',
@@ -2088,10 +2091,17 @@ class TakeReplay:
                 values['take.applied'] = '2'
         if self.sent and self.fault == 'p1.carried':
             values['p1.carried'] = '0' if self.holding == '1' else '1'
+            values['focus'] = 'css.grid.mario'
         if self.sent and self.fault == 'cpu.placed.at':
             values['cpu.placed.at'] = '44'
         if self.sent and self.fault == 'take.applied':
             values['take.applied'] = '2'
+        if self.sent and self.fault == 'duplicate':
+            values['take.ack'] = '4'
+        if self.sent and self.fault == 'tile_step':
+            values['ack'] = '14'
+        if self.sent and self.fault == 'p1_moved':
+            values['p1.coin.at'] = '1'
         if self.old:
             values.pop('take.ack')
             values.pop('take.applied')
@@ -2140,6 +2150,14 @@ class TakeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "took P1's own coin"):
             self.run_take(fault='own_coin')
 
+    def test_take_cpu_rejects_concurrent_steps_multiple_reads_and_p1_motion(self):
+        for fault, error in (('duplicate', 'read more than once'),
+                             ('tile_step', 'a tile step arrived'),
+                             ('p1_moved', "P1's coin changed"),
+                             ('unsettled', 'taken but its hover did not settle')):
+            with self.subTest(fault=fault), self.assertRaisesRegex(RuntimeError, error):
+                self.run_take(fault=fault)
+
     def test_take_noop_passes_when_the_press_is_read_and_nothing_changes(self):
         for holding in ('1', '0'):
             with self.subTest(holding=holding):
@@ -2151,9 +2169,10 @@ class TakeTests(unittest.TestCase):
                 self.assertEqual(io.actions, ['tile-take'])
 
     def test_take_noop_fails_on_any_changed_field_or_an_unread_press(self):
-        for fault in ('p1.carried', 'cpu.placed.at', 'take.applied', 'unread'):
+        for fault in ('p1.carried', 'cpu.placed.at', 'take.applied', 'unread', 'duplicate'):
             with self.subTest(fault=fault), self.assertRaisesRegex(
-                    RuntimeError, 'was not read' if fault == 'unread' else f'changed {fault}'):
+                    RuntimeError, 'was not read' if fault == 'unread' else
+                    'read more than once' if fault == 'duplicate' else f'changed {fault}'):
                 self.run_take(holding='1', fault=fault, noop=True)
 
 

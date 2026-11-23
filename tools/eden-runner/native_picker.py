@@ -480,6 +480,127 @@ def acquire_local_token(io, target, topology, cap=4, *, expected_context=None):
     if (topology is None or topology.layout != current.values['layout']
             or list(topology.targets.values()).count(target) != 1):
         raise RuntimeError('local token takeback needs the qualified target in the active layout')
+    take_back_local_token(io, current, ui, cap, expected_context=expected_context)
+    return None
+
+CPU_FIELDS = (
+    'hand.token', 'p1.coin', 'p1.coin.at', 'cpu.token', 'cpu.placed.at',
+    'cpu.placed.kind', 'cpu.placed.name', 'cpu.placed.form', 'carried.kind',
+    'carried.name', 'carried.form', 'target.token', 'token.settled',
+)
+
+TAKE_FIELDS = ('take.ack', 'take.applied')
+
+
+def take_lines(state):
+    if any(key not in state.values for key in TAKE_FIELDS):
+        raise RuntimeError('tile.cursor: this build has no L3 + B (no take.ack line)')
+    for key in TAKE_FIELDS:
+        number(state, key)
+    return state
+
+
+def take_cpu(io, cap=4, *, expected_context='training'):
+    before, ui = _coin_baseline(io, cap, expected_context)
+    take_lines(before)
+    _p1_placed(before)
+    if before.values.get('cpu.token') != 'placed':
+        raise RuntimeError(f"the CPU's coin is not resting on a tile: {before.values.get('cpu.token')!r}")
+    start_ack, start_applied = number(before, 'take.ack'), number(before, 'take.applied')
+    tile_ack, tile_applied = number(before, 'ack'), number(before, 'applied')
+    p1_at = before.values['p1.coin.at']
+    io.send('tile-take')
+    until = time.monotonic() + cap
+    latest = before
+    while True:
+        try:
+            latest = take_lines(cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True,
+                                                      stepping=True, pending_placement=True)))
+        except RuntimeError as exc:
+            if str(exc) == f'{TILE}: no newer active observation' and time.monotonic() >= until:
+                break
+            raise
+        check_context(before, latest, 'css')
+        if (number(latest, 'ack'), number(latest, 'applied')) != (tile_ack, tile_applied):
+            raise RuntimeError("a tile step arrived while taking the CPU's coin")
+        ack, applied = number(latest, 'take.ack'), number(latest, 'take.applied')
+        if ack > start_ack + 1 or applied > start_applied + 1:
+            raise RuntimeError('L3 + B was read more than once')
+        if ack < start_ack or applied < start_applied:
+            raise RuntimeError('L3 + B counters regressed')
+        values = latest.values
+        if (values.get('local.token') == 'held' or values.get('carried') == '0'
+                or values.get('p1.carried') == '0'):
+            raise RuntimeError("L3 + B took P1's own coin")
+        if values.get('p1.coin') not in ('placed', 'unknown') or values.get('p1.coin.at') not in (p1_at, 'unknown'):
+            raise RuntimeError("P1's coin changed while taking the CPU's coin")
+        if (ack == start_ack + 1 and applied == start_applied + 1 and values.get('p1.carried') == '1'
+                and values.get('cpu.token') == 'held' and values.get('p1.coin') == 'placed'
+                and values.get('p1.coin.at') == p1_at and values.get('settled') == '1'):
+            settled(latest)
+            _coin_finish(io, ui, until, expected_context)
+            return latest
+    if number(latest, 'take.ack') == start_ack:
+        raise RuntimeError(f'L3 + B was not read within {cap} s (take.ack unchanged)')
+    if number(latest, 'take.applied') == start_applied:
+        raise RuntimeError("L3 + B was read but the CPU's coin was not taken")
+    raise RuntimeError(f"the CPU's coin was taken but its hover did not settle within {cap} s")
+
+
+def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
+    if holding not in ('0', '1'):
+        raise ValueError(f'invalid holding {holding!r}')
+    before, ui = _coin_baseline(io, cap, expected_context)
+    take_lines(before)
+    values = before.values
+    held = 'cpu.token' if holding == '1' else 'local.token'
+    if values.get('p1.carried') != holding or values.get(held) != 'held':
+        raise RuntimeError(f"holding {holding} requires p1.carried={holding} and {held}=held; "
+                           f"saw {values.get('p1.carried')!r} and {values.get(held)!r}")
+    watched = ('p1.carried', 'carried', 'local.token', 'p1.coin', 'p1.coin.at', 'cpu.token',
+               'cpu.placed.at', 'at', 'hovered', 'ack', 'applied', 'blocked', 'take.applied')
+    if any(field not in values for field in watched):
+        raise RuntimeError('tile.cursor: incomplete L3 + B no-op observation')
+    unchanged = {field: values[field] for field in watched}
+    ack, applied = number(before, 'take.ack'), number(before, 'take.applied')
+    io.send('tile-take')
+    until = time.monotonic() + cap + quiet
+    latest, first, blocks = before, None, 0
+    while True:
+        try:
+            latest = take_lines(cpu_lines(wait_sample(io, TILE, until, latest, in_flight=True,
+                                                      stepping=True, pending_placement=True)))
+        except RuntimeError as exc:
+            if str(exc) == f'{TILE}: no newer active observation' and time.monotonic() >= until:
+                break
+            raise
+        check_context(before, latest, 'css')
+        for field, old in unchanged.items():
+            new = latest.values.get(field)
+            if new != old:
+                raise RuntimeError(f'L3 + B changed {field}: {old!r} -> {new!r}')
+        current = number(latest, 'take.ack')
+        if current > ack + 1:
+            raise RuntimeError('L3 + B was read more than once')
+        if current < ack or (first is not None and current != ack + 1):
+            raise RuntimeError('L3 + B take.ack regressed')
+        if current == ack + 1:
+            if first is None:
+                first = time.monotonic()
+            else:
+                blocks += 1
+                if blocks >= 5 and time.monotonic() - first >= quiet:
+                    _coin_finish(io, ui, until, expected_context)
+                    return {'take.ack': [ack, current], 'take.applied': [applied, applied],
+                            'unchanged': unchanged, 'blocks': blocks}
+    if first is None:
+        raise RuntimeError(f'L3 + B was not read within {cap + quiet} s (take.ack unchanged)')
+    raise RuntimeError(f'L3 + B did not remain unchanged for {quiet} s within the deadline')
+
+
+def take_back_local_token(io, current, ui, cap=4, *, expected_context=None):
+    until = time.monotonic() + cap
+    wanted = Target.read(current, 'placed.')
     ui = wait_sample(io, UI, until, ui)
     native_input_owner(ui, 'css', expected_context=expected_context)
     before = wait_sample(io, TILE, until, current)
@@ -513,33 +634,9 @@ def acquire_local_token(io, target, topology, cap=4, *, expected_context=None):
             io.log({'local_token_taken_back': state.values['seat'], 'boot': state.block['boot'],
                     'rev': state.block['rev']})
             io.finish()
-            return None
+            return state
         if state.values.get('local.token') != 'placed' or Target.read(state, 'placed.') != wanted:
             raise RuntimeError('local medal changed while taking it back')
-
-CPU_FIELDS = (
-    'hand.token', 'p1.coin', 'p1.coin.at', 'cpu.token', 'cpu.placed.at',
-    'cpu.placed.kind', 'cpu.placed.name', 'cpu.placed.form', 'carried.kind',
-    'carried.name', 'carried.form', 'target.token', 'token.settled',
-)
-
-TAKE_FIELDS = ('take.ack', 'take.applied')
-
-
-def take_lines(state):
-    return state
-
-
-def take_cpu(io, cap=4, *, expected_context='training'):
-    return None
-
-
-def take_noop(io, holding, cap=4, quiet=1.0, *, expected_context='training'):
-    return {}
-
-
-def take_back_local_token(io, current, ui, cap=4, *, expected_context=None):
-    return None
 
 
 class CoinBlocked(RuntimeError):
