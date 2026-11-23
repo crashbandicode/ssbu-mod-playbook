@@ -796,6 +796,7 @@ class HostInterfaceTests(unittest.TestCase):
                     return b'\0' * 256
                 fcntl.ioctl.side_effect = ioctl
                 self.assertEqual(eden_test.host_interface_problem('missing0'), 'no such interface')
+                self.assertEqual(eden_test.host_interface_problem('../wifi0'), 'no such interface')
                 self.assertEqual(eden_test.host_interface_problem('down0'), 'is down')
                 self.assertEqual(eden_test.host_interface_problem('lo'), 'is loopback')
                 self.assertEqual(eden_test.host_interface_problem('ipless0'), 'has no IPv4 address')
@@ -826,9 +827,9 @@ class EdenTestTests(unittest.TestCase):
         self.rows = self.dir / 'rows-src'
         self.rows.mkdir()
         (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[]}')
-        self.interface_check = mock.patch.object(eden_test, 'host_interface_problem', return_value=None, create=True)
-        self.interface_check.start()
-        self.addCleanup(self.interface_check.stop)
+        interface_check = mock.patch.object(eden_test, 'host_interface_problem', return_value=None, create=True)
+        self.interface_check = interface_check.start()
+        self.addCleanup(interface_check.stop)
 
     def tearDown(self):
         eden_test.LIFECYCLE, eden_test.RUNNER, eden_test.HARVEST, eden_test.RUNS = self.saved
@@ -900,6 +901,14 @@ class EdenTestTests(unittest.TestCase):
         self.assertIsNone(config['network_interface'])
         self.assertEqual(config['network_check'], {
             'interface': None, 'usable': False, 'problem': 'the base names none', 'no_lobby': True})
+
+    def test_no_lobby_retains_named_interface_failure(self):
+        with mock.patch.object(eden_test, 'host_interface_problem', return_value='is down'), \
+             mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args() + ['--no-lobby']), 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertEqual(config['network_check'], {
+            'interface': 'test0', 'usable': False, 'problem': 'is down', 'no_lobby': True})
 
     def test_go_requires_owner_before_dispatch(self):
         error = io.StringIO()

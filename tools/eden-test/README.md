@@ -6,6 +6,9 @@ From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ss
 On the Eden host, run the same command with its local host name:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
+The base names the host's network interface; `go` refuses an unusable interface unless `--no-lobby`.
+Never set `lo`: lobby rows must also open the room themselves. A no-lobby run without a usable interface
+needs boot rows that do not invoke `host_network`.
 
 What it does:
 1. Copies and pins the NROs and rows.

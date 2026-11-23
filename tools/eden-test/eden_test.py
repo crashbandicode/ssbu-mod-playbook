@@ -37,6 +37,8 @@ import re
 import shlex
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -44,11 +46,17 @@ import time
 import uuid
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 PLAYBOOK = Path(__file__).resolve().parents[2]
 LIFECYCLE = PLAYBOOK / 'tools/eden-lifecycle/lifecycle.py'
 RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
 RUNS = Path('/home/intpa/eden-runs')
+NET_SYSFS = Path('/sys/class/net')
 
 
 def sha256(path):
@@ -190,6 +198,41 @@ def _go_base_trace(config, args):
                          "blocks use are libtraining_rooms.nro!edge_juggle_attempt and libtraining_rooms.nro!planner_chose")
 
 
+def host_interface_problem(name):
+    if not isinstance(name, str) or not name or name in ('.', '..') or '/' in name or '\0' in name:
+        return 'no such interface'
+    encoded = os.fsencode(name)
+    if len(encoded) > 15:
+        return 'no such interface'
+    interface = NET_SYSFS / name
+    if not interface.exists():
+        return 'no such interface'
+    try:
+        flags = int((interface / 'flags').read_text().strip(), 0)
+    except (OSError, ValueError):
+        return 'cannot read interface flags'
+    if flags & 0x8:
+        return 'is loopback'
+    if not flags & 0x1:
+        return 'is down'
+    if fcntl is None:
+        return 'IPv4 interface check unavailable on this host'
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            fcntl.ioctl(probe.fileno(), 0x8915, struct.pack('256s', encoded))
+    except OSError:
+        return 'has no IPv4 address'
+    return None
+
+
+def usable_interfaces():
+    try:
+        names = sorted(item.name for item in NET_SYSFS.iterdir())
+    except OSError:
+        return []
+    return [name for name in names if host_interface_problem(name) is None]
+
+
 def go_new(args):
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
@@ -197,6 +240,17 @@ def go_new(args):
         raise SystemExit(f'base {base} is for host {config.get("host")!r}, not {args.host!r}')
     _go_base_trace(config, args)
     module = _go_trace(args)
+    interface = args.network_interface or config.get('network_interface')
+    problem = host_interface_problem(interface) if interface else 'the base names none'
+    if problem and not args.no_lobby:
+        description = f'{json.dumps(interface)} {problem}' if interface else problem
+        usable = ', '.join(usable_interfaces()) or 'none'
+        raise SystemExit(f'lobby rows need a usable host network interface: {description}; usable here: {usable}. '
+                         f'Set "network_interface" in {base} or pass --network-interface; '
+                         'pass --no-lobby only for a run without lobby rows')
+    config['network_interface'] = interface
+    config['network_check'] = {'interface': interface, 'usable': problem is None,
+                               'problem': problem, 'no_lobby': bool(args.no_lobby)}
     run = RUNS / args.label
     if run.exists():
         raise SystemExit(f'{run} exists; pick a new label')
@@ -1122,6 +1176,10 @@ def _go_remote(args):
         remote.extend(('--elf', f'{stage}/elf/{Path(args.elf).name}'))
     for point in args.trace_point:
         remote.extend(('--trace-point', point))
+    if args.network_interface:
+        remote.extend(('--network-interface', args.network_interface))
+    if args.no_lobby:
+        remote.append('--no-lobby')
     remote.extend(('--owner', args.owner))
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
@@ -1264,6 +1322,8 @@ def main(argv=None):
     p.add_argument('--rows', required=True, help='rows.json or a folder containing rows.json')
     p.add_argument('--elf')
     p.add_argument('--trace-point', action='append', default=[])
+    p.add_argument('--network-interface', help='override the base host network interface for lobby rows')
+    p.add_argument('--no-lobby', action='store_true', help='this run has no lobby rows')
     p.add_argument('--owner', required=True,
                    help='ledger owner, "<Engine> <session>/<stream>" with Engine one of OpenCode, Codex, '
                         'Claude, Cursor — e.g. "Claude devin-<lane>/<label>"')

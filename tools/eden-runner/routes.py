@@ -6,6 +6,7 @@ game state (Eden status, a plugin log line, a tile-cursor line, an image gate) w
 where a state exists. Every block fails closed: a missing state raises with what it saw, and nothing guesses.
 
 Blocks (docs/ROUTES.md has what each guarantees on exit):
+  host_network     select and read back a non-loopback interface and LAN mode before game.load
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
   load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
   wait_lines       the boot lines the plugins print (instead of a fixed post-load sleep)
@@ -643,6 +644,24 @@ def _setting(ctx, key, value):
     if str(got.get('value')).lower() != str(value).lower():
         raise RuntimeError(f'setting {key} reads {got!r}, not {value!r}')
     return got.get('value')
+
+
+def host_network(ctx, interface=None, lan_online=False):
+    if (ctx.call('status') or {}).get('running'):
+        raise RuntimeError('host_network runs before game.load: core.network_interface is not changeable at run time')
+    if not interface:
+        config = Path(ctx.runner.out).parent / 'config.json'
+        if config.is_file():
+            interface = json.loads(config.read_text()).get('network_interface')
+    if not interface:
+        raise RuntimeError('host_network: no interface: pass "interface" or use a base that names "network_interface"')
+    if interface == 'lo':
+        raise RuntimeError('host_network: Eden never lists loopback, so "lo" means no network and no local wireless room; '
+                           'name a real interface')
+    readback = {'core.network_interface': _setting(ctx, 'core.network_interface', interface),
+                'core.lan_online': _setting(ctx, 'core.lan_online', lan_online)}
+    return _save(ctx, 'routes-host-network', {'block': 'host_network', 'interface': interface,
+                                              'lan_online': lan_online, 'readback': readback})
 
 
 def configure_boot(ctx, gdb_port=None, volume=0, memory_layout_mode=0):

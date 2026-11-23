@@ -15,8 +15,7 @@
       "on_failure": "stop",
       "steps": [
         {"run": "routes:_setting", "args": {"key": "core.use_gdbstub", "value": false}},
-        {"run": "routes:_setting", "args": {"key": "core.network_interface", "value": "lo"}},
-        {"run": "routes:_setting", "args": {"key": "core.lan_online", "value": false}},
+        {"run": "routes:host_network"},
         {"run": "routes:configure_boot"},
         {"run": "routes:load_game"},
         {"run": "routes:bridge_on"},
