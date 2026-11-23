@@ -7,6 +7,7 @@ where a state exists. Every block fails closed: a missing state raises with what
 
 Blocks (docs/ROUTES.md has what each guarantees on exit):
   host_network     select and read back a non-loopback interface and LAN mode before game.load
+  frontend_room    host or join a connected Eden frontend room before game.load
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
   load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
   wait_lines       the boot lines the plugins print (instead of a fixed post-load sleep)
@@ -646,7 +647,7 @@ def _setting(ctx, key, value):
     return got.get('value')
 
 
-def host_network(ctx, interface=None, lan_online=False):
+def host_network(ctx, interface=None, lan_online=False, ldn_mitm=False):
     if (ctx.call('status') or {}).get('running'):
         raise RuntimeError('host_network runs before game.load: core.network_interface is not changeable at run time')
     if not interface:
@@ -660,8 +661,106 @@ def host_network(ctx, interface=None, lan_online=False):
                            'name a real interface')
     readback = {'core.network_interface': _setting(ctx, 'core.network_interface', interface),
                 'core.lan_online': _setting(ctx, 'core.lan_online', lan_online)}
+    try:
+        ctx.call('settings.get', {'key': 'core.ldn_mitm'})
+    except RuntimeError as error:
+        if not re.search(r"""['"]code['"]:\s*['"]unknown_setting['"]""", str(error)):
+            raise
+        readback['core.ldn_mitm'] = 'absent'
+    else:
+        readback['core.ldn_mitm'] = _setting(ctx, 'core.ldn_mitm', ldn_mitm)
     return _save(ctx, 'routes-host-network', {'block': 'host_network', 'interface': interface,
-                                              'lan_online': lan_online, 'readback': readback})
+                                              'lan_online': lan_online, 'ldn_mitm': ldn_mitm, 'readback': readback})
+
+
+def _frontend_title(node):
+    title = node.get('title')
+    if title in (None, ''):
+        props = node.get('properties') or {}
+        for key in ('windowTitle', 'title'):
+            value = props.get(key)
+            title = value.get('value') if isinstance(value, dict) else value
+            if title not in (None, ''):
+                break
+    return '' if title is None else str(title)
+
+
+def _frontend_wait(ctx, match, cap, members=None):
+    until = time.monotonic() + cap
+    titles = []
+    while time.monotonic() < until:
+        ctx.check_stop()
+        tree = ctx.call('ui.tree', {}) or []
+        titles = [_frontend_title(node) for node in tree if node.get('class') == 'ClientRoomWindow']
+        for node in tree:
+            if not ctx.runner.ui_matches(node, match):
+                continue
+            if members is not None:
+                title = _frontend_title(node)
+                count = re.search(r'\((\d+)/\d+ members\).* - connected$', title)
+                if not count or int(count.group(1)) < members:
+                    continue
+                return {k: node.get(k) for k in ('id', 'class', 'name', 'text')}, title, int(count.group(1))
+            return {k: node.get(k) for k in ('id', 'class', 'name', 'text')}
+        time.sleep(min(.5, max(0, until - time.monotonic())))
+    if members is not None:
+        seen = ', '.join(repr(title) for title in titles) if titles else 'no room window'
+        raise RuntimeError(f'frontend_room: expected a connected room window with at least {members} member(s); '
+                           f'saw: {seen}')
+    raise RuntimeError(f'frontend_room: widget {match} did not appear within {cap} s')
+
+
+def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip='127.0.0.1', members=1, cap=30):
+    if (ctx.call('status') or {}).get('running'):
+        raise RuntimeError('frontend_room runs before game.load')
+    if role not in ('host', 'join'):
+        raise RuntimeError(f'frontend_room: unknown role {role!r}')
+    room_file = Path(ctx.runner.out) / 'frontend-room.json'
+    saved = json.loads(room_file.read_text()) if role == 'join' and port is None and room_file.is_file() else {}
+    if port is None:
+        port = free_udp_port() if role == 'host' else saved.get('port')
+    if port is None:
+        raise RuntimeError('frontend_room: join needs a port or the frontend-room.json of this run')
+    nickname = nickname or ('TRHost' if role == 'host' else 'TRGuest')
+    if role == 'host' and not room_name:
+        config = Path(ctx.runner.out).parent / 'config.json'
+        label = json.loads(config.read_text()).get('label') if config.is_file() else None
+        room_name = f'TR-{label or "run"}'
+    elif role == 'join' and room_name is None:
+        room_name = saved.get('room_name')
+
+    evidence = {}
+    if role == 'host':
+        action = {'class': 'QAction', 'name': 'action_Start_Room'}
+        evidence['host_action'] = _frontend_wait(ctx, action, cap)
+        ctx.runner.ui(ctx.on, {'ui': 'trigger', 'target': action})
+        dialog = {'class': 'QLineEdit', 'name': 'username'}
+        evidence['host_dialog'] = _frontend_wait(ctx, dialog, cap)
+        for name, value in (('username', nickname), ('room_name', room_name), ('port', str(port))):
+            ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
+                                   'property': 'text', 'value': value})
+        ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QComboBox', 'name': 'host_type'},
+                               'property': 'currentIndex', 'value': 1})
+        ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'host'}})
+        evidence['frontend_leave'] = _frontend_wait(
+            ctx, {'class': 'QPushButton', 'name': 'disconnect', 'text': '^Leave Room$'}, cap)
+    else:
+        action = {'class': 'QAction', 'name': 'action_Connect_To_Room'}
+        evidence['peer_action'] = _frontend_wait(ctx, action, cap)
+        ctx.runner.ui(ctx.on, {'ui': 'trigger', 'target': action})
+        dialog = {'class': 'QLineEdit', 'name': 'nickname'}
+        evidence['peer_dialog'] = _frontend_wait(ctx, dialog, cap)
+        for name, value in (('nickname', nickname), ('ip', ip), ('port', str(port))):
+            ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
+                                   'property': 'text', 'value': value})
+        ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'connect'}})
+    evidence['frontend_connected'], title, count = _frontend_wait(
+        ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, members)
+    if role == 'host':
+        room_file.write_text(json.dumps({'port': port, 'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
+    return _save(ctx, 'routes-frontend-room', {'role': role, 'port': port, 'nickname': nickname,
+                                               'room_name': room_name, 'ip': ip, 'evidence': evidence,
+                                               'window_title': title, 'member_count': count})
 
 
 def configure_boot(ctx, gdb_port=None, volume=0, memory_layout_mode=0):
@@ -2570,6 +2669,17 @@ def free_port(first=6980, last=7079, host='0.0.0.0'):
         except OSError:
             continue
     raise RuntimeError(f'no free TCP port on {host} in range {first}-{last}')
+
+
+def free_udp_port(first=24872, last=24971):
+    for port in range(first, last + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as candidate:
+                candidate.bind(('0.0.0.0', port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(f'no free UDP port on 0.0.0.0 in range {first}-{last}')
 
 
 def bridge_on(ctx, port=None, cap=60):

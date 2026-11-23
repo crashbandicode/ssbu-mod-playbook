@@ -1,0 +1,21 @@
+{
+  "about": "Lobby boot fragment; host an Eden frontend room before loading the game.",
+  "rows": [
+    {
+      "id": "lobby-boot",
+      "start": "frontend",
+      "end": "main",
+      "role": "setup",
+      "on_failure": "stop",
+      "steps": [
+        {"run": "routes:_setting", "args": {"key": "core.use_gdbstub", "value": false}},
+        {"run": "routes:host_network"},
+        {"run": "routes:frontend_room"},
+        {"run": "routes:configure_boot"},
+        {"run": "routes:load_game"},
+        {"run": "routes:bridge_on"},
+        {"run": "routes:to_main"}
+      ]
+    }
+  ]
+}

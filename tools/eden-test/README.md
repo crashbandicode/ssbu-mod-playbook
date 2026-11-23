@@ -9,6 +9,7 @@ Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have 
 Each run gets its own bridge port and its own X display (when the base has a display helper; otherwise the base's display is kept).
 The base names the host's network interface ("network_interface"); go refuses when that interface is missing, down, loopback or has no IPv4 address, unless --no-lobby. Override with `--network-interface <name>`.
 Boot rows call routes:host_network (never set core.network_interface to "lo": Eden does not list loopback, so the game has no network and cannot open a local wireless room).
+Lobby rows: the boot row calls routes:frontend_room after routes:host_network and before routes:load_game (Eden carries local wireless only between members of a frontend room).
 go refuses rows that set core.network_interface to anything but the run's checked interface; load_game checks it again just before loading.
 A run with --no-lobby on a host without a usable interface must not call host_network.
 
