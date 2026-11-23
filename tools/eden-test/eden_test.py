@@ -246,6 +246,43 @@ def free_display(preferred, taken=()):
     raise SystemExit(f'no free X display from {preferred} upward (40 tried)')
 
 
+def network_row_overrides(rows, interface):
+    path = Path(rows)
+    plan = json.loads((path / 'rows.json' if path.is_dir() else path).read_text())
+    conflicts = []
+
+    def walk(steps, row, prefix=''):
+        if not isinstance(steps, list):
+            return
+        for index, step in enumerate(steps, 1):
+            if not isinstance(step, dict):
+                continue
+            position = f'{prefix}{index}' if prefix else index
+            run = step.get('run')
+            args = step.get('args')
+            if isinstance(args, dict):
+                if run == 'routes:_setting' and args.get('key') == 'core.network_interface':
+                    value = args.get('value')
+                elif run == 'routes:host_network' and 'interface' in args:
+                    value = args['interface']
+                else:
+                    value = interface
+                if value != interface:
+                    conflicts.append({'row': row, 'step': position, 'run': run, 'value': value})
+            gif = step.get('gif')
+            if isinstance(gif, dict):
+                walk(gif.get('steps'), row, f'{position} gif step ')
+
+    for row in plan.get('rows', []):
+        if not isinstance(row, dict):
+            continue
+        row_id = row.get('id', '<unnamed>')
+        walk(row.get('steps'), row_id)
+        walk(row.get('recover'), row_id, 'recover ')
+    walk(plan.get('recover'), '<plan recover>')
+    return conflicts
+
+
 def go_new(args):
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
@@ -264,6 +301,18 @@ def go_new(args):
     config['network_interface'] = interface
     config['network_check'] = {'interface': interface, 'usable': problem is None,
                                'problem': problem, 'no_lobby': bool(args.no_lobby)}
+    overrides = network_row_overrides(args.rows, interface)
+    config['network_check']['row_overrides'] = overrides
+    if overrides and not args.no_lobby:
+        messages = [
+            f'rows set core.network_interface to {json.dumps(item["value"])} in row {item["row"]} '
+            f'step {item["step"]} ({item["run"]}), but this run\'s checked interface is {json.dumps(interface)}: '
+            'remove that step and use {"run": "routes:host_network"} '
+            '(or pass --network-interface <value> if that interface is meant; "lo" is never usable: '
+            'Eden does not list loopback)'
+            for item in overrides
+        ]
+        raise SystemExit('\n'.join(messages))
     choices = []
     for item in config['instances']:
         if 'display' in item:

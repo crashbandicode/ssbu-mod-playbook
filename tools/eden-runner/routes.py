@@ -718,9 +718,20 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
     """game.load, then (stub on) the no-hold kick BEFORE any wait, then the game's own state: loading_complete, no
     shaders building, game_fps at least min_fps. Fails closed: a guest that never draws after three kicks, or Eden
     that stops running, raises with the polls it saw."""
+    out = {}
+    runner_out = getattr(getattr(ctx, 'runner', None), 'out', None)
+    config_path = Path(runner_out).parent / 'config.json' if runner_out is not None else None
+    if config_path is not None and config_path.is_file():
+        check = json.loads(config_path.read_text()).get('network_check')
+        if isinstance(check, dict) and check.get('no_lobby') is False and check.get('interface'):
+            live = (ctx.call('settings.get', {'key': 'core.network_interface'}) or {}).get('value')
+            interface = check['interface']
+            if live != interface:
+                raise RuntimeError(f'load_game: core.network_interface is "{live}" but this run\'s checked interface '
+                                   f'is "{interface}"; a step changed it after host_network. No game was loaded.')
+            out['network_interface'] = live
     t0 = time.monotonic()
     ctx.call('game.load', {'path': ctx.instance['game']}, job_cap=240)
-    out = {}
     if gdb_port:
         out['kick'] = [_kick(int(gdb_port), 60.0)]
         drawing, status = _drawing(ctx, 90.0)
