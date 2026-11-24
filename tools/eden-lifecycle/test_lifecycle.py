@@ -1474,6 +1474,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_notify_validation_rejects_unsafe_fields(self):
         for spec in ({'file': 'relative'}, {'file': '/tmp/file;touch'}, {'file': '/tmp/../file'},
+                     {'file': r'C:\Users\intpa\eden-run-notify\NOTIFY.md'},
                      {'file': '/tmp/file', 'ssh': 'host;bad'}, {'file': '/tmp/file', 'from': 'bad\nname'}):
             with self.subTest(spec=spec):
                 config = deepcopy(self.config)
@@ -3756,6 +3757,25 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(self.host.started_settles, [])
         self.assertTrue(c.down()['released'])
 
+    def test_ally_notify_accepts_windows_only_and_writes_through_local_path(self):
+        value = r'C:\Users\intpa\eden-run-notify\NOTIFY.md'
+        self.config['notify'] = {'file': value, 'to': 'tr-primary-2'}
+        self.assertEqual(life.validate(self.config)['notify']['file'], value)
+        for invalid in ('/home/intpa/eden-run-notify/NOTIFY.md', r'C:\Users\intpa\..\NOTIFY.md',
+                        r'C:Users\intpa\NOTIFY.md', r'\\server\share\NOTIFY.md',
+                        r'C:\Users\intpa\bad;name.md'):
+            with self.subTest(path=invalid):
+                config = deepcopy(self.config)
+                config['notify']['file'] = invalid
+                with self.assertRaisesRegex(life.Refused, 'notify file must be an absolute safe path'):
+                    life.validate(config)
+        target = self.base / 'windows-profile' / 'eden-run-notify' / 'NOTIFY.md'
+        c = self.controller()
+        with patch.object(life, 'safe_absolute', return_value=target) as resolve:
+            c.notify('pending')
+        resolve.assert_called_once_with(value)
+        self.assertRegex(target.read_text(), r'^\n## \d\d:\d\d:\d\dZ eden-lifecycle test-01 → tr-primary-2 \| pending\n$')
+
     def test_windows_bridge_preserves_ledger_transport_classification(self):
         token = 'a' * 32
         def dispatch(*args):
@@ -4001,7 +4021,7 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(packet['not_for_execution'])
         self.assertTrue(draft['lifecycle_only'])
         self.assertEqual(draft['notify'],
-                         {'file': '/home/intpa/eden-run-notify/NOTIFY.md', 'to': 'tr-primary-2'})
+                         {'file': r'C:\Users\intpa\eden-run-notify\NOTIFY.md', 'to': 'tr-primary-2'})
         self.assertFalse(draft['defer_load'])
         self.assertFalse(draft['allow_inbound_block'])
         self.assertEqual(len(draft['instances']), 1)

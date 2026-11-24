@@ -24,8 +24,9 @@ The repository does not ship a `base.json` template; it is maintained on
 each host. Add `"notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md",
 "to": "tr-primary-2"}` to that base, without an `ssh` key. Notifications
 append to this file locally on the run host; the coordinator's Surface
-monitor relays new lines to the inbox. The POSIX path is not absolute on
-native Windows; a Windows-local path policy is still needed.
+monitor relays new lines to the inbox. On the Ally use the run user's
+Windows profile path instead: `C:\Users\intpa\eden-run-notify\NOTIFY.md`
+for the `intpa` user.
 Each run gets its own bridge port and its own X display (when the base has a display helper; otherwise the base's display is kept).
 The base names the host's network interface ("network_interface"); go refuses when that interface is missing, down, loopback or has no IPv4 address, unless --no-lobby. Override with `--network-interface <name>`.
 Boot rows call routes:host_network (never set core.network_interface to "lo": Eden does not list loopback, so the game has no network and cannot open a local wireless room).
