@@ -4250,8 +4250,7 @@ def _bridge_on_stub_title(ctx, hello, start):
                 raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
                                    f"{values.get('screen')}/{values.get('focus')}, not the Title")
             native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
-            if is_opening:
-                state['opening_seen'] = True
+            state['opening_seen'] = is_opening
             last = {'rev': block['rev'], 'frame': block['frame'],
                     **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
             identity = (last['screen'], last['screen.context'], last['focus'])

@@ -503,6 +503,17 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(self.macro_attempts(), [])
         self.assertRegex(str(stopped.exception), 'main_menu/title.press_any, not the Title')
 
+    def test_bridge_on_stub_on_title_without_prompt_at_recheck_keeps_existing_timeout(self):
+        self.recorded_opening(prompt_after_skip=False)
+        passive = self.sample(boot=RUN1_BOOT, fields={
+            'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
+            'focus.index': 'unknown', 'focus.label': 'unknown',
+            'input.owner': 'unknown', 'dialog': 'unknown'})
+        self.stub_samples, self.stub_default = [RUN1_OPENING, passive], ''
+        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+
     def test_bridge_on_stub_on_recheck_without_reply_sends_nothing(self):
         self.recorded_opening(prompt_after_skip=False)
         self.stub_samples, self.stub_default = [RUN1_OPENING], ''
