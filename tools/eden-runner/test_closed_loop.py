@@ -40,6 +40,36 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_a_locate_predicate_can_stop_with_a_complete_step_receipt(self):
+        fake = Script(lambda f: 'unsupported')
+
+        def at(obs):
+            raise RouteStopped('fixture', 'open', 'unsupported reader', {})
+
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([Step('open', at, lambda obs: False, 'zr', cap=3)])
+        self.assertEqual(caught.exception.step, 'open')
+        self.assertEqual(caught.exception.receipt['entered_at'], 'open')
+        self.assertEqual(caught.exception.receipt['steps'][0]['sends'], 0)
+        self.assertEqual(caught.exception.receipt['stalls'], [])
+        self.assertEqual(fake.sends, [])
+
+    def test_a_predicate_stop_after_a_send_keeps_the_original_entry(self):
+        fake = Script(lambda f: 'unsupported' if f.sends else 'down')
+
+        def open_at(obs):
+            if obs == 'unsupported':
+                raise RouteStopped('fixture', 'open', 'unsupported reader', {})
+            return False
+
+        steps = [Step('open', open_at, lambda obs: False, 'zr', cap=3),
+                 Step('down', lambda obs: obs == 'down', lambda obs: False, 'down', cap=3)]
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run(steps)
+        self.assertEqual(caught.exception.step, 'open')
+        self.assertEqual(caught.exception.receipt['entered_at'], 'down')
+        self.assertEqual(fake.sends, [('down', 0)])
+
     def test_locate_enters_a_recognised_screen_that_is_not_ready_and_waits_in_that_step(self):
         fake = Script(lambda f: {'screen': 'stage', 'ready': False, 'done': False})
         item = Step('stage', lambda obs: obs['ready'], lambda obs: obs['done'], 'a',

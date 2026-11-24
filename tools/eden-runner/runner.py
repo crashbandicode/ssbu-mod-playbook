@@ -1913,6 +1913,17 @@ class Runner:
                 if digest(path) != seg['sha256']:
                     raise RuntimeError(f'segment {gate["recover"]} changed since the dry run')
 
+                start_gate = seg.get('start_gate')
+                if start_gate:
+                    try:
+                        self.gate(on, start_gate)
+                    except Exception as error:
+                        if isinstance(error, StopRun) or macro_gate.stop(error, self.check_stop):
+                            raise
+                        raise closed_loop.DispatchRejected(
+                            f'recovery segment {gate["recover"]} not sent: start gate {start_gate} failed: '
+                            f'{error}') from error
+
                 def still_needed(remaining):
                     started = time.monotonic()
                     try:

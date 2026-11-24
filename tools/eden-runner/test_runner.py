@@ -1378,12 +1378,14 @@ class RunnerTests(unittest.TestCase):
             checks.append(name)
             if name == 'red':
                 raise RuntimeError('not red')
-            raise RuntimeError('not blue')
+            if checks.count('blue') > 1:
+                raise RuntimeError('not blue')
+            return True
 
         with mock.patch.object(run, 'check_gate', side_effect=check):
             with self.assertRaisesRegex(RuntimeError, r'to-red.*blue'):
                 run.gate('a', 'red')
-        self.assertEqual(checks, ['red', 'red', 'blue'])
+        self.assertEqual(checks, ['red', 'blue', 'red', 'blue'])
         self.assertNotIn('macro.play', eden.calls)
         self.assertEqual(len(run.row_macro_waits), 1)
         self.assertIn('not sent:', run.row_macro_waits[0]['outcome'])
@@ -1399,15 +1401,15 @@ class RunnerTests(unittest.TestCase):
         def check(on, name, **options):
             checks.append((name, options))
             if name == 'red' and sum(checked == 'red' for checked, _ in checks) < 3:
-                if len(checks) == 2:
+                if sum(checked == 'red' for checked, _ in checks) == 2:
                     now[0] += 2
                 raise RuntimeError('not red')
             return True
 
         with mock.patch.object(run, 'check_gate', side_effect=check):
             run.gate('a', 'red')
-        self.assertEqual([name for name, _ in checks], ['red', 'red', 'blue', 'red'])
-        self.assertAlmostEqual(checks[1][1]['cap'] - checks[2][1]['cap'], 2)
+        self.assertEqual([name for name, _ in checks], ['red', 'blue', 'red', 'blue', 'red'])
+        self.assertAlmostEqual(checks[2][1]['cap'] - checks[3][1]['cap'], 2)
         self.assertEqual(eden.calls.count('macro.play'), 1)
         self.assertEqual(run.row_macro_waits[0]['outcome'], 'requalified, accepted')
 
@@ -1438,10 +1440,25 @@ class RunnerTests(unittest.TestCase):
         eden = FakeEden({})
         run = self.make(eden)
         run.plan['gates']['red']['recover'] = 'to-red'
-        run.plan['segments']['to-red']['start_gate'] = 'blue'
-        with mock.patch.object(run, 'check_gate', side_effect=[RuntimeError('not red'), True]) as check:
+        run.plan['segments']['to-red']['start_gate'] = 'paused'
+        events = []
+        request = eden.request
+
+        def check(on, name, **options):
+            events.append(name)
+            if events == ['red']:
+                raise RuntimeError('not red')
+            return True
+
+        def record_request(method, params):
+            if method == 'macro.play':
+                events.append('macro.play')
+            return request(method, params)
+
+        eden.request = record_request
+        with mock.patch.object(run, 'check_gate', side_effect=check):
             run.gate('a', 'red')
-        self.assertEqual([call.args[1] for call in check.call_args_list], ['red', 'red'])
+        self.assertEqual(events, ['red', 'paused', 'macro.play', 'red'])
         self.assertEqual(eden.calls.count('macro.play'), 1)
         self.assertEqual(getattr(run, 'row_macro_waits', []), [])
 
@@ -1479,6 +1496,23 @@ class RunnerTests(unittest.TestCase):
             run.gate('a', 'red')
         self.assertEqual(names, ['red', 'paused', 'red'])
         self.assertEqual(eden.calls.count('macro.play'), 1)
+
+    def test_stop_during_the_recovery_start_gate_propagates_without_input(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['segments']['to-red']['start_gate'] = 'paused'
+
+        def check(on, name, **options):
+            if name == 'red':
+                raise RuntimeError('not red')
+            raise runner.StopRun('STOP-INPUT')
+
+        with mock.patch.object(run, 'check_gate', side_effect=check):
+            with self.assertRaises(runner.StopRun):
+                run.gate('a', 'red')
+        self.assertNotIn('macro.play', eden.calls)
+        self.assertEqual(getattr(run, 'row_macro_waits', []), [])
 
     def test_a_rejected_dispatch_after_requalification_is_recorded_as_rejected(self):
         run, eden, _ = self.waiting_run()

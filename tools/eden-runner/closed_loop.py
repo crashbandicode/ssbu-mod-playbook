@@ -77,7 +77,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
 
     def matching(obs, excluding=None):
         result = next((i for i in range(len(steps) - 1, -1, -1)
-                       if i != excluding and steps[i].at(obs)), None)
+                       if i != excluding and step_at(steps[i], obs)), None)
         if result is not None:
             return result
         return next((i for i in range(len(steps) - 1, -1, -1)
@@ -125,11 +125,22 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 records[active_index]['ms'] += round((clock() - active_started) * 1000)
             stop(error.step, error.reason)
 
+    def step_at(step, obs):
+        nonlocal entered_at
+        try:
+            return step.at(obs)
+        except RouteStopped as error:
+            if active_index is not None:
+                records[active_index]['ms'] += round((clock() - active_started) * 1000)
+            else:
+                entered_at = error.step
+            stop(error.step, error.reason)
+
     def target(step, obs):
         return step.target(obs) if step.target else None
 
     def source(step, obs):
-        return step.source(obs) if step.source else step.at(obs)
+        return step.source(obs) if step.source else step_at(step, obs)
 
     def changed_reason(witness, current):
         return (f'source target changed after the send: {witness!r} -> {current!r}; '
@@ -335,7 +346,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     finish()
                 record['ms'] += round((clock() - started) * 1000)
                 return receipt()
-            at = step.at(obs)
+            at = step_at(step, obs)
             other = matching(obs, index)
             if ready_grace and retry is not None and (not at or target(step, obs) != retry['witness']):
                 record['ms'] += round((clock() - started) * 1000)
@@ -492,7 +503,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         if clock() - changed_since >= step.lost_after:
                             record['ms'] += round((clock() - started) * 1000)
                             stop(step.name, changed_reason(witness, current_target))
-                    elif at_source and step.at(obs):
+                    elif at_source and step_at(step, obs):
                         changed_since = None
                         if lost_since is None:
                             lost_since = clock()
@@ -531,11 +542,11 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                             fresh_done = done(step, fresh)
                             fresh_final_done = False if fresh_done else done(steps[-1], fresh)
                             if (grace and not fresh_done and not fresh_final_done
-                                    and not (step.at(fresh) and target(step, fresh) == witness)):
+                                    and not (step_at(step, fresh) and target(step, fresh) == witness)):
                                 record['ms'] += round((clock() - started) * 1000)
                                 stop(step.name, unreadable_reason(record['unanswered']))
                             if (not fresh_done and not fresh_final_done
-                                    and matching(fresh, index) is None and step.at(fresh)
+                                    and matching(fresh, index) is None and step_at(step, fresh)
                                     and target(step, fresh) == witness):
                                 retry = {'witness': witness, 'event': event, 'changed_since': None,
                                          'deadline': deadline, 'grace_used': grace_used, 'pause_at': None}
