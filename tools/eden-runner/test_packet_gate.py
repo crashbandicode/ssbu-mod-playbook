@@ -1053,7 +1053,7 @@ fn elsewhere() { write!(out, "outside=1"); }
              mock.patch.object(packet_gate, 'shared_hook_names', return_value=('sharedfx', 'fixtures'), create=True):
             return packet_gate.check(plan, self.base, plan)
 
-    def test_shared_hook_without_entry_warns_or_refuses_and_fixtures_remain_exempt(self):
+    def test_shared_hook_without_entry_and_fixture_cases_belong_to_runner(self):
         shared, _, plan = self.shared_case_setup()
         (shared / 'sharedfx.py').write_text('raise RuntimeError("must not import")\ndef hook(ctx): return 1\n')
         message = 'G9 row trial: effect hook sharedfx:hook has no judge cases; its evidence is trusted'
@@ -1065,6 +1065,39 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertIn(message + ' (require_cases)', self.shared_case_check(shared, plan)['errors'])
         plan['rows'][0]['steps'] = [{'run': 'fixtures:cpu_standing', 'effect': True,
                                      'cases': {'judge': 'unused.py:judge', 'dir': 'unused'}}]
+        report = self.shared_case_check(shared, plan)
+        self.assertIn('G9 row trial: fixtures:cpu_standing is a shared hook; its judge cases belong to '
+                      'the runner (remove "cases")', report['errors'])
+
+    def test_fixture_effect_judge_replays_cases_and_enforces_binding(self):
+        shared, cases, plan = self.shared_case_setup()
+        fixture = shared / 'fixtures.py'
+        source = (shared / 'sharedfx.py').read_text()
+        fixture.write_text(source)
+        plan['rows'][0]['steps'] = [{'run': 'fixtures:hook', 'effect': True}]
+        report = self.shared_case_check(shared, plan)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'], [])
+        self.assertEqual(report['cases'].get('trial', {}).get('fixtures:judge'), {'accept': 1, 'reject': 1})
+        (cases / 'standing.log').write_text('walking\n')
+        self.assertIn('G9 row trial: case a.json: expected accept, the judge refused: walking frame 2',
+                      self.shared_case_check(shared, plan)['errors'])
+        (cases / 'standing.log').write_text('standing\n')
+        fixture.write_text(source.replace('return judge(lines=["standing"])', 'return 1'))
+        self.assertIn('G9 row trial: fixtures:hook does not call its judge judge',
+                      self.shared_case_check(shared, plan)['errors'])
+
+    def test_non_effect_and_setup_fixture_hooks_do_not_need_cases(self):
+        shared, _, plan = self.shared_case_setup()
+        plan['require_cases'] = True
+        plan['rows'] = [
+            {'id': 'trial', 'role': 'test', 'steps': [
+                {'run': 'fixtures:seeded_room'}, {'run': 'fixtures:guard_first_use'}]},
+            {'id': 'setup', 'role': 'setup', 'steps': [
+                {'run': 'fixtures:cpu_standing', 'effect': True},
+                {'run': 'fixtures:seeded_room', 'effect': True,
+                 'cases': {'judge': 'unused.py:judge', 'dir': 'unused'}}]},
+        ]
         report = self.shared_case_check(shared, plan)
         self.assertFalse(any(item.startswith('G9 ') for item in report['errors'] + report['warnings']))
 
@@ -1286,7 +1319,7 @@ fn elsewhere() { write!(out, "outside=1"); }
             'from judge import judge\ndef ok(ctx): return {"frames": 3}\n')
         self.assertEqual(self.errors(), [])
 
-    def test_missing_hook_cases_warn_or_refuse_but_shared_fixtures_are_exempt(self):
+    def test_missing_hook_cases_warn_or_refuse_including_shared_fixtures(self):
         self.plan['rows'] = [{'id': 'trial', 'role': 'test', 'steps': [{'run': 'steps.py:ok', 'effect': True}]}]
         message = 'G9 row trial: effect hook steps.py:ok has no judge cases; its evidence is trusted'
         result = packet_gate.check(self.plan, self.base, self.plan)
@@ -1295,7 +1328,12 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertIn(message + ' (require_cases)', self.errors())
         self.plan['rows'][0]['steps'] = [{'run': 'fixtures:cpu_standing', 'effect': True}]
         result = packet_gate.check(self.plan, self.base, self.plan)
-        self.assertFalse(any(message.startswith('G9 ') for message in result['errors'] + result['warnings']))
+        fixture = 'G9 row trial: effect hook fixtures:cpu_standing has no judge cases; its evidence is trusted'
+        self.assertIn(fixture + ' (require_cases)', result['errors'])
+        self.plan.pop('require_cases')
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertIn(fixture, result['warnings'])
+        self.assertFalse(any(message.startswith('G9 ') for message in result['errors']))
 
     def test_require_cases_is_checked_without_a_target_too(self):
         self.plan.pop('target')
