@@ -1,6 +1,7 @@
 """Offline closed-loop route tests with a scripted clock and observations."""
 import unittest
 
+import closed_loop
 from closed_loop import RouteStopped, Step, run
 
 
@@ -39,6 +40,53 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_an_unanswered_read_keeps_the_lost_timer_and_the_retry_runs(self):
+        no_read = getattr(closed_loop, 'NO_READ', object())
+        fake = Script(lambda f: 'done' if len(f.sends) >= 2 else
+                      no_read if f.sends and f.now == 3 else 'source')
+        result = fake.run([step('press', 'source', 'done', lost_after=3)])
+        self.assertEqual(len(fake.sends), 2)
+        self.assertEqual(fake.sends[1][1], 6)
+        self.assertEqual(result['steps'][0]['unanswered'], 1)
+        self.assertEqual(fake.finishes, 2)
+
+    def test_an_unanswered_read_never_authorises_a_send(self):
+        no_read = getattr(closed_loop, 'NO_READ', object())
+        fake = Script(lambda f: 'done' if f.sends else no_read if f.now < 2 else 'source')
+        result = fake.run([step('press', 'source', 'done')])
+        self.assertEqual(fake.sends, [('press', 2)])
+        self.assertGreaterEqual(result['steps'][0]['unanswered'], 2)
+
+    def test_a_reply_just_after_the_deadline_is_used(self):
+        no_read = getattr(closed_loop, 'NO_READ', object())
+        grace = []
+
+        def observe(f):
+            if not f.sends:
+                return 'source'
+            if f.now >= 4:
+                grace.append(True)
+                return no_read if len(grace) == 1 else 'done'
+            return no_read
+
+        fake = Script(observe)
+        result = fake.run([step('press', 'source', 'done', cap=4)])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 1)
+        self.assertGreaterEqual(result['steps'][0]['unanswered'], 1)
+        self.assertGreaterEqual(len(grace), 2)
+
+    def test_only_unanswered_reads_until_the_cap_stop_with_the_last_answered_read(self):
+        no_read = getattr(closed_loop, 'NO_READ', object())
+        fake = Script(lambda f: 'source' if not f.sends else no_read)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=4)])
+        self.assertIn("last answered read 'source'", caught.exception.reason)
+        self.assertIn('unanswered reads', caught.exception.reason)
+        self.assertGreaterEqual(caught.exception.receipt['steps'][0]['unanswered'], 4)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+
     def test_every_step_runs_once_on_the_plain_path(self):
         fake = Script(lambda f: ['one', 'two', 'done'][len(f.sends)])
         result = fake.run([step('first', 'one', 'two'), step('second', 'two', 'done')])
