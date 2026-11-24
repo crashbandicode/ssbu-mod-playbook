@@ -1105,7 +1105,9 @@ class ReachTrainingPhaseReplay:
             fields = {'screen': screen, 'screen.context': 'training',
                       'focus': screen,
                       'focus.source': 'tile.cursor' if screen in ('stage_select', 'css.training') else 'native'}
-        return recorded.native(self.revision, **fields)
+        sample = recorded.native(self.revision, **fields)
+        sample.block.update({'frame': self.revision * 10, 'wall': self.revision * 100})
+        return sample
 
     def finish(self):
         self.events.append(('finish', self.screen, self.ctx.on in self.pending))
@@ -1181,6 +1183,51 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.assertEqual(self.io.calls.count('pick_stage'), 1)
         self.assertEqual(result['recovered'], ['pick_stage'])
         self.assertEqual(self.io.calls, ['pick_stage', 'pick_fighters', 'enter_training'])
+
+    def test_a_phase_retry_writes_a_stall_event_and_is_not_a_plain_pass(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.phase_duration = 1
+        log = self.row / 'bridge.log'
+        log.write_text('old line\nphase retry evidence\n\n')
+        self.ctx.instance = {'bridge_log': str(log)}
+        result = self.invoke()
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        event, = result['stalls']
+        self.assertEqual((event['kind'], event['step'], event['start']),
+                         ('phase-retry', 'pick_stage', 1))
+        self.assertEqual(event['error'], 'phase transition deadline')
+        self.assertEqual(event['screen'], 'stage_select')
+        self.assertEqual(event['seconds'], 1)
+        self.assertEqual(event['frame'], event['rev'] * 10)
+        self.assertEqual(event['wall'], event['rev'] * 100)
+        self.assertEqual(event['last_bridge_line'], 'phase retry evidence')
+        self.assertIn('utc', event)
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{**event, 'block': 'reach_training'}])
+
+    def test_a_recovered_phase_writes_a_stall_event(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.after_failure = lambda io, name: setattr(io, 'screen', 'css.training')
+        result = self.invoke()
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        event, = result['stalls']
+        self.assertEqual((event['kind'], event['step'], event['start'], event['screen']),
+                         ('phase-recovered', 'pick_stage', 1, 'css.training'))
+        self.assertEqual(event['error'], 'phase transition deadline')
+        self.assertEqual(event['rev'], 3)
+        self.assertIsNone(event['last_bridge_line'])
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{**event, 'block': 'reach_training'}])
+
+    def test_a_phase_stop_keeps_the_retry_stall_events(self):
+        self.io.failures['pick_stage'] = 3
+        with self.assertRaises(routes.closed_loop.RouteStopped):
+            self.invoke()
+        stop = self.stop_receipt()
+        self.assertEqual(stop['result'], 'STOPPED with 2 stalls')
+        self.assertEqual([(event['kind'], event['start']) for event in stop['stalls']],
+                         [('phase-retry', 1), ('phase-retry', 2)])
+        self.assertEqual(len((self.row / 'stall-events.jsonl').read_text().splitlines()), 2)
 
     def test_a_css_reached_without_a_recorded_stage_goes_back_and_picks_the_stage_again(self):
         self.ctx.runner.routes_expect.clear()

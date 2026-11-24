@@ -61,6 +61,104 @@ class ClosedLoopTests(unittest.TestCase):
         index = fake.events.index(('finish',))
         self.assertEqual(fake.events[index + 1][0], 'read')
 
+    def test_a_lost_input_is_resent_only_on_the_same_target(self):
+        fake = Script(lambda f: ('done', None) if len(f.sends) >= 2 else ('source', 'tile-0'))
+        item = Step('press', lambda o: o[0] == 'source', lambda o: o[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda o: o[1])
+        result = fake.run([item])
+        self.assertEqual([macro for macro, _ in fake.sends], ['press', 'press'])
+        self.assertEqual(result['steps'][0]['sends'], 2)
+        self.assertEqual(fake.finishes, 2)
+
+    def test_a_changed_target_stops_without_finish_or_resend(self):
+        fake = Script(lambda f: ('source', 'tile-0' if not f.sends else 'tile-1'))
+        item = Step('press', lambda o: o[0] == 'source', lambda o: o[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda o: o[1])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertEqual(caught.exception.step, 'press')
+        self.assertIn('source target changed after the send', caught.exception.reason)
+        self.assertIn('tile-0', caught.exception.reason)
+        self.assertIn('tile-1', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['stalls'], [])
+
+    def test_a_changed_fresh_retry_target_does_not_authorize_resending(self):
+        reads_at_three = []
+
+        def observe(f):
+            if not f.sends or f.now < 3:
+                return ('source', 'tile-0')
+            if f.now == 3:
+                reads_at_three.append(True)
+                return ('source', 'tile-0' if len(reads_at_three) == 1 else 'tile-1')
+            return ('source', 'tile-1')
+
+        fake = Script(observe)
+        item = Step('press', lambda o: o[0] == 'source', lambda o: o[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda o: o[1])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertIn('source target changed after the send', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['stalls'], [])
+
+    def test_a_send_error_stops_with_delivery_unknown(self):
+        fake = Script(lambda f: 'source')
+
+        def send(macro):
+            fake.sends.append((macro, fake.now))
+            raise RuntimeError('no reply to macro.play')
+
+        fake.send = send
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')])
+        self.assertEqual(caught.exception.step, 'press')
+        self.assertEqual(caught.exception.reason, 'dispatch failed, delivery unknown: no reply to macro.play')
+        self.assertEqual(caught.exception.receipt['steps'][0]['sends'], 1)
+        self.assertEqual(caught.exception.receipt['steps'][0]['dispatch'], 'unknown')
+        self.assertFalse(caught.exception.receipt['steps'][0]['skipped'])
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['stalls'], [])
+
+    def test_each_resend_reports_a_stall_event(self):
+        fake = Script(lambda f: ('done', None) if len(f.sends) >= 3 else ('source', 'tile-0'))
+        item = Step('press', lambda o: o[0] == 'source', lambda o: o[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda o: o[1])
+        callbacks = []
+
+        def on_stall(event, obs):
+            callbacks.append((dict(event), obs))
+            return {**event, 'extra': 'recorded'}
+
+        result = fake.run([item], on_stall=on_stall)
+        self.assertEqual(len(fake.sends), 3)
+        self.assertEqual([event['send'] for event in result['stalls']], [1, 2])
+        self.assertEqual([event['step'] for event in result['stalls']], ['press', 'press'])
+        self.assertTrue(all(event['target'] == repr('tile-0') for event in result['stalls']))
+        self.assertTrue(all(event['seconds_on_source'] >= 2 for event in result['stalls']))
+        self.assertTrue(all(event['extra'] == 'recorded' for event in result['stalls']))
+        self.assertEqual([obs for _, obs in callbacks], [('source', 'tile-0')] * 2)
+
+    def test_the_last_lost_send_also_reports_a_stall(self):
+        fake = Script(lambda f: 'source')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', lost_after=2, sends=2)])
+        self.assertEqual([event['send'] for event in caught.exception.receipt['stalls']], [1, 2])
+        self.assertEqual(caught.exception.reason, 'no transition after 2 sends')
+        self.assertEqual(fake.finishes, 2)
+
+    def test_none_from_stall_callback_keeps_the_original_event(self):
+        fake = Script(lambda f: 'done' if len(f.sends) >= 2 else 'source')
+        seen = []
+        result = fake.run([step('press', 'source', 'done', lost_after=2)],
+                          on_stall=lambda event, obs: seen.append((dict(event), obs)))
+        self.assertEqual(result['stalls'], [seen[0][0]])
+        self.assertEqual(seen[0][1], 'source')
+        self.assertEqual(result['stalls'][0]['target'], 'None')
+
     def test_a_slow_transition_is_waited_out_without_a_second_send(self):
         fake = Script(lambda f: 'source' if not f.sends else
                       ('done' if f.now - f.sends[-1][1] >= 40 else 'flight'))

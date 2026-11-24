@@ -2876,6 +2876,10 @@ class WirelessRoomTests(unittest.TestCase):
             self.stage_script = []
             self.stage_errors_after_send = False
             self.stage_tile_unsettled_reads = 0
+            self.stage_token = 'held'
+            self.stage_tile_after_send = None
+            self.fail_stage_dispatch = False
+            self.pending = None
             self.css_tile_delay = 0
             self.css_since = None
             self.clock = lambda: 0
@@ -2905,8 +2909,9 @@ class WirelessRoomTests(unittest.TestCase):
                 if self.phase in ('stage', 'stage_reacting'):
                     settled = '0' if self.stage_tile_unsettled_reads else '1'
                     self.stage_tile_unsettled_reads = max(0, self.stage_tile_unsettled_reads - 1)
-                    values = {'screen': 'sss', 'settled': settled, 'at': '0', 'hovered': '0',
-                              'local.token': 'held'}
+                    at = self.stage_tile_after_send if self.stage_count and self.stage_tile_after_send else '0'
+                    values = {'screen': 'sss', 'settled': settled, 'at': at, 'hovered': at,
+                              'local.token': self.stage_token}
                     block = {'name': provider, 'schema': provider + '/1', 'filtered': False,
                              'rev': self.revision, 'boot': '0xe54e9b821337ecd1', 'values': values}
                     self.events.append(('read', provider, dict(values)))
@@ -2999,6 +3004,7 @@ class WirelessRoomTests(unittest.TestCase):
                 if fault and self.ui_fault_kind == 'missing':
                     values.pop('screen')
             block = {'name': provider, 'schema': provider + '/1', 'filtered': False, 'rev': self.revision,
+                     'frame': self.revision * 10, 'wall': self.revision * 100,
                      'boot': '0xe54e9b821337ecd1', 'values': values}
             self.events.append(('read', provider, dict(values)))
             return types.SimpleNamespace(block=block, values=values, connection=1)
@@ -3006,6 +3012,9 @@ class WirelessRoomTests(unittest.TestCase):
         def send(self, macro):
             self.events.append(('send', macro))
             self.actions.append(macro)
+            self.pending = macro
+            if macro == 'lobby-a' and self.phase == 'stage' and self.fail_stage_dispatch:
+                raise RuntimeError('no reply to macro.play')
             if macro == 'lobby-open-room-list' and self.phase == 'main':
                 if not self.room_list_missing:
                     self.phase = 'rooms'
@@ -3063,7 +3072,8 @@ class WirelessRoomTests(unittest.TestCase):
                 raise AssertionError(f'unexpected input {macro!r} on {self.phase!r}')
 
         def finish(self):
-            pass
+            self.events.append(('finish', self.pending))
+            self.pending = None
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -3472,13 +3482,19 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(next(s for s in result['steps'] if s['name'] == 'ready')['sends'], 1)
         self.assertEqual(result['waiting']['ldn.role'], 'host')
 
-    def test_a_lost_ready_is_pressed_once_more_after_thirty_seconds(self):
+    def test_a_lost_ready_is_never_pressed_twice(self):
         self.io.lost_ready_sends = 1
-        result = self.run_room(unpublished_create='allow')
-        self.assertEqual(self.io.actions.count('lobby-ready'), 2)
-        self.assertGreaterEqual(self.io.ready_send_times[1] - self.io.ready_send_times[0], 30)
-        self.assertEqual(next(s for s in result['steps'] if s['name'] == 'ready')['sends'], 2)
-        self.assertEqual(result['waiting']['ldn.role'], 'host')
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'ready')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(self.io.actions.count('lobby-ready'), 1)
+        self.assertGreaterEqual(self.now - self.io.ready_send_times[0], 45)
+        self.assertEqual(self.io.pending, 'lobby-ready')
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['sends'], 1)
+        self.assertEqual(stop['result'], 'STOPPED')
+        self.assertEqual(stop['stalls'], [])
 
     def test_waiting_timeout_reports_screens_seen(self):
         self.io.never_waiting = True
@@ -3502,6 +3518,90 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.stage_count, 2)
         self.assertEqual(result['stage_presses'], 2)
         self.assertEqual(next(s for s in result['steps'] if s['name'] == 'stage-a')['sends'], 2)
+
+    def test_stage_a_needs_the_held_stage_token(self):
+        for token in ('unknown', 'none', None):
+            with self.subTest(token=token):
+                self.io = self.IO()
+                self.io.stage_token = token
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_room(unpublished_create='allow')
+                self.assertEqual(caught.exception.step, 'stage-a')
+                self.assertIn('not ready', caught.exception.reason)
+                self.assertNotIn('lobby-a', self.io.actions)
+                stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+                self.assertEqual(stop['sends'], 0)
+
+    def test_a_lost_a_then_a_different_stage_tile_never_presses_again(self):
+        self.io.lost_stage_sends = 1
+        self.io.stage_tile_after_send = '1'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertIn('source target changed after the send', caught.exception.reason)
+        self.assertEqual(self.io.actions.count('lobby-a'), 1)
+        self.assertEqual(self.io.pending, 'lobby-a')
+        press = self.io.events.index(('send', 'lobby-a'))
+        self.assertFalse(any(event[0] == 'finish' for event in self.io.events[press + 1:]))
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual((stop['step'], stop['sends']), ('stage-a', 1))
+        self.assertEqual(stop['result'], 'STOPPED')
+
+    def test_a_macro_play_error_writes_the_stop_receipt(self):
+        self.io.fail_stage_dispatch = True
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertIn('dispatch failed, delivery unknown: no reply to macro.play', caught.exception.reason)
+        self.assertEqual(self.io.actions.count('lobby-a'), 1)
+        self.assertEqual(self.io.pending, 'lobby-a')
+        press = self.io.events.index(('send', 'lobby-a'))
+        self.assertFalse(any(event[0] == 'finish' for event in self.io.events[press + 1:]))
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual((stop['step'], stop['sends'], stop['dispatch']), ('stage-a', 1, 'unknown'))
+        self.assertEqual(stop['last_ui']['screen'], 'stage_select')
+        self.assertEqual((stop['last_tile']['screen'], stop['last_tile']['at']), ('sss', '0'))
+        self.assertEqual(stop['result'], 'STOPPED')
+
+    def test_a_resend_is_reported_as_pass_with_one_stall(self):
+        log = self.row / 'bridge.log'
+        log.write_text('previous\nlast non-empty line\n\n')
+        self.ctx.instance = {'bridge_log': str(log)}
+        self.ctx.call = lambda method: {'game_fps': 50}
+        self.io.lost_stage_sends = 1
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        self.assertEqual(len(result['stalls']), 1)
+        event, = result['stalls']
+        self.assertEqual((event['kind'], event['step'], event['send']), ('resend', 'stage-a', 1))
+        self.assertEqual(event['target'], repr('0'))
+        self.assertEqual(event['screen'], 'stage_select')
+        self.assertEqual(event['tile']['at'], '0')
+        self.assertGreaterEqual(event['seconds_on_source'], 6)
+        self.assertEqual(event['frame'], event['rev'] * 10)
+        self.assertEqual(event['wall'], event['rev'] * 100)
+        self.assertEqual(event['last_bridge_line'], 'last non-empty line')
+        self.assertEqual((event['eden_fps'], event['eden_frame_ms']), (50, 20))
+        self.assertIn('utc', event)
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0], {**event, 'block': 'wireless_room'})
+
+    def test_the_plain_path_is_a_plain_pass_with_no_stall_file(self):
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual((result['result'], result['stalls']), ('PASS', []))
+        self.assertFalse((self.row / 'stall-events.jsonl').exists())
+
+    def test_a_stop_after_resends_lists_its_stalls(self):
+        self.io.stuck_stage = True
+        with self.assertRaises(routes.closed_loop.RouteStopped):
+            self.run_room(unpublished_create='allow')
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['result'], 'STOPPED with 3 stalls')
+        self.assertEqual([item['send'] for item in stop['stalls']], [1, 2, 3])
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row['block'] == 'wireless_room' for row in rows))
 
     def test_a_slow_stage_load_gets_one_press(self):
         self.io.stage_load_seconds = 40
