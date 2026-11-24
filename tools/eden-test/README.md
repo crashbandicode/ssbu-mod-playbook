@@ -60,6 +60,10 @@ What it does:
 6. Leaves Eden up after Up succeeds, whether the rows pass or fail.
 
 Read the printed `REPORT.md` for PASS, FAIL and NOT RUN.
+`PASS with N stalls` means the row passed after N inputs or steps had to be recovered.
+Machine counts still count the row as PASS.
+Each stall event is counted once, including copies in nested receipts and the JSONL log.
+Stall totals count passed rows only.
 `go` exits 0 only when every row passed, and 3 otherwise.
 Rows continue after a failure; a row whose recovery fails is FAILED without running.
 Rerun one row: `eden_test.py run /home/intpa/eden-runs/my-run --rows r02a`.

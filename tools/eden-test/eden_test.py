@@ -1382,6 +1382,10 @@ def time_split(run):
 
 def results_md(run, config):
     passed, failed, unrun, retained = row_accounting(run)
+    reported = report_rows_with_stalls(run)
+    stalled = [(row, result, stalls) for row, result, _, _, stalls in reported
+               if result == 'PASS' and stalls]
+    stall_suffix = _stall_totals(reported)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
     timing = json.loads((run / 'timing.json').read_text())
     runs = [(start, end) for start, end in timing.get('runs', []) if end]
@@ -1400,8 +1404,12 @@ def results_md(run, config):
     lines = [f'# {config["label"]} — {time.strftime("%Y-%m-%d", time.gmtime())}',
              f'- Eden: {"; ".join(apps)}',
              f'- Plugins: ' + ', '.join(f'{Path(p["path"]).name} {p["sha256"][:8]}' for p in config['instances'][0].get('plugins', [])),
-             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun; {retained} earlier failed attempts retained '
+             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun{stall_suffix}; {retained} earlier failed attempts retained '
              f'(receipts in `out/`); final rows.json {rows_note}; {len(manifests)} runner manifests in `out/manifests/`']
+    for row, result, stalls in stalled[:6]:
+        lines.append(f'  - {shown_result(result, stalls)} {row["id"]}')
+    if len(stalled) > 6:
+        lines.append(f'  - and {len(stalled) - 6} more rows passed with stalls (see REPORT.md)')
     for row, error in failed[:6]:
         lines.append(f'  - FAILED {row}: {one_line(error)}')
     if unrun:
@@ -1420,8 +1428,8 @@ def results_md(run, config):
               + (' (incomplete timing)' if split['incomplete'] else '')
               + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
-    (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
-    print('\n'.join(lines[:20]))
+    (run / 'RESULTS.md').write_text('\n'.join(lines) + '\n')
+    print('\n'.join(lines))
 
 
 PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'  # lifecycle.py PLUGINS
@@ -1560,6 +1568,93 @@ def row_report(run, row, history):
     return result, reason, proof + [f'out/{name}' for name in asides]
 
 
+class _RowStalls(list):
+    def __init__(self):
+        super().__init__()
+        self.unreadable = 0
+
+
+def row_stalls(run, row_id, receipt) -> list[dict]:
+    stalls = _RowStalls()
+    seen = {}
+
+    def add(event):
+        if not isinstance(event, dict):
+            return
+        identity = json.dumps({key: value for key, value in event.items() if key != 'block'},
+                              sort_keys=True, default=str)
+        if identity not in seen:
+            seen[identity] = len(stalls)
+            stalls.append(dict(event))
+        elif 'block' in event:
+            stalls[seen[identity]].setdefault('block', event['block'])
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == 'stalls' and isinstance(child, list):
+                    for event in child:
+                        add(event)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for step in receipt.get('results', []):
+        if isinstance(step, dict):
+            walk(step.get('value'))
+    path = Path(run) / 'out' / row_id / 'stall-events.jsonl'
+    if path.exists():
+        try:
+            with path.open(encoding='utf-8', errors='replace') as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        stalls.unreadable += 1
+                        continue
+                    if isinstance(event, dict):
+                        add(event)
+                    else:
+                        stalls.unreadable += 1
+        except OSError:
+            stalls.unreadable += 1
+    return stalls
+
+
+def shown_result(result, stalls):
+    if result != 'PASS' or not stalls:
+        return result
+    count = len(stalls)
+    return f'PASS with {count} {"stall" if count == 1 else "stalls"}'
+
+
+def report_rows_with_stalls(run):
+    run = Path(run)
+    rows = []
+    for row, result, reason, proof in report_rows(run):
+        path = run / 'out' / f'{row["id"]}.json'
+        receipt = json.loads(path.read_text()) if path.exists() else {}
+        rows.append((row, result, reason, proof, row_stalls(run, row['id'], receipt)))
+    return rows
+
+
+def _stall_totals(rows):
+    passed_stalls = [stalls for _, result, _, _, stalls in rows if result == 'PASS' and stalls]
+    if not passed_stalls:
+        return ''
+    passed = len(passed_stalls)
+    total = sum(len(stalls) for stalls in passed_stalls)
+    return (f' ({passed} {"row" if passed == 1 else "rows"} passed with stalls, '
+            f'{total} {"stall" if total == 1 else "stalls"} in those rows)')
+
+
+def _stall_text(event):
+    fields = ('block', 'kind', 'step', 'screen', 'send')
+    parts = [f'{key}={event[key]}' for key in fields if key in event]
+    return ', '.join(parts) if parts else json.dumps(event, sort_keys=True, default=str)
+
+
 def report_rows(run):
     run = Path(run)
     spec = json.loads((run / 'rows' / 'rows.json').read_text())
@@ -1587,7 +1682,7 @@ def report_md(run):
     from the run folder alone. Works while Eden is still up and again after Down."""
     run = Path(run)
     config = json.loads((run / 'config.json').read_text())
-    rows = report_rows(run)
+    rows = report_rows_with_stalls(run)
     timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
 
     def utc(key):
@@ -1604,10 +1699,18 @@ def report_md(run):
     else:
         state = f'no Up recorded on {host}'
     table, counts = [], {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}
-    for row, result, reason, proof in rows:
+    for row, result, reason, proof, stalls in rows:
         counts[result] += 1
         blocks = ', '.join(str(step.get('run', next(iter(step), '?'))).split(':')[-1] for step in row.get('steps', []))
-        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {result} | {cell(reason, 420)} | {"<br>".join(proof)} |')
+        details = []
+        if stalls:
+            text = f'stalls: {len(stalls)}: ' + '; '.join(_stall_text(event) for event in stalls)
+            details.append(cell(text, len(text)))
+        if stalls.unreadable:
+            details.append(f'unreadable stall-event lines: {stalls.unreadable}')
+        details.append(cell(reason, 420))
+        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {shown_result(result, stalls)} | '
+                     f'{"; ".join(details)} | {"<br>".join(proof)} |')
     split = time_split(run)
     ends = []  # how each runner call ended: its last status line that is not a row's
     runner_log = run / 'runner.log'
@@ -1624,8 +1727,8 @@ def report_md(run):
              f'- Runner: {len(ends)} call(s) ended: ' + ('; '.join(ends) if ends else 'no end line in runner.log'),
              card_lineup_report(config),
              '- NROs:', *nro_lines(run, config),
-             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)} '
-             f'(proof paths are relative to `{run}`)',
+             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)}'
+             f'{_stall_totals(rows)} (proof paths are relative to `{run}`)',
              '', '| Row | Steps | Result | Reason | Proof |', '| --- | --- | --- | --- | --- |', *table, '',
              f'- Times: Up {utc("up_start")} to {utc("up_done")}; rows {utc("run_start")} to {utc("run_end")} over '
              f'{len(timing.get("runs", [])) or 1} runner call(s); setup rows {split["setup"]:.0f} s, test rows '
