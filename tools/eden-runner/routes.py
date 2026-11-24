@@ -3481,7 +3481,7 @@ def _bridge_on_control_journal(ctx):
             'requests_after_load': len(after), 'inputs_after_load': 0}
 
 
-def _bridge_on_qualified_receipt(ctx, event):
+def _bridge_on_qualified_receipt(ctx, event, port):
     candidates = []
     for path in Path(ctx.row_dir).parent.glob('*/routes-bridge-on*.json'):
         try:
@@ -3493,10 +3493,13 @@ def _bridge_on_qualified_receipt(ctx, event):
             receipt = json.loads(path.read_text())
             chord = receipt['chord']
             witness = receipt['witness']
-            if not isinstance(chord, dict) or chord.get('event') != event:
+            if (not isinstance(chord, dict) or chord.get('event') != event
+                    or receipt['capture']['port'] != port):
                 continue
             title = receipt.get('title')
             if witness == 'trace':
+                if not isinstance(chord.get('stock'), dict) or chord.get('chord') == 'already on':
+                    continue
                 title = None
             elif not (witness == 'stub-on' and chord.get('chord') == 'pad'
                       and isinstance(chord.get('pre_chord'), dict)
@@ -3510,11 +3513,11 @@ def _bridge_on_qualified_receipt(ctx, event):
                        'bridge_on receipt for that On event: cannot show how it was enabled')
 
 
-def _bridge_on_stub_enable(ctx):
+def _bridge_on_stub_enable(ctx, port):
     before = _bridge_on_events(ctx)
     existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
     if existing is not None:
-        return _bridge_on_qualified_receipt(ctx, existing)
+        return _bridge_on_qualified_receipt(ctx, existing, port)
     until = time.monotonic() + 54
     missing = []
     while time.monotonic() < until:
@@ -3522,7 +3525,7 @@ def _bridge_on_stub_enable(ctx):
         before = _bridge_on_events(ctx)
         existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
         if existing is not None:
-            return _bridge_on_qualified_receipt(ctx, existing)
+            return _bridge_on_qualified_receipt(ctx, existing, port)
         _bridge_on_control_journal(ctx)
         install = next((line for line in reversed(before) if 'toggle=off reason=boot_default' in line), None)
         ready = next((line for line in reversed(before) if re.fullmatch(r'\d+ \[Bridge\] chord ready', line)), None)
@@ -3685,7 +3688,7 @@ def bridge_on(ctx, port=None, cap=60):
             port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())
         except (KeyError, OSError, ValueError):
             raise RuntimeError('bridge_on needs a port argument or an integer in profile port.txt') from None
-    chord = _bridge_on_cold_enable(ctx, trace) if trace is not None else _bridge_on_stub_enable(ctx)
+    chord = _bridge_on_cold_enable(ctx, trace) if trace is not None else _bridge_on_stub_enable(ctx, port)
     until = time.monotonic() + 5
     listening = last_listen = None
     pattern = re.compile(r'\[Bridge\] listening port=' + re.escape(str(port)) + r'\b')
