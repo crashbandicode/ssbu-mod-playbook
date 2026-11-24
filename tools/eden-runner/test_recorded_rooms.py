@@ -1,5 +1,6 @@
 """Offline route replay against unmodified recorded bridge exchanges."""
 import gzip
+import hashlib
 import json
 import re
 import tempfile
@@ -17,10 +18,12 @@ FIXTURES = Path(__file__).parent / 'fixtures' / 'recorded-rooms'
 RUNS = {
     'xps-stop-1': dict(boot='0x022b82b302fcdd39', room_list=618, stage_first=840,
                        stage_wait_last=1783, lost_a=847, tiles=(6617, 7141, 13973),
-                       start_before_tile=13964, working_a=13986, css=14061, lines=2686),
+                       start_before_tile=13964, working_a=13986, css=14061, lines=2686,
+                       sha256='a31a826e57dbb45bd01aac56888e55f5228a8ec117c9c0ddcd0f0deb6bd371f4'),
     'xps-1': dict(boot='0x41ebfad78f601a4b', room_list=772, stage_first=992,
                   stage_wait_last=1931, lost_a=1004, tiles=(7230, 12845),
-                  start_before_tile=12837, working_a=12862, css=12936, lines=2971),
+                  start_before_tile=12837, working_a=12862, css=12936, lines=2971,
+                  sha256='f15060a8119ff3215fe7013fd31778ec78d54c0c904febaa1053a4729c445351'),
 }
 BEGIN = re.compile(r'\[Bridge\] state begin name=(\S+).* frame=(\d+) wall=\d+$')
 FENCE = re.compile(r'\[Bridge\] req providers result=ok .* boot=(0x[0-9a-f]{16})(?: |$)')
@@ -127,6 +130,7 @@ class RecordedRoomsTests(unittest.TestCase):
             with self.subTest(run=name):
                 lines, blocks = exchanges(name)
                 self.assertEqual(len(lines), facts['lines'])
+                self.assertEqual(hashlib.sha256(''.join(lines).encode('utf-8')).hexdigest(), facts['sha256'])
                 self.assertEqual({entry['boot'] for entry in blocks}, {facts['boot']})
                 ui = [entry for entry in blocks if entry['provider'] == 'ssbu.ui']
                 rooms = [entry for entry in ui if entry['values'].get('screen') == 'ldn.room_list']

@@ -28,7 +28,7 @@ class Step:
     """A before_send hook may return a rollback for a known busy rejection."""
 
     def __init__(self, name, at, done, macro, *, cap, ready_cap=20.0, lost_after=4.0, sends=3,
-                 before_send=None, target=None, source=None):
+                 before_send=None, target=None, source=None, screen=None):
         self.name = name
         self.at = at
         self.done = done
@@ -40,6 +40,7 @@ class Step:
         self.before_send = before_send
         self.target = target
         self.source = source
+        self.screen = screen
 
 
 def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time.sleep, poll=0.3,
@@ -273,6 +274,9 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         if grace:
             stop('locate', unreadable_reason(locate_unanswered))
         index = matching(obs)
+        if index is None:
+            index = next((i for i in range(len(steps) - 1, -1, -1)
+                          if steps[i].screen and steps[i].screen(obs)), None)
         if index is not None:
             entered_at = steps[index].name
             records[index]['unanswered'] += locate_unanswered

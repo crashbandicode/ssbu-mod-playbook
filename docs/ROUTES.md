@@ -88,8 +88,14 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
-Before every input, the step requires a `macro.status` of `idle` or `finished` without an error.
-`countdown`, `recording`, `playing`, and `branch_playing` wait; any other or unreadable status is treated as busy.
+A route starting on a recognised but unready screen waits in that screen's step and stops there, not on `locate`,
+if readiness never arrives; this was found by replaying `rc15-i2-71158421-xps-stop-1`.
+Before every `routes.play` input, wait up to one 15-second budget for an idle macro channel; a wait over one second
+that sends an input records a stall event, and an exhausted budget sends nothing. The wireless engine owns this wait
+for its own inputs.
+Eden's `error` state is inactive and releases input; its failure text is retained in the wireless receipt or play log.
+`idle` also releases input, as does `finished` without an error. `countdown`, `recording`, `playing`, and `branch_playing`
+wait; any other or unreadable status is treated as busy.
 One 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
 a fresh read. Each `macro.status` poll is limited to the remaining budget; its control-client timeout cannot
 extend that budget, and an unanswered poll counts as busy. Stall diagnostic `status` reads are capped at one
@@ -130,6 +136,10 @@ the row folder also receives `stall-events.jsonl`. The flight owner copies that 
 Inner Training input resends are stall events in every enclosing receipt and in `stall-events.jsonl`.
 After a phase fails, the route re-decides from live state and never repeats it when its postcondition already holds.
 This closed-loop route is host-tested only, not flown.
+
+**Recorded streams:** `fixtures/recorded-rooms/xps-stop-1.bridge.log.gz` and `xps-1.bridge.log.gz` replay the real
+fenced bridge answers. They show no stage press without a tile read, one A after a qualifying tile read reaches CSS,
+and refusal to open Create when the room-list focus is unpublished.
 
 **Why (2026-11-23/24):** the three stalled flights pressed A 5 to 12 frames after the first `stage_select` block,
 before the picker took input, and the wait's last read had a 1 ms cap; see

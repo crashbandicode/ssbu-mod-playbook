@@ -109,7 +109,11 @@ def _bounded_call(ctx, method, cap):
     return result[0] if not worker.is_alive() else (False, None)
 
 
-def _eden_macro_busy(ctx, remaining):
+def _eden_macro_note(status):
+    return status.get('error') or ''
+
+
+def _eden_macro_busy(ctx, remaining, note=None):
     try:
         answered, status = _bounded_call(ctx, 'macro.status', remaining)
         if not answered:
@@ -118,11 +122,14 @@ def _eden_macro_busy(ctx, remaining):
             return f'macro.status not understood: {repr(status)[:160]}'
         if isinstance(status, dict):
             state, error = status.get('state'), status.get('error')
-            if error in (None, ''):
-                if state in ('idle', 'finished'):
-                    return None
-                if state in ('countdown', 'recording', 'playing', 'branch_playing'):
-                    return f'macro {state}'
+            if state == 'error':
+                if note is not None:
+                    note(_eden_macro_note(status))
+                return None
+            if state in ('countdown', 'recording', 'playing', 'branch_playing'):
+                return f'macro {state}'
+            if state == 'idle' or (state == 'finished' and error in (None, '')):
+                return None
         return f'macro.status not understood: {repr(status)[:160]}'
     except Exception as error:
         return f'macro.status not understood: {repr(error)[:160]}'
@@ -749,9 +756,40 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
+PLAY_IDLE_CAP = 15.0
+
+
 def play(ctx, name):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
     path, sha, cap = macro_file(name)
+    stall = None
+    if not getattr(ctx.runner, 'closed_loop_owns_idle', False):
+        started, waits, why = time.monotonic(), 0, 'macro.status slow'
+        while True:
+            remaining = PLAY_IDLE_CAP - (time.monotonic() - started)
+            if remaining <= 1e-6:
+                if remaining > 0:
+                    time.sleep(remaining)
+                seconds = time.monotonic() - started
+                raise closed_loop.DispatchRejected(
+                    f'macro {name} not sent: input channel busy for {seconds:g} s over {waits} waits: {why}')
+            current = _eden_macro_busy(ctx, remaining, note=lambda text: ctx.log({'last_macro_error': text}))
+            waits += 1
+            if current is not None:
+                why = current
+            seconds = time.monotonic() - started
+            if seconds >= PLAY_IDLE_CAP:
+                raise closed_loop.DispatchRejected(
+                    f'macro {name} not sent: input channel busy for {seconds:g} s over {waits} waits: {why}')
+            if current is None:
+                if seconds > 1.0:
+                    stall = (seconds, waits, why)
+                break
+            time.sleep(min(.2, PLAY_IDLE_CAP - seconds))
+        seconds = time.monotonic() - started
+        if seconds >= PLAY_IDLE_CAP:
+            raise closed_loop.DispatchRejected(
+                f'macro {name} not sent: input channel busy for {seconds:g} s over {waits} waits: {why}')
     try:
         ctx.call('macro.play', {'path': str(path)})
     except RuntimeError as error:
@@ -759,6 +797,18 @@ def play(ctx, name):
         if 'input_busy' in message or 'macro.play busy' in message:
             raise closed_loop.DispatchRejected(str(error)) from error
         raise
+    if stall is not None:
+        seconds, waits, why = stall
+        try:
+            event = {'kind': 'idle-wait', 'block': 'play', 'step': name, 'seconds': seconds,
+                     'waits': waits, 'why': why, 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
+            metrics = getattr(ctx.runner, 'setup_metrics', None)
+            if isinstance(metrics, dict):
+                metrics.setdefault('stalls', []).append(event)
+            if getattr(ctx, 'row_dir', None) is not None:
+                _append_stall(ctx, 'play', event)
+        except Exception as error:
+            raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
     try:
         ctx.runner.wait_macro(ctx.on, cap)
     except RuntimeError as error:
@@ -1174,7 +1224,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
              'form_pending': False, 'form_ready': False, 'form_settling': False, 'ready_published': False,
              'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
              'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
-             'prefinished': False, 'current': None, 'ui_clock': {}}
+             'prefinished': False, 'current': None, 'ui_clock': {}, 'last_macro_error': None}
 
     def remember_ui(sample):
         state['ui_clock'] = {key: sample.block.get(key) for key in ('frame', 'wall', 'rev')}
@@ -1329,21 +1379,26 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
                          lambda o: (available() and active(o, 'main_menu') and accepting(o['ui'])
                                     and o['ui'].get('input.owner') == 'native'),
                          lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6,
-                         target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer'))),
+                         target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer')),
+                         screen=lambda o: active(o, 'main_menu')),
         closed_loop.Step('open-create', lambda o: (not state['form_settling'] and active(o, 'ldn.room_list')
                                                    and accepting(o['ui'])
                                                    and o['ui'].get('focus.id') == 'ldn.create_room'
                                                    and o['ui'].get('focus.index') == '0'), create_done, 'tap-a1',
                          cap=15, lost_after=5, before_send=begin_create,
                          source=lambda o: active(o, 'ldn.room_list'),
-                         target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index'))),
+                         target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index')),
+                         screen=lambda o: active(o, 'ldn.room_list')),
         closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
-                         cap=20, lost_after=0, sends=2, before_send=begin_confirm),
+                         cap=20, lost_after=0, sends=2, before_send=begin_confirm,
+                         screen=lambda o: active(o, 'ldn.create')),
         closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
-                         cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at')),
+                         cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at'),
+                         screen=lambda o: local(o, 'stage_select')),
         closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
                          cap=5, ready_cap=30, lost_after=3, before_send=fence_chord,
-                         target=lambda o: ((o['tile'] or {}).get('at'), (o['tile'] or {}).get('hovered'))),
+                         target=lambda o: ((o['tile'] or {}).get('at'), (o['tile'] or {}).get('hovered')),
+                         screen=lambda o: local(o, 'css.smash')),
         closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4,
                          target=lambda o: (o['tile'] or {}).get('at')),
         closed_loop.Step('ready', lambda o: placed(o) and accepting(o['ui']), waiting, 'lobby-ready', cap=ready_wait_cap,
@@ -1395,11 +1450,24 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
         _append_stall(ctx, 'wireless_room', result)
         return result
 
+    def run_steps():
+        missing = object()
+        previous = getattr(ctx.runner, 'closed_loop_owns_idle', missing)
+        ctx.runner.closed_loop_owns_idle = True
+        try:
+            return closed_loop.run('wireless_room', steps, observe, send, finish,
+                                   clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
+                                   idle=lambda remaining: _eden_macro_busy(
+                                       ctx, remaining, note=lambda text: state.__setitem__('last_macro_error', text)),
+                                   idle_cap=idle_cap, revalidate_cap=4.5)
+        finally:
+            if previous is missing:
+                del ctx.runner.closed_loop_owns_idle
+            else:
+                ctx.runner.closed_loop_owns_idle = previous
+
     try:
-        outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
-                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
-                                  idle=lambda remaining: _eden_macro_busy(ctx, remaining), idle_cap=idle_cap,
-                                  revalidate_cap=4.5)
+        outcome = run_steps()
     except closed_loop.RouteStopped as error:
         reason = error.reason
         continuity = (error.receipt.get('continuity') == 'lost'
@@ -1455,8 +1523,10 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             'screens': screens, 'last_ui': state['last_ui'], 'last_tile': state['last_tile'],
             'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
             'stalls': error.receipt['stalls'], 'result': _stall_result(False, error.receipt['stalls']),
-            'last_error': state['last_error'], 'press_gate': press_gate(),
+            'last_error': state['last_error'], 'press_gate': press_gate(), 'entered_at': error.receipt['entered_at'],
         }
+        if state['last_macro_error'] is not None:
+            stop_receipt['last_macro_error'] = error.receipt['last_macro_error'] = state['last_macro_error']
         if continuity:
             stop_receipt['continuity'] = 'lost'
             stop_receipt['last_ui'] = state['last_ui'] if state['ui_answered'] else None
@@ -1499,6 +1569,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
         'entered_at': outcome['entered_at'], 'steps': outcome['steps'],
         'stalls': outcome['stalls'], 'result': _stall_result(True, outcome['stalls']),
         'press_gate': press_gate(),
+        **({'last_macro_error': state['last_macro_error']} if state['last_macro_error'] is not None else {}),
     })
 
 

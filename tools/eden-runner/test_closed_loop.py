@@ -96,6 +96,19 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual((caught.exception.step, caught.exception.receipt['entered_at']), ('second', 'second'))
         self.assertEqual(fake.sends, [])
 
+    def test_a_ready_or_source_match_takes_precedence_over_screen_fallback(self):
+        for ready in (False, True):
+            with self.subTest(ready=ready):
+                fake = Script(lambda f: 'shared')
+                first = Step('first', lambda obs: ready, lambda obs: False, 'a',
+                             cap=1, ready_cap=1, lost_after=5, source=lambda obs: obs == 'shared')
+                second = Step('second', lambda obs: False, lambda obs: False, 'b',
+                              cap=1, ready_cap=1, screen=lambda obs: obs == 'shared')
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([first, second])
+                self.assertEqual((caught.exception.step, caught.exception.receipt['entered_at']), ('first', 'first'))
+                self.assertEqual(len(fake.sends), int(ready))
+
     def test_an_invalid_revalidation_cap_is_rejected_before_any_read(self):
         for value in (-1, float('nan'), float('inf'), None, '4'):
             with self.subTest(value=value):

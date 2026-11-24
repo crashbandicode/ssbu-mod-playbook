@@ -195,6 +195,24 @@ class PlayIdleTests(unittest.TestCase):
         self.assertFalse(self.runner.setup_metrics.get('stalls'))
         self.assertFalse((self.row / 'stall-events.jsonl').exists())
 
+    def test_play_rejects_an_idle_answer_that_uses_up_the_budget(self):
+        def status():
+            self.now += 15
+            return {'state': 'idle'}
+
+        self.status = status
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'not sent: input channel busy for 15 s'):
+            self.play()
+        self.assertEqual(self.sent, [])
+
+    def test_play_keeps_accepted_delivery_explicit_if_the_stall_journal_fails(self):
+        self.status = lambda: {'state': 'playing'} if self.now < 1.2 else {'state': 'idle'}
+        self.ctx.row_dir = self.row / 'missing'
+        with self.assertRaisesRegex(routes.closed_loop.DeliveryUnknown, 'macro training-input was accepted'):
+            self.play()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
+
     def test_play_does_not_wait_when_the_engine_owns_the_idle_check(self):
         self.runner.closed_loop_owns_idle = True
         self.status = lambda: {'state': 'playing'}
@@ -3730,28 +3748,36 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(stop['sends'], 0)
 
     def test_wireless_room_restores_the_idle_owner_flag(self):
-        for stuck in (False, True):
-            with self.subTest(stuck=stuck):
-                self.io = self.IO()
-                self.io.phase = 'stage'
-                self.io.stuck_stage = stuck
-                self.now = 0
-                self.ctx.runner.closed_loop_owns_idle = False
-                original, observed = self.io.send, []
+        for previous in (None, False, True):
+            for stuck in (False, True):
+                with self.subTest(previous=previous, stuck=stuck):
+                    self.io = self.IO()
+                    self.io.phase = 'stage'
+                    self.io.stuck_stage = stuck
+                    self.now = 0
+                    if previous is None:
+                        if hasattr(self.ctx.runner, 'closed_loop_owns_idle'):
+                            del self.ctx.runner.closed_loop_owns_idle
+                    else:
+                        self.ctx.runner.closed_loop_owns_idle = previous
+                    original, observed = self.io.send, []
 
-                def send(macro):
-                    observed.append(self.ctx.runner.closed_loop_owns_idle)
-                    return original(macro)
+                    def send(macro):
+                        observed.append(self.ctx.runner.closed_loop_owns_idle)
+                        return original(macro)
 
-                self.io.send = send
-                if stuck:
-                    with self.assertRaises(routes.closed_loop.RouteStopped):
+                    self.io.send = send
+                    if stuck:
+                        with self.assertRaises(routes.closed_loop.RouteStopped):
+                            self.run_room()
+                    else:
                         self.run_room()
-                else:
-                    self.run_room()
-                self.assertTrue(observed)
-                self.assertTrue(all(value is True for value in observed))
-                self.assertFalse(self.ctx.runner.closed_loop_owns_idle)
+                    self.assertTrue(observed)
+                    self.assertTrue(all(value is True for value in observed))
+                    if previous is None:
+                        self.assertFalse(hasattr(self.ctx.runner, 'closed_loop_owns_idle'))
+                    else:
+                        self.assertIs(self.ctx.runner.closed_loop_owns_idle, previous)
 
     def blocked_control(self, blocked_method):
         release, entered, finished = threading.Event(), threading.Event(), threading.Event()
@@ -4362,9 +4388,9 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertIn('macro.status not understood:', stop['input_channel'])
         self.assertIn('unknown', stop['input_channel'])
 
-    def test_idle_and_finished_without_an_error_release_input(self):
+    def test_idle_and_finished_statuses_release_input(self):
         for reply in ({'state': 'idle'}, {'state': 'finished'}, {'state': 'idle', 'error': None},
-                      {'state': 'finished', 'error': ''}):
+                      {'state': 'idle', 'error': 'stale failure'}, {'state': 'finished', 'error': ''}):
             with self.subTest(reply=reply):
                 self.io = self.IO()
                 self.io.phase = 'stage'
