@@ -191,6 +191,7 @@ read, with its position after it, so an append during the read looked like a tru
 its first line (A1 trace boot `rc15-a1-trace-2ddba1f-xps-2`: eleven times in one receipt, the file itself only
 appended to). The cursor now checks the open file after the read, knows a file by device and inode, and finds the
 text it read last in a replaced file. A replaced file it cannot place is left out and counted (`unqualified`); only
-lines appended to it afterwards are returned. `rotates=True` keeps the read from the first byte for the plugins own
-rotating logs. `test_routes.py` `LogCursorTests` are host tests on temporary files, one with a writer thread and one
+lines appended to it afterwards are returned, and what the old handle still had is dropped with it. `rotates=True`
+keeps the read from the first byte for a plugins own rotating logs; `routes._log_cursor` chooses it by the file, never
+for the bridge captures log (a Switch instance names that one file `diag_log` and `bridge_log`). `test_routes.py` `LogCursorTests` are host tests on temporary files, one with a writer thread and one
 with `ui` lines in the shape of that boots; no runtime acceptance is claimed.

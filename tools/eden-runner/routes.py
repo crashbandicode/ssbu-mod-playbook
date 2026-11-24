@@ -105,14 +105,16 @@ class LogCursor:
     - Another file at the path, the same file cut short, or the same file written again from its start is a
       replacement (`rotations` counts them). With another file at the path the old handle is drained first. A
       replacement that carries the text the cursor read last is continued after that text.
-    - Any other replacement holds text of unknown age. The cursor never returns it: it starts at that file's end,
-      counts the lines it left out in `unqualified`, and returns only what is appended afterwards.
+    - Any other replacement holds text of unknown age. The cursor never returns it: it starts at that file's end
+      and returns only what is appended afterwards. What the old handle still had and a partial line read before
+      are dropped with it, because they belong to a generation that ended. `unqualified` counts the lines left out.
     - A file that did not exist when the cursor started is read from its first byte: nothing was there before.
     - `rotates=True` is for a log whose writer starts new files itself (a plugin log it rotates by rename or
       empties at boot): a file the cursor cannot continue is then new from its first byte. Its limit: the cursor
       knows only the ANCHOR bytes it read last, so a new file that repeats older lines without them is read again.
-    A partial line of a file that ended is returned as its own line. `mark()` restarts from the current end, so a
-    wait sees only lines written after the input it follows.
+      There a partial line of a file that ended is returned as its own line. Open plugin logs through
+      `_log_cursor`, which never reads the bridge capture's log this way.
+    `mark()` restarts from the current end, so a wait sees only lines written after the input it follows.
     """
 
     ANCHOR = 4096  # bytes of the text read last, kept to find it again in a replaced file
@@ -185,26 +187,28 @@ class LogCursor:
         return f.read(len(want)) == want
 
     def _resume(self, f):
-        """(where unread text starts in a file the cursor cannot simply continue, whether that place is proven)."""
+        """(where unread text starts in a file the cursor cannot simply continue, how that place is known):
+        'continues' after the text read last, 'cut' when f is that text cut short, 'new' from the first byte, or
+        'unknown' at the end of a file the cursor cannot place."""
         anchor = self.anchor
         if anchor and self.offset == len(anchor):  # the anchor is the cursor's file from its first byte
             f.seek(0)
             head = f.read(len(anchor) + 1)
             if head.startswith(anchor):
-                return len(anchor), True
+                return len(anchor), 'continues'
             if anchor.startswith(head):  # the read text cut short holds nothing new
-                return len(head), True
+                return len(head), 'cut'
         elif anchor:
             f.seek(self.offset - len(anchor))
             if f.read(len(anchor)) == anchor:
-                return self.offset, True
+                return self.offset, 'continues'
             f.seek(0)
             at = f.read().rfind(anchor)
             if at >= 0:
-                return at + len(anchor), True
+                return at + len(anchor), 'continues'
         if self.rotates or self.identity is None:
-            return 0, False
-        return os.fstat(f.fileno()).st_size, False  # text of unknown age: only what follows it is new
+            return 0, 'new'
+        return os.fstat(f.fileno()).st_size, 'unknown'  # text of unknown age: only what follows it is new
 
     def _take(self, f):
         """The bytes of f after the offset that the cursor returns, and the offset moved past them."""
@@ -217,36 +221,47 @@ class LogCursor:
             self._drop_line = not newline
         return data
 
-    def _replaced(self, f):
-        """Make f the cursor's file and return what it has to give, after a line break unless f continues the text."""
+    @staticmethod
+    def _count(text):
+        return sum(1 for line in text.split(b'\n') if line.strip())
+
+    def _replaced(self, f, before):
+        """Make f the cursor's file. `before` is what this read holds from the file that ended: its partial line and
+        what the old handle still had. Returns the bytes this read gives."""
         if self.identity is not None:
             self.rotations += 1
-        at, proven = self._resume(f)
+        at, kind = self._resume(f)
         self._drop_line = False
-        if at and not proven:
+        if kind == 'unknown' and at:
             f.seek(0)
             left_out = f.read(at)
-            self.unqualified += sum(1 for line in left_out.split(b'\n') if line.strip())
+            self.unqualified += self._count(left_out)
             self._drop_line = not left_out.endswith(b'\n')
         self._start_at(f, at)
-        return (b'' if proven and at else b'\n') + self._take(f)
+        data = self._take(f)
+        if kind == 'continues':
+            return before + data  # the same text goes on: a partial line is completed
+        if self.rotates or kind == 'new':
+            return before + b'\n' + data  # the old file's partial line is its own line
+        self.unqualified += self._count(before)  # the generation that ended gives nothing, nor its partial line
+        return data
 
-    def _read_file(self, f):
-        return self._take(f) if self._continues(f) else self._replaced(f)
+    def _read_file(self, f, before):
+        return before + self._take(f) if self._continues(f) else self._replaced(f, before)
 
-    def _read_unheld(self):
+    def _read_unheld(self, before):
         f = self._open_path()
         if f is None:
-            return b''
+            return before
         with f:
-            return self._read_file(f)
+            return self._read_file(f, before)
 
-    def _read_held(self):
+    def _read_held(self, before):
         if self.handle is None:  # the file was not there yet, or close() was called
             self.handle = self._open_path()
             if self.handle is None:
-                return b''
-        data = self._read_file(self.handle)
+                return before
+        data = self._read_file(self.handle, before)
         try:
             now = os.stat(self.path)
         except OSError:
@@ -256,13 +271,13 @@ class LogCursor:
             if f is not None and self._identity(f) != self.identity:
                 self.handle.close()
                 self.handle = f
-                data += self._replaced(f)  # the file now at the path, after what the old handle still had
+                data = self._replaced(f, data)  # the file now at the path decides what the old handle's text is worth
             elif f is not None:
                 f.close()
         return data
 
     def read(self):
-        data = self.pending + (self._read_held() if self.hold else self._read_unheld())
+        data = self._read_held(self.pending) if self.hold else self._read_unheld(self.pending)
         lines = data.split(b'\n')
         self.pending = lines.pop()
         return [line.decode('utf-8', 'replace').rstrip('\r') for line in lines if line.strip()]
@@ -293,6 +308,27 @@ class LogCursor:
         if self.handle is not None:
             self.handle.close()
             self.handle = None
+
+
+PLUGIN_LOGS = ('diag_log', 'tile_log')  # files a plugin writes and starts anew itself
+
+
+def _log_cursor(ctx, source):
+    """A cursor on an instance's log. A plugin's own file is read as a rotating log (`rotates=True`). The bridge
+    capture's log never is, also when an instance gives it a plugin log's name: a Switch has `diag_log` and
+    `bridge_log` on one file, and a line of unknown age there must not answer a wait."""
+    path = instance_path(ctx, source)
+    name = source if source.endswith('_log') else source + '_log'
+    captures = [ctx.instance.get(key) for key in ('bridge_log', 'console_log')]
+
+    def same(other):
+        try:
+            return os.path.samefile(path, other)
+        except OSError:
+            return Path(path).absolute() == Path(other).absolute()
+
+    rotates = name in PLUGIN_LOGS and not any(isinstance(other, str) and same(other) for other in captures)
+    return LogCursor(path, rotates=rotates)
 
 
 # --- gates and macros -----------------------------------------------------------------------------------------------
@@ -666,7 +702,7 @@ def chord(ctx, name, expect=None, source=None, cap=10):
     a known diag line (or `expect` is given), wait for that line after the press."""
     source, expect = (source, expect) if expect else CHORD_LINES.get(name, (None, None))
     try:
-        cursor = LogCursor(instance_path(ctx, source), rotates=True) if expect else None
+        cursor = _log_cursor(ctx, source) if expect else None
     except KeyError:
         cursor = None  # that log isn't available here (a real Switch has no diag log); the chord still plays
     try:
@@ -1564,7 +1600,7 @@ class TileWalker:
 
     def __init__(self, ctx, screen):
         self.ctx, self.screen = ctx, screen
-        self.cursor = LogCursor(instance_path(ctx, 'tile_log'), rotates=True)
+        self.cursor = _log_cursor(ctx, 'tile_log')
         self.trace = []
         self.at = None
         self.token = None
@@ -1803,7 +1839,7 @@ def read_state(ctx, cap=6.0):
     `[TrainingRooms] state pos entry=N kind= x= y= lr= dmg= status= situation=` for P1 (0) and the CPU (1) and
     deletes the request (states.rs). Only lines written after the request count."""
     request = instance_path(ctx, 'settings').parent / 'diag-pos.req'
-    cursor = LogCursor(instance_path(ctx, 'diag_log'), rotates=True)
+    cursor = _log_cursor(ctx, 'diag_log')
     try:
         request.write_text('')
         bodies = {}
@@ -1953,7 +1989,7 @@ def select_screen(ctx, cap=2.5):
     """'sss' or 'css' when an L3+Up step is logged on that screen (the tile cursor names it), else None. On the CSS a
     step logs only while the hand carries a token; on the SSS the hand always steps."""
     try:
-        cursor = LogCursor(instance_path(ctx, 'tile_log'), rotates=True)
+        cursor = _log_cursor(ctx, 'tile_log')
     except KeyError:
         return None  # This legacy probe requires a configured tile log.
     try:
