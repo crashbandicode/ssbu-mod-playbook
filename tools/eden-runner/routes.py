@@ -5076,6 +5076,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         deadline(f'deadline expired before {name}')
         if starts.get(name, 0) >= 3:
             stop(name, f'no transition after 3 starts; last error: {errors.get(name, "none")}')
+        recovered[:] = [item for item in recovered if item != name]
         starts[name] = starts.get(name, 0) + 1
         begin = time.monotonic()
         try:

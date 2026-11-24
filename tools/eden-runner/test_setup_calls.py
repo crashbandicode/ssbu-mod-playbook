@@ -1182,6 +1182,27 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['recovered'], ['pick_stage'])
         self.assertEqual(self.io.calls, ['pick_stage', 'pick_fighters', 'enter_training'])
 
+    def test_a_css_reached_without_a_recorded_stage_goes_back_and_picks_the_stage_again(self):
+        self.ctx.runner.routes_expect.clear()
+        self.io.failures['pick_stage'] = 1
+        self.io.after_failure = lambda io, name: setattr(io, 'screen', 'css.training')
+        original_phase = self.io.phase
+
+        def phase(name):
+            result = original_phase(name)
+            if name == 'pick_stage':
+                self.ctx.runner.routes_expect['stage_id'] = 3
+            return result
+
+        self.io.phase = phase
+        result = self.invoke()
+        self.assertEqual(self.io.calls, ['pick_stage', 'back_to_main', 'main_to_stage', 'pick_stage',
+                                         'pick_fighters', 'enter_training'])
+        self.assertEqual(result['starts']['pick_stage'], 2)
+        self.assertEqual(result['retries'], {'pick_stage': 1})
+        self.assertEqual(result['recovered'], [])
+        self.assertEqual(result['verified']['stage_id'], 3)
+
     def test_three_failures_of_one_phase_stop_on_that_phase(self):
         self.io.failures['pick_stage'] = 3
         with self.assertRaises(routes.closed_loop.RouteStopped) as caught:

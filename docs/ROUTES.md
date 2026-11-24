@@ -98,6 +98,7 @@ Training phases re-locate after each phase; a failed phase retries only after tw
 recognised native-owned screen, with at most three starts per phase per call. Continuity errors and unreadable
 state stop with `routes-reach-training-stop.json`. The overall cap is checked between phases; a running phase ends
 on its own caps. This phase recovery is host-tested only.
+A Training fighter select reached without a recorded stage is not trusted: the route returns to Main and picks the stage again.
 `ready` waits 30 s of unchanged CSS before its single resend; what a second Plus does while the room is still loading has not been observed in a game.
 This closed-loop route is host-tested only, not flown.
 
