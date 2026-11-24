@@ -145,6 +145,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import still_fresh  # noqa: E402
 import packet_gate  # noqa: E402
 import trace_text  # noqa: E402
 import subprocess  # noqa: E402
@@ -1307,6 +1308,10 @@ class Runner:
         self.default = next(iter(instances))
         self.out = out
         self.out.mkdir(parents=True, exist_ok=True)
+        self.stills = still_fresh.Ledger(self.out, frames=(self.plan.get('still_freshness') or {}).get('frames', 180))
+        self._frame_sources = {}
+        self.still_records = {}
+        self.row_stills_refused = []
         capture_path = self.out / 'bridge-run' / 'capture.json'
         if capture_path.is_file():
             capture = json.loads(capture_path.read_text())
@@ -1542,12 +1547,31 @@ class Runner:
     def shot(self, on, name):
         # "screenshot_target" in instances.json overrides the window lookup: the Ally needs "screen" (a per-window
         # grab is black under Vulkan there). Image gates are per host resolution; log gates are portable.
+        self.__dict__.setdefault('row_still_errors', [])
         target = self.instances[on].get('screenshot_target')
         if not target:
             tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
             target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
         path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
-        self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        reply = self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        try:
+            if on not in self._frame_sources:
+                self._frame_sources[on] = still_fresh.FrameSource(self.instances[on].get('bridge_log'))
+            frame = self._frame_sources[on].read()
+            record = self.stills.record(on, path, reply, frame)
+            self.still_records[str(path)] = record
+            if still_fresh.refused(record):
+                item = {'file': record['file'], 'reason': record['reason']}
+                self.row_stills_refused.append(item)
+                self.log({'still_refused': item})
+        except Exception as error:  # noqa: BLE001 - freshness must not break a screenshot
+            reason = f'freshness check failed: {error!r}'[:200]
+            self.still_records[str(path)] = {
+                'file': path.name, 'path': str(path), 'on': on, 'status': 'error', 'reason': reason,
+            }
+            item = {'file': path.name, 'reason': reason}
+            self.row_still_errors.append(item)
+            self.log({'still_error': item})
         if self.captures is not None:
             utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             try:
@@ -1889,6 +1913,7 @@ class Runner:
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
+        last_refused = None
         if kind == 'text':
             source = self.trace_source(on)
             pattern = re.compile(gate['pattern'])
@@ -1960,9 +1985,21 @@ class Runner:
             before = self.marks.get((on, gate['mark']))
             if before is None:
                 raise RuntimeError(f'gate {name}: no mark {gate["mark"]!r} taken on {on} earlier in this row')
+            baseline = self.still_records.get(str(before))
+            if not still_fresh.usable(baseline):
+                raise RuntimeError(f'gate {name}: baseline mark {gate["mark"]} is not valid evidence: '
+                                   f'{still_fresh.unusable_reason(baseline)}')
             previous = None
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
+                still = self.still_records.get(str(path))
+                if not still_fresh.usable(still):
+                    last_refused = still_fresh.evidence_issue(still)
+                    if still_fresh.refused(still):
+                        path.unlink(missing_ok=True)
+                    time.sleep(gate.get('interval', .5))
+                    continue
+                last_refused = None
                 changed = self.roi_diff(path, before, gate['roi']) > gate.get('min_diff', DEFAULT_TOLERANCE)
                 settled = not gate.get('stable', True) or (
                     previous is not None and self.roi_diff(path, previous, gate['roi']) <= gate.get('tolerance', 2))
@@ -2022,6 +2059,14 @@ class Runner:
             scale = None if hook is not None else self.image_scale(gate)
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
+                still = self.still_records.get(str(path))
+                if not still_fresh.usable(still):
+                    last_refused = still_fresh.evidence_issue(still)
+                    if still_fresh.refused(still):
+                        path.unlink(missing_ok=True)
+                    time.sleep(gate.get('interval', 1))
+                    continue
+                last_refused = None
                 note = None
                 hook_evidence = None
                 if hook is not None:
@@ -2054,14 +2099,16 @@ class Runner:
                 path.unlink(missing_ok=True)  # keep only the passing shot and the final failing one
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
-            raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s')
+            detail = f'; {last_refused}' if last_refused else ''
+            raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{detail}')
         # Non-image gates save what the game showed when they gave up, so a
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
         self.failure_evidence(on, name)
         missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
         unreadable = (f'; newest sample unreadable (sequence {record["sequence"]}: {record["why"]})'
                       if kind == 'text' and record and not record['known'] else '')
-        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}{unreadable}')
+        detail = f'; {last_refused}' if last_refused else ''
+        raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}{unreadable}{detail}')
 
     def failure_evidence(self, on, name):
         """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""
@@ -2083,9 +2130,17 @@ class Runner:
     def acquire(self, on, name, gate, until):
         """First visit of a screen with no reference yet: wait until the region stops changing, save that shot as the
         reference, write its sha256 into rows.json, and flag the row so the runner stops for a review after it."""
-        previous = None
+        previous, last_refused = None, None
         while time.monotonic() < until:
             path = self.shot(on, 'acquire-' + name)
+            still = self.still_records.get(str(path))
+            if not still_fresh.usable(still):
+                last_refused = still_fresh.evidence_issue(still)
+                if still_fresh.refused(still):
+                    path.unlink(missing_ok=True)
+                time.sleep(gate.get('interval', .5))
+                continue
+            last_refused = None
             if previous is not None and self.roi_diff(path, previous, gate['roi']) <= gate.get('settle', 2):
                 reference = self.base / gate['reference']
                 reference.parent.mkdir(parents=True, exist_ok=True)
@@ -2100,7 +2155,9 @@ class Runner:
                 previous.unlink(missing_ok=True)
             previous = path
             time.sleep(gate.get('interval', .5))
-        raise RuntimeError(f'gate {name} on {on}: screen never settled within {gate["cap"]} s to acquire a reference')
+        detail = f'; {last_refused}' if last_refused else ''
+        raise RuntimeError(f'gate {name} on {on}: screen never settled within {gate["cap"]} s to acquire a reference'
+                           f'{detail}')
 
     UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
 
@@ -2376,7 +2433,12 @@ class Runner:
             return {'bridge_error': repr(error)[:160]}
 
     def _step_mark(self, on, step):
-        self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
+        self.marks.pop((on, step['mark']), None)
+        path = self.shot(on, 'mark-' + step['mark'])
+        record = self.still_records.get(str(path))
+        if not still_fresh.usable(record):
+            raise RuntimeError(f'mark {step["mark"]} on {on}: {still_fresh.evidence_issue(record)}')
+        self.marks[(on, step['mark'])] = path
         return {'mark': step['mark'], 'on': on}
 
     def _step_copy(self, on, step):
@@ -3027,6 +3089,7 @@ class Runner:
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()
             self.marks, self.copies, self.acquired = {}, {}, []
+            self.row_stills_refused, self.row_still_errors = [], []
             self.scales_used, self.gate_saw_evidence = [], []
             self.last_image_scale = None
             self.last_hook_evidence = None
@@ -3177,6 +3240,10 @@ class Runner:
                                          end_mark.get('rec_ms') if end_mark else None]
                 if self.acquired:
                     receipt['acquired_references'] = self.acquired
+                if self.row_stills_refused:
+                    receipt['stills_refused'] = list(self.row_stills_refused)
+                if self.row_still_errors:
+                    receipt['still_errors'] = list(self.row_still_errors)
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
                 self.captures = None
@@ -3187,6 +3254,8 @@ class Runner:
                         pass
                 print(json.dumps({'row': row['id'], 'status': receipt['status'],
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
+                                  **({'stills_refused': len(self.row_stills_refused)} if self.row_stills_refused else {}),
+                                  **({'still_errors': len(self.row_still_errors)} if self.row_still_errors else {}),
                                   'receipt': str(receipt_path)}), flush=True)
                 if not (self.session_config() or {}).get('per_row_files') or self.session is None:
                     self.queue_judge(row['id'])  # no per-row clip file: judge the shots now

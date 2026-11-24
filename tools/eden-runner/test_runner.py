@@ -2,6 +2,7 @@
 """Offline tests for runner.py with a fake Eden: no emulator, no input. Run: python3 -I test_runner.py"""
 import copy
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -70,6 +71,28 @@ class FakeEden:
             Image.new('RGB', (64, 36), self.colour).save(params['path'])
             return {'ok': True, 'result': {}}
         return {'ok': True, 'result': {}}
+
+
+class FreshEden(FakeEden):
+    def __init__(self, bridge_log, frames, colours=None):
+        super().__init__({})
+        self.bridge_log = bridge_log
+        self.frames = list(frames)
+        self.colours = list(colours or [])
+        self.screenshot_reply = {'backend': 'window', 'uniform': False, 'warning': 'test warning'}
+
+    def request(self, method, params):
+        if method == 'ui.screenshot':
+            if self.colours:
+                self.colour = self.colours.pop(0)
+            response = super().request(method, params)
+            frame = self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+            if self.bridge_log is not None:
+                with self.bridge_log.open('a') as stream:
+                    stream.write(f'[Bridge] boot=0xabc frame={frame} wall={frame * 17}\n')
+            response['result'] = dict(self.screenshot_reply)
+            return response
+        return super().request(method, params)
 
 
 class ReviewClassTests(unittest.TestCase):
@@ -1186,6 +1209,411 @@ class RunnerTests(unittest.TestCase):
 
     def make(self, eden, pace=15):
         return runner.Runner(self.manifest, self.instances, self.dir / 'out', pace, client_factory=lambda s: eden)
+
+    def test_shot_records_the_game_frame_and_edens_reply(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000]))
+        path = run.shot('a', 'capture')
+        record = run.still_records[str(path)]
+        self.assertEqual((record['boot'], record['frame'], record['wall']), ('0xabc', 1000, 17000))
+        self.assertEqual((record['backend'], record['uniform'], record['warning']),
+                         ('window', False, 'test warning'))
+        self.assertEqual(record['sha256'], sha(path))
+        self.assertEqual(record['status'], 'fresh')
+        self.assertEqual(json.loads((run.out / 'stills.jsonl').read_text().splitlines()[0]), record)
+
+    def test_a_row_capture_and_its_freshness_record_name_the_same_bytes(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue',
+                              'steps': [{'shot': 'first'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(FreshEden(bridge, [1000], [BLUE]))
+        with mock.patch.object(runner.Runner, 'bridge_at_shot', return_value={}):
+            run.run()
+        receipt = json.loads((run.out / 'r1.json').read_text())
+        self.assertEqual(len(receipt['captures']), 1)
+        capture = receipt['captures'][0]
+        path = run.out / 'r1' / capture['file']
+        record = run.still_records[str(path)]
+        journal = json.loads((run.out / 'stills.jsonl').read_text())
+        self.assertEqual(set(capture), {'name', 'file', 'sha256', 'utc', 'status'})
+        self.assertEqual(capture['file'], record['file'])
+        self.assertEqual(capture['file'], journal['file'])
+        self.assertEqual(capture['sha256'], record['sha256'])
+        self.assertEqual(capture['sha256'], journal['sha256'])
+        self.assertEqual(capture['sha256'], sha(path))
+        self.assertEqual(record['status'], 'fresh')
+
+    def test_shot_keeps_the_boot_across_a_long_log(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        bridge.write_bytes(b'[Bridge] boot=0xabc frame=1000 wall=17000\n')
+        run = self.make(FakeEden({}))
+        first = run.still_records[str(run.shot('a', 'first'))]
+        with bridge.open('ab') as stream:
+            stream.write(b'[Bridge] state long-padding=xxxxxxxxxxxxxxxxxxxxxxxx frame=1200 wall=20400\n' * 2000)
+        self.assertGreater(bridge.stat().st_size, 65536)
+        second = run.still_records[str(run.shot('a', 'second'))]
+        self.assertEqual((first['status'], second['status']), ('fresh', 'refused'))
+        self.assertEqual((second['boot'], second['frame'], second['unchanged_frames']), ('0xabc', 1200, 200))
+
+    def test_shot_does_not_inherit_boot_from_a_replaced_log(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        bridge.write_bytes(b'[Bridge] boot=0xabc frame=1000 wall=17000\n')
+        run = self.make(FakeEden({}))
+        run.shot('a', 'first')
+        replacement = self.dir / 'replacement.log'
+        replacement.write_bytes(b'[Bridge] padding=' + b'x' * 200 + b' frame=1200 wall=20400\n')
+        replacement.replace(bridge)
+        second = run.still_records[str(run.shot('a', 'second'))]
+        self.assertEqual((second['boot'], second['frame'], second['status']), (None, 1200, 'unverified'))
+
+    def test_a_frozen_still_is_listed_in_the_row_receipt(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'first'}, {'shot': 'frozen'}]},
+            {'id': 'r2', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'changed'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(FreshEden(bridge, [1000, 1200, 1300], [BLUE, BLUE, RED]))
+        with mock.patch.object(runner.Runner, 'bridge_at_shot', return_value={}):
+            run.run()
+        first = json.loads((run.out / 'r1.json').read_text())
+        second = json.loads((run.out / 'r2.json').read_text())
+        self.assertEqual(first['status'], 'PASS')
+        self.assertEqual(len(first['stills_refused']), 1)
+        self.assertIn('unchanged across 200 game frames', first['stills_refused'][0]['reason'])
+        self.assertIn('frozen.png', first['stills_refused'][0]['file'])
+        self.assertNotIn('stills_refused', second)
+
+    def test_an_image_gate_does_not_pass_on_a_refused_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1200])
+        eden.colour = RED
+        run = self.make(eden)
+        run.shot('a', 'anchor')
+        gate = {**self.plan['gates']['red'], 'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence: unchanged across 200 game frames'):
+            run.check_gate_spec('a', gate, 'red')
+
+    def test_an_image_gate_passes_on_a_fresh_matching_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000])
+        eden.colour = RED
+        run = self.make(eden)
+        path = run.check_gate_spec('a', self.plan['gates']['red'], 'red')
+        self.assertEqual(run.still_records[path]['status'], 'fresh')
+
+    def test_a_change_gate_does_not_pass_on_a_refused_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [900, 1000, 1200], [BLUE, RED, RED])
+        run = self.make(eden)
+        run.marks = {}
+        run._step_mark('a', {'mark': 'before'})
+        run.shot('a', 'anchor')
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence'):
+            run.check_gate_spec('a', gate, 'change')
+
+    def test_a_refused_mark_is_not_established(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1200]))
+        run.marks = {}
+        run.shot('a', 'anchor')
+        with self.assertRaisesRegex(RuntimeError, 'mark before on a: still refused as evidence: unchanged across 200'):
+            run._step_mark('a', {'mark': 'before'})
+        self.assertNotIn(('a', 'before'), run.marks)
+
+    def test_a_failed_remark_does_not_leave_the_previous_mark(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1200]))
+        run.marks = {}
+        run._step_mark('a', {'mark': 'before'})
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence'):
+            run._step_mark('a', {'mark': 'before'})
+        self.assertNotIn(('a', 'before'), run.marks)
+
+    def test_a_change_gate_refuses_a_refused_baseline(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1200, 1300], [BLUE, BLUE, RED]))
+        run.shot('a', 'anchor')
+        before = run.shot('a', 'refused-mark')
+        fresh = run.shot('a', 'fresh-after')
+        self.assertEqual((run.still_records[str(before)]['status'], run.still_records[str(fresh)]['status']),
+                         ('refused', 'fresh'))
+        run.marks = {('a', 'before'): before}
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        with mock.patch.object(run, 'shot', return_value=fresh) as shot:
+            with self.assertRaisesRegex(RuntimeError, 'gate change: baseline mark before is not valid evidence: '
+                                                      'unchanged across 200'):
+                run.check_gate_spec('a', gate, 'change')
+            shot.assert_not_called()
+
+    def test_a_change_gate_passes_against_a_fresh_baseline(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1010], [BLUE, RED]))
+        run.marks = {}
+        run._step_mark('a', {'mark': 'before'})
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        path = run.check_gate_spec('a', gate, 'change')
+        self.assertEqual(run.still_records[path]['status'], 'fresh')
+
+    def test_a_change_gate_refuses_an_error_baseline(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1010], [BLUE, RED]))
+        before = run.shot('a', 'before')
+        fresh = run.shot('a', 'after')
+        run.still_records[str(before)] = {'status': 'error', 'reason': 'freshness check failed: disk'}
+        run.marks = {('a', 'before'): before}
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        with mock.patch.object(run, 'shot', return_value=fresh) as shot:
+            with self.assertRaisesRegex(RuntimeError, 'baseline mark before is not valid evidence: '
+                                                      'freshness check failed: disk'):
+                run.check_gate_spec('a', gate, 'change')
+            shot.assert_not_called()
+
+    def test_a_change_gate_refuses_a_missing_baseline_record(self):
+        run = self.make(FakeEden({}))
+        run.marks = {('a', 'before'): self.dir / 'missing-record.png'}
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        with mock.patch.object(run, 'shot') as shot:
+            with self.assertRaisesRegex(RuntimeError, 'baseline mark before is not valid evidence: '
+                                                      'no freshness record'):
+                run.check_gate_spec('a', gate, 'change')
+            shot.assert_not_called()
+
+    def test_a_mark_accepts_same_and_unverified_stills(self):
+        run = self.make(FakeEden({}))
+        run.marks = {}
+        run._step_mark('a', {'mark': 'unverified'})
+        self.assertEqual(run.still_records[str(run.marks[('a', 'unverified')])]['status'], 'unverified')
+
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1060]))
+        run.marks = {}
+        run.shot('a', 'anchor')
+        run._step_mark('a', {'mark': 'same'})
+        self.assertEqual(run.still_records[str(run.marks[('a', 'same')])]['status'], 'same')
+
+    def test_a_ledger_write_failure_never_authorises_an_image_gate(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        self.plan['gates']['red'].update(cap=.15, interval=.03)
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue',
+                              'steps': [{'shot': 'anchor'}, {'gate': 'red'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        journal = self.dir / 'out' / 'stills.jsonl'
+
+        class BrokenLedgerEden(FreshEden):
+            def __init__(self):
+                super().__init__(bridge, [1000, 1200], [RED, RED])
+                self.screenshot_count = 0
+
+            def request(self, method, params):
+                if method == 'ui.screenshot':
+                    self.screenshot_count += 1
+                    if self.screenshot_count == 2:
+                        journal.unlink()
+                        journal.mkdir()
+                return super().request(method, params)
+
+        run = self.make(BrokenLedgerEden())
+        with mock.patch.object(runner.Runner, 'bridge_at_shot', return_value={}):
+            with self.assertRaisesRegex(RuntimeError, 'still not usable as evidence: freshness check failed:'):
+                run.run()
+        receipt = json.loads((run.out / 'r1.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertTrue(receipt['still_errors'])
+        self.assertTrue(all((run.out / 'r1' / entry['file']).is_file() for entry in receipt['still_errors']))
+        self.assertTrue(all(entry['reason'].startswith('freshness check failed:') for entry in receipt['still_errors']))
+
+    def test_a_ledger_write_failure_never_authorises_acquire(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1200])
+        eden.colour = RED
+        run = self.make(eden)
+        run.acquired = []
+        run.shot('a', 'anchor')
+        journal = run.out / 'stills.jsonl'
+        journal.unlink()
+        journal.mkdir()
+        gate = {'kind': 'image', 'reference': 'refs/acquired-error.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still not usable as evidence: freshness check failed:'):
+            run.check_gate_spec('a', gate, 'acquired')
+        self.assertFalse((self.dir / gate['reference']).exists())
+        self.assertEqual(run.acquired, [])
+        self.assertTrue(run.row_still_errors)
+        self.assertTrue(all((run.row_dir / entry['file']).is_file() for entry in run.row_still_errors))
+
+    def test_a_ledger_write_failure_blocks_a_mark(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000, 1200]))
+        run.marks = {}
+        run.shot('a', 'anchor')
+        journal = run.out / 'stills.jsonl'
+        journal.unlink()
+        journal.mkdir()
+        with self.assertRaisesRegex(RuntimeError, 'mark before on a: still not usable as evidence: '
+                                                  'freshness check failed:'):
+            run._step_mark('a', {'mark': 'before'})
+        self.assertNotIn(('a', 'before'), run.marks)
+        self.assertTrue((run.row_dir / run.row_still_errors[-1]['file']).is_file())
+
+    def test_the_picture_is_kept_when_recording_fails(self):
+        run = self.make(FakeEden({}))
+        (run.out / 'stills.jsonl').mkdir()
+        path = run.shot('a', 'diagnostic')
+        self.assertTrue(path.is_file())
+        record = run.still_records[str(path)]
+        self.assertEqual((record['file'], record['path'], record['on'], record['status']),
+                         (path.name, str(path), 'a', 'error'))
+        self.assertTrue(record['reason'].startswith('freshness check failed:'))
+        self.assertEqual(run.row_still_errors, [{'file': path.name, 'reason': record['reason']}])
+
+    def test_a_frame_source_exception_preserves_the_picture_and_records_an_error(self):
+        run = self.make(FakeEden({}))
+        with mock.patch.object(runner.still_fresh.FrameSource, 'read', side_effect=RuntimeError('frame failure')):
+            path = run.shot('a', 'diagnostic')
+        self.assertTrue(path.is_file())
+        self.assertEqual(run.still_records[str(path)]['status'], 'error')
+        self.assertIn('frame failure', run.row_still_errors[0]['reason'])
+        self.assertIn('still_error', (run.out / 'actions.jsonl').read_text())
+
+    def test_still_errors_are_reported_and_reset_between_rows(self):
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'broken'}]},
+            {'id': 'r2', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'healthy'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(FakeEden({}))
+        original = run.stills.record
+        attempts = []
+
+        def record(*args, **kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise OSError('temporary ledger outage')
+            return original(*args, **kwargs)
+
+        output = io.StringIO()
+        with mock.patch.object(run.stills, 'record', side_effect=record), mock.patch('sys.stdout', output):
+            run.run()
+        first = json.loads((run.out / 'r1.json').read_text())
+        second = json.loads((run.out / 'r2.json').read_text())
+        self.assertEqual((first['status'], second['status']), ('PASS', 'PASS'))
+        self.assertEqual(len(first['still_errors']), 1)
+        self.assertNotIn('still_errors', second)
+        self.assertIn('"still_errors": 1', output.getvalue())
+
+    def test_a_missing_freshness_record_cannot_authorise_an_image_gate(self):
+        run = self.make(FakeEden({}))
+        path = self.dir / 'matching.png'
+        Image.new('RGB', (64, 36), RED).save(path)
+        gate = {**self.plan['gates']['red'], 'cap': .15, 'interval': .03}
+        with mock.patch.object(run, 'shot', return_value=path):
+            with self.assertRaisesRegex(RuntimeError, 'still not usable as evidence: no freshness record'):
+                run.check_gate_spec('a', gate, 'red')
+        self.assertTrue(path.is_file())
+
+    def test_a_missing_freshness_record_cannot_authorise_a_change_gate(self):
+        run = self.make(FakeEden({}))
+        run.marks = {}
+        run._step_mark('a', {'mark': 'before'})
+        path = self.dir / 'different.png'
+        Image.new('RGB', (64, 36), RED).save(path)
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        with mock.patch.object(run, 'shot', return_value=path):
+            with self.assertRaisesRegex(RuntimeError, 'still not usable as evidence: no freshness record'):
+                run.check_gate_spec('a', gate, 'change')
+        self.assertTrue(path.is_file())
+
+    def test_a_missing_freshness_record_cannot_authorise_acquire(self):
+        run = self.make(FakeEden({}))
+        run.acquired = []
+        path = self.dir / 'unrecorded.png'
+        Image.new('RGB', (64, 36), RED).save(path)
+        gate = {'kind': 'image', 'reference': 'refs/unrecorded.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': .15, 'interval': .03}
+        with mock.patch.object(run, 'shot', return_value=path):
+            with self.assertRaisesRegex(RuntimeError, 'still not usable as evidence: no freshness record'):
+                run.check_gate_spec('a', gate, 'acquired')
+        self.assertTrue(path.is_file())
+        self.assertFalse((self.dir / gate['reference']).exists())
+        self.assertEqual(run.acquired, [])
+
+    def test_acquire_never_writes_a_reference_from_a_refused_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1200])
+        eden.colour = RED
+        run = self.make(eden)
+        run.acquired = []
+        run.shot('a', 'anchor')
+        gate = {'kind': 'image', 'reference': 'refs/acquired.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence'):
+            run.check_gate_spec('a', gate, 'acquired')
+        self.assertFalse((self.dir / gate['reference']).exists())
+        self.assertEqual(run.acquired, [])
+
+    def test_acquire_writes_a_reference_from_a_fresh_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+
+        class NewBootEden(FreshEden):
+            def __init__(self):
+                super().__init__(bridge, [1000, 1200])
+                self.colour = RED
+                self.shots = 0
+
+            def request(self, method, params):
+                result = super().request(method, params)
+                if method == 'ui.screenshot':
+                    self.shots += 1
+                    if self.shots >= 2:
+                        with bridge.open('a') as stream:
+                            stream.write('[Bridge] boot=0xdef frame=1200 wall=20400\n')
+                return result
+
+        run = self.make(NewBootEden())
+        run.acquired = []
+        gate = {'kind': 'image', 'reference': 'refs/acquired.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': 1, 'interval': .03}
+        result = run.check_gate_spec('a', gate, 'acquired')
+        self.assertEqual(result, str(self.dir / gate['reference']))
+        self.assertEqual(run.still_records[run.acquired[0]['shot']]['status'], 'fresh')
+        self.assertTrue(Path(result).is_file())
+
+    def test_shot_without_a_bridge_log_behaves_as_before(self):
+        eden = FreshEden(None, [1000])
+        eden.colour = RED
+        run = self.make(eden)
+        path = run.shot('a', 'without-bridge')
+        self.assertEqual(run.still_records[str(path)]['status'], 'unverified')
+        passed = run.check_gate_spec('a', self.plan['gates']['red'], 'red')
+        self.assertEqual(run.still_records[passed]['status'], 'unverified')
 
     def test_fresh_runner_restores_captured_bridge_log_without_overwriting(self):
         run = self.dir / 'out' / 'bridge-run'
