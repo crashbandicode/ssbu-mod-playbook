@@ -2,9 +2,14 @@
 """Offline tests for runner.py with a fake Eden: no emulator, no input. Run: python3 -I test_runner.py"""
 import copy
 import hashlib
+import importlib.util
 import io
 import json
+import os
+import pwd
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -93,6 +98,423 @@ class FreshEden(FakeEden):
             response['result'] = dict(self.screenshot_reply)
             return response
         return super().request(method, params)
+
+
+def ctx_ssh_lifecycle():
+    path = Path(__file__).resolve().parent.parent / 'eden-lifecycle' / 'lifecycle.py'
+    spec = importlib.util.spec_from_file_location('ctx_ssh_test_lifecycle', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class CtxSshTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='ctx-ssh-test-', dir='/tmp')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.life = ctx_ssh_lifecycle()
+        self.helper_patch = mock.patch.object(runner, '_SSH_LIFECYCLE', self.life, create=True)
+        self.helper_patch.start()
+        self.addCleanup(self.helper_patch.stop)
+        self.tool = runner.Runner.__new__(runner.Runner)
+        self.tool.instances = {'a': {'socket': 'fake'}}
+        self.tool.out = self.tool.row_dir = self.root
+        self.tool.pace = {'first_row_done': True}
+        self.tool.pace_seconds = 900
+        self.tool.replaying = False
+        self.ctx = runner.StepContext(self.tool, 'a')
+        self.diag = {'line': 'ssh diag named', 'phase': 'auth', 'cause': 'packet loss',
+                     'evidence': '/tmp/ctx-diagnostic', 'transient': False}
+        outer = self
+        class Mux:
+            def __init__(self, host, **kwargs):
+                outer.masters.append((host, kwargs))
+                self.host, self.root = host, outer.root
+                self.options, self.ssh_bin, self.windows = (), 'ssh', False
+                self.master_log = None
+                self.run = subprocess.run
+                self.rider_args = ['-o', 'test-mux']
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+        self.Mux = Mux
+        self.masters = []
+
+    def entries(self):
+        path = self.tool.out / 'actions.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def receipt(self):
+        path = self.tool.out / 'ssh-diag.md'
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_helper_loads_lazily_once(self):
+        with mock.patch.object(runner, '_SSH_LIFECYCLE', None), \
+                mock.patch.object(importlib.util, 'spec_from_file_location',
+                                  wraps=importlib.util.spec_from_file_location) as spec:
+            runner.StepContext(self.tool, 'a')
+            spec.assert_not_called()
+            first = runner._ssh_lifecycle()
+            self.assertIs(runner._ssh_lifecycle(), first)
+            spec.assert_called_once()
+
+    def test_success_sends_one_rider_and_logs_argv_not_output(self):
+        result = subprocess.CompletedProcess([], 0, 'private stdout', 'private stderr')
+        with mock.patch.object(self.life, 'SshMux', self.Mux), \
+                mock.patch.object(runner.subprocess, 'run', return_value=result) as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis') as diagnosis:
+            value = self.ctx.ssh('user@fake-host', ['printf', 'word'], timeout=7, input='payload')
+        self.assertEqual(len(self.masters), 1)
+        self.assertFalse(self.masters[0][1]['allow_master_retry'])
+        expected = ['ssh', '-T', '-o', 'test-mux', 'user@fake-host', 'printf', 'word']
+        run.assert_called_once_with(expected, capture_output=True, text=True, timeout=7, input='payload')
+        diagnosis.assert_not_called()
+        self.assertEqual(value['returncode'], 0)
+        self.assertEqual(value['stdout'], 'private stdout')
+        self.assertEqual(value['stderr'], 'private stderr')
+        self.assertGreaterEqual(value['seconds'], 0)
+        entries = self.entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['argv'], expected)
+        self.assertEqual((entries[0]['ssh'], entries[0]['returncode']), ('user@fake-host', 0))
+        self.assertNotIn('private stdout', json.dumps(entries))
+        self.assertNotIn('private stderr', json.dumps(entries))
+        self.assertNotIn('payload', json.dumps(entries))
+        self.assertEqual(self.receipt(), [])
+
+    def test_application_failure_is_returned_without_diagnosis(self):
+        result = subprocess.CompletedProcess([], 1, '', 'remote application error')
+        with mock.patch.object(self.life, 'SshMux', self.Mux), \
+                mock.patch.object(runner.subprocess, 'run', return_value=result) as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis') as diagnosis:
+            value = self.ctx.ssh('fake-host', 'exit 1')
+        run.assert_called_once()
+        diagnosis.assert_not_called()
+        self.assertEqual((value['returncode'], value['stderr']), (1, 'remote application error'))
+        self.assertEqual(run.call_args.args[0][-1], 'exit 1')
+        self.assertEqual(self.receipt(), [])
+        self.assertEqual(self.entries()[0]['returncode'], 1)
+
+    def test_rider_255_is_diagnosed_receipted_and_never_replayed(self):
+        result = subprocess.CompletedProcess([], 255, '', 'connection reset')
+        with mock.patch.object(self.life, 'SshMux', self.Mux), \
+                mock.patch.object(runner.subprocess, 'run', return_value=result) as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis', return_value=self.diag) as diagnosis:
+            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: ssh diag named; ssh-diag receipt:') as error:
+                self.ctx.ssh('fake-host', ['work'])
+        self.assertIn(str(self.root / 'ssh-diag.md'), str(error.exception))
+        self.assertEqual(len(self.masters), 1)
+        run.assert_called_once()
+        diagnosis.assert_called_once()
+        self.assertFalse(diagnosis.call_args.kwargs['allow_retry'])
+        self.assertEqual(len(self.receipt()), 1)
+        self.assertIn('ssh ctx.ssh', self.receipt()[0])
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual({key: self.entries()[0][key] for key in ('ssh', 'transport_failure', 'phase', 'cause', 'evidence')},
+                         {'ssh': 'fake-host', 'transport_failure': True, 'phase': 'auth',
+                          'cause': 'packet loss', 'evidence': '/tmp/ctx-diagnostic'})
+
+    def test_rider_timeout_names_bound_and_possible_running_command(self):
+        with mock.patch.object(self.life, 'SshMux', self.Mux), \
+                mock.patch.object(runner.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 7)) as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis', return_value=self.diag) as diagnosis:
+            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: remote command exceeded 7 s; '
+                                                    r'.*may still be running.*; ssh diag named; ssh-diag receipt:'):
+                self.ctx.ssh('fake-host', ['work'], timeout=7)
+        run.assert_called_once()
+        diagnosis.assert_called_once()
+        self.assertTrue(diagnosis.call_args.kwargs['attempt_timed_out'])
+        self.assertEqual(len(self.receipt()), 1)
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_master_failure_has_one_receipt_one_log_and_zero_riders(self):
+        outer = self
+        class FailedMux(self.Mux):
+            def __enter__(self):
+                diagnosis = outer.life.ssh_record(outer.diag, 'ssh', 'master', outer.root)
+                raise outer.life.LedgerTransport([diagnosis], 'SSH master failed')
+        with mock.patch.object(self.life, 'SshMux', FailedMux), \
+                mock.patch.object(runner.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: ssh diag named; ssh-diag receipt:'):
+                self.ctx.ssh('fake-host', ['work'])
+        self.assertEqual(len(self.masters), 1)
+        run.assert_not_called()
+        self.assertEqual(len(self.receipt()), 1)
+        self.assertEqual(len(self.entries()), 1)
+        self.assertTrue(self.entries()[0]['transport_failure'])
+
+    def test_local_mux_refusal_is_named_and_receipted_without_contact(self):
+        outer = self
+        class FailedMux(self.Mux):
+            def __enter__(self):
+                raise outer.life.Refused('Unsafe SSH mux directory')
+        with mock.patch.object(self.life, 'SshMux', FailedMux), \
+                mock.patch.object(runner.subprocess, 'run') as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis') as diagnosis:
+            with self.assertRaisesRegex(RuntimeError, 'ctx.ssh fake-host: ssh mux failed: Unsafe SSH mux directory; '
+                                                      'attempt phase unknown; cause: local mux failure; retry: no'):
+                self.ctx.ssh('fake-host', ['work'])
+        run.assert_not_called()
+        diagnosis.assert_not_called()
+        self.assertEqual(len(self.receipt()), 1)
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(self.entries()[0]['cause'], 'local mux failure')
+
+    def test_stop_created_during_master_acquisition_prevents_rider(self):
+        outer = self
+        closed = []
+        class StopMux(self.Mux):
+            def __enter__(self):
+                (outer.root / 'STOP').write_text('stop during master')
+                return self
+            def __exit__(self, *_args):
+                closed.append(True)
+                return False
+        with mock.patch.object(self.life, 'SshMux', StopMux), \
+                mock.patch.object(runner.subprocess, 'run') as run:
+            with self.assertRaisesRegex(runner.StopRun, 'STOP present'):
+                self.ctx.ssh('fake-host', ['work'])
+        run.assert_not_called()
+        self.assertEqual(closed, [True])
+        self.assertEqual(len(self.entries()), 1)
+        self.assertTrue(self.entries()[0]['stopped'])
+
+    def test_rider_diagnosis_failure_still_records_named_stop(self):
+        outer = self
+        class LoggedMux(self.Mux):
+            def __init__(self, host, **kwargs):
+                super().__init__(host, **kwargs)
+                self.master_log = outer.root / 'master.log'
+                self.master_log.write_text('SSH2_MSG_NEWKEYS received\n')
+        result = subprocess.CompletedProcess([], 255, '', 'connection reset')
+        with mock.patch.object(self.life, 'SshMux', LoggedMux), \
+                mock.patch.object(runner.subprocess, 'run', return_value=result) as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis', side_effect=OSError('diagnostic denied')) as diag:
+            with self.assertRaises(RuntimeError) as error:
+                self.ctx.ssh('fake-host', ['work'])
+        run.assert_called_once()
+        diag.assert_called_once()
+        self.assertIn('attempt phase auth', str(error.exception))
+        self.assertIn('diagnosis failed: diagnostic denied', str(error.exception))
+        self.assertIn('evidence unavailable', str(error.exception))
+        self.assertIn(f'ssh-diag receipt: {self.root / "ssh-diag.md"}', str(error.exception))
+        self.assertEqual(len(self.receipt()), 1)
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(self.entries()[0]['phase'], 'auth')
+        self.assertEqual(self.entries()[0]['cause'], 'diagnosis failed: diagnostic denied')
+        self.assertEqual(self.entries()[0]['evidence'], 'unavailable')
+
+    def test_windows_shaped_host_with_loss_does_not_reopen_master(self):
+        starts, allow_retry = [], []
+        real_mux = self.life.SshMux
+        class Process:
+            pid = 123456
+            def wait(self, timeout=None):
+                return 255
+            def poll(self):
+                return 255
+        def popen(argv, **_kwargs):
+            starts.append(argv)
+            return Process()
+        def run(argv, **_kwargs):
+            if '-G' in argv:
+                path = next(arg.removeprefix('ControlPath=') for arg in argv if arg.startswith('ControlPath='))
+                return subprocess.CompletedProcess(argv, 0, 'controlpath ' + path.replace('%C', 'key') + '\n', '')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        def factory(host, **kwargs):
+            return real_mux(host, run=run, popen=popen, **kwargs)
+        def diagnosis(*_args, **kwargs):
+            allow_retry.append(kwargs['allow_retry'])
+            return {**self.diag, 'transient': True}
+        with mock.patch.object(self.life, 'SshMux', side_effect=factory), \
+                mock.patch.object(self.life, 'ssh_diagnosis', side_effect=diagnosis), \
+                mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': self.temporary.name}):
+            with self.assertRaisesRegex(RuntimeError, 'ssh diag named'):
+                self.ctx.ssh('fake-ally', ['work'])
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(allow_retry, [False])
+        self.assertEqual(len(self.receipt()), 1)
+
+    def test_invalid_inputs_refused_before_any_process(self):
+        with mock.patch.object(self.life, 'SshMux') as mux, mock.patch.object(runner.subprocess, 'run') as run:
+            for host in ('', '-host', 'host;touch', 'host name', None):
+                with self.subTest(host=host), self.assertRaisesRegex(RuntimeError, 'ctx.ssh: unsafe host'):
+                    self.ctx.ssh(host, ['true'])
+            for command in ('', [], [1], ['true', None], None, 'true\0bad', ['true\0bad']):
+                with self.subTest(command=command), self.assertRaisesRegex(RuntimeError, 'ctx.ssh:.*command'):
+                    self.ctx.ssh('fake-host', command)
+            for timeout in (0, -1, 901, float('nan'), float('inf'), True, '10'):
+                with self.subTest(timeout=timeout), self.assertRaisesRegex(RuntimeError, 'ctx.ssh:.*timeout'):
+                    self.ctx.ssh('fake-host', ['true'], timeout=timeout)
+        mux.assert_not_called()
+        run.assert_not_called()
+
+    def test_stop_file_precedes_any_ssh(self):
+        for name in ('STOP', 'STOP-INPUT'):
+            with self.subTest(name=name):
+                (self.root / name).write_text('stop now')
+                with mock.patch.object(self.life, 'SshMux') as mux, mock.patch.object(runner.subprocess, 'run') as run:
+                    with self.assertRaisesRegex(runner.StopRun, name + ' present'):
+                        self.ctx.ssh('fake-host', ['work'])
+                mux.assert_not_called()
+                run.assert_not_called()
+                (self.root / name).unlink()
+
+    def test_test_option_seam_rejects_non_loopback_host(self):
+        with mock.patch.object(runner, '_SSH_OPTIONS_FOR_TESTS', ('-o', 'Port=12345'), create=True), \
+                mock.patch.object(self.life, 'SshMux') as mux:
+            with self.assertRaisesRegex(RuntimeError, 'test options are restricted to 127.0.0.1'):
+                self.ctx.ssh('fake-host', ['work'])
+        mux.assert_not_called()
+
+    def test_replay_refuses_before_any_ssh(self):
+        self.tool.replaying = True
+        with mock.patch.object(self.life, 'SshMux') as mux, mock.patch.object(runner.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, '^ctx.ssh is not available in replay: a fixture has no remote host$'):
+                self.ctx.ssh('fake-host', ['work'])
+        mux.assert_not_called()
+        run.assert_not_called()
+
+    @unittest.skipIf(os.environ.get('EDEN_SKIP_SSH_STALL_TESTS'), 'real SSH loopback tests explicitly skipped')
+    def test_real_loopback_pass_and_auth_stall(self):
+        if evidence := os.environ.get('EDEN_TEST_EVIDENCE_DIR'):
+            self.tool.out = Path(evidence) / 'ctx-ssh'
+            self.tool.out.mkdir(parents=True, exist_ok=False)
+        def free_port():
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                return sock.getsockname()[1]
+        key = self.root / 'key'
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)],
+                       check=True, capture_output=True, timeout=10)
+        (self.root / 'authorized_keys').write_text(key.with_suffix('.pub').read_text())
+        target_port = free_port()
+        config = self.root / 'sshd_config'
+        config.write_text(f'Port {target_port}\nListenAddress 127.0.0.1\nHostKey {key}\nPidFile none\n'
+                          f'UsePAM no\nAuthorizedKeysFile {self.root / "authorized_keys"}\nStrictModes no\n'
+                          f'PubkeyAuthentication yes\nPasswordAuthentication no\n'
+                          f'AllowUsers {pwd.getpwuid(os.getuid()).pw_name}\n')
+        sshd_log = (self.root / 'sshd.log').open('w+')
+        sshd = subprocess.Popen(['/usr/sbin/sshd', '-D', '-e', '-f', str(config)],
+                                stdout=subprocess.DEVNULL, stderr=sshd_log, start_new_session=True)
+        proxies, streams, starts, timings = [], [], [], []
+        def stop(process):
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=3)
+        def proxy(stall):
+            port = free_port()
+            path = self.root / ('stall.log' if stall else 'pass.log')
+            log = path.open('w+')
+            streams.append(log)
+            argv = ['/usr/bin/python3', '-I', '-B',
+                    str(Path(__file__).resolve().parent.parent / 'eden-lifecycle' / 'test-data' / 'stall_proxy.py'),
+                    '--port', str(port), '--target', str(target_port)]
+            if stall:
+                argv.append('--stall')
+            process = subprocess.Popen(argv, stdout=log, stderr=log, start_new_session=True)
+            proxies.append(process)
+            for _ in range(100):
+                log.flush()
+                if 'READY' in path.read_text():
+                    return port
+                if process.poll() is not None:
+                    break
+                time.sleep(.02)
+            self.fail(f'loopback proxy did not start: {path.read_text()}')
+        def options(port):
+            return ('-F', '/dev/null', '-o', f'Port={port}', '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'UserKnownHostsFile=/dev/null', '-o', f'IdentityFile={key}', '-o', 'IdentitiesOnly=yes')
+        class TimedProcess:
+            def __init__(self, argv, **kwargs):
+                self.process = subprocess.Popen(argv, **kwargs)
+                self.pid, self.started = self.process.pid, time.monotonic()
+                starts.append(self.process)
+            def wait(self, timeout=None):
+                try:
+                    return self.process.wait(timeout=timeout)
+                finally:
+                    if len(timings) < len(starts):
+                        timings.append(time.monotonic() - self.started)
+            def poll(self):
+                return self.process.poll()
+            def kill(self):
+                self.process.kill()
+        real_mux = self.life.SshMux
+        def mux(host, **kwargs):
+            return real_mux(host, popen=TimedProcess, **kwargs)
+        try:
+            time.sleep(.3)
+            if sshd.poll() is not None:
+                sshd_log.flush()
+                self.fail(f'unprivileged sshd failed: {(self.root / "sshd.log").read_text()}')
+            pass_port = proxy(False)
+            with mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': self.temporary.name}), \
+                    mock.patch.object(self.life, 'SshMux', side_effect=mux), \
+                    mock.patch.object(runner, '_SSH_OPTIONS_FOR_TESTS', options(pass_port), create=True):
+                started = time.monotonic()
+                result = self.ctx.ssh('127.0.0.1', ['printf', 'hook-ssh-ok'])
+                positive = time.monotonic() - started
+            self.assertEqual((result['returncode'], result['stdout']), (0, 'hook-ssh-ok'))
+            self.assertLess(positive, 10)
+            self.assertEqual(len(starts), 1)
+            starts.clear()
+            timings.clear()
+            stall_port = proxy(True)
+            with mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': self.temporary.name}), \
+                    mock.patch.object(self.life, 'SshMux', side_effect=mux), \
+                    mock.patch.object(runner, '_SSH_OPTIONS_FOR_TESTS', options(stall_port), create=True):
+                started = time.monotonic()
+                with self.assertRaises(RuntimeError) as error:
+                    self.ctx.ssh('127.0.0.1', ['printf', 'never-sent'])
+                total = time.monotonic() - started
+            self.assertEqual(len(starts), 1)
+            self.assertTrue(9.5 <= timings[0] <= 11, timings)
+            self.assertIn('attempt phase auth', str(error.exception))
+            self.assertIn('diag login failed, phase auth', str(error.exception))
+            self.assertIn('retry: no', str(error.exception))
+            self.assertIn('BOTH_NEWKEYS', (self.root / 'stall.log').read_text())
+            self.assertEqual(len(self.receipt()), 1)
+            self.assertEqual(len(self.entries()), 2)
+            print(f'ctx.ssh loopback auth: positive {positive:.3f}s; master {timings[0]:.3f}s; total {total:.3f}s')
+        finally:
+            for process in proxies:
+                stop(process)
+            stop(sshd)
+            for stream in streams:
+                stream.close()
+            sshd_log.close()
+        self.assertIsNotNone(sshd.poll())
+        self.assertTrue(all(process.poll() is not None for process in proxies))
+        self.assertTrue(all(process.poll() is not None for process in starts))
+        owned_groups = {sshd.pid, *(process.pid for process in proxies)}
+        remaining = []
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                group = os.getpgid(int(entry.name))
+                parts = (entry / 'cmdline').read_bytes().split(b'\0')
+                name = Path(os.fsdecode(parts[0])).name if parts else ''
+                command = b'\0'.join(parts)
+                if (group in owned_groups or
+                        (name in ('ssh', 'sshd', 'sshd-session') and
+                         (str(self.root).encode() in command or f'Port={pass_port}'.encode() in command
+                          or f'Port={stall_port}'.encode() in command)) or
+                        (b'stall_proxy.py' in command and str(self.root).encode() in command)):
+                    remaining.append(entry.name)
+            except (OSError, ValueError):
+                pass
+        self.assertEqual(remaining, [])
 
 
 class ReviewClassTests(unittest.TestCase):
@@ -3521,6 +3943,32 @@ class RunnerTests(unittest.TestCase):
         refused = runner.harness.replay_fixture(self.manifest, fixture, self.dir / 'replay-out-2', runner.Runner)
         self.assertFalse(refused['ok'])
         self.assertIn('card', refused['checks'][1]['error'])
+
+    def test_fixture_replay_refuses_ctx_ssh_without_contacting_host(self):
+        (self.dir / 'steps.py').write_text(
+            'def remote(ctx):\n'
+            '    return ctx.ssh("fake-host", ["true"])\n')
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue',
+                              'steps': [{'run': 'steps.py:remote'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        fixture = self.dir / 'fixture'
+        fixture.mkdir()
+        (fixture / 'fixture.json').write_text(json.dumps({'row': 'r1', 'instances': {'a': {'sources': {}}}}))
+        with mock.patch.object(runner.subprocess, 'run') as run:
+            result = runner.harness.replay_fixture(self.manifest, fixture, self.dir / 'replay-out', runner.Runner)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['checks'][0]['error'],
+                         'ctx.ssh is not available in replay: a fixture has no remote host')
+        run.assert_not_called()
+
+    def test_dry_run_does_not_load_ssh_helper_or_run_hook(self):
+        (self.dir / 'steps.py').write_text('def remote(ctx):\n    return ctx.ssh("fake-host", ["true"])\n')
+        self.plan['rows'][0]['steps'].append({'run': 'steps.py:remote'})
+        self.manifest.write_text(json.dumps(self.plan))
+        with mock.patch.object(runner, '_ssh_lifecycle') as helper, mock.patch.object(runner.subprocess, 'run') as run:
+            runner.dry_run(self.manifest)
+        helper.assert_not_called()
+        run.assert_not_called()
 
     def test_self_test_reports_each_declared_recovery(self):
         menu, popup = (20, 180, 40), (180, 180, 20)
