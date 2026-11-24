@@ -28,6 +28,24 @@ json.dump({"verdict": word, "reason": "stand-in judge: " + word, "shots_cited": 
            "model": "stand-in", "saw_expected": job["expected"]}, open(a.out, "w"))
 '''
 
+INPUT_JUDGE = '''
+import argparse, json
+from pathlib import Path
+from PIL import Image
+ap = argparse.ArgumentParser(); ap.add_argument("--job"); ap.add_argument("--out"); a = ap.parse_args()
+job = json.loads(Path(a.job).read_text())
+Path(job["plan_dir"], "judge-ran.json").write_text(json.dumps([s["label"] for s in job["shots"]]))
+mode = job["expected"]
+if mode == "PERSIST":
+    bright = sum(Image.open(s["path"]).convert("RGB").getpixel((0, 0))[0] >= 128 for s in job["shots"])
+    word, cited = ("PASS" if bright >= 2 else "UNSURE"), ["step:bright-step"]
+else:
+    word = "PASS"
+    cited = [] if mode == "NO-CITE" else ["not-an-image"] if mode == "UNRESOLVED" else [mode]
+json.dump({"verdict": word, "reason": "stand-in input judge", "shots_cited": cited, "model": "stand-in"},
+          open(a.out, "w"))
+'''
+
 
 class PngClient:
     """Fake backend: per-row OBS files; screenshots are real PNGs, coloured by shot name ("same" = one grey)."""
@@ -90,6 +108,180 @@ def make_plan(folder, rows, **plan_keys):
 
 def receipt(folder, row):
     return json.loads((folder / 'out' / f'{row}.json').read_text())
+
+
+class WorkerJudgeInput(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+        self.workdir = self.folder / 'judge'
+        self.workdir.mkdir()
+        self.job_path = self.folder / 'job.json'
+        self.receipt_path = self.folder / 'receipt.json'
+        (self.folder / 'judge.py').write_text(INPUT_JUDGE)
+
+    def shot(self, name, phase, level, fresh):
+        from PIL import Image
+        path = self.folder / f'{name}.png'
+        Image.new('RGB', (32, 18), (level, level, level)).save(path)
+        shot = {'name': name, 'phase': phase, 'path': str(path)}
+        if fresh is not None:
+            shot['fresh'] = fresh
+        return shot
+
+    def run_worker(self, shots, expected, frames=None, dense=None):
+        marker = self.folder / 'judge-ran.json'
+        marker.unlink(missing_ok=True)
+        self.receipt_path.write_text(json.dumps({'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED',
+                                                 'blockers': []}))
+        job = {'row': 'a', 'shots': shots, 'expected': expected, 'clip': 'fake.mp4' if frames is not None else None,
+               'dir': str(self.workdir), 'receipt': str(self.receipt_path),
+               'plan_dir': str(self.folder), 'judge_cmd': 'judge.py'}
+        self.job_path.write_text(json.dumps(job))
+        with mock.patch.object(jq, 'sample_frames', return_value=(frames or {}, {'start': 0, 'end': 2000})), \
+             mock.patch.object(jq, 'sample_dense', return_value=dense or {}):
+            verdict = jq.work(self.job_path)
+        return (json.loads(self.job_path.read_text()), json.loads(self.receipt_path.read_text()),
+                json.loads((self.workdir / 'done.json').read_text()), verdict, marker)
+
+    def test_persistence_judge_does_not_see_refused_after(self):
+        good = {'status': 'fresh'}
+        refused = {'status': 'refused', 'reason': 'unchanged across 200 game frames'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('bright-step', 'step', 220, good),
+                 self.shot('bright-after', 'after', 220, refused)]
+        job, result, done, verdict, marker = self.run_worker(shots, 'PERSIST')
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads(marker.read_text()), ['before:base', 'step:bright-step'])
+        self.assertEqual([s['path'] for s in job['shots']], [shots[0]['path'], shots[1]['path']])
+        excluded = [{'label': 'after:bright-after', 'name': 'bright-after', 'phase': 'after',
+                     'path': shots[2]['path'], 'reason': refused['reason']}]
+        self.assertEqual(job.get('excluded_shots'), excluded)
+        self.assertEqual(done.get('excluded_shots'), excluded)
+        self.assertEqual(result['judge'].get('excluded_shots'), excluded)
+
+        shots[2]['fresh'] = good
+        job, result, done, verdict, marker = self.run_worker(shots, 'PERSIST')
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+        self.assertEqual(json.loads(marker.read_text()), ['before:base', 'step:bright-step', 'after:bright-after'])
+        self.assertEqual(len(job['shots']), 3)
+        self.assertEqual(job.get('excluded_shots'), [])
+        self.assertEqual(done.get('excluded_shots'), [])
+        self.assertNotIn('excluded_shots', result['judge'])
+
+    def test_all_unusable_stills_skip_judge_and_are_audited(self):
+        shots = [self.shot('base', 'before', 20, {'status': 'error', 'reason': 'journal failed'}),
+                 self.shot('after', 'after', 220, None)]
+        job, result, done, verdict, marker = self.run_worker(shots, 'PERSIST')
+        self.assertFalse(marker.exists())
+        self.assertEqual(verdict, {'verdict': 'UNSURE',
+                                   'reason': 'no usable image for the judge: 2 unusable still(s) excluded',
+                                   'shots_cited': [], 'model': None})
+        self.assertEqual((result['status'], result['review']), ('RAN-UNVERIFIED', True))
+        self.assertEqual(job['shots'], [])
+        excluded = [{'label': 'before:base', 'name': 'base', 'phase': 'before',
+                     'path': shots[0]['path'], 'reason': 'journal failed'},
+                    {'label': 'after:after', 'name': 'after', 'phase': 'after',
+                     'path': shots[1]['path'], 'reason': 'no freshness record'}]
+        self.assertEqual(job.get('excluded_shots'), excluded)
+        self.assertEqual(done.get('excluded_shots'), excluded)
+        self.assertEqual(result['judge'].get('excluded_shots'), excluded)
+
+    def test_unrelated_excluded_diagnostic_preserves_pass_and_labels(self):
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('diagnostic', 'step', 200, good),
+                 self.shot('result', 'after', 220, good)]
+        full, result, _, _, marker = self.run_worker(shots, 'after:result')
+        self.assertEqual(result['status'], 'PASS')
+        full_labels = json.loads(marker.read_text())
+        self.assertEqual(full_labels, ['before:base', 'step:diagnostic', 'after:result'])
+        shots[1]['fresh'] = {'status': 'error', 'reason': 'diagnostic journal failed'}
+        job, result, done, _, marker = self.run_worker(shots, 'after:result')
+        self.assertEqual((result['status'], result['blockers']), ('PASS', []))
+        self.assertEqual(json.loads(marker.read_text()), [full_labels[0], full_labels[2]])
+        self.assertEqual(job.get('excluded_shots'), [
+            {'label': full_labels[1], 'name': 'diagnostic', 'phase': 'step', 'path': shots[1]['path'],
+             'reason': 'diagnostic journal failed'}])
+        self.assertEqual(done.get('excluded_shots'), job['excluded_shots'])
+        self.assertEqual(result['judge'].get('excluded_shots'), job['excluded_shots'])
+
+    def test_clip_only_and_no_images_without_exclusions_keep_running_judge(self):
+        start = self.shot('clip-start', 'clip', 20, None)['path']
+        end = self.shot('clip-end', 'clip', 220, None)['path']
+        dense = self.shot('clip-dense', 'clip', 120, None)['path']
+        job, result, done, _, marker = self.run_worker([], 'clip end',
+                                                       frames={'start': start, 'end': end}, dense={1000: dense})
+        self.assertEqual((result['status'], json.loads(marker.read_text())),
+                         ('PASS', ['clip start', 'clip end', 'dense 1.0s']))
+        self.assertEqual(job.get('excluded_shots'), [])
+        self.assertEqual(done.get('excluded_shots'), [])
+        self.assertNotIn('excluded_shots', result['judge'])
+        job, result, _, _, marker = self.run_worker([], 'NO-CITE')
+        self.assertEqual((result['status'], json.loads(marker.read_text())), ('PASS', []))
+        self.assertEqual(job['shots'], [])
+
+    def test_uncited_or_unresolved_verdict_still_checks_expected_after(self):
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('bright-step', 'step', 220, good),
+                 self.shot('result', 'after', 220, {'status': 'refused', 'reason': 'frozen'})]
+        for mode in ('NO-CITE', 'UNRESOLVED'):
+            with self.subTest(mode=mode):
+                job, result, _, verdict, marker = self.run_worker(shots, mode)
+                self.assertTrue(marker.is_file())
+                self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+                self.assertEqual(result['blockers'], [
+                    {'kind': 'evidence', 'source': 'after:result',
+                     'text': f"still {shots[2]['path']} is not usable evidence: frozen"}])
+                self.assertEqual(job.get('excluded_shots', [{}])[0].get('label'), 'after:result')
+
+    def test_missing_path_and_phaseless_row_shots_are_audited(self):
+        good = {'status': 'fresh'}
+        diagnostic = self.shot('diagnostic', 'step', 100, {'status': 'error', 'reason': 'bad'})
+        diagnostic.pop('phase')
+        shots = [self.shot('base', 'before', 20, good), diagnostic,
+                 self.shot('result', 'after', 220, good)]
+        job, result, _, _, _ = self.run_worker(shots, 'after:result')
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(job.get('excluded_shots'), [
+            {'label': 'step:diagnostic', 'name': 'diagnostic', 'phase': None,
+             'path': diagnostic['path'], 'reason': 'bad'}])
+        missing = [{'name': 'missing', 'phase': 'before', 'path': None}]
+        job, result, _, verdict, marker = self.run_worker(missing, 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job.get('excluded_shots'), [
+            {'label': 'before:missing', 'name': 'missing', 'phase': 'before', 'path': None,
+             'reason': 'still was not taken'}])
+
+    def test_saved_job_replay_preserves_exclusions_in_fresh_worker_processes(self):
+        shots = [self.shot('base', 'before', 20, {'status': 'error', 'reason': 'journal failed'}),
+                 self.shot('after', 'after', 220, None)]
+        self.receipt_path.write_text(json.dumps({'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED',
+                                                 'blockers': []}))
+        self.job_path.write_text(json.dumps({
+            'row': 'a', 'shots': shots, 'expected': 'NO-CITE', 'clip': None, 'dir': str(self.workdir),
+            'receipt': str(self.receipt_path), 'plan_dir': str(self.folder), 'judge_cmd': 'judge.py'}))
+        marker = self.folder / 'judge-ran.json'
+        exclusions = None
+        for _ in range(2):
+            worker = subprocess.run([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                                     str(self.job_path)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(worker.returncode, 0, worker.stderr)
+            verdict = json.loads(worker.stdout)
+            job = json.loads(self.job_path.read_text())
+            result = json.loads(self.receipt_path.read_text())
+            done = json.loads((self.workdir / 'done.json').read_text())
+            self.assertFalse(marker.exists())
+            self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+            self.assertEqual(verdict['reason'], 'no usable image for the judge: 2 unusable still(s) excluded')
+            if exclusions is None:
+                exclusions = job.get('excluded_shots')
+                self.assertEqual(len(exclusions), 2)
+            self.assertEqual(job.get('excluded_shots'), exclusions)
+            self.assertEqual(done.get('excluded_shots'), exclusions)
+            self.assertEqual(result['judge'].get('excluded_shots'), exclusions)
+            self.assertEqual(json.loads((self.workdir / 'row-shots.json').read_text()), shots)
 
 
 class StatusRules(unittest.TestCase):
@@ -494,23 +686,36 @@ class RunnerEffects(unittest.TestCase):
                 row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': f'say {word}',
                        'steps': [{'shot': 'before'}, {'shot': 'after'}],
                        'shots': [{'name': 'before', 'phase': 'before'}, {'name': 'after', 'phase': 'after'}]}
+                if broken:
+                    row['steps'].append({'shot': 'witness'})
+                    row['shots'].append({'name': 'witness', 'phase': 'diagnostic'})
                 engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60},
                                    known_issues={'known': {'title': 'known', 'reason': 'stand-in judge: FAIL',
                                                            'rows': ['a']}})
                 if broken:
                     (engine.out / 'stills.jsonl').mkdir()
+                    record = engine.stills.record
+
+                    def record_with_witness(on, path, reply, frame):
+                        if 'witness' in path.name:
+                            return {'status': 'unverified', 'reason': 'no game frame source'}
+                        return record(on, path, reply, frame)
+
+                    engine.stills.record = record_with_witness
                 self.assertEqual(engine.run(), 'DONE')
                 result = receipt(folder, 'a')
                 self.assertEqual(result['judge']['verdict'], word)
                 job = json.loads((engine.out / 'judge/jobs/a.json').read_text())
                 self.assertEqual([shot.get('fresh', {}).get('status') for shot in job['shots']],
-                                 ['error', 'error'] if broken else ['unverified', 'unverified'])
+                                 ['unverified'] if broken else ['unverified', 'unverified'])
                 if broken:
                     self.assertEqual((result['status'], result['review'], result['review_kind']),
                                      ('RAN-UNVERIFIED', True, 'unverified'))
                     blockers = [item for item in result['blockers'] if item['kind'] == 'evidence']
                     self.assertEqual(len(blockers), 2)
-                    for shot in job['shots']:
+                    excluded = job.get('excluded_shots') or []
+                    self.assertEqual([shot['name'] for shot in excluded], ['before', 'after'])
+                    for shot in excluded:
                         self.assertTrue(any(shot['path'] in item['text'] for item in blockers))
                     self.assertNotIn('known_issue', result)
                 else:
@@ -544,6 +749,8 @@ class RunnerEffects(unittest.TestCase):
                         return request(method, params)
 
                     client.request = call
+                    (folder / 'judge.py').write_text(JUDGE.replace(
+                        '[s["path"] for s in job["shots"]]', '[]'))
                 else:
                     record = engine.stills.record
 
@@ -561,12 +768,16 @@ class RunnerEffects(unittest.TestCase):
                 self.assertEqual(result['judge']['verdict'], 'PASS')
                 job = json.loads((engine.out / 'judge/jobs/a.json').read_text())
                 if stale:
-                    self.assertEqual((job['shots'][-1].get('fresh') or {}).get('status'), 'refused')
+                    excluded = job.get('excluded_shots') or []
+                    self.assertEqual([shot['name'] for shot in excluded], ['same-after'])
+                    self.assertIn('unchanged across 200 game frames', excluded[0]['reason'])
                     self.assertEqual(result['status'], 'RAN-UNVERIFIED')
-                    self.assertTrue(any(item['kind'] == 'evidence' and job['shots'][-1]['path'] in item['text']
+                    self.assertTrue(any(item['kind'] == 'evidence' and excluded[0]['path'] in item['text']
                                         for item in result['blockers']))
                 else:
-                    self.assertEqual((job['shots'][1].get('fresh') or {}).get('status'), 'error')
+                    excluded = job.get('excluded_shots') or []
+                    self.assertEqual([shot['name'] for shot in excluded], ['diagnostic'])
+                    self.assertIn('diagnostic journal failure', excluded[0]['reason'])
                     self.assertEqual(result['status'], 'PASS')
                     self.assertEqual(result['blockers'], [])
 
@@ -585,12 +796,18 @@ class RunnerEffects(unittest.TestCase):
                 job = json.loads(job_path.read_text())
                 for shot in job['shots']:
                     shot.pop('fresh', None)
+                job.pop('row_shots_saved', None)
+                clip = folder / 'clip-start.png'
+                clip.write_bytes(Path(job['shots'][0]['path']).read_bytes())
+                job['clip'] = str(clip)
                 job_path.write_text(json.dumps(job))
                 current = receipt(folder, 'a')
                 current.update(status='RAN-UNVERIFIED', judge={'state': 'pending'},
                                blockers=[{'kind': 'visual', 'source': 'row', 'text': 'visual read pending'}])
                 (engine.out / 'a.json').write_text(json.dumps(current))
-                jq.work(job_path)
+                with mock.patch.object(jq, 'sample_frames', return_value=({'start': str(clip)}, {'start': 0})), \
+                     mock.patch.object(jq, 'sample_dense', return_value={}):
+                    jq.work(job_path)
                 result = receipt(folder, 'a')
                 self.assertEqual((result['status'], result['judge']['verdict'], result.get('review_kind')),
                                  ('RAN-UNVERIFIED', word, 'unverified'))
