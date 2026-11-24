@@ -505,6 +505,8 @@ nothing usable can be compared. The runner records
 every still taken inside a row, including image-gate polling stills, as a
 capture with one `status` call after each. Without a game-frame source the
 freshness is `unverified` and remains usable; that is not frame-freshness proof.
+The judge is shown only usable row stills and clip frames; excluded stills are
+listed in the job and the receipt.
 The still's own recorded path selects its capture; otherwise use
 `--capture <row>:<file>` to name its source, or omit it when the hash matches
 exactly one capture. An ambiguous hash is refused.
