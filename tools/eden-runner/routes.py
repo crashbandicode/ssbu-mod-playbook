@@ -977,14 +977,16 @@ def _wireless_placed(tile):
                                              or tile.get('local.token') == 'placed')
 
 
-def wireless_room(ctx, ready_cap=60):
+def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
     """Reach the Local Wireless waiting room as host from an observed route screen."""
+    if unpublished_create not in ('refuse', 'allow'):
+        raise RuntimeError(f'wireless_room: invalid unpublished_create {unpublished_create!r}')
     if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
         raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
     started, screens = time.monotonic(), []
     io = BridgePickerIO(ctx)
     state = {'last_ui': {}, 'last_tile': None, 'form_pending': False, 'form_ready': False,
-             'form_away': 0, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
+             'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
              'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
              'prefinished': False, 'current': None}
 
@@ -1021,6 +1023,15 @@ def wireless_room(ctx, ready_cap=60):
         if not state['form_pending']:
             return False
         screen = obs['ui'].get('screen')
+        if screen is not None and screen != 'ldn.room_list':
+            state['form_left_list'] = True
+        if unpublished_create == 'refuse':
+            if not active(obs, 'ldn.create'):
+                return False
+            state['create_form'] = 'ldn.create'
+            state['form_ready'] = True
+            state['form_pending'] = False
+            return True
         state['form_away'] = state['form_away'] + 1 if screen is not None and screen != 'ldn.room_list' else 0
         if state['form_away'] < 3:
             return False
@@ -1041,8 +1052,11 @@ def wireless_room(ctx, ready_cap=60):
     def confirm_ready(obs):
         ui = obs['ui']
         screen = ui.get('screen')
-        form = screen == 'ldn.create' or (screen == 'unknown' and state['form_ready']
-                                          and state['current'] == 'confirm-create')
+        if unpublished_create == 'refuse':
+            form = active(obs, 'ldn.create')
+        else:
+            form = screen == 'ldn.create' or (screen == 'unknown' and state['form_ready']
+                                              and state['current'] == 'confirm-create')
         return available() and form and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= 20)
 
     def confirm_done(obs):
@@ -1097,7 +1111,7 @@ def wireless_room(ctx, ready_cap=60):
         closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
                          cap=20, lost_after=0, sends=2, before_send=begin_confirm),
         closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
-                         cap=60, ready_cap=20, lost_after=4),
+                         cap=60, ready_cap=20, lost_after=6),
         closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
                          cap=5, ready_cap=30, lost_after=3, before_send=fence_chord),
         closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4),
@@ -1148,7 +1162,12 @@ def wireless_room(ctx, ready_cap=60):
         elif error.step == 'open-room-list':
             reason += f'; expected ldn.room_list; saw {state["last_ui"]}'
         elif error.step == 'open-create':
-            reason += f'; expected ssbu.ui to leave ldn.room_list; saw {state["last_ui"]}'
+            if (unpublished_create == 'refuse' and state['form_left_list']
+                    and reason.startswith('no transition within cap')):
+                reason = ('unsupported reader: the Create form is not published as ldn.create; '
+                          f'last read {state["last_ui"]}')
+            else:
+                reason += f'; expected ssbu.ui to leave ldn.room_list; saw {state["last_ui"]}'
         elif error.step == 'stage-a':
             reason += f'; expected css.smash in local_wireless; saw {state["last_ui"]}'
         elif error.step == 'css-hand':
@@ -1166,11 +1185,14 @@ def wireless_room(ctx, ready_cap=60):
         error.receipt['reason'] = reason
         error.args = (f'wireless_room: stopped on step {error.step!r}: {reason}',)
         sends = next((entry['sends'] for entry in error.receipt['steps'] if entry['name'] == error.step), 0)
-        _save(ctx, 'routes-wireless-room-stop', {
+        stop_receipt = {
             'block': 'wireless_room', 'ok': False, 'step': error.step, 'reason': reason, 'sends': sends,
             'screens': screens, 'last_ui': state['last_ui'], 'last_tile': state['last_tile'],
             'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
-        })
+        }
+        if reason.startswith('unsupported reader: the Create form is not published as ldn.create'):
+            stop_receipt['unsupported_reader'] = 'ldn.create'
+        _save(ctx, 'routes-wireless-room-stop', stop_receipt)
         raise
 
     tile, waiting_ui = state['last_tile'], state['last_ui']
@@ -1182,6 +1204,8 @@ def wireless_room(ctx, ready_cap=60):
         placed_by = 'already placed'
     return _save(ctx, 'routes-wireless-room', {
         'block': 'wireless_room', 'screens': screens, 'create_form': state['create_form'],
+        'create_witness': ('none: unpublished Create form allowed by the caller'
+                           if state['create_form'] == 'unpublished' else 'ldn.create'),
         'confirm_presses': state['confirm_presses'], 'stage_presses': state['stage_presses'], 'tile': tile,
         'placed_by': placed_by, 'chord_sent': state['chord_sent'], 'chord_fence': state['chord_fence'],
         'waiting': {key: waiting_ui.get(key, 'unknown')

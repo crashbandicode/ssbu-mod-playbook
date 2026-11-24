@@ -55,7 +55,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
-| `wireless_room` `{ready_cap}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; each step awaits its screen, sends once, awaits the transition, resends a lost input at most 3 times and otherwise stops on a named step with `routes-wireless-room-stop.json` |
+| `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; each step awaits its screen, sends once, awaits the transition, resends a lost input at most 3 times and otherwise stops on a named step with `routes-wireless-room-stop.json` |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
@@ -91,6 +91,9 @@ Look for the current screen and start there; wait for the step's fresh ready obs
 After a send, wait for the transition. A continuously observed source counts as a lost input:
 finish it and resend, up to three sends total (some steps allow fewer). If observations stay unreadable
 or in flight until the cap, stop on the named step without confirming or pressing again.
+The Create form is refused by default until the bridge publishes active `ldn.create`;
+`unpublished_create='allow'` is an explicit, recorded exception.
+A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
 `ready` waits 30 s of unchanged CSS before its single resend; what a second Plus does while the room is still loading has not been observed in a game.
 This closed-loop route is host-tested only, not flown.
 
