@@ -80,6 +80,7 @@ class BridgeOnTests(unittest.TestCase):
         self.stub_default = STUB_UI
         self.stub_preamble = STUB_PREAMBLE
         self.bridge_requests = []
+        self.request_times = []
         self.ready_at = None
         self.chord_started = None
         self.toggle_enabled = True
@@ -150,6 +151,7 @@ class BridgeOnTests(unittest.TestCase):
         self.assertIs(ctx, self.ctx)
         self.assertEqual(requests, ('providers', 'state ssbu.ui'))
         self.bridge_requests.append(requests)
+        self.request_times.append(self.seconds)
         sample = self.stub_samples.pop(0) if self.stub_samples else self.stub_default
         if self.prompt_after_skip and any(method == 'macro.play' for method, _ in self.calls):
             sample = RUN1_PROMPT
@@ -508,6 +510,52 @@ class BridgeOnTests(unittest.TestCase):
             self.invoke(port=6980)
         self.assertEqual(self.macro_attempts(), [])
         self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+        self.assertAlmostEqual(self.seconds - self.request_times[0], 10)
+
+    def test_bridge_on_stub_on_recheck_accepts_a_delayed_reply(self):
+        self.recorded_opening()
+        self.stub_samples, self.stub_default = [RUN1_OPENING, ''], ''
+        recheck_started = []
+
+        def deliver(_amount):
+            if len(self.bridge_requests) >= 2:
+                if not recheck_started:
+                    recheck_started.append(self.seconds)
+                elif self.seconds - recheck_started[0] >= .2:
+                    with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
+                        stream.write(RUN1_LAST_OPENING)
+                    self.sleep_hook = None
+
+        self.sleep_hook = deliver
+        title = self.invoke(port=6980)['title']
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assertEqual(title['skip']['sent_on']['frame'], 7849)
+        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 1, 'block_index': 1})
+
+    def test_bridge_on_stub_on_retries_confirmation_after_a_silent_recheck(self):
+        self.recorded_opening()
+        self.stub_samples, self.stub_default = [RUN1_OPENING, '', RUN1_OPENING, RUN1_LAST_OPENING], ''
+        title = self.invoke(port=6980)['title']
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assertEqual(title['skip']['sent_on']['frame'], 7849)
+        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 2, 'block_index': 2})
+        self.assertGreaterEqual(self.request_times[2] - self.request_times[1], 2)
+
+    def test_bridge_on_stub_on_fresh_indices_include_preexisting_blocks(self):
+        self.recorded_opening()
+        self.stub_preamble = RUN1_PREAMBLE + RUN1_OPENING
+        self.stub_samples, self.stub_default = [RUN1_OPENING, RUN1_LAST_OPENING], ''
+        title = self.invoke(port=6980)['title']
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 2, 'block_index': 2})
+
+    def test_bridge_on_stub_on_preexisting_prompt_still_qualifies(self):
+        self.recorded_opening(prompt_after_skip=False)
+        self.stub_preamble = RUN1_PREAMBLE + RUN1_PROMPT
+        self.stub_default = ''
+        title = self.invoke(port=6980)['title']
+        self.assertEqual((title['matched'], title['frame'], title['skip']), ('prompt', 7860, None))
+        self.assertEqual(self.macro_attempts(), [])
 
     def test_bridge_on_stub_on_does_not_press_on_other_screens(self):
         self.configure_stub()

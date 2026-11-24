@@ -4110,6 +4110,9 @@ def _bridge_on_ui_blocks_since_hello(text, hello, start):
                 segment = []
 
 
+OPENING_RECHECK_S = 2  # Maximum wait for one confirming bridge reply.
+
+
 def _bridge_on_skip_opening(ctx, block, state):
     if state['sent']:
         raise RuntimeError('bridge_on (stub on): the opening skip was already sent')
@@ -4139,8 +4142,19 @@ def _bridge_on_skip_opening(ctx, block, state):
             raise
 
     def send(macro):
+        nonlocal block, values
         try:
-            state['revalidate'](block)
+            confirmed = state['revalidate']()
+        except RuntimeError as error:
+            state['poll_error'] = error
+            raise
+        if confirmed is None:
+            state['not_dispatched'] = True
+            raise RuntimeError('opening skip was not confirmed')
+        block, state['fresh'] = confirmed
+        values = block['values']
+        try:
+            state['check_current'](block)
         except RuntimeError as error:
             state['poll_error'] = error
             raise
@@ -4164,6 +4178,9 @@ def _bridge_on_skip_opening(ctx, block, state):
     except closed_loop.RouteStopped as error:
         if state.get('poll_error') is not None:
             raise state['poll_error'] from error
+        if state.pop('not_dispatched', False):
+            io.finish()
+            return
         if state['sent'] and 'delivery unknown' not in error.reason:
             raise state['timeout']() from error
         raise RuntimeError(str(error)) from error
@@ -4182,7 +4199,8 @@ def _bridge_on_stub_title(ctx, hello, start):
     last = None
     not_yet = []
     identities = set()
-    state = {'boot': boot, 'sent': False, 'prompt': None}
+    state = {'boot': boot, 'sent': False, 'prompt': None, 'opening_seen': False}
+    asked = []
 
     def timeout():
         sent_on = state['sent_on']
@@ -4191,25 +4209,31 @@ def _bridge_on_stub_title(ctx, hello, start):
                             f"observed within 10 s; last Title state: "
                             f"{last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
 
-    def revalidate(block):
-        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello, start))
-        if not blocks or blocks[-1] != block:
-            raise RuntimeError('bridge_on (stub on): the opening observation changed before Plus; nothing was sent')
-
-    def poll():
-        nonlocal next_request, seen, last
-        if state['sent'] and time.monotonic() >= state['sent_at'] + 10:
-            raise timeout()
-        ctx.check_stop()
-        now = time.monotonic()
-        if now >= next_request:
-            bridge_v2(ctx, 'providers', 'state ssbu.ui')
-            next_request = now + .1
+    def read_blocks():
         blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello, start))
         if len(blocks) < seen:
             raise RuntimeError('bridge_on (stub on): bridge observation history changed')
+        return blocks
+
+    def check_current(block):
+        blocks = read_blocks()
+        if not blocks or blocks[-1] != block:
+            raise RuntimeError('bridge_on (stub on): the opening observation changed before Plus; nothing was sent')
+
+    def request():
+        nonlocal next_request
+        before = len(read_blocks())
+        asked.append(before)
+        now = time.monotonic()
+        bridge_v2(ctx, 'providers', 'state ssbu.ui')
+        next_request = now + .1
+        return before
+
+    def consume(blocks):
+        nonlocal seen, last
         observation = {'kind': 'waiting'}
         for block in blocks[seen:]:
+            index = seen
             seen += 1
             values = block['values']
             if block['boot'] != boot or values.get('observation.active') != 'yes':
@@ -4226,17 +4250,45 @@ def _bridge_on_stub_title(ctx, hello, start):
                 raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
                                    f"{values.get('screen')}/{values.get('focus')}, not the Title")
             native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+            if is_opening:
+                state['opening_seen'] = True
             last = {'rev': block['rev'], 'frame': block['frame'],
                     **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
             identity = (last['screen'], last['screen.context'], last['focus'])
             if identity not in identities:
                 identities.add(identity)
                 not_yet.append(last)
-            if is_opening and seen == len(blocks):
-                observation = {'kind': 'opening', 'block': block}
+            if is_opening and seen == len(blocks) and any(index >= mark for mark in asked):
+                observation = {'kind': 'opening', 'block': block, 'index': index}
         return observation
 
-    state.update(poll=poll, timeout=timeout, revalidate=revalidate)
+    def poll():
+        if state['sent'] and time.monotonic() >= state['sent_at'] + 10:
+            raise timeout()
+        ctx.check_stop()
+        if time.monotonic() >= next_request:
+            request()
+        return consume(read_blocks())
+
+    def revalidate():
+        if time.monotonic() >= until:
+            return None
+        before = request()
+        deadline = min(until, time.monotonic() + OPENING_RECHECK_S)
+        while time.monotonic() < deadline:
+            ctx.check_stop()
+            blocks = read_blocks()
+            observation = consume(blocks)
+            if state['prompt'] is not None:
+                return None
+            if len(blocks) > before:
+                if observation['kind'] == 'opening' and observation['index'] >= before:
+                    return observation['block'], {'request_blocks_before': before, 'block_index': observation['index']}
+                return None
+            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+        return None
+
+    state.update(poll=poll, timeout=timeout, revalidate=revalidate, check_current=check_current)
     while (remaining := until - time.monotonic()) > 0:
         observation = poll()
         if observation['kind'] == 'opening':
@@ -4247,12 +4299,16 @@ def _bridge_on_stub_title(ctx, hello, start):
             skip = None
             if state['sent']:
                 skip = {'button': 'plus', 'sent_on': state['sent_on'], 'send': state['send'],
-                        'prompt_after_s': round(time.monotonic() - state['sent_at'], 3)}
+                        'prompt_after_s': round(time.monotonic() - state['sent_at'], 3),
+                        'fresh': state['fresh']}
             return {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'], 'boot': block['boot'],
                     **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
                     'matched': 'prompt', 'not_yet': not_yet, 'waited_s': round(time.monotonic() - started, 3),
                     'skip': skip}
         time.sleep(min(.05, max(0, until - time.monotonic())))
+    if state['opening_seen']:
+        raise RuntimeError('bridge_on (stub on): the opening was seen but no fresh ssbu.ui reply confirmed it; '
+                           'nothing was sent')
     if last is not None:
         raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within 10 s of the greeting; "
                            f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
