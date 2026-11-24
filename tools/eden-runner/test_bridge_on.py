@@ -1,3 +1,4 @@
+import copy
 import fcntl
 import json
 import os
@@ -177,6 +178,13 @@ class BridgeOnTests(unittest.TestCase):
              patch.object(routes, 'bridge_v2', side_effect=self.spool):
             return routes.bridge_on(self.ctx, **kwargs)
 
+    def cold_stub_receipt(self):
+        self.configure_stub()
+        receipt = self.invoke(port=6980)
+        path = self.row / 'routes-bridge-on.json'
+        self.assertEqual(json.loads(path.read_text()), receipt)
+        return receipt, path
+
     def test_bridge_on_uses_real_witness_and_detached_capture(self):
         receipt = self.invoke(port=6979)
         self.assertEqual([call[0] for call in self.calls].count('trace.arm'), 1)
@@ -285,29 +293,36 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(len(self.bridge_requests), 3)
 
     def test_bridge_on_stub_on_already_on_checks_no_title_and_sends_no_chord(self):
+        self.stub = True
+        self.events.write_text('\n'.join(STUB_EVENTS[:2]) + '\n')
+        first = self.invoke(port=6980)
+        prior = self.row / 'routes-bridge-on.json'
+        self.assertEqual(json.loads(prior.read_text()), first)
+        self.assertEqual(first['witness'], 'trace')
         self.configure_stub()
         self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
         self.journal.unlink()
-        prior = self.row / 'routes-bridge-on-prior.json'
-        prior.write_text(json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]},
-                                     'capture': {'port': 6980}}))
         run = self.out / 'bridge-run'
-        run.mkdir()
-        (run / 'bridge.log').write_text(STUB_PREAMBLE)
-        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6980}))
+        buttons = [call for call in self.calls if call[0] == 'input.button']
         with (run / 'bridge.lock').open('w') as lock, \
              patch.object(routes, '_bridge_on_stub_title', return_value={'unexpected': True}) as title_read:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             receipt = self.invoke(port=6980)
+            with self.subTest(boot='foreign'):
+                other = copy.deepcopy(first)
+                other['hello'] = other['hello'].replace(STUB_BOOT, FOREIGN_BOOT)
+                prior.write_text(json.dumps(other))
+                with self.assertRaisesRegex(RuntimeError, f'from boot {FOREIGN_BOOT}.*greeting is boot {STUB_BOOT}'):
+                    self.invoke(port=6980)
         title_read.assert_not_called()
         self.assertEqual(receipt['title'], {
             'checked': False, 'reason': 'bridge already On before this call',
-            'qualified_by': {'receipt': str(prior), 'witness': 'trace', 'title': None}})
+            'qualified_by': {'receipt': str(prior), 'witness': 'trace', 'title': None, 'boot': STUB_BOOT}})
         self.assertEqual(receipt['chord']['chord'], 'already on')
         self.assertTrue(receipt['reused'])
-        self.assertEqual(self.popen, [])
+        self.assertEqual(len(self.popen), 1)
         self.assertEqual(self.bridge_requests, [])
-        self.assertFalse(any(method == 'input.button' for method, _ in self.calls))
+        self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
 
     def test_bridge_on_stub_on_title_record_has_the_checked_blocks_frame(self):
         self.configure_stub()
@@ -356,44 +371,57 @@ class BridgeOnTests(unittest.TestCase):
         self.assertLess(self.seconds, 30)
 
     def test_bridge_on_stub_on_already_on_without_a_qualified_receipt_refuses(self):
-        self.configure_stub()
-        self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
+        first, prior = self.cold_stub_receipt()
         self.journal.unlink()
-        prior = self.row / 'routes-bridge-on-invalid.json'
-        for contents in (None, '{not-json}', json.dumps({'witness': 'stub-on',
-                         'chord': {'chord': 'pad', 'event': STUB_EVENTS[3], 'pre_chord': {}}, 'title': {},
-                         'capture': {'port': 6980}}),
-                         json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': 'another event'},
-                                     'capture': {'port': 6980}}),
-                         json.dumps({'witness': 'trace',
-                                     'chord': {'chord': 'already on', 'event': STUB_EVENTS[3]},
-                                     'capture': {'port': 6980}}),
-                         json.dumps({'witness': 'trace',
-                                     'chord': {'chord': 'already on', 'stock': STOCK, 'event': STUB_EVENTS[3]},
-                                     'capture': {'port': 6980}}),
-                         json.dumps({'witness': 'trace', 'chord': {'event': STUB_EVENTS[3]},
-                                     'capture': {'port': 6980}}),
-                         json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]}}),
-                         json.dumps({'witness': 'stub-on',
-                                     'chord': {'chord': 'pad', 'event': STUB_EVENTS[3], 'pre_chord': {}},
-                                     'title': {'matched': 'prompt'}, 'capture': {'port': 6981}})):
-            with self.subTest(contents=contents):
-                if contents is None:
-                    prior.unlink(missing_ok=True)
-                else:
-                    prior.write_text(contents)
-                with self.assertRaisesRegex(RuntimeError, r'bridge is already On .*no qualified bridge_on receipt'):
-                    self.invoke(port=6980)
-                self.assertEqual(self.popen, [])
-                self.assertFalse(any(method == 'input.button' for method, _ in self.calls))
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        requests = list(self.bridge_requests)
+        run = self.out / 'bridge-run'
+        cases = ('missing', 'corrupt', 'missing title', 'wrong event', 'reused trace',
+                 'reused trace with stock', 'trace missing stock', 'trace empty stock',
+                 'trace missing capture', 'wrong port')
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for label in cases:
+                with self.subTest(case=label):
+                    other = copy.deepcopy(first)
+                    if label in ('wrong event', 'reused trace', 'reused trace with stock',
+                                 'trace missing stock', 'trace empty stock', 'trace missing capture'):
+                        other['witness'] = 'trace'
+                        other['chord'] = {'stock': STOCK, 'event': STUB_EVENTS[3]}
+                    if label == 'missing title':
+                        other['title'] = {}
+                    elif label == 'wrong event':
+                        other['chord']['event'] = 'another event'
+                    elif label in ('reused trace', 'reused trace with stock'):
+                        other['chord']['chord'] = 'already on'
+                        if label == 'reused trace':
+                            del other['chord']['stock']
+                    elif label == 'trace missing stock':
+                        del other['chord']['stock']
+                    elif label == 'trace empty stock':
+                        other['chord']['stock'] = {}
+                    elif label == 'trace missing capture':
+                        del other['capture']
+                    elif label == 'wrong port':
+                        other['capture']['port'] = 6981
+                    if label == 'missing':
+                        prior.unlink(missing_ok=True)
+                    elif label == 'corrupt':
+                        prior.write_text('{not-json}')
+                    else:
+                        prior.write_text(json.dumps(other))
+                    with self.assertRaisesRegex(RuntimeError, r'bridge is already On .*no qualified bridge_on receipt'):
+                        self.invoke(port=6980)
+                    self.assertEqual(len(self.popen), 1)
+                    self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+                    self.assertEqual(self.bridge_requests, requests)
 
     def test_bridge_on_stub_on_already_on_links_the_qualified_receipt(self):
-        self.configure_stub()
-        first = self.invoke(port=6980)
-        prior = self.row / 'routes-bridge-on.json'
+        first, prior = self.cold_stub_receipt()
         self.assertTrue(prior.is_file())
         self.assertEqual(first['capture']['port'], 6980)
         self.assertEqual(first['chord']['chord'], 'pad')
+        requests = list(self.bridge_requests)
         presses = len([1 for method, args in self.calls if method == 'input.button' and args['state'] == 'press'])
         run = self.out / 'bridge-run'
         with (run / 'bridge.lock').open('w') as lock:
@@ -402,31 +430,141 @@ class BridgeOnTests(unittest.TestCase):
         qualified = second['title'].get('qualified_by', {})
         self.assertEqual(qualified.get('receipt'), str(prior))
         self.assertEqual(qualified.get('title'), first['title'])
+        self.assertEqual(qualified.get('boot'), STUB_BOOT)
         self.assertFalse(second['title']['checked'])
+        self.assertEqual(self.bridge_requests, requests)
         self.assertEqual(json.loads(prior.read_text()), first)
         self.assertEqual(len([1 for method, args in self.calls
                               if method == 'input.button' and args['state'] == 'press']), presses)
 
+    def test_bridge_on_stub_on_already_on_refuses_a_receipt_from_another_boot(self):
+        first, prior = self.cold_stub_receipt()
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        requests = list(self.bridge_requests)
+        run = self.out / 'bridge-run'
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for change in ('hello', 'title', 'both'):
+                with self.subTest(change=change):
+                    other = copy.deepcopy(first)
+                    if change in ('hello', 'both'):
+                        other['hello'] = other['hello'].replace(STUB_BOOT, FOREIGN_BOOT)
+                    if change in ('title', 'both'):
+                        other['title']['boot'] = FOREIGN_BOOT
+                    prior.write_text(json.dumps(other))
+                    error = (f'from boot {FOREIGN_BOOT}.*greeting is boot {STUB_BOOT}' if change == 'both'
+                             else 'no qualified bridge_on receipt')
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        self.invoke(port=6980)
+                    self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+                    self.assertEqual(self.bridge_requests, requests)
+                    self.assertEqual(len(self.popen), 1)
+
+    def test_bridge_on_stub_on_already_on_refuses_a_receipt_without_its_observations(self):
+        first, prior = self.cold_stub_receipt()
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        requests = list(self.bridge_requests)
+        missing = object()
+        cases = (
+            ('frame missing', ('title', 'frame'), missing),
+            ('wall missing', ('title', 'wall'), missing),
+            ('frame string', ('title', 'frame'), '31'),
+            ('wall string', ('title', 'wall'), '474261702'),
+            ('rev string', ('title', 'rev'), '4'),
+            ('frame bool', ('title', 'frame'), True),
+            ('wall bool', ('title', 'wall'), False),
+            ('rev bool', ('title', 'rev'), True),
+            ('pre empty', ('chord', 'pre_chord'), {}),
+            ('input sent', ('chord', 'pre_chord', 'journal', 'inputs_after_load'), 1),
+            ('input bool', ('chord', 'pre_chord', 'journal', 'inputs_after_load'), False),
+            ('load time empty', ('chord', 'pre_chord', 'journal', 'game_load_time'), ''),
+            ('not running', ('chord', 'pre_chord', 'status', 'running'), False),
+            ('not loaded', ('chord', 'pre_chord', 'status', 'loading_complete'), False),
+            ('ready missing', ('chord', 'pre_chord', 'chord_ready'), missing),
+            ('ready malformed', ('chord', 'pre_chord', 'chord_ready'), '1 [Bridge] chord ready extra'),
+            ('install not boot default', ('chord', 'pre_chord', 'install'), 'not the install'),
+            ('screen not title', ('title', 'screen'), 'main'),
+            ('focus not prompt', ('title', 'focus'), 'title'),
+            ('matched not prompt', ('title', 'matched'), 'opening'),
+            ('inactive', ('title', 'observation.active'), 'no'),
+            ('title boot missing', ('title', 'boot'), missing),
+            ('hello missing', ('hello',), missing),
+        )
+        run = self.out / 'bridge-run'
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for label, path, value in cases:
+                with self.subTest(case=label):
+                    other = copy.deepcopy(first)
+                    parent = other
+                    for key in path[:-1]:
+                        parent = parent[key]
+                    if value is missing:
+                        del parent[path[-1]]
+                    else:
+                        parent[path[-1]] = value
+                    prior.write_text(json.dumps(other))
+                    with self.assertRaisesRegex(RuntimeError, 'no qualified bridge_on receipt'):
+                        self.invoke(port=6980)
+                    self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+                    self.assertEqual(self.bridge_requests, requests)
+                    self.assertEqual(len(self.popen), 1)
+
+    def test_bridge_on_stub_on_receipt_qualification_checks_observations(self):
+        first, _ = self.cold_stub_receipt()
+        qualify = getattr(routes, '_bridge_on_receipt_qualifies', lambda *_: 'missing helper')
+        for label in ('frame missing', 'input bool'):
+            with self.subTest(case=label):
+                other = copy.deepcopy(first)
+                if label == 'frame missing':
+                    del other['title']['frame']
+                else:
+                    other['chord']['pre_chord']['journal']['inputs_after_load'] = False
+                self.assertIsNone(qualify(other, STUB_EVENTS[3], 6980))
+        self.assertEqual(qualify(first, STUB_EVENTS[3], 6980), STUB_BOOT)
+        other = copy.deepcopy(first)
+        other['hello'] = other['hello'].replace(STUB_BOOT, FOREIGN_BOOT)
+        other['title']['boot'] = FOREIGN_BOOT
+        self.assertEqual(qualify(other, STUB_EVENTS[3], 6980), FOREIGN_BOOT)
+
+    def test_bridge_on_stub_on_already_on_refuses_a_greeting_without_boot(self):
+        first, _ = self.cold_stub_receipt()
+        run = self.out / 'bridge-run'
+        log = run / 'bridge.log'
+        no_boot = first['hello'].replace(f'boot={STUB_BOOT} ', '')
+        log.write_text(log.read_text().replace(first['hello'], no_boot, 1))
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        requests = list(self.bridge_requests)
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, 'bridge greeting has no boot id'):
+                self.invoke(port=6980)
+        self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+        self.assertEqual(self.bridge_requests, requests)
+
     def test_bridge_on_stub_on_already_on_chooses_newest_qualified_receipt(self):
-        self.configure_stub()
-        self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
-        older = self.row / 'routes-bridge-on.json'
+        first, older = self.cold_stub_receipt()
+        requests = list(self.bridge_requests)
         newer = self.row / 'routes-bridge-on-2.json'
         wrong_port = self.row / 'routes-bridge-on-3.json'
         corrupt = self.row / 'routes-bridge-on-4.json'
-        older.write_text(json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]},
-                                     'capture': {'port': 6980}}))
-        newer.write_text(json.dumps({'witness': 'stub-on',
-            'chord': {'event': STUB_EVENTS[3], 'chord': 'pad', 'pre_chord': {}},
-            'title': {'matched': 'prompt', 'frame': 31}, 'capture': {'port': 6980}}))
-        wrong_port.write_text(json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]},
-                                          'capture': {'port': 6981}}))
+        trace = copy.deepcopy(first)
+        trace['witness'] = 'trace'
+        trace['chord'] = {'stock': STOCK, 'event': STUB_EVENTS[3]}
+        older.write_text(json.dumps(trace))
+        newer.write_text(json.dumps(first))
+        trace['capture']['port'] = 6981
+        wrong_port.write_text(json.dumps(trace))
         corrupt.write_text('{bad')
         for index, path in enumerate((older, newer, wrong_port, corrupt), 1):
             os.utime(path, ns=(index * 1_000_000_000, index * 1_000_000_000))
-        receipt = self.invoke(port=6980)
+        run = self.out / 'bridge-run'
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            receipt = self.invoke(port=6980)
         self.assertEqual(receipt['chord'].get('qualified_by', {}).get('receipt'), str(newer))
         self.assertEqual(receipt['title'].get('qualified_by', {}).get('title', {}).get('frame'), 31)
+        self.assertEqual(self.bridge_requests, requests)
 
     def test_bridge_on_stub_on_no_toggle_stops_without_a_retry(self):
         self.configure_stub()
