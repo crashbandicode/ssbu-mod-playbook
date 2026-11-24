@@ -1,0 +1,1 @@
+{"args":{"p1":"Mario","cpu":"Fox","stage":"Final Destination","form":"normal","boot":"0xa1e80deccd2a9a15","stage_id":3},"files":{"lines":"other-run-tk06.lines"},"expect":"reject","contains":"is from boot 0x3dec61593ef80877, not this boot 0xa1e80deccd2a9a15"}

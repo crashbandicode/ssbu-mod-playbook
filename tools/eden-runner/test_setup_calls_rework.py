@@ -40,6 +40,32 @@ REAL_SET = '[Bridge] req set result=ok frame=2899 wall=383391489'
 REAL_RELOAD = '[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0 ev=110 frame=2899 wall=383391484'
 
 
+def logged_native(log, values):
+    hello = (Path(__file__).parent / 'library' / 'cases' / 'expect_fighters' / 'accept-tk06.lines').read_text().splitlines()[0]
+    log.write_text(hello + '\n')
+    if callable(values):
+        get = values
+    elif isinstance(values, list):
+        items = iter(values)
+        get = lambda *args, **kwargs: next(items)
+    else:
+        get = lambda *args, **kwargs: values
+
+    def read(*args, **kwargs):
+        state = get(*args, **kwargs)
+        roster = state.get('roster', {})
+        mask = sum(1 << int(seat) for seat in roster)
+        with log.open('a') as stream:
+            stream.write(f'[Bridge] req roster result=ok entries=0x{mask:x} frame=1 wall=1\n')
+            for seat, fighter in sorted(roster.items()):
+                fighter.setdefault('nana', False)
+                nana = str(fighter['nana']).lower()
+                stream.write(f"[Bridge] roster entry={seat} kind={fighter['kind']} nana={nana} frame=2 wall=2\n")
+        return state
+
+    return read
+
+
 def delayed_coin(*, action='a', pending='once'):
     from test_setup_calls import CoinReplay
 
@@ -460,7 +486,7 @@ class SetupReworkTests(unittest.TestCase):
         initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: io.set_screen('css.training')), \
              patch.object(routes, 'enter_training', side_effect=lambda *a, **k: io.set_screen('training')), \
              patch.object(routes, 'pick_fighters', return_value={}) as fighters, \

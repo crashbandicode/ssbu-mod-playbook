@@ -59,6 +59,11 @@ HERE = Path(__file__).resolve().parent
 ROUTES = HERE / 'library' / 'routes'
 LIBRARY = HERE / 'library'
 
+EFFECT_JUDGES = {
+    'reach_training': {'judge': 'judge_reach_training', 'cases': 'reach_training'},
+    'expect_fighters': {'judge': 'judge_expect_fighters', 'cases': 'expect_fighters'},
+}
+
 
 # --- small utilities ------------------------------------------------------------------------------------------------
 
@@ -2992,6 +2997,14 @@ def place_cpu(ctx, fighter, must_move=False):
         'ms': {'total': round((time.monotonic() - started) * 1000)},
         'skipped': skipped, 'already': already, 'taken_here': taken_here,
     })
+
+
+def judge_expect_fighters(lines, p1=None, cpu=None, boot=None):
+    raise NotImplementedError
+
+
+def judge_reach_training(lines, p1, cpu=None, stage='Final Destination', form='normal', boot=None, stage_id=None):
+    raise NotImplementedError
 
 
 def expect_fighters(ctx, p1=None, cpu=None):

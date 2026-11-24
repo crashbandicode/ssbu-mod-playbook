@@ -1,0 +1,3 @@
+[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0-rc.15 port=6980 guards=0x7ffffff boot=0xa1e80deccd2a9a15 uptime_ms=474261363 reconnects=0 event_latest=2 state_api=1 toggle_gen=1 toggle_reason=pad_chord refusals=0 last_refusal=none frame=10 wall=474261363
+[Bridge] req roster result=ok entries=0x3 frame=2753 wall=474309017
+[Bridge] roster entry=0 kind=28 nana=false ev=125 frame=2754 wall=474309018
