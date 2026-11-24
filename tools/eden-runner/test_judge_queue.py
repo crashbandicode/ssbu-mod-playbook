@@ -1587,6 +1587,172 @@ class RunnerEffects(unittest.TestCase):
         capture = receipt(folder, 'a')['captures'][-1]
         return folder, engine.out / 'a' / capture['file']
 
+    def visual_payloads(self):
+        image = Image.new('RGB', (4, 4), (20, 30, 40))
+        output = io.BytesIO()
+        image.save(output, format='PNG')
+        png = output.getvalue()
+        self.assertEqual(len(png), 77)
+        offset = 8
+        idat = iend = None
+        while offset < len(png):
+            length, kind = struct.unpack('>I4s', png[offset:offset + 8])
+            if kind == b'IDAT':
+                idat = (offset + 8, length)
+            if kind == b'IEND':
+                iend = offset
+            offset += length + 12
+        self.assertIsNotNone(idat)
+        self.assertIsNotNone(iend)
+        self.assertEqual(iend + 12, len(png))
+        start, length = idat
+        self.assertGreater(length, 2)
+        bad_crc = bytearray(png)
+        bad_crc[start + length] ^= 1
+        output = io.BytesIO()
+        image.save(output, format='JPEG')
+        return {'empty': b'', 'short-header': png[:20], 'cut-idat': png[:start + length - 2],
+                'no-iend': png[:iend], 'bad-crc': bytes(bad_crc), 'png': png, 'jpeg': output.getvalue()}
+
+    def visual_payload_run(self, data, copied=False):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        rows = ([{'id': 'a', 'role': 'setup', 'steps': [{'shot': 'visual'}]},
+                 {'id': 'b', 'outcome': 'visual', 'steps': []}] if copied else
+                [{'id': 'a', 'outcome': 'visual', 'steps': [{'shot': 'visual'}]}])
+        engine = make_plan(folder, rows)
+        bridge = engine.out / 'bridge.log'
+        engine.instances['sw']['bridge_log'] = str(bridge)
+        client = engine.clients['sw']
+        request = client.request
+
+        def call(method, params=None):
+            if method == 'ui.screenshot':
+                Path(params['path']).write_bytes(data)
+                bridge.write_text('[Bridge] boot=0xabc frame=1000 wall=17000\n')
+                return {'ok': True, 'result': {}}
+            return request(method, params)
+
+        client.request = call
+        self.assertEqual(engine.run(), 'DONE')
+        original = self.captured(folder)
+        self.assertEqual(original.read_bytes(), data)
+        source = receipt(folder, 'a')
+        self.assertEqual(len(source['captures']), 1)
+        capture = source['captures'][0]
+        self.assertEqual(capture['fresh']['status'], 'fresh')
+        self.assertEqual(capture['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(capture['fresh']['sha256'], capture['sha256'])
+        row = 'b' if copied else 'a'
+        if copied:
+            self.assertEqual(source['inputs_identity'], receipt(folder, 'b')['inputs_identity'])
+            still = folder / 'out/b/copied.png'
+            still.write_bytes(data)
+        else:
+            still = original
+        current = receipt(folder, row)
+        self.assertEqual((current['status'], current['gates_status']), ('RAN-UNVERIFIED', 'PASS'))
+        self.assertTrue(any(item['kind'] == 'visual' for item in current['blockers']))
+        return folder, original, still, row
+
+    def test_record_read_refuses_undecodable_fresh_captures_for_both_verdicts(self):
+        payloads = self.visual_payloads()
+        for name in ('empty', 'short-header', 'cut-idat', 'no-iend', 'bad-crc'):
+            with self.subTest(name=name):
+                folder, original, still, row = self.visual_payload_run(payloads[name])
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', False):
+                    with self.assertRaises(Exception):
+                        with Image.open(still) as reference:
+                            reference.verify()
+                before = (folder / 'out' / f'{row}.json').read_bytes()
+                for verdict in ('PASS', 'FAIL'):
+                    with self.subTest(verdict=verdict):
+                        result = self.record_read(folder, still, verdict=verdict, row=row)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f'the capture {row}/{original.name} is not usable evidence: '
+                                      'still file is not a decodable image', result.stderr)
+                        self.assertEqual((folder / 'out' / f'{row}.json').read_bytes(), before)
+                        self.assertTrue(any(item['kind'] == 'visual' for item in receipt(folder, row)['blockers']))
+
+    def test_record_read_accepts_fresh_png_and_jpeg_captures(self):
+        payloads = self.visual_payloads()
+        for name in ('png', 'jpeg'):
+            with self.subTest(name=name):
+                folder, original, still, row = self.visual_payload_run(payloads[name])
+                with Image.open(still) as reference:
+                    self.assertEqual(reference.format, 'PNG' if name == 'png' else 'JPEG')
+                    reference.verify()
+                with Image.open(still) as reference:
+                    reference.load()
+                if name == 'jpeg':
+                    still = original.parent / 'copy.jpg'
+                    still.write_bytes(original.read_bytes())
+                    capture = f'{row}:{original.name}'
+                else:
+                    capture = None
+                result = self.record_read(folder, still, row=row, capture=capture)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                current = receipt(folder, row)
+                self.assertEqual(current['status'], 'PASS')
+                self.assertEqual(current['visual_read']['capture']['fresh']['status'], 'fresh')
+                self.assertEqual(current['visual_read']['capture']['sha256'],
+                                 hashlib.sha256(payloads[name]).hexdigest())
+
+    def test_record_read_checks_identity_before_declared_non_image_copy(self):
+        data = self.visual_payloads()['short-header']
+        folder, original, still, row = self.visual_payload_run(data, copied=True)
+        source_path = folder / 'out/a.json'
+        source_bytes = source_path.read_bytes()
+        selected = f'a:{original.name}'
+        target_path = folder / 'out' / f'{row}.json'
+        before = target_path.read_bytes()
+        for field in ('plan_identity', 'instances_sha256', 'inputs_identity'):
+            with self.subTest(field=field):
+                source = json.loads(source_bytes)
+                source[field] = 'another'
+                source_path.write_text(json.dumps(source))
+                result = self.record_read(folder, still, row=row, capture=selected)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'--capture {selected} is not a capture of this run with these bytes', result.stderr)
+                self.assertNotIn('still file is not a decodable image', result.stderr)
+                self.assertEqual(target_path.read_bytes(), before)
+        source_path.write_bytes(source_bytes)
+        for capture in (selected, None):
+            for verdict in ('PASS', 'FAIL'):
+                with self.subTest(capture=capture, verdict=verdict):
+                    result = self.record_read(folder, still, verdict=verdict, row=row, capture=capture)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f'the capture a/{original.name} is not usable evidence: '
+                                  'still file is not a decodable image', result.stderr)
+                    self.assertEqual(target_path.read_bytes(), before)
+                    self.assertTrue(any(item['kind'] == 'visual' for item in receipt(folder, row)['blockers']))
+
+    def test_record_read_checks_hash_and_freshness_before_image(self):
+        data = self.visual_payloads()['short-header']
+        folder, original, still, row = self.visual_payload_run(data)
+        target_path = folder / 'out' / f'{row}.json'
+        before = target_path.read_bytes()
+        still.write_bytes(b'other non-image bytes')
+        result = self.record_read(folder, still, row=row)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"the still's bytes differ from the capture recorded for {row}/{original.name}", result.stderr)
+        self.assertNotIn('still file is not a decodable image', result.stderr)
+        self.assertEqual(target_path.read_bytes(), before)
+        still.write_bytes(data)
+        current = json.loads(before)
+        current['captures'][0]['fresh'].update(status='refused', reason='frozen frame')
+        target_path.write_text(json.dumps(current))
+        before = target_path.read_bytes()
+        for verdict in ('PASS', 'FAIL'):
+            with self.subTest(verdict=verdict):
+                result = self.record_read(folder, still, verdict=verdict, row=row)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('still refused as evidence: frozen frame', result.stderr)
+                self.assertNotIn('still file is not a decodable image', result.stderr)
+                self.assertEqual(target_path.read_bytes(), before)
+                self.assertTrue(any(item['kind'] == 'visual' for item in receipt(folder, row)['blockers']))
+
     def test_record_read_requires_usable_freshness_for_pass_and_fail(self):
         for state in ('fresh', 'same', 'unverified', 'refused', 'error', 'missing'):
             with self.subTest(state=state):
@@ -1846,7 +2012,7 @@ class RunnerEffects(unittest.TestCase):
     def test_failed_verdict_receipt_cannot_be_promoted_by_record_read(self):
         folder, _ = self.hook_run({'verdict': 'FAIL', 'reason': 'x'}, target=True, effect=True)
         still = folder / 'out/a/still.png'
-        still.write_bytes(b'fixture image')
+        Image.new('RGB', (4, 4), (10, 20, 30)).save(still)
         before = receipt(folder, 'a')
         self.assertEqual(before['status'], 'RAN-UNVERIFIED')
         self.assertNotEqual(self.record_read(folder, still).returncode, 0)
@@ -1970,7 +2136,7 @@ class RunnerEffects(unittest.TestCase):
         before = receipt(folder, 'a')
         self.assertEqual(before['status'], 'RAN-UNVERIFIED')
         outside = folder / 'outside.png'
-        outside.write_bytes(b'outside')
+        Image.new('RGB', (4, 4), (10, 20, 30)).save(outside)
         self.assertNotEqual(self.record_read(folder, outside).returncode, 0)
         self.assertNotEqual(self.record_read(folder, still, text='   ').returncode, 0)
         self.assertEqual(receipt(folder, 'a'), before)
