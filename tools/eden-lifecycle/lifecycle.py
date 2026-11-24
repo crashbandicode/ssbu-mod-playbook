@@ -1594,7 +1594,9 @@ class Lifecycle:
                                           input=line, capture_output=True, text=True, timeout=10)
                 require(done.returncode == 0, 'notify SSH failed: ' + (done.stderr or '')[-500:])
             else:
-                with safe_absolute(spec['file']).open('a', encoding='utf-8') as stream:
+                path = safe_absolute(spec['file'])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open('a', encoding='utf-8') as stream:
                     stream.write(line)
         except Exception as error:
             try:

@@ -1608,6 +1608,8 @@ class EdenTestTests(unittest.TestCase):
 
     def test_go_default_base_updates_every_instances_plugin_and_port(self):
         base = json.loads(self.previous.read_text())
+        notify = {'file': '/home/intpa/eden-run-notify/NOTIFY.md', 'to': 'tr-primary-2'}
+        base['notify'] = notify
         port = self.dir / 'base-port.txt'
         port.write_text('6979\n')
         base['instances'][0]['files'] = [{'path': str(port), 'sha256': sha(port),
@@ -1628,6 +1630,7 @@ class EdenTestTests(unittest.TestCase):
         up.assert_called_once_with(self.dir / 'runs/go-1', skip_setup_plan=True, allow_volatile_pins=True)
         free.assert_called_once_with()
         config = json.loads((self.dir / 'runs/go-1/config.json').read_text())
+        self.assertEqual(config['notify'], notify)
         self.assertEqual(len(config['plugin_swaps']), 2)
         for item in config['instances']:
             self.assertEqual(item['plugins'][0]['path'], str(self.dir / 'runs/go-1/inputs/plugin.nro'))
