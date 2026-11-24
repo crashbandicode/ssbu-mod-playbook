@@ -1137,6 +1137,19 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(record['status'], 'fresh')
         self.assertEqual(json.loads((run.out / 'stills.jsonl').read_text().splitlines()[0]), record)
 
+    def test_shot_keeps_the_boot_across_a_long_log(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        bridge.write_bytes(b'[Bridge] boot=0xabc frame=1000 wall=17000\n')
+        run = self.make(FakeEden({}))
+        first = run.still_records[str(run.shot('a', 'first'))]
+        with bridge.open('ab') as stream:
+            stream.write(b'[Bridge] state long-padding=xxxxxxxxxxxxxxxxxxxxxxxx frame=1200 wall=20400\n' * 2000)
+        self.assertGreater(bridge.stat().st_size, 65536)
+        second = run.still_records[str(run.shot('a', 'second'))]
+        self.assertEqual((first['status'], second['status']), ('fresh', 'refused'))
+        self.assertEqual((second['boot'], second['frame'], second['unchanged_frames']), ('0xabc', 1200, 200))
+
     def test_a_frozen_still_is_listed_in_the_row_receipt(self):
         bridge = self.dir / 'bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)

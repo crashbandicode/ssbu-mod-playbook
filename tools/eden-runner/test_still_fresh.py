@@ -1,7 +1,9 @@
 """Offline checks for screenshot freshness and bridge frame provenance."""
 import hashlib
+import gzip
 import importlib
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,24 +27,125 @@ class StillFreshTests(unittest.TestCase):
         path.write_bytes(data)
         return self.ledger.record(on, path, reply, frame)
 
-    def test_game_frame_reads_the_last_frame_line_and_boot(self):
+    def test_frame_source_reads_the_last_frame_line_and_boot(self):
         path = self.root / 'bridge.log'
         path.write_text('[Bridge] boot=0xabc\n[Bridge] state.8 screen=one frame=618 wall=1513497634\n'
                         '[Bridge] state.8 screen=two frame=625 wall=1513497790\n')
-        self.assertEqual(self.fresh.game_frame(path), {'boot': '0xabc', 'frame': 625, 'wall': 1513497790})
+        self.assertEqual(self.fresh.FrameSource(path).read(), {'boot': '0xabc', 'frame': 625, 'wall': 1513497790})
 
-    def test_game_frame_is_none_without_a_log_or_a_frame_line(self):
+    def test_frame_source_is_none_without_a_log_or_a_frame_line(self):
         path = self.root / 'bridge.log'
-        self.assertIsNone(self.fresh.game_frame(None))
-        self.assertIsNone(self.fresh.game_frame(path))
+        self.assertIsNone(self.fresh.FrameSource(None).read())
+        self.assertIsNone(self.fresh.FrameSource(path).read())
         path.write_text('[Bridge] boot=0xabc\n[Bridge] no frame here\n')
-        self.assertIsNone(self.fresh.game_frame(path))
+        self.assertIsNone(self.fresh.FrameSource(path).read())
 
-    def test_game_frame_boot_is_limited_to_the_tail(self):
+    def test_initial_read_finds_a_boot_before_the_last_64k(self):
         path = self.root / 'bridge.log'
         path.write_bytes(b'[Bridge] boot=0xabc\n' + b'x' * (65 * 1024) +
                          b'\n[Bridge] state screen=sss frame=42 wall=99\n')
-        self.assertEqual(self.fresh.game_frame(path), {'boot': None, 'frame': 42, 'wall': 99})
+        self.assertEqual(self.fresh.FrameSource(path).read(), {'boot': '0xabc', 'frame': 42, 'wall': 99})
+
+    def growing_trace(self):
+        fixture = Path(__file__).parent / 'fixtures' / 'still-fresh' / 'a1-boot2-bridge.log.gz'
+        lines = gzip.decompress(fixture.read_bytes()).splitlines(keepends=True)
+        path = self.root / 'growing-bridge.log'
+        path.write_bytes(b'')
+        return lines, path, self.fresh.FrameSource(path)
+
+    def append_until_frame(self, lines, path, offset, target):
+        for index in range(offset, len(lines)):
+            match = re.search(rb' frame=(\d+) wall=(\d+)\r?\n$', lines[index])
+            if match and int(match[1]) >= target:
+                with path.open('ab') as stream:
+                    stream.writelines(lines[offset:index + 1])
+                return index + 1, int(match[1]), int(match[2])
+        self.fail(f'no retained frame at or after {target}')
+
+    def test_the_retained_trace_gives_the_boot_at_every_frozen_frame(self):
+        lines, path, source = self.growing_trace()
+        offset = 0
+        for expected in (1751, 1967, 2807, 4603):
+            offset, frame, wall = self.append_until_frame(lines, path, offset, expected)
+            self.assertEqual(frame, expected)
+            self.assertEqual(source.read(), {'boot': '0x0d10511fffc85e43', 'frame': frame, 'wall': wall})
+
+    def test_the_flown_freeze_is_refused_from_the_retained_trace(self):
+        lines, path, source = self.growing_trace()
+        offset, frames, records = 0, [], []
+        for target in (1751, 1967, 2750, 2800, 2810, 3350, 3400, 3440):
+            offset, frame, wall = self.append_until_frame(lines, path, offset, target)
+            observed = source.read()
+            self.assertEqual((observed['frame'], observed['wall']), (frame, wall))
+            frames.append(frame)
+            records.append(self.record(observed, data=b'prior image' if target == 1751 else b'frozen image'))
+        self.assertEqual(frames, [1751, 1967, 2750, 2800, 2811, 3350, 3400, 3440])
+        self.assertEqual([record['status'] for record in records], ['fresh', 'fresh'] + ['refused'] * 6)
+        self.assertTrue(all(record['first_identical'] == records[1]['file'] for record in records[1:]))
+
+    def test_a_replaced_log_does_not_inherit_the_old_boot(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=100 wall=1000\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read()['boot'], '0xabc')
+        replacement = self.root / 'new.log'
+        replacement.write_bytes(b'[Bridge] state frame=300 wall=3000\n')
+        replacement.replace(path)
+        frame = source.read()
+        self.assertEqual(frame, {'boot': None, 'frame': 300, 'wall': 3000})
+        self.assertEqual(self.record(frame)['status'], 'unverified')
+
+    def test_a_truncated_log_restarts_from_its_start(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=100 wall=1000\n' + b'x' * 200 + b'\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read()['boot'], '0xabc')
+        path.write_bytes(b'[Bridge] frame=2 wall=20\n')
+        self.assertEqual(source.read(), {'boot': None, 'frame': 2, 'wall': 20})
+
+    def test_a_new_boot_token_switches_the_boot(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=100 wall=1000\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read()['boot'], '0xabc')
+        with path.open('ab') as stream:
+            stream.write(b'[Bridge] boot=0xdef\n')
+        self.assertIsNone(source.read())
+        with path.open('ab') as stream:
+            stream.write(b'[Bridge] frame=2 wall=20\n')
+        self.assertEqual(source.read(), {'boot': '0xdef', 'frame': 2, 'wall': 20})
+
+    def test_an_incomplete_last_line_is_completed_by_the_next_read(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=12 wall=')
+        source = self.fresh.FrameSource(path)
+        self.assertIsNone(source.read())
+        with path.open('ab') as stream:
+            stream.write(b'345\n')
+        self.assertEqual(source.read(), {'boot': '0xabc', 'frame': 12, 'wall': 345})
+
+    def test_reads_are_incremental(self):
+        path = self.root / 'bridge.log'
+        initial = b'[Bridge] boot=0xabc frame=1 wall=10\n'
+        appended = b'[Bridge] frame=2 wall=20\n'
+        path.write_bytes(initial)
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read()['frame'], 1)
+        self.assertEqual(source.offset, len(initial))
+        with path.open('ab') as stream:
+            stream.write(appended)
+        self.assertEqual(source.read()['frame'], 2)
+        self.assertEqual(source.offset, len(initial) + len(appended))
+
+    def test_missing_log_clears_a_previously_observed_boot(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=1 wall=10\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read()['boot'], '0xabc')
+        path.unlink()
+        self.assertIsNone(source.read())
+        path.write_bytes(b'[Bridge] frame=200 wall=2000\n')
+        self.assertEqual(source.read(), {'boot': None, 'frame': 200, 'wall': 2000})
 
     def test_a_changed_picture_is_fresh(self):
         first = self.record(self.frame(1000))
