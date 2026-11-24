@@ -9,10 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fake_clock
 import native_picker_io
 import routes
 import test_native_picker as state_fixtures
 from test_routes import FakeCtx, FakeRunner
+
+READ_COST = .001  # One bridge read, as the fake models it.
 
 
 def ui(screen, focus=None, *, context='unknown', source='unknown', tab='unknown', layer='unknown',
@@ -47,6 +50,7 @@ TR_OVERLAY = ui('training', context='training', owner='tr.menu')
 
 class BridgeNavigationTests(unittest.TestCase):
     def setUp(self):
+        self.clock = fake_clock.install(self, routes, routes.native_picker, native_picker_io)
         directory = Path(self.enterContext(TemporaryDirectory()))
         self.log = directory / 'bridge.log'
         self.log.touch()
@@ -106,7 +110,10 @@ class BridgeNavigationTests(unittest.TestCase):
         else:
             self.revision += 1
             if request == 'state ssbu.ui':
+                previous = self.last_ui
                 self.last_ui = UNKNOWN if self.initial_empty else (self.loading_next or self.scene)
+                if previous == self.last_ui and routes.time is self.clock:
+                    self.clock.spend(READ_COST)
                 self.loading_next = None
                 if self.watch_armed:
                     self.checked_source = True

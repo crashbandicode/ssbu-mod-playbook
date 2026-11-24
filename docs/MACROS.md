@@ -425,7 +425,9 @@ the exact `path` and a `reason`. Packet-gate errors name their check:
 - **G4:** a path points into another run, or a local file is missing.
 - **G5:** a test row has no checked effect, judged expectation, or visual outcome.
 - **G6:** a need has no matching earlier giver.
-- **G8:** `ctx.play` names no plan segment, or `routes.play` names no library macro.
+- **G8:** a hook the plan reaches plays a name that is no plan segment
+  (`ctx.play`) or no library macro (`routes.play`); a name declared with
+  `among=` is neither; or a written name is outside its own declared set.
 - **G9:** an effect hook's judge cases are malformed, disagree, or are not
   connected to that hook.
 
@@ -465,8 +467,60 @@ segment files, acquired or acquirable gate references, and a GIF step's named
 a packet input (including any `.py` or `.json`), and it is not excluded as a GIF.
 The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
-an exact `key` with a `reason`. Play calls with computed names or unknown
-callees are warned about, not checked. The built-in providers are `tr.menu`,
+an exact `key` with a `reason`.
+
+G8 follows the plan into its hooks. It starts at the functions the manifest
+names (steps, recovery, failure hooks, hook gates) and follows calls and
+references into the same module and into other modules of the rows folder. A
+module a step names is read as a whole; a module that is only imported is read
+in the functions the plan reaches. The gate resolves a play name when it is:
+
+- written at the call, or a choice between such names (`"a" if fast else "b"`);
+- a module constant, or an entry of a module table written out with constant
+  keys (`TAP["A"]`; `TAP[button]` stands for every entry);
+- a local set once to one of these;
+- a parameter of a function, when every argument resolves: at each call the
+  plan reaches, and in the step's `args` or the default where the manifest
+  names the function;
+- declared at the call: `ctx.play(name, among=("a", "b"))` or
+  `routes.play(ctx, name, among=NAMES)` with `NAMES` a module constant. Every
+  declared name is checked like a written one.
+
+A name written at the play, a choice, a constant or a table entry with a written
+key is what the play takes: it is refused when it is no segment (or no library
+macro), and when it is outside the set the play declares. Names that reach a
+play through a parameter, or through a table read with a computed key, are
+names it may take. They refuse nothing, because a helper can send some of them
+elsewhere: one that plays a plan segment with `ctx.play` and anything else
+with `routes.play` is valid for a name of either kind. Such a play is checked
+when every name fits; otherwise it warns until it declares its own set, and
+then only the declared names are checked.
+
+The gate knows the step context as the first parameter of every function the
+manifest names, as any parameter that is given the context at a call the plan
+reaches (by place or by keyword), as a local set once to it, and by the name
+`ctx` or an attribute `.ctx`. Imports are followed where they stand, at module
+level or inside a function, also `from helper import *`.
+
+Any other play warns: a name built at run time, a parameter of a method, of a
+nested function or of a function handed on as a value, and arguments passed
+with `*`. In code the plan reaches, a `.play(` on anything the gate cannot
+place warns too: a context kept under another attribute, passed with `*` or
+handed on through a callback, and a play on `ctx.runner` directly. A packet
+does not fly with a warning; declare the set, or call `ctx.play` on a context
+the gate can follow. Code reached only through a dynamic import or `getattr`
+is not read; a `ctx.play` in it stops at run time.
+
+At run time `ctx.play` refuses a name the gate did not check for this plan,
+before anything is sent, and a name outside its `among=` set. So a call the
+gate could not follow stops the row; it does not play an unchecked name. A
+manifest `{"play": ...}` step and `routes.play` are not restricted this way;
+library macros are hash-checked by the library index. This is not a check of
+every input a hook can send: a hook that calls `ctx.call("macro.play", ...)`
+or `ctx.press` sends input G8 does not see. The report lists the checked names
+as `plays`.
+
+The built-in providers are `tr.menu`,
 `tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need
 `target.bridge`. Example reads include `tr.event:fed run.p1`,
 `ssbu.ui:input.ready`, `bridge:fighter status`, `bridge:input lx` and `bridge:ev`.

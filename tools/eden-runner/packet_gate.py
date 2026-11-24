@@ -1301,12 +1301,649 @@ def _paths(plan, base, raw, modules, repos, errors):
                 check_path(node.value, module, False)
 
 
-def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
+def _play_set(value):
+    """The names of a tuple, list or set of strings written out; None for anything else, and for an empty one."""
+    if not isinstance(value, (ast.Tuple, ast.List, ast.Set)) or not value.elts:
+        return None
+    if not all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts):
+        return None
+    return {item.value for item in value.elts}
+
+
+_PLAY_DEPTH = 6
+_PLAY_MUTATORS = {'update', 'pop', 'popitem', 'setdefault', 'clear', 'append', 'extend', 'insert', 'remove', 'add',
+                  'discard', 'sort', 'reverse'}
+_PLAY_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _bound_names(tree):
+    """How often each name is bound anywhere in a module: an assignment, a parameter, a loop target, an import or a
+    definition."""
+    bound = {}
+
+    def count(name):
+        if isinstance(name, str):
+            bound[name] = bound.get(name, 0) + 1
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            count(node.id)
+        elif isinstance(node, ast.arg):
+            count(node.arg)
+        elif isinstance(node, ast.alias):
+            count((node.asname or node.name).split('.')[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                count(name)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            count(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            count(node.rest)
+    return bound
+
+
+def _inside(node, chain=()):
+    """(the functions around it, innermost first; the node) for every node inside `node`."""
+    stack = [(chain, child) for child in ast.iter_child_nodes(node)]
+    while stack:
+        chain, child = stack.pop()
+        yield chain, child
+        inner = (child,) + chain if isinstance(child, _PLAY_FUNCTIONS) else chain
+        stack.extend((inner, below) for below in ast.iter_child_nodes(child))
+
+
+def _parameters(function):
+    """The names a function takes by position, and every name it takes."""
+    args = function.args
+    positional = [arg.arg for arg in args.posonlyargs + args.args]
+    every = set(positional) | {arg.arg for arg in args.kwonlyargs}
+    every.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
+    return positional, every
+
+
+def _stores(function, name):
+    """The nodes with which a function binds `name` itself, nested functions aside; None when it declares the
+    name global or nonlocal. The function's bindings are read once and kept on its node."""
+    bindings = getattr(function, '_play_bindings', None)
+    if bindings is None:
+        bindings, outer = {}, set()
+        stack = list(ast.iter_child_nodes(function))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bindings.setdefault(node.name, []).append(node)
+                continue
+            if isinstance(node, ast.Lambda):
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    alias._play_import = node
+            bound = None
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                outer.update(node.names)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound = node.id
+            elif isinstance(node, ast.alias):
+                bound = (node.asname or node.name).split('.')[0]
+            elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                bound = node.name
+            elif isinstance(node, ast.MatchMapping):
+                bound = node.rest
+            if isinstance(bound, str):
+                bindings.setdefault(bound, []).append(node)
+            stack.extend(ast.iter_child_nodes(node))
+        bindings.update(dict.fromkeys(outer))
+        function._play_bindings = bindings
+    return bindings.get(name, [])
+
+
+def _module_level(node):
+    """Every node of a module that is not inside a function or a class."""
+    for child in ast.iter_child_nodes(node):
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            yield child
+            yield from _module_level(child)
+
+
+class _PlayModule:
+    """One hook module, read with ast only: its functions, classes, the names it binds once to a value, and what
+    it imports from the rows folder."""
+
+    def __init__(self, path, label, find):
+        self.path, self.label = path, label
+        self.tree = ast.parse(path.read_text())
+        self.bound = _bound_names(self.tree)
+        self.functions, self.classes, self.constants = {}, {}, {}
+        self.local, self.imported, self.stars = {}, {}, []
+        self.routes, self.route_play, self.mutated = {'routes'}, set(), set()
+        # The module's own imports. An import inside a function belongs to that function (`_PlayReader.binding`).
+        for node in _module_level(self.tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if '.' in alias.name:
+                        continue
+                    if alias.name == 'routes':
+                        self.routes.add(alias.asname or alias.name)
+                    found = find(path, alias.name)
+                    if found is not None:
+                        self.local[alias.asname or alias.name] = found
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                found = find(path, node.module)
+                for alias in node.names:
+                    if node.module == 'routes' and alias.name == 'play':
+                        self.route_play.add(alias.asname or alias.name)
+                    elif found is not None and alias.name == '*':
+                        self.stars.append(found)
+                    elif found is not None:
+                        self.imported[alias.asname or alias.name] = (found, alias.name)
+        for node in ast.walk(self.tree):
+            if (isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del))
+                    and isinstance(node.value, ast.Name)):
+                self.mutated.add(node.value.id)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr in _PLAY_MUTATORS and isinstance(node.func.value, ast.Name)):
+                self.mutated.add(node.func.value.id)
+        for node in self.tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions[node.name] = node
+            elif isinstance(node, ast.ClassDef):
+                self.classes[node.name] = [item for item in node.body
+                                           if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                  and self.bound.get(node.targets[0].id) == 1):
+                self.constants[node.targets[0].id] = node.value
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                  and isinstance(node.value, (ast.Tuple, ast.List))
+                  and len(node.targets[0].elts) == len(node.value.elts)
+                  and all(isinstance(target, ast.Name) for target in node.targets[0].elts)
+                  and not any(isinstance(value, ast.Starred) for value in node.value.elts)):
+                # `UP, DOWN = TAP["Up"], TAP["Down"]`: one constant per name.
+                for target, value in zip(node.targets[0].elts, node.value.elts):
+                    if self.bound.get(target.id) == 1:
+                        self.constants[target.id] = value
+
+
+class _PlayReader:
+    """The play calls a plan can reach, and the names they can take (G8).
+
+    It starts at the functions the manifest names (steps, recovery, failure hooks, hook gates) and follows calls
+    and references into the same module and into other modules of the rows folder. A module a step names is read
+    as a whole; a module that is only imported is read in the functions the plan reaches.
+
+    A name is resolved when it is written at the call, a choice between resolved names, a module constant, an entry
+    of a written-out module table, a local set once, or a parameter whose every argument resolves: at each call the
+    plan reaches, and in the step's `args`. Anything else is not resolved, and the gate says so. The runner refuses
+    a `ctx.play` of a name that is not in the resolved or declared set, so a miss here stops a run; it does not
+    let a name through."""
+
+    def __init__(self, plan, base):
+        from runner import SHARED_HOOKS
+
+        self.plan, self.base = plan, Path(base).resolve()
+        self.modules, self.steps, self.entries = {}, {}, []
+        self.reached, self.sites, self.escaped, self.contexts = {}, {}, set(), set()
+        # Set by `resolve` when the names it returns are names the expression may take, not names it must take:
+        # they came through a parameter (every caller's argument) or a table read with a key the gate cannot tell.
+        self.inexact = False
+        for name, function, args in _play_hooks(plan):
+            if name in SHARED_HOOKS:
+                continue
+            path = Path(name)
+            path = (path if path.is_absolute() else self.base / path).resolve()
+            if self.base not in path.parents or not path.is_file():
+                continue
+            self.steps.setdefault(path, name)
+            if self.module(path, name) is not None:
+                self.entries.append((path, function, args))
+        self.reach()
+        self.flow()
+
+    def find(self, path, name):
+        for folder in (path.parent, self.base):
+            candidate = (folder / f'{name}.py').resolve()
+            if candidate.is_file() and self.base in candidate.parents:
+                return candidate
+        return None
+
+    def module(self, path, label=None):
+        if path not in self.modules:
+            try:
+                self.modules[path] = _PlayModule(path, label or path.relative_to(self.base).as_posix(), self.find)
+            except (OSError, SyntaxError, UnicodeError, ValueError):
+                self.modules[path] = None
+        return self.modules[path]
+
+    def targets(self, mod, name, seen=()):
+        """The functions a module-level name stands for, each with its module and whether it is a plain function
+        defined once (its parameters can be followed)."""
+        if mod is None or (mod.path, name) in seen:
+            return []
+        if name in mod.functions:
+            return [(mod, mod.functions[name], mod.bound.get(name) == 1)]
+        if name in mod.classes:
+            return [(mod, method, False) for method in mod.classes[name]]
+        seen += ((mod.path, name),)
+        if name in mod.imported:
+            path, other = mod.imported[name]
+            return self.targets(self.module(path), other, seen)
+        # Another module-level name for a function: `ok = helper.press`.
+        value = mod.constants.get(name)
+        if isinstance(value, ast.Name):
+            return self.targets(mod, value.id, seen)
+        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id in mod.local:
+            return self.targets(self.module(mod.local[value.value.id]), value.attr, seen)
+        if not name.startswith('_'):
+            for path in mod.stars:
+                found = self.targets(self.module(path), name, seen)
+                if found:
+                    return found
+        return []
+
+    def binding(self, mod, name, chain):
+        """How the functions around a use bind a name. None: none of them does, so the module's own binding holds.
+        ('module', path), ('from', path, name), ('routes',) or ('route play',): one import inside a function.
+        ('hidden',): anything else (a parameter, a local, a name the gate cannot place)."""
+        for function in chain:
+            if name in _parameters(function)[1]:
+                return ('hidden',)
+            stores = _stores(function, name)
+            if stores == []:
+                continue
+            if stores is None or len(stores) != 1 or not isinstance(stores[0], ast.alias):
+                return ('hidden',)
+            alias, source = stores[0], stores[0]._play_import
+            if isinstance(source, ast.Import):
+                if '.' in alias.name:
+                    return ('hidden',)
+                if alias.name == 'routes':
+                    return ('routes',)
+                found = self.find(mod.path, alias.name)
+                return ('module', found) if found is not None else ('hidden',)
+            if source.level or not source.module:
+                return ('hidden',)
+            if source.module == 'routes':
+                return ('route play',) if alias.name == 'play' else ('hidden',)
+            found = self.find(mod.path, source.module)
+            return ('from', found, alias.name) if found is not None else ('hidden',)
+        return None
+
+    def named(self, mod, name, seen=()):
+        """(the value, its module, its name there) of the module constant a module-level name stands for."""
+        while mod is not None and (mod.path, name) not in seen:
+            seen += ((mod.path, name),)
+            if name in mod.constants:
+                return mod.constants[name], mod, name
+            if name in mod.imported and mod.bound.get(name) == 1:
+                path, name = mod.imported[name]
+                mod = self.module(path)
+                continue
+            if name not in mod.bound and not name.startswith('_'):
+                for path in mod.stars:
+                    found = self.named(self.module(path), name, seen)
+                    if found[0] is not None:
+                        return found
+            break
+        return None, None, None
+
+    def constant(self, expr, mod, chain=()):
+        """(the value, its module, its name there) of a module constant written as a name or as `module.NAME`."""
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+            bound = self.binding(mod, expr.value.id, chain)
+            if bound is None and expr.value.id in mod.local:
+                return self.named(self.module(mod.local[expr.value.id]), expr.attr)
+            if bound is not None and bound[0] == 'module':
+                return self.named(self.module(bound[1]), expr.attr)
+        elif isinstance(expr, ast.Name):
+            bound = self.binding(mod, expr.id, chain)
+            if bound is None:
+                return self.named(mod, expr.id)
+            if bound[0] == 'from':
+                return self.named(self.module(bound[1]), bound[2])
+        return None, None, None
+
+    def refs(self, mod, node, chain):
+        """The functions an expression names, as a name or as `module.name`, and whether the gate found them only
+        inside a module constant (a dispatch table), which is a way it does not follow."""
+        found = []
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            bound = self.binding(mod, node.id, chain)
+            if bound is None:
+                found = self.targets(mod, node.id)
+            elif bound[0] == 'from':
+                found = self.targets(self.module(bound[1]), bound[2])
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            bound = self.binding(mod, node.value.id, chain)
+            if bound is None and node.value.id in mod.local:
+                found = self.targets(self.module(mod.local[node.value.id]), node.attr)
+            elif bound is not None and bound[0] == 'module':
+                found = self.targets(self.module(bound[1]), node.attr)
+        else:
+            return [], False
+        if found:
+            return found, False
+        value, home, _ = self.constant(node, mod, chain)
+        if value is not None:
+            for inner in ast.walk(value):
+                if not isinstance(inner, ast.Constant):
+                    found.extend(self.refs(home, inner, ())[0])
+        return found, True
+
+    def reach(self):
+        todo = []
+        for path, function, _ in self.entries:
+            todo.extend(self.targets(self.module(path), function))
+        while todo:
+            mod, node, plain = todo.pop()
+            if not plain or node.decorator_list:
+                self.escaped.add(id(node))
+            if id(node) in self.reached:
+                continue
+            self.reached[id(node)] = (mod, node)
+            called = {id(child.func) for _, child in _inside(node) if isinstance(child, ast.Call)}
+            for chain, child in _inside(node, (node,)):
+                if id(child) in called:
+                    continue
+                call = isinstance(child, ast.Call)
+                found, indirect = self.refs(mod, child.func if call else child, chain)
+                for target in found:
+                    todo.append(target)
+                    if call and not indirect and target[2]:
+                        self.sites.setdefault(id(target[1]), []).append((child, mod, chain))
+                    else:
+                        self.escaped.add(id(target[1]))
+
+    def flow(self):
+        """The parameters that hold the step context: the first one of every function the manifest names, and
+        every parameter that is given the context at a call the plan reaches."""
+        for path, function, _ in self.entries:
+            for _, node, plain in self.targets(self.module(path), function):
+                positional = _parameters(node)[0]
+                if plain and positional:
+                    self.contexts.add((id(node), positional[0]))
+        changed = True
+        while changed:
+            changed = False
+            for target, sites in self.sites.items():
+                positional, every = _parameters(self.reached[target][1])
+                for call, _, chain in sites:
+                    given = [(keyword.arg, keyword.value) for keyword in call.keywords if keyword.arg in every]
+                    if not any(isinstance(arg, ast.Starred) for arg in call.args):
+                        given.extend(zip(positional, call.args))
+                    for name, value in given:
+                        if (target, name) not in self.contexts and self.context(value, chain):
+                            self.contexts.add((target, name))
+                            changed = True
+
+    def context(self, expr, chain, depth=_PLAY_DEPTH):
+        """Whether an expression is the step context, as far as the gate can tell: the name `ctx`, an attribute
+        `.ctx`, a parameter the context flows into, or a local set once to one of these."""
+        if isinstance(expr, ast.Attribute):
+            return expr.attr == 'ctx'
+        if not isinstance(expr, ast.Name) or depth <= 0:
+            return False
+        if expr.id == 'ctx':
+            return True
+        for index, function in enumerate(chain):
+            if expr.id in _parameters(function)[1]:
+                return (id(function), expr.id) in self.contexts
+            stores = _stores(function, expr.id)
+            if stores == []:
+                continue
+            if stores is None or len(stores) != 1:
+                return False
+            for _, node in _inside(function):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and node.targets[0] is stores[0]:
+                    return self.context(node.value, chain[index:], depth - 1)
+            return False
+        return False
+
+    def table(self, expr, mod, chain):
+        """The entries of a module table written out with constant keys and names as values; None otherwise."""
+        value, home, name = self.constant(expr, mod, chain)
+        if not isinstance(value, ast.Dict) or name in home.mutated or not all(
+                isinstance(key, ast.Constant) and isinstance(item, ast.Constant) and isinstance(item.value, str)
+                for key, item in zip(value.keys, value.values)):
+            return None
+        return {key.value: item.value for key, item in zip(value.keys, value.values)}
+
+    def declared(self, expr, mod, chain):
+        """The closed set a play declares with `among=`: written at the call, or a module constant; None if the
+        gate cannot read it."""
+        if isinstance(expr, (ast.Name, ast.Attribute)):
+            expr, home, name = self.constant(expr, mod, chain)
+            if expr is None or name in home.mutated:
+                return None
+        return _play_set(expr)
+
+    def resolve(self, expr, mod, chain, depth=_PLAY_DEPTH, active=frozenset()):
+        """The names an expression can be, or None when the gate cannot tell."""
+        if depth <= 0:
+            return None
+        if isinstance(expr, ast.Constant):
+            return {expr.value} if isinstance(expr.value, str) else None
+        if isinstance(expr, ast.IfExp):
+            first = self.resolve(expr.body, mod, chain, depth, active)
+            second = self.resolve(expr.orelse, mod, chain, depth, active)
+            return first | second if first is not None and second is not None else None
+        if isinstance(expr, ast.Subscript):
+            table = self.table(expr.value, mod, chain)
+            if table is None:
+                return None
+            if isinstance(expr.slice, ast.Constant):
+                return {table[expr.slice.value]} if expr.slice.value in table else None
+            self.inexact = True
+            return set(table.values())
+        if isinstance(expr, ast.Name):
+            for index, function in enumerate(chain):
+                if expr.id in _parameters(function)[1]:
+                    if index != len(chain) - 1 or isinstance(function, ast.Lambda):
+                        return None
+                    self.inexact = True
+                    return self.parameter(function, expr.id, depth, active)
+                stores = _stores(function, expr.id)
+                if stores is None:
+                    return None
+                if len(stores) == 1 and isinstance(stores[0], ast.alias):
+                    break
+                if stores:
+                    value = None
+                    for _, node in _inside(function):
+                        if isinstance(node, ast.Assign) and len(node.targets) == 1 and node.targets[0] is stores[0]:
+                            value = node.value
+                    if len(stores) != 1 or value is None:
+                        return None
+                    return self.resolve(value, mod, chain[index:], depth - 1, active)
+        if isinstance(expr, (ast.Name, ast.Attribute)):
+            value, home, _ = self.constant(expr, mod, chain)
+            return self.resolve(value, home, (), depth - 1, active) if value is not None else None
+        return None
+
+    def parameter(self, function, name, depth, active):
+        """The names a parameter of a reached function can be: from the step's `args` and its default where the
+        manifest names the function, and from the argument at every call the plan reaches."""
+        key = (id(function), name)
+        if key in active:
+            return set()
+        args = function.args
+        if (id(function) not in self.reached or id(function) in self.escaped or _stores(function, name) != []
+                or name in [arg.arg for arg in (args.vararg, args.kwarg) if arg is not None]):
+            return None
+        mod = self.reached[id(function)][0]
+        active = active | {key}
+        positional = _parameters(function)[0]
+        defaults = dict(zip(reversed(positional), reversed(args.defaults)))
+        defaults.update({arg.arg: value for arg, value in zip(args.kwonlyargs, args.kw_defaults)
+                         if value is not None})
+        names, used = set(), False
+        for path, entry, given in self.entries:
+            if not any(target[1] is function for target in self.targets(self.module(path), entry)):
+                continue
+            used = True
+            if given is None:
+                return None
+            if name in given:
+                found = {given[name]} if isinstance(given[name], str) else None
+            else:
+                found = self.resolve(defaults[name], mod, (), depth - 1, active) if name in defaults else None
+            if found is None:
+                return None
+            names |= found
+        for call, caller, chain in self.sites.get(id(function), []):
+            used = True
+            if any(isinstance(arg, ast.Starred) for arg in call.args) or any(k.arg is None for k in call.keywords):
+                return None
+            given, home, scope = None, caller, chain
+            if name in positional and positional.index(name) < len(call.args):
+                given = call.args[positional.index(name)]
+            for keyword in call.keywords:
+                if keyword.arg == name:
+                    given = keyword.value
+            if given is None:
+                if name not in defaults:
+                    return None
+                given, home, scope = defaults[name], mod, ()
+            found = self.resolve(given, home, scope, depth - 1, active)
+            if found is None:
+                return None
+            names |= found
+        return names if used else None
+
+    def kind(self, mod, call, chain, reached):
+        """('segment' | 'macro', where the name stands) for a play the gate knows; (None, 0) for a `.play(` on
+        something it does not know; (False, 0) for a call that is no play.
+
+        In a function the plan reaches, every `.play(` the gate cannot place is reported. In the rest of a step
+        module, which is read as before, only a `.play(ctx, ...)` on something unknown is."""
+        func = call.func
+        if isinstance(func, ast.Name):
+            bound = self.binding(mod, func.id, chain)
+            routed = bound == ('route play',) or (
+                bound is None and func.id in mod.route_play and mod.bound.get(func.id) == 1)
+            return ('macro', 1) if routed else (False, 0)
+        if not isinstance(func, ast.Attribute) or func.attr != 'play':
+            return False, 0
+        owner = func.value
+        if self.context(owner, chain):
+            return 'segment', 0
+        if isinstance(owner, ast.Name):
+            bound = self.binding(mod, owner.id, chain)
+            if bound == ('routes',) or (bound is None and owner.id in mod.routes):
+                return 'macro', 1
+            if (bound is None and owner.id in mod.local) or (bound is not None and bound[0] == 'module'):
+                return False, 0
+        if reached or (call.args and self.context(call.args[0], chain)):
+            return None, 0
+        return False, 0
+
+    def calls(self):
+        """One record per play call: (module label, 'segment' | 'macro' | None, the names it can take or None,
+        the set it declares or None, the name written at the call or None)."""
+        scopes = [(self.module(path), self.module(path).tree, ()) for path in self.steps
+                  if self.module(path) is not None]
+        scopes.extend((mod, node, (node,)) for mod, node in self.reached.values())
+        seen, records = set(), []
+        for mod, node, chain in scopes:
+            for inner, call in _inside(node, chain):
+                if not isinstance(call, ast.Call) or id(call) in seen:
+                    continue
+                reached = any(id(function) in self.reached for function in inner)
+                kind, index = self.kind(mod, call, inner, reached)
+                if kind is False:
+                    continue
+                seen.add(id(call))
+                argument = call.args[index] if kind and len(call.args) > index else None
+                among = next((keyword.value for keyword in call.keywords if keyword.arg == 'among'), None)
+                declared = self.declared(among, mod, inner) if kind and among is not None else None
+                self.inexact = False
+                names = self.resolve(argument, mod, inner) if argument is not None else None
+                records.append((mod.label, kind, names, declared, not self.inexact))
+        return records
+
+
+def _play_hooks(plan):
+    """Every hook a manifest names, as (module, function, the step's args); the args are None for a gate hook,
+    which the runner calls with the gate."""
+    def one(hook):
+        spec = hook.get('run') if isinstance(hook, dict) else hook
+        args = hook.get('args', {}) if isinstance(hook, dict) else {}
+        if isinstance(spec, str) and ':' in spec:
+            module, _, function = spec.partition(':')
+            yield module, function, args if isinstance(args, dict) else {}
+
+    yield from one(plan.get('on_failure_hook'))
+    for row in plan.get('rows') if isinstance(plan.get('rows'), list) else []:
+        if isinstance(row, dict):
+            yield from one(row.get('on_failure_hook'))
+    for _, step in _plan_steps(plan):
+        if 'run' in step:
+            yield from one(step)
+    gates = plan.get('gates') if isinstance(plan.get('gates'), dict) else {}
+    for gate in gates.values():
+        if (isinstance(gate, dict) and gate.get('kind') == 'hook' and isinstance(gate.get('module'), str)
+                and isinstance(gate.get('function'), str)):
+            yield gate['module'], gate['function'], None
+
+
+def _plays(plan, base):
+    """G8 for a plan's hooks: per module label its errors and its warning, and the segment names `ctx.play` was
+    checked for."""
     import routes
 
-    segment_names = set(plan.get('segments', {}))
-    route_names = set(routes.routes_index()['macros'])
-    route_names.update(json.loads((routes.LIBRARY / 'index.json').read_text())['segments'])
+    segments = plan.get('segments') if isinstance(plan.get('segments'), dict) else {}
+    known = {'segment': set(segments), 'macro': set(routes.routes_index()['macros'])}
+    known['macro'].update(json.loads((routes.LIBRARY / 'index.json').read_text())['segments'])
+    callee = {'segment': 'ctx.play', 'macro': 'routes.play'}
+    found, checked = {}, set()
+    for label, kind, names, declared, exact in _PlayReader(plan, base).calls():
+        entry = found.setdefault(label, {'segment': set(), 'macro': set(), 'among segment': set(),
+                                         'among macro': set(), 'outside': set(), 'unchecked': 0})
+        # Exact names are what the play takes: each must be in its namespace, and inside the set it declares.
+        # Names that only may reach the play (through a parameter, a table read with a computed key) refuse
+        # nothing: a helper can send some of them elsewhere, as one that plays a plan segment through ctx.play and
+        # anything else through the routes library. Such a play is checked when all of them fit, or when it
+        # declares its set; otherwise it is unchecked, and the gate says so.
+        if kind is not None and declared is not None:
+            entry[f'among {kind}'].update(declared)
+            if names and exact:
+                entry[kind].update(names)
+                entry['outside'].update((callee[kind], name) for name in names - declared)
+            approved = declared
+        elif kind is not None and names and (exact or names <= known[kind]):
+            entry[kind].update(names)
+            approved = names
+        else:
+            entry['unchecked'] += 1
+            continue
+        if kind == 'segment':
+            checked.update(approved)
+    result = {}
+    for label, entry in found.items():
+        errors = [f'G8 {label}: ctx.play("{name}") names no segment of this plan'
+                  for name in sorted(entry['segment'] - known['segment'])]
+        errors.extend(f'G8 {label}: routes.play("{name}") names no routes library macro'
+                      for name in sorted(entry['macro'] - known['macro']))
+        errors.extend(f'G8 {label}: ctx.play among "{name}" names no segment of this plan'
+                      for name in sorted(entry['among segment'] - known['segment']))
+        errors.extend(f'G8 {label}: routes.play among "{name}" names no routes library macro'
+                      for name in sorted(entry['among macro'] - known['macro']))
+        errors.extend(f'G8 {label}: {call}("{name}") is not among the names it declares'
+                      for call, name in sorted(entry['outside']))
+        warning = (f'G8 {label}: {entry["unchecked"]} play call(s) with a computed name or unknown callee '
+                   'are not checked') if entry['unchecked'] else None
+        result[label] = (errors, warning)
+    return result, checked & known['segment']
+
+
+def play_names(plan, base):
+    """The segment names the gate checked for `ctx.play` in this plan's hooks. The runner plays no other name
+    through `ctx.play`."""
+    return sorted(_plays(plan, base)[1])
+
+
+def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
     sources = []
     for module in sorted(modules):
         path = (base / module).resolve()
@@ -1317,7 +1954,8 @@ def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
         except (OSError, SyntaxError, UnicodeError):
             continue
     if not sources:
-        return
+        return []
+    plays, checked = _plays(plan, base)
     written = set()
     for source in providers.values():
         if not isinstance(source, dict) or not isinstance(source.get('repo'), str) or source['repo'] not in repos:
@@ -1335,30 +1973,8 @@ def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
                if isinstance(item, dict) and isinstance(item.get('key'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
     for module, tree in sources:
-        route_aliases = {'routes'}
-        for imported in ast.walk(tree):
-            if isinstance(imported, ast.Import):
-                route_aliases.update(alias.asname or alias.name for alias in imported.names if alias.name == 'routes')
-        segments, macros, reads, unchecked = set(), set(), set(), 0
+        reads = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'play':
-                owner = node.func.value
-                if isinstance(owner, ast.Name) and owner.id == 'ctx':
-                    index = 0
-                    names = segments
-                elif node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == 'ctx':
-                    if not isinstance(owner, ast.Name) or owner.id not in route_aliases:
-                        unchecked += 1
-                        continue
-                    index = 1
-                    names = macros
-                else:
-                    continue
-                argument = node.args[index] if len(node.args) > index else None
-                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-                    names.add(argument.value)
-                else:
-                    unchecked += 1
             key = None
             if isinstance(node, ast.Subscript):
                 key = node.slice
@@ -1370,14 +1986,19 @@ def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
                 if (re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', value)
                         and value.split('.', 1)[0] in prefixes and value not in written and value not in ignored):
                     reads.add(value)
-        for name in sorted(segments - segment_names):
-            errors.append(f'G8 {module}: ctx.play("{name}") names no segment of this plan')
-        for name in sorted(macros - route_names):
-            errors.append(f'G8 {module}: routes.play("{name}") names no routes library macro')
-        if unchecked:
-            warnings.append(f'G8 {module}: {unchecked} play call(s) with a computed name or unknown callee are not checked')
+        found, warning = plays.pop(module, ([], None))
+        errors.extend(found)
+        if warning:
+            warnings.append(warning)
         for key in sorted(reads):
             errors.append(f'G2 {module}: reads "{key}", which the target does not write')
+    # Modules the plan reaches only through an import: G8 names them too.
+    for module in sorted(plays):
+        found, warning = plays[module]
+        errors.extend(found)
+        if warning:
+            warnings.append(warning)
+    return sorted(checked)
 
 
 def _needs(plan, errors):
@@ -1681,7 +2302,7 @@ def check(plan, base, raw):
     report = {'errors': [], 'warnings': [], 'result': 'NO TARGET', 'packet_sha256': packet_digest(base),
               'gate_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'inputs_identity': inputs_identity(base, plan),
-              'target': plan.get('target'), 'emitted': {}, 'rows': {}, 'cases': {}}
+              'target': plan.get('target'), 'emitted': {}, 'rows': {}, 'cases': {}, 'plays': []}
     inputs = _packet_inputs(base, plan)
     for row_id, name, path in _gif_destinations(base, plan):
         if _gif_names_input(path, inputs):
@@ -1698,7 +2319,7 @@ def check(plan, base, raw):
         providers = _providers(plan, errors, report['warnings'])
         report['emitted'] = _reads(plan, repos, errors, providers)
         _bindings(plan, base, settings, errors, report['warnings'])
-        _hook_checks(plan, base, modules, repos, errors, report['warnings'], providers)
+        report['plays'] = _hook_checks(plan, base, modules, repos, errors, report['warnings'], providers)
     _paths(plan, base, raw, modules, repos, errors)
     report['rows'] = _needs(plan, errors)
     _effects(plan, errors)

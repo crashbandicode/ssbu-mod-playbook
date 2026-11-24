@@ -792,9 +792,23 @@ class FrontendRoomTests(unittest.TestCase):
         self.warning_after_host = False
         self.repeat_warning = False
         self.queued_warning = -1
-        self.runner = types.SimpleNamespace(out=self.out, ui=self.ui, ui_matches=runner.Runner.ui_matches)
+        self.host_port = 24872
+        self.host_connected = False
+        self.runner = types.SimpleNamespace(out=self.out, ui=self.ui, ui_matches=runner.Runner.ui_matches,
+                                            instances={'a': {'pid': 111}, 'b': {'pid': 222}})
         self.ctx = types.SimpleNamespace(runner=self.runner, on='a', row_dir=self.row,
-                                         call=self.call, check_stop=lambda: None)
+                                         instance=self.runner.instances['a'], call=self.call, check_stop=lambda: None)
+        self.real_udp_listeners = routes.udp_listeners
+        patcher = mock.patch.object(routes, 'udp_listeners', side_effect=self.default_listeners)
+        self.listeners = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def default_listeners(self):
+        existing = any(node.get('class') == 'ClientRoomWindow' for node in self.nodes)
+        available_action = any(node.get('name') == 'action_Start_Room' for node in self.nodes)
+        if self.host_connected or (existing and not available_action):
+            return [{'port': self.host_port, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        return []
 
     def call(self, method, params=None, job_cap=15):
         if method == 'status':
@@ -815,11 +829,14 @@ class FrontendRoomTests(unittest.TestCase):
             self.nodes.append(self.HOST_DIALOG if target['name'] == 'action_Start_Room' else self.PEER_DIALOG)
         elif step['ui'] == 'set' and target.get('name') == 'room_name':
             self.host_room_name = step['value']
+        elif step['ui'] == 'set' and target.get('name') == 'port' and step.get('property') == 'text':
+            self.host_port = int(step['value'])
         elif step['ui'] == 'click' and target.get('id') == self.OK['id']:
             self.nodes = [node for node in self.nodes if node not in (self.MESSAGE, self.OK)]
             if self.room_after_dismiss is not None:
                 self.nodes.append(self.room_after_dismiss)
         elif step['ui'] == 'click' and target.get('id') == self.WARNING_OK['id']:
+            self.host_connected = True
             self.nodes = [node for node in self.nodes if node not in
                           (self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL)]
             if self.repeat_warning:
@@ -829,6 +846,8 @@ class FrontendRoomTests(unittest.TestCase):
                 if self.room_node is not None:
                     self.nodes.append(self.connected_room())
         elif step['ui'] == 'click' and target.get('name') in ('host', 'connect'):
+            if target.get('name') == 'host':
+                self.host_connected = True
             if self.modal_after_host:
                 self.nodes.extend([self.MESSAGE, self.OK])
             elif self.warning_after_host:
@@ -857,6 +876,7 @@ class FrontendRoomTests(unittest.TestCase):
             {'ui': 'set', 'target': target('QLineEdit', 'username'), 'property': 'text', 'value': 'TRHost'},
             {'ui': 'set', 'target': target('QLineEdit', 'room_name'), 'property': 'text', 'value': 'TR24872'},
             {'ui': 'set', 'target': target('QLineEdit', 'port'), 'property': 'text', 'value': '24872'},
+            {'ui': 'set', 'target': target('QLineEdit', 'port'), 'property': 'modified', 'value': True},
             {'ui': 'set', 'target': target('QComboBox', 'host_type'), 'property': 'currentIndex', 'value': 1},
             {'ui': 'click', 'target': target('QPushButton', 'host')}]])
         self.assertEqual(receipt['port'], 24872)
@@ -870,11 +890,691 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(receipt['evidence']['frontend_leave'], self.HOST_LEAVE)
         self.assertEqual(json.loads((self.row / 'routes-frontend-room.json').read_text()), receipt)
         self.assertEqual(json.loads((self.out / 'frontend-room.json').read_text()),
-                         {'port': 24872, 'room_name': 'TR24872', 'instance': 'a'})
+                         {'port': 24872, 'port_verified': True, 'room_name': 'TR24872', 'instance': 'a'})
+
+    def test_host_marks_port_before_click_and_verifies_own_udp_listener(self):
+        self.ctx.instance = {'pid': 111}
+        self.listeners.side_effect = [[], [{'port': 24890, 'address': '0.0.0.0', 'comm': 'Eden', 'pid': 111}]]
+        result = routes.frontend_room(self.ctx, port=24890)
+        steps = [step for _, step in self.actions]
+        text = next(i for i, step in enumerate(steps) if step.get('property') == 'text'
+                    and step['target'].get('name') == 'port')
+        modified = next(i for i, step in enumerate(steps) if step.get('property') == 'modified')
+        host = next(i for i, step in enumerate(steps) if step['ui'] == 'click'
+                    and step['target'].get('name') == 'host')
+        self.assertLess(text, modified)
+        self.assertLess(modified, host)
+        self.assertEqual(steps[modified]['value'], True)
+        self.assertTrue(result['port_marked_edited'])
+        self.assertTrue(result['port_verified'])
+        self.assertEqual(result['bound_ports'], [24890])
+        handoff = json.loads((self.out / 'frontend-room.json').read_text())
+        self.assertEqual((handoff['port'], handoff['port_verified']), (24890, True))
+
+    def test_explicit_port_already_bound_stops_before_dialog_actions(self):
+        self.listeners.side_effect = None
+        for holder, expected in (({'port': 24873, 'address': '::', 'comm': 'eden', 'pid': 111}, 'eden pid 111'),
+                                 ({'port': 24873, 'address': '*', 'comm': None, 'pid': None},
+                                  'an unknown process')):
+            with self.subTest(holder=holder):
+                self.listeners.return_value = [holder]
+                with self.assertRaises(RuntimeError) as caught:
+                    routes.frontend_room(self.ctx, port=24873)
+                self.assertEqual(str(caught.exception), f'frontend_room: UDP port 24873 is already in use on this '
+                                 f'host by {expected}; pass another port or omit it')
+                self.assertEqual(self.actions, [])
+        self.nodes = [self.MESSAGE, self.OK]
+        with self.assertRaisesRegex(RuntimeError, 'UDP port 24873 is already in use'):
+            routes.frontend_room(self.ctx, port=24873)
+        self.assertEqual(self.actions, [])
+
+    def test_refused_modified_property_stops_nondefault_but_allows_default(self):
+        def refuse(on, step):
+            if step.get('property') == 'modified':
+                self.actions.append((on, step))
+                raise RuntimeError('property is read-only')
+            return self.ui(on, step)
+        self.runner.ui = refuse
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24873)
+        self.assertEqual(str(caught.exception),
+                         'frontend_room: this Eden refused to mark the port field as edited '
+                         '(property is read-only); it would host on its default port 24872, not 24873')
+        self.assertFalse(any(step['ui'] == 'click' and step['target'].get('name') == 'host'
+                             for _, step in self.actions))
+        self.actions.clear()
+        self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+        result = routes.frontend_room(self.ctx, port=24872)
+        self.assertFalse(result['port_marked_edited'])
+        self.assertTrue(result['port_verified'])
+        self.assertTrue(any(step['ui'] == 'click' and step['target'].get('name') == 'host'
+                            for _, step in self.actions))
+
+    def test_port_edit_refusal_never_bypasses_stop(self):
+        stopped = []
+        def refuse(on, step):
+            if step.get('property') == 'modified':
+                stopped.append(True)
+                raise runner.StopRun('STOP')
+            return self.ui(on, step)
+        self.runner.ui = refuse
+        def stop():
+            if stopped:
+                raise runner.StopRun('STOP')
+        self.ctx.check_stop = stop
+        with self.assertRaises(runner.StopRun):
+            routes.frontend_room(self.ctx, port=24872)
+        self.assertFalse(any(step['ui'] == 'click' and step['target'].get('name') == 'host'
+                             for _, step in self.actions))
+
+    def test_create_failure_reports_requested_default_or_no_holder(self):
+        failure = 'Creating a room failed. Please retry. Restarting Eden might be necessary.'
+        self.MESSAGE = {**self.MESSAGE, 'properties': {'text': {'value': failure}}}
+        self.modal_after_host = True
+        for holders, suffix in (
+            ([{'port': 24872, 'address': '0.0.0.0', 'comm': 'eden', 'pid': 111}],
+             "; port 24872 (Eden's default) is held by eden pid 111"),
+            ([{'port': 24873, 'address': '::', 'comm': 'other', 'pid': 222}],
+             '; port 24873 is held by other pid 222'),
+            ([], '; no holder of 24873 or 24872 found'),
+        ):
+            with self.subTest(holders=holders):
+                self.actions.clear()
+                self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+                self.listeners.side_effect = [[], holders]
+                with self.assertRaises(RuntimeError) as caught:
+                    routes.frontend_room(self.ctx, port=24873, cap=.1)
+                self.assertEqual(str(caught.exception),
+                                 'frontend_room: Eden could not open the room on UDP port 24873' + suffix)
+                self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_connected_wrong_instance_port_stops_without_handoff(self):
+        self.ctx.instance = {'pid': 111}
+        self.listeners.side_effect = [[], [
+            {'port': 24872, 'address': '0.0.0.0', 'comm': 'eden', 'pid': 111},
+            {'port': 24873, 'address': '0.0.0.0', 'comm': 'eden', 'pid': 222}]]
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24873)
+        self.assertEqual(str(caught.exception),
+                         'frontend_room: the room is connected but this Eden listens on UDP [24872], '
+                         'not the requested 24873; UDP 24873 is held by eden pid 222')
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_reviewer_listeners_unavailable_after_connect_refuses_without_handoff(self):
+        self.listeners.side_effect = [[], None]
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24890)
+        self.assertEqual(str(caught.exception), "frontend_room: cannot read this host's UDP listeners; "
+                         'room port 24890 is not verified')
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_reviewer_unknown_identity_cannot_credit_another_eden(self):
+        self.ctx.instance = {}
+        self.listeners.side_effect = [[], [
+            {'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111},
+            {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 222}]]
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24890)
+        self.assertEqual(str(caught.exception),
+                         'frontend_room: cannot tell which processes belong to this Eden; room port 24890 is not verified')
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_reviewer_foreign_eden_listener_is_not_owned(self):
+        self.listeners.side_effect = [[], [
+            {'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111},
+            {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 222}]]
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24890)
+        self.assertEqual(str(caught.exception), 'frontend_room: the room is connected but this Eden listens on UDP '
+                         '[24872], not the requested 24890; UDP 24890 is held by eden pid 222')
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_automatically_selected_port_is_not_prechecked(self):
+        self.listeners.side_effect = None
+        self.listeners.return_value = [{'port': 24873, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        with mock.patch.object(routes, 'free_udp_port', return_value=24873):
+            result = routes.frontend_room(self.ctx)
+        self.assertTrue(result['port_verified'])
+        self.assertEqual(self.listeners.call_count, 1)
+
+    def test_reused_room_verifies_requested_port_and_has_no_new_ui(self):
+        self.nodes = [self.ROOM]
+        result = routes.frontend_room(self.ctx, room_name='TRB3Waiting', port=24872)
+        self.assertTrue(result['already_connected'])
+        self.assertTrue(result['port_verified'])
+        self.assertEqual(result['bound_ports'], [24872])
+        self.assertTrue(json.loads((self.out / 'frontend-room.json').read_text())['port_verified'])
+        self.assertEqual(self.actions, [])
+        self.listeners.assert_called_once()
+
+    def test_reviewer_reuse_saved_port_mismatch_stops_without_dialog_actions(self):
+        self.nodes = [self.ROOM]
+        room_file = self.out / 'frontend-room.json'
+        saved = {'port': 24872, 'port_verified': True, 'room_name': 'TRB3Waiting', 'instance': 'a'}
+        room_file.write_text(json.dumps(saved))
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx, port=24890)
+        self.assertEqual(str(caught.exception),
+                         "frontend_room: this Eden's room was saved with port 24872, not the requested 24890")
+        self.assertEqual(self.actions, [])
+        self.listeners.assert_not_called()
+        self.assertEqual(json.loads(room_file.read_text()), saved)
+
+    def test_reuse_saved_port_not_owned_stops_without_actions(self):
+        self.nodes = [self.ROOM]
+        saved = {'port': 24890, 'port_verified': True, 'room_name': 'TRB3Waiting', 'instance': 'a'}
+        (self.out / 'frontend-room.json').write_text(json.dumps(saved))
+        with self.assertRaises(RuntimeError) as caught:
+            routes.frontend_room(self.ctx)
+        self.assertEqual(str(caught.exception), 'frontend_room: the room is connected but this Eden listens on UDP '
+                         '[24872], not the requested 24890')
+        self.assertEqual(self.actions, [])
+        handoff = json.loads((self.out / 'frontend-room.json').read_text())
+        self.assertFalse(handoff['port_verified'])
+        self.assertEqual(handoff['disproved']['bound_ports'], [24872])
+        self.assertIsNone(handoff['disproved']['holder'])
+        self.assertEqual(handoff['disproved']['reason'], str(caught.exception))
+
+    def seed_verified_room(self):
+        owned = {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 111}
+        self.listeners.side_effect = [[], [owned]]
+        result = routes.frontend_room(self.ctx, port=24890)
+        self.assertTrue(result['port_verified'])
+        self.nodes = [self.connected_room()]
+        self.actions.clear()
+        self.listeners.side_effect = None
+        return owned
+
+    def test_reviewer_disproved_handoff_refuses_saved_join_without_actions(self):
+        self.seed_verified_room()
+        self.listeners.return_value = [
+            {'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111},
+            {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 222}]
+        room_file = self.out / 'frontend-room.json'
+        with self.assertRaises(routes.RoomPortDisproved) as caught:
+            routes.frontend_room(self.ctx)
+        reason = ('frontend_room: the room is connected but this Eden listens on UDP [24872], '
+                  'not the requested 24890; UDP 24890 is held by eden pid 222')
+        self.assertEqual(str(caught.exception), reason)
+        saved = json.loads(room_file.read_text())
+        self.assertIs(saved['port_verified'], False)
+        self.assertEqual(saved['disproved']['bound_ports'], [24872])
+        self.assertEqual(saved['disproved']['holder'], {'comm': 'eden', 'pid': 222})
+        self.assertEqual(saved['disproved']['reason'], reason)
+        routes.datetime.fromisoformat(saved['disproved']['utc'])
+        self.assertEqual(list(self.out.glob('.frontend-room.json.*.tmp')), [])
+        self.ctx.on = 'b'
+        self.nodes = [self.PEER_ACTION]
+        self.actions.clear()
+        self.listeners.reset_mock()
+        with self.assertRaises(RuntimeError) as joined:
+            routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(joined.exception), 'frontend_room: join refuses the saved room port 24890: '
+                         f"the host route found this Eden no longer listening on it at {saved['disproved']['utc']}")
+        self.assertEqual(self.actions, [])
+        self.listeners.assert_not_called()
+
+    def test_verified_reuse_still_allows_saved_join(self):
+        owned = self.seed_verified_room()
+        self.listeners.return_value = [owned]
+        result = routes.frontend_room(self.ctx)
+        self.assertTrue(result['port_verified'])
+        self.assertEqual(self.actions, [])
+        self.assertIs(json.loads((self.out / 'frontend-room.json').read_text())['port_verified'], True)
+        self.ctx.on = 'b'
+        self.nodes = [self.PEER_ACTION]
+        self.actions.clear()
+        self.listeners.reset_mock()
+        result = routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(result['port'], 24890)
+        self.listeners.assert_called_once()
+        clicks = [step for _, step in self.actions if step['ui'] == 'click']
+        self.assertEqual([step['target'].get('name') for step in clicks], ['connect'])
+        self.assertIn(('b', {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': 'port'},
+                             'property': 'text', 'value': '24890'}), self.actions)
+
+    def test_unknown_listener_or_identity_does_not_disprove_saved_handoff(self):
+        owned = self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        before = room_file.read_bytes()
+        # Missing evidence is not evidence against the earlier verified port.
+        self.listeners.return_value = None
+        with self.assertRaisesRegex(RuntimeError, "cannot read this host's UDP listeners"):
+            routes.frontend_room(self.ctx)
+        self.assertEqual(room_file.read_bytes(), before)
+        self.listeners.return_value = [owned]
+        with mock.patch.object(routes, '_instance_pids', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'cannot tell which processes belong'):
+                routes.frontend_room(self.ctx)
+        self.assertEqual(room_file.read_bytes(), before)
+        self.assertEqual(self.actions, [])
+
+    def test_different_requested_port_and_foreign_instance_do_not_invalidate(self):
+        self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        before = room_file.read_bytes()
+        self.listeners.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "saved with port 24890, not the requested 24891"):
+            routes.frontend_room(self.ctx, port=24891)
+        self.listeners.assert_not_called()
+        self.assertEqual(room_file.read_bytes(), before)
+        saved = json.loads(before)
+        saved['instance'] = 'b'
+        room_file.write_text(json.dumps(saved))
+        before = room_file.read_bytes()
+        self.listeners.return_value = [
+            {'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111},
+            {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 222}]
+        with self.assertRaises(routes.RoomPortDisproved):
+            routes.frontend_room(self.ctx)
+        self.assertEqual(room_file.read_bytes(), before)
+        self.assertEqual(self.actions, [])
+
+    def test_disproved_port_requalifies_and_preserves_bounded_history(self):
+        owned = self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        with self.assertRaises(routes.RoomPortDisproved):
+            routes.frontend_room(self.ctx)
+        saved = json.loads(room_file.read_text())
+        old_disproof = saved['disproved']
+        saved['history'] = [{'utc': str(i)} for i in range(6)]
+        room_file.write_text(json.dumps(saved))
+        self.listeners.return_value = [owned]
+        result = routes.frontend_room(self.ctx)
+        self.assertTrue(result['port_verified'])
+        requalified = json.loads(room_file.read_text())
+        self.assertIs(requalified['port_verified'], True)
+        self.assertNotIn('disproved', requalified)
+        self.assertEqual(requalified['history'], [{'utc': str(i)} for i in range(2, 6)] + [old_disproof])
+        self.assertEqual(list(self.out.glob('.frontend-room.json.*.tmp')), [])
+
+    def test_new_room_disproves_existing_same_instance_handoff(self):
+        room_file = self.out / 'frontend-room.json'
+        saved = {'port': 24890, 'port_verified': True, 'room_name': 'TR24890', 'instance': 'a'}
+        room_file.write_text(json.dumps(saved))
+        self.listeners.side_effect = [[], [
+            {'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111},
+            {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 222}]]
+        with self.assertRaises(routes.RoomPortDisproved):
+            routes.frontend_room(self.ctx, port=24890)
+        invalid = json.loads(room_file.read_text())
+        self.assertFalse(invalid['port_verified'])
+        self.assertEqual(invalid['disproved']['holder']['pid'], 222)
+
+    def test_new_room_requalifies_same_instance_handoff(self):
+        room_file = self.out / 'frontend-room.json'
+        old_disproof = {'utc': '2026-11-24T00:00:00+00:00', 'bound_ports': [24872],
+                        'holder': None, 'reason': 'listener moved'}
+        room_file.write_text(json.dumps({'port': 24890, 'port_verified': False, 'room_name': 'TR24890',
+                                         'instance': 'a', 'disproved': old_disproof}))
+        self.listeners.side_effect = [[], [{'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 111}]]
+        result = routes.frontend_room(self.ctx, port=24890)
+        self.assertTrue(result['port_verified'])
+        saved = json.loads(room_file.read_text())
+        self.assertTrue(saved['port_verified'])
+        self.assertEqual(saved['history'], [old_disproof])
+        self.assertNotIn('disproved', saved)
+
+    def test_failed_atomic_replace_preserves_file_and_original_disproof(self):
+        self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        before = room_file.read_bytes()
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        with mock.patch.object(routes.os, 'replace', side_effect=PermissionError('replace denied')):
+            with self.assertRaises(routes.RoomPortDisproved) as caught:
+                routes.frontend_room(self.ctx)
+        self.assertEqual(str(caught.exception), 'frontend_room: the room is connected but this Eden listens on UDP '
+                         '[24872], not the requested 24890; the saved handoff could not be invalidated: replace denied')
+        self.assertEqual(room_file.read_bytes(), before)
+        self.assertEqual(list(self.out.glob('.frontend-room.json.*.tmp')), [])
+
+    @unittest.skipIf(os.name != 'posix' or os.geteuid() == 0, 'requires non-root POSIX directory permissions')
+    def test_readonly_handoff_directory_does_not_mask_disproof(self):
+        self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        before = room_file.read_bytes()
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        self.out.chmod(0o500)
+        try:
+            with self.assertRaises(routes.RoomPortDisproved) as caught:
+                routes.frontend_room(self.ctx)
+        finally:
+            self.out.chmod(0o700)
+        self.assertIn('frontend_room: the room is connected but this Eden listens on UDP '
+                      '[24872], not the requested 24890; the saved handoff could not be invalidated: '
+                      '[Errno 13] Permission denied:', str(caught.exception))
+        self.assertEqual(room_file.read_bytes(), before)
+        self.assertEqual(list(self.out.glob('.frontend-room.json.*.tmp')), [])
+
+    @unittest.skipIf(os.name != 'posix' or os.geteuid() == 0, 'requires non-root POSIX directory permissions')
+    def test_reviewer_readonly_host_invalidation_then_guest_rechecks_and_invalidates(self):
+        self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        self.listeners.return_value = [
+            {'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111},
+            {'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 222}]
+        self.out.chmod(0o500)
+        try:
+            with self.assertRaises(routes.RoomPortDisproved) as host:
+                routes.frontend_room(self.ctx)
+        finally:
+            self.out.chmod(0o700)
+        self.assertIn('UDP 24890 is held by eden pid 222; the saved handoff could not be invalidated:',
+                      str(host.exception))
+        self.assertIs(json.loads(room_file.read_text())['port_verified'], True)
+        self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
+        self.nodes = [self.PEER_ACTION]
+        self.actions.clear()
+        self.listeners.reset_mock()
+        with self.assertRaises(routes.RoomPortDisproved) as guest:
+            routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(guest.exception), 'frontend_room: join refuses the saved room port 24890: '
+                         'a listens on UDP [24872]; UDP 24890 is held by eden pid 222')
+        self.assertEqual(self.actions, [])
+        self.listeners.assert_called_once()
+        saved = json.loads(room_file.read_text())
+        self.assertIs(saved['port_verified'], False)
+        self.assertEqual(saved['disproved']['bound_ports'], [24872])
+        self.assertEqual(saved['disproved']['holder'], {'comm': 'eden', 'pid': 222})
+        self.assertEqual(saved['disproved']['reason'], str(guest.exception))
+
+    def test_saved_join_confirms_host_not_guest_identity_once(self):
+        owned = self.seed_verified_room()
+        self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
+        self.nodes = [self.PEER_ACTION]
+        self.actions.clear()
+        self.listeners.return_value = [owned, {'port': 24891, 'address': '*', 'comm': 'eden', 'pid': 222}]
+        self.listeners.reset_mock()
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            result = routes.frontend_room(self.ctx, role='join')
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(result['port'], 24890)
+        self.assertEqual([step['target']['name'] for _, step in self.actions if step['ui'] == 'click'], ['connect'])
+        self.assertIn(('b', {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': 'port'},
+                             'property': 'text', 'value': '24890'}), self.actions)
+
+    def test_saved_join_refuses_unknown_host_or_evidence_before_ui(self):
+        self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
+        self.listeners.side_effect = None
+        room_file = self.out / 'frontend-room.json'
+        base = {'port': 24890, 'port_verified': True, 'room_name': 'TR24890', 'instance': 'a'}
+        for case, reason in (
+            ('listeners', "cannot read this host's UDP listeners"),
+            ('identity', 'cannot tell which processes belong to this Eden'),
+            ('foreign', 'instance is not in this run'),
+            ('missing', 'saved handoff has no instance'),
+            ('invalid-port', 'saved port is invalid'),
+        ):
+            with self.subTest(case=case):
+                saved = dict(base)
+                self.runner.instances['a'] = {'pid': 111}
+                self.listeners.return_value = [{'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 111}]
+                if case == 'listeners':
+                    self.listeners.return_value = None
+                elif case == 'identity':
+                    self.runner.instances['a'] = {}
+                elif case == 'foreign':
+                    saved['instance'] = 'remote'
+                elif case == 'missing':
+                    del saved['instance']
+                elif case == 'invalid-port':
+                    saved['port'] = 'bad'
+                room_file.write_text(json.dumps(saved))
+                before = room_file.read_bytes()
+                self.listeners.reset_mock()
+                with self.assertRaises(RuntimeError) as caught:
+                    routes.frontend_room(self.ctx, role='join')
+                instance = saved.get('instance', '<unknown>')
+                self.assertEqual(str(caught.exception), f'frontend_room: join cannot confirm that {instance} still '
+                                 f'hosts the saved room port {saved["port"]} ({reason}); pass the port in the row '
+                                 'to join without the saved handoff')
+                self.assertEqual(self.actions, [])
+                self.assertEqual(room_file.read_bytes(), before)
+                if case in ('foreign', 'missing', 'invalid-port'):
+                    self.listeners.assert_not_called()
+                else:
+                    self.listeners.assert_called_once()
+
+    def test_saved_join_disproof_ignores_failed_invalidation(self):
+        self.seed_verified_room()
+        room_file = self.out / 'frontend-room.json'
+        before = room_file.read_bytes()
+        self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
+        self.nodes = [self.PEER_ACTION]
+        self.actions.clear()
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        with mock.patch.object(routes.os, 'replace', side_effect=PermissionError('replace denied')):
+            with self.assertRaises(routes.RoomPortDisproved) as caught:
+                routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(caught.exception), 'frontend_room: join refuses the saved room port 24890: '
+                         'a listens on UDP [24872]')
+        self.assertEqual(room_file.read_bytes(), before)
+        self.assertEqual(self.actions, [])
+        self.assertEqual(list(self.out.glob('.frontend-room.json.*.tmp')), [])
+
+    def test_declared_join_port_bypasses_stale_or_disproved_handoff(self):
+        room_file = self.out / 'frontend-room.json'
+        for verified in (True, False):
+            with self.subTest(verified=verified):
+                room_file.write_text(json.dumps({'port': 24890, 'port_verified': verified,
+                                                  'room_name': 'TR24890', 'instance': 'remote',
+                                                  'disproved': {'utc': '2026-11-24T00:00:00+00:00'}}))
+                self.nodes = [self.PEER_ACTION]
+                self.actions.clear()
+                self.listeners.reset_mock()
+                self.ctx.on = 'b'
+                result = routes.frontend_room(self.ctx, role='join', port=24991)
+                self.assertEqual(result['port'], 24991)
+                self.listeners.assert_not_called()
+                self.assertEqual([step['target']['name'] for _, step in self.actions if step['ui'] == 'click'],
+                                 ['connect'])
+
+    def test_saved_join_disproof_stops_before_existing_warning_action(self):
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24890, 'port_verified': True, 'room_name': 'TR24890', 'instance': 'a'}))
+        self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
+        self.running = True
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL]
+        self.listeners.side_effect = None
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
+        with self.assertRaisesRegex(routes.RoomPortDisproved, r'a listens on UDP \[24872\]'):
+            routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(self.actions, [])
+
+    def prepare_saved_join_warning(self, ports):
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24890, 'port_verified': True, 'room_name': 'TR24890', 'instance': 'a'}))
+        self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
+        self.running = True
+        fields = [
+            {'class': 'QLineEdit', 'name': name, 'id': 'peer-' + name, 'window': 'peer-window',
+             'visible': True, 'properties': {'text': {'value': value}}}
+            for name, value in (('nickname', 'PeerName'), ('ip', '192.0.2.1'))
+        ]
+        fields.extend({'class': 'QLineEdit', 'name': 'port', 'id': f'peer-port-{index}',
+                       'window': 'peer-window', 'visible': True, 'properties': {'text': {'value': value}}}
+                      for index, value in enumerate(ports))
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        self.actions.clear()
+        self.listeners.reset_mock()
+        self.listeners.side_effect = None
+        self.listeners.return_value = [{'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 111}]
+
+    def test_saved_join_confirms_existing_warning_with_matching_port(self):
+        self.prepare_saved_join_warning(['24890'])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            result = routes.frontend_room(self.ctx, role='join', cap=.2)
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(result['port'], 24890)
+        self.assertTrue(result['room_matched'])
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_saved_join_refuses_existing_warning_dialog_with_different_port(self):
+        self.prepare_saved_join_warning(['24902'])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            with self.assertRaisesRegex(RuntimeError, 'Direct Connect dialog is on port 24902, not the requested port 24890'):
+                routes.frontend_room(self.ctx, role='join')
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(self.actions, [])
+
+    def test_saved_join_refuses_existing_warning_with_no_port_field(self):
+        self.prepare_saved_join_warning([])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            with self.assertRaises(RuntimeError) as caught:
+                routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(caught.exception), "frontend_room: the open Direct Connect dialog's port cannot be read "
+                         '(no port field); join will not confirm it against the saved room port 24890')
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(self.actions, [])
+
+    def test_saved_join_refuses_existing_warning_with_nonnumeric_port(self):
+        for value in ('not-a-port', '', '１２３', '0' * 5000):
+            with self.subTest(value=value[:16]):
+                self.prepare_saved_join_warning([value])
+                with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+                    with self.assertRaises(RuntimeError) as caught:
+                        routes.frontend_room(self.ctx, role='join')
+                self.assertEqual(str(caught.exception),
+                                 "frontend_room: the open Direct Connect dialog's port cannot be read "
+                                 f'({value!r}); join will not confirm it against the saved room port 24890')
+                identity.assert_called_once_with(self.runner.instances['a'])
+                self.listeners.assert_called_once()
+                self.assertEqual(self.actions, [])
+
+    def test_saved_join_refuses_existing_warning_with_ambiguous_port_fields(self):
+        self.prepare_saved_join_warning(['24890', '24890'])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            with self.assertRaises(RuntimeError) as caught:
+                routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(caught.exception), "frontend_room: the open Direct Connect dialog's port cannot be read "
+                         '(ambiguous port fields); join will not confirm it against the saved room port 24890')
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(self.actions, [])
+
+    def test_declared_join_existing_warning_with_no_port_field_is_unchanged(self):
+        self.prepare_saved_join_warning([])
+        result = routes.frontend_room(self.ctx, role='join', port=24890, cap=.2)
+        self.assertIsNone(result['port'])
+        self.assertTrue(result['room_matched'])
+        self.listeners.assert_not_called()
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_reuse_without_known_port_does_not_publish_handoff(self):
+        self.nodes = [self.ROOM]
+        result = routes.frontend_room(self.ctx, room_name='TRB3Waiting')
+        self.assertIsNone(result['port'])
+        self.assertIsNone(result['port_verified'])
+        self.assertIsNone(result['bound_ports'])
+        self.assertEqual(self.actions, [])
+        self.listeners.assert_not_called()
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+
+    def test_instance_pids_read_unit_from_sibling_run_receipt(self):
+        self.ctx.instance = {'pid': 42}
+        self.assertEqual(routes._instance_pids(self.ctx), {42})
+        self.ctx.instance = {'socket': str(self.run / 'control.sock')}
+        self.assertIsNone(routes._instance_pids(self.ctx))
+        unit = 'eden-life-' + 'a' * 32 + '-a.service'
+        (self.run / 'run.json').write_text(json.dumps({'unit': unit}))
+        responses = [types.SimpleNamespace(returncode=0, stdout='111\n'),
+                     types.SimpleNamespace(returncode=0, stdout='')]
+        with mock.patch.object(routes.subprocess, 'run', side_effect=responses) as systemctl:
+            self.assertEqual(routes._instance_pids(self.ctx), {111})
+        self.assertEqual(systemctl.call_args_list[0].args[0],
+                         ['systemctl', '--user', 'show', '-p', 'MainPID', '--value', unit])
+        with mock.patch.object(routes.subprocess, 'run', side_effect=OSError('unavailable')):
+            self.assertIsNone(routes._instance_pids(self.ctx))
+        responses = [types.SimpleNamespace(returncode=0, stdout='111\n'),
+                     types.SimpleNamespace(returncode=0, stdout=f'/user.slice/{unit}\n')]
+        original_read = Path.read_text
+        def read(path, *args, **kwargs):
+            if str(path) == f'/sys/fs/cgroup/user.slice/{unit}/cgroup.procs':
+                return '111\n333\n'
+            return original_read(path, *args, **kwargs)
+        with mock.patch.object(routes.subprocess, 'run', side_effect=responses), \
+                mock.patch.object(Path, 'read_text', read), mock.patch.object(Path, 'rglob', return_value=[]):
+            self.assertEqual(routes._instance_pids(self.ctx), {111, 333})
+
+    def test_instance_pids_check_start_boot_and_zombie_before_reusing_pid(self):
+        self.ctx.instance = {'socket': str(self.run / 'control.sock'), 'pid': 42}
+        (self.run / 'run.json').write_text(json.dumps({
+            'unit': 'invalid.service',
+            'owned_pids': [
+                {'pid': 111, 'start': '900', 'boot': 'current-boot'},
+                {'pid': 222, 'start': '901', 'boot': 'current-boot'},
+                {'pid': 333, 'start': '902', 'boot': 'other-boot'},
+                {'pid': 444, 'start': '903', 'boot': 'current-boot'},
+                {'pid': 555, 'start': '904', 'boot': 'current-boot'}]}))
+        def stat(pid, state, start):
+            return f'{pid} (Eden (Game)) {state} ' + ' '.join(['0'] * 18 + [start])
+        original_read = Path.read_text
+        fake = {'/proc/sys/kernel/random/boot_id': 'current-boot\n',
+                '/proc/111/stat': stat(111, 'S', '900'),
+                '/proc/222/stat': stat(222, 'S', '999'),
+                '/proc/444/stat': stat(444, 'Z', '903')}
+        def read(path, *args, **kwargs):
+            if str(path) in fake:
+                return fake[str(path)]
+            if str(path).startswith('/proc/'):
+                raise FileNotFoundError(str(path))
+            return original_read(path, *args, **kwargs)
+        with mock.patch.object(routes.subprocess, 'run') as systemctl, mock.patch.object(Path, 'read_text', read):
+            self.assertEqual(routes._instance_pids(self.ctx), {42, 111})
+        systemctl.assert_not_called()
+
+    def test_instance_pids_union_unit_and_identity_matched_owned_entries(self):
+        self.ctx.instance = {'socket': str(self.run / 'control.sock')}
+        unit = 'eden-life-' + 'b' * 32 + '-a.service'
+        (self.run / 'run.json').write_text(json.dumps(
+            {'unit': unit, 'owned_pids': [{'pid': 999, 'start': '777', 'boot': 'boot-id'}]}))
+        responses = [types.SimpleNamespace(returncode=0, stdout='111\n'),
+                     types.SimpleNamespace(returncode=0, stdout='')]
+        original_read = Path.read_text
+        def read(path, *args, **kwargs):
+            if str(path) == '/proc/sys/kernel/random/boot_id':
+                return 'boot-id\n'
+            if str(path) == '/proc/999/stat':
+                return '999 (Eden) S ' + ' '.join(['0'] * 18 + ['777'])
+            return original_read(path, *args, **kwargs)
+        with mock.patch.object(routes.subprocess, 'run', side_effect=responses), \
+                mock.patch.object(Path, 'read_text', read):
+            self.assertEqual(routes._instance_pids(self.ctx), {111, 999})
+
+    def test_udp_listeners_parses_ipv4_ipv6_wildcard_and_multiple_users(self):
+        output = ('UNCONN 0 0 0.0.0.0:24872 0.0.0.0:* users:(("eden",pid=111,fd=3))\n'
+                  'UNCONN 0 0 [::]:24873 [::]:* users:(("Eden",pid=222,fd=4))\n'
+                  'UNCONN 0 0 *:5353 *:* users:(("one",pid=12,fd=5),("two",pid=13,fd=8))\n'
+                  'UNCONN 0 0 127.0.0.1:1234 0.0.0.0:*\n'
+                  'garbage\nUNCONN 0 0 malformed:* *:*\n')
+        invoke = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout=output))
+        self.assertEqual(self.real_udp_listeners(invoke), [
+            {'port': 24872, 'address': '0.0.0.0', 'comm': 'eden', 'pid': 111},
+            {'port': 24873, 'address': '::', 'comm': 'Eden', 'pid': 222},
+            {'port': 5353, 'address': '*', 'comm': 'one', 'pid': 12},
+            {'port': 5353, 'address': '*', 'comm': 'two', 'pid': 13},
+            {'port': 1234, 'address': '127.0.0.1', 'comm': None, 'pid': None}])
+        invoke.assert_called_once_with(['ss', '-H', '-lunp'], capture_output=True, text=True, timeout=5)
+        self.assertIsNone(self.real_udp_listeners(mock.Mock(side_effect=FileNotFoundError())))
+        self.assertIsNone(self.real_udp_listeners(mock.Mock(return_value=types.SimpleNamespace(returncode=1))))
 
     def test_join_replays_peer_sequence_and_reads_host_port(self):
-        (self.out / 'frontend-room.json').write_text(json.dumps({'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
+        (self.out / 'frontend-room.json').write_text(json.dumps(
+            {'port': 24872, 'port_verified': True, 'room_name': 'TR-proof', 'instance': 'a'}))
         self.ctx.on = 'b'
+        self.listeners.side_effect = None
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
         receipt = routes.frontend_room(self.ctx, role='join', nickname='Guest', ip='127.0.0.1')
         target = lambda cls, name: {'class': cls, 'name': name}
         self.assertEqual(self.actions, [('b', step) for step in [
@@ -887,15 +1587,43 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(receipt['evidence']['peer_action'], self.PEER_ACTION)
         self.assertEqual(receipt['evidence']['peer_dialog'], self.PEER_DIALOG)
 
+    def test_join_refuses_unverified_saved_port_but_allows_row_port(self):
+        room_file = self.out / 'frontend-room.json'
+        for value in ('missing', None, False):
+            with self.subTest(value=value):
+                saved = {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}
+                if value != 'missing':
+                    saved['port_verified'] = value
+                room_file.write_text(json.dumps(saved))
+                with self.assertRaises(RuntimeError) as caught:
+                    routes.frontend_room(self.ctx, role='join')
+                self.assertEqual(str(caught.exception), 'frontend_room: join refuses the saved room port 24872: '
+                                 'frontend-room.json does not say it was verified')
+                self.assertEqual(self.actions, [])
+                self.listeners.assert_not_called()
+        result = routes.frontend_room(self.ctx, role='join', port=24872)
+        self.assertEqual(result['port'], 24872)
+        self.assertTrue(any(step['ui'] == 'click' and step['target'].get('name') == 'connect'
+                            for _, step in self.actions))
+
+    def test_join_reuse_refuses_unverified_saved_port(self):
+        self.nodes = [self.ROOM]
+        (self.out / 'frontend-room.json').write_text(json.dumps({'port': 24872, 'room_name': 'TRB3Waiting'}))
+        with self.assertRaisesRegex(RuntimeError, 'join refuses the saved room port 24872'):
+            routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(self.actions, [])
+
     def test_no_connected_window_and_insufficient_members_fail_with_observed_titles(self):
         self.room_node = None
         with self.assertRaisesRegex(RuntimeError, 'at least 1 member\\(s\\); saw: no room window'):
             routes.frontend_room(self.ctx, port=24872, cap=.01)
         self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+        self.host_connected = False
         self.room_node = self.ROOM
         with self.assertRaisesRegex(RuntimeError, r'at least 2 member\(s\); saw: .*1/8 members'):
             routes.frontend_room(self.ctx, port=24872, members=2, cap=.01)
         self.nodes = [self.HOST_ACTION, self.PEER_ACTION]
+        self.host_connected = False
         self.room_node = {**self.ROOM, 'title': self.ROOM['title'].replace(' - connected', ' - disconnected')}
         with self.assertRaisesRegex(RuntimeError, r'at least 1 member\(s\); saw: .*disconnected'):
             routes.frontend_room(self.ctx, port=24872, cap=.01)
@@ -993,7 +1721,7 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual(self.actions[0][1]['ui'], 'click')
         self.assertEqual(self.actions[0][1]['target']['id'], 'o276')
         self.assertEqual(json.loads((self.out / 'frontend-room.json').read_text()),
-                         {'port': 24872, 'room_name': 'TR24872', 'instance': 'a'})
+                         {'port': 24872, 'port_verified': True, 'room_name': 'TR24872', 'instance': 'a'})
 
     def test_existing_warning_without_running_game_is_an_error(self):
         self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *self.RUNNING_HOST]
@@ -1140,6 +1868,9 @@ class FrontendRoomTests(unittest.TestCase):
         self.assertEqual((result['room_name'], result['port']), ('TRB3Waiting', 24872))
         self.assertTrue(result['room_matched'])
         self.assertEqual(self.actions, [])
+        self.assertTrue(result['port_verified'])
+        self.listeners.assert_called_once()
+        self.assertTrue(json.loads((self.out / 'frontend-room.json').read_text())['port_verified'])
 
     def test_reuse_rejects_wrong_saved_name(self):
         self.nodes = [self.ROOM]
@@ -1172,7 +1903,9 @@ class FrontendRoomTests(unittest.TestCase):
 
     def test_fresh_join_rejects_room_different_from_saved_name(self):
         (self.out / 'frontend-room.json').write_text(json.dumps(
-            {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
+            {'port': 24872, 'port_verified': True, 'room_name': 'TR-proof', 'instance': 'a'}))
+        self.listeners.side_effect = None
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
         self.room_node = self.ROOM
         with self.assertRaisesRegex(RuntimeError, r'for room "TR-proof" with at least 1 member\(s\); saw: .*TRB3Waiting'):
             routes.frontend_room(self.ctx, role='join', cap=.05)
@@ -1180,7 +1913,9 @@ class FrontendRoomTests(unittest.TestCase):
 
     def test_fresh_join_accepts_matching_saved_name(self):
         (self.out / 'frontend-room.json').write_text(json.dumps(
-            {'port': 24872, 'room_name': 'TR-proof', 'instance': 'a'}))
+            {'port': 24872, 'port_verified': True, 'room_name': 'TR-proof', 'instance': 'a'}))
+        self.listeners.side_effect = None
+        self.listeners.return_value = [{'port': 24872, 'address': '*', 'comm': 'eden', 'pid': 111}]
         self.room_node = {**self.ROOM, 'title': self.ROOM['title'].replace('TRB3Waiting - ', 'TR-proof - ')}
         result = routes.frontend_room(self.ctx, role='join', cap=.05)
         self.assertEqual(result['room_name'], 'TR-proof')
@@ -1307,6 +2042,17 @@ class FrontendRoomTests(unittest.TestCase):
         result = routes.frontend_room(self.ctx, port=24872, room_name='WantedRoom', cap=.05)
         self.assertEqual(result['room_name'], 'WantedRoom')
         self.assertTrue(result['room_matched'])
+        self.assertEqual(result['port'], 24872)
+        self.assertTrue(result['port_verified'])
+
+    def test_existing_warning_without_known_port_never_publishes_host_handoff(self):
+        self.running = True
+        fields = [node for node in self.RUNNING_HOST if node['name'] != 'port']
+        self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        with self.assertRaisesRegex(RuntimeError, "cannot determine this Eden's room port"):
+            routes.frontend_room(self.ctx, cap=.05)
+        self.assertFalse((self.out / 'frontend-room.json').exists())
+        self.assertFalse((self.row / 'routes-frontend-room.json').exists())
 
     def test_reuse_rejects_ambiguous_longer_room_name_without_receipt(self):
         title = 'WantedRoom - Other - Super Smash Bros. Ultimate (1/8 members) - connected'
