@@ -195,3 +195,38 @@ lines appended to it afterwards are returned, and what the old handle still had 
 keeps the read from the first byte for a plugins own rotating logs; `routes._log_cursor` chooses it by the file, never
 for the bridge captures log (a Switch instance names that one file `diag_log` and `bridge_log`). `test_routes.py` `LogCursorTests` are host tests on temporary files, one with a writer thread and one
 with `ui` lines in the shape of that boots; no runtime acceptance is claimed.
+
+2026-11-24: `tools/eden-runner/packet_gate.py` and its tests use throw-away Git repositories shaped like
+TrainingRooms `71158421` `src/model/bridge_state.rs` and `src/model/practice_state.rs`. The button table maps the
+plugin's logical order in `src/model/chords.rs` at `71158421` to `recipe_macro.BITS`. The optional witness test
+compares the extractor with a recorded `tr.menu` snapshot when supplied. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/fixtures.py` ports the Recording page role switch from
+`dispatch-pack-v2/xps/waiting_room_docs.py` and `rm_lobby_retake_steps.py`, the popup role from `repro_hw.py`, and
+the first-use Guard sequence from `f15_room_steps.py` and `edge_steps.py` onto the canonical state readers.
+The waiting-room mark and readback, including the waiting-battle predicate, and the offline seed settings follow
+`install2/flight-prep/xps_fd_room.py` and `xps-stop-71158421/xps_fd_room.py`; the latter seeds Behavior Stop rather
+than Attack. Panel readback follows `dispatch-pack-v2/xps/docs_lobby_tail.py`.
+`take-p1-ground-jump` and `take-p1-jump-only` are compiled from `f10/fixtures/take-T.json`; X as Jump has not been
+checked against a run profile. `tap-zr1` and `recording-popup-chord` reproduce the flown `rm-tap-zr` and
+`rm-popup-chord` frame shapes. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/test-data/i2-play-p1-chord.edenmacro.json` is copied from
+`install2/flight-prep/dispatch-pack-v2/yoga/segments/i2-play-p1-chord.edenmacro.json`, SHA-256
+`437b038c2da32690c3ee43c923ca3c9d9e0fe97a70eb69bfdb75eeb523e66cb3`. The event extractor tests model
+TrainingRooms `71158421` `src/model/bridge_events.rs` lines 23–26, 45 and 132. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/fixtures.py` ports finite watch qualification from
+`dispatch-pack-v2/xps/bridge_watch_steps.py`, field parsing from `f16_judge.py` and effective partner readback
+from `f15_room_steps.py`, using canonical native state, log cursor and bridge request helpers. The fighter
+lines in `test_fixtures.py` are modelled, not recorded. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/runner.py` separates visual and deterministic blockers, binds visual reads to
+runner captures, and ties producer receipts to packet and canonical runner inputs. Offline fake-client
+regressions model the reviewer and F10 missing-delivery controls; host tests only, no runtime acceptance.
+Named GIF outputs are excluded from the input identity, including nested and recovery steps; collisions
+with packet inputs are refused and do not gain that exclusion.
+
+2026-11-24: `eden-runner/runner.py` binds visual reads to the still's own capture, an explicit source,
+or a unique matching capture; duplicate hashes no longer select an arbitrary receipt. Judge verdicts
+clear visual blockers only, leaving deterministic blockers unresolved. Host tests only.

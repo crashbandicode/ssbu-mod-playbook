@@ -25,6 +25,19 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def effect_evidence(value):
+    if isinstance(value, dict):
+        marker = value.get('unverified')
+        return (bool(value) and not (isinstance(marker, str) and marker)
+                and value.get('grade') != 'NEEDS VISUAL READ' and value.get('visual_verdict') != 'pending'
+                and ('verdict' not in value or str(value['verdict']).upper() == 'PASS')
+                and ('pass' not in value or value['pass'] is True))
+    return ((isinstance(value, str) and bool(value))
+            or (isinstance(value, (int, float)) and not isinstance(value, bool)))
+
+
 NO_EFFECT_DIFF = 3.0      # mean abs RGB diff (0-255, 320x180) below which two frames are "the same picture"
 JUDGE_TIMEOUT_S = 600
 FRAME_NAMES = ('start', 'mid', 'end')
@@ -219,7 +232,21 @@ def apply_verdict(receipt, check, verdict, frames, known=None):
     if issue:  # not chased, not counted by the consecutive-failure stop; listed apart in FAILING.md
         status, reason, review = 'KNOWN-PRODUCT-ISSUE', f'known issue {",".join(issue["ids"])}: {issue["judge_reason"]}', False
         receipt['known_issue'] = issue
-    receipt['judge'] = {'state': 'done', **(verdict or {}), 'frames': frames, 'landed': time.time()}
+    landed = time.time()
+    receipt['judge'] = {'state': 'done', **(verdict or {}), 'frames': frames, 'landed': landed}
+    if status == 'PASS' and 'blockers' in receipt:
+        blockers = receipt['blockers'] or []
+        visual = [blocker for blocker in blockers if blocker.get('kind') == 'visual']
+        if visual:
+            receipt['cleared'] = list(receipt.get('cleared') or []) + [
+                {**blocker, 'by': 'judge', 'landed': landed} for blocker in visual]
+        remaining = [blocker for blocker in blockers if blocker.get('kind') != 'visual']
+        receipt['blockers'] = remaining
+        if remaining:
+            status, reason, review = 'RAN-UNVERIFIED', remaining[0]['text'], True
+            receipt['review_kind'] = 'unverified'
+        elif visual:
+            receipt.pop('review_kind', None)
     receipt['clip_check'] = check
     receipt['status'] = status
     receipt['status_reason'] = reason

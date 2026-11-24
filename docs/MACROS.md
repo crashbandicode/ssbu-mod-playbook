@@ -241,7 +241,8 @@ The rules:
      `out/summary.json` lists every row as pass, fail, skipped or not run,
      with each failure's reason and evidence paths. `--rows failed` reruns
      only the rows whose receipt is FAILED, after a fix; passed rows are
-     skipped. If a row's recovery fails but the game is still running, that
+     skipped. A passed row named explicitly in `--rows` runs again; an unnamed
+     passed row is skipped. If a row's recovery fails but the game is still running, that
      row is FAILED without running its steps; the runner tries to recover the
      next row. It writes `STOP-INPUT` and stops when the game is no longer
      running (`running` false, or a crash).
@@ -383,6 +384,151 @@ The rules:
     rows passed on their setup gates while their clips showed no respawn, no
     hit during playback, and no difference between SDI on and off. The
     coordinator's frame review caught it.)
+
+#### Packet gate
+
+`rows.json` names the build it was checked against in `target`: `plugin.tree`,
+`plugin.commit`, and `plugin.nro_sha256`, with optional `bridge.tree` and
+`bridge.commit`, `settings`, and `providers`. The trees are absolute Git
+directories and the commits are full commit IDs. Provider source files are read
+from the named commit, never from the working tree; the settings fixture is
+read from the rows folder.
+
+The lifecycle's Up check and `runner.py up-check`, `run`, `self-test`, and
+`capture-fixture` refuse a plan without a target. `dry-run` and `replay` report
+`NO TARGET` instead. Each checked runner command writes `out/packet-gate.json`
+at the start. `eden_test.py check` also refuses a target NRO that is not staged
+or does not contain the plugin commit's first eight characters.
+
+Rows can declare `needs`, `gives`, and `reads` (`"<provider>:<key>"`); setup
+items can declare `gives`. A segment can name its persisted input `binding`.
+The plan can allow a path into another run with `allow_paths`, an entry with
+the exact `path` and a `reason`. Packet-gate errors name their check:
+
+- **G1:** a hook's call shape does not accept its arguments, or its module does
+  not import on its own.
+- **G2:** a declared read is not written by the target.
+- **G3:** the recipe, compiled macro, and persisted binding differ; a persisted
+  chord has no binding, or a chord has no settings against which to check it.
+- **G4:** a path points into another run, or a local file is missing.
+- **G5:** a test row has no checked effect, judged expectation, or visual outcome.
+- **G6:** a need has no matching earlier giver.
+- **G8:** `ctx.play` names no plan segment, or `routes.play` names no library macro.
+- **G9:** an effect hook's judge cases are malformed, disagree, or are not
+  connected to that hook.
+
+An effect hook can declare `"cases": {"judge": "judge.py:judge", "dir":
+"cases/name"}`. Each JSON case supplies `args`, `files` (argument names to
+relative line-file paths), `expect` (`accept` or `reject`), and optionally
+`contains` for a rejection. Cases are discovered recursively; the directory
+must hold only case JSON files, with data files in other formats or outside it.
+The judge returns evidence for accept; a reject
+raises or returns a non-evidence value. A test effect hook with no cases warns,
+or refuses when the plan sets `require_cases: true`. Setup rows, effect gates
+and shared `fixtures:` hooks are not asked for cases.
+
+A dependent row whose source row did not pass is not played. Its receipt says
+`NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
+A passing source receipt must also match the dependent row's plan identity and
+instances file hash and inputs identity; otherwise it is not played and its receipt says
+`NOT RUN (setup): needs "<token>" from row <id>, whose receipt is from another packet or another Up`.
+Rerun the producer with the dependent using
+`eden_test.py run <run> --rows <producer>,<dependent>`.
+The identity hashes the library-expanded plan, excluding segment `sha256` and
+`recorded` and gate `sha256` and `acquired` written during a run. It includes
+the segment file and start gate changed by `record-stop`; changing those names
+a different plan. The instances hash does not detect a game reload inside the
+same Up. The inputs identity hashes the rows folder and canonical runner Python,
+excluding `rows.json`, `out/`, caches and `packet-gate.json`, recorded or missing
+segment files, acquired or acquirable gate references, and a GIF step's named
+`out` file, including nested steps and recovery; G4 refuses an `out` that names
+a packet input (including any `.py` or `.json`), and it is not excluded as a GIF.
+The G2 undeclared-read net checks dotted subscript and `.get` keys in local
+hooks when their first segment is known to a provider; `reads_ignore` can list
+an exact `key` with a `reason`. Play calls with computed names or unknown
+callees are warned about, not checked. The built-in providers are `tr.menu`,
+`tr.practice` and `tr.event`;
+event reads use names such as `tr.event:fed run.p1`. A dotted
+string literal in a provider's source file is accepted as a key. The packet
+gate has host tests; it has not been proven in a runtime acceptance.
+
+#### What PASS means
+
+With a target or `require_effect`, a test row without a judge reaches PASS only
+with a checked effect. A gate can declare `effect: true`; a `run` step can
+declare `effect: true` and return evidence (a non-empty dict or string, or a
+number other than a boolean). A boolean, empty value or unverified hook result
+is not evidence. A dictionary with `verdict` is evidence only for PASS
+(case-insensitive); one with `pass` is evidence only when that value is true.
+A hook's `unverified` text, `NEEDS VISUAL READ` grade or
+pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
+A receipt records separate visual, unverified and effect blockers. A visual
+read can clear only visual blockers, never a missing deterministic observation
+or effect; a judge's PASS likewise clears only visual blockers. Remaining
+blockers keep the row RAN-UNVERIFIED.
+A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
+resuming without naming it does not promote it. A setup row's PASS still means
+its steps did not raise.
+
+Record a visual read with
+`runner.py record-read rows.json --out out --rows <id> --reader <who> --verdict PASS|FAIL --text "<what the still shows>" --still <out/id/still>`.
+The still must be inside the row folder and match a runner capture from the same
+plan and instances file; a copied capture also needs the same inputs identity.
+The read stores the capture's name, hash, UTC time and scalar status snapshot. The runner
+records every still taken inside a row, including image-gate polling stills, as a
+capture with one `status` call after each. It does not yet check still freshness
+against the game frame.
+The still's own recorded path selects its capture; otherwise use
+`--capture <row>:<file>` to name its source, or omit it when the hash matches
+exactly one capture. An ambiguous hash is refused.
+A judge, when configured, decides those rows instead.
+
+#### Fixtures
+
+The shared `fixtures:recording_role` hook checks the Recording page or popup
+and gives `recording.role=<role>` or `recording.popup.role=<role>` respectively.
+`fixtures:guard_first_use` advances a cold wizard behind its state reads and
+gives `guard.ready` for the default `guard_edge` game, or `practice.ready=<game>`
+for another game. `fixtures:mark_before_room` records the native main-menu
+epoch and bridge-log offset immediately before `routes:wireless_room`; it gives
+nothing. `fixtures:seeded_room` reads the waiting host, settings and native
+waiting battle, and checks the last stage line after that mark. It gives
+`lobby.practice=on`, `partner.behavior=<behavior>` and `lobby.stage=<stage>`.
+`partner.behavior` is the stored panel value; this fixture does not read the
+partner's effective Behavior.
+By default it uses the mark in this row; `mark_row` names an earlier row under
+`out/`. Fixture gives apply to later rows.
+
+`fixtures:fresh_watch` captures a finite bridge fighter window after a fresh
+native roster baseline; `fixtures:cpu_standing` requires a still grounded Wait
+fighter and gives `cpu.standing`. `fixtures:partner_effective` checks every
+sample's `eb` and `ab`, records (but does not gate) the `cpu` flag, and gives
+`partner.effective=<eb>`. Stored Behavior 1 (Stop) has `eb=1 ab=1`, and stored
+Behavior 7 (Attack) has `eb=34 ab=34`; no other mapping is established.
+
+To install a saved take before load, pin a reviewed TrainingRooms library root
+through the run config's `files` using the existing setup `via: fixture`
+mechanism, and give `"take:<name>"` in that setup item's `gives`. No hook records
+a take yet.
+
+Before game load, the offline seed command writes a new settings file without
+changing its base:
+
+```
+/usr/bin/python3 -I tools/eden-runner/fixtures.py seed --base settings.json --out seed.json --behavior 7 --stage 3
+```
+
+The optional `--partners` defaults to 1. The writer refuses an inherited
+custom Direct stage and refuses to overwrite its output.
+`window_from_wait` selects a consecutive grounded Wait stream window after its
+first observation, which is a baseline and is not counted. Capture at least one
+sample before the desired window: 300 Wait samples from the first report 299 of 300. The
+`take-p1-ground-jump` and `take-p1-jump-only` library macros use X for Jump;
+the run's control binding has not been verified. Host tests do not prove
+runtime behavior. Not covered: the live take-recording hook, a CPU take,
+Training CPU behaviour, other bridge providers, or comparing
+a saved take with the pinned input list (it comes with the take-recording
+hook, against a real saved take).
 
 #### The shared runner: a helper, extended per project
 
