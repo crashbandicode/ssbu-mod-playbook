@@ -1993,7 +1993,8 @@ fn elsewhere() { write!(out, "outside=1"); }
 
     def test_play_names_the_gate_can_resolve(self):
         self.plan['segments'].update({name: {'file': f'{name}.json'} for name in ('tap-a', 'tap-b', 'tap-x', 'hold')})
-        tables = 'TAP = {"A": "tap-a", "B": "tap-b", "X": "tap-x"}\nHOLD = "hold"\n'
+        tables = ('TAP = {"A": "tap-a", "B": "tap-b", "X": "tap-x"}\nHOLD = "hold"\n'
+                  'FIRST, SECOND = TAP["A"], TAP["B"]\n')
 
         def gate(body, extra=''):
             steps = (self.HOOK_HEAD + 'import tables\nfrom tables import TAP, HOLD\n' + extra
@@ -2009,6 +2010,8 @@ fn elsewhere() { write!(out, "outside=1"); }
         # A choice between names, a module constant, a local set once.
         self.assertEqual(gate('    ctx.play(TAP["X"] if fast else HOLD)\n'), ([], [], ['hold', 'tap-x']))
         self.assertEqual(gate('    name = tables.HOLD\n    ctx.play(name)\n'), ([], [], ['hold']))
+        # Two module constants set in one statement.
+        self.assertEqual(gate('    ctx.play(tables.FIRST if fast else tables.SECOND)\n'), ([], [], ['tap-a', 'tap-b']))
         # A play on the context an object keeps. It was neither checked nor warned about.
         session = ('class Session:\n    def __init__(self, ctx):\n        self.ctx = ctx\n'
                    '    def press(self):\n        self.ctx.play(TAP["A"])\n')
