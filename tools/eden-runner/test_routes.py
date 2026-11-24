@@ -2848,6 +2848,10 @@ class WirelessRoomTests(unittest.TestCase):
             self.main_owner = 'native'
             self.room_list_missing = False
             self.stuck_in_list = False
+            self.room_focus_id = 'ldn.create_room'
+            self.room_focus_index = '0'
+            self.room_focus_after_send = None
+            self.lost_create_sends = 0
             self.form_script = []
             self.form_screen = 'unknown'
             self.confirm_form_reads = 0
@@ -3050,6 +3054,8 @@ class WirelessRoomTests(unittest.TestCase):
                     'observation.active': 'no' if screen == 'unknown' else 'yes',
                     'ldn.role': role, 'ldn.members': 'unknown',
                 }
+                if screen == 'ldn.room_list':
+                    values.update({'focus.id': self.room_focus_id, 'focus.index': self.room_focus_index})
                 if self.phase == self.ready_no_phase:
                     values['input.ready'] = 'no'
                 elif self.phase == 'stage' and self.stage_ready_after:
@@ -3072,7 +3078,11 @@ class WirelessRoomTests(unittest.TestCase):
                 if not self.room_list_missing:
                     self.phase = 'rooms'
             elif macro == 'tap-a1' and self.phase == 'rooms':
-                if not self.stuck_in_list:
+                if self.lost_create_sends:
+                    self.lost_create_sends -= 1
+                    if self.room_focus_after_send is not None:
+                        self.room_focus_id, self.room_focus_index = self.room_focus_after_send
+                elif not self.stuck_in_list:
                     self.phase = 'form'
             elif macro == 'tap-plus1' and self.phase in ('form', 'confirm_form', 'unpublished', 'wrong'):
                 self.confirm_count += 1
@@ -3576,6 +3586,56 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.stage_count, 2)
         self.assertEqual(result['stage_presses'], 2)
         self.assertEqual(next(s for s in result['steps'] if s['name'] == 'stage-a')['sends'], 2)
+
+    def test_open_create_presses_only_on_the_create_row(self):
+        self.io.phase = 'rooms'
+        self.run_room(unpublished_create='allow')
+        index = self.io.events.index(('send', 'tap-a1'))
+        reads = [event[2] for event in self.io.events[:index] if event[:2] == ('read', 'ssbu.ui')]
+        self.assertEqual((reads[-1]['focus.id'], reads[-1]['focus.index']), ('ldn.create_room', '0'))
+        self.assertEqual(self.io.actions.count('tap-a1'), 1)
+
+    def test_a_room_row_focus_gets_no_a(self):
+        self.io.phase = 'rooms'
+        self.io.room_focus_id = 'ldn.room.aabbccddeeff.' + 'a' * 32
+        self.io.room_focus_index = '1'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'open-create')
+        self.assertIn('the Create row is not focused', caught.exception.reason)
+        self.assertIn(self.io.room_focus_id, caught.exception.reason)
+        self.assertNotIn('tap-a1', self.io.actions)
+
+    def test_an_unknown_room_list_focus_is_an_unsupported_reader_stop(self):
+        self.io.phase = 'rooms'
+        self.io.room_focus_id = self.io.room_focus_index = 'unknown'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'open-create')
+        self.assertIn('the Create row is not focused', caught.exception.reason)
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['unsupported_reader'], 'ldn.room_list focus')
+        self.assertNotIn('tap-a1', self.io.actions)
+
+    def test_a_lost_create_a_is_not_repeated_after_the_focus_moved_to_a_room(self):
+        self.io.phase = 'rooms'
+        self.io.lost_create_sends = 1
+        self.io.room_focus_after_send = ('ldn.room.aabbccddeeff.' + 'b' * 32, '1')
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'open-create')
+        self.assertIn('source target changed', caught.exception.reason)
+        self.assertEqual(self.io.actions.count('tap-a1'), 1)
+        self.assertEqual(self.io.pending, 'tap-a1')
+        sent = self.io.events.index(('send', 'tap-a1'))
+        self.assertFalse(any(event[0] == 'finish' for event in self.io.events[sent + 1:]))
+
+    def test_a_lost_create_a_is_repeated_on_the_same_create_row(self):
+        self.io.phase = 'rooms'
+        self.io.lost_create_sends = 1
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.actions.count('tap-a1'), 2)
+        self.assertEqual(result['result'], 'PASS with 1 stall')
 
     def test_a_press_on_the_first_stage_select_read_is_refused_while_not_ready(self):
         self.io.phase = 'stage'

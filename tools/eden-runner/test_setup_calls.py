@@ -389,6 +389,27 @@ class MenuReplay:
             raise AssertionError(segment)
 
 
+def retrying_menu(ctx, advance):
+    replay = MenuReplay()
+    replay.ctx = ctx
+    original_read, original_send = replay.read, replay.send
+    dropped = []
+
+    def read(provider, cap):
+        advance()
+        return original_read(provider, cap)
+
+    def send(macro):
+        if macro == 'tap-a1' and not dropped:
+            dropped.append(True)
+            replay.actions.append(macro)
+            return
+        original_send(macro)
+
+    replay.read, replay.send = read, send
+    return replay
+
+
 class SetupCallsR2Tests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -1147,7 +1168,7 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.io = ReachTrainingPhaseReplay(self.ctx)
         self.state = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
 
-    def invoke(self, **kwargs):
+    def invoke(self, *, set_fighter=None, **kwargs):
         with ExitStack() as stack:
             stack.enter_context(patch.object(routes, 'BridgePickerIO', return_value=self.io))
             stack.enter_context(patch.object(routes.time, 'monotonic', side_effect=lambda: self.io.now))
@@ -1158,8 +1179,8 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
                          'pick_fighters', 'enter_training'):
                 stack.enter_context(patch.object(routes, name, side_effect=lambda *a, _name=name, **k:
                                                  self.io.phase(_name)))
-            stack.enter_context(patch.object(routes, '_set_fighter', side_effect=lambda *a, **k:
-                                             self.io.phase('set_cpu')))
+            stack.enter_context(patch.object(routes, '_set_fighter', side_effect=set_fighter or
+                                             (lambda *a, **k: self.io.phase('set_cpu'))))
             return routes.reach_training(self.ctx, 'Mario', cpu='Fox', **kwargs)
 
     def sleep(self, seconds):
@@ -1175,6 +1196,93 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['starts']['pick_stage'], 2)
         self.assertEqual(result['retries'], {'pick_stage': 1})
         self.assertEqual(result['recovered'], [])
+
+    def test_a_phase_whose_effect_already_applied_is_not_dispatched_again(self):
+        self.io.screen = 'training'
+        self.state['roster'][1]['kind'] = 3
+        self.io.failures['set_cpu'] = 1
+        self.io.after_failure = lambda io, name: self.state['roster'][1].update(kind=7)
+        result = self.invoke()
+        self.assertEqual(self.io.calls, ['set_cpu'])
+        self.assertEqual(result['recovered'], ['set_cpu'])
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        self.assertEqual(result['stalls'][0]['kind'], 'phase-recovered')
+
+    def test_a_same_screen_failure_with_the_postcondition_unmet_is_retried(self):
+        self.io.screen = 'training'
+        self.state['roster'][1]['kind'] = 3
+        self.io.failures['set_cpu'] = 1
+        original = self.io.phase
+
+        def phase(name):
+            result = original(name)
+            if name == 'set_cpu':
+                self.state['roster'][1]['kind'] = 7
+            return result
+
+        self.io.phase = phase
+        result = self.invoke()
+        self.assertEqual(self.io.calls, ['set_cpu', 'set_cpu'])
+        self.assertEqual(result['retries'], {'set_cpu': 1})
+        self.assertEqual(result['stalls'][0]['kind'], 'phase-retry')
+
+    def test_an_inner_training_resend_is_a_stall_and_not_a_plain_pass(self):
+        self.io.screen = 'training'
+        self.state['roster'][1]['kind'] = 3
+        menu = retrying_menu(self.ctx, lambda: self.sleep(1))
+
+        def set_cpu(ctx, fighter, seat, cap, metrics):
+            before = menu.read('tr.menu', 2)
+            routes._tr_input(menu, before, 'tap-a1', self.io.now + 20)
+            self.state['roster'][1]['kind'] = 7
+            return {'block': 'set_cpu'}
+
+        result = self.invoke(set_fighter=set_cpu)
+        self.assertEqual(menu.actions, ['tap-a1', 'tap-a1'])
+        self.assertEqual((result['result'], result['input_retries'], result['retries']),
+                         ('PASS with 1 stall', 1, {}))
+        event, = result['stalls']
+        self.assertEqual((event['kind'], event['block'], event['step'], event['send']),
+                         ('resend', 'tr_input', 'tap-a1', 2))
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [event])
+
+    def test_an_inner_resend_event_is_recorded_exactly_once_when_blocks_nest(self):
+        menu = retrying_menu(self.ctx, lambda: self.sleep(1))
+
+        def inner(metrics):
+            before = menu.read('tr.menu', 2)
+            routes._tr_input(menu, before, 'tap-a1', self.io.now + 20)
+            return {'block': 'inner', **metrics}
+
+        def outer(metrics):
+            inner_receipt = routes._block(self.ctx, 'inner', 'inner', {}, inner)
+            return {'block': 'outer', 'inner': inner_receipt, **metrics}
+
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: self.io.now):
+            result = routes._block(self.ctx, 'outer', 'outer', {}, outer)
+        self.assertEqual(result['retries'], 1)
+        self.assertEqual(len(result['stalls']), 1)
+        self.assertEqual(result['inner']['stalls'], result['stalls'])
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, result['stalls'])
+
+    def test_a_block_receipt_with_a_retry_lists_its_stall(self):
+        menu = retrying_menu(self.ctx, lambda: self.sleep(1))
+
+        def open_menu(io, until, page):
+            before = io.read('tr.menu', 2)
+            return routes._tr_input(io, before, 'tap-a1', until), []
+
+        owner = recorded.native(99, **{'input.owner': 'tr.menu'})
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: self.io.now), \
+             patch.object(routes, 'BridgePickerIO', return_value=menu), \
+             patch.object(routes, '_open_menu', side_effect=open_menu), \
+             patch.object(routes, '_wait_training_owner', return_value=owner):
+            result = routes.tr_open(self.ctx)
+        self.assertEqual(result['retries'], 1)
+        self.assertEqual(len(result['stalls']), 1)
+        self.assertEqual(result['stalls'][0]['step'], 'tap-a1')
 
     def test_a_phase_whose_transition_happened_anyway_is_not_run_again(self):
         self.io.failures['pick_stage'] = 1
