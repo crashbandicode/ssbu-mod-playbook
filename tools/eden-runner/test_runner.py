@@ -1825,6 +1825,157 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(recorded['acquired'])
         self.assertEqual(run.plan['gates']['capped']['sha256'], recorded['sha256'])
 
+    def test_timed_out_acquisition_rolls_back_at_each_publication_stage(self):
+        for phase in ('reference', 'manifest', 'receipt'):
+            with self.subTest(phase=phase):
+                bridge = self.dir / f'{phase}-bridge.log'
+                self.instances['a']['bridge_log'] = str(bridge)
+                eden = FreshEden(bridge, [1000, 1001, 1002, 1003])
+                eden.colour = RED
+                name = 'acquire-' + phase
+                gate = {'kind': 'image', 'reference': f'refs/{phase}.png', 'acquire': True,
+                        'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+                self.plan['gates'][name] = gate
+                self.manifest.write_text(json.dumps(self.plan))
+                before = self.manifest.read_bytes()
+                run = self.make(eden)
+                entered, release = threading.Event(), threading.Event()
+                workers = []
+                reference = self.dir / gate['reference']
+                replace = Path.replace
+
+                def block():
+                    workers.append(threading.current_thread())
+                    entered.set()
+                    release.wait(1)
+
+                def replacement(path, target):
+                    if ((phase == 'reference' and Path(target) == reference)
+                            or (phase == 'manifest' and Path(target) == self.manifest)):
+                        block()
+                    return replace(path, target)
+
+                class Receipts(list):
+                    def append(self, value):
+                        if phase == 'receipt':
+                            block()
+                        super().append(value)
+
+                run.acquired = Receipts()
+                try:
+                    with mock.patch.object(Path, 'replace', new=replacement):
+                        answered = runner.macro_gate.bounded_call(
+                            lambda _: run.check_gate('a', name), 'gate', .22)
+                        self.assertEqual(answered, (False, None))
+                        self.assertTrue(entered.is_set())
+                        report = runner.dry_run(self.manifest)
+                        self.assertIn(name, report['references_to_acquire'])
+                        release.set()
+                        workers[0].join(1)
+                        self.assertFalse(workers[0].is_alive())
+                    self.assertEqual(self.manifest.read_bytes(), before)
+                    self.assertFalse(reference.exists())
+                    self.assertEqual(run.acquired, [])
+                    self.assertNotIn('sha256', run.plan['gates'][name])
+                    self.assertNotIn('acquired', run.plan['gates'][name])
+                    with mock.patch.object(run, 'compare_region',
+                                           side_effect=AssertionError('unapproved reference was used')):
+                        result = run.check_gate('a', name)
+                    entry = json.loads(self.manifest.read_text())['gates'][name]
+                    self.assertEqual(entry['sha256'], sha(result))
+                    self.assertTrue(entry['acquired'])
+                    self.assertEqual(len(run.acquired), 1)
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(1)
+                        self.assertFalse(worker.is_alive())
+
+    def test_abandoned_replacement_restores_an_older_reference(self):
+        bridge = self.dir / 'old-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        reference = self.dir / 'refs' / 'old.png'
+        Image.new('RGB', (64, 36), BLUE).save(reference)
+        old_bytes = reference.read_bytes()
+        gate = {'kind': 'image', 'reference': 'refs/old.png', 'acquire': True, 'sha256': sha(reference),
+                'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.plan['gates']['old'] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        before = self.manifest.read_bytes()
+        run = self.make(eden)
+        run.acquired = []
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+        replace = Path.replace
+
+        def replacement(path, target):
+            if Path(target) == reference:
+                workers.append(threading.current_thread())
+                entered.set()
+                release.wait(1)
+            return replace(path, target)
+
+        try:
+            with mock.patch.object(Path, 'replace', new=replacement):
+                answered = runner.macro_gate.bounded_call(
+                    lambda _: run.acquire('a', 'old', run.plan['gates']['old'], time.monotonic() + 2),
+                    'gate', .22)
+                self.assertEqual(answered, (False, None))
+                self.assertTrue(entered.is_set())
+                release.set()
+                workers[0].join(1)
+                self.assertFalse(workers[0].is_alive())
+            self.assertEqual(reference.read_bytes(), old_bytes)
+            self.assertEqual(self.manifest.read_bytes(), before)
+            self.assertEqual(run.acquired, [])
+            self.assertEqual(run.plan['gates']['old'], gate)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+
+    def test_an_exception_during_acquisition_restores_reference_and_manifest(self):
+        bridge = self.dir / 'error-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        gate = {'kind': 'image', 'reference': 'refs/error.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.plan['gates']['error'] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        before = self.manifest.read_bytes()
+        run = self.make(eden)
+        run.acquired = []
+        replace = Path.replace
+
+        def replacement(path, target):
+            if Path(target) == self.manifest:
+                raise OSError('manifest replacement failed')
+            return replace(path, target)
+
+        with mock.patch.object(Path, 'replace', new=replacement):
+            with self.assertRaisesRegex(OSError, 'manifest replacement failed'):
+                run.check_gate('a', 'error')
+        self.assertFalse((self.dir / gate['reference']).exists())
+        self.assertEqual(self.manifest.read_bytes(), before)
+        self.assertEqual(run.acquired, [])
+        self.assertEqual(run.plan['gates']['error'], gate)
+
+    def test_legacy_hashed_acquisition_reference_remains_usable(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        gate = dict(self.plan['gates']['red'], acquire=True)
+        self.plan['gates']['legacy'] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(eden)
+        run.acquired = []
+        run.check_gate('a', 'legacy')
+        self.assertEqual(run.acquired, [])
+        self.assertTrue(run.last_gate_outcome['passed'])
+
     def test_acquisition_receipt_publication_cannot_outlive_the_gate_cap(self):
         bridge = self.dir / 'bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)
