@@ -2096,6 +2096,9 @@ fn elsewhere() { write!(out, "outside=1"); }
         # A written name outside its own set is refused.
         self.assertEqual(gate('def ok(ctx):\n    ctx.play("take-cpu", among=("take-p1",))\n'),
                          (['G8 steps.py: ctx.play("take-cpu") is not among the names it declares'], []))
+        # Also when another call of the same hook plays that name.
+        self.assertEqual(gate('def ok(ctx):\n    ctx.play("take-cpu")\n    ctx.play("take-cpu", among=("take-p1",))\n'),
+                         (['G8 steps.py: ctx.play("take-cpu") is not among the names it declares'], []))
 
     def test_a_hook_that_reads_a_key_the_build_does_not_write_is_refused(self):
         (self.base / 'steps.py').write_text(

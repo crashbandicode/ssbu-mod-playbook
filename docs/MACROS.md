@@ -495,8 +495,10 @@ At run time `ctx.play` refuses a name the gate did not check for this plan,
 before anything is sent, and a name outside its `among=` set. So a call the
 gate could not follow stops the row; it does not play an unchecked name. A
 manifest `{"play": ...}` step and `routes.play` are not restricted this way;
-library macros are hash-checked by the library index. The report lists the
-checked names as `plays`.
+library macros are hash-checked by the library index. This is not a check of
+every input a hook can send: a hook that calls `ctx.call("macro.play", ...)`
+or `ctx.press` sends input G8 does not see. The report lists the checked names
+as `plays`.
 
 The built-in providers are `tr.menu`,
 `tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need

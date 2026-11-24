@@ -1777,6 +1777,37 @@ class RunnerTests(unittest.TestCase):
         status, sent, error = run('def press(ctx):\n    ctx.play("to-" + "red", among=("pause",))\n')
         self.assertEqual((status, sent), ('FAILED', 0))
         self.assertIn('to-red is not among the names this step declares', error)
+        # A value outside a call's own set stops even though another call of this plan plays that value.
+        status, sent, error = run('def press(ctx):\n    ctx.play("pause")\n'
+                                  '    ctx.play("pa" + "use", among=("to-red",))\n')
+        self.assertEqual((status, sent), ('FAILED', 1))
+        self.assertIn('pause is not among the names this step declares', error)
+
+    def test_an_unchecked_manifest_segment_has_no_side_effect_when_a_hook_plays_it(self):
+        # Both segments are in the manifest. `to-red` has a valid hash and a start gate; `to-blue` has a recipe and
+        # no file, so playing it would record. The gate checked neither for this plan: its only hook plays `pause`.
+        self.plan['segments']['to-red']['start_gate'] = 'red'
+        (self.dir / 'steps.py').write_text('def press(ctx):\n    ctx.play("pause")\n')
+        self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'run': 'steps.py:press'}]}]
+        self.manifest.write_text(json.dumps(self.plan))
+        eden = FakeEden({'to-red': RED})
+        run = self.make(eden)
+        self.assertEqual(run.play_names(), {'pause'})
+        ctx = runner.StepContext(run, 'a')
+        before = list(eden.calls)
+        with mock.patch.object(run, 'gate') as gate, mock.patch.object(run, 'record') as record:
+            for name in ('to-red', 'to-blue'):
+                with self.assertRaisesRegex(RuntimeError, f'G8: ctx.play\\("{name}"\\) is a name the packet gate '
+                                                          'did not check for this plan; nothing was sent'):
+                    ctx.play(name)
+            gate.assert_not_called()
+            record.assert_not_called()
+        # No request reached Eden: no start-gate capture, no recording, no macro.
+        self.assertEqual(eden.calls, before)
+        self.assertFalse((self.dir / 'segments' / 'to-blue.edenmacro.json').exists())
+        # The checked name does go through, start to finish.
+        ctx.play('pause')
+        self.assertEqual(eden.calls[len(before):].count('macro.play'), 1)
 
     def _check_unusual_step_value(self, expression, expected):
         (self.dir / 'steps.py').write_text('def value(ctx):\n    return ' + expression + '\n')
