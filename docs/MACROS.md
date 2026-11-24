@@ -433,6 +433,12 @@ raises or returns a non-evidence value. A test effect hook with no cases warns,
 or refuses when the plan sets `require_cases: true`. Setup rows, effect gates
 and shared `fixtures:` hooks are not asked for cases.
 
+Shared effect hooks can declare a module-level literal `EFFECT_JUDGES` mapping
+each hook name to `{"judge": "function", "cases": "folder"}`. The judge is a
+function in the same module, which the hook calls by name; its cases live under
+`tools/eden-runner/library/cases/<folder>`. The gate runs them automatically;
+packets must not declare `cases` on a shared hook. `fixtures:` remains exempt.
+
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
 A passing source receipt must also match the dependent row's plan identity and

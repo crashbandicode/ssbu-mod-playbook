@@ -254,3 +254,6 @@ and commit, `src/native_ui/pause_focus.rs` lines 26–63 and 65–71; full blob 
 commit `ed2655d4`, `src/native_ui/mod.rs` lines 507–524, 634–711 and 714–720; full blob SHA-256
 `265aa2441a219d917066d3ed60a090836dce15cacb90fe7f51ed7f7133d9df4e`.
 Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/packet_gate.py` G9 supports shared-hook
+`EFFECT_JUDGES` and library cases. Host tests only; no runtime acceptance.
