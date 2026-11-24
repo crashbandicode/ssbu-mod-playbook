@@ -452,7 +452,9 @@ an exact `key` with a `reason`. Play calls with computed names or unknown
 callees are warned about, not checked. The built-in providers are `tr.menu`,
 `tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need
 `target.bridge`. Example reads include `tr.event:fed run.p1`,
-`ssbu.ui:input.ready`, `bridge:fighter status` and `bridge:input lx`.
+`ssbu.ui:input.ready`, `bridge:fighter status`, `bridge:input lx` and `bridge:ev`.
+The `bridge` provider reads `src/proto2.rs`, `src/hooks.rs`, `src/model.rs` and
+`src/runtime.rs` at the named commit.
 An event can follow one leading bracket tag, as in `[Bridge] fighter entry=...`;
 continuation literals without their own event contribute bare keys only.
 A dotted string literal in a provider's source file is accepted as a key.

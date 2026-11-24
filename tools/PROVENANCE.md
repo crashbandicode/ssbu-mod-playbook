@@ -222,5 +222,6 @@ or a unique matching capture; duplicate hashes no longer select an arbitrary rec
 clear visual blockers only, leaving deterministic blockers unresolved. Host tests only.
 
 2026-11-24: `eden-runner/packet_gate.py` bridge provider tests model `src/native_ui/mod.rs`,
-`src/proto2.rs`, `src/hooks.rs` and `src/model.rs` in bridge commits `ed2655d4` and `1a9b28ad`.
+`src/proto2.rs`, `src/hooks.rs`, `src/model.rs` and `src/runtime.rs` in bridge commits
+`ed2655d4` and `1a9b28ad`.
 Host tests only; no runtime acceptance.

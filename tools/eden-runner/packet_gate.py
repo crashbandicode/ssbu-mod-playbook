@@ -15,7 +15,7 @@ PROVIDERS = {
     'tr.practice': {'repo': 'plugin', 'files': ['src/model/practice_state.rs']},
     'tr.event': {'repo': 'plugin', 'files': ['src/model/bridge_events.rs']},
     'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs']},
-    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs']},
+    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs', 'src/runtime.rs']},
 }
 BUTTONS = (
     ('A', 1), ('B', 2), ('X', 4), ('Y', 8), ('L', 64), ('R', 128), ('ZL', 256), ('ZR', 512),
