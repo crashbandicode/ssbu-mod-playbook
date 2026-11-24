@@ -1024,6 +1024,123 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertEqual(self.errors(), [
             'G6 row consumer: needs "partner.effective=34" but partner.effective is "1" (set by watch)'])
 
+    def shared_case_setup(self):
+        shared = Path(self.tmp.name) / 'shared'
+        shared.mkdir()
+        (shared / 'sibling.py').write_text(
+            'def evaluate(lines):\n'
+            '    if "walking" in lines: raise RuntimeError("walking frame 2")\n'
+            '    return {"frames": len(lines)}\n')
+        (shared / 'sharedfx.py').write_text(
+            'from sibling import evaluate\n'
+            'EFFECT_JUDGES = {"hook": {"judge": "judge", "cases": "sample"}}\n'
+            'def hook(ctx): return judge(lines=["standing"])\n'
+            'def judge(lines): return evaluate(lines)\n')
+        cases = shared / 'library' / 'cases' / 'sample'
+        cases.mkdir(parents=True)
+        (cases / 'standing.log').write_text('standing\n')
+        (cases / 'walking.log').write_text('walking\n')
+        (cases / 'a.json').write_text(json.dumps(
+            {'files': {'lines': 'standing.log'}, 'expect': 'accept'}))
+        (cases / 'b.json').write_text(json.dumps(
+            {'files': {'lines': 'walking.log'}, 'expect': 'reject', 'contains': 'walking'}))
+        plan = {'rows': [{'id': 'trial', 'role': 'test',
+                          'steps': [{'run': 'sharedfx:hook', 'effect': True}]}]}
+        return shared, cases, plan
+
+    def shared_case_check(self, shared, plan):
+        with mock.patch.object(packet_gate, 'SHARED_DIR', shared, create=True), \
+             mock.patch.object(packet_gate, 'shared_hook_names', return_value=('sharedfx', 'fixtures'), create=True):
+            return packet_gate.check(plan, self.base, plan)
+
+    def test_shared_hook_without_entry_warns_or_refuses_and_fixtures_remain_exempt(self):
+        shared, _, plan = self.shared_case_setup()
+        (shared / 'sharedfx.py').write_text('raise RuntimeError("must not import")\ndef hook(ctx): return 1\n')
+        message = 'G9 row trial: effect hook sharedfx:hook has no judge cases; its evidence is trusted'
+        report = self.shared_case_check(shared, plan)
+        self.assertIn(message, report['warnings'])
+        plan['require_cases'] = True
+        self.assertIn(message + ' (require_cases)', self.shared_case_check(shared, plan)['errors'])
+        (shared / 'sharedfx.py').write_text('EFFECT_JUDGES = {"other": {"judge": "j", "cases": "sample"}}\n')
+        self.assertIn(message + ' (require_cases)', self.shared_case_check(shared, plan)['errors'])
+        plan['rows'][0]['steps'] = [{'run': 'fixtures:cpu_standing', 'effect': True,
+                                     'cases': {'judge': 'unused.py:judge', 'dir': 'unused'}}]
+        report = self.shared_case_check(shared, plan)
+        self.assertFalse(any(item.startswith('G9 ') for item in report['errors'] + report['warnings']))
+
+    def test_shared_judge_cases_use_siblings_and_run_once_for_multiple_rows(self):
+        shared, _, plan = self.shared_case_setup()
+        plan['rows'].append({'id': 'again', 'role': 'test', 'steps': plan['rows'][0]['steps']})
+        original = subprocess.run
+        with mock.patch.object(packet_gate.subprocess, 'run', wraps=original) as calls:
+            report = self.shared_case_check(shared, plan)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'], [])
+        loaders = [call for call in calls.call_args_list if packet_gate.CASE_LOADER in call.args[0]]
+        self.assertEqual(len(loaders), 1)
+        for row in ('trial', 'again'):
+            self.assertEqual(report['cases'][row]['sharedfx:judge'], {'accept': 1, 'reject': 1})
+        module = shared / 'sharedfx.py'
+        module.write_text(module.read_text().replace(
+            'def hook(ctx): return judge(lines=["standing"])',
+            'def hook(ctx):\n    def nested(): return judge(lines=["standing"])\n    return nested()'))
+        self.assertEqual(self.shared_case_check(shared, plan)['errors'], [])
+
+    def test_shared_judge_rejects_mismatched_outcomes_and_missing_polarity(self):
+        shared, cases, plan = self.shared_case_setup()
+        (cases / 'standing.log').write_text('walking\n')
+        report = self.shared_case_check(shared, plan)
+        self.assertIn('G9 row trial: case a.json: expected accept, the judge refused: walking frame 2',
+                      report['errors'])
+        (cases / 'standing.log').write_text('standing\n')
+        (cases / 'walking.log').write_text('standing\n')
+        self.assertIn('G9 row trial: case b.json: expected reject, the judge accepted',
+                      self.shared_case_check(shared, plan)['errors'])
+        (cases / 'walking.log').write_text('walking\n')
+        (cases / 'b.json').write_text(json.dumps(
+            {'files': {'lines': 'walking.log'}, 'expect': 'reject', 'contains': 'not present'}))
+        self.assertIn('G9 row trial: case b.json: refused, but not with "not present": walking frame 2',
+                      self.shared_case_check(shared, plan)['errors'])
+        (cases / 'b.json').unlink()
+        self.assertIn('G9 row trial: cases need at least one accept and one reject (found 1 accept, 0 reject)',
+                      self.shared_case_check(shared, plan)['errors'])
+
+    def test_shared_judge_validates_binding_folder_and_table(self):
+        shared, _, plan = self.shared_case_setup()
+        module = shared / 'sharedfx.py'
+        source = module.read_text()
+        module.write_text(source.replace('return judge(lines=["standing"])', 'return 1'))
+        self.assertIn('G9 row trial: sharedfx:hook does not call its judge judge',
+                      self.shared_case_check(shared, plan)['errors'])
+        module.write_text(source.replace('def judge(lines): return evaluate(lines)', 'def other(lines): return 1'))
+        self.assertIn('G9 row trial: sharedfx:judge is not a function of sharedfx',
+                      self.shared_case_check(shared, plan)['errors'])
+        for folder in ('missing', '../sample', '.', '/tmp', 'one\\two', 'bad\x00name'):
+            with self.subTest(folder=folder):
+                module.write_text(source.replace('"cases": "sample"', f'"cases": {json.dumps(folder)}'))
+                self.assertIn(f'G9 row trial: cases folder library/cases/{folder} is missing',
+                              self.shared_case_check(shared, plan)['errors'])
+        module.write_text(source)
+        plan['rows'][0]['steps'][0]['cases'] = {'judge': 'fake.py:judge', 'dir': 'fake'}
+        self.assertIn('G9 row trial: sharedfx:hook is a shared hook; its judge cases belong to '
+                      'the runner (remove "cases")', self.shared_case_check(shared, plan)['errors'])
+        del plan['rows'][0]['steps'][0]['cases']
+        for table in ('EFFECT_JUDGES = dict()', 'EFFECT_JUDGES = "judge"',
+                      'EFFECT_JUDGES = {"hook": "judge"}'):
+            with self.subTest(table=table):
+                module.write_text(table + '\ndef hook(ctx): return 1\n')
+                self.assertTrue(any(item.startswith('G9 row trial: sharedfx.EFFECT_JUDGES is malformed:')
+                                    for item in self.shared_case_check(shared, plan)['errors']))
+
+    def test_shared_judge_cases_cannot_read_outside_library_cases(self):
+        shared, cases, plan = self.shared_case_setup()
+        (shared / 'outside.log').write_text('standing\n')
+        (cases / 'a.json').write_text(json.dumps(
+            {'files': {'lines': '../../../outside.log'}, 'expect': 'accept'}))
+        report = self.shared_case_check(shared, plan)
+        self.assertTrue(any(item.startswith('G9 row trial: cases:') and 'leaves the rows folder' in item
+                            for item in report['errors']))
+
     def case_setup(self):
         (self.base / 'judge.py').write_text(
             'def judge(lines):\n'
