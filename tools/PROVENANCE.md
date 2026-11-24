@@ -237,3 +237,20 @@ clear visual blockers only, leaving deterministic blockers unresolved. Host test
 `events.log` copies lines 1–4 from that run's `out/post-run-offline/user/sdmc/ultimate/ssbu-hw-bridge/events.log`;
 SHA-256 `c80f086732a0ef13253a2edccb7d66ce1b07d525768278a5e0ae73a90992804d`.
 These are host test inputs, not runtime acceptance of this change.
+
+2026-11-24: `eden-runner/packet_gate.py` bridge provider tests model `src/native_ui/mod.rs`,
+`src/proto2.rs`, `src/hooks.rs`, `src/model.rs` and `src/runtime.rs` in bridge commits
+`ed2655d4` and `1a9b28ad`.
+Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/test-data/bridge-ui/c5efb86/src/native_ui/mod.rs` excerpts
+`/home/intpa/ssbu-hw-bridge` commit `c5efb86`, `src/native_ui/mod.rs` lines 13, 513–530,
+763–780, 885–970, 973–979 and 1040–1045; full blob SHA-256
+`4903f85b558dc78da4d02436b25f3b190c206604a3d43a714c39d5ac39b42b85`.
+`eden-runner/test-data/bridge-ui/c5efb86/src/native_ui/pause_focus.rs` excerpts the same repository
+and commit, `src/native_ui/pause_focus.rs` lines 26–63 and 65–71; full blob SHA-256
+`a90f1485e42aa34408cdee15a0f0cb45f4350ce74d2dba86b21eb946ee0ee843`.
+`eden-runner/test-data/bridge-ui/ed2655d4/src/native_ui/mod.rs` excerpts the same repository,
+commit `ed2655d4`, `src/native_ui/mod.rs` lines 507–524, 634–711 and 714–720; full blob SHA-256
+`265aa2441a219d917066d3ed60a090836dce15cacb90fe7f51ed7f7133d9df4e`.
+Host tests only; no runtime acceptance.

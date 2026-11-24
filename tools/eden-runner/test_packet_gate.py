@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -447,9 +448,9 @@ write!(text, "clip ctx={} total={} in={} out={}");
         row['reads'] = ['tr.menu:strip.aims', 'tr.menu:page', 'tr.menu:zone.left', 'tr.menu:rows',
                         'tr.practice:wizard.step', 'tr.practice:wizard.y', 'tr.practice:phase']
         self.assertEqual(self.errors(), [])
-        row['reads'] = ['ssbu.ui:screen']
-        self.assertIn('no extractor for provider ssbu.ui (add target.providers)', self.errors()[0])
-        self.plan['target']['providers'] = {'ssbu.ui': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        row['reads'] = ['user.ui:screen']
+        self.assertIn('no extractor for provider user.ui (add target.providers)', self.errors()[0])
+        self.plan['target']['providers'] = {'user.ui': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
         self.assertEqual(self.errors(), [])
         row['reads'] = ['tr.menu:test.only']
         self.assertIn('tr.menu:test.only is not written', self.errors()[0])
@@ -521,6 +522,439 @@ write!(text, "clip ctx={} total={} in={} out={}");
         self.assertIn('G2 row r1: provider ssbu.ui needs target.bridge', self.errors())
         self.plan['target']['providers'] = []
         self.assertIn('G2 target: providers must be an object', self.errors())
+
+    def bridge_fixture(self):
+        tree = Path(self.tmp.name) / 'bridge-source'
+        tree.mkdir()
+
+        def write(name, content):
+            path = tree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        old_ui = r'fn encode() { write!(out, "schema=ssbu.ui/1\nobservation={}\nobservation.active={}\nscreen={screen}\n"); }' + '\n'
+        write('src/native_ui/mod.rs', old_ui)
+        write('src/proto2.rs', r'''
+write!(out, "[Bridge] fighter entry={entry} kind={} x={} y={} status={} situation={} stock={} dead={} item={}");
+write!(out, " eb={} ab={} cpu={} cbt={}");
+write!(out, "[Bridge] input slot={slot} src={src} buttons={:#x} lx={} ly={} rx={} ry={}");
+write!(out, "x={} y={} at={} tr={}");
+write!(out, "[Bridge2] other hidden={}");
+write!(out, "[Bridge] [Nested] other hidden={}");
+''')
+        write('src/hooks.rs', r'''
+write!(out, "[Bridge] fighters_watch done entries={mask:#x}");
+write!(out, "[Bridge] req fighters_watch result=ok entries={mask:#x} frames={frames}");
+''')
+        write('src/runtime.rs', r'''
+let _ = write!(out, " ev={seq}");
+write!(out, "[Bridge] state begin name={name} schema={schema} rev={rev} boot={boot} lines={lines} filtered={filtered}");
+write!(out, "[Bridge] state end name={name} rev={rev} crc={crc}");
+write!(out, "[Bridge] provider name={name} schema_id={schema_id} version={version} rev={rev} dropped={dropped} toggle_gen={toggle_gen}");
+''')
+        git('init', '-q')
+        git('add', 'src')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'partial')
+        partial = git('rev-parse', 'HEAD').stdout.strip()
+        write('src/model.rs', 'write!(out, "[Bridge] stage id={stage}");\n')
+        git('add', 'src/model.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'old bridge')
+        old = git('rev-parse', 'HEAD').stdout.strip()
+        write('src/native_ui/mod.rs', old_ui.replace(
+            '); }', r'); write!(out, "\ninput.ready={}\nscreen.gen={}\nscreen.gap={}"); }'))
+        git('add', 'src/native_ui/mod.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'new bridge')
+        new = git('rev-parse', 'HEAD').stdout.strip()
+        return tree, partial, old, new
+
+    def bridge_ui_fixture(self):
+        tree = Path(self.tmp.name) / 'ui-source'
+        tree.mkdir()
+        source = Path(__file__).parent / 'test-data' / 'bridge-ui'
+        target = tree / 'src' / 'native_ui'
+        target.mkdir(parents=True)
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        shutil.copyfile(source / 'ed2655d4/src/native_ui/mod.rs', target / 'mod.rs')
+        git('init', '-q')
+        git('add', 'src')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'older excerpt')
+        older = git('rev-parse', 'HEAD').stdout.strip()
+        shutil.copyfile(source / 'c5efb86/src/native_ui/mod.rs', target / 'mod.rs')
+        shutil.copyfile(source / 'c5efb86/src/native_ui/pause_focus.rs', target / 'pause_focus.rs')
+        git('add', 'src')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'newer excerpts')
+        newer = git('rev-parse', 'HEAD').stdout.strip()
+        return tree, older, newer, git
+
+    def test_legacy_builtin_ui_provider_uses_the_builtin_block(self):
+        tree, _, newer, _ = self.bridge_ui_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': newer}
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:screen', 'ssbu.ui:pause.open']
+        baseline = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(baseline['errors'], [])
+        self.plan['target']['providers'] = {'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs']}}
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        warning = ('G2 target: providers.ssbu.ui repeats a built-in provider; '
+                   'the built-in extraction is used (remove the entry)')
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'].count(warning), 1)
+        self.assertEqual(report['emitted']['ssbu.ui'], baseline['emitted']['ssbu.ui'])
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:css.training']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [f'G2 row r1: ssbu.ui:css.training is not written by bridge '
+                                            f'{newer[:8]} (src/native_ui/mod.rs)'])
+        self.assertEqual(report['warnings'].count(warning), 1)
+        self.assertEqual(report['emitted']['ssbu.ui'], baseline['emitted']['ssbu.ui'])
+        self.plan['target']['providers']['ssbu.ui'].update(
+            block='ssbu.ui', helpers=['src/native_ui/pause_focus.rs'])
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['warnings'].count(warning), 1)
+        self.assertEqual(report['emitted']['ssbu.ui'], baseline['emitted']['ssbu.ui'])
+
+    def test_legacy_builtin_ui_provider_is_also_used_for_hook_reads(self):
+        tree, _, newer, _ = self.bridge_ui_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': newer}
+        self.plan['target']['providers'] = {'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs']}}
+        warning = ('G2 target: providers.ssbu.ui repeats a built-in provider; '
+                   'the built-in extraction is used (remove the entry)')
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("pause.open")\n')
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'].count(warning), 1)
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("pause.opne")\n')
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], ['G2 steps.py: reads "pause.opne", which the target does not write'])
+        self.assertEqual(report['warnings'].count(warning), 1)
+
+    def test_builtin_redefinitions_are_errors_and_do_not_replace_extraction(self):
+        tree, _, newer, _ = self.bridge_ui_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': newer}
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:pause.open', 'ssbu.ui:css.training']
+        baseline = packet_gate.check(self.plan, self.base, self.plan)
+        expected_read = (f'G2 row r1: ssbu.ui:css.training is not written by bridge '
+                         f'{newer[:8]} (src/native_ui/mod.rs)')
+        self.assertEqual(baseline['errors'], [expected_read])
+        for field, value in (('files', ['src/proto2.rs']), ('repo', 'plugin'), ('block', 'other'),
+                             ('helpers', ['src/other.rs']), ('whole_literals', False)):
+            with self.subTest(field=field):
+                spec = {'repo': 'bridge', 'files': ['src/native_ui/mod.rs'], field: value}
+                self.plan['target']['providers'] = {'ssbu.ui': spec}
+                report = packet_gate.check(self.plan, self.base, self.plan)
+                error = (f'G2 target: providers.ssbu.ui redefines a built-in provider ({field}); '
+                         'remove the entry or give the provider another name')
+                self.assertEqual(report['errors'], [error, expected_read])
+                self.assertEqual(report['emitted']['ssbu.ui'], baseline['emitted']['ssbu.ui'])
+                self.assertEqual(report['warnings'], [])
+        self.plan['target']['providers'] = {
+            'ssbu.ui': {'repo': 'plugin', 'files': ['src/other.rs'], 'block': 'other'}}
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [
+            'G2 target: providers.ssbu.ui redefines a built-in provider (repo, files, block); '
+            'remove the entry or give the provider another name', expected_read])
+        self.assertEqual(report['emitted']['ssbu.ui'], baseline['emitted']['ssbu.ui'])
+
+    def test_legacy_tr_menu_file_order_and_custom_repository_coexist(self):
+        tree = Path(self.tmp.name) / 'tile-provider'
+        tree.mkdir()
+        (tree / 'cursor.rs').write_text(r'write!(out, "p1.token={}");' + '\n')
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        git('init', '-q')
+        git('add', 'cursor.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'tile')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['repos'] = {'tile': {'tree': str(tree), 'commit': commit}}
+        self.plan['target']['providers'] = {
+            'tr.menu': {'repo': 'plugin', 'files': list(reversed(packet_gate.PROVIDERS['tr.menu']['files']))},
+            'tile.cursor': {'repo': 'tile', 'files': ['cursor.rs']}}
+        self.plan['rows'][0]['reads'] = ['tr.menu:zone.left', 'tile.cursor:p1.token']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertIn('p1.token', report['emitted']['tile.cursor'])
+        self.assertEqual(report['warnings'], [
+            'G2 target: providers.tr.menu repeats a built-in provider; '
+            'the built-in extraction is used (remove the entry)'])
+        self.plan['target']['providers']['bridge'] = {
+            'repo': 'bridge', 'files': list(reversed(packet_gate.PROVIDERS['bridge']['files'])),
+            'whole_literals': False}
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'], [
+            'G2 target: providers.tr.menu repeats a built-in provider; '
+            'the built-in extraction is used (remove the entry)',
+            'G2 target: providers.bridge repeats a built-in provider; '
+            'the built-in extraction is used (remove the entry)'])
+
+    def test_ui_block_uses_real_excerpts_and_only_declared_helper(self):
+        tree, older, newer, git = self.bridge_ui_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': newer}
+        positive = ['schema', 'screen', 'observation.active', 'input.ready', 'screen.gen', 'picker.phase',
+                    'focus.index', 'focus.label', 'ldn.members', 'ldn.room.session',
+                    'pause.open', 'pause.cpu_behavior', 'pause.panel']
+        self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}' for key in positive]
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        print('D8 newer excerpt block keys:', len(report['emitted']['ssbu.ui']))
+        for key in ('css.training', 'tile.cursor', 'ui ready', 'ready', 'menu.admission', 'ldn.create'):
+            with self.subTest(key=key):
+                self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}']
+                self.assertEqual(self.errors(), [f'G2 row r1: ssbu.ui:{key} is not written by bridge '
+                                                 f'{newer[:8]} (src/native_ui/mod.rs)'])
+        self.plan['target']['bridge']['commit'] = older
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:screen']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        print('D8 older excerpt block keys:', len(report['emitted']['ssbu.ui']))
+        for key in ('input.ready', 'pause.open'):
+            self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}']
+            self.assertEqual(self.errors(), [f'G2 row r1: ssbu.ui:{key} is not written by bridge '
+                                             f'{older[:8]} (src/native_ui/mod.rs)'])
+        mod = tree / 'src/native_ui/mod.rs'
+        mod.write_text(mod.read_text().replace('mod pause_focus;\n', ''))
+        git('add', 'src/native_ui/mod.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'undeclared helper')
+        self.plan['target']['bridge']['commit'] = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:pause.open']
+        self.assertIn('ssbu.ui:pause.open is not written', self.errors()[0])
+
+    def test_ui_block_requires_a_schema_writer_and_rejects_unbalanced_code(self):
+        tree, _, _, git = self.bridge_ui_fixture()
+        mod = tree / 'src/native_ui/mod.rs'
+        mod.write_text('fn other() { write!(out, "screen={}"); }\n')
+        git('add', 'src/native_ui/mod.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'no block')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:screen']
+        self.assertEqual(self.errors(), [f'G2 row r1: extractor ssbu.ui: no function writes '
+                                         f'schema=ssbu.ui/ in src/native_ui/mod.rs at {commit[:8]}'])
+        mod.write_text('fn broken() { write!(out, "schema=ssbu.ui/1\\nscreen={}");\n')
+        git('add', 'src/native_ui/mod.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'unbalanced')
+        self.plan['target']['bridge']['commit'] = git('rev-parse', 'HEAD').stdout.strip()
+        self.assertTrue(any('extractor ssbu.ui: could not be scanned' in error for error in self.errors()))
+
+    def test_rust_function_scanner_ignores_literals_comments_and_lifetimes(self):
+        source = r'''
+fn first<'a>(x: &'a str) {
+    let a = '{'; let b = "}"; let c = b"\n}"; let d = r#"}"#;
+    let e = '\''; let f = '\n'; // }
+    /* } /* nested } */ } */
+    write!(out, "schema=ssbu.ui/1\nscreen={}");
+}
+fn second() { write!(out, "other={}"); }
+'''
+        scanner = getattr(packet_gate, '_rust_function_bodies', None)
+        self.assertIsNotNone(scanner)
+        bodies = list(scanner(source))
+        self.assertEqual(len(bodies), 2)
+        self.assertIn('schema=ssbu.ui/', source[bodies[0][0]:bodies[0][1]])
+        self.assertNotIn('other={}', source[bodies[0][0]:bodies[0][1]])
+        self.assertIn('other={}', source[bodies[1][0]:bodies[1][1]])
+
+    def test_ui_hook_read_net_uses_the_same_block_keys(self):
+        tree, _, newer, _ = self.bridge_ui_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': newer}
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("pause.missing")\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "pause.missing", which the target does not write'])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("css.unrelated")\n')
+        self.assertEqual(self.errors(), [])
+
+    def test_bridge_does_not_take_whole_literal_values_as_keys(self):
+        tree, _, _, commit = self.bridge_fixture()
+        path = tree / 'src/proto2.rs'
+        path.write_text(path.read_text() + 'fn names() { match x { _ => "ldn.create", } }\n')
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+        git('add', 'src/proto2.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'value')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = ['bridge:fighter status', 'bridge:ev', 'bridge:stage id']
+        self.assertEqual(self.errors(), [])
+        self.plan['rows'][0]['reads'] = ['bridge:ldn.create']
+        errors = self.errors()
+        self.assertTrue(any('bridge:ldn.create is not written' in error for error in errors), errors)
+
+    def test_declared_block_provider_limits_literals_and_allows_optional_helpers(self):
+        tree, _, _, _ = self.bridge_fixture()
+        main = tree / 'src/custom.rs'
+        main.write_text(r'''
+mod helper;
+fn block() {
+    write!(out, "schema=mine/1\nfirst=1");
+    write!(out, "start=1 after_space=2");
+    write!(out, "[Bridge2] ignored=1\nignored.also=2");
+    write!(out, r#"\nraw.false=1"#);
+    write!(out, r#"raw.first=1"#);
+    number(&mut out, "helper.key", 1);
+    push_str(out, "page", 1);
+    number(out, pair(1, 2), "later.key", "not.first");
+    helpers::number::<u8>(out, "generic.key");
+    number(out, "not a key", "not.second");
+    number(other, "not.helper", 1);
+    let value = "dotted.value";
+    fn nested() { write!(out, "nested.key=1"); }
+}
+fn elsewhere() { write!(out, "outside=1"); }
+''')
+        helper = tree / 'src/helper.rs'
+        helper.write_text(r'fn help(out: &mut Out) { write!(out, "\nhelp.key=1"); }' + '\n')
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        git('add', 'src/custom.rs', 'src/helper.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'custom block')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['target']['providers'] = {
+            'custom': {'repo': 'bridge', 'files': ['src/custom.rs'], 'block': 'mine', 'helpers': ['src/helper.rs']}}
+        self.plan['rows'][0]['reads'] = ['custom:schema', 'custom:first', 'custom:start', 'custom:raw.first',
+                                         'custom:helper.key', 'custom:page', 'custom:later.key',
+                                         'custom:generic.key', 'custom:nested.key', 'custom:help.key']
+        self.assertEqual(self.errors(), [])
+        for key in ('after_space', 'ignored', 'ignored.also', 'raw.false', 'not.first', 'not.second',
+                    'not.helper', 'dotted.value', 'outside'):
+            with self.subTest(key=key):
+                self.plan['rows'][0]['reads'] = [f'custom:{key}']
+                self.assertTrue(any(f'custom:{key} is not written' in error for error in self.errors()))
+        helper.write_text(r'fn help(out: &mut Out) { write!(out, "\nhelp.key=1");' + '\n')
+        git('add', 'src/helper.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'unbalanced helper')
+        self.plan['target']['bridge']['commit'] = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['rows'][0]['reads'] = ['custom:first']
+        self.assertTrue(any('extractor custom: could not be scanned' in error for error in self.errors()))
+        git('rm', '-q', 'src/helper.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'missing optional helper')
+        self.plan['target']['bridge']['commit'] = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['rows'][0]['reads'] = ['custom:first']
+        self.assertEqual(self.errors(), [])
+        self.plan['rows'][0]['reads'] = ['custom:help.key']
+        self.assertTrue(any('custom:help.key is not written' in error for error in self.errors()))
+
+    def test_builtin_ssbu_ui_provider_checks_the_selected_bridge_commit(self):
+        tree, _, old, new = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': new}
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:screen', 'ssbu.ui:observation.active', 'ssbu.ui:input.ready']
+        self.assertEqual(self.errors(), [])
+        self.plan['target']['bridge']['commit'] = old
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn(f'ssbu.ui:input.ready is not written by bridge {old[:8]}', errors[0])
+
+    def test_builtin_bridge_provider_extracts_tagged_events_and_bare_continuations(self):
+        tree, _, _, commit = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = ['bridge:fighter status', 'bridge:fighter x', 'bridge:eb',
+                                         'bridge:input lx', 'bridge:stage id', 'bridge:fighters_watch entries',
+                                         'bridge:req result']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        emitted = set(report['emitted']['bridge'])
+        self.assertTrue({'fighter entry', 'fighter status', 'fighter x', 'eb', 'input lx',
+                         'stage id', 'fighters_watch entries', 'req result'} <= emitted)
+        self.assertNotIn('fighter eb', emitted)
+        self.assertNotIn('other hidden', emitted)
+        for key in ('fighter position', 'fighter eb'):
+            with self.subTest(key=key):
+                self.plan['rows'][0]['reads'] = [f'bridge:{key}']
+                self.assertEqual(self.errors(), [f'G2 row r1: bridge:{key} is not written by bridge '
+                                                 f'{commit[:8]} (src/proto2.rs, src/hooks.rs, src/model.rs, '
+                                                 'src/runtime.rs)'])
+
+    def test_builtin_bridge_provider_includes_runtime_stamps_and_events(self):
+        tree, _, _, commit = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = ['bridge:ev', 'bridge:state name', 'bridge:state crc',
+                                         'bridge:provider schema_id']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertTrue({'ev', 'state name', 'state crc', 'provider schema_id'} <= set(report['emitted']['bridge']))
+        self.plan['rows'][0]['reads'] = ['bridge:state colour']
+        self.assertEqual(self.errors(), [f'G2 row r1: bridge:state colour is not written by bridge '
+                                         f'{commit[:8]} (src/proto2.rs, src/hooks.rs, src/model.rs, src/runtime.rs)'])
+
+    def test_builtins_require_the_bridge_target(self):
+        self.plan['target'].pop('bridge')
+        for provider, key in (('ssbu.ui', 'screen'), ('bridge', 'fighter status')):
+            with self.subTest(provider=provider):
+                self.plan['rows'][0]['reads'] = [f'{provider}:{key}']
+                self.assertIn(f'G2 row r1: provider {provider} needs target.bridge', self.errors())
+
+    def test_missing_bridge_provider_file_names_its_commit(self):
+        tree, partial, _, _ = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': partial}
+        self.plan['rows'][0]['reads'] = ['bridge:fighter status']
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith('G2 row r1: extractor bridge:'), errors)
+        self.assertIn('src/model.rs', errors[0])
+        self.assertIn(partial, errors[0])
+
+    def test_declared_provider_can_use_a_third_repository(self):
+        tree = Path(self.tmp.name) / 'tile-source'
+        tree.mkdir()
+        (tree / 'cursor.rs').write_text(r'write!(out, "screen={}\np1.token={}\nsettled={}");' + '\n')
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        git('init', '-q')
+        git('add', 'cursor.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'tile')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['repos'] = {'tile': {'tree': str(tree), 'commit': commit}}
+        self.plan['target']['providers'] = {'tile.cursor': {'repo': 'tile', 'files': ['cursor.rs']}}
+        self.plan['rows'][0]['reads'] = ['tile.cursor:p1.token']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertIn('p1.token', report['emitted']['tile.cursor'])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("p1.unknown")\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "p1.unknown", which the target does not write'])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return True\n')
+        source = self.plan['target']['providers']['tile.cursor']
+        source['repo'] = 'unknown'
+        self.assertIn('G2 row r1: no extractor for provider tile.cursor (add target.providers)', self.errors())
+        source['repo'] = 'tile'
+        for name in ('plugin', 'bridge'):
+            with self.subTest(reserved=name):
+                self.plan['target']['repos'][name] = {'tree': str(tree), 'commit': commit}
+                self.assertIn(f'G2 target: repos.{name} is reserved', self.errors())
+                self.plan['target']['repos'].pop(name)
+        self.plan['target']['repos']['tile']['commit'] = '0' * 40
+        self.assertTrue(any('repos.tile.commit' in error and 'is not a commit' in error for error in self.errors()))
+        self.plan['target']['repos']['tile']['commit'] = 'not-a-commit'
+        self.assertIn('G2 target: repos.tile.commit must be 40 lower-case hex characters', self.errors())
+        self.plan['target']['repos']['tile']['commit'] = commit
+        self.plan['target']['repos']['tile']['tree'] = 'relative'
+        self.assertIn('G2 target: repos.tile.tree must be an existing absolute directory', self.errors())
+        self.plan['target']['repos']['tile']['tree'] = str(tree / 'missing')
+        self.assertIn('G2 target: repos.tile.tree must be an existing absolute directory', self.errors())
+        self.plan['target']['repos']['tile'] = 'bad'
+        self.assertIn('G2 target: repos.tile must be an object', self.errors())
+        self.plan['target']['repos'] = []
+        self.assertIn('G2 target: repos must be an object', self.errors())
+
+    def test_hook_read_prefixes_come_from_dotted_provider_keys_only(self):
+        tree, _, _, commit = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['target']['providers'] = {'probe': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        (self.base / 'steps.py').write_text(
+            'def ok(ctx):\n    return [values.get("x.position"), values.get("y.velocity"), '
+            'values.get("at.start"), values.get("tr.example")]\n')
+        self.assertEqual(self.errors(), [])
+        self.plan['target'].pop('providers')
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("screen.unknown")\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "screen.unknown", which the target does not write'])
 
     def test_the_packet_digest_changes_with_any_file_and_ignores_out(self):
         initial = packet_gate.packet_digest(self.base)
@@ -848,6 +1282,54 @@ write!(text, "clip ctx={} total={} in={} out={}");
             payload = re.sub(r'(?: ev=\d+)? frame=\d+ wall=\d+$', '', payload)
             expected = {'fed ' + key for key in re.findall(r'(?:^| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', payload)}
             self.assertEqual(expected - keys, set())
+
+    @unittest.skipUnless(os.environ.get('PACKET_GATE_BRIDGE_TREE') and os.environ.get('PACKET_GATE_BRIDGE_COMMIT')
+                         and os.environ.get('PACKET_GATE_BRIDGE_LOG'), 'recorded bridge witness not supplied')
+    def test_recorded_bridge_fighter_witness(self):
+        keys = packet_gate._provider_keys(Path(os.environ['PACKET_GATE_BRIDGE_TREE']),
+                                          os.environ['PACKET_GATE_BRIDGE_COMMIT'],
+                                          packet_gate.PROVIDERS['bridge'])
+        lines = [line for line in Path(os.environ['PACKET_GATE_BRIDGE_LOG']).read_text().splitlines()
+                 if '[Bridge] fighter entry=' in line]
+        self.assertTrue(lines, 'bridge witness has no fighter entry lines')
+        words = {key for line in lines
+                 for key in re.findall(r'(?:^| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', line)}
+        missing = {key for key in words if key not in keys and f'fighter {key}' not in keys}
+        print('bridge witness keys the extractor lacks:', sorted(missing))
+        self.assertEqual(missing, set())
+
+    @unittest.skipUnless(os.environ.get('PACKET_GATE_BRIDGE_TREE'), 'bridge source not supplied')
+    def test_real_bridge_ui_block_provider(self):
+        tree = os.environ['PACKET_GATE_BRIDGE_TREE']
+        positive = ('schema', 'screen', 'observation.active', 'input.ready', 'screen.gen', 'picker.phase',
+                    'focus.index', 'focus.label', 'ldn.members', 'ldn.room.session',
+                    'pause.open', 'pause.cpu_behavior', 'pause.panel')
+        negative = ('css.training', 'tile.cursor', 'ui ready', 'ready', 'menu.admission', 'ldn.create')
+        for revision, accepted, refused, legacy in (
+            ('c5efb86', positive, negative, False),
+            ('ed2655d4', ('screen',), ('input.ready', 'pause.open'), False),
+            ('c5efb86', positive, negative, True),
+            ('2bf3d1c8ce790000be25b2348294b4a4fd2d6a03', positive, negative, True),
+        ):
+            commit = subprocess.run(['git', '-C', tree, 'rev-parse', f'{revision}^{{commit}}'],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+            self.plan['target']['bridge'] = {'tree': tree, 'commit': commit}
+            if legacy:
+                self.plan['target']['providers'] = {'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs']}}
+            else:
+                self.plan['target'].pop('providers', None)
+            self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}' for key in accepted]
+            report = packet_gate.check(self.plan, self.base, self.plan)
+            self.assertEqual(report['errors'], [])
+            warning = ('G2 target: providers.ssbu.ui repeats a built-in provider; '
+                       'the built-in extraction is used (remove the entry)')
+            self.assertEqual(report['warnings'].count(warning), int(legacy))
+            for key in refused:
+                self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}']
+                report = packet_gate.check(self.plan, self.base, self.plan)
+                self.assertEqual(report['errors'], [f'G2 row r1: ssbu.ui:{key} is not written by bridge '
+                                                    f'{commit[:8]} (src/native_ui/mod.rs)'])
+                self.assertEqual(report['warnings'].count(warning), int(legacy))
 
 
 if __name__ == '__main__':
