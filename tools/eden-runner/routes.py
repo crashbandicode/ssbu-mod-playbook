@@ -1160,13 +1160,17 @@ def _frontend_dismiss(ctx, tree, cap, ok_pattern='^OK$'):
     raise RuntimeError(f'frontend_room: message box "{text}" did not close after OK')
 
 
-def _frontend_dialog_value(ctx, tree, anchor_name, field_name):
+def _frontend_dialog_fields(ctx, tree, anchor_name, field_name):
     anchors = [n for n in tree if ctx.runner.ui_matches(n, {'class': 'QLineEdit', 'name': anchor_name})]
     if len(anchors) != 1 or not anchors[0].get('window'):
         return None
-    fields = [n for n in tree if n.get('window') == anchors[0]['window']
-              and ctx.runner.ui_matches(n, {'class': 'QLineEdit', 'name': field_name})]
-    return _frontend_text(fields[0]) if len(fields) == 1 else None
+    return [n for n in tree if n.get('window') == anchors[0]['window']
+            and ctx.runner.ui_matches(n, {'class': 'QLineEdit', 'name': field_name})]
+
+
+def _frontend_dialog_value(ctx, tree, anchor_name, field_name):
+    fields = _frontend_dialog_fields(ctx, tree, anchor_name, field_name)
+    return _frontend_text(fields[0]) if fields is not None and len(fields) == 1 else None
 
 
 def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip='127.0.0.1', members=1, cap=30):
@@ -1318,7 +1322,24 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     if warning:
         anchor = 'username' if role == 'host' else 'nickname'
         actual_port = _frontend_dialog_value(ctx, tree, anchor, 'port')
-        port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
+        try:
+            port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
+        except ValueError:
+            if role != 'join' or requested_port is not None or verified_saved_port is None:
+                raise
+            port = None
+        if role == 'join' and requested_port is None and verified_saved_port is not None and port is None:
+            fields = _frontend_dialog_fields(ctx, tree, anchor, 'port')
+            if fields is None:
+                read = 'no port field or ambiguous dialog'
+            elif not fields:
+                read = 'no port field'
+            elif len(fields) > 1:
+                read = 'ambiguous port fields'
+            else:
+                read = repr(actual_port)
+            raise RuntimeError(f"frontend_room: the open Direct Connect dialog's port cannot be read ({read}); "
+                               f'join will not confirm it against the saved room port {verified_saved_port}')
         dialog_name = _frontend_dialog_value(ctx, tree, anchor, 'room_name') if role == 'host' else None
         comparison_port = requested_port if requested_port is not None else verified_saved_port
         comparable_port = (int(comparison_port) if isinstance(comparison_port, str) and comparison_port.isascii()

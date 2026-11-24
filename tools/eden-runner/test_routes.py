@@ -1388,23 +1388,88 @@ class FrontendRoomTests(unittest.TestCase):
             routes.frontend_room(self.ctx, role='join')
         self.assertEqual(self.actions, [])
 
-    def test_saved_join_refuses_existing_warning_dialog_with_different_port(self):
+    def prepare_saved_join_warning(self, ports):
         (self.out / 'frontend-room.json').write_text(json.dumps(
             {'port': 24890, 'port_verified': True, 'room_name': 'TR24890', 'instance': 'a'}))
         self.ctx.on = 'b'
+        self.ctx.instance = self.runner.instances['b']
         self.running = True
         fields = [
             {'class': 'QLineEdit', 'name': name, 'id': 'peer-' + name, 'window': 'peer-window',
              'visible': True, 'properties': {'text': {'value': value}}}
-            for name, value in (('nickname', 'PeerName'), ('port', '24902'), ('ip', '192.0.2.1'))
+            for name, value in (('nickname', 'PeerName'), ('ip', '192.0.2.1'))
         ]
+        fields.extend({'class': 'QLineEdit', 'name': 'port', 'id': f'peer-port-{index}',
+                       'window': 'peer-window', 'visible': True, 'properties': {'text': {'value': value}}}
+                      for index, value in enumerate(ports))
         self.nodes = [self.RUNNING_WARNING, self.WARNING_OK, self.WARNING_CANCEL, *fields]
+        self.actions.clear()
+        self.listeners.reset_mock()
         self.listeners.side_effect = None
         self.listeners.return_value = [{'port': 24890, 'address': '*', 'comm': 'eden', 'pid': 111}]
-        with self.assertRaisesRegex(RuntimeError, 'Direct Connect dialog is on port 24902, not the requested port 24890'):
-            routes.frontend_room(self.ctx, role='join')
+
+    def test_saved_join_confirms_existing_warning_with_matching_port(self):
+        self.prepare_saved_join_warning(['24890'])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            result = routes.frontend_room(self.ctx, role='join', cap=.2)
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(result['port'], 24890)
+        self.assertTrue(result['room_matched'])
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
+
+    def test_saved_join_refuses_existing_warning_dialog_with_different_port(self):
+        self.prepare_saved_join_warning(['24902'])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            with self.assertRaisesRegex(RuntimeError, 'Direct Connect dialog is on port 24902, not the requested port 24890'):
+                routes.frontend_room(self.ctx, role='join')
+        identity.assert_called_once_with(self.runner.instances['a'])
         self.listeners.assert_called_once()
         self.assertEqual(self.actions, [])
+
+    def test_saved_join_refuses_existing_warning_with_no_port_field(self):
+        self.prepare_saved_join_warning([])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            with self.assertRaises(RuntimeError) as caught:
+                routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(caught.exception), "frontend_room: the open Direct Connect dialog's port cannot be read "
+                         '(no port field); join will not confirm it against the saved room port 24890')
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(self.actions, [])
+
+    def test_saved_join_refuses_existing_warning_with_nonnumeric_port(self):
+        for value in ('not-a-port', '', '１２３', '0' * 5000):
+            with self.subTest(value=value[:16]):
+                self.prepare_saved_join_warning([value])
+                with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+                    with self.assertRaises(RuntimeError) as caught:
+                        routes.frontend_room(self.ctx, role='join')
+                self.assertEqual(str(caught.exception),
+                                 "frontend_room: the open Direct Connect dialog's port cannot be read "
+                                 f'({value!r}); join will not confirm it against the saved room port 24890')
+                identity.assert_called_once_with(self.runner.instances['a'])
+                self.listeners.assert_called_once()
+                self.assertEqual(self.actions, [])
+
+    def test_saved_join_refuses_existing_warning_with_ambiguous_port_fields(self):
+        self.prepare_saved_join_warning(['24890', '24890'])
+        with mock.patch.object(routes, '_instance_record_pids', wraps=routes._instance_record_pids) as identity:
+            with self.assertRaises(RuntimeError) as caught:
+                routes.frontend_room(self.ctx, role='join')
+        self.assertEqual(str(caught.exception), "frontend_room: the open Direct Connect dialog's port cannot be read "
+                         '(ambiguous port fields); join will not confirm it against the saved room port 24890')
+        identity.assert_called_once_with(self.runner.instances['a'])
+        self.listeners.assert_called_once()
+        self.assertEqual(self.actions, [])
+
+    def test_declared_join_existing_warning_with_no_port_field_is_unchanged(self):
+        self.prepare_saved_join_warning([])
+        result = routes.frontend_room(self.ctx, role='join', port=24890, cap=.2)
+        self.assertIsNone(result['port'])
+        self.assertTrue(result['room_matched'])
+        self.listeners.assert_not_called()
+        self.assertEqual([step['target'].get('id') for _, step in self.actions], ['o276'])
 
     def test_reuse_without_known_port_does_not_publish_handoff(self):
         self.nodes = [self.ROOM]

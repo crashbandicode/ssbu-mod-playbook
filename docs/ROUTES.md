@@ -103,6 +103,8 @@ in this run currently owns that UDP listener; missing host identity or listener
 data refuses the join, while a different owned port marks the handoff
 disproved on a best-effort basis. For a host on another machine (not an
 instance in the guest's run), give the port in the row instead.
+If a Direct Connect warning is already open, a saved-port join also requires
+one readable dialog port matching the saved port before confirming.
 An explicitly occupied port stops before Host. A rejected edited flag stops
 a nondefault port, and a room-creation failure names the requested or
 default-port holder when known. The port-field cause and the new behavior
