@@ -71,6 +71,28 @@ class FakeEden:
         return {'ok': True, 'result': {}}
 
 
+class FreshEden(FakeEden):
+    def __init__(self, bridge_log, frames, colours=None):
+        super().__init__({})
+        self.bridge_log = bridge_log
+        self.frames = list(frames)
+        self.colours = list(colours or [])
+        self.screenshot_reply = {'backend': 'window', 'uniform': False, 'warning': 'test warning'}
+
+    def request(self, method, params):
+        if method == 'ui.screenshot':
+            if self.colours:
+                self.colour = self.colours.pop(0)
+            response = super().request(method, params)
+            frame = self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+            if self.bridge_log is not None:
+                with self.bridge_log.open('a') as stream:
+                    stream.write(f'[Bridge] boot=0xabc frame={frame} wall={frame * 17}\n')
+            response['result'] = dict(self.screenshot_reply)
+            return response
+        return super().request(method, params)
+
+
 class ReviewClassTests(unittest.TestCase):
     def setUp(self):
         self.plan = {
@@ -1101,6 +1123,67 @@ class RunnerTests(unittest.TestCase):
 
     def make(self, eden, pace=15):
         return runner.Runner(self.manifest, self.instances, self.dir / 'out', pace, client_factory=lambda s: eden)
+
+    def test_shot_records_the_game_frame_and_edens_reply(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        run = self.make(FreshEden(bridge, [1000]))
+        path = run.shot('a', 'capture')
+        record = run.still_records[str(path)]
+        self.assertEqual((record['boot'], record['frame'], record['wall']), ('0xabc', 1000, 17000))
+        self.assertEqual((record['backend'], record['uniform'], record['warning']),
+                         ('window', False, 'test warning'))
+        self.assertEqual(record['sha256'], sha(path))
+        self.assertEqual(record['status'], 'fresh')
+        self.assertEqual(json.loads((run.out / 'stills.jsonl').read_text().splitlines()[0]), record)
+
+    def test_a_frozen_still_is_listed_in_the_row_receipt(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        self.plan['rows'] = [
+            {'id': 'r1', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'first'}, {'shot': 'frozen'}]},
+            {'id': 'r2', 'start': 'blue', 'end': 'blue', 'steps': [{'shot': 'changed'}]},
+        ]
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(FreshEden(bridge, [1000, 1200, 1300], [BLUE, BLUE, RED]))
+        with mock.patch.object(runner.Runner, 'bridge_at_shot', return_value={}):
+            run.run()
+        first = json.loads((run.out / 'r1.json').read_text())
+        second = json.loads((run.out / 'r2.json').read_text())
+        self.assertEqual(first['status'], 'PASS')
+        self.assertEqual(len(first['stills_refused']), 1)
+        self.assertIn('unchanged across 200 game frames', first['stills_refused'][0]['reason'])
+        self.assertIn('frozen.png', first['stills_refused'][0]['file'])
+        self.assertNotIn('stills_refused', second)
+
+    def test_an_image_gate_does_not_pass_on_a_refused_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1200])
+        eden.colour = RED
+        run = self.make(eden)
+        run.shot('a', 'anchor')
+        gate = {**self.plan['gates']['red'], 'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence: unchanged across 200 game frames'):
+            run.check_gate_spec('a', gate, 'red')
+
+    def test_an_image_gate_passes_on_a_fresh_matching_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000])
+        eden.colour = RED
+        run = self.make(eden)
+        path = run.check_gate_spec('a', self.plan['gates']['red'], 'red')
+        self.assertEqual(run.still_records[path]['status'], 'fresh')
+
+    def test_shot_without_a_bridge_log_behaves_as_before(self):
+        eden = FreshEden(None, [1000])
+        eden.colour = RED
+        run = self.make(eden)
+        path = run.shot('a', 'without-bridge')
+        self.assertEqual(run.still_records[str(path)]['status'], 'unverified')
+        passed = run.check_gate_spec('a', self.plan['gates']['red'], 'red')
+        self.assertEqual(run.still_records[passed]['status'], 'unverified')
 
     def test_fresh_runner_restores_captured_bridge_log_without_overwriting(self):
         run = self.dir / 'out' / 'bridge-run'
