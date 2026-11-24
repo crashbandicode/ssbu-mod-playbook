@@ -461,8 +461,8 @@ class SetupReworkTests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training', return_value={}), \
-             patch.object(routes, 'enter_training', return_value={}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: io.set_screen('css.training')), \
+             patch.object(routes, 'enter_training', side_effect=lambda *a, **k: io.set_screen('training')), \
              patch.object(routes, 'pick_fighters', return_value={}) as fighters, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             json.dumps(routes.reach_training(self.ctx, 'Mario', cpu='Fox'))

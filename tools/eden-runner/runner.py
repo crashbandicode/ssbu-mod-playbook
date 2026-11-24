@@ -125,6 +125,7 @@ row failed. --rows failed reruns only rows whose receipt is FAILED. A STOP file 
 runner before its next input. If no row has finished --pace-minutes after the first run started, it writes
 STOP-INPUT. Every control call goes to out/actions.jsonl; each row writes out/<row>.json and its media under
 out/<row>/. Rerunning skips rows whose receipt passed and resumes at the next.
+A passed row explicitly named in --rows runs again; unnamed passed rows are skipped.
 """
 import argparse
 import copy
@@ -144,6 +145,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import packet_gate  # noqa: E402
 import trace_text  # noqa: E402
 import subprocess  # noqa: E402
 
@@ -159,7 +161,7 @@ STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 
               'state_baseline')
 UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
 # Shared step-hook modules next to runner.py, named without ".py" in a run step: {"run": "routes:to_main"}.
-SHARED_HOOKS = ('routes', 'routes_online')
+SHARED_HOOKS = ('routes', 'routes_online', 'fixtures')
 # Eden recording.start accepts fps 1..30, width 160..1280, duration_ms 100..120000.
 # Use GIF previews where the surface requires an image. Documentation/tutorial videos are source-rate MP4s.
 GIF_PREVIEW_FPS = {'preview': 12, 'preview-menu': 10}
@@ -249,6 +251,18 @@ def expand_library(plan):
             merged.update({k: v for k, v in item.items() if k not in ('file', 'reference', 'module', 'sha256')})
             plan[kind][name] = merged
     return plan
+
+
+def plan_identity(plan):
+    canonical = copy.deepcopy(plan)
+    for segment in (canonical.get('segments') or {}).values():
+        segment.pop('sha256', None)
+        segment.pop('recorded', None)
+    for gate in (canonical.get('gates') or {}).values():
+        gate.pop('sha256', None)
+        gate.pop('acquired', None)
+    data = json.dumps(canonical, sort_keys=True, separators=(',', ':'), default=str).encode()
+    return hashlib.sha256(data).hexdigest()
 
 
 class GifRefused(RuntimeError):
@@ -1049,13 +1063,45 @@ def dry_run(manifest_path):
             if recover_steps_of(plan, nxt) is None:
                 errors.append(f'row {row["id"]}: on_failure continue needs a recover list on {nxt["id"]} or the plan')
         state = row['end']
+    packet = packet_gate.check(plan, base, raw)
+    packet['plan_identity'] = plan_identity(plan)
+    errors.extend(packet['errors'])
     effects = effect_report(plan, base, errors)
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
               'gates': len(plan.get('gates', {})), 'errors': errors, 'review': review_class(plan, base, raw),
-              'roles_defaulted': roles_defaulted,
+              'roles_defaulted': roles_defaulted, 'packet_gate': packet,
               'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing or to_acquire else 'READY')}
     report.update(effects)
+    return report
+
+
+def up_check(manifest_path, config=None):
+    report = dry_run(manifest_path)
+    plan = json.loads(manifest_path.read_text())
+    if 'target' not in plan:
+        report['errors'].append('packet gate: rows.json has no "target" (the build the rows were checked against)')
+        report['result'] = 'BROKEN'
+    declared = plan.get('target')
+    target = declared.get('plugin') if isinstance(declared, dict) else {}
+    target = target if isinstance(target, dict) else {}
+    sha256 = target.get('nro_sha256')
+    if config is not None and isinstance(sha256, str) and sha256:
+        pins = [pin for item in config.get('instances', []) for pin in item.get('plugins', [])
+                if isinstance(pin.get('sha256'), str) and pin['sha256'].lower() == sha256.lower()]
+        if not pins:
+            report['errors'].append(f'packet gate: target NRO {sha256[:12]}… is not a plugin pin of this run')
+        for pin in pins:
+            path = Path(pin['path'])
+            commit = target.get('commit', '')
+            commit = commit[:8] if isinstance(commit, str) else ''
+            try:
+                if commit.encode('ascii') not in path.read_bytes():
+                    report['errors'].append(f'packet gate: target NRO {path.name} does not carry commit {commit}')
+            except (OSError, UnicodeError) as error:
+                report['errors'].append(f'packet gate: target NRO {path.name} cannot be read: {error}')
+        if report['errors']:
+            report['result'] = 'BROKEN'
     return report
 
 
@@ -1251,11 +1297,13 @@ class Runner:
     # and step_kind.extra = tuple(step_handlers).
     step_handlers = {}
 
-    def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None, on_failure=None):
+    def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None, on_failure=None,
+                 instances_sha256=None):
         self.manifest_path = manifest_path
         self.base = manifest_path.parent
         self.plan = expand_library(json.loads(manifest_path.read_text()))
         self.instances = instances
+        self.instances_sha256 = instances_sha256
         self.default = next(iter(instances))
         self.out = out
         self.out.mkdir(parents=True, exist_ok=True)
@@ -1271,6 +1319,7 @@ class Runner:
         self.recovered_to = None
         self.current_on = self.default
         self.current_row = None
+        self.captures = None
         if client_factory is None:
             client_factory = default_client_factory()
         self.clients = {key: client_factory(inst['socket']) for key, inst in instances.items()}
@@ -1293,6 +1342,8 @@ class Runner:
         self.session_unavailable = None
         self.session_file = None  # per_row_files: {'path', 'row', 'rows', 'file_rec_ms'} of the file OBS writes now
         self.effects_passed = []  # effect gates ("effect": true on the gate or its step) that passed in this row
+        self.unverified_hooks = []
+        self.empty_effect_hooks = []
         self.consecutive_failures = 0
         self.judge_workers = []   # (row id, Popen) of the background judge jobs (judge_queue.py)
         self.executed_rows = []   # this run's rows, in the order they ran (the verdict stop rule's order)
@@ -1308,17 +1359,41 @@ class Runner:
         gate when the plan has require_effect."""
         receipt['gates_status'] = 'PASS'
         receipt['effects_passed'] = list(self.effects_passed)
-        if self.judge_config():
+        row = self.current_row or {}
+        is_test = bool(row) and row_role(row) == 'test'
+        skipped_pending = row.get('judge') == 'skip' and (
+            bool(self.unverified_hooks) or row.get('outcome') == 'visual' or (is_test and 'target' in self.plan))
+        judge_pending = self.judge_config() and not skipped_pending
+        blockers = []
+        if row.get('outcome') == 'visual':
+            blockers.append({'kind': 'visual', 'source': 'row', 'text': 'visual read pending'})
+        blockers.extend({'kind': kind, 'source': spec, 'text': f'hook {spec}: {marker}'}
+                        for spec, kind, marker in self.unverified_hooks)
+        required = bool(self.plan.get('require_effect')) or (is_test and 'target' in self.plan)
+        if is_test and self.empty_effect_hooks:
+            blockers.extend({'kind': 'effect', 'source': spec, 'text': f'effect hook {spec} returned {reason}'}
+                            for spec, reason in self.empty_effect_hooks)
+        if not judge_pending and required and not self.effects_passed and row.get('outcome') != 'visual':
+            _, reason = judge_queue.gates_only_status(self.effects_passed, required)
+            blockers.append({'kind': 'effect', 'source': 'row', 'text': reason})
+        receipt['blockers'] = blockers
+        if judge_pending:
             receipt['status'] = 'RAN-UNVERIFIED'
             receipt['status_reason'] = 'judge pending'
             receipt['judge'] = {'state': 'pending'}
             return receipt['status']
-        status, reason = judge_queue.gates_only_status(self.effects_passed, self.plan.get('require_effect'))
-        receipt['status'] = status
-        if reason:
-            receipt['status_reason'] = reason
-            receipt['review'] = True
-        return status
+        if self.judge_config() and skipped_pending:
+            receipt['judge'] = {'state': 'skipped'}
+        if not blockers:
+            receipt['status'] = 'PASS'
+            return 'PASS'
+        nonvisual = next((blocker for blocker in blockers if blocker['kind'] != 'visual'), None)
+        receipt.update(status='RAN-UNVERIFIED', review=True,
+                       review_kind='unverified' if nonvisual else 'visual',
+                       status_reason=(nonvisual or blockers[0])['text'])
+        if any(blocker['kind'] == 'visual' for blocker in blockers):
+            receipt['visual_read'] = {'state': 'pending'}
+        return receipt['status']
 
     def queue_judge(self, row_id, clip=None):
         """Write the row's judge job and start its worker; never blocks the console. Only rows whose deterministic
@@ -1333,7 +1408,16 @@ class Runner:
         row = next((r for r in self.plan['rows'] if r['id'] == row_id), {'id': row_id})
         if row.get('judge') == 'skip':
             # a setup row (fixture, navigation): no gameplay effect to judge; its gates are its evidence
-            receipt.update(status='PASS', status_reason='setup row: judge skipped', judge={'state': 'skipped'})
+            blockers = receipt.get('blockers') or []
+            if blockers:
+                nonvisual = next((blocker for blocker in blockers if blocker['kind'] != 'visual'), None)
+                receipt.update(status='RAN-UNVERIFIED', review=True,
+                               review_kind='unverified' if nonvisual else 'visual',
+                               status_reason=(nonvisual or blockers[0])['text'], judge={'state': 'skipped'})
+                if any(blocker['kind'] == 'visual' for blocker in blockers):
+                    receipt['visual_read'] = {'state': 'pending'}
+            else:
+                receipt.update(status='PASS', status_reason='setup row: judge skipped', judge={'state': 'skipped'})
             receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
             return None
         try:
@@ -1464,6 +1548,17 @@ class Runner:
             target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
         path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
         self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        if self.captures is not None:
+            utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            try:
+                status = self.call(on, 'status', {})
+                status = ({key: value for key, value in status.items()
+                           if isinstance(value, (str, int, float, bool, type(None)))}
+                          if isinstance(status, dict) else None)
+            except Exception:  # noqa: BLE001 - a missing status does not invalidate a screenshot
+                status = None
+            self.captures.append({'name': name, 'file': path.name, 'sha256': digest(path), 'utc': utc,
+                                  'status': status})
         if self._arm_frames:
             try:
                 data = path.read_bytes()
@@ -2301,6 +2396,28 @@ class Runner:
     def _step_run(self, on, step):
         hook = load_step(self.base, step['run'])
         value = hook(StepContext(self, on), **step.get('args', {}))
+        markers = []
+        if isinstance(value, dict):
+            unverified = value.get('unverified')
+            if isinstance(unverified, str) and unverified:
+                markers.append(('unverified', unverified))
+            if value.get('grade') == 'NEEDS VISUAL READ':
+                markers.append(('visual', value['grade']))
+            if value.get('visual_verdict') == 'pending':
+                markers.append(('visual', value['visual_verdict']))
+        self.unverified_hooks.extend((step['run'], kind, text) for kind, text in markers)
+        if step.get('effect'):
+            if judge_queue.effect_evidence(value):
+                self.effects_passed.append(f'run:{step["run"]}')
+            else:
+                reason = 'no evidence'
+                if isinstance(value, dict):
+                    if 'verdict' in value and str(value['verdict']).upper() != 'PASS':
+                        reason = f'verdict {value["verdict"]}'
+                    elif 'pass' in value and value['pass'] is not True:
+                        reason = f'pass={value["pass"]}'
+                if not markers or reason != 'no evidence':
+                    self.empty_effect_hooks.append((step['run'], reason))
         if not isinstance(value, (str, int, float, bool, list, dict, type(None))):
             value = repr(value)
         try:
@@ -2873,6 +2990,8 @@ class Runner:
         pending_recovery = None
         rows = self.plan['rows']
         review = None
+        packet = self.out / 'packet-gate.json'
+        dependencies = json.loads(packet.read_text()).get('rows', {}) if packet.is_file() else {}
         for index, row in enumerate(rows):
             self.current_row = row
             receipt_path = self.out / f'{row["id"]}.json'
@@ -2881,8 +3000,8 @@ class Runner:
             if receipt_path.exists():
                 prior = json.loads(receipt_path.read_text())
                 prior_status = prior.get('status')
-            if prior_status == 'PASS' or (prior_status == 'RAN-UNVERIFIED' and prior.get('gates_status') == 'PASS'
-                                          and (only is None or row['id'] not in only)):
+            if ((prior_status == 'PASS' or (prior_status == 'RAN-UNVERIFIED' and prior.get('gates_status') == 'PASS'))
+                    and (only is None or row['id'] not in only)):
                 # a RAN-UNVERIFIED row is listed for review (FAILING.md), and reruns only when named (--rows)
                 self.note(row['id'], 'pass' if prior_status == 'PASS' else 'unverified')
                 previous_end = row['end']
@@ -2914,14 +3033,19 @@ class Runner:
             self.screen_reached = False
             self.last_gate_outcome = None
             self.effects_passed = []
+            self.unverified_hooks, self.empty_effect_hooks = [], []
+            self.captures = []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'role': row_role(row), 'role_source': 'explicit' if 'role' in row else 'default',
                        'manifest_sha256': self.snapshot_manifest(),
-                       'started': time.time(), 'results': []}
+                       'plan_identity': plan_identity(self.plan), 'instances_sha256': self.instances_sha256,
+                       'inputs_identity': packet_gate.inputs_identity(self.base, self.plan),
+                       'started': time.time(), 'results': [], 'captures': self.captures}
             try:
                 self.session_start()
                 start_mark = self.session_mark('row-start', row['id'])
             except StopRun as error:  # never run a row unrecorded: stopped before any of its input
+                self.captures = None
                 receipt.update(status='FAILED', error=repr(error), ended=time.time(), not_executed=True)
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
@@ -2930,6 +3054,25 @@ class Runner:
                                   'receipt': str(receipt_path)}), flush=True)
                 raise
             try:
+                for token, source in dependencies.get(row['id'], {}).get('provided_by', {}).items():
+                    if source == 'setup':
+                        continue
+                    source_path = self.out / f'{source}.json'
+                    source_receipt = json.loads(source_path.read_text()) if source_path.is_file() else {}
+                    if not (source_receipt.get('status') == 'PASS' or
+                            (source_receipt.get('status') == 'RAN-UNVERIFIED'
+                             and source_receipt.get('gates_status') == 'PASS')):
+                        if pending_recovery and pending_recovery[0] == row['id']:
+                            pending_recovery = None
+                        raise UnmetRecovery(f'NOT RUN (setup): needs "{token}" from row {source}, which did not pass')
+                    if (source_receipt.get('plan_identity') != receipt['plan_identity']
+                            or 'instances_sha256' not in source_receipt
+                            or source_receipt['instances_sha256'] != receipt['instances_sha256']
+                            or source_receipt.get('inputs_identity') != receipt['inputs_identity']):
+                        if pending_recovery and pending_recovery[0] == row['id']:
+                            pending_recovery = None
+                        raise UnmetRecovery(f'NOT RUN (setup): needs "{token}" from row {source}, '
+                                            'whose receipt is from another packet or another Up')
                 if pending_recovery and pending_recovery[0] == row['id']:
                     recovered = pending_recovery[1]
                     pending_recovery = None
@@ -2969,8 +3112,10 @@ class Runner:
             except Exception as error:
                 prerequisite = isinstance(error, UnmetRecovery)
                 if prerequisite:
+                    reason = str(error.failure)
                     receipt.update(status='FAILED', not_executed=True,
-                                   error=f'not run: recovery to its start failed: {error.failure!r}')
+                                   error=reason if reason.startswith('NOT RUN (setup):') else
+                                   f'not run: recovery to its start failed: {error.failure!r}')
                 else:
                     receipt.update(status='FAILED', error=repr(error))
                 if isinstance(error, GifRefused):
@@ -3034,6 +3179,7 @@ class Runner:
                     receipt['acquired_references'] = self.acquired
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
+                self.captures = None
                 for key in self.clients:
                     try:
                         self.call(key, 'input.reset')
@@ -3115,9 +3261,107 @@ def record_command(mode, manifest, instances, name, on, start_gate=None, client_
     return {'recorded': name, 'sha256': seg['sha256'], 'rows_json': str(manifest)}
 
 
+def record_read(manifest, out, row_id, reader, verdict, text, still, capture=None):
+    plan = json.loads(manifest.read_text())
+    if isinstance(plan.get('judge'), dict) and plan['judge'].get('cmd'):
+        raise ValueError('the plan has a judge')
+    if not row_id or ',' in row_id or not any(row.get('id') == row_id for row in plan.get('rows', [])):
+        raise ValueError('record-read needs exactly one row from the plan')
+    if not text or not text.strip():
+        raise ValueError('record-read needs non-empty text')
+    row_dir = (out / row_id).resolve()
+    still = still.resolve()
+    if row_dir.parent != out.resolve() or not still.is_file() or row_dir not in still.parents:
+        raise ValueError('the still must exist inside the row folder')
+    path = out / f'{row_id}.json'
+    if not path.is_file():
+        raise ValueError('the row receipt does not exist')
+    read = {'state': 'read', 'reader': reader, 'verdict': verdict, 'text': text, 'still': str(still),
+            'still_sha256': digest(still), 'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+
+    def update(receipt):
+        if receipt.get('gates_status') != 'PASS' or receipt.get('status') != 'RAN-UNVERIFIED':
+            raise ValueError('the receipt is not a pending visual read with passing gates')
+        blockers = receipt.get('blockers') or []
+        visual = [blocker for blocker in blockers if blocker.get('kind') == 'visual']
+        if not visual:
+            kinds = ', '.join(blocker.get('kind', '?') for blocker in blockers) or 'none'
+            raise ValueError(f'the row has no pending visual read (blockers: {kinds})')
+        names = {row.get('id') for row in plan.get('rows', [])}
+        captures = []
+        for candidate in sorted(out.glob('*.json')):
+            if candidate.stem not in names:
+                continue
+            try:
+                source = json.loads(candidate.read_text())
+            except (OSError, ValueError):
+                continue
+            if (not isinstance(source, dict) or source.get('id') != candidate.stem
+                    or not isinstance(receipt.get('plan_identity'), str)
+                    or source.get('plan_identity') != receipt['plan_identity']
+                    or 'instances_sha256' not in receipt or 'instances_sha256' not in source
+                    or source['instances_sha256'] != receipt['instances_sha256']):
+                continue
+            if (candidate.stem != row_id
+                    and ('inputs_identity' not in receipt or 'inputs_identity' not in source
+                         or source['inputs_identity'] != receipt['inputs_identity'])):
+                continue
+            for item in source.get('captures') or []:
+                if (isinstance(item, dict) and all(key in item for key in ('name', 'file', 'sha256', 'utc', 'status'))
+                        and isinstance(item['file'], str) and item['file'] and Path(item['file']).name == item['file']):
+                    captures.append({'row': candidate.stem, **{key: item[key]
+                                                              for key in ('name', 'file', 'sha256', 'utc', 'status')}})
+        own = [item for item in captures if item['row'] == row_id and still.parent == row_dir
+               and item['file'] == still.name]
+        if own:
+            if capture is not None and capture != f"{own[0]['row']}:{own[0]['file']}":
+                raise ValueError("--capture names another capture than the still's own path")
+            if len(own) != 1:
+                matches = ', '.join(f"{item['row']}/{item['file']}" for item in own)
+                raise ValueError(f'the still matches {len(own)} captures ({matches}); name one with --capture <row>:<file>')
+            selected = own[0]
+            if selected['sha256'] != read['still_sha256']:
+                raise ValueError(f"the still's bytes differ from the capture recorded for {row_id}/{still.name}")
+        elif capture is not None:
+            declared = [item for item in captures if f"{item['row']}:{item['file']}" == capture
+                        and item['sha256'] == read['still_sha256']]
+            if len(declared) != 1:
+                raise ValueError(f'--capture {capture} is not a capture of this run with these bytes')
+            selected = declared[0]
+        else:
+            matches = [item for item in captures if item['sha256'] == read['still_sha256']]
+            if not matches:
+                raise ValueError('the still is not a capture recorded by the runner in this run')
+            if len(matches) != 1:
+                labels = ', '.join(f"{item['row']}/{item['file']}" for item in matches)
+                raise ValueError(f'the still matches {len(matches)} captures ({labels}); name one with --capture <row>:<file>')
+            selected = matches[0]
+        read['capture'] = selected
+        previous = receipt.get('visual_read')
+        history = list(receipt.get('visual_reads') or [])
+        if previous is not None:
+            history.append(previous)
+        receipt.update(visual_read=read, visual_reads=history)
+        if verdict == 'FAIL':
+            receipt.update(status='FAILED', status_reason=f'visual read by {reader}: {text}', review=False)
+            return
+        receipt['cleared'] = list(receipt.get('cleared') or []) + [
+            {**blocker, 'reader': reader, 'utc': read['utc']} for blocker in visual]
+        remaining = [blocker for blocker in blockers if blocker.get('kind') != 'visual']
+        receipt['blockers'] = remaining
+        if remaining:
+            receipt.update(status='RAN-UNVERIFIED', review=True, review_kind='unverified',
+                           status_reason=remaining[0]['text'])
+        else:
+            receipt.update(status='PASS', status_reason=f'visual read by {reader}: {text}', review=False)
+            receipt.pop('review_kind', None)
+
+    return judge_queue.merge_receipt(path, update)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('dry-run', 'run', 'replay', 'self-test', 'capture-fixture',
+    parser.add_argument('mode', choices=('dry-run', 'up-check', 'run', 'replay', 'self-test', 'capture-fixture', 'record-read',
                                          'record-start', 'record-stop'))
     parser.add_argument('manifest', type=Path)
     parser.add_argument('--instances', type=Path, help='instances.json written at Up (run mode)')
@@ -3134,7 +3378,24 @@ def main(argv=None):
     parser.add_argument('--segment', help='record-start/record-stop: the segment name')
     parser.add_argument('--on', help='record-start/record-stop: the instance key (default: the first)')
     parser.add_argument('--start-gate', help='record-stop: the gate that checks the segment\'s start screen')
+    parser.add_argument('--reader', help='record-read: person who read the still')
+    parser.add_argument('--verdict', choices=('PASS', 'FAIL'), help='record-read: visual verdict')
+    parser.add_argument('--text', help='record-read: what the still shows')
+    parser.add_argument('--still', type=Path, help='record-read: still under the row folder')
+    parser.add_argument('--capture', help='record-read: source capture as <row>:<file>')
     args = parser.parse_args(argv)
+    if args.mode == 'record-read':
+        if not args.reader or not args.verdict or args.text is None or not args.still:
+            parser.error('record-read needs --rows, --reader, --verdict, --text and --still')
+        manifest = args.manifest.resolve()
+        out = (args.out or manifest.parent / 'out').resolve()
+        try:
+            result = record_read(manifest, out, args.rows, args.reader, args.verdict, args.text, args.still, args.capture)
+        except (OSError, ValueError) as error:
+            print(f'record-read: {error}', file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
     if args.mode in ('record-start', 'record-stop'):
         if not (args.instances and args.segment):
             parser.error(f'{args.mode} needs --instances and --segment')
@@ -3142,10 +3403,14 @@ def main(argv=None):
                                         args.segment, args.on, args.start_gate)))
         return 0
     manifest = args.manifest.resolve()
-    report = dry_run(manifest)
+    report = up_check(manifest) if args.mode in ('up-check', 'run', 'self-test', 'capture-fixture') else dry_run(manifest)
     out = (args.out or manifest.parent / 'out').resolve()
     out.mkdir(parents=True, exist_ok=True)
     (out / 'dry-run.json').write_text(json.dumps(report, indent=2) + '\n')
+    receipt = {**report.get('packet_gate', {}), 'manifest': str(manifest),
+               'manifest_sha256': report.get('manifest_sha256'), 'runner_sha256': digest(Path(__file__)),
+               'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    (out / 'packet-gate.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if args.mode == 'replay':
         if report['errors']:
             print(json.dumps(report, indent=2))
@@ -3157,14 +3422,16 @@ def main(argv=None):
             print(line, file=sys.stderr)
         print(json.dumps(result, indent=2))
         return 0 if result.get('ok') else 1
-    if args.mode == 'dry-run' or report['errors']:
+    if args.mode in ('dry-run', 'up-check') or report['errors']:
         print(json.dumps(report, indent=2))
         return 1 if report['errors'] else 0
     if not args.instances:
         parser.error(f'{args.mode} needs --instances')
-    instances = json.loads(args.instances.read_text())
+    instances_bytes = args.instances.read_bytes()
+    instances = json.loads(instances_bytes)
+    instances_sha256 = hashlib.sha256(instances_bytes).hexdigest()
     if args.mode == 'self-test':
-        result = Runner(manifest, instances, out, args.pace_minutes).self_test()
+        result = Runner(manifest, instances, out, args.pace_minutes, instances_sha256=instances_sha256).self_test()
         (out / 'self-test.json').write_text(json.dumps(result, indent=2) + '\n')
         for line in result.get('lines') or []:
             print(line, file=sys.stderr)
@@ -3181,7 +3448,8 @@ def main(argv=None):
     elif args.rows:
         only = set(args.rows.split(','))
     try:
-        tool = Runner(manifest, instances, out, args.pace_minutes, on_failure=args.on_failure)
+        tool = Runner(manifest, instances, out, args.pace_minutes, on_failure=args.on_failure,
+                      instances_sha256=instances_sha256)
         tool.capture_fixtures = bool(args.capture_fixtures or args.mode == 'capture-fixture')
         result = tool.run(only)
         if result == 'REVIEW':

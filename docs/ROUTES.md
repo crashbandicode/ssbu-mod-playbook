@@ -55,6 +55,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
+| `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; each step awaits its screen, sends once, awaits the transition, resends a lost input at most 3 times and otherwise stops on a named step with `routes-wireless-room-stop.json` |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
@@ -79,10 +80,64 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `bridge_on` `{port, cap}` | title-screen trace, stub-on no-input boot, or bridge already on | own listening event before detached capture, greeting and backup reply; stub-on also checks listener ownership and the first active Title prompt when it sends the chord; backup refusal is recorded, not a block failure |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
-| `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded |
+| `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded; cap defaults to 240 seconds |
 | `chord` `{name}` | Training | the chord pressed in one frame, and for `tr-save`/`tr-load` TrainingRooms' `state saved`/`state placed` line after it |
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
+
+### Closed-loop steps (`closed_loop.py`)
+
+Look for the current screen and start there; wait for the step's fresh ready observation before acting.
+Before every input, the step requires a `macro.status` of `idle` or `finished` without an error.
+`countdown`, `recording`, `playing`, and `branch_playing` wait; any other or unreadable status is treated as busy.
+One 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
+a fresh read. Each `macro.status` poll is limited to the remaining budget; its control-client timeout cannot
+extend that budget, and an unanswered poll counts as busy. Stall diagnostic `status` reads are capped at one
+second and skipped on idle and stop paths. Only a refusal of the `macro.play` call itself (`input_busy`) is
+retried once after idle; a failure after the macro was accepted stops as delivery unknown. Accumulated waits over
+one second and dispatch rejections
+are stall events, carrying `kind`, `step`, `seconds`, `why`, `last_bridge_line`, and `utc`; idle waits also carry
+their count in `waits`.
+The wireless route reserves 4.5 seconds for revalidation, leaving 10.5 seconds of the 15-second budget for waiting;
+if that reserve is unavailable it stops without reading or sending.
+The Stage Select A gate requires a settled `tile.cursor` with numeric `at == hovered` and both `p1.token`
+and `local.token` held. Every wireless press also requires `input.ready=yes` whenever the bridge publishes that
+key; never press on the screen name alone.
+On the room list, A requires `focus.id=ldn.create_room` and `focus.index=0`: a room row or unknown focus stops;
+the route never moves that cursor.
+After a send, wait for the transition. A continuously observed source with the same target counts as a lost input:
+finish it and resend, up to three sends total (some steps allow fewer). A continuously changed target stops without
+confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
+A bridge continuity, boot or fence error is never retried: the route stops on the current step with the receipt and leaves the input unconfirmed.
+If observations stay unreadable or in flight until the cap, stop on the named step without confirming or pressing again.
+Every wireless bridge read gets at least 2 seconds. An unanswered read preserves the last answered read and the
+source timer, but cannot authorise input; at the deadline one grace read may witness completion or a qualified retry.
+Training settle reads also have a 2-second floor and may finish up to 2 seconds after their settle cap.
+The Create form is refused by default until the bridge publishes active `ldn.create`;
+`unpublished_create='allow'` is an explicit, recorded exception.
+A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
+Training phases re-locate after each phase; a failed phase retries only after two consecutive fresh reads of a
+recognised native-owned screen, with at most three starts per phase per call. Continuity errors and unreadable
+state stop with `routes-reach-training-stop.json`. The overall cap is checked between phases; a running phase ends
+on its own caps. This phase recovery is host-tested only.
+A Training fighter select reached without a recorded stage is not trusted: the route returns to Main and picks the stage again.
+`ready` is sent once; a second Plus stays out until a flown run has measured that load.
+Wireless stall events record `step`, `send`, `seconds_on_source`, `target`, `screen`, `frame`, `wall`, `rev`,
+`tile`, `last_bridge_line`, `eden_frame_ms` and available `eden_fps`, and `utc`. Training retry/recovery events
+record `kind`, `step`, `start`, `error`, `screen`, `seconds`, `frame`, `wall`, `rev`, `last_bridge_line` and `utc`.
+Receipts say `PASS`, `PASS with 1 stall`, or `PASS with N stalls` (and corresponding `STOPPED` forms on failure);
+the row folder also receives `stall-events.jsonl`. The flight owner copies that file into the root-cause folder.
+Inner Training input resends are stall events in every enclosing receipt and in `stall-events.jsonl`.
+After a phase fails, the route re-decides from live state and never repeats it when its postcondition already holds.
+This closed-loop route is host-tested only, not flown.
+
+**Why (2026-11-23/24):** the three stalled flights pressed A 5 to 12 frames after the first `stage_select` block,
+before the picker took input, and the wait's last read had a 1 ms cap; see
+`smash-training-lobby/artifacts/phase23/route-hardening/stage-stall/ROOT-CAUSE.md`.
+The `lobby-a` press stays 9 frames (commit 2537dd5). Its stated reason, that a 4-frame tap did not confirm, was a
+misreading of the early press: both lengths are lost when sent before the picker takes input, and a 4-frame tap sent
+late did reach the fighter select (proof-lobby-17060a5e-3). 9 frames is kept only because it is the length flown in
+every later successful transition; it is not evidence against the 4-frame tap.
 
 `bridge_on` accepts a trace witness or, on Linux Eden hosts with the stub on, checks boot-default chord readiness,
 running and loading status, no input since `game.load`, and listener ownership before capture. With the stub on, the
@@ -92,6 +147,7 @@ the attract loop. The Title read requires `title.press_any`, and records the fra
 Opening playback is not the prompt and can extend the readiness wait to 180 seconds.
 If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event.
 A chord that brings no toggle stops the step; it is not retried.
+The first stub-on receipt in a row is `routes-bridge-on.json`; repeats are `routes-bridge-on-2.json` and so on.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
 within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.
