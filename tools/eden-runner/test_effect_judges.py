@@ -94,11 +94,25 @@ class EffectJudgeTests(unittest.TestCase):
             with self.subTest(hook=hook), self.assertRaisesRegex(RuntimeError, 'bridge connection changed during the read'):
                 getattr(routes, routes.EFFECT_JUDGES[hook]['judge'])(**args)
 
+    def test_judge_rejects_an_other_boot_state_block(self):
+        _, args = load_case(CASES / 'expect_fighters' / 'accept-tk06.json')
+        args['lines'].append('[Bridge] state begin name=ssbu.ui schema=ssbu.ui/1 rev=1 '
+                             'boot=0xa1e80deccd2a9a15 lines=1 filtered=0 frame=1 wall=1')
+        with self.assertRaisesRegex(RuntimeError, 'is from boot 0xa1e80deccd2a9a15, not this boot 0x3dec61593ef80877'):
+            routes.judge_expect_fighters(**args)
+
     def test_roster_reply_rejects_records_older_than_its_fence(self):
         _, args = load_case(CASES / 'expect_fighters' / 'accept-tk06.json')
         args['lines'] = [line.replace('frame=5775 ', 'frame=5773 ')
                          if '[Bridge] roster entry=' in line else line for line in args['lines']]
         with self.assertRaisesRegex(RuntimeError, 'no roster entry'):
+            routes.judge_expect_fighters(**args)
+
+    def test_fighter_reply_rejects_records_older_than_its_fence(self):
+        _, args = load_case(CASES / 'expect_fighters' / 'accept-tk06.json')
+        args['lines'] = [line.replace('frame=5789 ', 'frame=5787 ')
+                         if '[Bridge] fighter entry=' in line else line for line in args['lines']]
+        with self.assertRaisesRegex(RuntimeError, 'no live body'):
             routes.judge_expect_fighters(**args)
 
 
@@ -117,7 +131,7 @@ class EffectHookTests(unittest.TestCase):
         self.io = recorded.Replay(native_blocks=[recorded.l8w_native(1)])
         self.ui = recorded.native(1, screen='training', **{'screen.context': 'training'})
 
-    def invoke(self, cpu='Fox', live_body=7):
+    def invoke(self, cpu='Fox', live_body=7, recorded_body=7, extra=''):
         state = {'roster': {0: {'kind': 0, 'nana': False}, 1: {'kind': 7, 'nana': False}}}
         bodies = {0: {'kind': 0}, 1: {'kind': live_body}}
 
@@ -130,7 +144,9 @@ class EffectHookTests(unittest.TestCase):
             return state
 
         def fighters(*args, **kwargs):
-            append(self.recorded[6:])
+            lines = [line.replace('fighter entry=1 kind=7 ', f'fighter entry=1 kind={recorded_body} ')
+                     for line in self.recorded[6:]]
+            append(lines + ([extra] if extra else []))
             return bodies
 
         with patch.object(routes, 'BridgePickerIO', return_value=self.io), \
@@ -157,6 +173,15 @@ class EffectHookTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'expect_fighters: the judged lines and the live read disagree'):
             self.invoke(live_body=3)
 
+    def test_hook_refuses_disagreement_when_the_lines_have_the_wrong_fighter(self):
+        with self.assertRaisesRegex(RuntimeError, 'expect_fighters: the judged lines and the live read disagree'):
+            self.invoke(recorded_body=3)
+
+    def test_hook_refuses_a_connection_change_during_the_reads(self):
+        boundary = f'[Adapter] reconnect same_boot=1 boot={BOOT} connects=2 cursor=0'
+        with self.assertRaisesRegex(RuntimeError, 'bridge connection changed during the read'):
+            self.invoke(extra=boundary)
+
     def test_reach_hook_and_judge_agree_on_recorded_roster_and_live_stage(self):
         replay = MenuReplay()
         replay.menu['open'] = '0'
@@ -178,6 +203,22 @@ class EffectHookTests(unittest.TestCase):
             self.fail('judge is not implemented')
         self.assertEqual(result['verified'], judged)
         self.assertEqual(replay.actions, [])
+
+    def test_reach_hook_refuses_disagreement_with_the_recorded_roster(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        state = {'stage': 3, 'roster': {0: {'kind': 0, 'nana': True}, 1: {'kind': 7, 'nana': False}}}
+
+        def roster(*args, **kwargs):
+            with self.log.open('a') as stream:
+                stream.write('\n'.join(self.recorded[1:6]) + '\n')
+            return state
+
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=roster), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'reach_training: the judged lines and the live read disagree'):
+                routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
 
 
 if __name__ == '__main__':
