@@ -1,1 +1,1 @@
-{"args":{"p1":"Mr. Game & Watch","cpu":"Greninja","stage":"Battlefield","form":"normal","boot":"0xa1e80deccd2a9a15","stage_id":3},"files":{"lines":"accept-docs-enter-training.lines"},"expect":"reject","contains":"live Training state does not match the requested setup"}
+{"args":{"p1":"Mr. Game & Watch","cpu":"Greninja","stage":"Battlefield","form":"normal","boot":"0xa1e80deccd2a9a15"},"files":{"lines":"accept-docs-enter-training.lines"},"expect":"reject","contains":"live Training state does not match the requested setup"}

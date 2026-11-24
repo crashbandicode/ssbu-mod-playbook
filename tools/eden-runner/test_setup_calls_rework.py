@@ -42,7 +42,8 @@ REAL_RELOAD = '[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0 ev=110 
 
 def logged_native(log, values):
     hello = (Path(__file__).parent / 'library' / 'cases' / 'expect_fighters' / 'accept-tk06.lines').read_text().splitlines()[0]
-    log.write_text(hello + '\n')
+    stage = (Path(__file__).parent / 'library' / 'cases' / 'reach_training' / 'other-run-tk06.lines').read_text().splitlines()[1]
+    log.write_text(hello + '\n' + stage + '\n')
     if callable(values):
         get = values
     elif isinstance(values, list):

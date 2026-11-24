@@ -1,0 +1,8 @@
+[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0-rc.15 port=6980 guards=0x7fffff boot=0x0b774a7580185f1b uptime_ms=400191423 reconnects=1 event_latest=452 state_api=1 toggle_gen=1 toggle_reason=pad_chord refusals=0 last_refusal=none frame=22326 wall=400191423
+[Bridge] stage id=308 ev=461 frame=26757 wall=400265864
+[Bridge] stage id=0 ev=687 frame=38731 wall=400466198
+[Bridge] req roster result=ok entries=0x3 frame=38757 wall=400466618
+[Bridge] roster entry=0 kind=0 nana=false ev=689 frame=38758 wall=400466632
+[Bridge] item entry=0 held=false kind=-1 ev=690 frame=38758 wall=400466632
+[Bridge] roster entry=1 kind=52 nana=false ev=691 frame=38758 wall=400466633
+[Bridge] item entry=1 held=false kind=-1 ev=692 frame=38758 wall=400466633

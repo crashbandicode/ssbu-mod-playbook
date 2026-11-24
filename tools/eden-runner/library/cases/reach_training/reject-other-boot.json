@@ -1,1 +1,1 @@
-{"args":{"p1":"Mr. Game & Watch","cpu":"Greninja","stage":"Final Destination","form":"normal","boot":"0x3dec61593ef80877","stage_id":3},"files":{"lines":"accept-docs-enter-training.lines"},"expect":"reject","contains":"is from boot 0xa1e80deccd2a9a15, not this boot 0x3dec61593ef80877"}
+{"args":{"p1":"Mr. Game & Watch","cpu":"Greninja","stage":"Final Destination","form":"normal","boot":"0x3dec61593ef80877"},"files":{"lines":"accept-docs-enter-training.lines"},"expect":"reject","contains":"is from boot 0xa1e80deccd2a9a15, not this boot 0x3dec61593ef80877"}

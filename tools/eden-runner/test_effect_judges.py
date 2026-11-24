@@ -64,6 +64,8 @@ class EffectJudgeTests(unittest.TestCase):
                     self.assertEqual(paths['reject-missing-body.json']['expect'], 'reject')
                 else:
                     self.assertEqual(paths['reject-other-stage.json']['expect'], 'reject')
+                    self.assertEqual(paths['reject-no-stage.json']['expect'], 'reject')
+                    self.assertEqual(paths['reject-superseded-stage.json']['expect'], 'reject')
 
     def test_effect_table_names_existing_judges_and_hooks_call_them_directly(self):
         self.assertEqual(routes.EFFECT_JUDGES, {
@@ -114,6 +116,34 @@ class EffectJudgeTests(unittest.TestCase):
                          if '[Bridge] fighter entry=' in line else line for line in args['lines']]
         with self.assertRaisesRegex(RuntimeError, 'no live body'):
             routes.judge_expect_fighters(**args)
+
+    def test_reach_stage_requires_a_recorded_observation(self):
+        _, missing = load_case(CASES / 'reach_training' / 'reject-no-stage.json')
+        for stage in ('Final Destination', 'Battlefield'):
+            with self.subTest(stage=stage), self.assertRaisesRegex(RuntimeError, 'no stage observation'):
+                routes.judge_reach_training(**{**missing, 'stage': stage})
+        _, witnessed = load_case(CASES / 'reach_training' / 'accept-docs-enter-training.json')
+        try:
+            result = routes.judge_reach_training(**witnessed)
+        except RuntimeError as error:
+            self.fail(f'recorded stage must pass: {error}')
+        self.assertEqual(result['stage_id'], 3)
+        with self.assertRaisesRegex(RuntimeError, 'live Training state does not match the requested setup'):
+            routes.judge_reach_training(**{**witnessed, 'stage': 'Battlefield'})
+
+    def test_reach_signature_and_hook_do_not_supply_stage_id(self):
+        self.assertNotIn('stage_id', inspect.signature(routes.judge_reach_training).parameters)
+        tree = ast.parse(inspect.getsource(routes.reach_training))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == 'judge_reach_training']
+        self.assertTrue(calls)
+        self.assertTrue(all(keyword.arg != 'stage_id' for call in calls for keyword in call.keywords))
+
+    def test_live_comparison_does_not_copy_the_live_stage(self):
+        tree = ast.parse(inspect.getsource(routes._effect_compare_live))
+        self.assertFalse(any(isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                             and node.value.id == 'live' and isinstance(node.slice, ast.Constant)
+                             and node.slice.value == 'stage_id' for node in ast.walk(tree)))
 
 
 class EffectHookTests(unittest.TestCase):
@@ -186,6 +216,9 @@ class EffectHookTests(unittest.TestCase):
         replay = MenuReplay()
         replay.menu['open'] = '0'
         state = {'stage': 3, 'roster': {0: {'kind': 0, 'nana': False}, 1: {'kind': 7, 'nana': False}}}
+        stage_line = (CASES / 'reach_training' / 'other-run-tk06.lines').read_text().splitlines()[1]
+        with self.log.open('a') as stream:
+            stream.write(stage_line + '\n')
 
         def roster(*args, **kwargs):
             with self.log.open('a') as stream:
@@ -197,17 +230,21 @@ class EffectHookTests(unittest.TestCase):
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
         try:
-            judged = routes.judge_reach_training(self.recorded, p1='Mario', cpu='Fox',
-                                                stage='Final Destination', boot=BOOT, stage_id=3)
-        except NotImplementedError:
-            self.fail('judge is not implemented')
+            judged = routes.judge_reach_training([self.recorded[0], stage_line, *self.recorded[1:]],
+                                                p1='Mario', cpu='Fox', stage='Final Destination', boot=BOOT)
+        except RuntimeError as error:
+            self.fail(f'recorded stage must pass: {error}')
         self.assertEqual(result['verified'], judged)
+        self.assertEqual(result['verified']['stage_id'], 3)
         self.assertEqual(replay.actions, [])
 
     def test_reach_hook_refuses_disagreement_with_the_recorded_roster(self):
         replay = MenuReplay()
         replay.menu['open'] = '0'
         state = {'stage': 3, 'roster': {0: {'kind': 0, 'nana': True}, 1: {'kind': 7, 'nana': False}}}
+        stage_line = (CASES / 'reach_training' / 'other-run-tk06.lines').read_text().splitlines()[1]
+        with self.log.open('a') as stream:
+            stream.write(stage_line + '\n')
 
         def roster(*args, **kwargs):
             with self.log.open('a') as stream:
@@ -218,6 +255,25 @@ class EffectHookTests(unittest.TestCase):
              patch.object(routes, 'native_state', side_effect=roster), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             with self.assertRaisesRegex(RuntimeError, 'reach_training: the judged lines and the live read disagree'):
+                routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+
+    def test_reach_hook_refuses_stage_only_before_latest_greeting(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        state = {'stage': 3, 'roster': {0: {'kind': 0, 'nana': False}, 1: {'kind': 7, 'nana': False}}}
+        stage_line = (CASES / 'reach_training' / 'other-run-tk06.lines').read_text().splitlines()[1]
+        self.log.write_text(stage_line + '\n' + self.recorded[0] +
+                            '\nplugin=ssbu-hw-bridge/0.1.0 result=installed\n')
+
+        def roster(*args, **kwargs):
+            with self.log.open('a') as stream:
+                stream.write('\n'.join(self.recorded[1:6]) + '\n')
+            return state
+
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=roster), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'no stage observation in this bridge connection'):
                 routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
 
 
