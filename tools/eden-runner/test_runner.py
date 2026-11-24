@@ -1746,6 +1746,38 @@ class RunnerTests(unittest.TestCase):
         self.make(eden).run()
         self.assertEqual(json.loads((self.dir / 'out' / 'r2.json').read_text())['status'], 'PASS')
 
+    def test_a_hook_play_the_gate_did_not_check_stops_before_anything_is_sent(self):
+        def run(source, args=None):
+            (self.dir / 'steps.py').write_text(source)
+            step = {'run': 'steps.py:press', **({'args': args} if args else {})}
+            self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'red', 'steps': [step]}]
+            self.manifest.write_text(json.dumps(self.plan))
+            shutil.rmtree(self.dir / 'out', ignore_errors=True)
+            eden = FakeEden({'to-red': RED})
+            try:
+                self.make(eden).run()
+            except RuntimeError:
+                pass
+            receipt = json.loads((self.dir / 'out' / 'r1.json').read_text())
+            return receipt['status'], eden.calls.count('macro.play'), receipt.get('error', '')
+
+        # A name the gate checked for this plan is played: written at the call, or passed by the manifest.
+        self.assertEqual(run('def press(ctx):\n    ctx.play("to-red")\n')[:2], ('PASS', 1))
+        self.assertEqual(run('def press(ctx, name):\n    ctx.play(name)\n', {'name': 'to-red'})[:2], ('PASS', 1))
+        # A name built at run time is one the gate could not check: the play stops and nothing is sent, even
+        # though the name is a segment of the plan.
+        status, sent, error = run('def press(ctx):\n    ctx.play("to-" + "red")\n')
+        self.assertEqual((status, sent), ('FAILED', 0))
+        self.assertIn('G8: ctx.play("to-red") is a name the packet gate did not check for this plan', error)
+        self.assertIn('nothing was sent', error)
+        # The same call with its closed set declared is checked, and plays.
+        self.assertEqual(run('def press(ctx):\n    ctx.play("to-" + "red", among=("to-red", "pause"))\n')[:2],
+                         ('PASS', 1))
+        # A name outside the declared set stops too.
+        status, sent, error = run('def press(ctx):\n    ctx.play("to-" + "red", among=("pause",))\n')
+        self.assertEqual((status, sent), ('FAILED', 0))
+        self.assertIn('to-red is not among the names this step declares', error)
+
     def _check_unusual_step_value(self, expression, expected):
         (self.dir / 'steps.py').write_text('def value(ctx):\n    return ' + expression + '\n')
         self.plan['rows'] = [
@@ -3548,12 +3580,18 @@ class DeclaredPlayTests(unittest.TestCase):
     def test_a_segment_play_outside_its_declared_set_stops(self):
         fake = mock.Mock()
         fake.instances = {'a': {}}
+        fake.play_names.return_value = {'take-p1', 'take-cpu', 'written'}
         ctx = runner.StepContext(fake, 'a')
         ctx.play('take-p1', among=('take-p1', 'take-cpu'))
-        ctx.play('anything')
-        self.assertEqual(fake.play.call_args_list, [mock.call('a', 'take-p1'), mock.call('a', 'anything')])
+        ctx.play('written')
+        self.assertEqual(fake.play.call_args_list, [mock.call('a', 'take-p1'), mock.call('a', 'written')])
         with self.assertRaisesRegex(RuntimeError, 'take-p2 is not among the names this step declares'):
             ctx.play('take-p2', among=('take-p1', 'take-cpu'))
+        # A name the gate did not check for this plan stops, declared at the call or not.
+        for among in (None, ('unchecked',)):
+            with self.assertRaisesRegex(RuntimeError, 'G8: ctx.play\\("unchecked"\\) is a name the packet gate '
+                                                      'did not check for this plan; nothing was sent'):
+                ctx.play('unchecked', among=among)
         self.assertEqual(fake.play.call_count, 2)
 
     def test_a_route_play_outside_its_declared_set_stops(self):
