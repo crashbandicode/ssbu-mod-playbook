@@ -46,6 +46,17 @@ pub fn lanes(slots: &[u64], name: &str, out: &mut String) {
     for lane in 2..=3 {
         let _ = writeln!(out, "lane.{lane}.frames={}", 0);
     }
+    for (group, kind) in [("player", "left"), ("partner", "right")] {
+        let _ = writeln!(out, "{group}.{kind}=1");
+    }
+    for half in ["top", "bottom"] {
+        for edge in ["in", "out"] {
+            let _ = writeln!(out, "{half}.{edge}=1");
+        }
+    }
+    for (rank, medal) in ["gold", "silver"].into_iter().enumerate() {
+        let _ = writeln!(out, "medal.{rank}.{medal}=1");
+    }
 }
 '''
 
@@ -569,6 +580,53 @@ for side in ["p1", "cpu"] {
         self.assertEqual(self.errors(), [])
         self.assertIn('writes lane.{lane}.frames with lane = 2 to 3', self.refused('tr.practice:lane.4.frames'))
         self.refused('tr.practice:lane.1.frames')
+
+    def test_placeholders_of_one_loop_stay_together(self):
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/practice_state.rs'])
+        # One loop over pairs writes one key per pair, not every combination.
+        self.assertEqual({key for key in keys if key.startswith(('player.', 'partner.'))},
+                         {'player.left', 'partner.right'})
+        self.plan['rows'][0]['reads'] = ['tr.practice:player.left', 'tr.practice:partner.right']
+        self.assertEqual(self.errors(), [])
+        for read in ('tr.practice:player.right', 'tr.practice:partner.left'):
+            self.refused(read)
+        # An index and its item come from the same pass of the loop.
+        self.assertEqual({key for key in keys if key.startswith('medal.')}, {'medal.0.gold', 'medal.1.silver'})
+        self.refused('tr.practice:medal.0.silver')
+        # Two loops, one inside the other, do write every combination.
+        self.assertEqual({key for key in keys if key.startswith(('top.', 'bottom.'))},
+                         {'top.in', 'top.out', 'bottom.in', 'bottom.out'})
+
+    def test_a_mutable_loop_binding_writes_no_key(self):
+        self.practice('for (entry, count) in thinks.into_iter().enumerate().skip(1) {',
+                      'for (mut entry, count) in thinks.into_iter().enumerate().skip(1) {\n        entry += 1;')
+        for read in ('tr.practice:cpu.1.ai_thinks', 'tr.practice:cpu.4.ai_thinks', 'tr.practice:cpu.8.ai_thinks'):
+            self.assertIn('writes cpu.{entry}.ai_thinks, but the gate cannot tell its values: '
+                          'entry is a mutable binding', self.refused(read))
+        self.practice('for lane in 2..=3 {', 'for mut lane in 2..=3 {\n        lane *= 2;')
+        self.assertIn('lane is a mutable binding', self.refused('tr.practice:lane.2.frames'))
+        self.practice('for (key, value) in [("score", fields.score)',
+                      'for (mut key, value) in [("score", fields.score)')
+        self.refused('tr.practice:score')
+        self.plan['rows'][0]['reads'] = ['tr.practice:step', 'tr.practice:phase']
+        self.assertEqual(self.errors(), [])
+
+    def test_a_loop_that_can_stop_or_skip_writes_no_key(self):
+        write = '        let _ = writeln!(out, "lane.{lane}.frames={}", 0);\n'
+        # A pass the loop can skip: the gate cannot tell which lanes reach the write.
+        self.practice('for lane in 2..=3 {', 'for lane in 2..=3 {\n        if lane == 2 { continue; }')
+        for read in ('tr.practice:lane.2.frames', 'tr.practice:lane.3.frames'):
+            self.assertIn('its loop can stop or skip a pass', self.refused(read))
+        # A loop that can stop after a write.
+        self.practice(write, write + '        if done { break; }\n')
+        self.assertIn('its loop can stop or skip a pass', self.refused('tr.practice:lane.3.frames'))
+        # A write under a condition on the placeholder itself.
+        self.practice(write, '        if lane != 2 {\n    ' + write + '        }\n')
+        for read in ('tr.practice:lane.2.frames', 'tr.practice:lane.3.frames'):
+            self.assertIn('lane is used inside its loop before the key is written', self.refused(read))
+        # A condition on something else leaves the keys as they are (the pairs of the practice state).
+        self.plan['rows'][0]['reads'] = ['tr.practice:step', 'tr.practice:score', 'tr.practice:cpu.4.ai_thinks']
+        self.assertEqual(self.errors(), [])
 
     def test_an_event_line_with_a_format_key_names_its_event(self):
         self.plan['rows'][0]['reads'] = ['tr.event:seat owner.p1', 'tr.event:seat owner.cpu', 'tr.event:owner.cpu']
