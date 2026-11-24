@@ -355,12 +355,12 @@ def image_issue(path, *, previews=None):
                 with Image.open(path) as image:
                     image_format = image.format
                     image.verify()
+                if not _file_ends_complete(path, image_format):
+                    return 'not a decodable image'
                 with Image.open(path) as image:
                     image.load()
                     if previews is not None:
                         previews[str(Path(path))] = image.convert('RGB').resize((320, 180), Image.Resampling.BOX)
-                if not _file_ends_complete(path, image_format):
-                    return 'not a decodable image'
             finally:
                 ImageFile.LOAD_TRUNCATED_IMAGES = truncated
         return None
