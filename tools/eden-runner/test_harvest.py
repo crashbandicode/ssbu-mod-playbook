@@ -94,6 +94,18 @@ class HarvestTests(unittest.TestCase):
             harvest.harvest(self.manifest, self.out, 'test', self.library)
         self.assertFalse(self.index.exists())
 
+    def test_reserved_candidate_is_not_harvested_even_if_its_hash_matches(self):
+        candidate = self.base / '.gate-candidate-leftover'
+        candidate.write_bytes(b'unpublished')
+        plan = json.loads(self.manifest.read_text())
+        plan['gates']['g1'] = {'kind': 'image', 'reference': candidate.name,
+                               'sha256': hashlib.sha256(candidate.read_bytes()).hexdigest(), 'cap': 1}
+        self.manifest.write_text(json.dumps(plan))
+        self.receipt('PASS')
+        with self.assertRaisesRegex(RuntimeError, 'reference is not approved'):
+            harvest.harvest(self.manifest, self.out, 'test', self.library)
+        self.assertFalse(self.index.exists())
+
     def test_reference_that_becomes_pending_during_read_is_not_harvested(self):
         reference = self.base / 'reference.png'
         reference.write_bytes(b'old reference')

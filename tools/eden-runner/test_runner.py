@@ -2040,6 +2040,127 @@ class RunnerTests(unittest.TestCase):
                 worker.join(1)
                 self.assertFalse(worker.is_alive())
 
+    def stopped_acquisition(self):
+        bridge = self.dir / 'stop-acquire.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001, 1002, 1003])
+        eden.colour = RED
+        self.plan['gates']['red'].update(acquire=True, reference='refs/new.png', interval=.01)
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(eden)
+        run.acquired = []
+        return run
+
+    def check_direct_stop(self, entry, ready):
+        run = self.stopped_acquisition()
+        before = self.manifest.read_bytes()
+        original = run.log if ready else run.shot
+
+        def stop_after(*args):
+            result = original(*args)
+            if not ready or args[0].get('acquisition_pending'):
+                (run.out / 'STOP').write_text('operator stop')
+            return result
+
+        with mock.patch.object(run, 'log' if ready else 'shot', side_effect=stop_after):
+            with self.assertRaisesRegex(runner.StopRun, 'operator stop'):
+                if entry == 'check_gate':
+                    run.check_gate('a', 'red')
+                else:
+                    run.acquire('a', 'red', run.plan['gates']['red'], time.monotonic() + 2)
+        self.assertEqual(self.manifest.read_bytes(), before)
+        self.assertFalse((self.dir / 'refs/new.png').exists())
+        self.assertEqual(run.acquired, [])
+        self.assertFalse((run.out / 'stills.jsonl').exists())
+        self.assertEqual(list(run.row_dir.glob('*.png')), [])
+        self.assertFalse(list(self.dir.rglob('.gate-candidate-*')))
+        (run.out / 'STOP').unlink()
+        run.check_gate('a', 'red')
+        self.assertEqual(len(run.acquired), 1)
+        self.assertTrue(run.last_gate_outcome['passed'])
+
+    def test_direct_gate_stops_after_first_candidate_shot(self):
+        self.check_direct_stop('check_gate', False)
+
+    def test_direct_gate_stops_after_reference_is_staged(self):
+        self.check_direct_stop('check_gate', True)
+
+    def test_direct_acquire_stops_after_first_candidate_shot(self):
+        self.check_direct_stop('acquire', False)
+
+    def test_direct_acquire_stops_after_reference_is_staged(self):
+        self.check_direct_stop('acquire', True)
+
+    def test_reserved_candidate_is_not_an_image_gate_reference_even_with_matching_hash(self):
+        candidate = self.dir / 'refs/.gate-candidate-leftover'
+        candidate.write_bytes((self.dir / 'refs/red.png').read_bytes())
+        self.plan['gates']['red'].update(reference=str(candidate), acquire=True)
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertTrue(runner.dry_run(self.manifest)['errors'])
+        run = self.make(FakeEden({}))
+        with self.assertRaisesRegex(RuntimeError, 'candidate'):
+            run.check_gate('a', 'red')
+        self.assertFalse((run.out / 'stills.jsonl').exists())
+
+    def test_gate_does_not_compare_against_another_gates_uncommitted_reference(self):
+        run = self.stopped_acquisition()
+
+        def two_checks(_):
+            run.check_gate('a', 'red')
+            run.check_gate('a', 'red')
+
+        with mock.patch.object(run, 'compare_region', side_effect=AssertionError('compared pending reference')):
+            answered, error = runner.macro_gate.bounded_call(two_checks, 'gate', 2)
+        self.assertFalse(answered)
+        self.assertIsInstance(error, runner.closed_loop.DispatchRejected)
+        self.assertFalse((self.dir / 'refs/new.png').exists())
+        self.assertEqual(run.acquired, [])
+        self.assertFalse((run.out / 'stills.jsonl').exists())
+
+    def test_new_process_ignores_candidates_after_writer_exits_before_commit(self):
+        run = self.stopped_acquisition()
+        before = self.manifest.read_bytes()
+        tool_dir = Path(runner.__file__).parent
+        writer = '''
+import os, sys
+from pathlib import Path
+from test_runner import FreshEden, RED, runner
+manifest, out = map(Path, sys.argv[1:])
+bridge = manifest.parent / 'stop-acquire.log'
+eden = FreshEden(bridge, [1000, 1001])
+eden.colour = RED
+run = runner.Runner(manifest, {'a': {'socket': 'fake', 'bridge_log': str(bridge)}},
+                    out, 15, client_factory=lambda _: eden)
+run.acquired = []
+log = run.log
+def exit_before_commit(record):
+    log(record)
+    if record.get('acquisition_pending'):
+        os._exit(73)
+run.log = exit_before_commit
+run.check_gate('a', 'red')
+'''
+        writer_result = subprocess.run([sys.executable, '-B', '-c', writer, str(self.manifest), str(run.out)],
+                                       cwd=tool_dir, capture_output=True, timeout=5)
+        self.assertEqual(writer_result.returncode, 73, writer_result.stderr)
+        self.assertTrue(list(self.dir.rglob('.gate-candidate-*')))
+        self.assertEqual(before, self.manifest.read_bytes())
+        self.assertFalse((self.dir / 'refs/new.png').exists())
+        self.assertFalse((run.out / 'stills.jsonl').exists())
+        report = subprocess.run([sys.executable, '-B', '-c',
+                                 'import sys, json, runner; from pathlib import Path; '
+                                 'print(json.dumps(runner.dry_run(Path(sys.argv[1]))["references_to_acquire"]))',
+                                 str(self.manifest)], cwd=tool_dir, capture_output=True, check=True, timeout=5)
+        self.assertIn('red', json.loads(report.stdout))
+        (run.out / 'r2.json').write_text('{"status": "PASS"}')
+        harvest = subprocess.run([sys.executable, '-B', str(tool_dir / 'harvest.py'), str(self.manifest),
+                                  '--out', str(run.out), '--library', str(self.dir / 'library'), '--label', 'probe',
+                                  '--dry-run'], cwd=tool_dir, capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(harvest.returncode, 0)
+        self.assertIn('reference is not approved', harvest.stderr)
+        run.check_gate('a', 'red')
+        self.assertEqual(len(run.acquired), 1)
+
     def test_direct_acquisition_cannot_publish_a_candidate_staged_after_its_deadline(self):
         for entry, phase in (('check_gate', 'manifest'), ('acquire', 'manifest'),
                              ('check_gate', 'end'), ('acquire', 'end')):
