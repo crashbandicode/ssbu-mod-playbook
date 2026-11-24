@@ -2945,7 +2945,7 @@ class ReportStallTests(unittest.TestCase):
         self.row = {'id': 'r1', 'steps': [{'run': 'routes:wireless_room'}]}
         (self.run / 'rows' / 'rows.json').write_text(json.dumps({'rows': [self.row]}))
         self.config = {
-            'label': 'stall-control', 'host': 'fake',
+            'label': 'report-control', 'host': 'fake',
             'rows': {'sha256': sha(self.run / 'rows' / 'rows.json')},
             'instances': [{'key': 'a', 'app': {'path': '/fake', 'sha256': '0' * 64}}],
         }
@@ -3010,6 +3010,8 @@ class ReportStallTests(unittest.TestCase):
         self.assertIn('stage_select', row)
         self.assertEqual(len(eden_test.row_stalls(self.run, 'r1', receipt)), 1)
         self.assertEqual(eden_test.row_report(self.run, self.row, {})[0], 'PASS')
+        self.assertEqual(len(eden_test.report_rows(self.run)[0]), 4)
+        self.assertEqual(len(eden_test.report_rows_with_stalls(self.run)[0]), 5)
         self.assertEqual(eden_test.report_counts(self.run), {'PASS': 1, 'FAIL': 0, 'NOT RUN': 0})
         self.assertIn('(1 row passed with stalls, 1 stall in all)', eden_test.report_md(self.run))
         summary = self.summary()
@@ -3066,6 +3068,43 @@ class ReportStallTests(unittest.TestCase):
         row = self.report_row()
         self.assertIn('| PASS with 30 stalls |', row)
         self.assertIn('step-29', row)
+
+    def test_row_stalls_keep_first_seen_order_and_merge_the_block(self):
+        value, journal = self.wireless_value(1)
+        first = value['stalls'][0]
+        second = dict(first, step='place')
+        value['phases'] = {'phase': {'stalls': [dict(first), second]}}
+        receipt = self.write_receipt(value, journal=journal)
+        events = eden_test.row_stalls(self.run, 'r1', receipt)
+        self.assertEqual([event['step'] for event in events], ['stage-a', 'place'])
+        self.assertEqual(events[0]['block'], 'wireless_room')
+        self.assertNotIn('block', first)
+
+    def test_summary_keeps_every_passed_row_with_stalls(self):
+        value, journal = self.wireless_value(1)
+        rows = [{'id': f'r{i}', 'steps': self.row['steps']} for i in range(25)]
+        (self.run / 'rows' / 'rows.json').write_text(json.dumps({'rows': rows}))
+        self.config['rows']['sha256'] = sha(self.run / 'rows' / 'rows.json')
+        receipt = {'status': 'PASS', 'results': [{'run': 'routes:wireless_room', 'value': value}]}
+        for row in rows:
+            (self.run / 'out' / f'{row["id"]}.json').write_text(json.dumps(receipt))
+        summary = self.summary()
+        self.assertIn('(25 rows passed with stalls, 25 stalls in all)', summary)
+        self.assertIn('PASS with 1 stall r24', summary)
+
+    def test_total_includes_stalls_on_a_failed_row(self):
+        value, journal = self.wireless_value(1)
+        self.write_receipt(value, journal=journal)
+        rows = [self.row, {'id': 'r2', 'steps': self.row['steps']}]
+        (self.run / 'rows' / 'rows.json').write_text(json.dumps({'rows': rows}))
+        self.config['rows']['sha256'] = sha(self.run / 'rows' / 'rows.json')
+        stopped = {'status': 'FAILED', 'error': 'route stopped', 'results': [
+            {'run': 'routes:wireless_room', 'value': value}]}
+        (self.run / 'out' / 'r2.json').write_text(json.dumps(stopped))
+        report = eden_test.report_md(self.run)
+        self.assertIn('(1 row passed with stalls, 2 stalls in all)', report)
+        self.assertIn('| r2 | wireless_room | FAIL |', report)
+        self.assertIn('(1 row passed with stalls, 2 stalls in all)', self.summary())
 
 
 class RerunTests(unittest.TestCase):
