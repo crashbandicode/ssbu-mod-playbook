@@ -431,7 +431,8 @@ class SetupCallsR2Tests(unittest.TestCase):
             original = menu.send
 
             def send(macro):
-                routes.play(ctx, macro)
+                witness = dict(menu.menu)
+                routes.play(ctx, macro, requalify=lambda: menu.menu == witness)
                 original(macro)
 
             menu.send = send

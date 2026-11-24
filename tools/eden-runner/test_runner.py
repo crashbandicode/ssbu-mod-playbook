@@ -1210,6 +1210,95 @@ class RunnerTests(unittest.TestCase):
     def make(self, eden, pace=15):
         return runner.Runner(self.manifest, self.instances, self.dir / 'out', pace, client_factory=lambda s: eden)
 
+    def waiting_run(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        now = [0.0]
+        eden.played_paths, eden.played_times = [], []
+        original = eden.request
+
+        def request(method, params):
+            if method == 'macro.play':
+                eden.played_paths.append(params['path'])
+                eden.played_times.append(now[0])
+            if method == 'macro.status' and now[0] < 1.2:
+                eden.calls.append(method)
+                return {'ok': True, 'result': {'state': 'playing', 'error': ''}}
+            return original(method, params)
+
+        eden.request = request
+        clock = mock.patch.object(runner.time, 'monotonic', side_effect=lambda: now[0])
+        sleep = mock.patch.object(runner.time, 'sleep', side_effect=lambda delay: now.__setitem__(0, now[0] + delay))
+        clock.start()
+        sleep.start()
+        self.addCleanup(clock.stop)
+        self.addCleanup(sleep.stop)
+        return run, eden, now
+
+    def test_runner_play_waits_for_idle_and_rechecks_the_start_gate(self):
+        run, eden, now = self.waiting_run()
+        run.plan['segments']['to-red']['start_gate'] = 'red'
+        with mock.patch.object(run, 'check_gate', return_value=True) as check:
+            run.play('a', 'to-red')
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertGreaterEqual(eden.played_times[0], 1.2)
+
+    def test_runner_play_does_not_play_when_the_start_screen_left_during_the_wait(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['segments']['to-red']['start_gate'] = 'red'
+        with mock.patch.object(run, 'check_gate', side_effect=[True, RuntimeError('start screen left')]):
+            with self.assertRaisesRegex(RuntimeError, 'start screen left'):
+                run.play('a', 'to-red')
+        self.assertNotIn('macro.play', eden.calls)
+
+    def test_a_segment_without_a_start_gate_is_played_after_the_wait(self):
+        run, eden, now = self.waiting_run()
+        run.play('a', 'to-red')
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertEqual(eden.played_paths, [str(self.dir / 'segments' / 'to-red.edenmacro.json')])
+        self.assertGreaterEqual(eden.played_times[0], 1.2)
+
+    def test_gate_recovery_is_skipped_when_the_gate_passes_after_the_wait(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['gates']['red']['recover'] = 'to-red'
+        with mock.patch.object(run, 'check_gate', side_effect=[RuntimeError('not red'), True, True]) as check:
+            run.gate('a', 'red')
+        self.assertEqual(check.call_count, 3)
+        self.assertNotIn('macro.play', eden.calls)
+
+    def test_play_library_uses_the_same_gate(self):
+        run, eden, _ = self.waiting_run()
+        entry = {'file': 'segments/to-red.edenmacro.json', 'sha256': sha(self.dir / 'segments/to-red.edenmacro.json'),
+                 'start_gate': 'red'}
+        with mock.patch.object(runner, 'LIBRARY', self.dir), \
+                mock.patch.object(runner, 'library_index', return_value={'segments': {'shared': entry}}), \
+                mock.patch.object(run, 'check_gate', return_value=True) as check:
+            run.play_library('a', 'shared')
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertEqual(eden.played_paths, [str(self.dir / 'segments' / 'to-red.edenmacro.json')])
+
+    def test_a_runner_macro_wait_is_listed_in_the_row_receipt(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'red',
+                             'steps': [{'play': 'to-red', 'unchecked': True}]}]
+        run.run()
+        receipt = json.loads((run.out / 'r1.json').read_text())
+        self.assertEqual(len(receipt['macro_waits']), 1)
+        self.assertEqual(receipt['macro_waits'][0]['outcome'], 'sent: the caller declared no witness')
+        rows = (run.out / 'r1' / 'stall-events.jsonl').read_text().splitlines()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0])['block'], 'runner')
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+
+    def test_runner_call_itself_never_waits(self):
+        run, eden, now = self.waiting_run()
+        run.call('a', 'macro.play', {'path': str(self.dir / 'segments' / 'to-red.edenmacro.json')})
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertNotIn('macro.status', eden.calls)
+        self.assertEqual(now[0], 0)
+
     def test_shot_records_the_game_frame_and_edens_reply(self):
         bridge = self.dir / 'bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)

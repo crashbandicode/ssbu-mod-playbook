@@ -1,12 +1,16 @@
 """Replay exact tile and native state facts without controller or bridge I/O."""
 
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
+import native_picker_io
+import routes
 
 
 def snapshot(provider, rev, fields, epoch=1):
@@ -53,6 +57,90 @@ def native(rev, epoch=1, **extra):
                                     'dialog': 'none', 'focus.source': 'tile.cursor',
                                     'screen.context': 'unknown', 'ack': '0', 'ack.result': 'unsupported',
                                     **extra}, epoch)
+
+
+class IORequalificationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.bridge = self.root / 'bridge.log'
+        self.bridge.write_text('')
+        self.now, self.sent, self.logs, self.reads = 0.0, [], [], []
+        self.free_at = 1.2
+        self.runner = types.SimpleNamespace(wait_macro=Mock(),
+                                            setup_metrics={'inputs': 0, 'bridge_requests': 0,
+                                                           'bridge_boot': None, 'revisions': {}, 'stalls': []})
+        self.ctx = types.SimpleNamespace(on='a', instance={'bridge_log': str(self.bridge)}, runner=self.runner,
+                                         row_dir=self.root, call=self.call, log=self.logs.append,
+                                         check_stop=lambda: None)
+        self.io = native_picker_io.BridgePickerIO(self.ctx)
+        self.before = native(1, screen='css.training', **{'screen.context': 'training'})
+        self.after = native(2, screen='css.training', **{'screen.context': 'training'})
+        self.io._record(self.before)
+
+    def call(self, method, params=None):
+        if method == 'macro.status':
+            return {'state': 'idle' if self.now >= self.free_at else 'playing', 'error': ''}
+        if method == 'macro.play':
+            self.sent.append((self.now, params))
+            return {}
+        raise AssertionError(method)
+
+    def read(self, provider, cap):
+        self.reads.append((provider, cap, self.io.in_flight))
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(provider, 'ssbu.ui')
+        return self.io._record(self.after)
+
+    def send(self, **options):
+        def sleep(seconds):
+            self.now += seconds
+
+        with patch.object(routes, 'macro_file', return_value=(Path('/leave-css'), 'sha', 5)), \
+                patch.object(self.io, 'read', side_effect=self.read), \
+                patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
+                patch.object(routes.time, 'sleep', side_effect=sleep):
+            return self.io.send('leave-css', **options)
+
+    def test_a_screen_that_changed_while_the_channel_was_busy_gets_no_press(self):
+        self.after = native(2, screen='main_menu', **{'screen.context': 'unknown'})
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'ssbu.ui changed.*screen'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
+
+    def test_a_channel_that_frees_after_the_callers_deadline_gets_no_press(self):
+        self.free_at = 10.2
+        with self.assertRaises(routes.closed_loop.DispatchRejected):
+            self.send(until=9)
+        self.assertEqual(self.sent, [])
+        self.assertLessEqual(self.now, 9.000001)
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+
+    def test_an_unchanged_source_is_requalified_and_pressed_once(self):
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.reads), 1)
+        self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'], 'requalified, sent')
+
+    def test_a_changed_bridge_connection_cannot_authorise_the_input(self):
+        self.after = native(2, epoch=2, screen='css.training', **{'screen.context': 'training'})
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'ssbu.ui changed.*connection'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.io.in_flight)
+
+    def test_an_idle_channel_sends_at_once_as_before(self):
+        self.free_at = 0
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reads, [])
+        self.assertIn('a', self.io.pending)
+        self.assertTrue(self.io.in_flight)
 
 
 def loading(rev, *, epoch=1, **extra):

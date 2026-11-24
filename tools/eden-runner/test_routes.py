@@ -146,18 +146,18 @@ class PlayIdleTests(unittest.TestCase):
             return {}
         raise AssertionError(method)
 
-    def play(self):
+    def play(self, **options):
         def sleep(seconds):
             self.now += seconds
 
         with mock.patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)), \
                 mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
                 mock.patch.object(routes.time, 'sleep', side_effect=sleep):
-            return routes.play(self.ctx, 'training-input')
+            return routes.play(self.ctx, 'training-input', **options)
 
     def test_play_waits_while_a_macro_is_playing_then_sends_once(self):
         self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
-        self.assertEqual(self.play(), 'sha')
+        self.assertEqual(self.play(requalify=lambda: True), 'sha')
         self.assertEqual(len(self.sent), 1)
         self.assertGreaterEqual(self.sent[0][0], .4)
         self.assertGreater(len(self.status_calls), 1)
@@ -171,16 +171,20 @@ class PlayIdleTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertGreaterEqual(self.now, 15)
         self.runner.wait_macro.assert_not_called()
+        self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
+        self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'], 'not sent: still busy')
+        self.assertEqual(len((self.row / 'stall-events.jsonl').read_text().splitlines()), 1)
 
     def test_play_records_one_stall_event_for_a_wait_over_a_second(self):
         self.status = lambda: {'state': 'recording'} if self.now < 1.2 else {'state': 'finished'}
-        self.play()
+        self.play(requalify=lambda: True)
         self.assertEqual(len(self.sent), 1)
         stalls = self.runner.setup_metrics['stalls']
         self.assertEqual(len(stalls), 1)
         event = stalls[0]
         self.assertEqual((event['kind'], event['block'], event['step'], event['why']),
                          ('idle-wait', 'play', 'training-input', 'macro recording'))
+        self.assertEqual(event['outcome'], 'requalified, sent')
         self.assertGreater(event['seconds'], 1)
         self.assertGreater(event['waits'], 1)
         self.assertIn('utc', event)
@@ -205,15 +209,22 @@ class PlayIdleTests(unittest.TestCase):
             self.play()
         self.assertEqual(self.sent, [])
 
-    def test_a_stall_journal_failure_is_raised_only_after_the_macro_was_waited_for(self):
+    def test_a_stall_journal_failure_is_logged_without_changing_the_send(self):
         self.status = lambda: {'state': 'playing'} if self.now < 1.2 else {'state': 'idle'}
         self.ctx.row_dir = self.row / 'missing'
-        with self.assertRaisesRegex(RuntimeError,
-                                    'macro training-input finished, but its stall event could not be recorded'):
-            self.play()
+        self.play(requalify=lambda: True)
         self.assertEqual(len(self.sent), 1)
         self.runner.wait_macro.assert_called_once_with('a', 3)
         self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
+        self.assertTrue(any('error' in str(event).lower() for event in self.logs))
+
+    def test_play_without_a_witness_does_not_send_after_waiting(self):
+        self.status = lambda: {'state': 'playing'} if self.now < 1.2 else {'state': 'idle'}
+        with self.assertRaises(routes.closed_loop.DispatchRejected):
+            self.play()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'],
+                         'not sent: no witness to requalify after the wait')
 
     def test_play_does_not_wait_when_the_engine_owns_the_idle_check(self):
         self.runner.closed_loop_owns_idle = True
