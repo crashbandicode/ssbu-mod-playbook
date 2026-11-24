@@ -533,6 +533,44 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(self.macro_attempts(), [])
         self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
 
+    def test_bridge_on_stub_on_provider_reply_begun_before_recheck_is_not_fresh(self):
+        self.recorded_opening(prompt_after_skip=False)
+        lines = RUN1_LAST_OPENING.splitlines(keepends=True)
+        cut = len(lines[0]) // 2
+        self.stub_samples = [RUN1_OPENING + lines[0][:cut], lines[0][cut:] + ''.join(lines[1:])]
+        self.stub_default = ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+
+    def test_bridge_on_stub_on_embedded_provider_text_is_not_a_reply(self):
+        self.recorded_opening(prompt_after_skip=False)
+        lines = RUN1_LAST_OPENING.splitlines(keepends=True)
+        self.stub_samples = [RUN1_OPENING, '[Adapter] note=' + ''.join(lines)]
+        self.stub_default = ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+
+    def test_bridge_on_stub_on_first_opening_reply_without_provider_is_not_fresh(self):
+        self.recorded_opening(prompt_after_skip=False)
+        no_fence = ''.join(RUN1_OPENING.splitlines(keepends=True)[1:])
+        self.stub_samples, self.stub_default = [no_fence], ''
+        with self.assertRaisesRegex(RuntimeError, 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent'):
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertFalse(any(method == 'macro.status' for method, _ in self.calls))
+
+    def test_bridge_on_stub_on_offsets_count_utf8_bytes(self):
+        self.recorded_opening()
+        self.stub_preamble = RUN1_PREAMBLE + '[Adapter] note=é\n'
+        self.stub_samples, self.stub_default = [RUN1_OPENING, RUN1_LAST_OPENING], ''
+        title = self.invoke(port=6980)['title']
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assert_fresh_offsets(title, self.stub_preamble + RUN1_OPENING, RUN1_LAST_OPENING, 1)
+
     def test_bridge_on_stub_on_first_opening_begun_before_its_request_is_not_fresh(self):
         self.recorded_opening(prompt_after_skip=False)
         lines = RUN1_OPENING.splitlines(keepends=True)
@@ -568,6 +606,18 @@ class BridgeOnTests(unittest.TestCase):
             'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
             'focus.index': 'unknown', 'focus.label': 'unknown',
             'input.owner': 'unknown', 'dialog': 'unknown'})
+        self.stub_samples, self.stub_default = [RUN1_OPENING, passive], ''
+        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+
+    def test_bridge_on_stub_on_passive_title_without_provider_keeps_existing_timeout(self):
+        self.recorded_opening(prompt_after_skip=False)
+        passive = self.sample(boot=RUN1_BOOT, fields={
+            'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
+            'focus.index': 'unknown', 'focus.label': 'unknown',
+            'input.owner': 'unknown', 'dialog': 'unknown'})
+        passive = re.sub(r'^\[Bridge\] req providers result=.*\n', '', passive, flags=re.MULTILINE)
         self.stub_samples, self.stub_default = [RUN1_OPENING, passive], ''
         with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
             self.invoke(port=6980)

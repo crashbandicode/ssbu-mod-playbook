@@ -4087,16 +4087,26 @@ def _bridge_on_connection_changed(line):
 
 
 def _bridge_on_ui_blocks_since_hello(text, hello, start):
-    lines = text.splitlines()
-    if start >= len(lines) or lines[start] != hello:
+    raw = text.encode() if isinstance(text, str) else text
+    lines = []
+    offset = 0
+    for part in raw.split(b'\n')[:-1]:
+        lines.append((offset, part.removesuffix(b'\r').decode('utf-8', errors='replace')))
+        offset += len(part) + 1
+    if start >= len(lines) or lines[start][1] != hello:
         raise RuntimeError('bridge_on (stub on): bridge greeting disappeared from capture log')
-    for line in lines[start + 1:]:
+    for _, line in lines[start + 1:]:
         if state_gate.BOUNDARY.search(line):
             raise _bridge_on_connection_changed(line)
     segment = []
-    for line in lines[start + 1:]:
+    providers_offset = None
+    begin_offset = reply_offset = None
+    for line_offset, line in lines[start + 1:]:
+        if line.startswith('[Bridge] req providers result='):
+            providers_offset = line_offset
         if state_gate.BEGIN.search(line):
             segment = [line]
+            begin_offset, reply_offset = line_offset, providers_offset
         elif segment:
             segment.append(line)
             if state_gate.END.search(line):
@@ -4105,7 +4115,8 @@ def _bridge_on_ui_blocks_since_hello(text, hello, start):
                     clock = re.search(r' frame=(\d+) wall=(\d+)$', segment[0])
                     if clock is None:
                         raise RuntimeError('bridge_on (stub on): state begin lacks frame or wall')
-                    blocks[0].update(frame=int(clock[1]), wall=int(clock[2]))
+                    blocks[0].update(frame=int(clock[1]), wall=int(clock[2]), begin_offset=begin_offset,
+                                     providers_reply_offset=reply_offset)
                     yield blocks[0]
                 segment = []
 
@@ -4210,10 +4221,15 @@ def _bridge_on_stub_title(ctx, hello, start):
                             f"{last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
 
     def read_blocks():
-        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello, start))
+        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_bytes(), hello, start))
         if len(blocks) < seen:
             raise RuntimeError('bridge_on (stub on): bridge observation history changed')
         return blocks
+
+    def fresh(block, boundary):
+        reply = block['providers_reply_offset']
+        begin = block['begin_offset']
+        return reply is not None and boundary <= reply < begin and boundary <= begin
 
     def check_current(block):
         blocks = read_blocks()
@@ -4222,9 +4238,10 @@ def _bridge_on_stub_title(ctx, hello, start):
 
     def request():
         nonlocal next_request
-        before = len(read_blocks())
-        asked.append(before)
+        read_blocks()
         now = time.monotonic()
+        before = log.stat().st_size
+        asked.append(before)
         bridge_v2(ctx, 'providers', 'state ssbu.ui')
         next_request = now + .1
         return before
@@ -4253,7 +4270,7 @@ def _bridge_on_stub_title(ctx, hello, start):
             if is_opening:
                 state['opening_seen'] = True
                 state['fresh_non_opening'] = False
-            elif any(index >= mark for mark in asked):
+            elif any(block['begin_offset'] >= mark for mark in asked):
                 state['fresh_non_opening'] = True
             last = {'rev': block['rev'], 'frame': block['frame'],
                     **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
@@ -4261,7 +4278,7 @@ def _bridge_on_stub_title(ctx, hello, start):
             if identity not in identities:
                 identities.add(identity)
                 not_yet.append(last)
-            if is_opening and seen == len(blocks) and any(index >= mark for mark in asked):
+            if is_opening and seen == len(blocks) and any(fresh(block, mark) for mark in asked):
                 observation = {'kind': 'opening', 'block': block, 'index': index}
         return observation
 
@@ -4284,9 +4301,12 @@ def _bridge_on_stub_title(ctx, hello, start):
             observation = consume(blocks)
             if state['prompt'] is not None:
                 return None
-            if len(blocks) > before:
-                if observation['kind'] == 'opening' and observation['index'] >= before:
-                    return observation['block'], {'request_blocks_before': before, 'block_index': observation['index']}
+            if blocks and fresh(blocks[-1], before):
+                if observation['kind'] == 'opening':
+                    block = observation['block']
+                    return block, {'request_bytes_before': before,
+                                   'providers_reply_offset': block['providers_reply_offset'],
+                                   'block_begin_offset': block['begin_offset'], 'block_index': observation['index']}
                 return None
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
         return None

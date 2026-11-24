@@ -174,7 +174,8 @@ With the stub on, if the first active read is the opening movie, the route press
 up to 10 seconds for the Title prompt. It never presses twice and never presses on another screen. The press is in
 the receipt with the read it was sent on.
 The press needs an opening read that arrived after a state request of this call, confirmed by a second fresh read just
-before the press; an opening block already in the capture is not enough.
+before the press; that read must begin after the request and after that request's providers reply. An opening block
+already in the capture is not enough.
 With the stub on, the greeting, the install line and the Title read come from the latest complete connection in the capture log; a connection change after that greeting stops the step.
 If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event,
 the same port and the same boot: a stub-on receipt with its pre-On evidence and its Title prompt read, or a trace
