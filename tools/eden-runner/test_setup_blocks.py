@@ -8,16 +8,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import fake_clock
 import routes
 import test_native_picker as recorded
 
 
 PAGES = ('cpu', 'saves', 'recording', 'fighters_stages', 'display_controls', 'developer')
+READ_COST = .0001  # One bridge read, as the fake models it.
 
 
 class MenuIO:
     def __init__(self, ctx, *, opened=False, page='cpu', depth=0, fault=None):
         self.ctx = ctx
+        self.clock = ctx.clock
+        self._observed_values = {}
         self.connection = 1
         self.boot = '0x0000000000000001'
         self.rev = 0
@@ -31,6 +35,13 @@ class MenuIO:
     def arm(self, provider, cap):
         pass
 
+    def observe(self, provider, cap, sample):
+        values = {key: value for key, value in sample.values.items() if key not in ('rev', 'observation')}
+        if self._observed_values.get(provider) == values:
+            self.clock.spend(min(cap, READ_COST))
+        self._observed_values[provider] = values
+        return sample
+
     def read(self, provider, cap):
         self.rev += 1
         metrics = self.ctx.runner.setup_metrics
@@ -40,12 +51,12 @@ class MenuIO:
             metrics['revisions'].setdefault(provider, [self.rev, self.rev])[1] = self.rev
         epoch = 2 if self.fault == 'epoch' and self.actions else 1
         if provider == 'tr.menu':
-            return recorded.snapshot(provider, self.rev, dict(self.menu), epoch=epoch)
+            return self.observe(provider, cap, recorded.snapshot(provider, self.rev, dict(self.menu), epoch=epoch))
         owner = 'tr.menu' if self.menu['open'] == '1' else 'native'
         if self.fault == 'owner' or self.fault == 'owner_after_input' and self.actions:
             owner = 'unknown'
-        return recorded.native(self.rev, epoch=epoch, screen='training', focus='training',
-                               **{'screen.context': 'training', 'input.owner': owner})
+        return self.observe(provider, cap, recorded.native(self.rev, epoch=epoch, screen='training', focus='training',
+                                                          **{'screen.context': 'training', 'input.owner': owner}))
 
     def send(self, segment):
         self.actions.append(segment)
@@ -78,11 +89,12 @@ class MenuIO:
 
 class OpenCloseTests(unittest.TestCase):
     def setUp(self):
+        self.clock = fake_clock.install(self, routes, routes.native_picker)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.ctx = SimpleNamespace(runner=SimpleNamespace(), row_dir=directory.name, on='s',
                                    instance={'bridge_log': str(Path(directory.name) / 'bridge.log')},
-                                   check_stop=lambda: None)
+                                   check_stop=lambda: None, clock=self.clock)
 
     def invoke(self, name, io, **kwargs):
         with patch.object(routes, 'BridgePickerIO', return_value=io):
@@ -569,7 +581,7 @@ class WizardIO(RowsIO):
             metrics['bridge_boot'] = self.boot
             metrics['revisions'].setdefault(provider, [self.menu_rev, self.menu_rev])[1] = self.menu_rev
         epoch = 2 if self.fault == 'epoch' and self.actions else 1
-        return recorded.snapshot(provider, self.menu_rev, dict(self.menu), epoch=epoch)
+        return self.observe(provider, cap, recorded.snapshot(provider, self.menu_rev, dict(self.menu), epoch=epoch))
 
     def send(self, segment):
         if self.menu['open'] == '1':
