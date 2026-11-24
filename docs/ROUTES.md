@@ -91,6 +91,7 @@ Look for the current screen and start there; wait for the step's fresh ready obs
 After a send, wait for the transition. A continuously observed source counts as a lost input:
 finish it and resend, up to three sends total (some steps allow fewer). If observations stay unreadable
 or in flight until the cap, stop on the named step without confirming or pressing again.
+`ready` waits 30 s of unchanged CSS before its single resend; what a second Plus does while the room is still loading has not been observed in a game.
 This closed-loop route is host-tested only, not flown.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog

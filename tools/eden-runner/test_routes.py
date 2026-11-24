@@ -2882,6 +2882,10 @@ class WirelessRoomTests(unittest.TestCase):
             self.stuck_placement = False
             self.waiting_role = 'host'
             self.never_waiting = False
+            self.ready_load_seconds = 0
+            self.ready_load_until = None
+            self.lost_ready_sends = 0
+            self.ready_send_times = []
             self.confirm_count = 0
             self.stage_count = 0
             self.role_reads = 0
@@ -2917,6 +2921,8 @@ class WirelessRoomTests(unittest.TestCase):
             else:
                 if self.phase == 'loading' and self.clock() >= self.stage_load_until:
                     self.phase = 'css'
+                if self.phase == 'ready_loading' and self.clock() >= self.ready_load_until:
+                    self.phase = 'waiting'
                 if self.phase == 'css' and self.css_since is None:
                     self.css_since = self.clock()
                 if self.phase == 'form':
@@ -2964,6 +2970,7 @@ class WirelessRoomTests(unittest.TestCase):
                     'confirm_form': 'ldn.create',
                     'unpublished': 'unknown', 'wrong': 'ldn.room_list', 'stage': 'stage_select',
                     'css': 'css.smash', 'waiting': 'ldn.waiting', 'not_waiting': 'css.smash', 'loading': 'unknown',
+                    'ready_loading': 'css.smash',
                 }[self.phase]
                 if scripted_stage is not None:
                     screen = scripted_stage
@@ -3030,8 +3037,17 @@ class WirelessRoomTests(unittest.TestCase):
                                       'p1.coin': 'placed', 'p1.coin.at': '66',
                                       'p1.placed.at': '66', 'p1.placed.name': 'Simon',
                                       'phase': 'resting'})
-            elif macro in ('tap-plus1', 'lobby-ready') and self.phase == 'css':
-                self.phase = 'not_waiting' if self.never_waiting else 'waiting'
+            elif macro in ('tap-plus1', 'lobby-ready') and self.phase in ('css', 'ready_loading', 'not_waiting'):
+                self.ready_send_times.append(self.clock())
+                if self.lost_ready_sends:
+                    self.lost_ready_sends -= 1
+                elif self.never_waiting:
+                    self.phase = 'not_waiting'
+                elif self.ready_load_seconds:
+                    self.phase = 'ready_loading'
+                    self.ready_load_until = self.clock() + self.ready_load_seconds
+                else:
+                    self.phase = 'waiting'
             else:
                 raise AssertionError(f'unexpected input {macro!r} on {self.phase!r}')
 
@@ -3312,12 +3328,15 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
         self.assertFalse((self.row / 'routes-wireless-room.json').exists())
 
-    def test_local_held_without_p1_held_on_tile_can_place(self):
+    def test_local_held_without_p1_held_on_tile_never_authorizes_placement(self):
         self.io.tile.update({'p1.token': 'unknown', 'local.token': 'held', 'at': '42', 'hovered': '42'})
-        result = self.run_room()
-        self.assertEqual(result['placed_by'], 'A')
-        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
-                                           'lobby-a', 'lobby-a', 'lobby-ready'])
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room()
+        self.assertEqual(caught.exception.step, 'css-hand')
+        self.assertIn('not ready', caught.exception.reason)
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
+        self.assertEqual(self.io.actions.count('lobby-a'), 1)
+        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
 
     def test_local_held_waits_until_p1_held_before_chord(self):
         self.io.tile_script = [
@@ -3405,6 +3424,22 @@ class WirelessRoomTests(unittest.TestCase):
     def test_waiting_role_can_arrive_after_waiting_screen(self):
         self.io.host_after = 3
         self.assertEqual(self.run_room()['waiting']['ldn.role'], 'host')
+
+    def test_ready_is_not_pressed_again_while_the_room_loads(self):
+        self.io.ready_load_seconds = 25
+        result = self.run_room()
+        self.assertGreaterEqual(self.now - self.io.ready_send_times[0], 25)
+        self.assertEqual(self.io.actions.count('lobby-ready'), 1)
+        self.assertEqual(next(s for s in result['steps'] if s['name'] == 'ready')['sends'], 1)
+        self.assertEqual(result['waiting']['ldn.role'], 'host')
+
+    def test_a_lost_ready_is_pressed_once_more_after_thirty_seconds(self):
+        self.io.lost_ready_sends = 1
+        result = self.run_room()
+        self.assertEqual(self.io.actions.count('lobby-ready'), 2)
+        self.assertGreaterEqual(self.io.ready_send_times[1] - self.io.ready_send_times[0], 30)
+        self.assertEqual(next(s for s in result['steps'] if s['name'] == 'ready')['sends'], 2)
+        self.assertEqual(result['waiting']['ldn.role'], 'host')
 
     def test_waiting_timeout_reports_screens_seen(self):
         self.io.never_waiting = True

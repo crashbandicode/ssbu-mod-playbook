@@ -1079,7 +1079,8 @@ def wireless_room(ctx, ready_cap=60):
 
     def place_at(obs):
         tile = obs['tile'] or {}
-        return css(obs) and tile.get('screen') == 'css' and hovered(tile) and not _wireless_placed(tile)
+        return (css(obs) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
+                and hovered(tile) and not _wireless_placed(tile))
 
     def placed(obs):
         return css(obs) and _wireless_placed(obs['tile'] or {})
@@ -1100,7 +1101,8 @@ def wireless_room(ctx, ready_cap=60):
         closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
                          cap=5, ready_cap=30, lost_after=3, before_send=fence_chord),
         closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4),
-        closed_loop.Step('ready', placed, waiting, 'lobby-ready', cap=ready_cap + 10, lost_after=20, sends=2),
+        closed_loop.Step('ready', placed, waiting, 'lobby-ready', cap=max(ready_cap + 10, 45),
+                         lost_after=30, sends=2),
     ]
 
     def send(macro):
