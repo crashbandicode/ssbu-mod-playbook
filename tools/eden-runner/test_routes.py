@@ -3737,6 +3737,17 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertIn('macro.status not understood:', stop['input_channel'])
         self.assertIn('late failure', stop['input_channel'])
 
+    def test_a_macro_error_state_is_not_an_idle_channel(self):
+        self.io.phase = 'stage'
+        self.status_script = lambda: {'state': 'error', 'error': ''}
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertEqual(self.io.actions, [])
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertIn('macro.status not understood:', stop['input_channel'])
+        self.assertIn("'error'", stop['input_channel'])
+
     def test_countdown_and_branch_playing_are_busy(self):
         for state in ('countdown', 'branch_playing'):
             with self.subTest(state=state):

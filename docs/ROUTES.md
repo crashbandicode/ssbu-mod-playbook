@@ -88,10 +88,13 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
-Before every input, the step asks Eden's `macro.status`; while a macro plays or records it waits up to 15 seconds,
-reads again, then sends. A busy dispatch reply is never a blind resend: wait, read, and send once; a second
-rejection stops. Waits longer than one second and busy rejections are stall events.
-These events carry `kind`, `step`, `seconds`, `why`, `last_bridge_line`, and `utc`.
+Before every input, the step requires a `macro.status` of `idle` or `finished` without an error.
+`countdown`, `recording`, `playing`, and `branch_playing` wait; any other or unreadable status is treated as busy.
+One 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
+a fresh read. Only a refusal of the `macro.play` call itself (`input_busy`) is retried once after idle; a failure
+after the macro was accepted stops as delivery unknown. Accumulated waits over one second and dispatch rejections
+are stall events, carrying `kind`, `step`, `seconds`, `why`, `last_bridge_line`, and `utc`; idle waits also carry
+their count in `waits`.
 The Stage Select A gate requires a settled `tile.cursor` with numeric `at == hovered` and both `p1.token`
 and `local.token` held. Every wireless press also requires `input.ready=yes` whenever the bridge publishes that
 key; never press on the screen name alone.

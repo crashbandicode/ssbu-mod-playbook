@@ -96,15 +96,16 @@ def _bridge_tail(ctx):
 def _eden_macro_busy(ctx):
     try:
         status = ctx.call('macro.status')
-        if not isinstance(status, dict):
-            return 'macro.status unavailable: non-dict reply'
-        if status.get('error'):
-            return f'macro.status unavailable: {status["error"]}'
-        if status.get('state') in ('playing', 'recording'):
-            return f'macro {status["state"]}'
-        return None
+        if isinstance(status, dict):
+            state, error = status.get('state'), status.get('error')
+            if error in (None, ''):
+                if state in ('idle', 'finished'):
+                    return None
+                if state in ('countdown', 'recording', 'playing', 'branch_playing'):
+                    return f'macro {state}'
+        return f'macro.status not understood: {repr(status)[:160]}'
     except Exception as error:
-        return f'macro.status unavailable: {error}'
+        return f'macro.status not understood: {repr(error)[:160]}'
 
 
 def _stall_result(ok, stalls):
@@ -617,8 +618,17 @@ def macro_file(name):
 def play(ctx, name):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
     path, sha, cap = macro_file(name)
-    ctx.call('macro.play', {'path': str(path)})
-    ctx.runner.wait_macro(ctx.on, cap)
+    try:
+        ctx.call('macro.play', {'path': str(path)})
+    except RuntimeError as error:
+        message = str(error).lower()
+        if 'input_busy' in message or 'macro.play busy' in message:
+            raise closed_loop.DispatchRejected(str(error)) from error
+        raise
+    try:
+        ctx.runner.wait_macro(ctx.on, cap)
+    except RuntimeError as error:
+        raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
     ctx.log({'route_macro': name, 'sha256': sha})
     return sha
 

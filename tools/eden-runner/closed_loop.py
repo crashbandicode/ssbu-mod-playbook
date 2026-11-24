@@ -5,6 +5,14 @@ import time
 NO_READ = object()
 
 
+class DispatchRejected(RuntimeError):
+    pass
+
+
+class DeliveryUnknown(RuntimeError):
+    pass
+
+
 class RouteStopped(RuntimeError):
     def __init__(self, route, step, reason, receipt):
         self.route = route
@@ -38,8 +46,10 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
     entered_at = 'done'
     stalls = []
     last_answered, last_answered_at, locate_unanswered = None, None, 0
+    idle_budget = None
 
     def receipt():
+        flush_idle_budget()
         return {'entered_at': entered_at, 'steps': [dict(record) for record in records],
                 'stalls': list(stalls)}
 
@@ -109,39 +119,102 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         enriched = on_stall(event, obs) if on_stall else None
         stalls.append(event if enriched is None else enriched)
 
+    def flush_idle_budget(ended=None):
+        nonlocal idle_budget
+        budget, idle_budget = idle_budget, None
+        if budget is not None:
+            now = clock() if ended is None else ended
+            elapsed = now - budget['measure_started']
+            record = records[budget['index']]
+            total_ms = budget['previous_ms'] + round((now - budget['segment_started']) * 1000)
+            if total_ms:
+                record['idle_wait_ms'] = total_ms
+            if elapsed > 1.0:
+                stall({'kind': 'idle-wait', 'step': steps[budget['index']].name,
+                       'seconds': elapsed, 'waits': budget['waits'], 'why': budget['why']}, last_answered)
+
+    def begin_idle_budget(index, started, why, *, measure_started=None):
+        nonlocal idle_budget
+        if idle_budget is None:
+            record = records[index]
+            idle_budget = {'index': index, 'started': started,
+                           'measure_started': started if measure_started is None else measure_started,
+                           'segment_started': started if measure_started is None else measure_started,
+                           'why': why, 'waits': 0, 'segment_waits': 0,
+                           'previous_waits': record.get('idle_waits', 0),
+                           'previous_ms': record.get('idle_wait_ms', 0)}
+
+    def transfer_idle_budget(index):
+        if idle_budget is not None:
+            budget = idle_budget
+            now = clock()
+            previous = records[budget['index']]
+            total_ms = budget['previous_ms'] + round((now - budget['segment_started']) * 1000)
+            if total_ms:
+                previous['idle_wait_ms'] = total_ms
+            record = records[index]
+            budget.update(index=index, segment_started=now, segment_waits=0,
+                          previous_waits=record.get('idle_waits', 0), previous_ms=record.get('idle_wait_ms', 0))
+
+    def note_idle_wait(why):
+        budget = idle_budget
+        budget['waits'] += 1
+        budget['segment_waits'] += 1
+        if why is not None:
+            budget['why'] = why
+        record = records[budget['index']]
+        record['idle_waits'] = budget['previous_waits'] + budget['segment_waits']
+        total_ms = budget['previous_ms'] + round((clock() - budget['segment_started']) * 1000)
+        if total_ms:
+            record['idle_wait_ms'] = total_ms
+
+    def check_idle_budget():
+        if idle_budget is not None:
+            elapsed = clock() - idle_budget['started']
+            if elapsed >= idle_cap:
+                record = records[idle_budget['index']]
+                record['input_channel'] = idle_budget['why']
+                record['ms'] += round((clock() - active_started) * 1000)
+                stop(steps[idle_budget['index']].name,
+                     f'input channel busy for {elapsed:g} s over {idle_budget["waits"]} waits: '
+                     f'{idle_budget["why"]}; nothing was sent')
+
     def wait_idle(step, record, obs, *, rejected=False, rejection_reason=None):
+        check_idle_budget()
         if idle is None:
             if rejected:
+                begin_idle_budget(active_index, clock(), rejection_reason)
                 started_wait = clock()
-                sleep(poll)
-                elapsed = clock() - started_wait
-                record['idle_waits'] = record.get('idle_waits', 0) + 1
-                record['idle_wait_ms'] = record.get('idle_wait_ms', 0) + round(elapsed * 1000)
-                if elapsed > 1.0:
-                    stall({'kind': 'idle-wait', 'step': step.name, 'seconds': elapsed,
-                           'why': rejection_reason}, obs)
+                remaining = idle_cap - (started_wait - idle_budget['started'])
+                sleep(min(poll, max(0.0, remaining)))
+                note_idle_wait(rejection_reason)
+                check_idle_budget()
                 return True
             return False
         started_wait = clock()
         why = idle()
+        duration = clock() - started_wait
+        if idle_budget is None and (why is not None or duration > 1.0):
+            begin_idle_budget(active_index, started_wait if duration > 1.0 else clock(),
+                              why if why is not None else 'macro.status slow', measure_started=started_wait)
         if why is None:
+            if duration > 1.0:
+                note_idle_wait(None)
+                check_idle_budget()
+                return True
+            check_idle_budget()
             return False
-        record['idle_waits'] = record.get('idle_waits', 0) + 1
-        deadline = started_wait + idle_cap
+        deadline = idle_budget['started'] + idle_cap
         current = why
         while current is not None and clock() < deadline:
             sleep(min(poll, max(0.0, deadline - clock())))
+            if clock() >= deadline:
+                break
             current = idle()
             if current is not None:
                 why = current
-        elapsed = clock() - started_wait
-        record['idle_wait_ms'] = record.get('idle_wait_ms', 0) + round(elapsed * 1000)
-        if elapsed > 1.0:
-            stall({'kind': 'idle-wait', 'step': step.name, 'seconds': elapsed, 'why': why}, obs)
-        if current is not None or clock() > deadline:
-            record['input_channel'] = why
-            record['ms'] += round((clock() - active_started) * 1000)
-            stop(step.name, f'input channel busy for {elapsed:g} s: {why}; nothing was sent')
+        note_idle_wait(why)
+        check_idle_budget()
         return True
 
     active_index, active_started = None, None
@@ -186,6 +259,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         ready_deadline = started + step.ready_cap
         ready_grace = False
         while True:
+            check_idle_budget()
             if obs is NO_READ:
                 if retry is not None and retry['pause_at'] is None:
                     retry['pause_at'] = last_answered_at
@@ -215,6 +289,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 record['ms'] += round((clock() - started) * 1000)
                 index += 1
                 if index < len(steps):
+                    transfer_idle_budget(index)
                     obs = read(index)
                 break
             if done(steps[-1], obs):
@@ -247,6 +322,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     finish()
                 record['ms'] += round((clock() - started) * 1000)
                 index = other
+                transfer_idle_budget(index)
                 break
             if at:
                 if retry is not None:
@@ -268,40 +344,57 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 if wait_idle(step, record, obs):
                     obs = read(index)
                     continue
-                if retry is not None and not retry.get('finished'):
-                    finish()
-                    stall(retry['event'], obs)
-                    retry['finished'] = True
                 rollback = None
                 if step.before_send:
                     rollback = step.before_send(obs)
                 macro = step.macro(obs) if callable(step.macro) else step.macro
+                if idle_budget is not None and clock() - idle_budget['started'] >= idle_cap:
+                    if callable(rollback):
+                        rollback()
+                    check_idle_budget()
+                if retry is not None and not retry.get('finished'):
+                    if not retry.get('stall_reported'):
+                        stall(retry['event'], obs)
+                        retry['stall_reported'] = True
+                    if idle_budget is not None and clock() - idle_budget['started'] >= idle_cap:
+                        if callable(rollback):
+                            rollback()
+                        check_idle_budget()
+                    finish()
+                    retry['finished'] = True
+                if idle_budget is not None and clock() - idle_budget['started'] >= idle_cap:
+                    if callable(rollback):
+                        rollback()
+                    check_idle_budget()
                 witness = target(step, obs)
                 record['sends'] += 1
                 record['skipped'] = False
                 dispatch_started = clock()
                 try:
                     send(macro)
-                except RuntimeError as error:
-                    if 'busy' in str(error).lower():
-                        record['sends'] -= 1
-                        finish()
-                        if callable(rollback):
-                            rollback()
-                        count = record.get('busy_rejections', 0) + 1
-                        record['busy_rejections'] = count
-                        stall({'kind': 'busy-rejected', 'step': step.name, 'seconds': clock() - dispatch_started,
-                               'why': str(error)}, obs)
-                        if count >= 2:
-                            record['input_channel'] = str(error)
-                            record['ms'] += round((clock() - started) * 1000)
-                            stop(step.name, 'dispatch rejected as busy twice; nothing was delivered')
-                        wait_idle(step, record, obs, rejected=True, rejection_reason=str(error))
-                        obs = read(index)
-                        continue
+                except DispatchRejected as error:
+                    begin_idle_budget(index, clock(), str(error))
+                    record['sends'] -= 1
+                    finish()
+                    if callable(rollback):
+                        rollback()
+                    count = record.get('busy_rejections', 0) + 1
+                    record['busy_rejections'] = count
+                    stall({'kind': 'busy-rejected', 'step': step.name, 'seconds': clock() - dispatch_started,
+                           'why': str(error)}, obs)
+                    if count >= 2:
+                        record['input_channel'] = str(error)
+                        record['ms'] += round((clock() - started) * 1000)
+                        stop(step.name, 'dispatch rejected as busy twice; nothing was delivered')
+                    wait_idle(step, record, obs, rejected=True, rejection_reason=str(error))
+                    obs = read(index)
+                    continue
+                except Exception as error:
                     record['dispatch'] = 'unknown'
                     record['ms'] += round((clock() - started) * 1000)
+                    flush_idle_budget(dispatch_started)
                     stop(step.name, f'dispatch failed, delivery unknown: {error}')
+                flush_idle_budget(dispatch_started)
                 retry = None
                 deadline = clock() + step.cap
                 lost_since = changed_since = None
