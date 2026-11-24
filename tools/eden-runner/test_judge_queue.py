@@ -842,6 +842,26 @@ class ImageAndEvidenceAttempts(unittest.TestCase):
                 if not valid:
                     self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
 
+    def test_refused_incomplete_image_leaves_no_preview(self):
+        samples = complete_file_samples(self.integrity_inputs()['valid.png'])
+        for name in ('short-iend.png', 'bad-iend-crc.png', 'valid.png'):
+            with self.subTest(name=name):
+                path = self.base / name
+                path.write_bytes(samples[name])
+                self.assertEqual(path.read_bytes(), samples[name])
+                previews = {}
+                with mock.patch.object(Image, 'open', wraps=Image.open) as opened:
+                    issue = jq.image_issue(path, previews=previews)
+                if name == 'valid.png':
+                    self.assertIsNone(issue)
+                    self.assertEqual(list(previews), [str(path)])
+                    self.assertEqual(previews[str(path)].size, (320, 180))
+                    self.assertEqual(opened.call_count, 2)
+                else:
+                    self.assertEqual(issue, 'not a decodable image')
+                    self.assertEqual(previews, {})
+                    self.assertEqual(opened.call_count, 1)
+
     def test_stdlib_77_byte_png_requires_the_complete_iend(self):
         png = self.integrity_inputs()['valid.png']
         with mock.patch.object(jq, 'Image', None):
