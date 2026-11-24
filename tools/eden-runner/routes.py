@@ -756,8 +756,11 @@ def macro_file(name):
 
 
 def play(ctx, name, *, among=None):
-    """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
-    # RED: the declared set is not enforced yet.
+    """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it.
+    `among` declares the closed set of names this call may take, for a name computed at run time: the packet gate
+    checks every declared name (G8), and a name outside the set stops before any input."""
+    if among is not None and name not in among:
+        raise RuntimeError(f'{name} is not among the names this step declares')
     path, sha, cap = macro_file(name)
     try:
         ctx.call('macro.play', {'path': str(path)})

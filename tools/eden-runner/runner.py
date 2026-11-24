@@ -1158,7 +1158,10 @@ class StepContext:
         return self.runner.shot(self.on, name)
 
     def play(self, segment, *, among=None):
-        # RED: the declared set is not enforced yet.
+        """Play a plan segment. `among` declares the closed set of names this call may take, for a name computed at
+        run time: the packet gate checks every declared name (G8), and a name outside the set stops before any input."""
+        if among is not None and segment not in among:
+            raise RuntimeError(f'{segment} is not among the names this step declares')
         return self.runner.play(self.on, segment)
 
     def gate(self, name):

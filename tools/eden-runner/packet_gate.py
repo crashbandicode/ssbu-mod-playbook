@@ -1301,6 +1301,49 @@ def _paths(plan, base, raw, modules, repos, errors):
                 check_path(node.value, module, False)
 
 
+def _play_set(value):
+    """The names of a tuple, list or set of strings written out; None for anything else, and for an empty one."""
+    if not isinstance(value, (ast.Tuple, ast.List, ast.Set)) or not value.elts:
+        return None
+    if not all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts):
+        return None
+    return {item.value for item in value.elts}
+
+
+def _play_sets(tree):
+    """Module-level names that hold a written-out set of play names: bound once at module level and nowhere else
+    in the module (no second assignment, parameter, loop target, import or definition of that name)."""
+    bound = {}
+
+    def count(name):
+        if isinstance(name, str):
+            bound[name] = bound.get(name, 0) + 1
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            count(node.id)
+        elif isinstance(node, ast.arg):
+            count(node.arg)
+        elif isinstance(node, ast.alias):
+            count((node.asname or node.name).split('.')[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                count(name)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            count(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            count(node.rest)
+    sets = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, names = node.targets[0].id, _play_set(node.value)
+            if names is not None and bound.get(name) == 1:
+                sets[name] = names
+    return sets
+
+
 def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
     import routes
 
@@ -1340,24 +1383,37 @@ def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
             if isinstance(imported, ast.Import):
                 route_aliases.update(alias.asname or alias.name for alias in imported.names if alias.name == 'routes')
         segments, macros, reads, unchecked = set(), set(), set(), 0
+        # A play may declare the closed set of names it can take: `among=` a written-out tuple, list or set of
+        # strings, or a module-level name bound once to one. Every declared name is then checked like a written one.
+        play_sets = _play_sets(tree)
+        among_segments, among_macros, outside = set(), set(), set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'play':
                 owner = node.func.value
                 if isinstance(owner, ast.Name) and owner.id == 'ctx':
                     index = 0
-                    names = segments
+                    names, among, callee = segments, among_segments, 'ctx.play'
                 elif node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == 'ctx':
                     if not isinstance(owner, ast.Name) or owner.id not in route_aliases:
                         unchecked += 1
                         continue
                     index = 1
-                    names = macros
+                    names, among, callee = macros, among_macros, 'routes.play'
                 else:
                     continue
+                declared = None
+                for keyword in node.keywords:
+                    if keyword.arg == 'among':
+                        value = keyword.value
+                        declared = play_sets.get(value.id) if isinstance(value, ast.Name) else _play_set(value)
+                if declared is not None:
+                    among.update(declared)
                 argument = node.args[index] if len(node.args) > index else None
                 if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                     names.add(argument.value)
-                else:
+                    if declared is not None and argument.value not in declared:
+                        outside.add((callee, argument.value))
+                elif declared is None:
                     unchecked += 1
             key = None
             if isinstance(node, ast.Subscript):
@@ -1374,6 +1430,12 @@ def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
             errors.append(f'G8 {module}: ctx.play("{name}") names no segment of this plan')
         for name in sorted(macros - route_names):
             errors.append(f'G8 {module}: routes.play("{name}") names no routes library macro')
+        for name in sorted(among_segments - segment_names):
+            errors.append(f'G8 {module}: ctx.play among "{name}" names no segment of this plan')
+        for name in sorted(among_macros - route_names):
+            errors.append(f'G8 {module}: routes.play among "{name}" names no routes library macro')
+        for callee, name in sorted(outside):
+            errors.append(f'G8 {module}: {callee}("{name}") is not among the names it declares')
         if unchecked:
             warnings.append(f'G8 {module}: {unchecked} play call(s) with a computed name or unknown callee are not checked')
         for key in sorted(reads):
