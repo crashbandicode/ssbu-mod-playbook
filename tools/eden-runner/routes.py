@@ -5008,7 +5008,32 @@ def setup_state(ctx):
     })
 
 
-def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', cap=180):
+def _reach_training_screen(ui):
+    values = ui.values
+    if (values.get('observation.active') != 'yes' or values.get('input.owner') != 'native'
+            or values.get('dialog') != 'none'):
+        return None
+    screen = values.get('screen')
+    if screen == 'main_menu':
+        return screen
+    if screen in ('stage_select', 'css.training', 'training') and values.get('screen.context') == 'training':
+        return screen
+    return None
+
+
+def _reach_training_main_checkpoint(ui):
+    if _main_top(ui):
+        return True
+    values = ui.values
+    focus = values.get('focus.id')
+    return focus in ('classic_mode', 'mob_smash', 'training') and _fields_match(ui, {
+        'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
+        'input.owner': 'native', 'dialog': 'none', 'focus.source': 'native', 'focus.id': focus,
+        'focus': f'main_menu.submenu.{focus}',
+    })
+
+
+def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', cap=240):
     started = time.monotonic()
     until = started + cap
     wanted_stage = stage_entry(stage)['id']
@@ -5020,77 +5045,226 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     phases = ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
               'pick_fighters', 'enter_training', 'set_cpu')
     skipped, timings, receipts = list(phases), {}, {}
+    starts, recovered, errors = {}, [], {}
+    io, ui, last_ui = None, None, None
+    known_stage = expected(ctx).get('stage_id')
+    css_picked, retry_same = False, None
 
-    def run(name, function, *args, **kwargs):
+    def pending():
+        entries = getattr(io, 'pending', None) if io is not None else None
+        if entries is None:
+            entries = getattr(ctx.runner, 'native_ui_pending', {})
+        value = entries.get(ctx.on)
+        return value[0] if isinstance(value, tuple) else value
+
+    def stop(step, reason):
+        receipt = {
+            'block': 'reach_training', 'ok': False, 'step': step, 'reason': reason,
+            'starts': dict(starts), 'recovered': list(recovered), 'last_ui': last_ui,
+            'phases': dict(receipts), 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)},
+            'pending': pending(),
+        }
+        _save(ctx, 'routes-reach-training-stop', receipt)
+        raise closed_loop.RouteStopped('reach_training', step, reason, receipt)
+
+    def deadline(reason):
         if time.monotonic() >= until:
-            raise RuntimeError(f'reach_training deadline expired before {name}')
+            stop('deadline', reason)
+
+    def phase(name):
+        nonlocal css_picked, known_stage
+        deadline(f'deadline expired before {name}')
+        if starts.get(name, 0) >= 3:
+            stop(name, f'no transition after 3 starts; last error: {errors.get(name, "none")}')
+        starts[name] = starts.get(name, 0) + 1
         begin = time.monotonic()
-        value = function(*args, **kwargs)
-        timings[name] = round((time.monotonic() - begin) * 1000)
+        try:
+            if name == 'to_main':
+                value = to_main(ctx)
+            elif name == 'back_to_main':
+                value = back_to_main(ctx)
+            elif name == 'main_to_stage':
+                value = main_to_stage(ctx)
+            elif name == 'pick_stage':
+                value = pick_stage(ctx, stage, topology=library_topology('sss-training'), form=form)
+            elif name == 'quit_training':
+                value = quit_training(ctx, cap=max(.01, until - time.monotonic()))
+            elif name == 'pick_fighters':
+                value = pick_fighters(ctx, p1, topology=library_topology('css-training'), take_back=True)
+            elif name == 'enter_training':
+                value = enter_training(ctx, cap=max(.01, until - time.monotonic()),
+                                       stage_ids={wanted_stage}, fighters={'p1': p1, 'cpu': None})
+            else:
+                value = _set_fighter(ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
+        finally:
+            timings[name] = timings.get(name, 0) + round((time.monotonic() - begin) * 1000)
         receipts[name] = value
         if name in skipped:
             skipped.remove(name)
-        return value
+        if name == 'pick_fighters':
+            css_picked = True
+        elif name == 'pick_stage':
+            known_stage = expected(ctx).get('stage_id')
+
+    def fatal(error):
+        return isinstance(error, closed_loop.RouteStopped) or any(
+            word in str(error).lower() for word in
+            ('boot changed', 'connection', 'continuity', 'rotated', 'truncated', 'malformed', 'overlapping'))
+
+    def settle(name, original, before):
+        nonlocal ui, last_ui
+        settle_until = min(until, time.monotonic() + 30)
+        previous, matching, count = ui, None, 0
+        if pending() is not None and hasattr(io, 'in_flight'):
+            io.in_flight = True
+        while True:
+            deadline(f'deadline expired; settle after {name} was cut short: {original}')
+            if time.monotonic() >= settle_until:
+                stop(name, f'{original}; no two consecutive qualified screens within settle cap')
+            try:
+                sample = native_picker.check_sample(
+                    io.read(native_picker.UI, min(2, settle_until - time.monotonic())),
+                    native_picker.UI, loading_ui=True)
+                deadline(f'deadline expired; settle after {name} was cut short: {original}')
+                if time.monotonic() > settle_until:
+                    stop(name, f'{original}; no two consecutive qualified screens within settle cap')
+                if previous is not None:
+                    native_picker.same_epoch(previous, sample, in_flight=True)
+                    _, revision, observation = sample.clock
+                    _, old_revision, old_observation = previous.clock
+                    if revision < old_revision or observation < old_observation:
+                        raise RuntimeError('bridge observation continuity changed during settle')
+                    if revision == old_revision and sample.values != previous.values:
+                        raise RuntimeError('malformed contradictory bridge observation during settle')
+                    fresh = revision > old_revision and observation > old_observation
+                else:
+                    fresh = True
+                if fresh:
+                    previous = sample
+                last_ui = dict(sample.values)
+                current = _reach_training_screen(sample) if fresh else None
+                if current is None:
+                    matching, count = None, 0
+                elif current == matching:
+                    count += 1
+                else:
+                    matching, count = current, 1
+                if count == 2:
+                    deadline(f'deadline expired; settle after {name} was cut short: {original}')
+                    ui = sample
+                    io.finish()
+                    return current
+            except RuntimeError as error:
+                if isinstance(error, closed_loop.RouteStopped):
+                    raise
+                if fatal(error):
+                    stop(name, f'{original}; settle failed: {error}')
+                matching, count = None, 0
+            ctx.check_stop()
+            time.sleep(min(.5, max(0, settle_until - time.monotonic())))
+
+    def later(name, before, after):
+        if after == before:
+            return False
+        if name in ('to_main', 'back_to_main'):
+            return after == 'main_menu'
+        if name == 'quit_training':
+            return after == 'css.training'
+        rank = {'main_menu': 0, 'stage_select': 1, 'css.training': 2, 'training': 3}
+        target = {'main_to_stage': 1, 'pick_stage': 2, 'pick_fighters': 3, 'enter_training': 3}
+        return name in target and rank.get(after, -1) >= target[name]
 
     try:
-        io = BridgePickerIO(ctx)
-        ui = native_picker.wait_sample(io, native_picker.UI, until)
-        known_stage = expected(ctx).get('stage_id')
-        if not _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
-            if not _main_top(ui):
-                run('to_main', to_main, ctx)
-            screen = 'main'
-        else:
-            screen = ui.values.get('screen')
-        if screen == 'training':
-            if ui.values.get('input.owner') != 'native':
-                raise RuntimeError('reach_training needs native Training input ownership')
-            state = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
-                                 roster_entries=(0, 1))
-            known_stage = state.get('stage')
-            roster = state.get('roster', {})
-            stage_matches = state.get('stage') == wanted_stage
-            p1_matches = roster.get(0, {}).get('kind') == wanted_p1 and 1 in roster
-            if stage_matches and p1_matches:
-                final = state
-                screen = 'done'
-            elif stage_matches:
-                run('quit_training', quit_training, ctx, cap=max(.01, until - time.monotonic()))
-                screen = 'css.training'
+        try:
+            io = BridgePickerIO(ctx)
+        except RuntimeError as error:
+            stop('locate', str(error))
+        next_phase = 'locate'
+        while True:
+            deadline(f'deadline expired before {next_phase}')
+            try:
+                ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+                last_ui = dict(ui.values)
+            except RuntimeError as error:
+                if time.monotonic() >= until:
+                    stop('deadline', f'deadline expired before {next_phase}: {error}')
+                stop('locate', str(error))
+            screen = _reach_training_screen(ui)
+            if screen != 'css.training':
+                css_picked = False
+            if screen == 'main_menu':
+                name = 'main_to_stage' if _reach_training_main_checkpoint(ui) else 'back_to_main'
+            elif _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
+                raw_screen = ui.values.get('screen')
+                if raw_screen == 'training':
+                    if ui.values.get('input.owner') != 'native':
+                        stop('locate', 'reach_training needs native Training input ownership')
+                    try:
+                        final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
+                                             roster_entries=(0, 1))
+                    except RuntimeError as error:
+                        stop('locate', str(error))
+                    known_stage = final.get('stage')
+                    roster = final.get('roster', {})
+                    if known_stage != wanted_stage:
+                        name = 'back_to_main'
+                    elif roster.get(0, {}).get('kind') != wanted_p1 or 1 not in roster:
+                        name = 'quit_training'
+                    elif wanted_cpu is not None and roster[1].get('kind') != wanted_cpu:
+                        name = 'set_cpu'
+                    else:
+                        name = None
+                elif raw_screen == 'css.training':
+                    name = ('back_to_main' if known_stage != wanted_stage else
+                            'enter_training' if css_picked else 'pick_fighters')
+                elif raw_screen == 'stage_select':
+                    name = 'pick_stage'
+                else:
+                    name = 'back_to_main'
             else:
-                run('back_to_main', back_to_main, ctx)
-                screen = 'main'
-        if screen == 'css.training':
-            if known_stage != wanted_stage:
-                run('back_to_main', back_to_main, ctx)
-                screen = 'main'
-        if screen not in ('done', 'main', 'stage_select', 'css.training'):
-            run('back_to_main', back_to_main, ctx)
-            screen = 'main'
-        if screen == 'main':
-            run('main_to_stage', main_to_stage, ctx)
-            screen = 'stage_select'
-        if screen == 'stage_select':
-            run('pick_stage', pick_stage, ctx, stage, topology=library_topology('sss-training'), form=form)
-            screen = 'css.training'
-        if screen == 'css.training':
-            run('pick_fighters', pick_fighters, ctx, p1, topology=library_topology('css-training'),
-                take_back=True)
-            run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
-                stage_ids={wanted_stage}, fighters={'p1': p1, 'cpu': None})
-            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
-                                 roster_entries=(0, 1))
-        if wanted_cpu is not None and final.get('roster', {}).get(1, {}).get('kind') != wanted_cpu:
-            run('set_cpu', _set_fighter, ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
-            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
-                                 roster_entries=(0, 1))
-        final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
-        if not _fields_match(final_ui, TRAINING_SCREEN):
-            raise RuntimeError('final Training screen is not owned by native input')
-        roster = final.get('roster', {})
-        if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
-                or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
-            raise RuntimeError(f'live Training state does not match the requested setup: {final}')
+                name = 'to_main'
+            if retry_same is not None:
+                retry_name, retry_screen = retry_same
+                retry_same = None
+                if screen == retry_screen:
+                    name = retry_name
+            if name is None:
+                deadline('deadline expired before final verification')
+                try:
+                    final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+                    last_ui = dict(final_ui.values)
+                except RuntimeError as error:
+                    stop('locate', str(error))
+                if not _fields_match(final_ui, TRAINING_SCREEN):
+                    stop('locate', 'final Training screen is not owned by native input')
+                roster = final.get('roster', {})
+                if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
+                        or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
+                    stop('locate', f'live Training state does not match the requested setup: {final}')
+                break
+            next_phase = name
+            try:
+                phase(name)
+            except closed_loop.RouteStopped as error:
+                if error.route == 'reach_training' and error.receipt.get('block') == 'reach_training':
+                    raise
+                errors[name] = str(error)
+                stop(name, str(error))
+            except RuntimeError as error:
+                errors[name] = str(error)
+                if fatal(error):
+                    stop(name, str(error))
+                after = settle(name, str(error), screen)
+                if later(name, screen, after):
+                    recovered.append(name)
+                elif after == screen:
+                    retry_same = (name, screen)
+                if after != 'css.training':
+                    css_picked = False
+            next_phase = {'to_main': 'main_to_stage', 'back_to_main': 'main_to_stage',
+                          'main_to_stage': 'pick_stage', 'pick_stage': 'pick_fighters',
+                          'quit_training': 'pick_fighters', 'pick_fighters': 'enter_training',
+                          'enter_training': 'set_cpu', 'set_cpu': 'final verification'}[name]
     finally:
         ctx.runner.setup_metrics = previous
         if previous is not None:
@@ -5099,6 +5273,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         'block': 'reach_training', 'args': {'p1': p1, 'cpu': cpu, 'stage': stage, 'form': form},
         'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metrics,
         'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
+        'starts': starts, 'recovered': recovered, 'retries': {key: count - 1 for key, count in starts.items()
+                                                            if count > 1},
     })
 
 

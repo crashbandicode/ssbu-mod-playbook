@@ -80,7 +80,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `bridge_on` `{port, cap}` | title-screen trace or bridge already on | own listening event before detached capture, greeting and backup reply; backup refusal is recorded, not a block failure |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
-| `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded |
+| `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded; cap defaults to 240 seconds |
 | `chord` `{name}` | Training | the chord pressed in one frame, and for `tr-save`/`tr-load` TrainingRooms' `state saved`/`state placed` line after it |
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
@@ -94,6 +94,10 @@ or in flight until the cap, stop on the named step without confirming or pressin
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
+Training phases re-locate after each phase; a failed phase retries only after two consecutive fresh reads of a
+recognised native-owned screen, with at most three starts per phase per call. Continuity errors and unreadable
+state stop with `routes-reach-training-stop.json`. The overall cap is checked between phases; a running phase ends
+on its own caps. This phase recovery is host-tested only.
 `ready` waits 30 s of unchanged CSS before its single resend; what a second Plus does while the room is still loading has not been observed in a game.
 This closed-loop route is host-tested only, not flown.
 

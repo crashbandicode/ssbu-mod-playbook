@@ -327,6 +327,7 @@ class MenuReplay:
         self.wrong_grid = wrong_grid
         self.wrong_keyboard = wrong_keyboard
         self.writer_log = None
+        self.screen = 'training'
         self.menu = {'scene': 'training', 'keyboard': '0', 'open': '1', 'page': 'fighters_stages',
                      'cursor': '4', 'action': 'cpu_character', 'depth': str(depth),
                      'editor.sel': '1' if wrong_cell else '0', 'grid': 'cpu_character',
@@ -340,8 +341,12 @@ class MenuReplay:
         if provider == 'tr.menu':
             return recorded.snapshot(provider, self.rev, self.menu)
         owner = 'tr.menu' if self.menu['open'] == '1' else 'native'
-        return recorded.native(self.rev, screen='training', focus='training',
+        return recorded.native(self.rev, screen=self.screen, focus=self.screen,
                                **{'screen.context': 'training', 'input.owner': owner})
+
+    def set_screen(self, screen, result=None):
+        self.screen = screen
+        return {} if result is None else result
 
     def log(self, evidence):
         self.evidence.append(evidence)
@@ -624,9 +629,11 @@ class SetupCallsR2Tests(unittest.TestCase):
         calls = []
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: calls.append('quit')), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k:
+                          calls.append('quit') or replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', side_effect=lambda *a, **k: calls.append(('pick', k))), \
-             patch.object(routes, 'enter_training', side_effect=lambda *a, **k: calls.append(('enter', k))), \
+             patch.object(routes, 'enter_training', side_effect=lambda *a, **k:
+                          calls.append(('enter', k)) or replay.set_screen('training')), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
         json.dumps(result)
@@ -644,9 +651,10 @@ class SetupCallsR2Tests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
-             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, '_native_enter_training', side_effect=lambda *a, **k:
+                          replay.set_screen('training', {'stage_id': 3})), \
              patch.object(routes, 'wait_native', return_value=final), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
@@ -676,9 +684,10 @@ class SetupCallsR2Tests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
-             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, '_native_enter_training', side_effect=lambda *a, **k:
+                          replay.set_screen('training', {'stage_id': 3})), \
              patch.object(routes, 'wait_native', return_value=final), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
@@ -755,6 +764,7 @@ class SetupCallsR2Tests(unittest.TestCase):
 
         def enter(*args, **kwargs):
             calls.append('enter_training')
+            replay.set_screen('training')
             self.assertIs(self.ctx.runner.routes_expect, remembered)
             self.assertEqual(self.ctx.runner.routes_expect, expected_before_entry)
             self.assertEqual(kwargs['fighters'], {'p1': 'Mario', 'cpu': None})
@@ -765,7 +775,8 @@ class SetupCallsR2Tests(unittest.TestCase):
              patch.object(routes, 'wait_native', return_value=final), \
              patch.object(routes, '_fetch_settings', return_value=b'{"menu":{"cpu_character":[1,0]}}'), \
              patch.object(routes, '_live_body', return_value={'kind': 0}), \
-             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: calls.append('quit_training')), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k:
+                          calls.append('quit_training') or replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', side_effect=pick), \
              patch.object(routes, 'enter_training', side_effect=enter), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
@@ -781,9 +792,9 @@ class SetupCallsR2Tests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
-             patch.object(routes, 'enter_training', return_value={}), \
+             patch.object(routes, 'enter_training', side_effect=lambda *a, **k: replay.set_screen('training')), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             result = routes.reach_training(self.ctx, 'Mario', cpu='Mario')
         self.assertIn('set_cpu', result['skipped'])
@@ -822,9 +833,10 @@ class SetupCallsR2Tests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, entered, final]), \
-             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
-             patch.object(routes, '_native_enter_training', return_value={'stage_id': 3}), \
+             patch.object(routes, '_native_enter_training', side_effect=lambda *a, **k:
+                          replay.set_screen('training', {'stage_id': 3})), \
              patch.object(routes, 'wait_native', return_value=entered), \
              patch.object(routes, '_set_fighter', return_value={}) as set_fighter, \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
@@ -841,11 +853,12 @@ class SetupCallsR2Tests(unittest.TestCase):
 
         def enter(*args, **kwargs):
             routes.remember(self.ctx, entry_marker='kept')
+            replay.set_screen('training')
             return {}
 
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'native_state', side_effect=[initial, final]), \
-             patch.object(routes, 'quit_training', return_value={}), \
+             patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
              patch.object(routes, 'enter_training', side_effect=enter), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
@@ -1065,10 +1078,13 @@ class ReachTrainingPhaseReplay:
         self.read_fault = False
         self.good_reads_before_fault = 0
         self.read_script = []
+        self.pending_read_duration = 0.0
         self.phase_duration = 0.0
 
     def read(self, provider, cap):
         self.events.append(('read', self.screen, self.ctx.on in self.pending))
+        if self.ctx.on in self.pending:
+            self.now += self.pending_read_duration
         if self.read_fault:
             if self.good_reads_before_fault:
                 self.good_reads_before_fault -= 1
@@ -1239,6 +1255,16 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.assertIn(self.ctx.on, self.io.pending)
         self.assertEqual(self.io.calls, ['pick_stage'])
         self.assertFalse(any(event[0] == 'finish' for event in self.io.events))
+
+    def test_a_second_read_after_the_settle_cap_does_not_clear_the_pending_input(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.pending_read_duration = 16
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.step, 'pick_stage')
+        self.assertIn('settle cap', caught.exception.reason)
+        self.assertEqual(self.stop_receipt()['pending'], 'macro-pick_stage')
+        self.assertIn(self.ctx.on, self.io.pending)
 
     def test_unknown_between_good_reads_requires_another_qualified_pair(self):
         self.io.failures['pick_stage'] = 1
