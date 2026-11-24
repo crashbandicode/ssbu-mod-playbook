@@ -170,7 +170,9 @@ running and loading status, no input since `game.load`, and listener ownership b
 Title prompt is named by the bridge only after it is On. Before the chord the
 evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
 the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.
-Opening playback is not the prompt and can extend the readiness wait to 180 seconds.
+With the stub on, if the first active read is the opening movie, the route presses Plus once on that read and waits
+up to 10 seconds for the Title prompt. It never presses twice and never presses on another screen. The press is in
+the receipt with the read it was sent on.
 With the stub on, the greeting, the install line and the Title read come from the latest complete connection in the capture log; a connection change after that greeting stops the step.
 If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event,
 the same port and the same boot: a stub-on receipt with its pre-On evidence and its Title prompt read, or a trace

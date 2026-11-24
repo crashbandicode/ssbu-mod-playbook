@@ -330,6 +330,7 @@ class BridgeOnTests(unittest.TestCase):
         self.stub_default = self.sample(screen='main')
         with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
             self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
 
     def test_bridge_on_stub_on_skips_inactive_and_foreign_boot_observations(self):
         self.configure_stub()
@@ -386,6 +387,7 @@ class BridgeOnTests(unittest.TestCase):
         self.stub_samples, self.stub_default = [self.title_without_prompt()], ''
         with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title.*rev=4 frame=31'):
             self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
         self.assertFalse((self.row / 'routes-bridge-on.json').exists())
 
     def test_bridge_on_stub_on_does_not_accept_the_opening_playback(self):
@@ -486,6 +488,46 @@ class BridgeOnTests(unittest.TestCase):
             routes._bridge_on_skip_opening(self.ctx, opening, {'boot': RUN1_BOOT, 'sent': True})
         with self.assertRaisesRegex(RuntimeError, 'refusing the opening skip on title/title.press_any'):
             routes._bridge_on_skip_opening(self.ctx, prompt, {'boot': RUN1_BOOT, 'sent': False})
+        for changed in ({'boot': FOREIGN_BOOT}, {'active': 'no'}):
+            block = copy.deepcopy(opening)
+            if 'boot' in changed:
+                block['boot'] = changed['boot']
+            else:
+                block['values']['observation.active'] = changed['active']
+            with self.subTest(changed=changed), self.assertRaisesRegex(RuntimeError, 'refusing the opening skip'):
+                routes._bridge_on_skip_opening(self.ctx, block, {'boot': RUN1_BOOT, 'sent': False})
+
+    def test_bridge_on_stub_on_stops_at_deadline_even_if_macro_completion_is_slow(self):
+        self.recorded_opening()
+        self.ctx.runner.wait_macro = lambda *_: self.sleep(11)
+        with self.assertRaisesRegex(RuntimeError, 'opening was skipped with one press.*within 10 s'):
+            self.invoke(port=6980)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_stops_if_screen_changes_after_the_skip(self):
+        self.configure_stub()
+        self.stub_samples, self.stub_default = [self.opening(), self.sample(screen='main')], ''
+        with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
+            self.invoke(port=6980)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_stops_if_connection_changes_after_the_skip(self):
+        self.configure_stub()
+        self.stub_samples, self.stub_default = [self.opening(), '[Adapter] connection idle\n'], ''
+        with self.assertRaisesRegex(RuntimeError, 'bridge connection changed after the greeting'):
+            self.invoke(port=6980)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_refuses_if_opening_changes_while_checking_idle(self):
+        self.recorded_opening()
+        def idle_changes_screen(_ctx, _remaining):
+            with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
+                stream.write(RUN1_PROMPT)
+            return None
+        with patch.object(routes, '_eden_macro_busy', side_effect=idle_changes_screen):
+            with self.assertRaisesRegex(RuntimeError, 'opening observation changed before Plus; nothing was sent'):
+                self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
 
     def test_bridge_on_stub_on_skip_follows_chord_without_earlier_input(self):
         self.recorded_opening()
@@ -499,6 +541,8 @@ class BridgeOnTests(unittest.TestCase):
         buttons = ('lstick', 'rstick', 'zl', 'zr')
         self.assertEqual(inputs, [('input.button', b, 'press') for b in buttons]
                          + [('input.button', b, 'release') for b in buttons] + [('macro.play', None, None)])
+        names = [method for method, _ in self.calls]
+        self.assertLess(names.index('macro.status'), names.index('macro.play'))
 
     def test_bridge_on_stub_on_already_on_without_a_qualified_receipt_refuses(self):
         first, prior = self.cold_stub_receipt()

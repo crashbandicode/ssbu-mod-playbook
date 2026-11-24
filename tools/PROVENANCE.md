@@ -309,3 +309,10 @@ read 73 and 63 of their tests failed before and none after (the first version of
 failures inside subtests and printed 55 and 60). Caps and expected outcomes are unchanged. Not
 covered by the harness: real sleeps, and a clock stored before the slow run starts. Host tests only; no
 runtime acceptance.
+
+2026-11-24: `eden-runner/fixtures/bridge-on/stub-on-yoga-e-run1/bridge.log` preserves whole
+lines 1–3, 13–60, 1093–1140, 51272–51319 and 51326–51373, in order, from the
+`rh-e-yoga-01` run's `out/bridge-run/bridge.log`. Fixture SHA-256:
+`45ba048ef6127d13d35135897f96a61dae20b209265754f6540d5a445a6effd0`.
+The intervening repeated Title-family and unrelated capture lines were cut. The post-press prompt
+ordering in the host test is modelled, not a recorded skip. Host tests only; no runtime acceptance.
