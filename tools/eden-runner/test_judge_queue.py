@@ -14,7 +14,7 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, ImageFile, PngImagePlugin
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -766,6 +766,152 @@ class ImageAndEvidenceAttempts(unittest.TestCase):
                                str(self.job)], capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(self.receipt.read_text()), json.loads((self.folder / 'done.json').read_text())
+
+    def integrity_inputs(self):
+        output = io.BytesIO()
+        image = Image.new('RGB', (4, 4), (20, 30, 40))
+        image.save(output, format='PNG')
+        png = output.getvalue()
+        self.assertEqual(len(png), 77)
+        offset = 8
+        idat = iend = None
+        while offset < len(png):
+            length, kind = struct.unpack('>I4s', png[offset:offset + 8])
+            if kind == b'IDAT':
+                idat = (offset + 8, length)
+            if kind == b'IEND':
+                iend = offset
+            offset += length + 12
+        self.assertIsNotNone(idat)
+        self.assertIsNotNone(iend)
+        self.assertEqual(iend + 12, len(png))
+        start, length = idat
+        self.assertGreater(length, 2)
+        corrupt_crc = bytearray(png)
+        corrupt_crc[start + length] ^= 1
+        jpeg_output = io.BytesIO()
+        image.save(jpeg_output, format='JPEG')
+        jpeg = jpeg_output.getvalue()
+        scan = jpeg.find(b'\xff\xda')
+        self.assertGreater(scan, 0)
+        scan_data = scan + 2 + struct.unpack('>H', jpeg[scan + 2:scan + 4])[0]
+        self.assertLess(scan_data + 1, len(jpeg))
+        metadata = PngImagePlugin.PngInfo()
+        metadata.add_text('Comment', 'visible metadata')
+        png_output = io.BytesIO()
+        image.save(png_output, format='PNG', pnginfo=metadata)
+        return {'valid.png': png, 'truncated.png': png[:start + length - 2],
+                'no-iend.png': png[:iend], 'bad-crc.png': bytes(corrupt_crc),
+                'valid.jpg': jpeg, 'half.jpg': jpeg[:len(jpeg) // 2], 'short-scan.jpg': jpeg[:scan_data + 1],
+                'metadata.png': png_output.getvalue()}
+
+    def integrity_shot(self, name, data):
+        path = self.base / name
+        path.write_bytes(data)
+        self.assertEqual(path.read_bytes(), data)
+        fresh = still_fresh.Ledger(self.base).record(
+            'a', path, {}, {'boot': 'test', 'frame': 1, 'wall': 1})
+        self.assertEqual((fresh['status'], fresh['sha256']), ('fresh', hashlib.sha256(path.read_bytes()).hexdigest()))
+        return {'name': name, 'phase': 'before', 'path': str(path), 'fresh': fresh}
+
+    def test_pil_integrity_inputs_in_fresh_workers(self):
+        inputs = self.integrity_inputs()
+        bad = {'truncated.png', 'no-iend.png', 'bad-crc.png', 'half.jpg', 'short-scan.jpg'}
+        for name, data in inputs.items():
+            with self.subTest(name=name):
+                shot = self.integrity_shot(name, data)
+                path = Path(shot['path'])
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', False):
+                    if name in {'truncated.png', 'no-iend.png', 'bad-crc.png'}:
+                        with self.assertRaises(Exception):
+                            with Image.open(path) as reference:
+                                reference.verify()
+                        with Image.open(path) as reference:
+                            reference.load()
+                    elif name not in bad:
+                        with Image.open(path) as reference:
+                            reference.verify()
+                        with Image.open(path) as reference:
+                            reference.load()
+                            if name == 'metadata.png':
+                                self.assertEqual(reference.info['Comment'], 'visible metadata')
+                    else:
+                        if name == 'short-scan.jpg':
+                            with Image.open(path) as reference:
+                                reference.verify()
+                        with self.assertRaises(Exception):
+                            with Image.open(path) as reference:
+                                reference.load()
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                receipt, done = self.fresh_worker()
+                self.assertEqual(done['verdict']['verdict'], 'UNSURE' if name in bad else 'PASS')
+                self.assertEqual(receipt['status'], 'RAN-UNVERIFIED' if name in bad else 'PASS')
+                self.assertEqual(marker.exists(), name not in bad)
+                if name in bad:
+                    self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+                else:
+                    self.assertEqual(done['excluded_shots'], [])
+                self.assertEqual(jq.image_issue(path), 'not a decodable image' if name in bad else None)
+
+    def test_pil_truncated_tolerance_is_disabled_and_restored(self):
+        inputs = self.integrity_inputs()
+        for name in ('truncated.png', 'bad-crc.png', 'valid.png'):
+            with self.subTest(name=name):
+                shot = self.integrity_shot(name, inputs[name])
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', True):
+                    verdict = jq.work(self.job)
+                    self.assertTrue(ImageFile.LOAD_TRUNCATED_IMAGES)
+                    expected = 'PASS' if name == 'valid.png' else 'UNSURE'
+                    self.assertEqual(verdict['verdict'], expected)
+                    self.assertEqual(marker.exists(), name == 'valid.png')
+                    self.assertEqual(jq.image_issue(shot['path']),
+                                     None if name == 'valid.png' else 'not a decodable image')
+                    self.assertTrue(ImageFile.LOAD_TRUNCATED_IMAGES)
+
+    def test_pil_load_failure_restores_flag_after_successful_verify(self):
+        verified = mock.MagicMock()
+        loaded = mock.MagicMock()
+        loaded.load.side_effect = OSError('decoder failed')
+        opened = [mock.MagicMock(), mock.MagicMock()]
+        opened[0].__enter__.return_value = verified
+        opened[1].__enter__.return_value = loaded
+        with (mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', True),
+              mock.patch.object(Image, 'open', side_effect=opened)):
+            self.assertEqual(jq.image_issue(self.base / 'image'), 'not a decodable image')
+            self.assertTrue(ImageFile.LOAD_TRUNCATED_IMAGES)
+        verified.verify.assert_called_once_with()
+        loaded.load.assert_called_once_with()
+
+    def test_pil_corrupt_clip_and_dense_frames_are_excluded(self):
+        inputs = self.integrity_inputs()
+        for name in ('truncated.png', 'no-iend.png', 'bad-crc.png'):
+            with self.subTest(name=name):
+                path = self.base / name
+                path.write_bytes(inputs[name])
+                self.assertEqual(path.read_bytes(), inputs[name])
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', False):
+                    with self.assertRaises(Exception):
+                        with Image.open(path) as reference:
+                            reference.verify()
+                self.prepare([])
+                job = json.loads(self.job.read_text())
+                job['clip'] = 'fake.mp4'
+                self.job.write_text(json.dumps(job))
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                with (mock.patch.object(jq, 'sample_frames', return_value=({'start': str(path)}, {'start': 0})),
+                      mock.patch.object(jq, 'sample_dense', return_value={1000: str(path)})):
+                    verdict = jq.work(self.job)
+                done = json.loads((self.folder / 'done.json').read_text())
+                self.assertEqual(verdict['verdict'], 'UNSURE')
+                self.assertFalse(marker.exists())
+                self.assertEqual([entry['reason'] for entry in done['excluded_shots']],
+                                 ['clip frame is not a decodable image'] * 2)
 
     def test_ledger_corrupt_only_image_never_reaches_judge_and_valid_control_passes(self):
         for index, data in enumerate((b'', self.png(10)[:20], self.png(10))):
