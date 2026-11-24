@@ -216,3 +216,7 @@ runner captures, and ties producer receipts to packet and canonical runner input
 regressions model the reviewer and F10 missing-delivery controls; host tests only, no runtime acceptance.
 Named GIF outputs are excluded from the input identity, including nested and recovery steps; collisions
 with packet inputs are refused and do not gain that exclusion.
+
+2026-11-24: `eden-runner/runner.py` binds visual reads to the still's own capture, an explicit source,
+or a unique matching capture; duplicate hashes no longer select an arbitrary receipt. Judge verdicts
+clear visual blockers only, leaving deterministic blockers unresolved. Host tests only.

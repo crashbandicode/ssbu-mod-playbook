@@ -464,7 +464,8 @@ A hook's `unverified` text, `NEEDS VISUAL READ` grade or
 pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
 A receipt records separate visual, unverified and effect blockers. A visual
 read can clear only visual blockers, never a missing deterministic observation
-or effect; remaining blockers keep the row RAN-UNVERIFIED.
+or effect; a judge's PASS likewise clears only visual blockers. Remaining
+blockers keep the row RAN-UNVERIFIED.
 A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
 resuming without naming it does not promote it. A setup row's PASS still means
 its steps did not raise.
@@ -477,6 +478,9 @@ stores the capture's name, hash, UTC time and scalar status snapshot. The runner
 records every still taken inside a row, including image-gate polling stills, as a
 capture with one `status` call after each. It does not yet check still freshness
 against the game frame.
+The still's own recorded path selects its capture; otherwise use
+`--capture <row>:<file>` to name its source, or omit it when the hash matches
+exactly one capture. An ambiguous hash is refused.
 A judge, when configured, decides those rows instead.
 
 #### Fixtures

@@ -1363,13 +1363,7 @@ class Runner:
         is_test = bool(row) and row_role(row) == 'test'
         skipped_pending = row.get('judge') == 'skip' and (
             bool(self.unverified_hooks) or row.get('outcome') == 'visual' or (is_test and 'target' in self.plan))
-        if self.judge_config() and not skipped_pending:
-            receipt['status'] = 'RAN-UNVERIFIED'
-            receipt['status_reason'] = 'judge pending'
-            receipt['judge'] = {'state': 'pending'}
-            return receipt['status']
-        if self.judge_config() and skipped_pending:
-            receipt['judge'] = {'state': 'skipped'}
+        judge_pending = self.judge_config() and not skipped_pending
         blockers = []
         if row.get('outcome') == 'visual':
             blockers.append({'kind': 'visual', 'source': 'row', 'text': 'visual read pending'})
@@ -1379,10 +1373,17 @@ class Runner:
         if is_test and self.empty_effect_hooks:
             blockers.extend({'kind': 'effect', 'source': spec, 'text': f'effect hook {spec} returned {reason}'}
                             for spec, reason in self.empty_effect_hooks)
-        if required and not self.effects_passed and row.get('outcome') != 'visual':
+        if not judge_pending and required and not self.effects_passed and row.get('outcome') != 'visual':
             _, reason = judge_queue.gates_only_status(self.effects_passed, required)
             blockers.append({'kind': 'effect', 'source': 'row', 'text': reason})
         receipt['blockers'] = blockers
+        if judge_pending:
+            receipt['status'] = 'RAN-UNVERIFIED'
+            receipt['status_reason'] = 'judge pending'
+            receipt['judge'] = {'state': 'pending'}
+            return receipt['status']
+        if self.judge_config() and skipped_pending:
+            receipt['judge'] = {'state': 'skipped'}
         if not blockers:
             receipt['status'] = 'PASS'
             return 'PASS'
@@ -1407,7 +1408,16 @@ class Runner:
         row = next((r for r in self.plan['rows'] if r['id'] == row_id), {'id': row_id})
         if row.get('judge') == 'skip':
             # a setup row (fixture, navigation): no gameplay effect to judge; its gates are its evidence
-            receipt.update(status='PASS', status_reason='setup row: judge skipped', judge={'state': 'skipped'})
+            blockers = receipt.get('blockers') or []
+            if blockers:
+                nonvisual = next((blocker for blocker in blockers if blocker['kind'] != 'visual'), None)
+                receipt.update(status='RAN-UNVERIFIED', review=True,
+                               review_kind='unverified' if nonvisual else 'visual',
+                               status_reason=(nonvisual or blockers[0])['text'], judge={'state': 'skipped'})
+                if any(blocker['kind'] == 'visual' for blocker in blockers):
+                    receipt['visual_read'] = {'state': 'pending'}
+            else:
+                receipt.update(status='PASS', status_reason='setup row: judge skipped', judge={'state': 'skipped'})
             receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
             return None
         try:
@@ -3251,7 +3261,7 @@ def record_command(mode, manifest, instances, name, on, start_gate=None, client_
     return {'recorded': name, 'sha256': seg['sha256'], 'rows_json': str(manifest)}
 
 
-def record_read(manifest, out, row_id, reader, verdict, text, still):
+def record_read(manifest, out, row_id, reader, verdict, text, still, capture=None):
     plan = json.loads(manifest.read_text())
     if isinstance(plan.get('judge'), dict) and plan['judge'].get('cmd'):
         raise ValueError('the plan has a judge')
@@ -3278,7 +3288,7 @@ def record_read(manifest, out, row_id, reader, verdict, text, still):
             kinds = ', '.join(blocker.get('kind', '?') for blocker in blockers) or 'none'
             raise ValueError(f'the row has no pending visual read (blockers: {kinds})')
         names = {row.get('id') for row in plan.get('rows', [])}
-        capture = None
+        captures = []
         for candidate in sorted(out.glob('*.json')):
             if candidate.stem not in names:
                 continue
@@ -3293,16 +3303,36 @@ def record_read(manifest, out, row_id, reader, verdict, text, still):
                     or source['instances_sha256'] != receipt['instances_sha256']):
                 continue
             for item in source.get('captures') or []:
-                if (isinstance(item, dict) and item.get('sha256') == read['still_sha256']
-                        and all(key in item for key in ('name', 'file', 'utc', 'status'))):
-                    capture = {'row': candidate.stem, **{key: item[key]
-                                                        for key in ('name', 'file', 'sha256', 'utc', 'status')}}
-                    break
-            if capture is not None:
-                break
-        if capture is None:
-            raise ValueError('the still is not a capture recorded by the runner in this run')
-        read['capture'] = capture
+                if (isinstance(item, dict) and all(key in item for key in ('name', 'file', 'sha256', 'utc', 'status'))
+                        and isinstance(item['file'], str) and item['file'] and Path(item['file']).name == item['file']):
+                    captures.append({'row': candidate.stem, **{key: item[key]
+                                                              for key in ('name', 'file', 'sha256', 'utc', 'status')}})
+        own = [item for item in captures if item['row'] == row_id and still.parent == row_dir
+               and item['file'] == still.name]
+        if own:
+            if capture is not None and capture != f"{own[0]['row']}:{own[0]['file']}":
+                raise ValueError("--capture names another capture than the still's own path")
+            if len(own) != 1:
+                matches = ', '.join(f"{item['row']}/{item['file']}" for item in own)
+                raise ValueError(f'the still matches {len(own)} captures ({matches}); name one with --capture <row>:<file>')
+            selected = own[0]
+            if selected['sha256'] != read['still_sha256']:
+                raise ValueError(f"the still's bytes differ from the capture recorded for {row_id}/{still.name}")
+        elif capture is not None:
+            declared = [item for item in captures if f"{item['row']}:{item['file']}" == capture
+                        and item['sha256'] == read['still_sha256']]
+            if len(declared) != 1:
+                raise ValueError(f'--capture {capture} is not a capture of this run with these bytes')
+            selected = declared[0]
+        else:
+            matches = [item for item in captures if item['sha256'] == read['still_sha256']]
+            if not matches:
+                raise ValueError('the still is not a capture recorded by the runner in this run')
+            if len(matches) != 1:
+                labels = ', '.join(f"{item['row']}/{item['file']}" for item in matches)
+                raise ValueError(f'the still matches {len(matches)} captures ({labels}); name one with --capture <row>:<file>')
+            selected = matches[0]
+        read['capture'] = selected
         previous = receipt.get('visual_read')
         history = list(receipt.get('visual_reads') or [])
         if previous is not None:
@@ -3348,6 +3378,7 @@ def main(argv=None):
     parser.add_argument('--verdict', choices=('PASS', 'FAIL'), help='record-read: visual verdict')
     parser.add_argument('--text', help='record-read: what the still shows')
     parser.add_argument('--still', type=Path, help='record-read: still under the row folder')
+    parser.add_argument('--capture', help='record-read: source capture as <row>:<file>')
     args = parser.parse_args(argv)
     if args.mode == 'record-read':
         if not args.reader or not args.verdict or args.text is None or not args.still:
@@ -3355,7 +3386,7 @@ def main(argv=None):
         manifest = args.manifest.resolve()
         out = (args.out or manifest.parent / 'out').resolve()
         try:
-            result = record_read(manifest, out, args.rows, args.reader, args.verdict, args.text, args.still)
+            result = record_read(manifest, out, args.rows, args.reader, args.verdict, args.text, args.still, args.capture)
         except (OSError, ValueError) as error:
             print(f'record-read: {error}', file=sys.stderr)
             return 1
