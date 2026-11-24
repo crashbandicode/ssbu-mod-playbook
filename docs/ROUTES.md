@@ -55,6 +55,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
+| `wireless_room_list` `{ready_cap}` | Main Menu or Local Wireless room list | reaches the room list using one `lobby-open-room-list` macro; its ZR, Down, Down, A presses have no intervening read because the bridge does not publish the dashboard overlay |
 | `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; each step awaits its screen, sends once, awaits the transition, resends a lost input at most 3 times and otherwise stops on a named step with `routes-wireless-room-stop.json` |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |

@@ -5203,12 +5203,36 @@ class WirelessRoomListTests(unittest.TestCase):
         self.assertEqual(caught.exception.step, 'open-room-list')
         self.assertEqual(self.io.actions, [])
 
+    def test_idle_ownership_is_restored_on_success_and_stop(self):
+        for stop in (False, True):
+            with self.subTest(stop=stop):
+                self.io = self.IO()
+                self.now = 0
+                self.ctx.runner.closed_loop_owns_idle = False
+                self.io.ready_no_phase = 'main' if stop else None
+                original, flags = self.io.send, []
+
+                def send(macro):
+                    flags.append(self.ctx.runner.closed_loop_owns_idle)
+                    return original(macro)
+
+                self.io.send = send
+                if stop:
+                    with self.assertRaises(routes.closed_loop.RouteStopped):
+                        self.run_list()
+                else:
+                    self.run_list()
+                    self.assertEqual(flags, [True])
+                self.assertIs(self.ctx.runner.closed_loop_owns_idle, False)
+
     def test_entry_past_the_room_list_stops_on_locate(self):
         for phase, screen in (('waiting', 'ldn.waiting'), ('stage', 'stage_select'),
-                              ('css', 'css.smash'), ('confirm_form', 'ldn.create')):
+                              ('css', 'css.smash'), ('form', 'ldn.create')):
             with self.subTest(screen=screen):
                 self.io = self.IO()
                 self.io.phase = phase
+                if phase == 'form':
+                    self.io.form_screen = screen
                 self.now = 0
                 with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
                     self.run_list()
