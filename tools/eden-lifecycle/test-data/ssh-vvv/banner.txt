@@ -1,0 +1,4 @@
+debug1: Connecting to example.test [192.0.2.1] port 22.
+debug1: Local version string SSH-2.0-OpenSSH_9.8
+debug1: Remote protocol version 2.0, remote software version OpenSSH_9.2
+Connection reset by 192.0.2.1 port 22

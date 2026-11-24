@@ -1,0 +1,40 @@
+debug1: OpenSSH_10.2p1 Ubuntu-2ubuntu3.8, OpenSSL 3.5.5 27 Jan 2026
+debug3: Running on Linux 7.2.6-070206-generic #202609141300 SMP PREEMPT_DYNAMIC Mon Sep 14 15:22:52 UTC 2026 x86_64
+debug3: Started with: /usr/bin/ssh -vvv -o ControlMaster=yes -o ControlPersist=120 -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o Port=56029 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=no -o ControlPath=/tmp/trgate-stall-1c8b3e99db854136a1cce535b9933378/mux-kex/%C -f -N -E /tmp/trgate-stall-1c8b3e99db854136a1cce535b9933378/mux-kex/master-3804152000001.log intpa@127.0.0.1
+debug1: Reading configuration data /dev/null
+debug2: resolve_canonicalize: hostname 127.0.0.1 is address
+debug3: channel_clear_timeouts: clearing
+debug3: ssh_connect_direct: entering
+debug1: Connecting to 127.0.0.1 [127.0.0.1] port 56029.
+debug3: set_sock_tos: set socket 4 IP_TOS 0xb8
+debug2: fd 4 setting O_NONBLOCK
+debug1: fd 4 clearing O_NONBLOCK
+debug1: Connection established.
+debug3: timeout: 10000 ms remain after connect
+debug1: loaded pubkey from /home/intpa/.ssh/id_rsa: RSA SHA256:q5QToHO4OoqtC+enaaaP0VlJZEWp7Sl5b6qPQ5kGVTI
+debug1: identity file /home/intpa/.ssh/id_rsa type 0
+debug1: no identity pubkey loaded from /home/intpa/.ssh/id_rsa
+debug1: no pubkey loaded from /home/intpa/.ssh/id_ecdsa
+debug1: identity file /home/intpa/.ssh/id_ecdsa type -1
+debug1: no identity pubkey loaded from /home/intpa/.ssh/id_ecdsa
+debug1: no pubkey loaded from /home/intpa/.ssh/id_ecdsa_sk
+debug1: identity file /home/intpa/.ssh/id_ecdsa_sk type -1
+debug1: no identity pubkey loaded from /home/intpa/.ssh/id_ecdsa_sk
+debug1: no pubkey loaded from /home/intpa/.ssh/id_ed25519
+debug1: identity file /home/intpa/.ssh/id_ed25519 type -1
+debug1: no identity pubkey loaded from /home/intpa/.ssh/id_ed25519
+debug1: no pubkey loaded from /home/intpa/.ssh/id_ed25519_sk
+debug1: identity file /home/intpa/.ssh/id_ed25519_sk type -1
+debug1: no identity pubkey loaded from /home/intpa/.ssh/id_ed25519_sk
+debug1: Local version string SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.8
+debug1: Remote protocol version 2.0, remote software version OpenSSH_9.9
+debug1: compat_banner: match: OpenSSH_9.9 pat OpenSSH* compat 0x04000000
+debug2: fd 4 setting O_NONBLOCK
+debug1: Authenticating to 127.0.0.1:56029 as 'intpa'
+debug3: put_host_port: [127.0.0.1]:56029
+debug1: load_hostkeys: fopen /etc/ssh/ssh_known_hosts: No such file or directory
+debug1: load_hostkeys: fopen /etc/ssh/ssh_known_hosts2: No such file or directory
+debug3: order_hostkeyalgs: no algorithms matched; accept original
+debug3: send packet: type 20
+debug1: SSH2_MSG_KEXINIT sent
+Connection to 127.0.0.1 port 56029 timed out

@@ -4,7 +4,7 @@
   eden_test.py go --host <host> --label <label> --nro <file> --rows <rows> [--card-lineup <dir> | --no-card-lineup <reason>]  stage, Up, run, report (no Down)
   eden_test.py run <run> --rows <id>   rerun one row; eden_test.py report <run>   show the updated report
 
-Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh yoga python3 ~/ssbu-mod-playbook/...`,
+Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh tr-yoga python3 ~/ssbu-mod-playbook/...`,
 after `git -C ~/ssbu-mod-playbook pull --ff-only` there and copying the rows folder over).
 
   eden_test.py new  --from <previous config.json> --label lr-14 --rows <rows folder>   new run folder + config
@@ -29,6 +29,7 @@ import argparse
 import copy
 import hashlib
 import heapq
+import importlib.util
 import json
 import math
 import os
@@ -53,6 +54,10 @@ except ImportError:
 
 PLAYBOOK = Path(__file__).resolve().parents[2]
 LIFECYCLE = PLAYBOOK / 'tools/eden-lifecycle/lifecycle.py'
+_lifecycle_spec = importlib.util.spec_from_file_location('_eden_test_lifecycle', LIFECYCLE)
+_lifecycle_module = importlib.util.module_from_spec(_lifecycle_spec)
+_lifecycle_spec.loader.exec_module(_lifecycle_module)
+SshMux = _lifecycle_module.SshMux
 RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
 RUNS = Path('/home/intpa/eden-runs')
@@ -1144,7 +1149,8 @@ def results_md(run, config):
         lines.append(f'  - FAILED {row}: {one_line(error)}')
     if unrun:
         lines.append(f'  - unrun: {one_line(", ".join(unrun), 160)}')
-    lines += [one_line(f'- Down: cleanup_failures={journal.get("cleanup_failures")}, released={journal.get("released")}; '
+    pending = ', release pending' if journal.get('release_pending') else ''
+    lines += [one_line(f'- Down: cleanup_failures={journal.get("cleanup_failures")}, released={journal.get("released")}{pending}; '
                        + '; '.join(unit_results(run)), 240),
               one_line(f'- Prune: {prune_summary(run, journal)}', 240),
               f'- Harvest: {harvest_summary(run)}',
@@ -1400,6 +1406,12 @@ def _go_remote(args, lineup):
         raise SystemExit(f'no SSH host for {args.host!r}; use --ssh or add it to {hosts}')
     if host.startswith('-'):
         raise SystemExit(f'invalid SSH host {host!r}')
+    options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
+    with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
+        return _go_remote_with_mux(args, lineup, host, mux)
+
+
+def _go_remote_with_mux(args, lineup, host, mux):
     stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
     commands = [
         ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
@@ -1415,6 +1427,8 @@ def _go_remote(args, lineup):
     else:
         commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
     for command in commands:
+        mux.ensure()
+        command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
         if code := _go_sh(command):
             raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}')
     script = f'{stage}/tools/eden-test/eden_test.py'
@@ -1437,12 +1451,14 @@ def _go_remote(args, lineup):
     remote.extend(('--owner', args.owner))
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
-    ssh_code = _go_sh(['ssh', '-o', 'BatchMode=yes', host, *(_pwsh_arg(arg) for arg in remote)])
+    mux.ensure()
+    ssh_code = _go_sh(['ssh', *mux.rider_args, host, *(_pwsh_arg(arg) for arg in remote)])
     run = f'/home/intpa/eden-runs/{args.label}'
-    prefix = f'ssh -o BatchMode=yes {host} /usr/bin/python3 -I -B {script}'
+    prefix = f'on {host}: /usr/bin/python3 -I -B {script}'
     with tempfile.TemporaryDirectory(prefix='eden-go-') as directory:
         result_file = Path(directory) / 'go-result.json'
-        result_error = _go_sh(['scp', f'{host}:{run}/go-result.json', str(result_file)])
+        mux.ensure()
+        result_error = _go_sh(['scp', *mux.rider_args, f'{host}:{run}/go-result.json', str(result_file)])
         try:
             result = json.loads(result_file.read_text()) if not result_error else {}
             code = result['code']
@@ -1453,7 +1469,8 @@ def _go_remote(args, lineup):
             raise SystemExit(f'remote go produced no result for this call (ssh exit {ssh_code}); '
                              'nothing was copied; see the output above') from error
     report = f'./REPORT-{args.label}.md'
-    if report_error := _go_sh(['scp', f'{host}:{run}/REPORT.md', report]):
+    mux.ensure()
+    if report_error := _go_sh(['scp', *mux.rider_args, f'{host}:{run}/REPORT.md', report]):
         print(f'Down: {prefix} down {run}')
         raise SystemExit(f'copying remote report failed ({report_error})')
     print(f'Report: {Path(report).resolve()}')
@@ -1561,6 +1578,16 @@ def cmd_down(run, keep_state=False):
     (run / 'REPORT.md').write_text(report_md(run))
     if code != 0:
         raise SystemExit(f'lifecycle down failed ({code}); the claim stays held; see {run / "lifecycle-down.log"}')
+    journal_path = run / 'state' / 'lifecycle.json'
+    if journal_path.is_file():
+        journal = json.loads(journal_path.read_text())
+        if journal.get('release_pending'):
+            unit = journal.get('settle_unit') or 'not started'
+            receipt = run / 'state' / 'RELEASE-PENDING.md'
+            lines = receipt.read_text(encoding='utf-8').splitlines() if receipt.is_file() else []
+            last = lines[-1] if lines else 'receipt unavailable'
+            print(f'Down complete; the ledger release is pending: {last}; settle unit {unit}; '
+                  'running down again completes it')
 
 
 def main(argv=None):

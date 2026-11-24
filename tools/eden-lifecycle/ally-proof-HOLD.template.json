@@ -20,7 +20,7 @@
     "work_root": "C:\\Eden\\life-p6-go01\\work",
     "state_dir": "C:\\Eden\\life-p6-go01\\state",
     "ledger": "/tmp/deluxe-surface-1007/OWNER-COORDINATION.md",
-    "ledger_ssh": "memento-claw-yoga-ubuntu",
+    "ledger_ssh": "tr-yoga",
     "interactive_session": 0,
     "runtime": 600,
     "socket_cap": 90,

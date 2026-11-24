@@ -17,6 +17,28 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eden_test  # noqa: E402
 
+
+class FakeMux:
+    def __init__(self, host, **_kwargs):
+        self.host = host
+        self.rider_args = [*eden_test._lifecycle_module.SSH_OPTIONS, '-o', 'ControlMaster=no',
+                           '-o', 'ControlPath=/tmp/fake-eden-ssh/%C', '-o', 'ProxyCommand=/bin/false']
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        pass
+
+    def ensure(self):
+        pass
+
+
+def setUpModule():
+    mux = mock.patch.object(eden_test, 'SshMux', FakeMux)
+    mux.start()
+    unittest.addModuleCleanup(mux.stop)
+
 TRACE_REQUIRED = (
     "this base is a trace run: pass --elf <the build's libtraining_rooms.so> and at least one "
     "--trace-point <module!symbol> (the lifecycle needs 1..256 trace points); the two the drill "
@@ -1227,16 +1249,16 @@ class EdenTestTests(unittest.TestCase):
         stage = '/home/intpa/eden-runs/_eden-test/stage/go-1'
         token = 'd' * 32
         def fake_sh(command, log=None):
-            if command[0] == 'scp' and command[1].endswith('/go-result.json'):
-                Path(command[2]).write_text(json.dumps(
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps(
                     {'token': token, 'code': 0, 'counts': {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}}))
             return 0
         with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex=token)), \
              mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh:
             self.assertEqual(eden_test.main(self.go_args(host='xps', lineup=True) + ['--ssh', 'xps-host']), 0)
         commands = [call.args[0] for call in sh.call_args_list]
-        self.assertEqual(commands[1], ['rsync', '-a', '--delete', '--mkpath',
-                                       str(folder.resolve()) + '/', f'xps-host:{stage}/card-lineup/'])
+        self.assertEqual(commands[1][-2:], [str(folder.resolve()) + '/', f'xps-host:{stage}/card-lineup/'])
+        self.assertIn('ProxyCommand=/bin/false', commands[1][2])
         ssh = next(c for c in commands if c[0] == 'ssh')
         self.assertLess(commands.index(commands[1]), commands.index(ssh))
         self.assertEqual(ssh[ssh.index('--card-lineup'):ssh.index('--card-lineup') + 4],
@@ -1690,7 +1712,7 @@ class EdenTestTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, 'remote go produced no result for this call'):
                 eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
         self.assertIn(TRACE_REQUIRED, output.getvalue())
-        self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][1].endswith('/REPORT.md')
+        self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][-2].endswith('/REPORT.md')
                              for c in sh.call_args_list))
         self.assertFalse((self.dir / 'REPORT-go-1.md').exists())
 
@@ -1754,11 +1776,11 @@ class EdenTestTests(unittest.TestCase):
             if command[0] == 'ssh':
                 return 1
             if command[0] == 'scp':
-                if command[1].endswith('/go-result.json'):
-                    Path(command[2]).write_text(json.dumps(
+                if command[-2].endswith('/go-result.json'):
+                    Path(command[-1]).write_text(json.dumps(
                         {'token': token, 'code': 3, 'counts': {'PASS': 3, 'FAIL': 1, 'NOT RUN': 16}}))
                 else:
-                    Path(command[2]).write_text('report')
+                    Path(command[-1]).write_text('report')
             return 0
 
         with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex=token)), \
@@ -1781,7 +1803,17 @@ class EdenTestTests(unittest.TestCase):
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/go-result.json', mock.ANY],
             ['scp', f'{host}:/home/intpa/eden-runs/{label}/REPORT.md', f'./REPORT-{label}.md'],
         ]
-        self.assertEqual([call.args[0] for call in sh.call_args_list], expected)
+        commands = [call.args[0] for call in sh.call_args_list]
+        normalized = []
+        for command in commands:
+            self.assertIn('ProxyCommand=/bin/false', ' '.join(command))
+            if command[0] == 'rsync':
+                normalized.append([command[0], *command[3:]])
+            elif command[0] == 'scp':
+                normalized.append([command[0], *command[-2:]])
+            else:
+                normalized.append([command[0], '-o', 'BatchMode=yes', *command[command.index(host):]])
+        self.assertEqual(normalized, expected)
         self.interface_check.assert_not_called()
         temp = Path(sh.call_args_list[-2].args[0][-1])
         self.assertTrue(temp.is_absolute())
@@ -1796,8 +1828,8 @@ class EdenTestTests(unittest.TestCase):
         hosts.write_text(json.dumps({'xps': 'mapped-xps'}))
         rowfile = self.rows / 'rows.json'
         def fake_sh(command, log=None):
-            if command[0] == 'scp' and command[1].endswith('/go-result.json'):
-                Path(command[2]).write_text(json.dumps(
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps(
                     {'token': 'b' * 32, 'code': 0, 'counts': {'PASS': 2, 'FAIL': 0, 'NOT RUN': 0}}))
             return 0
 
@@ -1805,24 +1837,25 @@ class EdenTestTests(unittest.TestCase):
              mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh:
             self.assertEqual(eden_test.main(self.go_args(host='xps', rows=rowfile)), 0)
         commands = [call.args[0] for call in sh.call_args_list]
-        self.assertIn(['rsync', '-a', '--mkpath', str(rowfile),
-                       'mapped-xps:/home/intpa/eden-runs/_eden-test/stage/go-1/rows/rows.json'], commands)
-        self.assertEqual(commands[-3][0:4], ['ssh', '-o', 'BatchMode=yes', 'mapped-xps'])
+        self.assertTrue(any(c[0] == 'rsync' and c[-2:] == [str(rowfile),
+                       'mapped-xps:/home/intpa/eden-runs/_eden-test/stage/go-1/rows/rows.json'] for c in commands))
+        self.assertIn('mapped-xps', commands[-3])
+        self.assertIn('ProxyCommand=/bin/false', commands[-3])
 
     def test_go_remote_missing_result_refuses_without_copying_report(self):
         output = io.StringIO()
 
         def fake_sh(command, log=None):
-            if command[0] == 'ssh' or command[0] == 'scp' and command[1].endswith('/go-result.json'):
+            if command[0] == 'ssh' or command[0] == 'scp' and command[-2].endswith('/go-result.json'):
                 return 1
             if command[0] == 'scp':
-                Path(command[2]).write_text('report')
+                Path(command[-1]).write_text('report')
             return 0
 
         with chdir(self.dir), mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh, redirect_stdout(output):
             with self.assertRaisesRegex(SystemExit, 'remote go produced no result for this call \\(ssh exit 1\\)'):
                 eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
-        self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][1].endswith('/REPORT.md')
+        self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][-2].endswith('/REPORT.md')
                              for c in sh.call_args_list))
         self.assertNotIn('Down:', output.getvalue())
 
@@ -1835,20 +1868,20 @@ class EdenTestTests(unittest.TestCase):
                     if command[0] == 'ssh':
                         return 1
                     if command[0] == 'scp':
-                        if command[1].endswith('/go-result.json'):
+                        if command[-2].endswith('/go-result.json'):
                             old = {'code': 0, 'counts': {'PASS': 2, 'FAIL': 0, 'NOT RUN': 0}}
                             if old_token is not None:
                                 old['token'] = old_token
-                            Path(command[2]).write_text(json.dumps(old))
+                            Path(command[-1]).write_text(json.dumps(old))
                         else:
-                            Path(command[2]).write_text('old report')
+                            Path(command[-1]).write_text('old report')
                     return 0
 
                 with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex='c' * 32)), \
                      mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh, redirect_stdout(output):
                     with self.assertRaisesRegex(SystemExit, 'remote go produced no result for this call \\(ssh exit 1\\)'):
                         eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
-                self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][1].endswith('/REPORT.md')
+                self.assertFalse(any(c.args[0][0] == 'scp' and c.args[0][-2].endswith('/REPORT.md')
                                      for c in sh.call_args_list))
                 self.assertNotIn('Report:', output.getvalue())
                 self.assertNotIn('Down:', output.getvalue())
@@ -1988,6 +2021,41 @@ class EdenTestTests(unittest.TestCase):
         failed = {'evidence': str(run / 'out'), 'evidence_saved': 'now', 'error': "OSError('busy')"}
         self.assertEqual(eden_test.prune_summary(run, {'prune': failed}),
                          "FAILED: OSError('busy'); the run's files are in out/post-run-*/")
+
+    def test_down_pending_release_returns_zero_and_reports_retry_unit(self):
+        for unit in ('eden-settle-deadbeef.service', None):
+            with self.subTest(unit=unit):
+                label = 'pending-unit' if unit else 'pending-no-unit'
+                args = ['--from', str(self.previous), '--label', label, '--rows', str(self.rows)]
+                eden_test.main(['new', *args])
+                run = self.dir / 'runs' / label
+                eden_test.main(['up', str(run)])
+                source = FAKE_LIFECYCLE.replace(
+                    "j.update(phase='down', released=True, cleanup_failures=[])",
+                    f"j.update(phase='down', released=False, release_pending=True, "
+                    f"settle_unit={unit!r}, cleanup_failures=[])")
+                source = source.replace("elif '--evidence-dir' in sys.argv:", "elif False and '--evidence-dir' in sys.argv:")
+                eden_test.LIFECYCLE.write_text(source)
+                (run / 'state' / 'RELEASE-PENDING.md').write_text(
+                    'old line\nrelease pending since 03:00:00Z: ssh diag fixture\n')
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = eden_test.main(['down', str(run)])
+                self.assertEqual(code, 0)
+                self.assertIn('Down complete; the ledger release is pending: '
+                              'release pending since 03:00:00Z: ssh diag fixture; settle unit '
+                              + (unit or 'not started') + '; running down again completes it', output.getvalue())
+                self.assertNotIn('the claim stays held', output.getvalue())
+                self.assertIn('released=False, release pending', (run / 'RESULTS.md').read_text())
+                eden_test.LIFECYCLE.write_text(FAKE_LIFECYCLE)
+
+    def test_down_real_cleanup_failure_retains_held_claim_message(self):
+        eden_test.main(['new', *self.args()])
+        run = self.dir / 'runs/lr-14'
+        eden_test.main(['up', str(run)])
+        with mock.patch.object(eden_test, 'lifecycle', return_value=1):
+            with self.assertRaisesRegex(SystemExit, 'the claim stays held'):
+                eden_test.main(['down', str(run)])
 
     def test_retry_clears_stop_input_and_reruns_on_the_same_boot(self):
         (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[], "note": "fail-once"}')
