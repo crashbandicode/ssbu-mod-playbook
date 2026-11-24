@@ -246,7 +246,9 @@ Host tests only; no runtime acceptance.
 2026-11-24: The `eden-runner/library/cases/expect_fighters` and `reach_training` cases cut whole recorded
 bridge-log lines without editing them. Source `152629cd` is
 `rc15-fix-152629cd-yoga-training-1/out/bridge-run/bridge.log`; source `71158421` is
-`rc15-i2-71158421-yoga-1/out/bridge-run/bridge.log`. The cut files and SHA-256 values are:
+`rc15-i2-71158421-yoga-1/out/bridge-run/bridge.log`; source `ib-practice` is
+`ib-practice-publisher/combined-yoga-main-1/out/bridge-run/bridge.log` in the phase23 artifacts.
+The cut files and SHA-256 values are:
 
 | Case JSON | Source and one-based lines | Cut file SHA-256 |
 | --- | --- | --- |
@@ -256,16 +258,18 @@ bridge-log lines without editing them. Source `152629cd` is
 | `expect_fighters/reject-missing-roster.json` | 71158421: 2, 9396–9399 | `98d570fb690c9388628952090dab970aa3ff5e3430ae8a7424066c60051c541b` |
 | `expect_fighters/reject-missing-body.json` | 71158421: 2, 9390–9394, 9396 | `c5ea4a2694c904bc1cd28c868876e556a4431cec16874c07352e26fb9b93a73a` |
 | `expect_fighters/reject-other-run.json` | 71158421: 2, 9397–9398, 9401, 9405–9408 | `6568bb08c9a3bd32c1c5e1613166c38f957e8c682d110e9f0fb9ff9f0e3637ad` |
-| `reach_training/accept-docs-enter-training.json` | 71158421: 2, 9409–9413 | `ef32d8a3da408ec5497fd9ae297fd55062e6c199da00740be0330f5e0c5a6cb4` |
-| `reach_training/reject-other-fighter.json` | 71158421: 2, 9409–9413 | `ef32d8a3da408ec5497fd9ae297fd55062e6c199da00740be0330f5e0c5a6cb4` |
-| `reach_training/reject-other-stage.json` | 71158421: 2, 9409–9413 | `ef32d8a3da408ec5497fd9ae297fd55062e6c199da00740be0330f5e0c5a6cb4` |
-| `reach_training/reject-other-boot.json` | 71158421: 2, 9409–9413 | `ef32d8a3da408ec5497fd9ae297fd55062e6c199da00740be0330f5e0c5a6cb4` |
-| `reach_training/reject-missing-roster.json` | 71158421: 2, 9396–9399 | `98d570fb690c9388628952090dab970aa3ff5e3430ae8a7424066c60051c541b` |
-| `reach_training/reject-other-run.json` | 152629cd: 2, 18830–18834 | `69d44d8ac5fb826133ab16ffb03a8e6a0968ff2c59eed87b38b265c246ea0913` |
+| `reach_training/accept-docs-enter-training.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-other-fighter.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-other-stage.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-other-boot.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-missing-roster.json` | 71158421: 2, 8184, 9396–9399 | `1d3fb68bf365d14baead5f2b4f984556902457ed426feee8f512b250248c41f7` |
+| `reach_training/reject-other-run.json` | 152629cd: 2, 18786, 18830–18834 | `d9be3ddeb732a2a8cb1f8e09604f3fc4ef8cffd5e5023691314754c27e0c56e9` |
+| `reach_training/reject-no-stage.json` | 71158421: 2, 9409–9413 | `ef32d8a3da408ec5497fd9ae297fd55062e6c199da00740be0330f5e0c5a6cb4` |
+| `reach_training/reject-superseded-stage.json` | ib-practice: 49661, 55199, 82764, 82851–82855 | `4b2da8a5ca838e189718efc9507dcff4c4249893bfbb0f6f20108021a83524bb` |
 
 The missing-roster cases end after the old CPU goes and before the new CPU appears. The missing-body case has no
-fresh fighters reply in that interval. The reach stage input is
-3 from 71158421 line 8184 or 152629cd line 18786, as read from the existing log before the fresh roster. The
+fresh fighters reply in that interval. Reach stage lines come from the current connection. In the superseded-stage
+case, the recorded Training stage 308 is superseded by Battlefield 0 before the recorded roster reply. The
 wrong-stage case requests Battlefield against the recorded Final Destination stage. These are host test inputs,
 not runtime acceptance of this change.
 

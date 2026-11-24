@@ -3082,8 +3082,11 @@ def judge_expect_fighters(lines, p1=None, cpu=None, boot=None):
             'bodies': {seat: value.get('kind') for seat, value in bodies.items()}}
 
 
-def judge_reach_training(lines, p1, cpu=None, stage='Final Destination', form='normal', boot=None, stage_id=None):
+def judge_reach_training(lines, p1, cpu=None, stage='Final Destination', form='normal', boot=None):
     _effect_boot(lines, boot)
+    stage_id = switch_hw.parse_bridge_state(lines).get('stage')
+    if stage_id is None:
+        raise RuntimeError('no stage observation in this bridge connection')
     roster = _effect_roster(lines, ((0, p1), (1, cpu)), require_both=True)
     wanted_stage = stage_entry(stage)['id']
     wanted_p1 = fighter_entry(p1)['kind']
@@ -3092,7 +3095,7 @@ def judge_reach_training(lines, p1, cpu=None, stage='Final Destination', form='n
             or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
         raise RuntimeError(f'live Training state does not match the requested setup: '
                            f"{{'stage': {stage_id!r}, 'roster': {roster!r}}}")
-    return {'stage_id': wanted_stage, 'roster': roster}
+    return {'stage_id': stage_id, 'roster': roster}
 
 
 def _effect_capture_start(ctx):
@@ -3105,11 +3108,24 @@ def _effect_capture_start(ctx):
         raise RuntimeError('the bridge has no current greeting for the read')
     hello = connection[0]
     boot = _effect_boot([hello], None)
-    return log, len(text), hello, boot, (stat.st_dev, stat.st_ino)
+    return log, len(text), hello, boot, (stat.st_dev, stat.st_ino), connection[2]
+
+
+def _effect_capture_stages(capture):
+    log, start, hello, boot, identity, greeting_index = capture
+    with log.open('rb') as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino) != identity or stat.st_size < start:
+            raise RuntimeError('the bridge log rotated or truncated during the read')
+        text = stream.read(start).decode(errors='replace')
+    connection = _bridge_on_latest_connection(text, require_install=False)
+    if connection is None or connection[0] != hello or connection[2] != greeting_index:
+        raise RuntimeError('the bridge connection changed during the read')
+    return [line for line in text.splitlines()[greeting_index + 1:] if switch_hw.STAGE.search(line)]
 
 
 def _effect_capture_lines(capture):
-    log, start, hello, boot, identity = capture
+    log, start, hello, boot, identity = capture[:5]
     with log.open('rb') as stream:
         stat = os.fstat(stream.fileno())
         if (stat.st_dev, stat.st_ino) != identity or stat.st_size < start:
@@ -3119,7 +3135,7 @@ def _effect_capture_lines(capture):
     return [hello, *lines]
 
 
-def _effect_compare_live(lines, boot, live, hook):
+def _effect_compare_live(lines, boot, live, hook, judged=None):
     _effect_boot(lines, boot)
     roster = switch_hw.roster_response(lines, entries=(0, 1))
     if hook == 'expect_fighters':
@@ -3128,8 +3144,8 @@ def _effect_compare_live(lines, boot, live, hook):
             'roster': None if roster is None else {seat: value.get('kind') for seat, value in roster.items()},
             'bodies': None if bodies is None else {seat: value.get('kind') for seat, value in bodies.items()},
         }
-    else:
-        judged = {'stage_id': live['stage_id'], 'roster': roster}
+    elif judged is None:
+        judged = {'stage_id': switch_hw.parse_bridge_state(lines).get('stage'), 'roster': roster}
     if judged != live:
         raise RuntimeError(f'{hook}: the judged lines and the live read disagree: judged={judged!r} live={live!r}')
 
@@ -5967,6 +5983,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                         stop('locate', 'reach_training needs native Training input ownership')
                     try:
                         capture = _effect_capture_start(ctx)
+                        stage_lines = _effect_capture_stages(capture)
                         final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
                                              roster_entries=(0, 1))
                     except RuntimeError as error:
@@ -6007,15 +6024,17 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                 if not _fields_match(final_ui, TRAINING_SCREEN):
                     stop('locate', 'final Training screen is not owned by native input')
                 lines = _effect_capture_lines(capture)
+                lines[1:1] = stage_lines
                 live = {'stage_id': final.get('stage'), 'roster': final.get('roster', {})}
-                _effect_compare_live(lines, capture[3], live, 'reach_training')
                 try:
                     verified = judge_reach_training(lines, p1=p1, cpu=cpu, stage=stage, form=form,
-                                                    boot=capture[3], stage_id=final.get('stage'))
+                                                    boot=capture[3])
                 except RuntimeError as error:
                     if str(error).startswith('live Training state does not match the requested setup:'):
+                        _effect_compare_live(lines, capture[3], live, 'reach_training')
                         stop('locate', f'live Training state does not match the requested setup: {final}')
                     stop('locate', str(error))
+                _effect_compare_live(lines, capture[3], live, 'reach_training', judged=verified)
                 if verified != live:
                     raise RuntimeError(f'reach_training: the judged lines and the live read disagree: '
                                        f'judged={verified!r} live={live!r}')

@@ -533,6 +533,8 @@ The `tile-take` macro holds L3 then L3+B. `routes:take_cpu` takes the CPU coin w
 `reach_training` and `expect_fighters` each have a pure judge named in `EFFECT_JUDGES`.
 Their recorded cases live in `tools/eden-runner/library/cases/`.
 The judges may read the static fighter and stage tables, but read no runtime files or clock.
+`reach_training` reads the stage from recorded stage lines in the current bridge connection.
+If the capture reconnects after the stage loads, the stage has no observation in the current connection and the step stops.
 The take steps fence `take.ack` and `take.applied`; a build without both lines is refused before input.
 These paths have host replays, not runtime proof.
 

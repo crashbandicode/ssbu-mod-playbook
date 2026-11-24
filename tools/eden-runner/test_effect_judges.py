@@ -145,6 +145,13 @@ class EffectJudgeTests(unittest.TestCase):
                              and node.value.id == 'live' and isinstance(node.slice, ast.Constant)
                              and node.slice.value == 'stage_id' for node in ast.walk(tree)))
 
+    def test_later_recorded_stage_supersedes_the_earlier_one(self):
+        _, args = load_case(CASES / 'reach_training' / 'reject-superseded-stage.json')
+        with self.assertRaisesRegex(RuntimeError, 'live Training state does not match the requested setup'):
+            routes.judge_reach_training(**args)
+        result = routes.judge_reach_training(**{**args, 'stage': 'Battlefield'})
+        self.assertEqual(result['stage_id'], 0)
+
 
 class EffectHookTests(unittest.TestCase):
     def setUp(self):
@@ -274,6 +281,25 @@ class EffectHookTests(unittest.TestCase):
              patch.object(routes, 'native_state', side_effect=roster), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             with self.assertRaisesRegex(RuntimeError, 'no stage observation in this bridge connection'):
+                routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
+
+    def test_reach_hook_refuses_disagreement_with_the_recorded_stage(self):
+        replay = MenuReplay()
+        replay.menu['open'] = '0'
+        state = {'stage': 3, 'roster': {0: {'kind': 0, 'nana': False}, 1: {'kind': 7, 'nana': False}}}
+        stage_line = (CASES / 'reach_training' / 'superseded-stage-yoga.lines').read_text().splitlines()[2]
+        with self.log.open('a') as stream:
+            stream.write(stage_line + '\n')
+
+        def roster(*args, **kwargs):
+            with self.log.open('a') as stream:
+                stream.write('\n'.join(self.recorded[1:6]) + '\n')
+            return state
+
+        with patch.object(routes, 'BridgePickerIO', return_value=replay), \
+             patch.object(routes, 'native_state', side_effect=roster), \
+             patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
+            with self.assertRaisesRegex(RuntimeError, 'reach_training: the judged lines and the live read disagree'):
                 routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
 
 
