@@ -2049,13 +2049,13 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertEqual(gate('    helper.relay(ctx, take)\n', [{'id': 'r1', 'steps': [step]}]), ([], [], ['take-cpu']))
         self.assertEqual(gate('    helper.relay(ctx, take)\n', [{'id': 'r1', 'steps': [step, {'run': 'steps.py:ok'}]}]),
                          ([], [], ['take-cpu', 'take-p1']))
-        # A name that is no segment is refused where it is played.
+        # A name that is no segment, passed down to a play: the gate cannot tell whether it reaches the play, so
+        # it does not refuse it; the play is not checked, and the gate says so.
+        warning = ['G8 helper.py: 1 play call(s) with a computed name or unknown callee are not checked']
         step['args']['take'] = 'take-p2'
-        self.assertEqual(gate('    helper.relay(ctx, take)\n', [{'id': 'r1', 'steps': [step]}]),
-                         (['G8 helper.py: ctx.play("take-p2") names no segment of this plan'], [], []))
+        self.assertEqual(gate('    helper.relay(ctx, take)\n', [{'id': 'r1', 'steps': [step]}]), ([], warning, []))
         # Not followed, so the play warns: an argument built at run time, a helper handed on as a value, arguments
         # passed with *, a parameter the helper changes, a manifest argument that is not a name.
-        warning = ['G8 helper.py: 1 play call(s) with a computed name or unknown callee are not checked']
         rows = [{'id': 'r1', 'steps': [{'run': 'steps.py:ok'}]}]
         for body in ('    helper.press(ctx, pick())\n', '    helper.press(ctx, "tap-a")\n    queue(helper.press)\n',
                      '    helper.press(*pick())\n'):
@@ -2067,6 +2067,43 @@ fn elsewhere() { write!(out, "outside=1"); }
                                          '    helper.relay(ctx, "tap-a")\n'}), ([], warning, []))
         step['args']['take'] = 3
         self.assertEqual(gate('    helper.relay(ctx, take)\n', [{'id': 'r1', 'steps': [step]}]), ([], warning, []))
+
+    def test_a_helper_that_plays_from_two_namespaces_is_not_refused(self):
+        # One helper, two ways to play: a segment of the plan through ctx.play, anything else through the routes
+        # library. `tap-a` is a segment only, `tap-a1` a library macro only; both calls are valid.
+        self.plan['segments']['tap-a'] = {'file': 'tap-a.json'}
+        steps = self.HOOK_HEAD + 'import helper\ndef ok(ctx):\n    helper.press(ctx, "tap-a")\n    helper.press(ctx, "tap-a1")\n'
+
+        def gate(segment_play, library_play, extra=''):
+            helper = ('import routes\nTAP = {"A": "tap-a", "Y": "tap-y"}\n'
+                      'def press(ctx, name):\n    if name in ctx.runner.plan.get("segments", {}):\n'
+                      f'        {segment_play}\n    else:\n        {library_play}\n' + extra)
+            return self.play_gate({'steps.py': steps, 'helper.py': helper})
+
+        # The names a parameter can hold are names a play may take, not names it must take. Without a declaration
+        # the gate cannot tell which reach which play: it refuses nothing, checks nothing, and says so.
+        warning = 'G8 helper.py: {} play call(s) with a computed name or unknown callee are not checked'
+        self.assertEqual(gate('ctx.play(name)', 'routes.play(ctx, name)'), ([], [warning.format(2)], []))
+        # Each play declares its own closed set: checked, with no complaint about the other branch's name.
+        self.assertEqual(gate('ctx.play(name, among=("tap-a",))', 'routes.play(ctx, name, among=("tap-a1",))'),
+                         ([], [], ['tap-a']))
+        # Still refused: a declared name of the wrong kind, a written name that can never be played, and a written
+        # name outside its own set.
+        self.assertEqual(gate('ctx.play(name, among=("tap-a1",))', 'routes.play(ctx, name, among=("tap-a",))'), ([
+            'G8 helper.py: ctx.play among "tap-a1" names no segment of this plan',
+            'G8 helper.py: routes.play among "tap-a" names no routes library macro'], [], []))
+        self.assertEqual(gate('ctx.play("tap-a1")', 'routes.play(ctx, "tap-a")'), ([
+            'G8 helper.py: ctx.play("tap-a1") names no segment of this plan',
+            'G8 helper.py: routes.play("tap-a") names no routes library macro'], [], []))
+        self.assertEqual(gate('ctx.play("tap-a", among=("tap-b",))', 'routes.play(ctx, name, among=("tap-a1",))'), ([
+            'G8 helper.py: ctx.play among "tap-b" names no segment of this plan',
+            'G8 helper.py: ctx.play("tap-a") is not among the names it declares'], [], []))
+        # A table read with a key the gate cannot tell is the same kind of set: an entry that is no segment makes
+        # the play unchecked, not refused. With a written key it is refused.
+        self.assertEqual(gate('ctx.play(TAP[name])', 'routes.play(ctx, name, among=("tap-a1",))'),
+                         ([], [warning.format(1)], []))
+        self.assertEqual(gate('ctx.play(TAP["Y"])', 'routes.play(ctx, name, among=("tap-a1",))'),
+                         (['G8 helper.py: ctx.play("tap-y") names no segment of this plan'], [], []))
 
     def test_every_place_a_manifest_names_a_hook_is_read(self):
         self.plan['segments'].update({f'seg-{name}': {'file': f'{name}.json'} for name in 'abcde'})
