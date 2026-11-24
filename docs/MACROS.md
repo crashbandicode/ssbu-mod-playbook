@@ -593,9 +593,9 @@ is not evidence. A dictionary with `verdict` is evidence only for PASS
 (case-insensitive); one with `pass` is evidence only when that value is true.
 A hook's `unverified` text, `NEEDS VISUAL READ` grade or
 pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
-A receipt records separate visual, unverified and effect blockers. A visual
+A receipt records separate visual, unverified, effect and evidence blockers. A visual
 read can clear only visual blockers, never a missing deterministic observation
-or effect; a judge's PASS likewise clears only visual blockers. Remaining
+or effect or an evidence blocker; a judge's PASS likewise clears only visual blockers. Remaining
 blockers keep the row RAN-UNVERIFIED.
 A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
 resuming without naming it does not promote it. A setup row's PASS still means
@@ -605,10 +605,33 @@ Record a visual read with
 `runner.py record-read rows.json --out out --rows <id> --reader <who> --verdict PASS|FAIL --text "<what the still shows>" --still <out/id/still>`.
 The still must be inside the row folder and match a runner capture from the same
 plan and instances file; a copied capture also needs the same inputs identity.
-The read stores the capture's name, hash, UTC time and scalar status snapshot. The runner
-records every still taken inside a row, including image-gate polling stills, as a
-capture with one `status` call after each. It does not yet check still freshness
-against the game frame.
+The read stores the capture's name, hash, UTC time, scalar status snapshot and
+freshness record. A read is refused when its still fails the same image integrity
+and full-load checks as the judge. Both PASS and FAIL reads require a usable capture; a judge's
+PASS or FAIL requires usable stills on which the verdict rests. Refused or
+errored stills cannot establish either result; a judged verdict that rests on
+them leaves evidence blockers. A job written without freshness records also
+leaves the verdict unverified when it rests on row stills. A failed
+deterministic gate stays FAILED regardless of the stills. A failed clip check
+stays FAILED unless a row still it compared is unusable. The clip check compares
+only usable row stills, lists exclusions, and leaves an evidence blocker when
+nothing usable can be compared. The runner records
+every still taken inside a row, including image-gate polling stills, as a
+capture with one `status` call after each. Without a game-frame source the
+freshness is `unverified` and remains usable; that is not frame-freshness proof.
+The judge and clip check use a still only when its file is present, readable and
+passes an integrity check and fully loads as an image, its freshness record is
+usable and, where recorded, its SHA-256 matches the file's bytes. Clip and dense
+frames must also decode.
+An image counts as evidence only if the whole file is there: a PNG must end with its IEND chunk and a JPEG with its end marker.
+Without PIL, the PNG check refuses unsupported metadata and non-PNG formats.
+Evidence blockers belong to the latest judge pass; earlier ones are kept under
+`evidence_attempts`. The judge is shown only usable row stills and clip frames; excluded stills are
+listed in the job and the receipt. A judged row with no usable image is
+unverified. A verdict is taken only from a judge run that exited successfully
+and wrote it in that run. A new pass withdraws the previous verdict first; a
+pass that does not finish leaves the row unverified. Earlier results are kept
+as `verdict.attempt-<n>.json` and `done.attempt-<n>.json`.
 The still's own recorded path selects its capture; otherwise use
 `--capture <row>:<file>` to name its source, or omit it when the hash matches
 exactly one capture. An ambiguous hash is refused.

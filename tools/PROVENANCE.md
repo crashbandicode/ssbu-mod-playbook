@@ -317,3 +317,6 @@ lines 1–3, 12–60, 1092–1140, 51271–51319 and 51325–51373, in order, fr
 The first cut left out the providers replies; this cut retains each selected block's reply.
 The intervening repeated Title-family and unrelated capture lines were cut. The post-press prompt
 ordering in the host test is modelled, not a recorded skip. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/runner.py` and `judge_queue.py` consume captured still
+freshness for visual reads and async verdicts. Host tests only; no runtime acceptance.
