@@ -486,6 +486,16 @@ in the functions the plan reaches. The gate resolves a play name when it is:
   `routes.play(ctx, name, among=NAMES)` with `NAMES` a module constant. Every
   declared name is checked like a written one.
 
+A name written at the play, a choice, a constant or a table entry with a written
+key is what the play takes: it is refused when it is no segment (or no library
+macro), and when it is outside the set the play declares. Names that reach a
+play through a parameter, or through a table read with a computed key, are
+names it may take. They refuse nothing, because a helper can send some of them
+elsewhere: one that plays a plan segment with `ctx.play` and anything else
+with `routes.play` is valid for a name of either kind. Such a play is checked
+when every name fits; otherwise it warns until it declares its own set, and
+then only the declared names are checked.
+
 The gate knows the step context as the first parameter of every function the
 manifest names, as any parameter that is given the context at a call the plan
 reaches (by place or by keyword), as a local set once to it, and by the name

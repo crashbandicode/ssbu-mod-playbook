@@ -1475,6 +1475,9 @@ class _PlayReader:
         self.plan, self.base = plan, Path(base).resolve()
         self.modules, self.steps, self.entries = {}, {}, []
         self.reached, self.sites, self.escaped, self.contexts = {}, {}, set(), set()
+        # Set by `resolve` when the names it returns are names the expression may take, not names it must take:
+        # they came through a parameter (every caller's argument) or a table read with a key the gate cannot tell.
+        self.inexact = False
         for name, function, args in _play_hooks(plan):
             if name in SHARED_HOOKS:
                 continue
@@ -1721,12 +1724,14 @@ class _PlayReader:
                 return None
             if isinstance(expr.slice, ast.Constant):
                 return {table[expr.slice.value]} if expr.slice.value in table else None
+            self.inexact = True
             return set(table.values())
         if isinstance(expr, ast.Name):
             for index, function in enumerate(chain):
                 if expr.id in _parameters(function)[1]:
                     if index != len(chain) - 1 or isinstance(function, ast.Lambda):
                         return None
+                    self.inexact = True
                     return self.parameter(function, expr.id, depth, active)
                 stores = _stores(function, expr.id)
                 if stores is None:
@@ -1842,9 +1847,9 @@ class _PlayReader:
                 argument = call.args[index] if kind and len(call.args) > index else None
                 among = next((keyword.value for keyword in call.keywords if keyword.arg == 'among'), None)
                 declared = self.declared(among, mod, inner) if kind and among is not None else None
-                written = isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                self.inexact = False
                 names = self.resolve(argument, mod, inner) if argument is not None else None
-                records.append((mod.label, kind, names, declared, argument.value if written else None))
+                records.append((mod.label, kind, names, declared, not self.inexact))
         return records
 
 
@@ -1882,19 +1887,28 @@ def _plays(plan, base):
     known['macro'].update(json.loads((routes.LIBRARY / 'index.json').read_text())['segments'])
     callee = {'segment': 'ctx.play', 'macro': 'routes.play'}
     found, checked = {}, set()
-    for label, kind, names, declared, written in _PlayReader(plan, base).calls():
+    for label, kind, names, declared, exact in _PlayReader(plan, base).calls():
         entry = found.setdefault(label, {'segment': set(), 'macro': set(), 'among segment': set(),
                                          'among macro': set(), 'outside': set(), 'unchecked': 0})
-        if kind is None or (names is None and declared is None):
+        # Exact names are what the play takes: each must be in its namespace, and inside the set it declares.
+        # Names that only may reach the play (through a parameter, a table read with a computed key) refuse
+        # nothing: a helper can send some of them elsewhere, as one that plays a plan segment through ctx.play and
+        # anything else through the routes library. Such a play is checked when all of them fit, or when it
+        # declares its set; otherwise it is unchecked, and the gate says so.
+        if kind is not None and declared is not None:
+            entry[f'among {kind}'].update(declared)
+            if names and exact:
+                entry[kind].update(names)
+                entry['outside'].update((callee[kind], name) for name in names - declared)
+            approved = declared
+        elif kind is not None and names and (exact or names <= known[kind]):
+            entry[kind].update(names)
+            approved = names
+        else:
             entry['unchecked'] += 1
             continue
-        if declared is not None:
-            entry[f'among {kind}'].update(declared)
-            entry['outside'].update((callee[kind], name) for name in (names or set()) - declared)
-        if names is not None and (declared is None or written is not None):
-            entry[kind].update(names)
         if kind == 'segment':
-            checked.update(declared if declared is not None else names)
+            checked.update(approved)
     result = {}
     for label, entry in found.items():
         errors = [f'G8 {label}: ctx.play("{name}") names no segment of this plan'
