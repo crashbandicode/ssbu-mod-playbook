@@ -140,7 +140,7 @@ class CoinReplay:
                                 'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
                                 'from': 'unknown', 'to': 'unknown'})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
         if segment == 'tap-a1':
             held = self.values.get('p1.carried', self.values.get('carried', 'none'))
@@ -355,7 +355,7 @@ class MenuReplay:
     def finish(self):
         pass
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
         values = self.menu
         if segment != 'tr-menu-open':
@@ -400,18 +400,54 @@ def retrying_menu(ctx, advance):
         advance()
         return original_read(provider, cap)
 
-    def send(macro):
+    def send(macro, until=None):
         if macro == 'tap-a1' and not dropped:
             dropped.append(True)
             replay.actions.append(macro)
             return
-        original_send(macro)
+        original_send(macro, until=until)
 
     replay.read, replay.send = read, send
     return replay
 
 
 class SetupCallsR2Tests(unittest.TestCase):
+    def test_a_macro_playing_before_a_training_input_is_waited_for_and_reported(self):
+        now, sent = [0.0], []
+        runner = SimpleNamespace(setup_metrics={'stalls': []}, wait_macro=lambda on, cap: None)
+        with tempfile.TemporaryDirectory() as folder:
+            def call(method, params=None):
+                if method == 'macro.status':
+                    return {'state': 'playing' if now[0] < 1.2 else 'idle'}
+                if method == 'macro.play':
+                    sent.append((now[0], params))
+                    return {}
+                raise AssertionError(method)
+
+            ctx = SimpleNamespace(runner=runner, on='s', instance={}, row_dir=folder,
+                                  call=call, log=lambda event: None)
+            menu = MenuReplay()
+            menu.ctx = ctx
+            before = menu.read('tr.menu', 2)
+            original = menu.send
+
+            def send(macro, until=None):
+                witness = dict(menu.menu)
+                routes.play(ctx, macro, requalify=lambda remaining: menu.menu == witness, until=until)
+                original(macro, until=until)
+
+            menu.send = send
+            with patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)), \
+                    patch.object(routes.macro_gate, 'time', routes.time), \
+                    patch.object(routes.time, 'monotonic', side_effect=lambda: now[0]), \
+                    patch.object(routes.time, 'sleep', side_effect=lambda delay: now.__setitem__(0, now[0] + delay)):
+                result = routes._tr_input(menu, before, 'tap-a1', 10)
+            self.assertEqual(result.values['ack'], '1')
+            self.assertEqual(len(sent), 1)
+            self.assertGreaterEqual(sent[0][0], 1.2)
+            self.assertEqual(len(runner.setup_metrics['stalls']), 1)
+            self.assertEqual(runner.setup_metrics['stalls'][0]['step'], 'tap-a1')
+
     def setUp(self):
         self.clock = fake_clock.install(self, routes, picker)
         self.dir = tempfile.TemporaryDirectory()
@@ -950,7 +986,7 @@ class TakeRouteReplay(CoinReplay):
         super().__init__(**kwargs)
         self.values.update({'take.ack': '0', 'take.applied': '0'})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment == 'tile-take':
             self.actions.append(segment)
             self.values['take.ack'] = str(int(self.values['take.ack']) + 1)
@@ -962,7 +998,7 @@ class TakeRouteReplay(CoinReplay):
             self.actions.append(segment)
             self._take('0')
             return
-        return super().send(segment)
+        return super().send(segment, until=until)
 
 
 class TileTakeRouteTests(unittest.TestCase):
@@ -1300,8 +1336,8 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         menu.writer_log = log
         original_send = menu.send
 
-        def send(macro):
-            original_send(macro)
+        def send(macro, until=None):
+            original_send(macro, until=until)
             if menu.menu['depth'] == '1' and not menu.picked:
                 menu.menu['editor.sel'] = '7'
 

@@ -51,6 +51,7 @@ except ImportError:
     fcntl = None
 
 import closed_loop
+import macro_gate
 import native_picker
 import state_gate
 import switch_hw
@@ -102,37 +103,15 @@ def _bridge_tail(ctx):
 
 
 def _bounded_call(ctx, method, cap):
-    result = []
-
-    def call():
-        try:
-            result.append((True, ctx.call(method)))
-        except BaseException as error:
-            result.append((False, error))
-
-    worker = threading.Thread(target=call, daemon=True)
-    worker.start()
-    worker.join(cap)
-    return result[0] if not worker.is_alive() else (False, None)
+    return macro_gate.bounded_call(ctx.call, method, cap)
 
 
-def _eden_macro_busy(ctx, remaining):
-    try:
-        answered, status = _bounded_call(ctx, 'macro.status', remaining)
-        if not answered:
-            if status is None:
-                return f'macro.status not answered within {remaining:g} s'
-            return f'macro.status not understood: {repr(status)[:160]}'
-        if isinstance(status, dict):
-            state, error = status.get('state'), status.get('error')
-            if error in (None, ''):
-                if state in ('idle', 'finished'):
-                    return None
-                if state in ('countdown', 'recording', 'playing', 'branch_playing'):
-                    return f'macro {state}'
-        return f'macro.status not understood: {repr(status)[:160]}'
-    except Exception as error:
-        return f'macro.status not understood: {repr(error)[:160]}'
+def _eden_macro_note(status):
+    return status.get('error') or ''
+
+
+def _eden_macro_busy(ctx, remaining, note=None):
+    return macro_gate.busy(ctx.call, remaining, note=note)
 
 
 def _stall_result(ok, stalls):
@@ -756,20 +735,36 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
-def play(ctx, name, *, among=None):
+def play(ctx, name, *, among=None, requalify=None, until=None):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it.
     `among` declares the closed set of names this call may take, for a name computed at run time: the packet gate
     checks every declared name (G8), and a name outside the set stops before any input."""
     if among is not None and name not in among:
         raise RuntimeError(f'{name} is not among the names this step declares')
     path, sha, cap = macro_file(name)
-    try:
-        ctx.call('macro.play', {'path': str(path)})
-    except RuntimeError as error:
-        message = str(error).lower()
-        if 'input_busy' in message or 'macro.play busy' in message:
-            raise closed_loop.DispatchRejected(str(error)) from error
-        raise
+    def on_event(event):
+        event = {**event, 'block': 'play', 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
+        try:
+            metrics = getattr(ctx.runner, 'setup_metrics', None)
+            if isinstance(metrics, dict):
+                metrics.setdefault('stalls', []).append(event)
+            if getattr(ctx, 'row_dir', None) is not None:
+                _append_stall(ctx, 'play', event)
+        except Exception as error:
+            ctx.log({'stall_error': repr(error)})
+
+    if getattr(ctx.runner, 'closed_loop_owns_idle', False):
+        try:
+            ctx.call('macro.play', {'path': str(path)})
+        except RuntimeError as error:
+            message = str(error).lower()
+            if 'input_busy' in message or 'macro.play busy' in message:
+                raise closed_loop.DispatchRejected(str(error)) from error
+            raise
+    elif not macro_gate.dispatch(ctx.call, path, name=name, requalify=requalify, until=until,
+                                 on_event=on_event, note=lambda text: ctx.log({'last_macro_error': text}),
+                                 check=getattr(ctx, 'check_stop', None)):
+        return None
     try:
         ctx.runner.wait_macro(ctx.on, cap)
     except RuntimeError as error:
@@ -797,7 +792,7 @@ def chord(ctx, name, expect=None, source=None, cap=10):
     except KeyError:
         cursor = None  # that log isn't available here (a real Switch has no diag log); the chord still plays
     try:
-        sha = play(ctx, name)
+        sha = play(ctx, name, requalify=macro_gate.BLIND)
         line = cursor.wait(expect, cap, ctx).group(0) if cursor else None
     finally:
         if cursor:
@@ -1480,30 +1475,40 @@ def _wireless_placed(tile):
                                              or tile.get('local.token') == 'placed')
 
 
-def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0):
-    """Reach the Local Wireless waiting room as host from an observed route screen."""
-    if unpublished_create not in ('refuse', 'allow'):
-        raise RuntimeError(f'wireless_room: invalid unpublished_create {unpublished_create!r}')
-    if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
-        raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
-    if not isinstance(idle_cap, (int, float)) or not math.isfinite(idle_cap) or idle_cap <= 0:
-        raise RuntimeError(f'wireless_room: idle_cap must be positive, got {idle_cap!r}')
-    started, screens = time.monotonic(), []
-    io = BridgePickerIO(ctx)
-    state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
-             'last_error': None, 'last_read_was_error': False,
-             'form_pending': False, 'form_ready': False, 'form_settling': False, 'ready_published': False,
-             'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
-             'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
-             'prefinished': False, 'current': None, 'ui_clock': {}}
+DASHBOARD_KEY = 'dashboard'
+DASHBOARD_FOCUS = 'dashboard.'
+DASHBOARD_LOCAL_WIRELESS = 'dashboard.local_wireless'
+DASHBOARD_ABOVE_LOCAL_WIRELESS = ('dashboard.back', 'dashboard.collection')
+# What an open dashboard that takes input publishes (the bridge author's table, 2026-11-24): owner and dialog both
+# read `dashboard`. The Main Menu's own native/none on an open dashboard is a contradiction and gets no press.
+DASHBOARD_OWNERS = ('dashboard',)
+DASHBOARD_DIALOG = 'dashboard'
 
+
+def _wireless_ready(ui):
+    return ui.get('input.ready') == 'yes'
+
+
+def _wireless_picker_ready(ui):
+    return 'input.ready' not in ui or ui['input.ready'] == 'yes'
+
+
+def _wireless_observer(ctx, io, screens, state):
     def remember_ui(sample):
         state['ui_clock'] = {key: sample.block.get(key) for key in ('frame', 'wall', 'rev')}
-        state['ready_published'] |= 'input.ready' in sample.block['values']
+        values = sample.block['values']
+        if values.get('screen') == 'ldn.room_list' and values.get('observation.active') == 'yes':
+            state['room_list_seen'] = True
+        state['ready_published'] |= ('input.ready' in values
+                                     and values.get('screen') in ('stage_select', 'css.smash'))
 
-    def observe():
+    def observe(cap=None):
         try:
-            ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens, on_sample=remember_ui)
+            deadline = time.monotonic() + cap if cap is not None else None
+            ui_cap = min(2.0, deadline - time.monotonic()) if deadline is not None else 2.0
+            if ui_cap < 0.05:
+                return closed_loop.NO_READ
+            ui = _wireless_read(ctx, io, 'ssbu.ui', ui_cap, screens, on_sample=remember_ui)
             if 'error' in ui:
                 state['last_error'] = ui['error']
                 state['last_read_was_error'] = True
@@ -1514,7 +1519,9 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             tile = None
             if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
                     and ui.get('observation.active') == 'yes'):
-                tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+                tile_cap = min(2.0, deadline - time.monotonic()) if deadline is not None else 2.0
+                tile = ({'error': 'no time left for tile.cursor'} if tile_cap < 0.05
+                        else _wireless_read(ctx, io, 'tile.cursor', tile_cap, screens))
                 state['last_tile'] = tile
                 if 'error' not in tile:
                     state['last_answered_tile'] = tile
@@ -1524,14 +1531,241 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             state['last_read_was_error'] = True
             raise
 
+    return observe
+
+
+def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
+    def dashboard_open(obs):
+        return active(obs, 'main_menu') and obs['ui'].get(DASHBOARD_KEY) == 'open'
+
+    def dashboard(obs):
+        ui = obs['ui']
+        opened = dashboard_open(obs)
+        name = ui.get('focus.id')
+        if (opened and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
+                and name not in (*DASHBOARD_ABOVE_LOCAL_WIRELESS, DASHBOARD_LOCAL_WIRELESS)):
+            raise closed_loop.RouteStopped(
+                route, 'dashboard-focus',
+                f'the dashboard cursor is on {name} (index {ui.get("focus.index")}), '
+                'not above Local Wireless; the route does not move it upward', {})
+        return opened
+
+    def dashboard_ready(obs):
+        ui = obs['ui']
+        return (dashboard(obs) and _wireless_ready(ui)
+                and ui.get('input.owner') in DASHBOARD_OWNERS and ui.get('dialog') == DASHBOARD_DIALOG)
+
+    def open_at(obs):
+        ui = obs['ui']
+        if not (available() and active(obs, 'main_menu') and ui.get('screen.layer') == 'top'
+                and ui.get('input.owner') == 'native' and ui.get('dialog') == 'none' and _wireless_ready(ui)):
+            return False
+        value = ui.get(DASHBOARD_KEY)
+        if value in (None, 'unknown'):
+            raise closed_loop.RouteStopped(
+                route, 'open-dashboard',
+                'unsupported reader: the bridge does not publish the dashboard (key dashboard); '
+                'ZR is not sent blind', {})
+        return value == 'closed'
+
+    def focus(obs):
+        ui = obs['ui']
+        return ui.get('focus.id'), ui.get('focus.index')
+
+    steps = [closed_loop.Step(
+        'open-dashboard', open_at, dashboard, 'tap-zr1', cap=25, ready_cap=ready_cap, lost_after=6,
+        target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer')),
+        screen=lambda o: active(o, 'main_menu'))]
+    for item in DASHBOARD_ABOVE_LOCAL_WIRELESS:
+        def down_at(obs, item=item):
+            return available() and dashboard_ready(obs) and obs['ui'].get('focus.id') == item
+
+        def down_done(obs, item=item):
+            name = obs['ui'].get('focus.id')
+            return (dashboard_open(obs) and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
+                    and name != item)
+
+        steps.append(closed_loop.Step(f'dashboard-down-{item.removeprefix(DASHBOARD_FOCUS)}',
+                                      down_at, down_done, 'main-menu-down',
+                                      cap=25, lost_after=6, target=focus))
+    steps.append(closed_loop.Step(
+        'dashboard-a', lambda o: (available() and dashboard_ready(o)
+                                  and o['ui'].get('focus.id') == DASHBOARD_LOCAL_WIRELESS),
+        lambda o: active(o, 'ldn.room_list') and _wireless_ready(o['ui']), 'lobby-a',
+        cap=45, lost_after=46, sends=1, target=focus, latch=True))
+    return steps
+
+
+def _wireless_stall(ctx, state, block, event, obs):
+    skip = event.get('_skip_diagnostic') or event.get('kind') in ('idle-wait', 'busy-rejected')
+    event = {key: value for key, value in event.items() if key != '_skip_diagnostic'}
+    result = {
+        **event, 'kind': event.get('kind', 'resend'), 'screen': obs['ui'].get('screen'), **state['ui_clock'],
+        'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_fps': None, 'eden_frame_ms': None,
+        'utc': _stall_utc(),
+    }
+    if not skip:
+        answered, status = _bounded_call(ctx, 'status', 1.0)
+        status = status if answered else {}
+        fps = status.get('game_fps') if isinstance(status, dict) else None
+        if isinstance(fps, (int, float)) and math.isfinite(fps) and fps > 0:
+            result['eden_fps'] = fps
+            result['eden_frame_ms'] = 1000 / fps
+    _append_stall(ctx, block, result)
+    return result
+
+
+def wireless_room_list(ctx, ready_cap=60):
+    """Reach the native Local Wireless room list from the Main Menu."""
+    if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
+        raise RuntimeError(f'wireless_room_list: ready_cap must be positive, got {ready_cap!r}')
+    started, screens = time.monotonic(), []
+    io = BridgePickerIO(ctx)
+    state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
+             'last_error': None, 'last_read_was_error': False, 'ui_clock': {}, 'ready_published': False,
+             'last_macro_error': None}
+    observe = _wireless_observer(ctx, io, screens, state)
+
+    def active(obs, screen):
+        return obs['ui'].get('screen') == screen and obs['ui'].get('observation.active') == 'yes'
+
+    steps = _wireless_dashboard_steps('wireless_room_list', lambda: True, active, ready_cap=ready_cap)
+
+    def on_list():
+        return (state['last_ui'].get('screen') == 'ldn.room_list'
+                and state['last_ui'].get('observation.active') == 'yes')
+
+    def list_ready():
+        return on_list() and _wireless_ready(state['last_ui'])
+
+    def list_read():
+        return {**state['last_ui'], **{key: state['last_ui'].get(key, 'unknown')
+                                       for key in ('focus.id', 'focus.index', 'input.ready')}}
+
+    def press_gate():
+        return 'input.ready + dashboard focus; native owner on Main'
+
+    def on_stall(event, obs):
+        return _wireless_stall(ctx, state, 'wireless_room_list', event, obs)
+
+    missing = object()
+    previous = getattr(ctx.runner, 'closed_loop_owns_idle', missing)
+    ctx.runner.closed_loop_owns_idle = True
+    try:
+        try:
+            outcome = closed_loop.run(
+                'wireless_room_list', steps, observe, io.send, io.finish,
+                clock=time.monotonic, sleep=time.sleep, on_stall=on_stall,
+                idle=lambda remaining: _eden_macro_busy(
+                    ctx, remaining, note=lambda text: state.__setitem__('last_macro_error', text)),
+                idle_cap=15.0, revalidate_cap=4.5, locate_done=lambda obs: active(obs, 'ldn.room_list'))
+            deadline = time.monotonic() + 20.0
+            while not list_ready():
+                ctx.check_stop()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise closed_loop.RouteStopped(
+                        'wireless_room_list', 'room-list-ready',
+                        'not ready: ldn.room_list did not publish input.ready=yes within 20 s',
+                        {**outcome, 'step': 'room-list-ready'})
+                time.sleep(min(.3, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                try:
+                    observe(remaining)
+                except RuntimeError as error:
+                    if macro_gate.stop(error, ctx.check_stop):
+                        raise
+                    ctx.check_stop()
+                    raise closed_loop.RouteStopped(
+                        'wireless_room_list', 'room-list-ready',
+                        f'bridge continuity lost, nothing was sent after it: {error}',
+                        {**outcome, 'step': 'room-list-ready', 'continuity': 'lost'}) from error
+                if time.monotonic() >= deadline:
+                    raise closed_loop.RouteStopped(
+                        'wireless_room_list', 'room-list-ready',
+                        'not ready: ldn.room_list did not publish input.ready=yes within 20 s',
+                        {**outcome, 'step': 'room-list-ready'})
+        except closed_loop.RouteStopped as error:
+            reason = (error.reason if error.step == 'dashboard-focus'
+                      or error.reason.startswith('unsupported reader: the bridge does not publish')
+                      else f'{error.reason}; last screen {state["last_ui"].get("screen")!r}')
+            if error.step == 'dashboard-a' and error.reason.startswith('no transition within cap'):
+                reason += ('; the room list was reached but never read ready' if state.get('room_list_seen')
+                           else '; the room list did not appear')
+            error.reason = error.receipt['reason'] = reason
+            error.receipt.update(on_list=on_list(), list_ready=list_ready())
+            error.args = (f'wireless_room_list: stopped on step {error.step!r}: {reason}',)
+            stalls = error.receipt['stalls']
+            receipt = {
+                'block': 'wireless_room_list', 'ok': False, 'step': error.step, 'reason': reason,
+                'sends': next((entry['sends'] for entry in error.receipt['steps'] if entry['name'] == error.step), 0),
+                'entered_at': error.receipt['entered_at'], 'steps': error.receipt['steps'], 'screens': screens,
+                'stalls': stalls, 'result': _stall_result(False, stalls), 'press_gate': press_gate(),
+                'last_ui': state['last_ui'], 'last_tile': state['last_tile'], 'last_error': state['last_error'],
+                'ms': round((time.monotonic() - started) * 1000),
+                'on_list': on_list(), 'list_ready': list_ready(), 'room_list': list_read(),
+                **({'last_macro_error': state['last_macro_error']} if state['last_macro_error'] is not None else {}),
+            }
+            if error.reason.startswith('unsupported reader: the bridge does not publish the dashboard'):
+                receipt['unsupported_reader'] = error.receipt['unsupported_reader'] = DASHBOARD_KEY
+            if error.receipt.get('continuity') == 'lost':
+                receipt['continuity'] = 'lost'
+                receipt['last_ui'] = state['last_ui'] if state['ui_answered'] else None
+                receipt['last_tile'] = state['last_answered_tile']
+            for key in ('dispatch', 'input_channel'):
+                value = next((entry.get(key) for entry in error.receipt['steps'] if entry['name'] == error.step),
+                             None)
+                if value is not None:
+                    receipt[key] = error.receipt[key] = value
+            if state['last_macro_error'] is not None:
+                error.receipt['last_macro_error'] = state['last_macro_error']
+            _save(ctx, 'routes-wireless-room-list-stop', receipt)
+            raise
+    finally:
+        if previous is missing:
+            del ctx.runner.closed_loop_owns_idle
+        else:
+            ctx.runner.closed_loop_owns_idle = previous
+
+    return _save(ctx, 'routes-wireless-room-list', {
+        'block': 'wireless_room_list', 'entered_at': outcome['entered_at'], 'steps': outcome['steps'],
+        'screens': screens, 'stalls': outcome['stalls'], 'result': _stall_result(True, outcome['stalls']),
+        'press_gate': press_gate(), 'on_list': on_list(), 'list_ready': list_ready(), 'room_list': list_read(),
+        'ms': round((time.monotonic() - started) * 1000),
+        **({'last_macro_error': state['last_macro_error']} if state['last_macro_error'] is not None else {}),
+    })
+
+
+def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0):
+    """Reach the Local Wireless waiting room as host from an observed route screen."""
+    if unpublished_create not in ('refuse', 'allow'):
+        raise RuntimeError(f'wireless_room: invalid unpublished_create {unpublished_create!r}')
+    if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
+        raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
+    if not isinstance(idle_cap, (int, float)) or not math.isfinite(idle_cap) or idle_cap <= 0:
+        raise RuntimeError(f'wireless_room: idle_cap must be positive, got {idle_cap!r}')
+    started, screens = time.monotonic(), []
+    confirm_retry_wait, revalidate_cap = 20.0, 4.5
+    io = BridgePickerIO(ctx)
+    state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
+             'last_error': None, 'last_read_was_error': False,
+             'form_pending': False, 'form_ready': False, 'form_settling': False, 'ready_published': False,
+             'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
+             'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
+             'prefinished': False, 'current': None, 'ui_clock': {}, 'last_macro_error': None}
+
+    observe = _wireless_observer(ctx, io, screens, state)
+
     def active(obs, screen):
         ui = obs['ui']
         return ui.get('screen') == screen and ui.get('observation.active') == 'yes'
 
-    def accepting(ui):
-        return 'input.ready' not in ui or ui['input.ready'] == 'yes'
-
     def press_gate():
+        if (state['current'] in ('open-dashboard', 'dashboard-a', 'open-create', 'confirm-create')
+                or (state['current'] or '').startswith('dashboard-down-')):
+            return 'input.ready'
         return ('input.ready + tile.cursor' if state['ready_published']
                 else 'tile.cursor (no input.ready published)')
 
@@ -1593,8 +1827,8 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
         else:
             form = screen == 'ldn.create' or (screen == 'unknown' and state['form_ready']
                                               and state['current'] == 'confirm-create')
-        return (available() and form and accepting(ui)
-                and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= 20))
+        return (available() and form and _wireless_ready(ui)
+                and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= confirm_retry_wait))
 
     def confirm_done(obs):
         ui = obs['ui']
@@ -1625,17 +1859,17 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
     def stage_at(obs):
         tile = obs['tile'] or {}
         return (available() and local(obs, 'stage_select') and tile.get('screen') == 'sss'
-                and accepting(obs['ui']) and tile.get('settled') == '1'
+                and _wireless_picker_ready(obs['ui']) and tile.get('settled') == '1'
                 and tile.get('p1.token') == 'held' and tile.get('local.token') == 'held' and hovered(tile))
 
     def hand_at(obs):
         tile = obs['tile'] or {}
-        return (css(obs) and accepting(obs['ui']) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
+        return (css(obs) and _wireless_picker_ready(obs['ui']) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
                 and not hovered(tile) and not _wireless_placed(tile))
 
     def place_at(obs):
         tile = obs['tile'] or {}
-        return (css(obs) and accepting(obs['ui']) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
+        return (css(obs) and _wireless_picker_ready(obs['ui']) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
                 and hovered(tile) and not _wireless_placed(tile))
 
     def placed(obs):
@@ -1646,28 +1880,28 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
 
     ready_wait_cap = max(ready_cap + 10, 45)
     steps = [
-        closed_loop.Step('open-room-list',
-                         lambda o: (available() and active(o, 'main_menu') and accepting(o['ui'])
-                                    and o['ui'].get('input.owner') == 'native'),
-                         lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6,
-                         target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer'))),
+        *_wireless_dashboard_steps('wireless_room', available, active, ready_cap=min(ready_cap, 20.0)),
         closed_loop.Step('open-create', lambda o: (not state['form_settling'] and active(o, 'ldn.room_list')
-                                                   and accepting(o['ui'])
+                                                   and _wireless_ready(o['ui'])
                                                    and o['ui'].get('focus.id') == 'ldn.create_room'
                                                    and o['ui'].get('focus.index') == '0'), create_done, 'tap-a1',
                          cap=15, lost_after=5, before_send=begin_create,
                          source=lambda o: active(o, 'ldn.room_list'),
-                         target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index'))),
+                         target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index')),
+                         screen=lambda o: active(o, 'ldn.room_list')),
         closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
-                         cap=20, lost_after=0, sends=2, before_send=begin_confirm),
+                         cap=confirm_retry_wait + revalidate_cap, lost_after=0, sends=2, before_send=begin_confirm,
+                         screen=lambda o: active(o, 'ldn.create')),
         closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
-                         cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at')),
+                         cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at'),
+                         screen=lambda o: local(o, 'stage_select')),
         closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
                          cap=5, ready_cap=30, lost_after=3, before_send=fence_chord,
-                         target=lambda o: ((o['tile'] or {}).get('at'), (o['tile'] or {}).get('hovered'))),
+                         target=lambda o: ((o['tile'] or {}).get('at'), (o['tile'] or {}).get('hovered')),
+                         screen=lambda o: local(o, 'css.smash')),
         closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4,
                          target=lambda o: (o['tile'] or {}).get('at')),
-        closed_loop.Step('ready', lambda o: placed(o) and accepting(o['ui']), waiting, 'lobby-ready', cap=ready_wait_cap,
+        closed_loop.Step('ready', lambda o: placed(o) and _wireless_picker_ready(o['ui']), waiting, 'lobby-ready', cap=ready_wait_cap,
                          lost_after=ready_wait_cap + 1, sends=1,
                          target=lambda o: ((o['tile'] or {}).get('p1.placed.at'),
                                            (o['tile'] or {}).get('local.placed.at'))),
@@ -1699,28 +1933,26 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             state['create_form'] = 'ldn.create'
 
     def on_stall(event, obs):
-        skip = event.get('_skip_diagnostic') or event.get('kind') in ('idle-wait', 'busy-rejected')
-        event = {key: value for key, value in event.items() if key != '_skip_diagnostic'}
-        result = {
-            **event, 'kind': event.get('kind', 'resend'), 'screen': obs['ui'].get('screen'), **state['ui_clock'],
-            'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_fps': None, 'eden_frame_ms': None,
-            'utc': _stall_utc(),
-        }
-        if not skip:
-            answered, status = _bounded_call(ctx, 'status', 1.0)
-            status = status if answered else {}
-            fps = status.get('game_fps') if isinstance(status, dict) else None
-            if isinstance(fps, (int, float)) and math.isfinite(fps) and fps > 0:
-                result['eden_fps'] = fps
-                result['eden_frame_ms'] = 1000 / fps
-        _append_stall(ctx, 'wireless_room', result)
-        return result
+        return _wireless_stall(ctx, state, 'wireless_room', event, obs)
+
+    def run_steps():
+        missing = object()
+        previous = getattr(ctx.runner, 'closed_loop_owns_idle', missing)
+        ctx.runner.closed_loop_owns_idle = True
+        try:
+            return closed_loop.run('wireless_room', steps, observe, send, finish,
+                                   clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
+                                   idle=lambda remaining: _eden_macro_busy(
+                                       ctx, remaining, note=lambda text: state.__setitem__('last_macro_error', text)),
+                                   idle_cap=idle_cap, revalidate_cap=revalidate_cap)
+        finally:
+            if previous is missing:
+                del ctx.runner.closed_loop_owns_idle
+            else:
+                ctx.runner.closed_loop_owns_idle = previous
 
     try:
-        outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
-                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
-                                  idle=lambda remaining: _eden_macro_busy(ctx, remaining), idle_cap=idle_cap,
-                                  revalidate_cap=4.5)
+        outcome = run_steps()
     except closed_loop.RouteStopped as error:
         reason = error.reason
         continuity = (error.receipt.get('continuity') == 'lost'
@@ -1738,8 +1970,11 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
                       f'{reason}')
         elif error.step == 'locate':
             reason += '; expected main_menu with native input or a later route screen'
-        elif error.step == 'open-room-list':
-            reason += f'; expected ldn.room_list; saw {state["last_ui"]}'
+        elif error.step == 'open-dashboard' and not reason.startswith('unsupported reader:'):
+            reason += f'; expected the dashboard; saw {state["last_ui"]}'
+        elif error.step == 'dashboard-a' and reason.startswith('no transition within cap'):
+            reason += ('; the room list was reached but never read ready' if state.get('room_list_seen')
+                       else '; the room list did not appear')
         elif error.step == 'open-create':
             if state['form_settling'] and state['last_read_was_error']:
                 reason = f'expected the Create form after A; last read error: {state["last_error"]}; {reason}'
@@ -1769,6 +2004,9 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             reason += f'; expected ldn.waiting; expected ldn.role host; saw {state["last_ui"]}'
         error.reason = reason
         error.receipt['reason'] = reason
+        on_list = active({'ui': state['last_ui']}, 'ldn.room_list')
+        list_ready = on_list and _wireless_ready(state['last_ui'])
+        error.receipt.update(on_list=on_list, list_ready=list_ready)
         error.args = (f'wireless_room: stopped on step {error.step!r}: {reason}',)
         sends = next((entry['sends'] for entry in error.receipt['steps'] if entry['name'] == error.step), 0)
         stop_receipt = {
@@ -1776,8 +2014,11 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             'screens': screens, 'last_ui': state['last_ui'], 'last_tile': state['last_tile'],
             'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
             'stalls': error.receipt['stalls'], 'result': _stall_result(False, error.receipt['stalls']),
-            'last_error': state['last_error'], 'press_gate': press_gate(),
+            'last_error': state['last_error'], 'press_gate': press_gate(), 'entered_at': error.receipt['entered_at'],
+            'on_list': on_list, 'list_ready': list_ready,
         }
+        if state['last_macro_error'] is not None:
+            stop_receipt['last_macro_error'] = error.receipt['last_macro_error'] = state['last_macro_error']
         if continuity:
             stop_receipt['continuity'] = 'lost'
             stop_receipt['last_ui'] = state['last_ui'] if state['ui_answered'] else None
@@ -1790,7 +2031,9 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             stop_receipt['input_channel'] = error.receipt['input_channel'] = input_channel
         if dispatch is not None:
             stop_receipt['dispatch'] = error.receipt['dispatch'] = dispatch
-        if reason.startswith('unsupported reader: the Create form is not published as ldn.create'):
+        if reason.startswith('unsupported reader: the bridge does not publish the dashboard'):
+            stop_receipt['unsupported_reader'] = error.receipt['unsupported_reader'] = DASHBOARD_KEY
+        elif reason.startswith('unsupported reader: the Create form is not published as ldn.create'):
             stop_receipt['unsupported_reader'] = 'ldn.create'
         elif (error.step == 'open-create' and reason.startswith('not ready')
               and state['last_ui'].get('screen') == 'ldn.room_list'
@@ -1820,6 +2063,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
         'entered_at': outcome['entered_at'], 'steps': outcome['steps'],
         'stalls': outcome['stalls'], 'result': _stall_result(True, outcome['stalls']),
         'press_gate': press_gate(),
+        **({'last_macro_error': state['last_macro_error']} if state['last_macro_error'] is not None else {}),
     })
 
 
@@ -2110,7 +2354,7 @@ def to_main(ctx, tries=8, look_s=6, *, cap=None):
             raise _missing_navigation_state(route, before, f'qualified {route} source after arming')
         if time.monotonic() >= until:
             raise RuntimeError(f'{route} source deadline expired before Plus')
-        io.send('attract-cancel')
+        io.send('attract-cancel', until=until)
         presses += 1
         state = native_picker.wait_scene_transition(
             io, before, until, source, destinations[0], label=route,
@@ -2293,7 +2537,7 @@ def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=N
 def _probe_step(ctx, walker, direction='left', cap=2.5):
     """One L3 step and its line, or None when the hand moved nothing (an empty hand logs no step)."""
     walker.cursor.mark()
-    play(ctx, f'tile-{direction}')
+    play(ctx, f'tile-{direction}', requalify=macro_gate.BLIND)
     try:
         found = walker.cursor.wait(STEP.format(screen='css', dir=direction), cap, ctx)
     except RuntimeError:
@@ -2517,7 +2761,12 @@ def fixture(ctx, p1=None, cpu=None, stage=None, reset=True, damage=0.0, lr=None,
     before = read_state(ctx)
     out['before'] = before
     if reset:
-        play(ctx, 'reset-lra')
+        def requalify(remaining):
+            if read_state(ctx, cap=min(6.0, remaining)) != before:
+                raise closed_loop.DispatchRejected('reset-lra not sent: fixture changed while the input channel was busy')
+            return True
+
+        play(ctx, 'reset-lra', requalify=requalify)
     previous = None
     for n in range(reads):
         current = read_state(ctx)
@@ -2565,7 +2814,7 @@ def select_screen(ctx, cap=2.5):
     except KeyError:
         return None  # This legacy probe requires a configured tile log.
     try:
-        play(ctx, 'tile-up')
+        play(ctx, 'tile-up', requalify=macro_gate.BLIND)
         return cursor.wait(r'step screen=(css|sss) ', cap, ctx).group(1)
     except RuntimeError:
         return None
@@ -2608,7 +2857,7 @@ def _take_back_training_token(io, state):
         raise RuntimeError('local medal placement changed before B')
     if time.monotonic() >= until:
         raise RuntimeError('Training return source deadline expired before leave-css')
-    io.send('leave-css')
+    io.send('leave-css', until=until)
     current = tile_before
     while time.monotonic() < until:
         try:
@@ -2899,7 +3148,7 @@ def _watched_native_input(io, initial, source, target, macro, until, *, route='M
     if not _fields_match(before, source):
         raise RuntimeError(f'{route} source changed before {macro!r} at {source_focus!r}')
 
-    io.send(macro)
+    io.send(macro, until=until)
     if scene_change:
         return before, native_picker.wait_scene_transition(
             io, before, until, source, target, label=route, pending_destinations=pending_destinations,
@@ -3028,7 +3277,7 @@ def _native_enter_training(ctx, cap, stage_ids):
     source = {**owner, 'screen': 'css.training', 'focus.source': native_picker.TILE, 'focus': ui.values['focus']}
     live = {**owner, 'screen': 'training'}
     io.mark_training_stage(ui, 5)
-    io.send('enter-training')
+    io.send('enter-training', until=until)
     after = native_picker.wait_scene_transition(io, ui, time.monotonic() + cap, source, live, label='native')
     stage_id = expected(ctx).get('stage_id')
     if stage_ids is None and stage_id is not None:
@@ -3645,7 +3894,7 @@ def tr_menu(ctx):
         if not _fields_match(before, source):
             raise _missing_navigation_state('Training Mod menu', before, str(source))
         native_picker.same_epoch(before, current, in_flight=True)
-        io.send(macro)
+        io.send(macro, until=until)
         until = time.monotonic() + (cap if opened else 10)
         confirmed = _wait_tr_menu(io, until, not opened, current)
         _wait_training_owner(io, confirmed, until, 'native' if opened else 'tr.menu')
@@ -4546,7 +4795,7 @@ INPUT_LAG_S = 3.0
 
 
 def _send_with_retry(io, macro, until, wait):
-    io.send(macro)
+    io.send(macro, until=until)
     started = time.monotonic()
     result = wait(min(until, time.monotonic() + INPUT_LAG_S))
     if result is None and time.monotonic() < until:
@@ -4557,7 +4806,7 @@ def _send_with_retry(io, macro, until, wait):
         if metrics is not None:
             metrics.setdefault('stalls', []).append(event)
         _append_stall(io.ctx, 'tr_input', event)
-        io.send(macro)
+        io.send(macro, until=until)
         if metrics is not None:
             metrics['retries'] = metrics.get('retries', 0) + 1
         result = wait(until)
@@ -4871,7 +5120,7 @@ def _tr_idle(ctx, cap, metrics):
             header = last['notice.header']
             input_steps += 1
             try:
-                io.send('tap-b1')
+                io.send('tap-b1', until=until)
                 after = _try_tr_condition(
                     io, menu, until,
                     lambda state: any(state.values.get(key) != menu.values.get(key)
@@ -5368,7 +5617,7 @@ def _wizard_next(io, menu, game, until):
 
 def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
     page = _wizard_body(menu, game)
-    io.send(macro)
+    io.send(macro, until=until)
     deadline = min(until, time.monotonic() + pulse_cap)
 
     def read(cap):
@@ -6050,7 +6299,7 @@ def _set_fighter(ctx, fighter, seat, cap, metrics):
     if menu.values['open'] == '0':
         if time.monotonic() >= until:
             raise RuntimeError('Training Mod deadline expired before opening the menu')
-        io.send('tr-menu-open')
+        io.send('tr-menu-open', until=until)
         menu = _wait_tr_menu(io, until, opened=True, after=menu)
         _wait_training_owner(io, menu, until, 'tr.menu')
         io.finish()

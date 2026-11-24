@@ -133,7 +133,7 @@ class BridgeNavigationTests(unittest.TestCase):
             dest.write('[Bridge] req providers result=ok count=2 boot=0x0000000000000001\n')
             dest.write(response)
 
-    def press(self, _ctx, macro):
+    def press(self, _ctx, macro, **_options):
         self.actions.append(macro)
         self.assertTrue(self.checked_source, f'{macro} had no fresh fenced source check after arming')
         self.assertTrue(self.edges, f'unexpected input {macro} at {self.scene["focus"]}')
@@ -168,9 +168,9 @@ class BridgeNavigationTests(unittest.TestCase):
                 self.scene = next_state[1]
                 next_state = next(states, None)
 
-        def press(ctx, macro):
+        def press(ctx, macro, **options):
             input_times.append(elapsed)
-            self.press(ctx, macro)
+            self.press(ctx, macro, **options)
 
         def reply(ctx, fence, request):
             sleep(.01)

@@ -40,6 +40,386 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_no_read_is_started_at_or_after_the_step_deadline(self):
+        for phase in ('locate', 'ready', 'post-send'):
+            with self.subTest(phase=phase):
+                now, reads, sends = [0.0], [], []
+
+                def observe(*, cap=None):
+                    reads.append((now[0], cap))
+                    return 'source'
+
+                item = Step('bounded', lambda obs: phase == 'post-send',
+                            lambda obs: False, 'a', cap=2.5, ready_cap=2.5,
+                            lost_after=100, screen=lambda obs: phase == 'ready')
+                with self.assertRaises(RouteStopped):
+                    run('fixture', [item], observe, sends.append, lambda: None,
+                        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                        locate_cap=2.5, poll=1)
+                self.assertTrue(reads)
+                self.assertTrue(all(start < 2.5 for start, _ in reads), reads)
+
+    def test_the_final_read_gets_only_the_remaining_time(self):
+        now, reads = [0.0], []
+
+        def observe(*, cap=None):
+            reads.append((now[0], cap))
+            return 'source'
+
+        item = Step('bounded', lambda obs: True, lambda obs: False,
+                    'a', cap=2.5, lost_after=100)
+        with self.assertRaises(RouteStopped):
+            run('fixture', [item], observe, lambda macro: None, lambda: None,
+                clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
+        self.assertEqual(reads, [(0.0, 20.0), (1.0, 1.5), (2.0, 0.5)])
+
+    def test_a_slow_final_read_cannot_outlive_the_step_cap(self):
+        for latch in (False, True):
+            with self.subTest(latch=latch):
+                now, sends = [0.0], []
+
+                def observe(*, cap=None):
+                    if sends and now[0] >= 2:
+                        now[0] += 2 if cap is None else cap
+                    return 'source'
+
+                item = Step('bounded', lambda obs: True, lambda obs: False,
+                            'a', cap=3, lost_after=100, latch=latch)
+                with self.assertRaises(RouteStopped):
+                    run('fixture', [item], observe, sends.append, lambda: None,
+                        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
+                self.assertLessEqual(now[0], 3.01)
+
+    def test_retry_revalidation_cannot_start_a_read_at_the_deadline(self):
+        now, sends, reads = [0.0], [], []
+
+        def observe(*, cap=None):
+            reads.append((now[0], cap))
+            if sends and len(reads) == 3:
+                now[0] += cap
+            return 'source'
+
+        item = Step('bounded', lambda obs: True, lambda obs: False,
+                    'a', cap=3, lost_after=0)
+        with self.assertRaises(RouteStopped):
+            run('fixture', [item], observe, sends.append, lambda: None,
+                clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
+        self.assertEqual(sends, ['a'])
+        self.assertEqual(reads, [(0.0, 20.0), (1.0, 2.0), (1.0, 2.0)])
+        self.assertEqual(now[0], 3.0)
+
+    def test_a_latched_step_never_jumps_or_sends_after_its_send(self):
+        fake = Script(lambda f: 'other' if f.sends else 'source')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                       'a', cap=3, lost_after=1, latch=True)
+        other = step('other', 'other', 'done')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([latched, other])
+        self.assertEqual(caught.exception.step, 'latched')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_a_latched_step_still_recovers_before_its_send(self):
+        def observe(fake):
+            if not fake.sends:
+                return 'waiting' if fake.now == 0 else 'recover'
+            return 'source' if len(fake.sends) == 1 else 'done'
+
+        fake = Script(observe)
+        recover = step('recover', 'recover', 'source')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                       'a', cap=5, screen=lambda obs: obs == 'waiting', latch=True)
+        fake.run([recover, latched])
+        self.assertEqual([name for name, _ in fake.sends], ['recover', 'a'])
+
+    def test_a_latched_step_is_not_ended_by_the_final_step(self):
+        fake = Script(lambda f: 'final' if f.sends else 'source')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
+                       'a', cap=5, latch=True)
+        final = step('last', 'elsewhere', 'final')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([latched, final])
+        self.assertEqual(caught.exception.step, 'latched')
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_initial_final_destination_still_completes_without_a_send(self):
+        fake = Script(lambda f: 'final')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
+                       'a', cap=5, latch=True)
+        result = fake.run([latched, step('last', 'elsewhere', 'final')])
+        self.assertEqual(result['entered_at'], 'done')
+        self.assertEqual(fake.sends, [])
+
+    def test_final_destination_still_completes_a_non_latched_step(self):
+        fake = Script(lambda f: 'final' if f.sends else 'source')
+        first = Step('first', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
+                     'a', cap=5)
+        fake.run([first, step('last', 'elsewhere', 'final')])
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 1)
+
+    def test_idle_poll_cannot_outlive_a_first_send_window(self):
+        for delay in (.2, .8):
+            with self.subTest(delay=delay):
+                now, sent, caps = [0.0], [], []
+
+                def observe():
+                    return 'done' if sent else 'source' if now[0] >= 2.7 - 1e-9 else 'waiting'
+
+                def idle(cap):
+                    caps.append(cap)
+                    now[0] += delay
+                    return None
+
+                item = Step('press', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                            'a', cap=5, ready_cap=3, screen=lambda obs: obs == 'waiting')
+                args = ('fixture', [item], observe, lambda macro: sent.append((macro, now[0])), lambda: None)
+                options = dict(clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+                               poll=.3, idle=idle)
+                if delay == .8:
+                    with self.assertRaises(RouteStopped) as caught:
+                        run(*args, **options)
+                    self.assertIn('not ready', caught.exception.reason)
+                    self.assertIn('the send window closed while the input channel was polled', caught.exception.reason)
+                    self.assertEqual(sent, [])
+                else:
+                    run(*args, **options)
+                    self.assertEqual(len(sent), 1)
+                    self.assertLess(sent[0][1], 3)
+                self.assertAlmostEqual(caps[0], .3)
+
+    def test_idle_poll_cannot_outlive_a_resend_window(self):
+        for delay in (.2, .8):
+            with self.subTest(delay=delay):
+                now, sent, caps = [0.0], [], []
+
+                def observe():
+                    return 'done' if len(sent) >= 2 else 'source'
+
+                def idle(cap):
+                    caps.append(cap)
+                    if sent:
+                        now[0] += delay
+                    return None
+
+                item = Step('press', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                            'a', cap=3.5, lost_after=2)
+                args = ('fixture', [item], observe, lambda macro: sent.append((macro, now[0])), lambda: None)
+                options = dict(clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+                               poll=1, idle=idle)
+                if delay == .8:
+                    with self.assertRaises(RouteStopped) as caught:
+                        run(*args, **options)
+                    self.assertIn('no transition within cap', caught.exception.reason)
+                    self.assertIn('the send window closed while the input channel was polled', caught.exception.reason)
+                    self.assertEqual(len(sent), 1)
+                else:
+                    run(*args, **options)
+                    self.assertEqual(len(sent), 2)
+                    self.assertLess(sent[1][1], 3.5)
+                self.assertAlmostEqual(caps[-1], .5)
+
+    def test_each_busy_status_poll_uses_the_remaining_send_window(self):
+        now, polls, sent = [0.0], [], []
+
+        def idle(cap):
+            polls.append((now[0], cap))
+            return 'macro playing'
+
+        item = Step('press', lambda obs: True, lambda obs: False, 'a', cap=5, ready_cap=1)
+        with self.assertRaises(RouteStopped) as caught:
+            run('fixture', [item], lambda: 'source', sent.append, lambda: None,
+                clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+                poll=.3, idle=idle)
+        self.assertIn('the send window closed while the input channel was polled', caught.exception.reason)
+        self.assertEqual(sent, [])
+        self.assertGreater(len(polls), 1)
+        self.assertTrue(all(0 < cap <= 1 - start + 1e-9 for start, cap in polls), polls)
+
+    def test_a_latched_step_does_not_confirm_an_unanswered_or_late_read(self):
+        for late in (False, True):
+            with self.subTest(late=late):
+                def observe(fake):
+                    if not fake.sends:
+                        return 'source'
+                    if late:
+                        fake.now += 2
+                        return 'done'
+                    return closed_loop.NO_READ
+
+                fake = Script(observe)
+                item = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                            'a', cap=1, latch=True)
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([item])
+                self.assertEqual(caught.exception.step, 'latched')
+                self.assertIn('no transition within cap', caught.exception.reason)
+                self.assertEqual(len(fake.sends), 1)
+                self.assertEqual(fake.finishes, 0)
+
+    def test_a_latched_step_counts_dispatch_time_in_its_bound(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        send = fake.send
+
+        def slow_send(name):
+            send(name)
+            fake.now += 3
+
+        fake.send = slow_send
+        item = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                    'a', cap=2, latch=True)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertEqual(caught.exception.step, 'latched')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual([event for event in fake.events if event[0] == 'read'], [('read', 'source')])
+
+    def test_a_step_repeated_after_the_route_went_back_is_a_stall(self):
+        fake = Script(lambda f: ('a', 'b', 'a', 'done')[min(len(f.sends), 3)])
+        result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')])
+        self.assertEqual([name for name, _ in fake.sends], ['a', 'b', 'a'])
+        self.assertEqual(result['stalls'], [{'kind': 'repeat', 'step': 'a', 'send': 2, 'target': 'None'}])
+
+    def test_a_resend_within_one_visit_is_one_event_not_two(self):
+        fake = Script(lambda f: 'done' if len(f.sends) >= 2 else 'a')
+        result = fake.run([step('a', 'a', 'done', lost_after=2)])
+        self.assertEqual(len(fake.sends), 2)
+        self.assertEqual(len(result['stalls']), 1)
+        self.assertEqual(result['stalls'][0].get('kind', 'resend'), 'resend')
+
+    def test_ordinary_progress_through_distinct_steps_has_no_stall(self):
+        fake = Script(lambda f: ('a', 'b', 'done')[min(len(f.sends), 2)])
+        result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')])
+        self.assertEqual([name for name, _ in fake.sends], ['a', 'b'])
+        self.assertEqual(result['stalls'], [])
+
+    def test_a_busy_rejection_before_a_repeated_step_does_not_duplicate_the_repeat(self):
+        fake = Script(lambda f: ('a', 'b', 'a', 'done')[min(len(f.sends), 3)])
+        send = fake.send
+        rejected, payloads = [], []
+
+        def sometimes_busy(name):
+            if name == 'a' and len(fake.sends) == 2 and not rejected:
+                rejected.append(True)
+                raise closed_loop.DispatchRejected('busy')
+            send(name)
+
+        def on_stall(event, obs):
+            payloads.append(dict(event))
+            return event
+
+        fake.send = sometimes_busy
+        result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')],
+                          idle=lambda remaining: None, on_stall=on_stall)
+        self.assertEqual([name for name, _ in fake.sends], ['a', 'b', 'a'])
+        self.assertEqual([event.get('kind') for event in result['stalls']], ['busy-rejected', 'repeat'])
+        repeat = next(event for event in payloads if event.get('kind') == 'repeat')
+        self.assertTrue(repeat['_skip_diagnostic'])
+        self.assertEqual(repeat['send'], 2)
+
+    def test_a_locate_predicate_can_stop_with_a_complete_step_receipt(self):
+        fake = Script(lambda f: 'unsupported')
+
+        def at(obs):
+            raise RouteStopped('fixture', 'open', 'unsupported reader', {})
+
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([Step('open', at, lambda obs: False, 'zr', cap=3)])
+        self.assertEqual(caught.exception.step, 'open')
+        self.assertEqual(caught.exception.receipt['entered_at'], 'open')
+        self.assertEqual(caught.exception.receipt['steps'][0]['sends'], 0)
+        self.assertEqual(caught.exception.receipt['stalls'], [])
+        self.assertEqual(fake.sends, [])
+
+    def test_a_predicate_stop_after_a_send_keeps_the_original_entry(self):
+        fake = Script(lambda f: 'unsupported' if f.sends else 'down')
+
+        def open_at(obs):
+            if obs == 'unsupported':
+                raise RouteStopped('fixture', 'open', 'unsupported reader', {})
+            return False
+
+        steps = [Step('open', open_at, lambda obs: False, 'zr', cap=3),
+                 Step('down', lambda obs: obs == 'down', lambda obs: False, 'down', cap=3)]
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run(steps)
+        self.assertEqual(caught.exception.step, 'open')
+        self.assertEqual(caught.exception.receipt['entered_at'], 'down')
+        self.assertEqual(fake.sends, [('down', 0)])
+
+    def test_locate_enters_a_recognised_screen_that_is_not_ready_and_waits_in_that_step(self):
+        fake = Script(lambda f: {'screen': 'stage', 'ready': False, 'done': False})
+        item = Step('stage', lambda obs: obs['ready'], lambda obs: obs['done'], 'a',
+                    cap=3, ready_cap=3, screen=lambda obs: obs['screen'] == 'stage')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertEqual(caught.exception.step, 'stage')
+        self.assertEqual(caught.exception.receipt['entered_at'], 'stage')
+        self.assertIn('not ready', caught.exception.reason)
+        self.assertEqual(fake.sends, [])
+
+    def test_a_recognised_screen_that_becomes_ready_sends_once(self):
+        fake = Script(lambda f: {'screen': 'stage', 'ready': f.now >= 2, 'done': bool(f.sends)})
+        item = Step('stage', lambda obs: obs['ready'], lambda obs: obs['done'], 'a',
+                    cap=3, ready_cap=5, screen=lambda obs: obs['screen'] == 'stage')
+        receipt = fake.run([item])
+        self.assertEqual(receipt['entered_at'], 'stage')
+        self.assertEqual(fake.sends, [('a', 2)])
+        self.assertEqual(fake.finishes, 1)
+
+    def test_screen_is_never_used_after_a_send(self):
+        fake = Script(lambda f: {'screen': 'other' if f.sends else 'stage', 'ready': not f.sends})
+        first = Step('stage', lambda obs: obs['screen'] == 'stage' and obs['ready'], lambda obs: False,
+                     'a', cap=3, lost_after=10, screen=lambda obs: obs['screen'] == 'stage')
+        second = Step('other', lambda obs: False, lambda obs: False, 'b',
+                      cap=3, screen=lambda obs: obs['screen'] == 'other')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([first, second])
+        self.assertEqual(caught.exception.step, 'stage')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_screen_is_never_used_for_a_jump_during_a_ready_wait(self):
+        fake = Script(lambda f: {'screen': 'stage' if f.now == 0 else 'other'})
+        first = Step('stage', lambda obs: False, lambda obs: False, 'a',
+                     cap=3, ready_cap=3, screen=lambda obs: obs['screen'] == 'stage')
+        second = Step('other', lambda obs: False, lambda obs: False, 'b',
+                      cap=3, ready_cap=3, screen=lambda obs: obs['screen'] == 'other')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([first, second])
+        self.assertEqual(caught.exception.step, 'stage')
+        self.assertIn('not ready', caught.exception.reason)
+        self.assertEqual(fake.sends, [])
+
+    def test_locate_selects_the_last_matching_screen(self):
+        fake = Script(lambda f: 'shared')
+        first = Step('first', lambda obs: False, lambda obs: False, 'a',
+                     cap=3, ready_cap=1, screen=lambda obs: obs == 'shared')
+        second = Step('second', lambda obs: False, lambda obs: False, 'b',
+                      cap=3, ready_cap=1, screen=lambda obs: obs == 'shared')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([first, second])
+        self.assertEqual((caught.exception.step, caught.exception.receipt['entered_at']), ('second', 'second'))
+        self.assertEqual(fake.sends, [])
+
+    def test_a_ready_or_source_match_takes_precedence_over_screen_fallback(self):
+        for ready in (False, True):
+            with self.subTest(ready=ready):
+                fake = Script(lambda f: 'shared')
+                first = Step('first', lambda obs: ready, lambda obs: False, 'a',
+                             cap=1, ready_cap=1, lost_after=5, source=lambda obs: obs == 'shared')
+                second = Step('second', lambda obs: False, lambda obs: False, 'b',
+                              cap=1, ready_cap=1, screen=lambda obs: obs == 'shared')
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([first, second])
+                self.assertEqual((caught.exception.step, caught.exception.receipt['entered_at']), ('first', 'first'))
+                self.assertEqual(len(fake.sends), int(ready))
+
     def test_an_invalid_revalidation_cap_is_rejected_before_any_read(self):
         for value in (-1, float('nan'), float('inf'), None, '4'):
             with self.subTest(value=value):
@@ -741,7 +1121,7 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['steps'][0]['unanswered'], 2)
         self.assertEqual(fake.sends, [])
 
-    def test_a_grace_location_witness_is_not_evaluated_twice(self):
+    def test_location_does_not_read_a_witness_at_the_deadline(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         deadline_reads, done_reads = [], []
 
@@ -759,10 +1139,12 @@ class ClosedLoopTests(unittest.TestCase):
 
         fake = Script(observe)
         item = Step('press', lambda value: value == 'source', done, 'press', cap=5)
-        result = fake.run([item], locate_cap=1)
-        self.assertEqual(result['entered_at'], 'done')
-        self.assertEqual(len(done_reads), 1)
-        self.assertEqual(result['steps'][0]['unanswered'], 2)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item], locate_cap=1)
+        self.assertEqual(caught.exception.step, 'locate')
+        self.assertIn('1 unanswered reads', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
+        self.assertEqual(done_reads, [])
         self.assertEqual(fake.sends, [])
 
     def test_a_grace_location_source_does_not_authorize_a_first_send(self):
@@ -780,9 +1162,10 @@ class ClosedLoopTests(unittest.TestCase):
             fake.run([step('press', 'source', 'done')], locate_cap=1)
         self.assertEqual(caught.exception.step, 'locate')
         self.assertIn('last answered read', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
         self.assertEqual(fake.sends, [])
 
-    def test_a_reply_just_after_the_deadline_is_used(self):
+    def test_a_reply_at_or_after_the_deadline_is_not_read(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         grace = []
 
@@ -795,11 +1178,12 @@ class ClosedLoopTests(unittest.TestCase):
             return no_read
 
         fake = Script(observe)
-        result = fake.run([step('press', 'source', 'done', cap=4)])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=4)])
         self.assertEqual(len(fake.sends), 1)
-        self.assertEqual(fake.finishes, 1)
-        self.assertEqual(result['steps'][0]['unanswered'], 4)
-        self.assertEqual(len(grace), 2)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 3)
+        self.assertEqual(grace, [])
 
     def test_only_unanswered_reads_until_the_cap_stop_with_the_last_answered_read(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
@@ -808,7 +1192,7 @@ class ClosedLoopTests(unittest.TestCase):
             fake.run([step('press', 'source', 'done', cap=4)])
         self.assertIn("last answered read 'source'", caught.exception.reason)
         self.assertIn('unanswered reads', caught.exception.reason)
-        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 5)
+        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 3)
         self.assertEqual(len(fake.sends), 1)
         self.assertEqual(fake.finishes, 0)
 
@@ -853,10 +1237,11 @@ class ClosedLoopTests(unittest.TestCase):
                       step('second', 'second', 'done', ready_cap=2)])
         self.assertEqual(caught.exception.step, 'second')
         self.assertIn('last answered read', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
         self.assertEqual(fake.sends, [('first', 0)])
         self.assertEqual(fake.finishes, 1)
 
-    def test_a_grace_source_can_authorize_the_retry_only_if_the_lost_timer_was_satisfied(self):
+    def test_a_source_at_the_deadline_cannot_authorize_a_retry(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         reads_at_three = []
 
@@ -870,11 +1255,12 @@ class ClosedLoopTests(unittest.TestCase):
             return 'source'
 
         fake = Script(observe)
-        result = fake.run([step('press', 'source', 'done', cap=3, lost_after=2)])
-        self.assertEqual(len(fake.sends), 2)
-        self.assertEqual(result['steps'][0]['unanswered'], 1)
-        self.assertEqual(len(result['stalls']), 1)
-        self.assertEqual(fake.finishes, 2)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=3, lost_after=2)])
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(reads_at_three, [])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
 
     def test_a_grace_source_without_a_satisfied_lost_timer_does_not_resend(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
@@ -893,6 +1279,7 @@ class ClosedLoopTests(unittest.TestCase):
         with self.assertRaises(RouteStopped) as caught:
             fake.run([step('press', 'source', 'done', cap=4, lost_after=3)])
         self.assertIn('last answered read', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
         self.assertEqual(len(fake.sends), 1)
         self.assertEqual(fake.finishes, 0)
 
@@ -1160,6 +1547,7 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['entered_at'], 'second')
         self.assertEqual([s[0] for s in fake.sends], ['second', 'first', 'second'])
         self.assertEqual(fake.finishes, 3)
+        self.assertEqual(result['stalls'], [{'kind': 'repeat', 'step': 'second', 'send': 2, 'target': 'None'}])
 
     def test_not_ready_within_ready_cap_stops_with_zero_sends(self):
         fake = Script(lambda f: 'arrived' if not f.events else 'waiting')
@@ -1216,6 +1604,7 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['entered_at'], 'second')
         self.assertEqual([macro for macro, _ in fake.sends], ['second', 'first'])
         self.assertEqual(fake.finishes, 2)
+        self.assertEqual(result['stalls'], [])
 
     def test_a_destination_reached_while_waiting_is_skipped(self):
         def observe(f):
@@ -1238,6 +1627,7 @@ class ClosedLoopTests(unittest.TestCase):
         result = fake.run([step('first', 'one', 'arrived'), step('second', 'two', 'done')])
         self.assertEqual(result['entered_at'], 'first')
         self.assertEqual([macro for macro, _ in fake.sends], ['first', 'first', 'second'])
+        self.assertEqual(result['stalls'], [{'kind': 'repeat', 'step': 'first', 'send': 2, 'target': 'None'}])
 
     def test_final_witness_completes_without_an_extra_read(self):
         def observe(f):

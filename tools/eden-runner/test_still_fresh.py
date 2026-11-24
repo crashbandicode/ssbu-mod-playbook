@@ -28,6 +28,17 @@ class StillFreshTests(unittest.TestCase):
         path.write_bytes(data)
         return self.ledger.record(on, path, reply, frame)
 
+    def test_deferred_commit_does_not_publish_the_ledger_or_journal(self):
+        path = self.root / 'deferred.png'
+        path.write_bytes(b'deferred')
+        captured = []
+        record = self.ledger.record('a', path, None, self.frame(42),
+                                    commit=lambda result, run: captured.append((result, run)))
+        self.assertEqual(captured[0][0], record)
+        self.assertEqual(captured[0][1]['sha256'], hashlib.sha256(b'deferred').hexdigest())
+        self.assertEqual(self.ledger.runs, {})
+        self.assertFalse((self.root / 'stills.jsonl').exists())
+
     def test_frame_source_reads_the_last_frame_line_and_boot(self):
         path = self.root / 'bridge.log'
         path.write_text('[Bridge] boot=0xabc\n[Bridge] state.8 screen=one frame=618 wall=1513497634\n'
@@ -282,13 +293,23 @@ class StillFreshTests(unittest.TestCase):
         reply = {'backend': 'window', 'uniform': False, 'warning': 'sample warning'}
         one = self.record(self.frame(1000), reply=reply)
         two = self.record(self.frame(1200))
-        rows = [json.loads(line) for line in (self.root / 'stills.jsonl').read_text().splitlines()]
+        rows = self.fresh.load(self.root / 'stills.jsonl')
         self.assertEqual(rows, [one, two])
+        self.assertEqual(len((self.root / 'stills.jsonl').read_text().splitlines()), 2)
         self.assertEqual(one['sha256'], hashlib.sha256(b'picture').hexdigest())
         self.assertEqual((one['bytes'], one['backend'], one['uniform'], one['warning']),
                          (7, 'window', False, 'sample warning'))
         self.assertEqual(one['path'], str(self.root / one['file']))
         self.assertTrue(one['utc'])
+
+    def test_loading_a_journal_skips_only_records_with_a_later_matching_retraction(self):
+        first = self.record(self.frame(1000), data=b'first')
+        second = self.record(self.frame(1001), data=b'second')
+        replacement = {**first, 'frame': 1002}
+        self.ledger.append({'retract': first['file'], 'sha256': first['sha256'],
+                            'reason': 'written by a superseded gate check', 'utc': 'later'})
+        self.ledger.append(replacement)
+        self.assertEqual(self.fresh.load(self.root / 'stills.jsonl'), [second, replacement])
 
     def test_the_threshold_is_configurable(self):
         self.ledger = self.fresh.Ledger(self.root, frames=60)

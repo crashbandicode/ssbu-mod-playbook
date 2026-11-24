@@ -131,6 +131,7 @@ import argparse
 import copy
 import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import numbers
@@ -138,14 +139,19 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+import closed_loop  # noqa: E402
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import macro_gate  # noqa: E402
 import still_fresh  # noqa: E402
 import packet_gate  # noqa: E402
 import trace_text  # noqa: E402
@@ -192,6 +198,8 @@ DEFAULT_FAILURE_EVIDENCE = {'screenshot': True, 'log_tails': True, 'trace': 'aut
 # Mean absolute difference per colour byte (0-255) an image gate accepts. Exact matches (0) fail on animated screens
 # (the title's attract mode, menu shimmer, a blinking cursor); 2026-11-03 pkg4 lost two row-1 attempts to one.
 DEFAULT_TOLERANCE = 8
+STILL_PUBLICATION_CAP = 5.0
+GATE_CANDIDATE_PREFIX = '.gate-candidate-'
 # Eden control API (Eden-GIF docs/CLIControl.md, "Controller input"): a held input's lease_ms is 1..10000.
 # edenctl.py copies lease_ms onto input.button, input.stick and the other held-input commands. A new press
 # replaces the previous expiry, so a longer hold is renewed with another lease; it is not one request past the cap.
@@ -223,6 +231,38 @@ def digest(path):
     return h.hexdigest()
 
 
+def acquisition_intent(reference):
+    reference = Path(reference)
+    return reference.with_name(reference.name + '.acquiring')
+
+
+def gate_candidate(path):
+    return path.name.startswith(GATE_CANDIDATE_PREFIX) or path.resolve().name.startswith(GATE_CANDIDATE_PREFIX)
+
+
+def published_path(path):
+    if gate_candidate(path):
+        raise ValueError(f'reserved gate candidate is not a published input: {path.name}')
+    return path
+
+
+def reference_approved(base, gate, manifest=None, name=None):
+    reference = Path(base) / gate['reference']
+    intent = acquisition_intent(reference)
+    try:
+        if gate_candidate(reference) or intent.exists() or not reference.is_file() or not gate.get('sha256'):
+            return False
+        if manifest is not None and name is not None and (gate.get('acquire') or gate.get('acquired')):
+            raw = json.loads(published_path(Path(manifest)).read_text())
+            recorded = expand_library(raw).get('gates', {}).get(name)
+            if (not recorded or (Path(base) / recorded['reference']).resolve() != reference.resolve()
+                    or recorded.get('sha256') != gate['sha256']):
+                return False
+        return digest(reference) == gate['sha256'] and not intent.exists()
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def dotted(document, key):
     value = document
     for part in key.split('.'):
@@ -237,7 +277,8 @@ def row_role(row):
 
 
 def load_hook(base, gate):
-    spec = importlib.util.spec_from_file_location('gate_hook_' + Path(gate['module']).stem, base / gate['module'])
+    path = published_path(base / gate['module'])
+    spec = importlib.util.spec_from_file_location('gate_hook_' + path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return getattr(module, gate['function'])
@@ -858,7 +899,7 @@ def review_class(plan, base, raw_plan=None):
 def dry_run(manifest_path):
     """Offline only. Raises on a broken manifest; returns the report (missing segments are not an error)."""
     base = manifest_path.parent
-    raw = json.loads(manifest_path.read_text())
+    raw = json.loads(published_path(manifest_path).read_text())
     roles_defaulted = [row.get('id') for row in raw.get('rows', []) if 'role' not in row]
     try:
         plan = expand_library(copy.deepcopy(raw))
@@ -870,6 +911,9 @@ def dry_run(manifest_path):
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
+        if gate_candidate(path):
+            errors.append(f'segment {name}: reserved gate candidate is not a published input')
+            continue
         if path.is_file():
             if not seg.get('sha256'):
                 errors.append(f'segment {name}: no sha256')
@@ -909,10 +953,13 @@ def dry_run(manifest_path):
                     errors.append(f'gate {name}: frame must be [width, height]')
                 elif gate.get('reference_is_roi') and scale == 'fit' and frame is None:
                     errors.append(f'gate {name}: an ROI reference with scale "fit" needs "frame": [width, height]')
-                ref = base / gate['reference']
-                if not ref.is_file() and gate.get('acquire'):
+                if gate_candidate(base / gate['reference']):
+                    errors.append(f'gate {name}: reference uses a reserved candidate path')
+                    continue
+                approved = reference_approved(base, gate)
+                if not approved and gate.get('acquire'):
                     to_acquire.append(name)  # captured the first time the run reaches the screen
-                elif digest(ref) != gate.get('sha256'):
+                elif not approved:
                     errors.append(f'gate {name}: reference sha256 mismatch')
                 if len(gate['roi']) != 4:
                     errors.append(f'gate {name}: roi needs 4 numbers')
@@ -1154,6 +1201,10 @@ class StopRun(Exception):
     pass
 
 
+class GateEvidenceTimeout(RuntimeError):
+    pass
+
+
 class StepContext:
     """What a project step hook gets: the runner's own tools, bound to one instance and the current row.
 
@@ -1391,11 +1442,27 @@ class Runner:
     # and step_kind.extra = tuple(step_handlers).
     step_handlers = {}
 
+    @property
+    def last_gate_outcome(self):
+        slots = (slot for slot in getattr(self, '_gate_results', ())
+                 if slot['value'] is not None or slot.get('ticket') is not None
+                 and slot['ticket'].revoked_for('lock_timeout'))
+        latest = max(slots, key=lambda slot: slot['sequence'], default=None)
+        if latest is None:
+            return getattr(self, '_gate_result_default', None)
+        return latest['value'] if latest['value'] is not None else latest['timeout']
+
+    @last_gate_outcome.setter
+    def last_gate_outcome(self, value):
+        # Each invocation keeps its own slot, so a late result cannot overwrite a successor.
+        self._gate_results = []
+        self._gate_result_default = value
+
     def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None, on_failure=None,
                  instances_sha256=None):
         self.manifest_path = manifest_path
         self.base = manifest_path.parent
-        self.plan = expand_library(json.loads(manifest_path.read_text()))
+        self.plan = expand_library(json.loads(published_path(manifest_path).read_text()))
         self.instances = instances
         self.instances_sha256 = instances_sha256
         self.default = next(iter(instances))
@@ -1438,6 +1505,10 @@ class Runner:
         self._arm_frames = False
         self._gate_baseline = None
         self._gate_latest = None
+        self._gate_owner = None
+        self._gate_lock = threading.RLock()
+        self._gate_context = threading.local()
+        self._gate_sequence = itertools.count()
         self.session = None
         self.session_unavailable = None
         self.session_file = None  # per_row_files: {'path', 'row', 'rows', 'file_rec_ms'} of the file OBS writes now
@@ -1598,10 +1669,58 @@ class Runner:
         return judge_queue.failing_report(self.out, self.plan, self.manifest_path)
 
     # --- control -------------------------------------------------------------------------------------------------
+    def _gate_valid(self):
+        token = getattr(self._gate_context, 'token', None)
+        gate = getattr(self._gate_context, 'gate', None)
+        return (not macro_gate.abandoned()
+                and (gate is None or time.monotonic() < gate['deadline'])
+                and (token is None or (self._gate_owner is token and not token.is_abandoned())))
+
+    @contextmanager
+    def _gate_publication(self):
+        gate = getattr(self._gate_context, 'gate', None)
+        if gate is None:
+            remaining = STILL_PUBLICATION_CAP
+            on = getattr(self._gate_context, 'plain_screenshot', None)
+            subject = f'screenshot on {on}' if on is not None else 'still publication'
+            reason = (f'{subject}: gate evidence was still being written by an earlier check '
+                      f'within {STILL_PUBLICATION_CAP} s')
+        else:
+            remaining = max(0.0, gate['deadline'] - time.monotonic())
+            reason = (f'gate {gate["name"]} on {gate["on"]} did not pass within {gate["cap"]} s: '
+                      'gate evidence was still being written by an earlier check')
+        if remaining <= 0 or not self._gate_lock.acquire(timeout=remaining):
+            raise GateEvidenceTimeout(reason)
+        try:
+            if gate is not None and time.monotonic() >= gate['deadline']:
+                raise GateEvidenceTimeout(reason)
+            yield
+        finally:
+            self._gate_lock.release()
+
+    def _gate_result(self, slot, outcome):
+        gate = getattr(self._gate_context, 'gate', None)
+        if gate is not None:
+            gate['outcome'] = (slot, outcome)
+        elif not macro_gate.abandoned():
+            slot['value'] = outcome
+
     def log(self, record):
-        record['time'] = time.time()
-        with (self.out / 'actions.jsonl').open('a') as f:
-            f.write(json.dumps(record) + '\n')
+        gate = getattr(self._gate_context, 'gate', None)
+        if gate is not None:
+            record = {**self._evidence_paths(record, gate['paths']), 'time': time.time()}
+            gate['logs'].append(json.dumps(record) + '\n')
+            return
+        pending = getattr(self._gate_context, 'deferred_logs', None)
+        if pending is not None:
+            pending.append(record)
+            return
+        with self._gate_publication():
+            if not self._gate_valid():
+                return
+            record['time'] = time.time()
+            with (self.out / 'actions.jsonl').open('a') as f:
+                f.write(json.dumps(record) + '\n')
 
     def check_stop(self):
         for name in ('STOP', 'STOP-INPUT'):
@@ -1617,7 +1736,11 @@ class Runner:
         if method not in ('macro.stop', 'input.reset', 'recording.session_mark', 'recording.session_split',
                           'recording.session_ensure', 'recording.session_stop'):
             self.check_stop()  # cleanup and bookkeeping calls still go through after a STOP
+        if not self._gate_valid():
+            raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
         reply = self.clients[on].request(method, params or {})
+        if not self._gate_valid():
+            raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
         self.log({'on': on, 'method': method, 'params': params, 'ok': reply.get('ok')})
         if not reply.get('ok'):
             raise RuntimeError(f'{method} on {on}: {reply}')
@@ -1625,7 +1748,11 @@ class Runner:
         if isinstance(value, dict) and value.get('accepted') and value.get('job'):
             until = time.monotonic() + job_cap
             while True:
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
                 job = self.clients[on].request('jobs.get', {'job': value['job']})
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
                 state = (job.get('result') or {}).get('state')
                 if state in ('done', 'completed', 'finished'):
                     break
@@ -1639,33 +1766,441 @@ class Runner:
                 time.sleep(.1)
         return value
 
-    def shot(self, on, name):
-        # "screenshot_target" in instances.json overrides the window lookup: the Ally needs "screen" (a per-window
-        # grab is black under Vulkan there). Image gates are per host resolution; log gates are portable.
-        self.__dict__.setdefault('row_still_errors', [])
+    def _candidate_shot(self, on, name, gate):
         target = self.instances[on].get('screenshot_target')
         if not target:
             tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
             target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
-        path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
+        final = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
+        with tempfile.NamedTemporaryFile(dir=self.row_dir, prefix=GATE_CANDIDATE_PREFIX, suffix='.png',
+                                         delete=False) as stream:
+            path = Path(stream.name)
+        gate['temporary'].append(path)
+        gate['paths'][str(path)] = str(final)
         reply = self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        if not self._gate_valid():
+            raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+        gate['pictures'].append((path, final))
+        item = None
         try:
-            if on not in self._frame_sources:
-                self._frame_sources[on] = still_fresh.FrameSource(self.instances[on].get('bridge_log'))
-            frame = self._frame_sources[on].read()
-            record = self.stills.record(on, path, reply, frame)
-            self.still_records[str(path)] = record
-            if still_fresh.refused(record):
-                item = {'file': record['file'], 'reason': record['reason']}
-                self.row_stills_refused.append(item)
+            source = gate['frame_sources'].get(on)
+            source = copy.copy(source) if source is not None else still_fresh.FrameSource(
+                self.instances[on].get('bridge_log'))
+            gate['frame_sources'][on] = source
+            frame = source.read()
+            if not self._gate_valid():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+            ledger = still_fresh.Ledger(self.out, frames=self.stills.frames)
+            ledger.runs = gate['runs']
+
+            def prepare(record, run):
+                nonlocal item
+                record, run = dict(record), dict(run)
+                if run['first_file'] == path.name:
+                    run['first_file'] = final.name
+                    record['first_identical'] = final.name
+                record.update(file=final.name, path=str(final))
+                record = still_fresh.PreparedRecord(record)
+                gate['runs'][on] = run
+                gate['still_records'][str(path)] = record
+                gate['new_records'].append(str(path))
+                gate['stills'].append((path, final, record, run))
+                if still_fresh.refused(record):
+                    item = {'file': final.name, 'reason': record['reason']}
+                    gate['refused'].append(item)
+
+            ledger.record(on, path, reply, frame, commit=prepare)
+            if item is not None:
                 self.log({'still_refused': item})
-        except Exception as error:  # noqa: BLE001 - freshness must not break a screenshot
+        except Exception as error:  # noqa: BLE001
+            if not self._gate_valid():
+                raise
             reason = f'freshness check failed: {error!r}'[:200]
-            self.still_records[str(path)] = {
-                'file': path.name, 'path': str(path), 'on': on, 'status': 'error', 'reason': reason,
+            gate['still_records'][str(path)] = {
+                'file': final.name, 'path': str(final), 'on': on, 'status': 'error', 'reason': reason,
             }
-            item = {'file': path.name, 'reason': reason}
-            self.row_still_errors.append(item)
+            gate['new_records'].append(str(path))
+            item = {'file': final.name, 'reason': reason}
+            gate['errors'].append(item)
+            self.log({'still_error': item})
+        if self.captures is not None:
+            utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            try:
+                status = self.call(on, 'status', {})
+                status = ({key: value for key, value in status.items()
+                           if isinstance(value, (str, int, float, bool, type(None)))}
+                          if isinstance(status, dict) else None)
+            except Exception:  # noqa: BLE001
+                if not self._gate_valid():
+                    raise
+                status = None
+            gate['captures'].append(self._capture_record(name, path, final, utc, status))
+        data = path.read_bytes()
+        if gate['baseline'] is None:
+            gate['baseline'] = data
+        gate['latest'] = data
+        return path
+
+    def _still_record(self, path):
+        gate = getattr(self._gate_context, 'gate', None)
+        records = gate['still_records'] if gate is not None else self.still_records
+        return records.get(str(path))
+
+    def _capture_record(self, name, path, final, utc, status):
+        record = self._still_record(path)
+        fresh = ({key: value for key, value in record.items() if isinstance(value, (str, int, float, bool, type(None)))}
+                 if isinstance(record, dict) else None)
+        return {'name': name, 'file': final.name, 'sha256': digest(path), 'utc': utc, 'status': status, 'fresh': fresh}
+
+    def _retire_gate_picture(self, path):
+        gate = getattr(self._gate_context, 'gate', None)
+        if gate is not None and str(path) in gate['paths']:
+            gate['retired'].add(str(path))
+        else:
+            Path(path).unlink(missing_ok=True)
+
+    def _gate_reference(self, gate, name):
+        context = getattr(self._gate_context, 'gate', None)
+        target = self.base / gate['reference']
+        if gate_candidate(target):
+            raise RuntimeError(f'gate {name}: reference uses a reserved candidate path')
+        if context is not None and target.resolve() in context['references']:
+            context['ticket'].revoke('pending_reference')
+            raise closed_loop.DispatchRejected(f'gate {name}: reference acquisition has not committed')
+        return target if reference_approved(self.base, gate, self.manifest_path, name) else None
+
+    def _stage_gate_file(self, gate, target, contents):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=GATE_CANDIDATE_PREFIX, delete=False) as stream:
+            temporary = Path(stream.name)
+            gate['temporary'].append(temporary)
+            stream.write(contents)
+        backup = None
+        if target.exists():
+            with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f'{GATE_CANDIDATE_PREFIX}backup-',
+                                             delete=False) as stream:
+                backup = Path(stream.name)
+                gate['temporary'].append(backup)
+                stream.write(target.read_bytes())
+            mode = target.stat().st_mode & 0o777
+            os.chmod(temporary, mode)
+            os.chmod(backup, mode)
+        gate['files'].append((temporary, target, backup))
+
+    def _cancel_acquisition(self, gate):
+        checkpoint = gate.pop('acquisition_checkpoint', None)
+        if checkpoint is None:
+            return
+        del gate['files'][checkpoint['files']:]
+        del gate['intents'][checkpoint['intents']:]
+        del gate['receipts'][checkpoint['receipts']:]
+        gate['gate_updates'] = checkpoint['gate_updates']
+        gate['references'] = checkpoint['references']
+        name, previous = checkpoint['name'], checkpoint['previous']
+        if previous is None:
+            gate['plan']['gates'].pop(name, None)
+        else:
+            gate['plan']['gates'][name] = previous
+
+    def _discard_evidence(self, candidates):
+        for gate in candidates:
+            for path in gate['temporary']:
+                path.unlink(missing_ok=True)
+        if candidates:
+            record = {'late_candidate_discarded': [gate['name'] for gate in candidates], 'time': time.time()}
+            with (self.out / 'actions.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(record) + '\n')
+
+    @staticmethod
+    def _evidence_paths(value, paths):
+        if isinstance(value, str):
+            return paths.get(value, value)
+        if isinstance(value, list):
+            return [Runner._evidence_paths(item, paths) for item in value]
+        if isinstance(value, dict):
+            return {key: Runner._evidence_paths(item, paths) for key, item in value.items()}
+        return value
+
+    def _commit_evidence(self, ticket):
+        candidates = ticket.candidates
+        deadline = min(gate['deadline'] for gate in candidates)
+        if ticket.deadline is not None:
+            deadline = min(deadline, ticket.deadline)
+        if not self._gate_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            ticket.revoke('lock_timeout')
+            ticket.discard_later()
+            raise GateEvidenceTimeout(
+                f'gate {candidates[-1]["name"]} on {candidates[-1]["on"]} did not pass within '
+                f'{candidates[-1]["cap"]} s: gate evidence was still being written by an earlier check')
+        replaced, appended, intents = [], [], {}
+        preserve = False
+        journal_error = None
+        before = None
+        try:
+            try:
+                self.check_stop()
+            except StopRun:
+                ticket.revoke('cancel')
+                ticket.discard()
+                raise
+            if (time.monotonic() >= deadline and any(gate['passed'] or gate['receipts'] for gate in candidates)):
+                ticket.revoke('timeout')
+                ticket.discard()
+                raise closed_loop.DispatchRejected('gate evidence deadline passed before commit')
+            if self._gate_owner is not ticket or not ticket.commit():
+                ticket.revoke()
+                return False
+            updates = {name for gate in candidates for name in gate['gate_updates']}
+            before = {
+                'gates': {name: copy.deepcopy(self.plan['gates'].get(name)) for name in updates},
+                'acquired': list(getattr(self, 'acquired', [])),
+                'captures': None if self.captures is None else list(self.captures),
+                'state_marks': dict(getattr(self, 'state_marks', {})),
+                'state_pending': dict(getattr(self, 'state_pending', {})),
+                'gate_saw_evidence': list(self.gate_saw_evidence),
+                'scales_used': list(self.scales_used),
+                'screen_reached': self.screen_reached,
+                'scale': getattr(self, 'last_image_scale', None),
+                'hook': getattr(self, 'last_hook_evidence', None),
+                'evidence': getattr(self, '_gate_evidence', None),
+                'baseline': self._gate_baseline,
+                'latest': self._gate_latest,
+                'frame_sources': dict(self._frame_sources),
+                'refused': list(self.row_stills_refused),
+                'errors': list(getattr(self, 'row_still_errors', [])),
+                'slots': [(gate['result_slot'], gate['result_slot']['value'])
+                          for gate in candidates if 'result_slot' in gate],
+            }
+            for gate in candidates:
+                for temporary, intent, existed in gate['intents']:
+                    intents.setdefault(intent, (temporary, existed))
+            for intent, (temporary, existed) in intents.items():
+                if not existed:
+                    temporary.replace(intent)
+            files = [item for gate in candidates for item in gate['files']]
+            manifest_files = [item for item in files if item[1] == self.manifest_path]
+            files = [item for item in files if item[1] != self.manifest_path]
+            for gate in candidates:
+                for temporary, final in gate['pictures']:
+                    if str(temporary) not in gate['retired'] and temporary.exists():
+                        temporary.replace(final)
+                        replaced.append((final, None))
+                for temporary, final, record, run in gate['stills']:
+                    try:
+                        self.stills.append(record)
+                    except Exception as error:
+                        journal_error = (temporary, final, record, error)
+                        raise
+                    appended.append((record, run))
+            for temporary, target, backup in files:
+                temporary.replace(target)
+                replaced.append((target, backup))
+            for gate in candidates:
+                for line in gate['logs']:
+                    with (self.out / 'actions.jsonl').open('a', encoding='utf-8') as stream:
+                        stream.write(line)
+            if manifest_files:
+                temporary, target, backup = manifest_files[-1]
+                temporary.replace(target)
+                replaced.append((target, backup))
+            for intent in intents:
+                intent.unlink()
+            for gate in candidates:
+                self._frame_sources.update(gate['frame_sources'])
+                self.stills.runs = gate['runs']
+                for path in gate['new_records']:
+                    record = gate['still_records'][path]
+                    self.still_records[record['path']] = record
+                self.row_stills_refused.extend(gate['refused'])
+                self.__dict__.setdefault('row_still_errors', []).extend(gate['errors'])
+                if self.captures is not None:
+                    self.captures.extend(gate['captures'])
+                if gate['receipts']:
+                    self.acquired.extend(gate['receipts'])
+                for name, entry in gate['gate_updates'].items():
+                    self.plan['gates'].setdefault(name, {}).update(entry)
+                for key, pending_key in gate['state_consumes']:
+                    self.state_marks.pop(key, None)
+                    self.state_pending.pop(pending_key, None)
+                self._gate_baseline, self._gate_latest = gate['baseline'], gate['latest']
+                if gate.get('scale') is not None:
+                    self.last_image_scale = gate['scale']
+                    self.scales_used.append(gate['scale'])
+                if gate.get('hook_evidence_set'):
+                    self.last_hook_evidence = gate['hook_evidence']
+                if gate.get('passed'):
+                    if gate['role'] == 'screen':
+                        self.screen_reached = True
+                    self._gate_evidence = gate['evidence']
+                    self.gate_saw_evidence.append(gate['evidence'])
+                if gate['outcome'] is not None:
+                    slot, outcome = gate['outcome']
+                    outcome['screen_reached'] = self.screen_reached
+                    slot['value'] = outcome
+            return True
+        except BaseException:
+            try:
+                for intent in intents:
+                    if not intent.exists():
+                        intent.touch(exist_ok=False)
+                kept = {Path(record['path']) for record, _ in appended}
+                if journal_error is not None:
+                    temporary, final, _, _ = journal_error
+                    if not final.exists() and temporary.exists():
+                        temporary.replace(final)
+                    kept.add(final)
+                for target, backup in reversed(replaced):
+                    if target in kept:
+                        continue
+                    if backup is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        backup.replace(target)
+                for record, run in appended:
+                    self.still_records[record['path']] = record
+                    self.stills.runs[record['on']] = run
+                failed_item = None
+                if journal_error is not None:
+                    _, final, record, error = journal_error
+                    reason = f'freshness check failed: {error!r}'[:200]
+                    self.still_records[str(final)] = {
+                        'file': final.name, 'path': str(final), 'on': record['on'], 'status': 'error', 'reason': reason,
+                    }
+                    failed_item = {'file': final.name, 'reason': reason}
+                if before is not None:
+                    for name, entry in before['gates'].items():
+                        if entry is None:
+                            self.plan['gates'].pop(name, None)
+                        else:
+                            current = self.plan['gates'].setdefault(name, {})
+                            current.clear()
+                            current.update(entry)
+                    if hasattr(self, 'acquired'):
+                        self.acquired[:] = before['acquired']
+                    if self.captures is not None:
+                        self.captures[:] = before['captures']
+                    if hasattr(self, 'state_marks'):
+                        self.state_marks.clear()
+                        self.state_marks.update(before['state_marks'])
+                    if hasattr(self, 'state_pending'):
+                        self.state_pending.clear()
+                        self.state_pending.update(before['state_pending'])
+                    self.gate_saw_evidence[:] = before['gate_saw_evidence']
+                    self.scales_used[:] = before['scales_used']
+                    self.screen_reached = before['screen_reached']
+                    self.last_image_scale = before['scale']
+                    self.last_hook_evidence = before['hook']
+                    self._gate_evidence = before['evidence']
+                    self._gate_baseline = before['baseline']
+                    self._gate_latest = before['latest']
+                    self._frame_sources.clear()
+                    self._frame_sources.update(before['frame_sources'])
+                    self.row_stills_refused[:] = before['refused']
+                    self.__dict__.setdefault('row_still_errors', [])[:] = before['errors']
+                    for slot, outcome in before['slots']:
+                        slot['value'] = outcome
+                if failed_item is not None:
+                    self.__dict__.setdefault('row_still_errors', []).append(failed_item)
+                for intent, (_, existed) in intents.items():
+                    if not existed:
+                        intent.unlink(missing_ok=True)
+            except BaseException as error:
+                preserve = True
+                state = ('the reference remains unapproved' if all(intent.exists() for intent in intents)
+                         else 'the approval state is indeterminate')
+                raise RuntimeError(f'gate {candidates[-1]["name"]}: acquisition rollback failed; {state}') from error
+            if journal_error is not None:
+                raise RuntimeError(f'still not usable as evidence: {reason}') from journal_error[3]
+            raise
+        finally:
+            if self._gate_owner is ticket:
+                self._gate_owner = None
+                self._arm_frames = False
+            self._gate_lock.release()
+            if not preserve:
+                for gate in candidates:
+                    for path in gate['temporary']:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as error:
+                            try:
+                                print(f'gate {gate["name"]}: could not remove candidate {path.name}: {error}',
+                                      file=sys.stderr)
+                            except Exception:
+                                pass
+
+    def shot(self, on, name):
+        gate = getattr(self._gate_context, 'gate', None)
+        if gate is not None:
+            return self._candidate_shot(on, name, gate)
+        # "screenshot_target" in instances.json overrides the window lookup: the Ally needs "screen" (a per-window
+        # grab is black under Vulkan there). Image gates are per host resolution; log gates are portable.
+        previous_logs = getattr(self._gate_context, 'deferred_logs', None)
+        previous_shot = getattr(self._gate_context, 'plain_screenshot', None)
+        self._gate_context.deferred_logs = []
+        self._gate_context.plain_screenshot = on
+        try:
+            if not self._gate_valid():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+            target = self.instances[on].get('screenshot_target')
+            if not target:
+                tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
+                target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
+            path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
+            reply = self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        finally:
+            pending = self._gate_context.deferred_logs
+            self._gate_context.deferred_logs = previous_logs
+            try:
+                for record in pending:
+                    self.log(record)
+            finally:
+                self._gate_context.plain_screenshot = previous_shot
+        try:
+            with self._gate_publication():
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+                self.__dict__.setdefault('row_still_errors', [])
+                source = self._frame_sources.get(on)
+                if source is None:
+                    source = still_fresh.FrameSource(self.instances[on].get('bridge_log'))
+                self._frame_sources[on] = source
+            frame = source.read()
+            if not self._gate_valid():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+            item = None
+
+            def commit(record, run):
+                nonlocal item
+                # Hold the publication lock only for the ownership check and local append, never for I/O to Eden.
+                with self._gate_publication():
+                    if not self._gate_valid():
+                        raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+                    self.stills.append(record)
+                    self._frame_sources[on] = source
+                    self.stills.runs[on] = run
+                    self.still_records[str(path)] = record
+                    if still_fresh.refused(record):
+                        item = {'file': record['file'], 'reason': record['reason']}
+                        self.row_stills_refused.append(item)
+
+            record = self.stills.record(on, path, reply, frame, commit=commit)
+            if item is not None:
+                self.log({'still_refused': item})
+        except GateEvidenceTimeout:
+            raise
+        except Exception as error:  # noqa: BLE001 - freshness must not break a screenshot
+            if not self._gate_valid():
+                raise
+            reason = f'freshness check failed: {error!r}'[:200]
+            with self._gate_publication():
+                if not self._gate_valid():
+                    raise
+                self.still_records[str(path)] = {
+                    'file': path.name, 'path': str(path), 'on': on, 'status': 'error', 'reason': reason,
+                }
+                item = {'file': path.name, 'reason': reason}
+                self.row_still_errors.append(item)
             self.log({'still_error': item})
         if self.captures is not None:
             utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
@@ -1675,22 +2210,14 @@ class Runner:
                            if isinstance(value, (str, int, float, bool, type(None)))}
                           if isinstance(status, dict) else None)
             except Exception:  # noqa: BLE001 - a missing status does not invalidate a screenshot
+                if not self._gate_valid():
+                    raise
                 status = None
-            record = self.still_records.get(str(path))
-            fresh = ({key: value for key, value in record.items()
-                      if isinstance(value, (str, int, float, bool, type(None)))}
-                     if isinstance(record, dict) else None)
-            self.captures.append({'name': name, 'file': path.name, 'sha256': digest(path), 'utc': utc,
-                                  'status': status, 'fresh': fresh})
-        if self._arm_frames:
-            try:
-                data = path.read_bytes()
-            except OSError:
-                data = None
-            if data is not None:
-                if self._gate_baseline is None:
-                    self._gate_baseline = data
-                self._gate_latest = data
+            capture = self._capture_record(name, path, path, utc, status)
+            with self._gate_publication():
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+                self.captures.append(capture)
         return path
 
     # --- steps ---------------------------------------------------------------------------------------------------
@@ -1829,6 +2356,26 @@ class Runner:
         self.manifest_path.write_text(json.dumps(self.plan, indent=2) + '\n')
         self.log({'recorded': name, 'path': str(path), 'sha256': seg['sha256']})
 
+    def dispatch_macro(self, on, path, *, name, requalify):
+        def on_event(event):
+            event = {**event, 'block': 'runner'}
+            if not hasattr(self, 'row_macro_waits'):
+                self.row_macro_waits = []
+            self.row_macro_waits.append(event)
+            try:
+                self.log({'macro_idle_wait': event})
+            except Exception:
+                pass
+            try:
+                with (self.row_dir / 'stall-events.jsonl').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps(event) + '\n')
+            except Exception:
+                pass
+
+        return macro_gate.dispatch(lambda method, params=None: self.call(on, method, params), path,
+                                   name=name, requalify=requalify, on_event=on_event, check=self.check_stop,
+                                   is_stop=lambda error: isinstance(error, StopRun))
+
     def play_names(self):
         """The segment names the packet gate checked for `ctx.play` in this plan's hooks (G8): written at a call
         the plan reaches, resolved by the gate, or declared with `among=`. A hook plays no other name."""
@@ -1851,8 +2398,13 @@ class Runner:
                 f'segment {name} has no sha256; refusing to play an unhashed recording ({path.name})')
         if digest(path) != seg['sha256']:
             raise RuntimeError(f'segment {name} changed since the dry run')
-        self.call(on, 'macro.play', {'path': str(path)})
-        self.wait_macro(on, seg.get('cap', 60))
+        def requalify(remaining):
+            self.check_gate(on, seg['start_gate'], cap=remaining)
+            return True
+
+        witness = requalify if seg.get('start_gate') else macro_gate.BLIND
+        if self.dispatch_macro(on, path, name=name, requalify=witness):
+            self.wait_macro(on, seg.get('cap', 60))
 
     def source(self, on, key):
         """An instance file by key. "diag" and "diag_log" name the same file, so library gates work with any
@@ -1860,14 +2412,14 @@ class Runner:
         inst = self.instances[on]
         for name in (key, key + '_log', key[:-4] if key.endswith('_log') else None):
             if name and name in inst:
-                return Path(inst[name])
-        return Path(key)
+                return published_path(Path(inst[name]))
+        return published_path(Path(key))
 
     def trace_source(self, on):
         inst = self.instances[on]
         path = inst.get('trace_jsonl') or inst.get('trace')
         if isinstance(path, (str, Path)) and path:
-            return Path(path)
+            return published_path(Path(path))
         if path:
             raise RuntimeError(f'instance {on} is tracing but has no trace_jsonl file path')
         raise RuntimeError(f'instance {on}: run is not tracing (no trace_jsonl)')
@@ -1980,46 +2532,190 @@ class Runner:
                 return self.check_gate(on, name)
             except StopRun:
                 raise
+            except closed_loop.DispatchRejected:
+                raise
             except RuntimeError as error:
                 if not gate.get('recover') or attempt == gate.get('recover_times', 1):
                     raise
                 self.log({'gate': name, 'on': on, 'recover': gate['recover'], 'after': repr(error)[:200]})
                 seg = self.plan['segments'][gate['recover']]
-                self.call(on, 'macro.play', {'path': str(self.base / seg['file'])})
-                self.wait_macro(on, seg.get('cap', 60))
+                path = self.base / seg['file']
+                if not seg.get('sha256'):
+                    raise RuntimeError(f'segment {gate["recover"]} has no sha256; refusing to play an unhashed '
+                                       f'recording ({path.name})')
+                if digest(path) != seg['sha256']:
+                    raise RuntimeError(f'segment {gate["recover"]} changed since the dry run')
 
-    def check_gate(self, on, name):
-        self._gate_evidence = True
-        gate = self.plan['gates'][name]
-        self._arm_frames = True
-        self._gate_baseline = None
-        self._gate_latest = None
-        missing = harness.gate_inputs_missing(self, on, gate)
+                start_gate = seg.get('start_gate')
+                if start_gate:
+                    try:
+                        self.gate(on, start_gate)
+                    except Exception as error:
+                        if isinstance(error, StopRun) or macro_gate.stop(error, self.check_stop):
+                            raise
+                        raise closed_loop.DispatchRejected(
+                            f'recovery segment {gate["recover"]} not sent: start gate {start_gate} failed: '
+                            f'{error}') from error
+
+                def still_needed(remaining):
+                    started = time.monotonic()
+                    try:
+                        self.check_gate(on, name, cap=remaining)
+                    except closed_loop.DispatchRejected:
+                        raise
+                    except RuntimeError as error:
+                        if macro_gate.stop(error, self.check_stop):
+                            raise
+                    else:
+                        return False
+                    start_gate = seg.get('start_gate')
+                    left = remaining - (time.monotonic() - started)
+                    if start_gate and left > 0:
+                        try:
+                            self.check_gate(on, start_gate, cap=left)
+                        except Exception as error:
+                            if isinstance(error, StopRun) or macro_gate.stop(error, self.check_stop):
+                                raise
+                            raise closed_loop.DispatchRejected(
+                                f'recovery segment {gate["recover"]} not sent: start gate {start_gate} failed: '
+                                f'{error}') from error
+                    return True
+
+                if self.dispatch_macro(on, path, name=gate['recover'], requalify=still_needed):
+                    self.wait_macro(on, seg.get('cap', 60))
+
+    def _candidate_context(self, on, name, gate, cap, deadline, token):
+        preceding = token.candidates[-1] if token.candidates else None
+        return {
+            'name': name, 'on': on, 'cap': cap, 'deadline': deadline, 'logs': [], 'temporary': [],
+            'paths': {}, 'pictures': [], 'retired': set(), 'stills': [], 'files': [], 'captures': [],
+            'receipts': [], 'refused': [],
+            'errors': [], 'new_records': [], 'gate_updates': {}, 'state_consumes': [], 'intents': [],
+            'still_records': dict(preceding['still_records'] if preceding else self.still_records),
+            'runs': copy.deepcopy(preceding['runs'] if preceding else self.stills.runs),
+            'frame_sources': dict(preceding['frame_sources'] if preceding else self._frame_sources),
+            'plan': copy.deepcopy(preceding['plan'] if preceding else self.plan),
+            'ticket': token, 'references': set(preceding['references'] if preceding else ()),
+            'baseline': None, 'latest': None, 'outcome': None, 'evidence': True, 'passed': False,
+            'role': harness.assertion_role(gate),
+        }
+
+    def check_gate(self, on, name, *, cap=None):
+        started = time.monotonic()
+        current = macro_gate.current_ticket()
+        preceding = current.candidates[-1] if current is not None and current.candidates else None
+        original = (preceding['plan']['gates'][name] if preceding else self.plan['gates'][name])
+        cap = original['cap'] if cap is None else min(original['cap'], cap)
+        deadline = started + cap
+        previous_gate = getattr(self._gate_context, 'gate', None)
+        if previous_gate is not None:
+            deadline = min(deadline, previous_gate['deadline'])
+        gate = {**original, 'cap': cap}
+        token = macro_gate.current_ticket()
+        direct = token is None
+        if direct:
+            token = macro_gate.Ticket(deadline)
+        context = {'name': name, 'on': on, 'cap': cap, 'deadline': deadline, 'logs': [], 'outcome': None,
+                   'role': harness.assertion_role(gate)}
+        previous = getattr(self._gate_context, 'token', None)
+        if macro_gate.abandoned() or (previous is not None and self._gate_owner is not previous):
+            raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+        result_slot = {
+            'sequence': next(self._gate_sequence), 'value': None, 'ticket': token,
+            'timeout': {'gate': name, 'on': on, 'role': context['role'], 'timed_out': True,
+                        'reason': (f'gate {name} on {on} did not pass within {cap} s: '
+                                   'gate evidence was still being written by an earlier check'),
+                        'screen_unchanged': None, 'missing_evidence': False, 'screen_reached': self.screen_reached},
+        }
+        self._gate_results.append(result_slot)
+        context['result_slot'] = result_slot
+        self._gate_context.gate = context
+        registered = False
+        missing = False
         try:
-            result = self.check_gate_spec(on, gate, name)
-        except RuntimeError as error:
-            timed_out = 'did not pass within' in str(error) or 'never settled' in str(error)
-            if timed_out:
-                self.last_gate_outcome = harness.timeout_facts(
-                    self, on, name, gate, missing, gate.get('tolerance', DEFAULT_TOLERANCE))
-            else:
-                self.last_gate_outcome = {'gate': name, 'on': on, 'role': harness.assertion_role(gate),
-                                          'timed_out': False, 'screen_unchanged': None,
-                                          'missing_evidence': missing, 'screen_reached': self.screen_reached}
+            with self._gate_publication():
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                owner = self._gate_owner
+                if owner is not None and owner is not token:
+                    owner.revoke('superseded')
+                context.update(self._candidate_context(on, name, gate, cap, deadline, token))
+                if not token.attach(self, context):
+                    raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                self._gate_owner = token
+                self._gate_context.token = token
+                self._arm_frames = True
+                registered = True
+            missing = harness.gate_inputs_missing(self, on, gate)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GateEvidenceTimeout(
+                    f'gate {name} on {on} did not pass within {cap} s: '
+                    'gate evidence was still being written by an earlier check')
+            result = self.check_gate_spec(on, {**gate, 'cap': remaining}, name)
+            if not self._gate_valid():
+                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+            context['passed'] = True
+            self._gate_result(result_slot, {'gate': name, 'passed': True, 'role': context['role'],
+                                            'screen_reached': self.screen_reached})
+            return context['paths'].get(result, result) if isinstance(result, str) else result
+        except StopRun:
+            token.revoke('cancel')
             raise
-        else:
-            if harness.assertion_role(gate) == 'screen':
-                self.screen_reached = True
-            self.last_gate_outcome = {'gate': name, 'passed': True, 'role': harness.assertion_role(gate),
-                                      'screen_reached': self.screen_reached}
-            self.gate_saw_evidence.append(self._gate_evidence)
-            return result
+        except GateEvidenceTimeout as error:
+            self._gate_result(result_slot, {'gate': name, 'on': on, 'role': harness.assertion_role(gate),
+                                            'timed_out': True, 'reason': str(error), 'screen_unchanged': None,
+                                            'missing_evidence': missing, 'screen_reached': self.screen_reached})
+            token.revoke('lock_timeout')
+            raise
+        except RuntimeError as error:
+            if macro_gate.abandoned() or (registered and self._gate_owner is not token):
+                raise
+            timed_out = ('did not pass within' in str(error) or 'never settled' in str(error)
+                         or time.monotonic() >= deadline)
+            if timed_out:
+                outcome = harness.timeout_facts(self, on, name, gate, missing,
+                                                gate.get('tolerance', DEFAULT_TOLERANCE))
+                outcome['reason'] = str(error)
+            else:
+                outcome = {'gate': name, 'on': on, 'role': harness.assertion_role(gate), 'timed_out': False,
+                           'screen_unchanged': None, 'missing_evidence': missing, 'screen_reached': self.screen_reached}
+            self._gate_result(result_slot, outcome)
+            raise
         finally:
-            self._arm_frames = False
+            if not context.get('passed'):
+                self._cancel_acquisition(context)
+            self._gate_context.token = previous
+            self._gate_context.gate = previous_gate
+            if direct and registered:
+                if token.is_revoked():
+                    token.discard()
+                    if sys.exc_info()[0] is None:
+                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                elif not token.finish():
+                    token.revoke()
+                    token.discard()
+                    raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
         last_refused = None
+        failure_saved = False
+
+        def can_capture_failure():
+            context = getattr(self._gate_context, 'gate', None)
+            return context is None or time.monotonic() < context['deadline']
+
+        def pause(delay):
+            nonlocal failure_saved
+            if not failure_saved and time.monotonic() + delay >= until and can_capture_failure():
+                if kind in ('change', 'image'):
+                    self.shot(on, 'GATE-FAILED-' + name)
+                else:
+                    self.failure_evidence(on, name)
+                failure_saved = True
+            time.sleep(max(0, min(delay, until - time.monotonic())))
+
         if kind == 'text':
             source = self.trace_source(on)
             pattern = re.compile(gate['pattern'])
@@ -2061,7 +2757,7 @@ class Runner:
                         evidence['point_id'] = record['point_id']
                     self.log({'gate': name, 'on': on, 'pass': True, **evidence})
                     return evidence
-                time.sleep(max(0, min(.1, until - time.monotonic())))
+                pause(.1)
         elif kind == 'log':
             # Lines from this row only: the line usually appears while the segment before the gate is playing.
             # "on_all": every listed instance must match; "equal": their captured groups must be the same;
@@ -2078,32 +2774,32 @@ class Runner:
                                 raise RuntimeError(f'gate {name} on {side}: group {number} is {m.group(int(number))!r}, '
                                                    f'expected {want!r}: {m.group(0)[:200]}')
                     if gate.get('equal') and len(set(groups.values())) > 1:
-                        time.sleep(.5)  # the other side may not have written its line yet
+                        pause(.5)  # the other side may not have written its line yet
                         if time.monotonic() >= until:
                             raise RuntimeError(f'gate {name}: captured values differ across instances: {groups}')
                         continue
                     lines = {side: m.group(0)[:300] for side, m in found.items()}
                     self.log({'gate': name, 'on': sides, 'pass': True, 'lines': lines})
                     return lines
-                time.sleep(.3)
+                pause(.3)
         elif kind == 'change':
             # Passes when the region differs from the row's earlier "mark" shot and, with "stable", has stopped moving.
             before = self.marks.get((on, gate['mark']))
             if before is None:
                 raise RuntimeError(f'gate {name}: no mark {gate["mark"]!r} taken on {on} earlier in this row')
-            baseline = self.still_records.get(str(before))
+            baseline = self._still_record(before)
             if not still_fresh.usable(baseline):
                 raise RuntimeError(f'gate {name}: baseline mark {gate["mark"]} is not valid evidence: '
                                    f'{still_fresh.unusable_reason(baseline)}')
             previous = None
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
-                still = self.still_records.get(str(path))
+                still = self._still_record(path)
                 if not still_fresh.usable(still):
                     last_refused = still_fresh.evidence_issue(still)
                     if still_fresh.refused(still):
-                        path.unlink(missing_ok=True)
-                    time.sleep(gate.get('interval', .5))
+                        self._retire_gate_picture(path)
+                    pause(gate.get('interval', .5))
                     continue
                 last_refused = None
                 changed = self.roi_diff(path, before, gate['roi']) > gate.get('min_diff', DEFAULT_TOLERANCE)
@@ -2113,10 +2809,11 @@ class Runner:
                     self.log({'gate': name, 'on': on, 'pass': True, 'shot': str(path), 'mark': str(before)})
                     return str(path)
                 if previous is not None and previous != before:
-                    Path(previous).unlink(missing_ok=True)
+                    self._retire_gate_picture(previous)
                 previous = path
-                time.sleep(gate.get('interval', .5))
-            self.shot(on, 'GATE-FAILED-' + name)
+                pause(gate.get('interval', .5))
+            if not failure_saved and can_capture_failure():
+                self.shot(on, 'GATE-FAILED-' + name)
         elif kind == 'ui':
             # A frontend widget state, e.g. the room window's member count: {"match": {"class": "QLabel",
             # "text": "2 / 8"}}. Passes when at least one visible widget matches.
@@ -2128,20 +2825,24 @@ class Runner:
                     self.log({'gate': name, 'on': on, 'pass': True, 'widget': {k: hits[0].get(k) for k in
                                                                                  ('id', 'class', 'name', 'text')}})
                     return {k: hits[0].get(k) for k in ('id', 'class', 'name', 'text')}
-                time.sleep(.5)
+                pause(.5)
         elif kind == 'status':
             # Eden's own status, e.g. a game that finished loading: {"expect": {"running": true,
             # "loading_complete": true}, "max_frame_age_ms": 1500} (the same test eden-lifecycle's up uses).
             while time.monotonic() < until:
                 self.check_stop()
                 status = self.call(on, 'status') or {}
+                if not self._gate_valid():
+                    raise RuntimeError(f'gate {name} requalification was abandoned')
+                if time.monotonic() >= until:
+                    break
                 fresh = ('max_frame_age_ms' not in gate or
                          (isinstance(status.get('last_frame_age_ms'), (int, float))
                           and status['last_frame_age_ms'] < gate['max_frame_age_ms']))
                 if fresh and not status.get('modal') and all(status.get(k) == v for k, v in gate['expect'].items()):
                     self.log({'gate': name, 'on': on, 'pass': True})
                     return {k: status.get(k) for k in gate['expect']}
-                time.sleep(.5)
+                pause(.5)
         elif kind == 'state':
             return self.state_gate(on, name, gate, until)
         elif kind == 'json':
@@ -2151,32 +2852,43 @@ class Runner:
                 try:
                     document = json.loads(source.read_text())
                     if all(dotted(document, k) == v for k, v in gate['expect'].items()):
+                        if not self._gate_valid():
+                            raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
                         copy = self.row_dir / f'{name}-{source.name}'
-                        copy.write_text(json.dumps(document, indent=2) + '\n')
+                        context = getattr(self._gate_context, 'gate', None)
+                        contents = (json.dumps(document, indent=2) + '\n').encode()
+                        if context is None:
+                            copy.write_bytes(contents)
+                        else:
+                            self._stage_gate_file(context, copy, contents)
                         self.log({'gate': name, 'on': on, 'pass': True, 'copy': str(copy)})
                         return str(copy)
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
-                time.sleep(.25)
-        elif kind == 'image' and gate.get('acquire') and not (self.base / gate['reference']).is_file():
+                pause(.25)
+        elif kind == 'image' and gate.get('acquire') and self._gate_reference(gate, name) is None:
             return self.acquire(on, name, gate, until)
         else:
             hook = load_hook(self.base, gate) if kind == 'hook' else None
+            if kind == 'image' and self._gate_reference(gate, name) is None:
+                raise RuntimeError(f'gate {name}: reference is not approved or its sha256 does not match')
             scale = None if hook is not None else self.image_scale(gate)
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
-                still = self.still_records.get(str(path))
+                still = self._still_record(path)
                 if not still_fresh.usable(still):
                     last_refused = still_fresh.evidence_issue(still)
                     if still_fresh.refused(still):
-                        path.unlink(missing_ok=True)
-                    time.sleep(gate.get('interval', 1))
+                        self._retire_gate_picture(path)
+                    pause(gate.get('interval', 1))
                     continue
                 last_refused = None
                 note = None
                 hook_evidence = None
                 if hook is not None:
                     outcome = hook(str(path), gate)
+                    if not self._gate_valid():
+                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
                     passed = bool(outcome)
                     # Bare True checked the row and named nothing. Any other truthy result is the evidence.
                     if passed and outcome is not True:
@@ -2185,31 +2897,63 @@ class Runner:
                             hook_evidence = outcome
                         except TypeError:
                             hook_evidence = repr(outcome)[:300]
-                    self._gate_evidence = hook_evidence is not None
+                    with self._gate_publication():
+                        if not self._gate_valid():
+                            raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                        context = getattr(self._gate_context, 'gate', None)
+                        if context is None:
+                            self._gate_evidence = hook_evidence is not None
+                        else:
+                            context['evidence'] = hook_evidence is not None
                 else:
+                    reference = self._gate_reference(gate, name)
+                    if reference is None:
+                        raise RuntimeError(f'gate {name}: reference is not approved or its sha256 does not match')
                     diff, note = self.compare_region(
-                        path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'), scale,
+                        path, reference, gate['roi'], gate.get('reference_is_roi'), scale,
                         gate.get('frame'), gate.get('tolerance', DEFAULT_TOLERANCE))
+                    if not self._gate_valid():
+                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                    if self._gate_reference(gate, name) is None:
+                        raise RuntimeError(f'gate {name}: reference is not approved or its sha256 does not match')
                     passed = diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
                 if passed:
                     record = {'gate': name, 'on': on, 'pass': True, 'shot': str(path)}
                     if note:
                         record.update(note)
-                        self.last_image_scale = {'gate': name, **note}
-                        self.scales_used.append(self.last_image_scale)
+                        with self._gate_publication():
+                            if not self._gate_valid():
+                                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                            context = getattr(self._gate_context, 'gate', None)
+                            scale_note = {'gate': name, **note}
+                            if context is None:
+                                self.last_image_scale = scale_note
+                                self.scales_used.append(scale_note)
+                            else:
+                                context['scale'] = scale_note
                     if hook is not None:
                         record['hook_evidence'] = hook_evidence
-                        self.last_hook_evidence = hook_evidence
+                        with self._gate_publication():
+                            if not self._gate_valid():
+                                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                            context = getattr(self._gate_context, 'gate', None)
+                            if context is None:
+                                self.last_hook_evidence = hook_evidence
+                            else:
+                                context['hook_evidence_set'] = True
+                                context['hook_evidence'] = hook_evidence
                     self.log(record)
                     return str(path)
-                path.unlink(missing_ok=True)  # keep only the passing shot and the final failing one
-                time.sleep(gate.get('interval', 1))
-            self.shot(on, 'GATE-FAILED-' + name)
+                self._retire_gate_picture(path)
+                pause(gate.get('interval', 1))
+            if not failure_saved and can_capture_failure():
+                self.shot(on, 'GATE-FAILED-' + name)
             detail = f'; {last_refused}' if last_refused else ''
             raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{detail}')
         # Non-image gates save what the game showed when they gave up, so a
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
-        self.failure_evidence(on, name)
+        if not failure_saved and can_capture_failure():
+            self.failure_evidence(on, name)
         missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
         unreadable = (f'; newest sample unreadable (sequence {record["sequence"]}: {record["why"]})'
                       if kind == 'text' and record and not record['known'] else '')
@@ -2218,9 +2962,19 @@ class Runner:
 
     def failure_evidence(self, on, name):
         """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""
+        if not self._gate_valid():
+            return
         try:
             tree = self.clients[on].request('ui.tree', {})
-            (self.row_dir / f'{on}-GATE-FAILED-{name}-tree.json').write_text(json.dumps(tree.get('result'), indent=1))
+            if not self._gate_valid():
+                return
+            target = self.row_dir / f'{on}-GATE-FAILED-{name}-tree.json'
+            contents = json.dumps(tree.get('result'), indent=1).encode()
+            context = getattr(self._gate_context, 'gate', None)
+            if context is None:
+                target.write_bytes(contents)
+            else:
+                self._stage_gate_file(context, target, contents)
             dialogs = [{'class': n.get('class'), 'name': n.get('name'), 'title': node_text(n, 'title'),
                         'text': node_text(n, 'text')} for n in tree.get('result') or []
                        if n.get('visible') and (n.get('class') in ('QMessageBox', 'QDialog', 'QLabel')
@@ -2228,6 +2982,8 @@ class Runner:
             self.log({'gate': name, 'on': on, 'pass': False, 'visible_dialog_widgets': dialogs[:20]})
         except Exception as error:  # noqa: BLE001 - evidence is best effort; the gate failure is the result
             self.log({'gate': name, 'on': on, 'failure_evidence_error': repr(error)})
+        if not self._gate_valid():
+            return
         try:
             self.shot(on, 'GATE-FAILED-' + name)
         except Exception as error:  # noqa: BLE001
@@ -2236,29 +2992,100 @@ class Runner:
     def acquire(self, on, name, gate, until):
         """First visit of a screen with no reference yet: wait until the region stops changing, save that shot as the
         reference, write its sha256 into rows.json, and flag the row so the runner stops for a review after it."""
+        if gate_candidate(self.base / gate['reference']):
+            raise RuntimeError(f'gate {name}: reference uses a reserved candidate path')
+        if getattr(self._gate_context, 'gate', None) is None:
+            token = macro_gate.current_ticket()
+            direct = token is None
+            if direct:
+                token = macro_gate.Ticket(until)
+            cap = max(0.0, until - time.monotonic())
+            context = {'name': name, 'on': on, 'cap': cap, 'deadline': until, 'logs': [], 'outcome': None,
+                       'role': harness.assertion_role(gate)}
+            previous = getattr(self._gate_context, 'token', None)
+            self._gate_context.gate = context
+            registered = False
+            completed = False
+            try:
+                with self._gate_publication():
+                    if self._gate_owner is not None and self._gate_owner is not token:
+                        self._gate_owner.revoke('superseded')
+                    context.update(self._candidate_context(on, name, gate, cap, until, token))
+                    if not token.attach(self, context):
+                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                    self._gate_owner = token
+                    self._gate_context.token = token
+                    self._arm_frames = True
+                    registered = True
+                result = self.acquire(on, name, gate, until)
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                completed = True
+                return result
+            except StopRun:
+                token.revoke('cancel')
+                raise
+            finally:
+                if not completed:
+                    self._cancel_acquisition(context)
+                self._gate_context.token = previous
+                self._gate_context.gate = None
+                if direct and registered:
+                    if token.is_revoked():
+                        token.discard()
+                    elif not token.finish():
+                        token.revoke()
+                        token.discard()
+                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
         previous, last_refused = None, None
         while time.monotonic() < until:
             path = self.shot(on, 'acquire-' + name)
-            still = self.still_records.get(str(path))
+            still = self._still_record(path)
             if not still_fresh.usable(still):
                 last_refused = still_fresh.evidence_issue(still)
                 if still_fresh.refused(still):
-                    path.unlink(missing_ok=True)
+                    self._retire_gate_picture(path)
                 time.sleep(gate.get('interval', .5))
                 continue
             last_refused = None
             if previous is not None and self.roi_diff(path, previous, gate['roi']) <= gate.get('settle', 2):
+                if not self._gate_valid():
+                    raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
                 reference = self.base / gate['reference']
                 reference.parent.mkdir(parents=True, exist_ok=True)
-                reference.write_bytes(path.read_bytes())
-                gate['sha256'] = digest(reference)
-                gate['acquired'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                self.manifest_path.write_text(json.dumps(self.plan, indent=2) + '\n')
-                self.acquired.append({'gate': name, 'reference': str(reference), 'shot': str(path)})
-                self.log({'gate': name, 'on': on, 'acquired': str(reference), 'sha256': gate['sha256']})
+                data, sha256 = path.read_bytes(), digest(path)
+                if hashlib.sha256(data).hexdigest() != sha256:
+                    raise RuntimeError(f'gate {name}: acquisition screenshot changed while reading')
+                acquired = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                context = self._gate_context.gate
+                plan = context['plan']
+                context['acquisition_checkpoint'] = {
+                    'files': len(context['files']), 'intents': len(context['intents']),
+                    'receipts': len(context['receipts']), 'gate_updates': copy.deepcopy(context['gate_updates']),
+                    'references': set(context['references']), 'name': name,
+                    'previous': copy.deepcopy(plan['gates'].get(name)),
+                }
+                plan['gates'].setdefault(name, copy.deepcopy(gate)).update(sha256=sha256, acquired=acquired)
+                try:
+                    self._stage_gate_file(context, reference, data)
+                    self._stage_gate_file(context, self.manifest_path, (json.dumps(plan, indent=2) + '\n').encode())
+                    intent = acquisition_intent(reference)
+                    with tempfile.NamedTemporaryFile(dir=intent.parent, prefix=f'{GATE_CANDIDATE_PREFIX}intent-',
+                                                     delete=False) as stream:
+                        intent_candidate = Path(stream.name)
+                    context['temporary'].append(intent_candidate)
+                    context['intents'].append((intent_candidate, intent, intent.exists()))
+                except BaseException:
+                    self._cancel_acquisition(context)
+                    raise
+                context['gate_updates'][name] = copy.deepcopy(plan['gates'][name])
+                context['references'].add(reference.resolve())
+                context['receipts'].append({'gate': name, 'reference': str(reference),
+                                            'shot': context['paths'][str(path)]})
+                self.log({'gate': name, 'on': on, 'acquisition_pending': str(reference), 'sha256': sha256})
                 return str(reference)
             if previous is not None:
-                previous.unlink(missing_ok=True)
+                self._retire_gate_picture(previous)
             previous = path
             time.sleep(gate.get('interval', .5))
         detail = f'; {last_refused}' if last_refused else ''
@@ -2430,6 +3257,8 @@ class Runner:
         start, until, asked, why = log.stat().st_size if log.exists() else 0, time.monotonic() + cap, 0.0, 'no block'
         while time.monotonic() < until:
             self.check_stop()
+            if not self._gate_valid():
+                raise closed_loop.DispatchRejected('state requalification was abandoned')
             if time.monotonic() - asked > ask_every:
                 switch_hw.bridge_v2(log.parent, f'state {provider}')
                 asked = time.monotonic()
@@ -2479,9 +3308,16 @@ class Runner:
         block, why = self._state_block(on, provider, max(0.1, until - time.monotonic()), lambda b: state_gate.satisfies(
             b, gate.get('where', {}), base if input_gate else None, gate.get('transition'), gate.get('ack'), input_gate),
             ask_every=gate.get('poll_s', 1.0))
-        if input_gate:
-            self.state_marks.pop(key, None)  # one press, one baseline, one confirmation
-            self.state_pending.pop((row, on), None)
+        with self._gate_publication():
+            if not self._gate_valid():
+                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+            if input_gate:
+                context = getattr(self._gate_context, 'gate', None)
+                if context is None:
+                    self.state_marks.pop(key, None)
+                    self.state_pending.pop((row, on), None)
+                else:
+                    context['state_consumes'].append((key, (row, on)))
         evidence = {k: block['values'].get(k) for k in ('focus', 'ack', 'ack.result', *gate.get('where', {}))}
         if input_gate:
             evidence.update(press=pending, confirmed=why)
@@ -2620,10 +3456,16 @@ class Runner:
             raise RuntimeError(f'library segment {name} file missing: {path}')
         if entry.get('sha256') and digest(path) != entry['sha256']:
             raise RuntimeError(f'library segment {name} sha256 mismatch')
-        if entry.get('start_gate') and entry['start_gate'] in self.plan.get('gates', {}):
+        start_gate = entry.get('start_gate') if entry.get('start_gate') in self.plan.get('gates', {}) else None
+        if start_gate:
             self.gate(on, entry['start_gate'])
-        self.call(on, 'macro.play', {'path': str(path)})
-        self.wait_macro(on, entry.get('cap', 60))
+
+        def requalify(remaining):
+            self.check_gate(on, start_gate, cap=remaining)
+            return True
+
+        if self.dispatch_macro(on, path, name=name, requalify=requalify if start_gate else macro_gate.BLIND):
+            self.wait_macro(on, entry.get('cap', 60))
 
     def _step_library(self, on, step):
         self.play_library(on, step['library'])
@@ -3204,6 +4046,7 @@ class Runner:
             self.row_offsets = self.log_offsets()
             self.marks, self.copies, self.acquired = {}, {}, []
             self.row_stills_refused, self.row_still_errors = [], []
+            self.row_macro_waits = []
             self.scales_used, self.gate_saw_evidence = [], []
             self.last_image_scale = None
             self.last_hook_evidence = None
@@ -3358,6 +4201,8 @@ class Runner:
                     receipt['stills_refused'] = list(self.row_stills_refused)
                 if self.row_still_errors:
                     receipt['still_errors'] = list(self.row_still_errors)
+                if self.row_macro_waits:
+                    receipt['macro_waits'] = list(self.row_macro_waits)
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
                 self.captures = None
@@ -3370,6 +4215,7 @@ class Runner:
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
                                   **({'stills_refused': len(self.row_stills_refused)} if self.row_stills_refused else {}),
                                   **({'still_errors': len(self.row_still_errors)} if self.row_still_errors else {}),
+                                  **({'macro_waits': len(self.row_macro_waits)} if self.row_macro_waits else {}),
                                   'receipt': str(receipt_path)}), flush=True)
                 if not (self.session_config() or {}).get('per_row_files') or self.session is None:
                     self.queue_judge(row['id'])  # no per-row clip file: judge the shots now

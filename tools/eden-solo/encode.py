@@ -13,7 +13,7 @@ x, y, w, h = (int(v) for v in sys.argv[3].split(','))
 fps = float(sys.argv[4]) if len(sys.argv) > 4 else 10
 colors = int(sys.argv[5]) if len(sys.argv) > 5 else 128
 if source.is_dir():
-    raw = [Image.open(p) for p in sorted(source.glob('*.png'))]
+    raw = [Image.open(p) for p in sorted(source.glob('*.png')) if not p.name.startswith('.gate-candidate-')]
 else:
     raw = [frame.copy() for frame in ImageSequence.Iterator(Image.open(source))]
 if fps > 0:

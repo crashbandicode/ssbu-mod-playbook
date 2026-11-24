@@ -12,6 +12,12 @@ _FRAME = re.compile(rb' frame=(\d+) wall=(\d+)$')
 _READ_BYTES = 1024 * 1024
 
 
+class PreparedRecord(dict):
+    def __init__(self, record):
+        super().__init__(record)
+        self.encoded = json.dumps(record) + '\n'
+
+
 class FrameSource:
     def __init__(self, path):
         self.path = Path(path) if path is not None else None
@@ -74,7 +80,7 @@ class Ledger:
         self.frames = frames
         self.runs = {}
 
-    def record(self, on, path, reply, frame_source):
+    def record(self, on, path, reply, frame_source, *, commit=None):
         path = Path(path)
         data = path.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
@@ -111,11 +117,30 @@ class Ledger:
                   'utc': datetime.now(timezone.utc).isoformat(), 'boot': boot, 'frame': frame, 'wall': wall,
                   'backend': reply.get('backend'), 'uniform': reply.get('uniform'), 'warning': reply.get('warning'),
                   'status': status, 'reason': reason, 'unchanged_frames': unchanged, 'first_identical': first_file}
-        with (self.out_dir / 'stills.jsonl').open('a', encoding='utf-8') as stream:
-            stream.write(json.dumps(record) + '\n')
-        self.runs[on] = {'sha256': digest, 'boot': boot, 'frame': frame,
-                         'first_file': first_file, 'first_frame': first_frame}
+        run = {'sha256': digest, 'boot': boot, 'frame': frame,
+               'first_file': first_file, 'first_frame': first_frame}
+        if commit is None:
+            self.append(record)
+            self.runs[on] = run
+        else:
+            commit(record, run)
         return record
+
+    def append(self, record):
+        encoded = record.encoded if isinstance(record, PreparedRecord) else json.dumps(record) + '\n'
+        with (self.out_dir / 'stills.jsonl').open('a', encoding='utf-8') as stream:
+            stream.write(encoded)
+
+
+def load(path):
+    rows = [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines()]
+    retracted, records = set(), []
+    for row in reversed(rows):
+        if 'retract' in row:
+            retracted.add((row['retract'], row['sha256']))
+        elif (row.get('file'), row.get('sha256')) not in retracted:
+            records.append(row)
+    return list(reversed(records))
 
 
 def refused(record):

@@ -80,7 +80,7 @@ def delayed_coin(clock, *, action='a', pending='once'):
             self.pending = None
             self.pending_reads = 0
 
-        def send(self, segment):
+        def send(self, segment, until=None):
             if action == 'a' and segment == 'tap-a1':
                 self.actions.append(segment)
                 held = self.values.get('p1.carried', self.values.get('carried', 'none'))
@@ -88,7 +88,7 @@ def delayed_coin(clock, *, action='a', pending='once'):
                     held = 'none'
                 self.pending = ('take', self.values['hand.token']) if held == 'none' else ('place', held)
                 return
-            super().send(segment)
+            super().send(segment, until=until)
             if action == 'step' and segment.startswith('tile-'):
                 self.pending = ('identity', {key: self.values[key] for key in
                                              ('carried.kind', 'carried.name', 'carried.form')})
@@ -128,9 +128,9 @@ def menu_replay(clock, *, idle=False, delay_ack=False):
             self.cached = None
             self.previous = None
 
-        def send(self, segment):
+        def send(self, segment, until=None):
             previous = dict(self.menu)
-            super().send(segment)
+            super().send(segment, until=until)
             self.cached = None
             if delay_ack:
                 self.previous = previous
@@ -321,8 +321,8 @@ class SetupReworkTests(unittest.TestCase):
                 before = io.read('tr.menu', .2)
                 send = io.send
 
-                def press(segment):
-                    send(segment)
+                def press(segment, until=None):
+                    send(segment, until=until)
                     if macro == 'tap-a1':
                         io.previous['scene'] = 'notice'
 
@@ -339,12 +339,12 @@ class SetupReworkTests(unittest.TestCase):
                 before = io.read('tr.menu', .2)
                 send = io.send
 
-                def press(segment):
+                def press(segment, until=None):
                     if fault == 'timeout':
                         io.actions.append(segment)
                     else:
                         io.wrong_ack = fault == 'gap'
-                        send(segment)
+                        send(segment, until=until)
                         if fault == 'ignored':
                             io.menu['ack.result'] = 'ignored'
 

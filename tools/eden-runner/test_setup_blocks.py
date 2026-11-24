@@ -58,7 +58,7 @@ class MenuIO:
         return self.observe(provider, cap, recorded.native(self.rev, epoch=epoch, screen='training', focus='training',
                                                           **{'screen.context': 'training', 'input.owner': owner}))
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
         metrics = self.ctx.runner.setup_metrics
         if metrics is not None:
@@ -250,14 +250,14 @@ class OpenCloseTests(unittest.TestCase):
         release = [None]
         read, send = io.read, io.send
 
-        def delayed_send(segment):
+        def delayed_send(segment, until=None):
             if segment == 'tap-b1' and io.menu['open'] == '0' and io.step == 1:
                 io.actions.append(segment)
                 io.ctx.runner.setup_metrics['inputs'] += 1
                 io.pending_input = segment
                 release[0] = clock[0] + 4.0
                 return
-            send(segment)
+            send(segment, until=until)
 
         def delayed_read(provider, cap):
             if provider == 'tr.menu' and io.pending_input:
@@ -350,9 +350,9 @@ class RowsIO(MenuIO):
                           'action': action, 'row': row, 'row_id': row_id,
                           'focus': f'fighters_stages/{26 if nested else -1}/{self.page_index}/{action}'})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment not in ('main-menu-down', 'tap-a1'):
-            return super().send(segment)
+            return super().send(segment, until=until)
         self.actions.append(segment)
         if self.ctx.runner.setup_metrics is not None:
             self.ctx.runner.setup_metrics['inputs'] += 1
@@ -382,14 +382,14 @@ class GotoTests(OpenCloseTests):
         send = io.send
         dropped = False
 
-        def send_with_drop(segment):
+        def send_with_drop(segment, until=None):
             nonlocal dropped
             if segment == 'main-menu-down' and not dropped:
                 dropped = True
                 io.actions.append(segment)
                 io.ctx.runner.setup_metrics['inputs'] += 1
                 return
-            send(segment)
+            send(segment, until=until)
 
         io.send = send_with_drop
         with patch.object(routes, 'INPUT_LAG_S', .003, create=True):
@@ -402,15 +402,15 @@ class GotoTests(OpenCloseTests):
         send = io.send
         first = True
 
-        def send_with_late_input(segment):
+        def send_with_late_input(segment, until=None):
             nonlocal first
             if segment == 'main-menu-down' and first:
                 first = False
                 io.actions.append(segment)
                 io.ctx.runner.setup_metrics['inputs'] += 1
                 return
-            send(segment)
-            send(segment)
+            send(segment, until=until)
+            send(segment, until=until)
 
         io.send = send_with_late_input
         with patch.object(routes, 'INPUT_LAG_S', .003, create=True):
@@ -460,10 +460,10 @@ class GotoTests(OpenCloseTests):
         io = RowsIO(self.ctx)
         original = io.send
 
-        def send(segment):
+        def send(segment, until=None):
             if segment == 'main-menu-down' and io.menu['depth'] != '0':
                 io.fault = 'stuck'
-            original(segment)
+            original(segment, until=until)
 
         io.send = send
         with self.assertRaisesRegex(RuntimeError, 'focus identity did not change'):
@@ -484,7 +484,7 @@ class StopIO(RowsIO):
         self.menu.update({'game': 'Guard the Edge', 'game.running': '1',
                           'notice.header': '', 'notice.body': ''})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment == 'tap-a1' and self.menu['depth'] == '1':
             self.actions.append(segment)
             if self.ctx.runner.setup_metrics is not None:
@@ -496,7 +496,7 @@ class StopIO(RowsIO):
             if self.fault != 'stop_stuck':
                 self.menu['game.running'] = '0'
         else:
-            super().send(segment)
+            super().send(segment, until=until)
             if segment == 'tap-b1':
                 self.update_focus()
 
@@ -583,7 +583,7 @@ class WizardIO(RowsIO):
         epoch = 2 if self.fault == 'epoch' and self.actions else 1
         return self.observe(provider, cap, recorded.snapshot(provider, self.menu_rev, dict(self.menu), epoch=epoch))
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if self.menu['open'] == '1':
             if segment == 'tap-a1' and self.menu['depth'] == '1' and self.menu['row'] == 'Set up…':
                 self.actions.append(segment)
@@ -593,7 +593,7 @@ class WizardIO(RowsIO):
                 self.step = 1
                 self.refresh_notice()
                 return
-            return super().send(segment)
+            return super().send(segment, until=until)
         self.actions.append(segment)
         if self.ctx.runner.setup_metrics is not None:
             self.ctx.runner.setup_metrics['inputs'] += 1
@@ -626,7 +626,7 @@ class BackWizardIO(WizardIO):
         self.stuck = stuck
         self.pending_input = None
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment == 'tap-b1' and self.menu['open'] == '0' and self.menu['notice.header'].startswith('Edge · '):
             self.actions.append(segment)
             self.ctx.runner.setup_metrics['inputs'] += 1
@@ -639,7 +639,7 @@ class BackWizardIO(WizardIO):
                     self.menu.update({'open': '1' if self.ending == 'menu' else '0', 'depth': '0',
                                       'game.running': '0', 'notice.header': '', 'notice.body': ''})
             return
-        return super().send(segment)
+        return super().send(segment, until=until)
 
     def finish(self):
         self.pending_input = None
@@ -702,10 +702,10 @@ class WizardTests(OpenCloseTests):
         io = WizardIO(self.ctx)
         send = io.send
 
-        def double_advance(segment):
-            send(segment)
+        def double_advance(segment, until=None):
+            send(segment, until=until)
             if segment == 'tap-a1':
-                send(segment)
+                send(segment, until=until)
 
         io.send = double_advance
         with self.assertRaisesRegex(RuntimeError, 'expected wizard header Edge · 2/4; saw'):
@@ -726,11 +726,11 @@ class WizardTests(OpenCloseTests):
         io.refresh_notice()
         send = io.send
 
-        def delayed(segment):
+        def delayed(segment, until=None):
             if segment.startswith('wizard-') and len([a for a in io.actions if a.startswith('wizard-')]) < 2:
                 io.actions.append(segment)
                 return
-            send(segment)
+            send(segment, until=until)
 
         io.send = delayed
         result = self.invoke('wizard_place', io, game='Guard the Edge', cpu=[1, 1], cap=.2, pulse_cap=.002)
@@ -742,9 +742,9 @@ class WizardTests(OpenCloseTests):
         pending = []
         send, finish = io.send, io.finish
 
-        def track(segment):
+        def track(segment, until=None):
             pending[:] = [segment]
-            send(segment)
+            send(segment, until=until)
 
         def clear():
             pending.clear()
@@ -762,12 +762,12 @@ class WizardTests(OpenCloseTests):
         io.refresh_notice()
         read, send = io.read, io.send
 
-        def send_with_misses(segment):
+        def send_with_misses(segment, until=None):
             count = len([a for a in io.actions if a.startswith('wizard-')])
             if segment.startswith('wizard-') and count < 2:
                 io.actions.append(segment)
             else:
-                send(segment)
+                send(segment, until=until)
 
         def read_with_misses(provider, cap):
             count = len([a for a in io.actions if a.startswith('wizard-')])
@@ -871,9 +871,9 @@ class SetIO(MenuIO):
         self.menu.update({'action': row_id, 'row_id': row_id, 'row': row_id,
                           'editor': '', 'editor.sel': '-1', 'editor.sel_key': ''})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment == 'tr-menu-open' or segment == 'tap-b1' and self.menu['depth'] == '0':
-            return super().send(segment)
+            return super().send(segment, until=until)
         self.actions.append(segment)
         if self.ctx.runner.setup_metrics is not None:
             self.ctx.runner.setup_metrics['inputs'] += 1
@@ -923,10 +923,10 @@ class PracticeSetIO(RowsIO):
         self.cell = 0
         self.level = 9
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if self.menu['open'] == '0' or not self.editor and not (
                 segment == 'tap-a1' and self.menu['depth'] == '1' and self.menu['action'] == 'edge_difficulty'):
-            result = super().send(segment)
+            result = super().send(segment, until=until)
             if segment == 'tap-b1' and self.menu['open'] == '1':
                 self.update_focus()
             return result

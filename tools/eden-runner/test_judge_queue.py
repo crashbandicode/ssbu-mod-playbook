@@ -1908,15 +1908,14 @@ class RunnerEffects(unittest.TestCase):
                                    known_issues={'known': {'title': 'known', 'reason': 'stand-in judge: FAIL',
                                                            'rows': ['a']}})
                 if broken:
-                    (engine.out / 'stills.jsonl').mkdir()
-                    record = engine.stills.record
+                    append = engine.stills.append
 
-                    def record_with_witness(on, path, reply, frame):
-                        if 'witness' in path.name:
-                            return {'status': 'unverified', 'reason': 'no game frame source'}
-                        return record(on, path, reply, frame)
+                    def append_witness(record):
+                        if 'witness' not in record['file']:
+                            raise OSError('journal unavailable')
+                        append(record)
 
-                    engine.stills.record = record_with_witness
+                    engine.stills.append = append_witness
                 self.assertEqual(engine.run(), 'DONE')
                 result = receipt(folder, 'a')
                 self.assertEqual(result['judge']['verdict'], word)
@@ -1967,14 +1966,14 @@ class RunnerEffects(unittest.TestCase):
                     (folder / 'judge.py').write_text(JUDGE.replace(
                         '[s["path"] for s in job["shots"]]', '[]'))
                 else:
-                    record = engine.stills.record
+                    append = engine.stills.append
 
-                    def record_without_diagnostic(on, path, reply, frame):
-                        if 'diagnostic' in path.name:
+                    def append_without_diagnostic(record):
+                        if 'diagnostic' in record['file']:
                             raise OSError('diagnostic journal failure')
-                        return record(on, path, reply, frame)
+                        append(record)
 
-                    engine.stills.record = record_without_diagnostic
+                    engine.stills.append = append_without_diagnostic
                     (folder / 'judge.py').write_text(JUDGE.replace(
                         '[s["path"] for s in job["shots"]]',
                         '[s["path"] for s in job["shots"] if s["phase"] in ("before", "after")]'))

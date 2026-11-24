@@ -1,9 +1,12 @@
 """Replay exact tile and native state facts without controller or bridge I/O."""
 
 import sys
+import tempfile
+import threading
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_clock
@@ -11,6 +14,11 @@ import native_picker as picker
 import native_picker_io
 import routes
 import trace_attempts
+
+
+class DeadlineSend(Mock):
+    def __call__(self, segment, until=None):
+        return super().__call__(segment)
 
 
 def snapshot(provider, rev, fields, epoch=1):
@@ -57,6 +65,253 @@ def native(rev, epoch=1, **extra):
                                     'dialog': 'none', 'focus.source': 'tile.cursor',
                                     'screen.context': 'unknown', 'ack': '0', 'ack.result': 'unsupported',
                                     **extra}, epoch)
+
+
+class IORequalificationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.bridge = self.root / 'bridge.log'
+        self.bridge.write_text('')
+        self.now, self.sent, self.logs, self.reads = 0.0, [], [], []
+        self.free_at = 1.2
+        self.runner = types.SimpleNamespace(wait_macro=Mock(),
+                                            setup_metrics={'inputs': 0, 'bridge_requests': 0,
+                                                           'bridge_boot': None, 'revisions': {}, 'stalls': []})
+        self.ctx = types.SimpleNamespace(on='a', instance={'bridge_log': str(self.bridge)}, runner=self.runner,
+                                         row_dir=self.root, call=self.call, log=self.logs.append,
+                                         check_stop=lambda: None)
+        self.io = native_picker_io.BridgePickerIO(self.ctx)
+        self.before = native(1, screen='css.training', **{'screen.context': 'training'})
+        self.after = native(2, screen='css.training', **{'screen.context': 'training'})
+        self.after_tile = None
+        self.io._record(self.before)
+
+    def call(self, method, params=None):
+        if method == 'macro.status':
+            return {'state': 'idle' if self.now >= self.free_at else 'playing', 'error': ''}
+        if method == 'macro.play':
+            self.sent.append((self.now, params))
+            return {}
+        raise AssertionError(method)
+
+    def read(self, provider, cap):
+        self.reads.append((provider, cap, self.io.in_flight))
+        self.assertFalse(self.io.in_flight)
+        if provider == 'tile.cursor':
+            self.assertIsNotNone(self.after_tile)
+            return self.io._record(self.after_tile)
+        self.assertEqual(provider, 'ssbu.ui')
+        return self.io._record(self.after)
+
+    def send(self, **options):
+        def sleep(seconds):
+            self.now += seconds
+
+        with patch.object(routes, 'macro_file', return_value=(Path('/leave-css'), 'sha', 5)), \
+                patch.object(self.io, 'read', side_effect=self.read), \
+                patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
+                patch.object(routes.time, 'sleep', side_effect=sleep):
+            return self.io.send('leave-css', **options)
+
+    def test_a_screen_that_changed_while_the_channel_was_busy_gets_no_press(self):
+        self.after = native(2, screen='main_menu', **{'screen.context': 'unknown'})
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'ssbu.ui changed.*screen'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
+
+    def test_abandoned_requalification_cannot_restore_in_flight_after_rejection(self):
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        workers = []
+        self.io.stage_window = native_picker_io._StageWindow(self.before.block['boot'], 0, 0, 0, 0)
+
+        def read(provider, cap):
+            workers.append(threading.current_thread())
+            entered.set()
+            try:
+                release.wait(.8)
+                return self.io._record(self.after)
+            finally:
+                exited.set()
+
+        def expire():
+            if entered.wait(1):
+                self.now = 15
+
+        self.read = read
+        timer = threading.Thread(target=expire)
+        timer.start()
+        try:
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                self.send()
+            self.assertFalse(self.io.in_flight)
+            self.assertNotIn('a', self.io.pending)
+            self.assertNotIn('_receive', self.io.__dict__)
+        finally:
+            release.set()
+            timer.join(1)
+            self.assertTrue(exited.wait(1))
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
+        self.assertFalse(self.io.in_flight)
+        self.assertNotIn('a', self.io.pending)
+        self.assertNotIn('_receive', self.io.__dict__)
+        self.assertEqual(self.sent, [])
+        self.assertIs(self.io.witness['ssbu.ui'], self.before)
+        self.assertEqual(self.io.revisions['ssbu.ui'], [1, 1])
+
+    def test_a_late_requalification_cannot_clobber_a_newer_pending_send(self):
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        workers = []
+        self.io.stage_window = native_picker_io._StageWindow(self.before.block['boot'], 0, 0, 0, 0)
+
+        def read(provider, cap):
+            workers.append(threading.current_thread())
+            entered.set()
+            try:
+                release.wait(.8)
+                return self.io._record(self.after)
+            finally:
+                exited.set()
+
+        def expire():
+            if entered.wait(1):
+                self.now = 15
+
+        self.read = read
+        timer = threading.Thread(target=expire)
+        timer.start()
+        try:
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                self.send()
+            self.send()
+            pending = self.io.pending['a']
+            self.assertTrue(self.io.in_flight)
+            self.assertEqual(len(self.sent), 1)
+        finally:
+            release.set()
+            timer.join(1)
+            self.assertTrue(exited.wait(1))
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
+        self.assertTrue(self.io.in_flight)
+        self.assertEqual(self.io.pending['a'], pending)
+        self.assertEqual(self.io.witness, {})
+        self.assertNotIn('_receive', self.io.__dict__)
+
+    def test_a_channel_that_frees_after_the_callers_deadline_gets_no_press(self):
+        self.free_at = 10.2
+        with self.assertRaises(routes.closed_loop.DispatchRejected):
+            self.send(until=9)
+        self.assertEqual(self.sent, [])
+        self.assertLessEqual(self.now, 9.000001)
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+
+    def test_an_unchanged_source_is_requalified_and_pressed_once(self):
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.reads), 1)
+        self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'], 'requalified, accepted')
+
+    def test_a_changed_bridge_connection_cannot_authorise_the_input(self):
+        self.after = native(2, epoch=2, screen='css.training', **{'screen.context': 'training'})
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'ssbu.ui changed.*connection'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.io.in_flight)
+
+    def test_a_stop_during_requalification_is_not_wrapped_or_recorded_as_a_stall(self):
+        class StopRun(Exception):
+            pass
+
+        self.read = Mock(side_effect=StopRun('STOP-INPUT'))
+        with self.assertRaisesRegex(StopRun, 'STOP-INPUT'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(self.runner.setup_metrics['stalls'], [])
+
+    def test_a_one_shot_check_stop_during_requalification_is_preserved(self):
+        class Cancelled(RuntimeError):
+            pass
+
+        armed = False
+
+        def stop():
+            nonlocal armed
+            if armed:
+                armed = False
+                raise Cancelled('one-shot STOP')
+
+        def read(provider, cap):
+            nonlocal armed
+            armed = True
+            self.ctx.check_stop()
+
+        self.ctx.check_stop = stop
+        self.read = read
+        with self.assertRaisesRegex(Cancelled, 'one-shot STOP'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(self.runner.setup_metrics['stalls'], [])
+
+    def test_every_witness_provider_must_remain_unchanged(self):
+        self.io._record(tile(1, at='7', token='placed'))
+        self.after_tile = tile(2, at='12', token='placed')
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'tile.cursor changed.*at'):
+            self.send()
+        self.assertEqual([provider for provider, _, _ in self.reads], ['ssbu.ui', 'tile.cursor'])
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+
+    def test_requalification_read_is_capped_by_the_remaining_caller_deadline(self):
+        self.send(until=1.5)
+        self.assertEqual(len(self.reads), 1)
+        self.assertAlmostEqual(self.reads[0][1], 1.5 - self.sent[0][0])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_requalification_read_is_capped_by_the_remaining_gate_budget(self):
+        self.free_at = 14.2
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.reads), 1)
+        self.assertAlmostEqual(self.reads[0][1], 15.0 - self.sent[0][0])
+        self.assertLess(self.reads[0][1], 2.0)
+
+    def test_each_witness_read_shares_the_remaining_gate_budget(self):
+        self.free_at = 13.6
+        self.io._record(tile(1, at='7', token='placed'))
+        self.after_tile = tile(2, at='7', token='placed')
+        read = self.read
+
+        def slow_read(provider, cap):
+            sample = read(provider, cap)
+            if provider == 'ssbu.ui':
+                self.now += .8
+            return sample
+
+        self.read = slow_read
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual([provider for provider, _, _ in self.reads], ['ssbu.ui', 'tile.cursor'])
+        self.assertAlmostEqual(self.reads[1][1], self.reads[0][1] - .8)
+        self.assertGreater(self.reads[1][1], 0)
+
+    def test_an_idle_channel_sends_at_once_as_before(self):
+        self.free_at = 0
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reads, [])
+        self.assertIn('a', self.io.pending)
+        self.assertTrue(self.io.in_flight)
 
 
 def loading(rev, *, epoch=1, **extra):
@@ -143,7 +398,7 @@ class Replay:
         except StopIteration:
             raise RuntimeError(f'{provider} missing') from None
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
 
     def finish(self):
@@ -1330,7 +1585,7 @@ class TrainingStageProofTests(unittest.TestCase):
                     if request == 'events on':
                         dst.write(before_press)
 
-            def start(_ctx, name):
+            def start(_ctx, name, **_options):
                 actions.append(name)
                 self.assertEqual(requests, [
                     'state ssbu.ui', 'state tile.cursor', 'state_watch ssbu.ui keys=observation max=1',
@@ -1525,6 +1780,7 @@ class MainMenuStepTests(unittest.TestCase):
         self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
         self.ctx = SimpleNamespace()
         self.io = Mock(connection=1, boot=self.top(1, 'smash').clock[0])
+        self.io.attach_mock(DeadlineSend(), 'send')
         test_io = patch.object(routes, 'BridgePickerIO', return_value=self.io)
         save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
         self.addCleanup(test_io.stop)
@@ -1669,6 +1925,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
 
         import routes
 
+        io.attach_mock(DeadlineSend(), 'send')
         focuses = self.chain[start:]
         frames = [focuses[0]]
         for source, target in zip(focuses, focuses[1:]):
@@ -1966,6 +2223,7 @@ class NativeQuitTrainingTests(unittest.TestCase):
         self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
         self.ctx = SimpleNamespace()
         self.io = Mock(connection=1, boot=self.state(1, 'training').clock[0])
+        self.io.attach_mock(DeadlineSend(), 'send')
         adapter = patch.object(routes, 'BridgePickerIO', return_value=self.io)
         save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
         self.addCleanup(adapter.stop)

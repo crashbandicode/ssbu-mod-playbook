@@ -55,7 +55,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
-| `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; each step awaits its screen, sends once, awaits the transition, resends a lost input at most 3 times and otherwise stops on a named step with `routes-wireless-room-stop.json` |
+| `wireless_room_list` `{ready_cap}` | Main Menu or Local Wireless room list | reads before each dashboard press and reaches a positively ready room list; stops before ZR when the bridge does not publish `dashboard` |
+| `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; uses the same read-before-press dashboard steps, stops before ZR without `dashboard`, and otherwise resends a lost input at most 3 times or stops on a named step |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
@@ -113,12 +114,41 @@ have not yet been confirmed in a live run.
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
-Before every input, the step requires a `macro.status` of `idle` or `finished` without an error.
-`countdown`, `recording`, `playing`, and `branch_playing` wait; any other or unreadable status is treated as busy.
-One 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
+A route starting on a recognised but unready screen waits in that screen's step and stops there, not on `locate`,
+if readiness never arrives; this was found by replaying `rc15-i2-71158421-xps-stop-1`.
+The wireless dashboard path reads before each press: ZR, Down, Down, A on the recorded layout.
+The recorded items are `dashboard.back` (1), `dashboard.collection` (2), `dashboard.local_wireless` (3),
+`dashboard.news` (4), `dashboard.options` (5), and `dashboard.help` (6). Down is sent only on `back` or
+`collection`, guided by `focus.id`; a lower or unknown dashboard item stops without moving upward.
+These keys were recorded on a game once; the route remains unflown with a bridge publishing them.
+Without `dashboard` the route stops before ZR.
+Main, dashboard, room list and Create form require `input.ready=yes`; only the tile-gated pickers accept
+an absent readiness key. The guest waits up to 20 seconds for a positively ready room list without input.
+Dashboard Down and A also require what an open, input-taking dashboard publishes: `input.owner=dashboard` and
+`dialog=dashboard` (`DASHBOARD_OWNERS`, `DASHBOARD_DIALOG`). The Main Menu's own `native` / `none` on an open
+dashboard is a contradiction and gets no press.
+Dashboard A is sent at most once per run, even if the route leaves and later returns to that step.
+After dashboard A, the route only observes until a ready room list appears or the step stops by name.
+After a latched step sends, only its own destination can complete it.
+A repeated step after a jump back is recorded as a stall; a retry within one visit is not counted twice.
+The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,
+with one 15-second budget or the caller's earlier deadline, including requalification.
+An unanswered requalification is abandoned in the background at the bound and its answer is discarded.
+Gate frame capture belongs to its gate invocation, not an abandoned or superseded recheck.
+After a wait, bridge IO re-reads the caller's observations and sends only if they are unchanged and its original
+deadline has not passed. A caller without a witness sends nothing after a wait unless it declares `BLIND`.
+After a wait, recovery requires both the failed gate to remain failed and the recovery segment's own start gate
+to pass when it declares one. Every wait records one stall event, including when nothing is sent; dispatched events
+say whether the call was accepted, rejected or had an unknown delivery outcome. The wireless engine owns its own wait.
+STOP interrupts the idle gate, including a status poll or requalification, without sending or recording a busy stall.
+Eden's `error` state is inactive and releases input; its failure text is retained in the wireless receipt or play log.
+`idle` also releases input, as does `finished` without an error. `countdown`, `recording`, `playing`, and `branch_playing`
+wait; any other or unreadable status is treated as busy.
+In the wireless engine, one 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
 a fresh read. Each `macro.status` poll is limited to the remaining budget; its control-client timeout cannot
 extend that budget, and an unanswered poll counts as busy. Stall diagnostic `status` reads are capped at one
-second and skipped on idle and stop paths. Only a refusal of the `macro.play` call itself (`input_busy`) is
+second. A status poll never extends the step's send window.
+Stall diagnostics are skipped on idle and stop paths. Only a refusal of the `macro.play` call itself (`input_busy`) is
 retried once after idle; a failure after the macro was accepted stops as delivery unknown. Accumulated waits over
 one second and dispatch rejections
 are stall events, carrying `kind`, `step`, `seconds`, `why`, `last_bridge_line`, and `utc`; idle waits also carry
@@ -135,11 +165,13 @@ finish it and resend, up to three sends total (some steps allow fewer). A contin
 confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
 A bridge continuity, boot or fence error is never retried: the route stops on the current step with the receipt and leaves the input unconfirmed.
 If observations stay unreadable or in flight until the cap, stop on the named step without confirming or pressing again.
-Every wireless bridge read gets at least 2 seconds. An unanswered read preserves the last answered read and the
-source timer, but cannot authorise input; at the deadline one grace read may witness completion or a qualified retry.
+Each wireless bridge read gets at most 2 seconds and no more than the observation's remaining time; a read with
+under 0.05 seconds remaining is not started. An unanswered read preserves the last answered read and the source
+timer, but cannot authorise input; no new read begins at or after the deadline.
 Training settle reads also have a 2-second floor and may finish up to 2 seconds after their settle cap.
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
+Create confirmation waits 20 seconds before retrying; its 24.5-second cap reserves time for bounded revalidation reads.
 
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
 Training phases re-locate after each phase; a failed phase retries only after two consecutive fresh reads of a
@@ -156,6 +188,10 @@ the row folder also receives `stall-events.jsonl`. The flight owner copies that 
 Inner Training input resends are stall events in every enclosing receipt and in `stall-events.jsonl`.
 After a phase fails, the route re-decides from live state and never repeats it when its postcondition already holds.
 This closed-loop route is host-tested only, not flown.
+
+**Recorded streams:** `fixtures/recorded-rooms/xps-stop-1.bridge.log.gz` and `xps-1.bridge.log.gz` replay the real
+fenced bridge answers. They show no stage press without a tile read, one A after a qualifying tile read reaches CSS,
+and refusal to open Create when the room-list focus is unpublished.
 
 **Why (2026-11-23/24):** the three stalled flights pressed A 5 to 12 frames after the first `stage_select` block,
 before the picker took input, and the wait's last read had a 1 ms cap; see
@@ -196,6 +232,17 @@ from a constant.
 ### Fresh stills
 
 `stills.jsonl` records each capture's file, hash, size, Eden reply and same-boot bridge frame and wall time.
+Gate workers prepare temporary candidates only; one deciding-thread commit publishes the complete gate evidence under
+the publication lock, with the acquired-reference approval last.
+Each ticket moves from `PENDING` to `COMMITTED` or `REVOKED`; timeout, cancellation and supersession revoke before
+reporting, and a late candidate is discarded.
+Direct checks and bounded rechecks both check STOP at the commit decision. A second gate cannot use a staged
+reference before that decision. Reserved candidate names are not valid manifest or reference inputs.
+A deciding thread blocked in a local commit may report late, but a failed caller cannot be followed by a late approval.
+The deciding thread appends still records at commit, while journal readers continue to skip old retractions.
+The reserved `.gate-candidate-` names are excluded from packet digests, row reports and GIF frame lists.
+An acquired reference requires a matching hash and `acquired` marker, with no acquisition intent; matching legacy
+hashes without a marker remain usable, and an intent is retained when rollback cannot restore the previous state.
 The frame and boot are read incrementally from the instance's bridge log from its start; a replaced log starts
 again without the old boot.
 An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`

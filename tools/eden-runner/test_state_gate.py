@@ -1,6 +1,7 @@
 """state_gate: framed bridge state blocks and the gate's freshness/transition rules (no Eden, no console)."""
 import re
 import sys
+import threading
 import time
 import unittest
 import zlib
@@ -240,6 +241,9 @@ class RunnerEntryTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.addCleanup(self.dir.cleanup)
         r = runner.Runner.__new__(runner.Runner)
+        r._gate_context = threading.local()
+        r._gate_lock = threading.RLock()
+        r._gate_owner = None
         r.instances = {'tr': {'bridge_log': str(self.log)}}
         r.current_row = {'id': 'row-a'}
         r.log = lambda record: None
