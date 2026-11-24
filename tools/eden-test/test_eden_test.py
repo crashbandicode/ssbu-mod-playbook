@@ -2232,6 +2232,117 @@ class EdenTestTests(unittest.TestCase):
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertFalse(any('trace' in item for item in config['instances']))
 
+    def shared_base(self, host):
+        """Give this machine a shared base that says which host it is."""
+        shared = eden_test.RUNS / '_eden-test/base.json'
+        base = json.loads(self.previous.read_text())
+        base['host'] = host
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text(json.dumps(base))
+        return shared
+
+    def typed_go(self, argv):
+        """A go typed on this machine: (result or SystemExit, mocks). Nothing real is started."""
+        with mock.patch.object(eden_test, 'go_new', side_effect=SystemExit('go_new called')) as new, \
+             mock.patch.object(eden_test, '_go_remote', side_effect=SystemExit('sent to the host')) as remote, \
+             mock.patch.object(eden_test, 'cmd_up') as up, mock.patch.object(eden_test, 'sh') as sh, \
+             redirect_stdout(io.StringIO()):
+            try:
+                result = eden_test.main(argv)
+            except SystemExit as stop:
+                result = stop
+        return result, types.SimpleNamespace(new=new, remote=remote, up=up, sh=sh)
+
+    def test_a_copy_naming_another_host_never_starts_a_go_on_a_machine_whose_base_says_otherwise(self):
+        # rv-fusion-g4, 2026-11-24 08:01Z: this machine's shared base says surface; the --from copy says yoga.
+        shared = self.shared_base('surface')
+        hosts = eden_test.RUNS / '_eden-test/hosts.json'
+        for name, write in (('missing', None), ('malformed', '{"yoga": '), ('not an object', '["yoga"]'),
+                            ('without this host', '{"xps": "xps-host"}'), ('entry not a name', '{"yoga": 7}')):
+            hosts.unlink(missing_ok=True)
+            if write is not None:
+                hosts.write_text(write)
+            for extra in ([], ['--from', str(self.previous)]):
+                with self.subTest(hosts_json=name, extra=extra):
+                    result, mocks = self.typed_go(self.go_args()[:-2] + extra)
+                    self.assertIsInstance(result, SystemExit)
+                    mocks.new.assert_not_called()
+                    mocks.remote.assert_not_called()
+                    mocks.up.assert_not_called()
+                    mocks.sh.assert_not_called()
+                    text = str(result)
+                    self.assertIn("'yoga'", text)
+                    self.assertIn('nothing was started', text)
+                    if name in ('missing', 'without this host'):
+                        self.assertIn(str(shared), text)
+                        self.assertIn("'surface'", text)
+                    else:
+                        self.assertIn(str(hosts), text)
+
+    def test_a_route_to_the_host_never_opens_a_local_from(self):
+        self.shared_base('surface')
+        local = self.dir / 'broken-local-copy.json'
+        local.write_text('{"host": "yoga", ')
+        hosts = eden_test.RUNS / '_eden-test/hosts.json'
+        for route in ('--ssh', 'hosts.json'):
+            hosts.unlink(missing_ok=True)
+            if route == 'hosts.json':
+                hosts.write_text(json.dumps({'yoga': 'tr-yoga'}))
+            argv = self.go_args()[:-2] + ['--from', str(local)] + (['--ssh', 'tr-yoga'] if route == '--ssh' else [])
+            with self.subTest(route=route):
+                result, mocks = self.typed_go(argv)
+                self.assertEqual(str(result), 'sent to the host')  # the remote path then checks --from as a host path
+                mocks.remote.assert_called_once()
+                mocks.new.assert_not_called()
+        hosts.unlink(missing_ok=True)
+        result, commands = self.remote_go('--from', f'{self.HOST_STAGE}/base.stub-on.json')
+        self.assertEqual(result, 0)
+        result, commands = self.remote_go('--from', str(local))
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn('on the host', str(result))
+        self.assertEqual(commands, [])
+
+    def test_the_host_itself_takes_any_local_from_also_with_an_ssh_name(self):
+        self.shared_base('yoga')
+        loose = self.dir / 'loose-base.json'
+        loose.write_text(self.previous.read_text())
+        hosts = eden_test.RUNS / '_eden-test/hosts.json'
+        hosts.write_text('{"yoga": ')  # the host does not need the map to run itself
+        for extra in ([], ['--ssh', 'tr-yoga']):
+            with self.subTest(extra=extra):
+                result, mocks = self.typed_go(self.go_args()[:-2] + ['--from', str(loose), *extra])
+                self.assertEqual(str(result), 'go_new called')
+                mocks.remote.assert_not_called()
+                result, mocks = self.typed_go(self.go_args()[:-2] + extra)
+                self.assertEqual(str(result), 'go_new called')
+                mocks.remote.assert_not_called()
+
+    def test_an_unreadable_shared_base_stops_a_typed_go_by_name(self):
+        shared = eden_test.RUNS / '_eden-test/base.json'
+        shared.parent.mkdir(parents=True)
+        for body in ('{"host": ', '{"instances": []}', '[]'):
+            shared.write_text(body)
+            for extra in ([], ['--from', str(self.previous)], ['--ssh', 'tr-yoga']):
+                with self.subTest(body=body, extra=extra):
+                    result, mocks = self.typed_go(self.go_args()[:-2] + extra)
+                    self.assertIsInstance(result, SystemExit)
+                    self.assertIn(str(shared), str(result))
+                    self.assertIn('nothing was started', str(result))
+                    mocks.new.assert_not_called()
+                    mocks.remote.assert_not_called()
+
+    def test_a_machine_without_a_shared_base_or_a_route_runs_a_local_base_as_before(self):
+        result, mocks = self.typed_go(self.go_args())
+        self.assertEqual(str(result), 'go_new called')
+        mocks.remote.assert_not_called()
+        broken = self.dir / 'broken.json'
+        broken.write_text('{"host": ')
+        result, mocks = self.typed_go(self.go_args()[:-2] + ['--from', str(broken)])
+        self.assertIsInstance(result, SystemExit)
+        self.assertIn(str(broken), str(result))
+        mocks.new.assert_not_called()
+        mocks.remote.assert_not_called()
+
     def test_go_host_mismatch_without_remote_mapping_names_host_and_map(self):
         with self.assertRaises(SystemExit) as caught:
             eden_test.main(self.go_args(host='xps'))
