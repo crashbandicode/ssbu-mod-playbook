@@ -182,6 +182,23 @@ def sample_dense(clip, folder, positions_ms):
         pipe.close()
 
 
+def _file_ends_complete(path, image_format):
+    if image_format == 'PNG':
+        tail = b'\x00\x00\x00\x00IEND\xaeB\x60\x82'
+    elif image_format in ('JPEG', 'MPO'):
+        tail = b'\xff\xd9'
+    else:
+        return True
+    try:
+        with open(path, 'rb') as stream:
+            if stream.seek(0, 2) < len(tail):
+                return False
+            stream.seek(-len(tail), 2)
+            return stream.read(len(tail)) == tail
+    except OSError:
+        return False
+
+
 def _png_decodes(path):
     with open(path, 'rb') as stream:
         if stream.read(8) != b'\x89PNG\r\n\x1a\n':
@@ -336,11 +353,14 @@ def image_issue(path, *, previews=None):
             try:
                 ImageFile.LOAD_TRUNCATED_IMAGES = False
                 with Image.open(path) as image:
+                    image_format = image.format
                     image.verify()
                 with Image.open(path) as image:
                     image.load()
                     if previews is not None:
                         previews[str(Path(path))] = image.convert('RGB').resize((320, 180), Image.Resampling.BOX)
+                if not _file_ends_complete(path, image_format):
+                    return 'not a decodable image'
             finally:
                 ImageFile.LOAD_TRUNCATED_IMAGES = truncated
         return None

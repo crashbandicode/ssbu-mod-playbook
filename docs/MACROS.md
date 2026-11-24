@@ -510,6 +510,7 @@ The judge and clip check use a still only when its file is present, readable and
 passes an integrity check and fully loads as an image, its freshness record is
 usable and, where recorded, its SHA-256 matches the file's bytes. Clip and dense
 frames must also decode.
+An image counts as evidence only if the whole file is there: a PNG must end with its IEND chunk and a JPEG with its end marker.
 Without PIL, the PNG check refuses unsupported metadata and non-PNG formats.
 Evidence blockers belong to the latest judge pass; earlier ones are kept under
 `evidence_attempts`. The judge is shown only usable row stills and clip frames; excluded stills are
