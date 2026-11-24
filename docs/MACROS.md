@@ -457,7 +457,14 @@ The `bridge` provider reads `src/proto2.rs`, `src/hooks.rs`, `src/model.rs` and
 `src/runtime.rs` at the named commit.
 An event can follow one leading bracket tag, as in `[Bridge] fighter entry=...`;
 continuation literals without their own event contribute bare keys only.
-A dotted string literal in a provider's source file is accepted as a key.
+A provider may set `block` to a schema name to take keys only from functions
+writing that schema, and `helpers` to list optional files included when declared
+with `mod` in a main file and present at the commit. Block keys start a literal
+or follow `\n`, or are string arguments to helpers called with `out`; tagged
+diagnostic literals and whole dotted values are not keys. `ssbu.ui` reads its
+block writer and the pause helper when available; values of `screen` and
+`focus.source` are not keys. Without `block`, dotted string literals are keys
+unless a provider sets `whole_literals: false`, as the `bridge` provider does.
 The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means

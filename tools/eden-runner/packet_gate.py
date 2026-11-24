@@ -14,8 +14,10 @@ PROVIDERS = {
     'tr.menu': {'repo': 'plugin', 'files': ['src/model/bridge_state.rs', 'src/model/record_place.rs']},
     'tr.practice': {'repo': 'plugin', 'files': ['src/model/practice_state.rs']},
     'tr.event': {'repo': 'plugin', 'files': ['src/model/bridge_events.rs']},
-    'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs']},
-    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs', 'src/runtime.rs']},
+    'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs'], 'block': 'ssbu.ui',
+                'helpers': ['src/native_ui/pause_focus.rs']},
+    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs', 'src/runtime.rs'],
+               'whole_literals': False},
 }
 BUTTONS = (
     ('A', 1), ('B', 2), ('X', 4), ('Y', 8), ('L', 64), ('R', 128), ('ZL', 256), ('ZR', 512),
@@ -164,7 +166,7 @@ def _git(tree, *args):
     return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, timeout=20, check=True)
 
 
-def emitted_keys(tree, commit, files):
+def emitted_keys(tree, commit, files, whole_literals=True):
     keys = set()
     for path in files:
         try:
@@ -179,10 +181,198 @@ def emitted_keys(tree, commit, files):
             event = re.match(r'^(?:\[[A-Za-z]+\] )?([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
             if event:
                 keys.update(f'{event.group(1)} {key}' for key in found)
-            if re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
+            if whole_literals and re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
                 keys.add(literal)
         keys.update(re.findall(r'\bpush_str\s*\(\s*out\s*,\s*"((?:\\.|[^"\\])*)"', text))
     keys.discard('schema')
+    return keys
+
+
+def _rust_lex(text):
+    code = list(text)
+    literals = []
+    i = 0
+    while i < len(text):
+        start = i
+        if text.startswith('//', i):
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end
+        elif text.startswith('/*', i):
+            i += 2
+            depth = 1
+            while i < len(text) and depth:
+                if text.startswith('/*', i):
+                    depth += 1
+                    i += 2
+                elif text.startswith('*/', i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                raise ValueError('could not be scanned')
+        else:
+            raw = re.match(r'(?:b)?r(#+)?"', text[i:])
+            if raw:
+                hashes = raw.group(1) or ''
+                content = i + raw.end()
+                end = text.find('"' + hashes, content)
+                if end < 0:
+                    raise ValueError('could not be scanned')
+                i = end + 1 + len(hashes)
+                literals.append((start, i, text[content:end], True))
+            elif text[i] == '"' or text.startswith('b"', i):
+                quote = i + (text[i] == 'b')
+                i = quote + 1
+                while i < len(text) and text[i] != '"':
+                    i += 2 if text[i] == '\\' else 1
+                if i >= len(text):
+                    raise ValueError('could not be scanned')
+                literals.append((start, i + 1, text[quote + 1:i], False))
+                i += 1
+            elif text[i] == "'":
+                char = re.match(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'", text[i:])
+                if char:
+                    i += char.end()
+                else:
+                    i += 1
+                    continue
+            else:
+                i += 1
+                continue
+        code[start:i] = ['\n' if ch == '\n' else ' ' for ch in text[start:i]]
+    return ''.join(code), literals
+
+
+def _rust_function_bodies(text):
+    code, _ = _rust_lex(text)
+    depth = 0
+    for char in code:
+        depth += (char == '{') - (char == '}')
+        if depth < 0:
+            raise ValueError('could not be scanned')
+    if depth:
+        raise ValueError('could not be scanned')
+    for match in re.finditer(r'\bfn\s+[A-Za-z_][A-Za-z0-9_]*', code):
+        paren = bracket = angle = 0
+        pos = match.end()
+        while pos < len(code):
+            char = code[pos]
+            if char == '(':
+                paren += 1
+            elif char == ')':
+                paren -= 1
+            elif char == '[':
+                bracket += 1
+            elif char == ']':
+                bracket -= 1
+            elif char == '<':
+                angle += 1
+            elif char == '>' and angle:
+                angle -= 1
+            elif char == ';' and not (paren or bracket or angle):
+                break
+            elif char == '{' and not (paren or bracket or angle):
+                start = pos
+                depth = 1
+                pos += 1
+                while pos < len(code) and depth:
+                    depth += (code[pos] == '{') - (code[pos] == '}')
+                    pos += 1
+                if depth:
+                    raise ValueError('could not be scanned')
+                yield start, pos
+                break
+            pos += 1
+
+
+def _block_keys(text):
+    code, literals = _rust_lex(text)
+    keys = set()
+    key_pattern = r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*'
+    for _, _, literal, raw in literals:
+        if re.match(r'^\[[^\]\r\n]+\] ', literal):
+            continue
+        keys.update(re.findall((r'^(' if raw else r'(?:^|\\n)(') + key_pattern + r')=', literal))
+    calls = re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*'
+                        r'(?:::\s*<[^(){};]*>)?\s*\(\s*(?:out|&\s*mut\s+out)\s*,', code)
+    for call in calls:
+        arg_start = call.end()
+        stack = []
+        for pos in range(arg_start, len(code)):
+            char = code[pos]
+            if char in '([{':
+                stack.append(char)
+                continue
+            if char in ')]}':
+                if stack:
+                    stack.pop()
+                    continue
+                if char != ')':
+                    break
+            elif char != ',' or stack:
+                continue
+            argument = next((literal for start, end, literal, _ in literals
+                             if arg_start <= start and end <= pos
+                             and not code[arg_start:start].strip() and not code[end:pos].strip()), None)
+            if argument is not None:
+                if re.fullmatch(key_pattern, argument):
+                    keys.add(argument)
+                break
+            if char == ')':
+                break
+            arg_start = pos + 1
+    return keys
+
+
+def _provider_keys(tree, commit, source, partial=False):
+    files = source['files']
+    block = source.get('block')
+    if not block:
+        if not partial:
+            return emitted_keys(tree, commit, files, source.get('whole_literals') is not False)
+        keys = set()
+        for path in files:
+            try:
+                keys.update(emitted_keys(tree, commit, [path], source.get('whole_literals') is not False))
+            except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
+                continue
+        return keys
+    texts = []
+    for path in files:
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError as error:
+            if partial:
+                continue
+            detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
+            raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
+        texts.append(re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0])
+    keys = set()
+    found = False
+    for text in texts:
+        try:
+            bodies = list(_rust_function_bodies(text))
+            _, literals = _rust_lex(text)
+        except ValueError as error:
+            raise ValueError(f'{error} at {commit[:8]}') from error
+        for start, end in bodies:
+            if any(start < pos < end and f'schema={block}/' in value for pos, _, value, _ in literals):
+                found = True
+                keys.update(_block_keys(text[start:end]))
+    if not found:
+        raise ValueError(f'no function writes schema={block}/ in {", ".join(files)} at {commit[:8]}')
+    declarations = '\n'.join(_rust_lex(text)[0] for text in texts)
+    for path in source.get('helpers', []):
+        stem = Path(path).stem
+        if not re.search(r'\bmod\s+' + re.escape(stem) + r'\s*;', declarations):
+            continue
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError:
+            continue
+        list(_rust_function_bodies(text))
+        keys.update(_block_keys(text))
     return keys
 
 
@@ -371,7 +561,7 @@ def _reads(plan, repos, errors):
                 continue
             if provider not in emitted and provider not in failed:
                 try:
-                    emitted[provider] = emitted_keys(repo['tree'], repo['commit'], source['files'])
+                    emitted[provider] = _provider_keys(repo['tree'], repo['commit'], source)
                 except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError) as error:
                     errors.append(f'G2 row {row_id}: extractor {provider}: {error}')
                     failed.add(provider)
@@ -516,11 +706,10 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
         files = source.get('files')
         if not isinstance(files, list):
             continue
-        for file in files:
-            try:
-                written.update(emitted_keys(repo['tree'], repo['commit'], [file]))
-            except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
-                continue
+        try:
+            written.update(_provider_keys(repo['tree'], repo['commit'], source, partial=True))
+        except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
+            continue
     prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key and '.' in key}
     ignored = {item['key'] for item in plan.get('reads_ignore', [])
                if isinstance(item, dict) and isinstance(item.get('key'), str)
