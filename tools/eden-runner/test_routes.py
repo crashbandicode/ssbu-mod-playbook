@@ -6268,6 +6268,58 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(next(step for step in result['steps'] if step['name'] == 'dashboard-a')['sends'], 1)
                 self.assertGreaterEqual(self.now, 10)
 
+    def test_dashboard_a_slow_final_read_stops_within_the_cap(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index, self.io.a_delay = 'open', 2, 100
+                original = self.io.read
+
+                def slow_read(provider, cap):
+                    if (provider == 'ssbu.ui' and self.io.a_sent_at is not None
+                            and self.now >= self.io.a_sent_at + 44):
+                        self.now += cap
+                    return original(provider, cap)
+
+                self.io.read = slow_read
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_route(guest)
+                self.assertEqual(caught.exception.step, 'dashboard-a')
+                self.assertLessEqual(self.now, 45.35)
+                self.assertEqual(self.io.actions, ['lobby-a'])
+
+    def test_dashboard_a_ready_list_at_44_seconds_still_succeeds(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index, self.io.a_delay = 'open', 2, 44
+                result = self.run_route(guest)
+                dashboard_actions = (self.io.actions if guest
+                                     else self.io.actions[:self.io.actions.index('tap-a1')])
+                self.assertEqual(dashboard_actions, ['lobby-a'])
+                self.assertTrue(result['result'].startswith('PASS'))
+                self.assertGreaterEqual(self.now, 44)
+
+    def test_stage_a_slow_final_read_stops_within_the_cap(self):
+        self.io.phase = 'stage'
+        self.io.stage_errors_after_send = True
+        original = self.io.read
+
+        def slow_read(provider, cap):
+            if (provider == 'ssbu.ui' and self.io.stage_send_times
+                    and self.now >= self.io.stage_send_times[0] + 59):
+                self.now += cap
+            return original(provider, cap)
+
+        self.io.read = slow_read
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_route(guest=False)
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertLessEqual(self.now - self.io.stage_send_times[0], 60.35)
+        self.assertEqual(self.io.actions, ['lobby-a'])
+
     def test_reopened_dashboard_cannot_send_a_second_dashboard_a(self):
         for guest in (False, True):
             with self.subTest(guest=guest):

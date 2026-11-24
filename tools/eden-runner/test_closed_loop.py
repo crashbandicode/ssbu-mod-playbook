@@ -40,6 +40,56 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_no_read_is_started_at_or_after_the_step_deadline(self):
+        for phase in ('locate', 'ready', 'post-send'):
+            with self.subTest(phase=phase):
+                now, reads, sends = [0.0], [], []
+
+                def observe(*, cap=None):
+                    reads.append((now[0], cap))
+                    return 'source'
+
+                item = Step('bounded', lambda obs: phase == 'post-send',
+                            lambda obs: False, 'a', cap=2.5, ready_cap=2.5,
+                            lost_after=100, screen=lambda obs: phase == 'ready')
+                with self.assertRaises(RouteStopped):
+                    run('fixture', [item], observe, sends.append, lambda: None,
+                        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                        locate_cap=2.5, poll=1)
+                self.assertTrue(reads)
+                self.assertTrue(all(start < 2.5 for start, _ in reads), reads)
+
+    def test_the_final_read_gets_only_the_remaining_time(self):
+        now, reads = [0.0], []
+
+        def observe(*, cap=None):
+            reads.append((now[0], cap))
+            return 'source'
+
+        item = Step('bounded', lambda obs: True, lambda obs: False,
+                    'a', cap=2.5, lost_after=100)
+        with self.assertRaises(RouteStopped):
+            run('fixture', [item], observe, lambda macro: None, lambda: None,
+                clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
+        self.assertEqual(reads, [(0.0, 20.0), (1.0, 1.5), (2.0, 0.5)])
+
+    def test_a_slow_final_read_cannot_outlive_the_step_cap(self):
+        for latch in (False, True):
+            with self.subTest(latch=latch):
+                now, sends = [0.0], []
+
+                def observe(*, cap=None):
+                    if sends and now[0] >= 2:
+                        now[0] += 2 if cap is None else cap
+                    return 'source'
+
+                item = Step('bounded', lambda obs: True, lambda obs: False,
+                            'a', cap=3, lost_after=100, latch=latch)
+                with self.assertRaises(RouteStopped):
+                    run('fixture', [item], observe, sends.append, lambda: None,
+                        clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
+                self.assertLessEqual(now[0], 3.01)
+
     def test_a_latched_step_never_jumps_or_sends_after_its_send(self):
         fake = Script(lambda f: 'other' if f.sends else 'source')
         latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
