@@ -505,7 +505,9 @@ nothing usable can be compared. The runner records
 every still taken inside a row, including image-gate polling stills, as a
 capture with one `status` call after each. Without a game-frame source the
 freshness is `unverified` and remains usable; that is not frame-freshness proof.
-The judge is shown only usable row stills and clip frames; excluded stills are
+The judge and clip check use a still only when its file is present and readable,
+its freshness record is usable and, where recorded, its SHA-256 matches the
+file's bytes. The judge is shown only usable row stills and clip frames; excluded stills are
 listed in the job and the receipt. A judged row with no usable image is
 unverified. A verdict is taken only from a judge run that exited successfully
 and wrote it in that run. A new pass withdraws the previous verdict first; a

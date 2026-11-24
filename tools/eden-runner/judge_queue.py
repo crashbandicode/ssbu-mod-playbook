@@ -16,6 +16,7 @@ PASS; UNSURE -> RAN-UNVERIFIED. Without a judge: PASS needs a passed effect gate
 RAN-UNVERIFIED rows carry "review": true and a reason; FAILING.md lists them with the failures.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -171,17 +172,39 @@ def sample_dense(clip, folder, positions_ms):
         pipe.close()
 
 
+def shot_issue(shot):
+    path = shot.get('path')
+    if not path:
+        return 'still was not taken'
+    try:
+        path = Path(path)
+        if not path.is_file():
+            return 'still file is missing or unreadable'
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+    except (OSError, TypeError, ValueError):
+        return 'still file is missing or unreadable'
+    record = shot.get('fresh')
+    if not still_fresh.usable(record):
+        return still_fresh.unusable_reason(record)
+    expected = record.get('sha256')
+    if isinstance(expected, str) and re.fullmatch(r'[0-9a-fA-F]{64}', expected) and digest.hexdigest() != expected.lower():
+        return 'still bytes differ from the capture record'
+    return None
+
+
 def clip_check(job, frames):
     """Deterministic: the expected-result shot exists, and the row changed something on screen."""
     shots = job.get('shots') or []
-    taken = [s for s in shots if s.get('phase') in ('before', 'step', 'after')
-             and s.get('path') and Path(s['path']).is_file()]
+    taken = [s for s in shots if s.get('phase') in ('before', 'step', 'after') and s.get('path')]
+    checked = [(s, shot_issue(s)) for s in taken]
     excluded = [{'path': s['path'],
                  **({'label': s['label']} if s.get('label') else
                     {'name': s.get('name') or Path(s['path']).name}),
-                 'reason': still_fresh.unusable_reason(s.get('fresh'))}
-                for s in taken if not still_fresh.usable(s.get('fresh'))]
-    comparable = [s for s in taken if still_fresh.usable(s.get('fresh'))]
+                 'reason': issue} for s, issue in checked if issue]
+    comparable = [s for s, issue in checked if not issue]
 
     def result(values):
         return {**values, **({'excluded': excluded} if excluded else {})}
@@ -248,27 +271,33 @@ def known_issue(known, verdict):
 
 
 def _shot_blockers(shots):
-    return [{'kind': 'evidence', 'source': shot.get('label') or shot.get('name') or Path(shot['path']).name,
-             'text': f"still {shot['path']} is not usable evidence: {still_fresh.unusable_reason(shot.get('fresh'))}"}
-            for shot in shots if not still_fresh.usable(shot.get('fresh'))]
+    result = []
+    for shot in shots:
+        issue = shot_issue(shot)
+        if issue:
+            path = shot.get('path')
+            source = shot.get('label') or shot.get('name') or (Path(path).name if path else 'still')
+            result.append({'kind': 'evidence', 'source': source,
+                           'text': f"still {path} is not usable evidence: {issue}"})
+    return result
 
 
 def evidence_blockers(shots, verdict, all_shots=None):
     row_shots = [shot for shot in shots or [] if isinstance(shot, dict)
                  and shot.get('phase') in ('before', 'step', 'after')]
-    shots = [shot for shot in row_shots if shot.get('path')]
-    available = [shot for shot in (all_shots or shots) if isinstance(shot, dict) and shot.get('path')]
+    available = [shot for shot in (all_shots or row_shots) if isinstance(shot, dict) and shot.get('path')]
     citations = (verdict or {}).get('shots_cited')
     citations = citations if isinstance(citations, list) else []
-    matched = [shot for shot in shots if any(citation == shot.get('path') or citation == shot.get('label')
-                                               for citation in citations)]
+    matched = [shot for shot in row_shots if any((shot.get('path') and citation == shot['path'])
+                                                  or (shot.get('label') and citation == shot['label'])
+                                                  for citation in citations)]
     unresolved = any(not any(citation == shot.get('path') or citation == shot.get('label')
                              for shot in available) for citation in citations)
     if not citations or unresolved:
         expected = [shot for shot in row_shots if shot.get('phase') == 'after'] or \
             [shot for shot in row_shots if shot.get('phase') == 'step']
-        before = next((shot for shot in shots if shot.get('phase') == 'before'), None)
-        for shot in ([before] if before else []) + (expected[-1:] if expected and expected[-1].get('path') else []):
+        before = next((shot for shot in row_shots if shot.get('phase') == 'before'), None)
+        for shot in ([before] if before else []) + expected[-1:]:
             if shot not in matched:
                 matched.append(shot)
     return _shot_blockers(matched)
@@ -432,24 +461,33 @@ def work(job_path):
             # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
             # the evidence shots first, then the clip frames as shots labelled "clip start/mid/end" (an overlay left on screen
             # at the clip's end, e.g. a Break the Targets HUD, is a FAIL: session-1 LEG-04)
-            job['frames_by_name'] = frames
-            job['frames_at_ms'] = frames_at  # where each clip frame was cut (clip time, ms): the judge times them from this
-            job['frames'] = []
             # evidence-only labels: the row's own still labels (row id prefix dropped); a label that would give the verdict
             # away (FAIL/PASS) is neutral (judge/make_jobs.py rule)
             def label(s, i):
                 name = s['name'][len(job['row']) + 1:] if s['name'].startswith(job['row'] + '-') else s['name']
                 return f'shot-{i}' if re.search(r'FAIL|PASS', name) else f'{s.get("phase", "step")}:{name}'
             job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(row_shots, 1)]
+            checked = [(s, shot_issue(s)) for s in job['shots']]
             job['excluded_shots'] = [
                 {'label': s['label'], 'name': s.get('name'), 'phase': s.get('phase'), 'path': s.get('path'),
-                 'reason': still_fresh.unusable_reason(s.get('fresh')) if s.get('path') else 'still was not taken'}
-                for s in job['shots'] if not (s.get('path') and still_fresh.usable(s.get('fresh')))]
-            job['judge_shots'] = [s for s in job['shots'] if s.get('path') and still_fresh.usable(s.get('fresh'))] + \
+                 'reason': issue} for s, issue in checked if issue]
+            clip_shots = \
                 [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip',
                   **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)] + \
                 [{'label': f'dense {ms / 1000:.1f}s', 'path': p, 'phase': 'clip', 'clip_ms': ms}
                  for ms, p in sorted(dense.items())]
+            checked_clip = [(shot, Path(shot['path']).is_file()) for shot in clip_shots]
+            for shot, present in checked_clip:
+                if not present:
+                    job['excluded_shots'].append({'label': shot['label'], 'name': None, 'phase': 'clip',
+                                                  'path': shot['path'], 'reason': 'clip frame file is missing'})
+            job['judge_shots'] = [s for s, issue in checked if not issue] + \
+                [s for s, present in checked_clip if present]
+            available_clip_labels = {s['label'] for s, present in checked_clip if present}
+            frames = {k: p for k, p in frames.items() if f'clip {k}' in available_clip_labels}
+            job['frames_by_name'] = frames
+            job['frames_at_ms'] = frames_at  # where each clip frame was cut (clip time, ms): the judge times them from this
+            job['frames'] = []
             if frame_error:
                 job['frame_error'] = frame_error
             job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
