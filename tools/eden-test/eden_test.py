@@ -762,7 +762,7 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
     if problems:
         raise SystemExit('; '.join(problems))
     rows = run / 'rows' / 'rows.json'
-    if sh([sys.executable, '-B', '-I', str(RUNNER), 'dry-run', str(rows), '--out', str(run / 'out')],
+    if sh([sys.executable, '-B', '-I', str(RUNNER), 'up-check', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
     stamp(run, 'up_start')
@@ -789,6 +789,10 @@ def set_aside(run, rows):
 
 
 def cmd_run(run, retry=False, rows=None):
+    code = sh([sys.executable, '-B', '-I', str(RUNNER), 'up-check', str(run / 'rows' / 'rows.json'),
+               '--out', str(run / 'out')], run / 'dry-run.log')
+    if code:
+        return code
     stop = run / 'out' / 'STOP-INPUT'
     if (retry or rows) and stop.exists():
         stop.rename(run / 'out' / f'STOP-INPUT.{int(time.time())}')

@@ -241,7 +241,8 @@ The rules:
      `out/summary.json` lists every row as pass, fail, skipped or not run,
      with each failure's reason and evidence paths. `--rows failed` reruns
      only the rows whose receipt is FAILED, after a fix; passed rows are
-     skipped. If a row's recovery fails but the game is still running, that
+     skipped. A passed row named explicitly in `--rows` runs again; an unnamed
+     passed row is skipped. If a row's recovery fails but the game is still running, that
      row is FAILED without running its steps; the runner tries to recover the
      next row. It writes `STOP-INPUT` and stops when the game is no longer
      running (`running` false, or a crash).
@@ -393,7 +394,7 @@ directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is
 read from the rows folder.
 
-The lifecycle's Up check and `runner.py run`, `self-test`, and
+The lifecycle's Up check and `runner.py up-check`, `run`, `self-test`, and
 `capture-fixture` refuse a plan without a target. `dry-run` and `replay` report
 `NO TARGET` instead. Each checked runner command writes `out/packet-gate.json`
 at the start. `eden_test.py check` also refuses a target NRO that is not staged
@@ -404,28 +405,61 @@ items can declare `gives`. A segment can name its persisted input `binding`.
 The plan can allow a path into another run with `allow_paths`, an entry with
 the exact `path` and a `reason`. Packet-gate errors name their check:
 
-- **G1:** a hook's call shape does not accept its declared arguments.
+- **G1:** a hook's call shape does not accept its arguments, or its module does
+  not import on its own.
 - **G2:** a declared read is not written by the target.
-- **G3:** the recipe, compiled macro, and persisted binding differ.
+- **G3:** the recipe, compiled macro, and persisted binding differ; a persisted
+  chord has no binding, or a chord has no settings against which to check it.
 - **G4:** a path points into another run, or a local file is missing.
+- **G5:** a test row has no checked effect, judged expectation, or visual outcome.
 - **G6:** a need has no matching earlier giver.
-- **G8:** a hook plays a literal macro name absent from the plan and library.
+- **G8:** `ctx.play` names no plan segment, or `routes.play` names no library macro.
 
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
+A passing source receipt must also match the dependent row's plan identity and
+instances file hash; otherwise it is not played and its receipt says
+`NOT RUN (setup): needs "<token>" from row <id>, whose receipt is from another packet or another Up`.
+Rerun the producer with the dependent using
+`eden_test.py run <run> --rows <producer>,<dependent>`.
+The identity hashes the library-expanded plan, excluding segment `sha256` and
+`recorded` and gate `sha256` and `acquired` written during a run. It includes
+the segment file and start gate changed by `record-stop`; changing those names
+a different plan. The instances hash does not detect a game reload inside the
+same Up.
 The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
-an exact `key` with a `reason`. Computed macro names are warned about, not
-checked. The built-in providers are `tr.menu` and `tr.practice`; a dotted
+an exact `key` with a `reason`. Play calls with computed names or unknown
+callees are warned about, not checked. The built-in providers are `tr.menu`,
+`tr.practice` and `tr.event`;
+event reads use names such as `tr.event:fed run.p1`. A dotted
 string literal in a provider's source file is accepted as a key. The packet
 gate has host tests; it has not been proven in a runtime acceptance.
+
+#### What PASS means
+
+With a target or `require_effect`, a test row without a judge reaches PASS only
+with a checked effect. A gate can declare `effect: true`; a `run` step can
+declare `effect: true` and return evidence (a non-empty dict or string, or a
+number other than a boolean). A boolean, empty value or unverified hook result
+is not evidence. A hook's `unverified` text, `NEEDS VISUAL READ` grade or
+pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
+A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
+resuming without naming it does not promote it. A setup row's PASS still means
+its steps did not raise.
+
+Record a visual read with
+`runner.py record-read rows.json --out out --rows <id> --reader <who> --verdict PASS|FAIL --text "<what the still shows>" --still <out/id/still>`.
+The still must be inside the row folder and its hash is stored with the read.
+A judge, when configured, decides those rows instead.
 
 #### Fixtures
 
 The shared `fixtures:recording_role` hook checks the Recording page or popup
 and gives `recording.role=<role>` or `recording.popup.role=<role>` respectively.
 `fixtures:guard_first_use` advances a cold wizard behind its state reads and
-gives `guard.ready`. `fixtures:mark_before_room` records the native main-menu
+gives `guard.ready` for the default `guard_edge` game, or `practice.ready=<game>`
+for another game. `fixtures:mark_before_room` records the native main-menu
 epoch and bridge-log offset immediately before `routes:wireless_room`; it gives
 nothing. `fixtures:seeded_room` reads the waiting host, settings and native
 waiting battle, and checks the last stage line after that mark. It gives
@@ -444,11 +478,13 @@ changing its base:
 
 The optional `--partners` defaults to 1. The writer refuses an inherited
 custom Direct stage and refuses to overwrite its output.
-`window_from_wait` selects a consecutive grounded Wait stream window. The
+`window_from_wait` selects a consecutive grounded Wait stream window after its
+first observation, which is a baseline and is not counted. Capture at least one
+sample before the desired window: 300 Wait samples from the first report 299 of 300. The
 `take-p1-ground-jump` and `take-p1-jump-only` library macros use X for Jump;
 the run's control binding has not been verified. Host tests do not prove
 runtime behavior. Not covered: the live take-recording hook, a CPU take,
-Training CPU behaviour, G5 judge cases, other bridge providers, or comparing
+Training CPU behaviour, other bridge providers, or comparing
 a saved take with the pinned input list (it comes with the take-recording
 hook, against a real saved take).
 

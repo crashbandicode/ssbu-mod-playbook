@@ -17,7 +17,8 @@ import state_gate
 GIVES = {
     'recording_role': lambda args: [
         f'recording.{"popup.role" if args.get("where", "page") == "popup" else "role"}={args["role"]}'],
-    'guard_first_use': lambda args: ['guard.ready'],
+    'guard_first_use': lambda args: (['guard.ready'] if args.get('game', 'guard_edge') == 'guard_edge'
+                                     else [f'practice.ready={args["game"]}']),
     'seeded_room': lambda args: ['lobby.practice=on', f'partner.behavior={args["behavior"]}',
                                  f'lobby.stage={args["stage"]}'],
 }
@@ -301,6 +302,7 @@ def seed_settings(base, behavior, stage, partners=1):
 
 
 def window_from_wait(samples, entry, frames):
+    """Skip the baseline: 300 initial grounded Wait samples count as 299 of 300."""
     if frames < 1:
         raise ValueError('frames must be positive')
     stream = [item for item in samples if int(item[1].get('entry', entry)) == entry]

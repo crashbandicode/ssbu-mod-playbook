@@ -200,3 +200,8 @@ than Attack. Panel readback follows `dispatch-pack-v2/xps/docs_lobby_tail.py`.
 `take-p1-ground-jump` and `take-p1-jump-only` are compiled from `f10/fixtures/take-T.json`; X as Jump has not been
 checked against a run profile. `tap-zr1` and `recording-popup-chord` reproduce the flown `rm-tap-zr` and
 `rm-popup-chord` frame shapes. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/test-data/i2-play-p1-chord.edenmacro.json` is copied from
+`install2/flight-prep/dispatch-pack-v2/yoga/segments/i2-play-p1-chord.edenmacro.json`, SHA-256
+`437b038c2da32690c3ee43c923ca3c9d9e0fe97a70eb69bfdb75eeb523e66cb3`. The event extractor tests model
+TrainingRooms `71158421` `src/model/bridge_events.rs` lines 23–26, 45 and 132. Host tests only; no runtime acceptance.

@@ -11,6 +11,7 @@ Base plugins not on the card, including the bridge, are added; card files supers
 Use `--card-lineup <dir>` for another lineup or `--no-card-lineup <reason>` to opt out with a recorded reason.
 The receipt is in `config.json` (`card_lineup`, `staged_plugins`, `superseded_base_pins`) and `REPORT.md`.
 `go` and `up` need a `target` in the rows; see [Packet gate](../../docs/MACROS.md#packet-gate).
+`run` checks packet admission before it moves `STOP-INPUT` or earlier row evidence aside.
 On an Eden host the default folder does not exist, so `go` needs `--card-lineup <dir>`; remote dispatch copies the lineup and passes it.
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 Each run gets its own bridge port and its own X display (when the base has a display helper; otherwise the base's display is kept).

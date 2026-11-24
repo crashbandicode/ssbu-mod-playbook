@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 import recipe_macro
 
 PROVIDERS = {
     'tr.menu': {'repo': 'plugin', 'files': ['src/model/bridge_state.rs', 'src/model/record_place.rs']},
     'tr.practice': {'repo': 'plugin', 'files': ['src/model/practice_state.rs']},
+    'tr.event': {'repo': 'plugin', 'files': ['src/model/bridge_events.rs']},
 }
 BUTTONS = (
     ('A', 1), ('B', 2), ('X', 4), ('Y', 8), ('L', 64), ('R', 128), ('ZL', 256), ('ZR', 512),
@@ -46,7 +48,11 @@ def emitted_keys(tree, commit, files):
         text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
         text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
         for literal in re.findall(r'"((?:\\.|[^"\\])*)"', text):
-            keys.update(re.findall(r'(?:^|\\n)([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal))
+            found = re.findall(r'(?:^|\\n| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal)
+            keys.update(found)
+            event = re.match(r'^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
+            if event:
+                keys.update(f'{event.group(1)} {key}' for key in found)
             if re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
                 keys.add(literal)
         keys.update(re.findall(r'\bpush_str\s*\(\s*out\s*,\s*"((?:\\.|[^"\\])*)"', text))
@@ -165,6 +171,35 @@ def _hooks(plan, base, errors):
         step_hook(row_id, row.get('on_failure_hook'))
     for name in plan.get('gates', {}):
         gate_hook('<plan>', name)
+    runner_dir = Path(__file__).resolve().parent
+    loader = ('import importlib.util, pathlib, sys; '
+              'sys.path.insert(0, sys.argv[1]); p = pathlib.Path(sys.argv[2]); '
+              's = importlib.util.spec_from_file_location("step_hook_" + p.stem, p); '
+              'm = importlib.util.module_from_spec(s); s.loader.exec_module(m)')
+    seen_paths = set()
+    for module in sorted(m for m in modules if isinstance(m, str) and m):
+        path = Path(module)
+        path = path if path.is_absolute() else base / path
+        resolved = path.resolve()
+        if resolved.parent == runner_dir or resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        try:
+            proc = subprocess.run([sys.executable, '-I', '-B', '-c', loader, str(runner_dir), str(path)],
+                                  timeout=60, capture_output=True, text=True)
+            if proc.returncode == 0:
+                continue
+            lines = [line for line in proc.stderr.splitlines() if line.strip()]
+            detail = lines[-1][:200] if lines else f'exit {proc.returncode}'
+        except subprocess.TimeoutExpired as error:
+            stderr = error.stderr or ''
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode('utf-8', errors='replace')
+            lines = [line for line in stderr.splitlines() if line.strip()]
+            detail = lines[-1][:200] if lines else 'timed out after 60 seconds'
+        except OSError as error:
+            detail = str(error)[:200]
+        errors.append(f'G1 {module}: does not import on its own: {detail}')
     return modules
 
 
@@ -208,38 +243,64 @@ def _names(bits):
     return '+'.join(name for name, bit in BUTTONS if bits & bit) or 'none'
 
 
-def _bindings(plan, base, settings, errors):
+def _bindings(plan, base, settings, errors, warnings):
+    menu = settings.get('menu') if isinstance(settings, dict) else None
+    chords = {}
+    if isinstance(menu, dict):
+        for action, flags in menu.items():
+            if (isinstance(flags, list) and len(flags) == len(BUTTONS)
+                    and all(flag in (0, 1) for flag in flags) and sum(flags) >= 2):
+                mask = sum(bit for flag, (_, bit) in zip(flags, BUTTONS) if flag)
+                chords.setdefault(mask, []).append(action)
     for name, seg in (plan.get('segments') or {}).items():
         action = seg.get('binding')
-        if not action:
-            continue
-        menu = settings.get('menu') if isinstance(settings, dict) else None
-        flags = menu.get(action) if isinstance(menu, dict) else None
-        if not isinstance(flags, list) or len(flags) != len(BUTTONS) or any(flag not in (0, 1) for flag in flags):
-            errors.append(f'G3 segment {name}: no persisted binding menu.{action} in '
-                          f'{plan["target"].get("settings")}')
-            continue
-        persisted = sum(bit for flag, (_, bit) in zip(flags, BUTTONS) if flag)
         try:
             recipe = {recipe_macro.mask(item['buttons']) for item in seg.get('recipe', []) if item.get('buttons')}
         except (TypeError, ValueError) as error:
             errors.append(f'G3 segment {name}: {error}')
             continue
-        if recipe != {persisted}:
-            names = ', '.join(_names(mask) for mask in sorted(recipe)) or 'none'
-            errors.append(f'G3 segment {name}: recipe presses {names} but {action} is bound to {_names(persisted)}')
+        recipe.discard(0)
+        held = set()
         path = base / seg['file'] if seg.get('file') else None
         if path and path.is_file():
             try:
                 macro = json.loads(path.read_text())
                 held = {event['buttons'] for event in macro.get('events', []) if event.get('buttons')}
+                if any(not isinstance(mask, int) or isinstance(mask, bool) or mask < 0 for mask in held):
+                    raise ValueError('buttons must be non-negative integer masks')
             except (OSError, ValueError, TypeError, KeyError) as error:
                 errors.append(f'G3 segment {name}: compiled macro: {error}')
                 continue
-            if held != {persisted}:
+        if 'settings' not in plan['target']:
+            for mask in sorted(recipe | held):
+                if mask.bit_count() >= 2:
+                    errors.append(f'G3 segment {name}: presses the chord {_names(mask)} but the target names '
+                                  'no settings, so its binding cannot be checked')
+        if action:
+            flags = menu.get(action) if isinstance(menu, dict) else None
+            if not isinstance(flags, list) or len(flags) != len(BUTTONS) or any(flag not in (0, 1) for flag in flags):
+                errors.append(f'G3 segment {name}: no persisted binding menu.{action} in '
+                              f'{plan["target"].get("settings")}')
+                continue
+            persisted = sum(bit for flag, (_, bit) in zip(flags, BUTTONS) if flag)
+            if recipe != {persisted}:
+                names = ', '.join(_names(mask) for mask in sorted(recipe)) or 'none'
+                errors.append(f'G3 segment {name}: recipe presses {names} but {action} is bound to {_names(persisted)}')
+            if path and path.is_file() and held != {persisted}:
                 names = ', '.join(_names(mask) for mask in sorted(held)) or 'none'
                 errors.append(f'G3 segment {name}: the compiled macro holds {names} '
                               f'but {action} is bound to {_names(persisted)}')
+            continue
+        if recipe and path and path.is_file() and recipe != held:
+            recipe_names = ', '.join(_names(mask) for mask in sorted(recipe))
+            held_names = ', '.join(_names(mask) for mask in sorted(held)) or 'none'
+            message = f'G3 segment {name}: recipe presses {recipe_names} but the compiled macro holds {held_names}'
+            (errors if isinstance(seg.get('compiled'), dict) else warnings).append(message)
+        for mask in sorted(recipe | held):
+            if mask in chords:
+                actions = ', '.join(sorted(chords[mask]))
+                errors.append(f'G3 segment {name}: presses {_names(mask)}, the persisted chord of {actions}, '
+                              'without a "binding"')
 
 
 def _strings(value):
@@ -288,9 +349,9 @@ def _paths(plan, base, raw, modules, errors):
 def _hook_checks(plan, base, modules, repos, errors, warnings):
     import routes
 
-    macro_names = set(plan.get('segments', {}))
-    macro_names.update(routes.routes_index()['macros'])
-    macro_names.update(json.loads((routes.LIBRARY / 'index.json').read_text())['segments'])
+    segment_names = set(plan.get('segments', {}))
+    route_names = set(routes.routes_index()['macros'])
+    route_names.update(json.loads((routes.LIBRARY / 'index.json').read_text())['segments'])
     sources = []
     for module in sorted(modules):
         path = (base / module).resolve()
@@ -317,26 +378,35 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
                 written.update(emitted_keys(repo['tree'], repo['commit'], [file]))
             except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError):
                 continue
-    prefixes = {key.split('.', 1)[0] for key in written}
+    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key}
     ignored = {item['key'] for item in plan.get('reads_ignore', [])
                if isinstance(item, dict) and isinstance(item.get('key'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
     for module, tree in sources:
-        plays, reads, computed = set(), set(), 0
+        route_aliases = {'routes'}
+        for imported in ast.walk(tree):
+            if isinstance(imported, ast.Import):
+                route_aliases.update(alias.asname or alias.name for alias in imported.names if alias.name == 'routes')
+        segments, macros, reads, unchecked = set(), set(), set(), 0
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'play':
                 owner = node.func.value
                 if isinstance(owner, ast.Name) and owner.id == 'ctx':
                     index = 0
+                    names = segments
                 elif node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == 'ctx':
+                    if not isinstance(owner, ast.Name) or owner.id not in route_aliases:
+                        unchecked += 1
+                        continue
                     index = 1
+                    names = macros
                 else:
                     continue
                 argument = node.args[index] if len(node.args) > index else None
                 if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-                    plays.add(argument.value)
+                    names.add(argument.value)
                 else:
-                    computed += 1
+                    unchecked += 1
             key = None
             if isinstance(node, ast.Subscript):
                 key = node.slice
@@ -348,10 +418,12 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
                 if (re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', value)
                         and value.split('.', 1)[0] in prefixes and value not in written and value not in ignored):
                     reads.add(value)
-        for name in sorted(plays - macro_names):
-            errors.append(f'G8 {module}: plays "{name}", which is neither a segment of this plan nor a library macro')
-        if computed:
-            warnings.append(f'G8 {module}: {computed} play call(s) with a computed name are not checked')
+        for name in sorted(segments - segment_names):
+            errors.append(f'G8 {module}: ctx.play("{name}") names no segment of this plan')
+        for name in sorted(macros - route_names):
+            errors.append(f'G8 {module}: routes.play("{name}") names no routes library macro')
+        if unchecked:
+            warnings.append(f'G8 {module}: {unchecked} play call(s) with a computed name or unknown callee are not checked')
         for key in sorted(reads):
             errors.append(f'G2 {module}: reads "{key}", which the target does not write')
 
@@ -397,6 +469,31 @@ def _needs(plan, errors):
     return rows
 
 
+def _effects(plan, errors):
+    from runner import row_role
+
+    gates = plan.get('gates') or {}
+    judge = plan.get('judge')
+    has_judge = isinstance(judge, dict) and bool(judge.get('cmd'))
+    for row in plan.get('rows', []):
+        if 'role' not in row and ('start' not in row or 'end' not in row):
+            continue
+        if row_role(row) != 'test':
+            continue
+        steps = list(_steps(row.get('steps')))
+        gate_effect = any(step.get('gate') in gates and
+                          (step.get('effect') or gates[step['gate']].get('effect')) for step in steps)
+        hook_effect = any('run' in step and step.get('effect') for step in steps)
+        judged = has_judge and bool(row.get('expected')) and row.get('judge') != 'skip'
+        if gate_effect or hook_effect or judged or row.get('outcome') == 'visual':
+            continue
+        message = (f'G5 row {row.get("id", "?")}: a test row with no effect gate, no effect hook, '
+                   'no judged "expected" and no "outcome": "visual"; its PASS would only mean that no step raised')
+        if row.get('expected') and not has_judge:
+            message += ' ("expected" is set, but the plan has no judge)'
+        errors.append(message)
+
+
 def check(plan, base, raw):
     base = Path(base)
     report = {'errors': [], 'warnings': [], 'result': 'NO TARGET', 'packet_sha256': packet_digest(base),
@@ -409,9 +506,10 @@ def check(plan, base, raw):
     modules = _hooks(plan, base, errors)
     if isinstance(plan['target'], dict):
         report['emitted'] = _reads(plan, repos, errors)
-        _bindings(plan, base, settings, errors)
+        _bindings(plan, base, settings, errors, report['warnings'])
         _hook_checks(plan, base, modules, repos, errors, report['warnings'])
     _paths(plan, base, raw, modules, errors)
     report['rows'] = _needs(plan, errors)
+    _effects(plan, errors)
     report['result'] = 'BROKEN' if errors else 'OK'
     return report
