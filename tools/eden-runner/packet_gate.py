@@ -116,7 +116,7 @@ def _hooks(plan, base, errors):
         if not isinstance(spec, str):
             return
         path = spec.partition(':')[0]
-        if path not in ('routes', 'routes_online'):
+        if path not in ('routes', 'routes_online', 'fixtures'):
             modules.add(path)
         try:
             fn = load_step(base, spec)
@@ -285,6 +285,77 @@ def _paths(plan, base, raw, modules, errors):
                 check_path(node.value, module, False)
 
 
+def _hook_checks(plan, base, modules, repos, errors, warnings):
+    import routes
+
+    macro_names = set(plan.get('segments', {}))
+    macro_names.update(routes.routes_index()['macros'])
+    macro_names.update(json.loads((routes.LIBRARY / 'index.json').read_text())['segments'])
+    sources = []
+    for module in sorted(modules):
+        path = (base / module).resolve()
+        if base.resolve() not in path.parents or not path.is_file():
+            continue
+        try:
+            sources.append((module, ast.parse(path.read_text())))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+    if not sources:
+        return
+    declared = plan['target'].get('providers', {})
+    providers = {**PROVIDERS, **(declared if isinstance(declared, dict) else {})}
+    written = set()
+    for source in providers.values():
+        if not isinstance(source, dict) or source.get('repo') not in repos:
+            continue
+        repo = repos[source['repo']]
+        files = source.get('files')
+        if not isinstance(files, list):
+            continue
+        for file in files:
+            try:
+                written.update(emitted_keys(repo['tree'], repo['commit'], [file]))
+            except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError):
+                continue
+    prefixes = {key.split('.', 1)[0] for key in written}
+    ignored = {item['key'] for item in plan.get('reads_ignore', [])
+               if isinstance(item, dict) and isinstance(item.get('key'), str)
+               and isinstance(item.get('reason'), str) and item['reason'].strip()}
+    for module, tree in sources:
+        plays, reads, computed = set(), set(), 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'play':
+                owner = node.func.value
+                if isinstance(owner, ast.Name) and owner.id == 'ctx':
+                    index = 0
+                elif node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == 'ctx':
+                    index = 1
+                else:
+                    continue
+                argument = node.args[index] if len(node.args) > index else None
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    plays.add(argument.value)
+                else:
+                    computed += 1
+            key = None
+            if isinstance(node, ast.Subscript):
+                key = node.slice
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == 'get' and node.args):
+                key = node.args[0]
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                value = key.value
+                if (re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', value)
+                        and value.split('.', 1)[0] in prefixes and value not in written and value not in ignored):
+                    reads.add(value)
+        for name in sorted(plays - macro_names):
+            errors.append(f'G8 {module}: plays "{name}", which is neither a segment of this plan nor a library macro')
+        if computed:
+            warnings.append(f'G8 {module}: {computed} play call(s) with a computed name are not checked')
+        for key in sorted(reads):
+            errors.append(f'G2 {module}: reads "{key}", which the target does not write')
+
+
 def _needs(plan, errors):
     state, rows = {}, {}
 
@@ -313,6 +384,16 @@ def _needs(plan, errors):
                     provided[token] = source
         rows[row_id] = {'needs': list(needs), 'provided_by': provided}
         give(row.get('gives'), row_id)
+        for step in _steps(row.get('steps')):
+            spec = step.get('run', '')
+            if isinstance(spec, str) and spec.startswith('fixtures:'):
+                import fixtures
+                function = fixtures.GIVES.get(spec.partition(':')[2])
+                if function:
+                    try:
+                        give(function(step.get('args', {})), row_id)
+                    except (KeyError, TypeError, ValueError):
+                        pass
     return rows
 
 
@@ -329,6 +410,7 @@ def check(plan, base, raw):
     if isinstance(plan['target'], dict):
         report['emitted'] = _reads(plan, repos, errors)
         _bindings(plan, base, settings, errors)
+        _hook_checks(plan, base, modules, repos, errors, report['warnings'])
     _paths(plan, base, raw, modules, errors)
     report['rows'] = _needs(plan, errors)
     report['result'] = 'BROKEN' if errors else 'OK'

@@ -409,13 +409,48 @@ the exact `path` and a `reason`. Packet-gate errors name their check:
 - **G3:** the recipe, compiled macro, and persisted binding differ.
 - **G4:** a path points into another run, or a local file is missing.
 - **G6:** a need has no matching earlier giver.
+- **G8:** a hook plays a literal macro name absent from the plan and library.
 
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
-Only declared reads are checked. The built-in providers are `tr.menu` and
-`tr.practice`; a dotted string literal in a provider's source file is
-accepted as a key. The packet gate has host tests; it has not been proven
-in a runtime acceptance.
+The G2 undeclared-read net checks dotted subscript and `.get` keys in local
+hooks when their first segment is known to a provider; `reads_ignore` can list
+an exact `key` with a `reason`. Computed macro names are warned about, not
+checked. The built-in providers are `tr.menu` and `tr.practice`; a dotted
+string literal in a provider's source file is accepted as a key. The packet
+gate has host tests; it has not been proven in a runtime acceptance.
+
+#### Fixtures
+
+The shared `fixtures:recording_role` hook checks the Recording page or popup
+and gives `recording.role=<role>` or `recording.popup.role=<role>` respectively.
+`fixtures:guard_first_use` advances a cold wizard behind its state reads and
+gives `guard.ready`. `fixtures:mark_before_room` records the native main-menu
+epoch and bridge-log offset immediately before `routes:wireless_room`; it gives
+nothing. `fixtures:seeded_room` reads the waiting host, settings and native
+waiting battle, and checks the last stage line after that mark. It gives
+`lobby.practice=on`, `partner.behavior=<behavior>` and `lobby.stage=<stage>`.
+`partner.behavior` is the stored panel value; this fixture does not read the
+partner's effective Behavior.
+By default it uses the mark in this row; `mark_row` names an earlier row under
+`out/`. Fixture gives apply to later rows.
+
+Before game load, the offline seed command writes a new settings file without
+changing its base:
+
+```
+/usr/bin/python3 -I tools/eden-runner/fixtures.py seed --base settings.json --out seed.json --behavior 7 --stage 3
+```
+
+The optional `--partners` defaults to 1. The writer refuses an inherited
+custom Direct stage and refuses to overwrite its output.
+`window_from_wait` selects a consecutive grounded Wait stream window. The
+`take-p1-ground-jump` and `take-p1-jump-only` library macros use X for Jump;
+the run's control binding has not been verified. Host tests do not prove
+runtime behavior. Not covered: the live take-recording hook, a CPU take,
+Training CPU behaviour, G5 judge cases, other bridge providers, or comparing
+a saved take with the pinned input list (it comes with the take-recording
+hook, against a real saved take).
 
 #### The shared runner: a helper, extended per project
 

@@ -190,3 +190,13 @@ Retired practice-mode and hitbox slots are handled from `practice_games.rs` and 
 TrainingRooms `71158421` `src/model/bridge_state.rs` and `src/model/practice_state.rs`. The button table maps the
 plugin's logical order in `src/model/chords.rs` at `71158421` to `recipe_macro.BITS`. The optional witness test
 compares the extractor with a recorded `tr.menu` snapshot when supplied. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/fixtures.py` ports the Recording page role switch from
+`dispatch-pack-v2/xps/waiting_room_docs.py` and `rm_lobby_retake_steps.py`, the popup role from `repro_hw.py`, and
+the first-use Guard sequence from `f15_room_steps.py` and `edge_steps.py` onto the canonical state readers.
+The waiting-room mark and readback, including the waiting-battle predicate, and the offline seed settings follow
+`install2/flight-prep/xps_fd_room.py` and `xps-stop-71158421/xps_fd_room.py`; the latter seeds Behavior Stop rather
+than Attack. Panel readback follows `dispatch-pack-v2/xps/docs_lobby_tail.py`.
+`take-p1-ground-jump` and `take-p1-jump-only` are compiled from `f10/fixtures/take-T.json`; X as Jump has not been
+checked against a run profile. `tap-zr1` and `recording-popup-chord` reproduce the flown `rm-tap-zr` and
+`rm-popup-chord` frame shapes. Host tests only; no runtime acceptance.

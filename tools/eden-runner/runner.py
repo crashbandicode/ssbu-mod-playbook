@@ -160,7 +160,7 @@ STEP_KINDS = ('play', 'gate', 'shot', 'mark', 'copy', 'json_diff', 'ui', 'run', 
               'state_baseline')
 UI_OPS = ('trigger', 'click', 'set', 'key', 'select', 'items', 'context', 'close')
 # Shared step-hook modules next to runner.py, named without ".py" in a run step: {"run": "routes:to_main"}.
-SHARED_HOOKS = ('routes', 'routes_online')
+SHARED_HOOKS = ('routes', 'routes_online', 'fixtures')
 # Eden recording.start accepts fps 1..30, width 160..1280, duration_ms 100..120000.
 # Use GIF previews where the surface requires an image. Documentation/tutorial videos are source-rate MP4s.
 GIF_PREVIEW_FPS = {'preview': 12, 'preview-menu': 10}
