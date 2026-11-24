@@ -60,6 +60,8 @@ class PngClient:
             return {'ok': True, 'result': {'path': self.cur, 'finalized': True, 'late_paths': []}}
         if method == 'ui.tree':
             return {'ok': True, 'result': [{'id': 'w', 'class': 'GRenderWindow'}]}
+        if method == 'status':
+            return {'ok': True, 'result': {'frame': 321, 'state': 'running', 'nested': {'ignored': True}}}
         if method == 'ui.screenshot':
             name = Path(params['path']).stem.split('-', 3)[-1]
             colour = (90, 90, 90) if 'same' in name else tuple(hashlib.md5(name.encode()).digest()[:3])
@@ -143,7 +145,7 @@ class StatusRules(unittest.TestCase):
 
 
 class RunnerEffects(unittest.TestCase):
-    def hook_run(self, value, *, target=False, effect=False, role='test', outcome=None):
+    def hook_run(self, value, *, target=False, effect=False, role='test', outcome=None, capture=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         folder = Path(tmp.name)
@@ -154,15 +156,21 @@ class RunnerEffects(unittest.TestCase):
         if outcome:
             row['outcome'] = outcome
         r = make_plan(folder, [row], **({'target': {}} if target else {}))
-        (folder / 'hooks/result.py').write_text(f'def check(ctx):\n    return {value!r}\n')
+        shot = '    ctx.shot("visual")\n' if capture else ''
+        (folder / 'hooks/result.py').write_text(f'def check(ctx):\n{shot}    return {value!r}\n')
         self.assertEqual(r.run(), 'DONE')
         return folder, r
 
-    def record_read(self, folder, still, verdict='PASS', text='the expected text is visible'):
+    def record_read(self, folder, still, verdict='PASS', text='the expected text is visible', row='a'):
         return subprocess.run([sys.executable, '-I', '-B', str(HERE / 'runner.py'), 'record-read',
-                               str(folder / 'rows.json'), '--out', str(folder / 'out'), '--rows', 'a',
+                               str(folder / 'rows.json'), '--out', str(folder / 'out'), '--rows', row,
                                '--reader', 'reviewer', '--verdict', verdict, '--text', text, '--still', str(still)],
                               capture_output=True, text=True)
+
+    def captured(self, folder, row='a'):
+        captures = receipt(folder, row).get('captures')
+        self.assertTrue(captures)
+        return folder / 'out' / row / captures[0]['file']
 
     def test_unverified_hook_markers_never_become_pass_without_a_judge(self):
         for value, marker in (({'file': None, 'grade': 'NEEDS VISUAL READ'}, 'NEEDS VISUAL READ'),
@@ -172,7 +180,8 @@ class RunnerEffects(unittest.TestCase):
                 folder, _ = self.hook_run(value)
                 r = receipt(folder, 'a')
                 self.assertEqual(r['status'], 'RAN-UNVERIFIED')
-                self.assertEqual((r['gates_status'], r['review'], r['review_kind']), ('PASS', True, 'visual'))
+                kind = 'unverified' if 'unverified' in value else 'visual'
+                self.assertEqual((r['gates_status'], r['review'], r['review_kind']), ('PASS', True, kind))
                 self.assertEqual(r['status_reason'], f'hook hooks/result.py:check: {marker}')
 
     def test_admitted_test_rows_require_a_checked_effect(self):
@@ -198,6 +207,25 @@ class RunnerEffects(unittest.TestCase):
         r = receipt(folder, 'a')
         self.assertEqual((r['status'], r['effects_passed']), ('RAN-UNVERIFIED', []))
         self.assertEqual(r['status_reason'], 'hook hooks/result.py:check: read this')
+
+    def test_an_effect_hook_without_evidence_is_a_blocker_without_a_target(self):
+        folder, _ = self.hook_run(True, effect=True)
+        result = receipt(folder, 'a')
+        self.assertEqual(result['status'], 'RAN-UNVERIFIED')
+        self.assertEqual([b['kind'] for b in result.get('blockers', [])], ['effect'])
+        self.assertEqual(result['status_reason'], 'effect hook hooks/result.py:check returned no evidence')
+
+    def test_setup_with_require_effect_keeps_its_existing_unverified_status(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        engine = make_plan(folder, [{'id': 'a', 'role': 'setup', 'steps': [{'gate': 'nav'}]}],
+                           require_effect=True)
+        self.assertEqual(engine.run(), 'DONE')
+        result = receipt(folder, 'a')
+        self.assertEqual(result['status'], 'RAN-UNVERIFIED')
+        self.assertEqual([b['kind'] for b in result.get('blockers', [])], ['effect'])
+        self.assertEqual(result['status_reason'], 'no checked effect gate passed (only start/navigation gates)')
 
     def test_effect_hook_verdict_and_pass_values_are_checked(self):
         cases = (
@@ -266,9 +294,8 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual(r.outcomes['a']['status'], 'unverified')
 
     def test_wrong_text_visual_read_fails_and_cannot_be_promoted(self):
-        folder, _ = self.hook_run(True, outcome='visual')
-        still = folder / 'out/a/still.png'
-        still.write_bytes(b'fixture image')
+        folder, _ = self.hook_run(True, outcome='visual', capture=True)
+        still = self.captured(folder)
         self.assertEqual(receipt(folder, 'a')['status'], 'RAN-UNVERIFIED')
         result = self.record_read(folder, still, 'FAIL', 'shows 30..127, expected 30..97')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -279,9 +306,8 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual(receipt(folder, 'a'), failed)
 
     def test_record_read_accepts_only_a_pending_visual_receipt_and_owned_still(self):
-        folder, _ = self.hook_run(True, outcome='visual')
-        still = folder / 'out/a/still.png'
-        still.write_bytes(b'fixture image')
+        folder, _ = self.hook_run(True, outcome='visual', capture=True)
+        still = self.captured(folder)
         before = receipt(folder, 'a')
         self.assertEqual(before['status'], 'RAN-UNVERIFIED')
         outside = folder / 'outside.png'
@@ -296,7 +322,8 @@ class RunnerEffects(unittest.TestCase):
         self.assertFalse(after['review'])
         self.assertEqual(after['visual_read']['still_sha256'], hashlib.sha256(still.read_bytes()).hexdigest())
         self.assertEqual(after['visual_reads'], [{'state': 'pending'}])
-        changed = {'visual_read', 'visual_reads', 'status', 'status_reason', 'review'}
+        changed = {'visual_read', 'visual_reads', 'status', 'status_reason', 'review', 'review_kind',
+                   'blockers', 'cleared'}
         self.assertEqual({key: value for key, value in after.items() if key not in changed},
                          {key: value for key, value in before.items() if key not in changed})
         self.assertNotEqual(self.record_read(folder, still).returncode, 0)
@@ -307,6 +334,125 @@ class RunnerEffects(unittest.TestCase):
         (folder / 'out/a.json').write_text(json.dumps(before))
         self.assertNotEqual(self.record_read(folder, still).returncode, 0)
         self.assertEqual(receipt(folder, 'a'), before)
+
+    def test_missing_delivery_is_not_a_visual_read(self):
+        marker = 'P1 delivery count not observed'
+        folder, _ = self.hook_run({'unverified': marker}, target=True, effect=True, capture=True)
+        before = receipt(folder, 'a')
+        self.assertEqual((before['status'], before.get('review_kind')), ('RAN-UNVERIFIED', 'unverified'))
+        self.assertEqual(sum(item['kind'] == 'unverified' for item in before.get('blockers', [])), 1)
+        still = self.captured(folder)
+        result = self.record_read(folder, still)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('the row has no pending visual read', result.stderr)
+        self.assertEqual(receipt(folder, 'a'), before)
+
+    def test_a_visual_read_does_not_clear_missing_delivery(self):
+        marker = 'P1 delivery count not observed'
+        folder, _ = self.hook_run({'unverified': marker}, target=True, effect=True,
+                                  outcome='visual', capture=True)
+        before = receipt(folder, 'a')
+        self.assertEqual([item['kind'] for item in before.get('blockers', [])], ['visual', 'unverified'])
+        result = self.record_read(folder, self.captured(folder))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = receipt(folder, 'a')
+        self.assertEqual((after['status'], after.get('review_kind')), ('RAN-UNVERIFIED', 'unverified'))
+        self.assertEqual(after['status_reason'], f'hook hooks/result.py:check: {marker}')
+        self.assertEqual([item['kind'] for item in after['blockers']], ['unverified'])
+        self.assertEqual(after['cleared'][0]['kind'], 'visual')
+        self.assertEqual(after['cleared'][0]['reader'], 'reviewer')
+        self.assertNotEqual(self.record_read(folder, self.captured(folder)).returncode, 0)
+
+    def test_a_visual_read_records_the_actual_capture_and_clears_only_visual(self):
+        folder, _ = self.hook_run({'frames': 300}, target=True, effect=True, outcome='visual', capture=True)
+        still = self.captured(folder)
+        capture = receipt(folder, 'a')['captures'][0]
+        (folder / 'hooks/result.py').write_text('def check(ctx): return {"changed": True}\n')
+        result = self.record_read(folder, still)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = receipt(folder, 'a')
+        self.assertEqual(after['status'], 'PASS')
+        self.assertEqual(after['blockers'], [])
+        self.assertEqual(after['visual_read']['capture'], {'row': 'a', **capture})
+        self.assertEqual(capture['name'], 'visual')
+        self.assertEqual(capture['sha256'], hashlib.sha256(still.read_bytes()).hexdigest())
+        self.assertRegex(capture['utc'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+        self.assertEqual(capture['status'], {'frame': 321, 'state': 'running'})
+
+    def test_a_failed_status_read_does_not_fail_the_screenshot(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        engine = make_plan(folder, [{'id': 'a', 'outcome': 'visual', 'steps': [{'shot': 'visual'}]}])
+        client = engine.clients['sw']
+        request = client.request
+
+        def call(method, params=None):
+            if method == 'status':
+                return {'ok': False, 'error': 'unavailable'}
+            return request(method, params)
+
+        client.request = call
+        self.assertEqual(engine.run(), 'DONE')
+        captures = receipt(folder, 'a').get('captures')
+        self.assertTrue(captures)
+        self.assertIsNone(captures[0]['status'])
+
+    def test_visual_read_refuses_unrecorded_json_and_png(self):
+        folder, _ = self.hook_run({'frames': 300}, target=True, effect=True, outcome='visual', capture=True)
+        before = receipt(folder, 'a')
+        for name in ('hook.json', 'other.png'):
+            with self.subTest(name=name):
+                path = folder / 'out/a' / name
+                path.write_bytes(b'not a runner capture')
+                result = self.record_read(folder, path)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('the still is not a capture recorded by the runner in this run', result.stderr)
+                self.assertEqual(receipt(folder, 'a'), before)
+
+    def test_a_copied_capture_needs_the_same_packet_and_up(self):
+        for changed in (None, 'plan_identity', 'instances_sha256'):
+            with self.subTest(changed=changed):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                folder = Path(tmp.name)
+                rows = [{'id': 'a', 'role': 'setup', 'steps': [{'run': 'hooks/capture.py:check'}]},
+                        {'id': 'b', 'role': 'test', 'outcome': 'visual',
+                         'steps': [{'run': 'hooks/copy.py:check', 'effect': True}]}]
+                engine = make_plan(folder, rows, target={})
+                (folder / 'hooks/capture.py').write_text('def check(ctx):\n    ctx.shot("source")\n    return 1\n')
+                (folder / 'hooks/copy.py').write_text(
+                    'import json\nfrom pathlib import Path\n'
+                    'def check(ctx):\n'
+                    '    out = Path(ctx.runner.out)\n'
+                    '    captures = json.loads((out / "a.json").read_text()).get("captures") or []\n'
+                    '    data = (out / "a" / captures[0]["file"]).read_bytes() if captures else b"no capture"\n'
+                    '    (Path(ctx.row_dir) / "copy.png").write_bytes(data)\n'
+                    '    return 1\n')
+                self.assertEqual(engine.run(), 'DONE')
+                a = receipt(folder, 'a')
+                self.assertTrue(a.get('captures'))
+                if changed:
+                    a[changed] = 'another'
+                    (folder / 'out/a.json').write_text(json.dumps(a))
+                still = folder / 'out/b/copy.png'
+                before = receipt(folder, 'b')
+                result = self.record_read(folder, still, row='b')
+                if changed:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('the still is not a capture recorded by the runner in this run', result.stderr)
+                    self.assertEqual(receipt(folder, 'b'), before)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(receipt(folder, 'b')['visual_read']['capture']['row'], 'a')
+                    self.assertEqual(receipt(folder, 'b')['status'], 'PASS')
+
+    def test_a_visual_hook_marker_can_be_cleared_without_a_target(self):
+        folder, _ = self.hook_run({'grade': 'NEEDS VISUAL READ'}, capture=True)
+        self.assertEqual([b['kind'] for b in receipt(folder, 'a').get('blockers', [])], ['visual'])
+        result = self.record_read(folder, self.captured(folder))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt(folder, 'a')['status'], 'PASS')
 
     def test_without_an_effect_gate_a_row_is_ran_unverified_never_pass(self):
         folder = Path(tempfile.mkdtemp())

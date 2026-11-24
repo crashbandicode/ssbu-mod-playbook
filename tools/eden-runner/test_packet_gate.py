@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline packet gate tests with a temporary committed source tree."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -71,6 +72,168 @@ write!(text, "clip ctx={} total={} in={} out={}");
 
     def errors(self):
         return packet_gate.check(self.plan, self.base, self.plan)['errors']
+
+    def test_inputs_identity_covers_files_and_excludes_runner_writebacks(self):
+        identity = getattr(packet_gate, 'inputs_identity', None)
+        self.assertIsNotNone(identity)
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            (base / 'rows.json').write_text('{}')
+            (base / 'hook.py').write_text('return 1\n')
+            (base / 'fixture.json').write_text('{"mode": 1}\n')
+            (base / 'out').mkdir()
+            (base / 'out' / 'receipt.json').write_text('output')
+            (base / '__pycache__').mkdir()
+            (base / '__pycache__' / 'x.pyc').write_bytes(b'cache')
+            plan = {'segments': {'x': {'file': 'recorded.json'}},
+                    'gates': {'x': {'reference': 'reference.png', 'acquire': True}}}
+            before = identity(base, plan)
+            files = [('fixture.json', base / 'fixture.json'), ('hook.py', base / 'hook.py')]
+            runner_dir = Path(packet_gate.__file__).resolve().parent
+            files += [(f'runner:{path.name}', path) for path in runner_dir.glob('*.py')
+                      if path.is_file() and not path.is_symlink() and not path.name.startswith('test_')]
+            wanted = hashlib.sha256()
+            for name, path in sorted(files):
+                wanted.update(f'{name}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n'.encode())
+            self.assertEqual(before, wanted.hexdigest())
+            (base / 'recorded.json').write_text('recorded')
+            (base / 'reference.png').write_bytes(b'reference')
+            plan['segments']['x']['recorded'] = 'now'
+            plan['gates']['x']['acquired'] = 'now'
+            self.assertEqual(identity(base, plan), before)
+            (base / 'fixture.json').write_text('{"mode": 7}\n')
+            self.assertNotEqual(identity(base, plan), before)
+
+    def test_inputs_identity_excludes_nested_and_recovery_gif_outputs_at_the_runner_root(self):
+        identity = getattr(packet_gate, 'inputs_identity', None)
+        self.assertIsNotNone(identity)
+        for explicit in (False, True):
+            with self.subTest(explicit_root=explicit), tempfile.TemporaryDirectory() as temp:
+                parent = Path(temp)
+                checkout = parent / 'checkout'
+                (checkout / '.git').mkdir(parents=True)
+                base = checkout / 'packet' / 'rows'
+                (base / 'clips').mkdir(parents=True)
+                prefix = 'checkout/packet/rows/clips/' if explicit else 'packet/rows/clips/'
+
+                def gif(name, steps=None):
+                    return {'gif': {'name': name, 'out': prefix + name + '.gif', 'steps': steps or []}}
+
+                plan = {'rows': [{'id': 'producer', 'steps': [gif('row', [gif('nested')])],
+                                  'recover': [gif('row-recover', [gif('nested-recover')])]}],
+                        'recover': [gif('plan-recover')]}
+                if explicit:
+                    plan['root'] = str(parent)
+                neighbor = base / 'clips' / 'unnamed.dat'
+                neighbor.write_text('before')
+                before = identity(base, plan)
+                for name in ('row', 'nested', 'row-recover', 'nested-recover', 'plan-recover'):
+                    (base / 'clips' / (name + '.gif')).write_text('generated')
+                self.assertEqual(identity(base, plan), before)
+                (base / 'clips' / 'nested.gif').write_text('regenerated')
+                self.assertEqual(identity(base, plan), before)
+                neighbor.write_text('after')
+                self.assertNotEqual(identity(base, plan), before)
+
+    def test_inputs_identity_does_not_exclude_a_gif_out_rejected_by_inside_root(self):
+        identity = getattr(packet_gate, 'inputs_identity', None)
+        self.assertIsNotNone(identity)
+        (self.base / 'clips').mkdir()
+        neighbor = self.base / 'input.dat'
+        neighbor.write_text('before')
+        plan = {'rows': [{'steps': [{'gif': {'name': 'bad', 'out': 'clips/../input.dat'}}]}]}
+        before = identity(self.base, plan)
+        neighbor.write_text('after')
+        self.assertNotEqual(identity(self.base, plan), before)
+
+    def test_a_named_gif_output_cannot_mask_canonical_inputs(self):
+        identity = getattr(packet_gate, 'inputs_identity', None)
+        self.assertIsNotNone(identity)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base = root / 'rows'
+            base.mkdir()
+            canonical = root / 'runner'
+            canonical.mkdir()
+            output = canonical / 'runner.py'
+            output.write_text('before')
+            plan = {'root': str(root), 'rows': [{'id': 'owner', 'steps': [
+                {'gif': {'name': 'named', 'out': 'runner/runner.py'}}]}]}
+            with mock.patch.object(packet_gate, '__file__', str(canonical / 'packet_gate.py')):
+                before = identity(base, plan)
+                output.write_text('after')
+                self.assertNotEqual(identity(base, plan), before)
+            self.assertIn('G4 row owner: gif out runner/runner.py names a packet input',
+                          packet_gate.check(plan, base, plan)['errors'])
+
+    def test_gif_output_cannot_mask_a_packet_hook_but_a_gif_is_excluded(self):
+        identity = getattr(packet_gate, 'inputs_identity', None)
+        self.assertIsNotNone(identity)
+        gif = {'name': 'test', 'out': 'steps.py', 'steps': []}
+        self.plan['rows'][0]['steps'].append({'gif': gif})
+        before = identity(self.base, self.plan)
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return {"changed": 1}\n')
+        self.assertNotEqual(identity(self.base, self.plan), before)
+        self.assertIn('G4 row r1: gif out steps.py names a packet input', self.errors())
+
+        gif['out'] = 'clips/a.gif'
+        (self.base / 'clips').mkdir()
+        before = identity(self.base, self.plan)
+        self.assertFalse(any(error.startswith('G4 row r1: gif out') for error in self.errors()))
+        (self.base / 'clips/a.gif').write_bytes(b'generated')
+        self.assertEqual(identity(self.base, self.plan), before)
+
+    def test_gif_collisions_cover_packet_inputs_and_keep_original_writeback_exclusions(self):
+        identity = getattr(packet_gate, 'inputs_identity', None)
+        self.assertIsNotNone(identity)
+        cases = (
+            ('rows.json', {}, False),
+            ('segment.bin', {'segments': {'x': {'file': 'segment.bin'}}}, False),
+            ('recorded.bin', {'segments': {'x': {'file': 'recorded.bin', 'recorded': 'now'}}}, True),
+            ('reference.bin', {'gates': {'x': {'reference': 'reference.bin'}}}, False),
+            ('acquired.bin', {'gates': {'x': {'reference': 'acquired.bin', 'acquire': True}}}, True),
+            ('hook.step', {'rows': [{'id': 'r1', 'steps': [{'run': 'hook.step:ok'}]}]}, False),
+            ('hook.gate', {'gates': {'x': {'kind': 'hook', 'module': 'hook.gate'}}}, False),
+            ('hook.failure', {'on_failure_hook': 'hook.failure:ok'}, False),
+            ('hook.rowfailure', {'rows': [{'id': 'r1', 'steps': [],
+                                          'on_failure_hook': {'run': 'hook.rowfailure:ok'}}]}, False),
+            ('hook.recover', {'recover': [{'run': 'hook.recover:ok'}]}, False),
+            ('unreferenced.py', {}, False),
+            ('unreferenced.json', {}, False),
+            ('packet-gate.json', {}, False),
+            ('out/output.json', {}, False),
+            ('__pycache__/hook.pyc', {'recover': [{'run': '__pycache__/hook.pyc:ok'}]}, False),
+        )
+        for name, additions, unchanged in cases:
+            with self.subTest(name=name):
+                plan = {'rows': [{'id': 'r1', 'steps': []}], **additions}
+                plan['rows'][0]['steps'].append({'gif': {'name': 'test', 'out': name}})
+                path = self.base / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('before')
+                before = identity(self.base, plan)
+                errors = packet_gate.check(plan, self.base, plan)['errors']
+                self.assertIn(f'G4 row r1: gif out {name} names a packet input', errors)
+                path.write_text('after')
+                after = identity(self.base, plan)
+                if unchanged:
+                    self.assertEqual(before, after)
+                else:
+                    self.assertNotEqual(before, after)
+
+    def test_gif_collisions_in_nested_and_recovery_steps_are_refused(self):
+        plan = {
+            'rows': [{'id': 'r1', 'steps': [{'gif': {'name': 'outer', 'out': 'ok.gif', 'steps': [
+                {'gif': {'name': 'inner', 'out': 'inner.json'}}]}}],
+                      'recover': [{'gif': {'name': 'row-recover', 'out': 'row.py'}}]}],
+            'recover': [{'gif': {'name': 'plan-recover', 'out': 'plan.py'}}],
+            'screen_classes': [{'class': 'menu', 'reach': [
+                {'gif': {'name': 'reach', 'out': 'reach.json'}}]}],
+        }
+        errors = packet_gate.check(plan, self.base, plan)['errors']
+        for name in ('inner.json', 'row.py', 'plan.py', 'reach.json'):
+            self.assertIn(f'G4 row r1: gif out {name} names a packet input', errors)
+        self.assertNotIn('G4 row r1: gif out ok.gif names a packet input', errors)
 
     def test_the_stale_capture_path_of_another_run_is_refused(self):
         path = '/home/intpa/eden-runs/rc15-fix-17060a5e-yoga-1/rows/cap-video.sh'

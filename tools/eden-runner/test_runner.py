@@ -1974,6 +1974,9 @@ class RunnerTests(unittest.TestCase):
                     {'rows': {'r2': {'needs': ['drill:a'], 'provided_by': {'drill:a': 'r1'}}}}))
                 source = {'status': 'RAN-UNVERIFIED'}
                 source['plan_identity'] = runner.plan_identity(runner.expand_library(copy.deepcopy(self.plan)))
+                source['instances_sha256'] = None
+                source['inputs_identity'] = getattr(runner.packet_gate, 'inputs_identity', lambda *_: None)(
+                    self.dir, runner.expand_library(copy.deepcopy(self.plan)))
                 if gates_status is not None:
                     source['gates_status'] = gates_status
                 (out / 'r1.json').write_text(json.dumps(source))
@@ -2018,7 +2021,9 @@ class RunnerTests(unittest.TestCase):
                                        client_factory=lambda _: eden, instances_sha256=sha(second))
                 source = {'status': 'PASS',
                           'plan_identity': 'another-packet' if reason == 'packet' else runner.plan_identity(engine.plan),
-                          'instances_sha256': sha(second) if reason == 'packet' else sha(first)}
+                          'instances_sha256': sha(second) if reason == 'packet' else sha(first),
+                          'inputs_identity': getattr(runner.packet_gate, 'inputs_identity', lambda *_: None)(
+                              self.dir, engine.plan)}
                 if reason == 'missing':
                     source.pop('plan_identity')
                 (out / 'producer.json').write_text(json.dumps(source))
@@ -2031,17 +2036,18 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(receipt.get('instances_sha256'), sha(second))
                 self.assertNotIn('settings.get', eden.calls)
 
-    def test_dependency_without_instances_file_does_not_compare_its_hash(self):
+    def test_dependency_without_instances_file_rejects_a_different_hash(self):
         out, _ = self._identity_dependency_plan()
         eden = FakeEden({})
         engine = self.make(eden)
         (out / 'producer.json').write_text(json.dumps({
-            'status': 'PASS', 'plan_identity': runner.plan_identity(engine.plan), 'instances_sha256': 'old-up'}))
-        self.assertEqual(engine.run(only={'dependent'}), 'DONE')
+            'status': 'PASS', 'plan_identity': runner.plan_identity(engine.plan), 'instances_sha256': 'old-up',
+            'inputs_identity': getattr(runner.packet_gate, 'inputs_identity', lambda *_: None)(self.dir, engine.plan)}))
+        self.assertEqual(engine.run(only={'dependent'}), 'FAILED')
         receipt = json.loads((out / 'dependent.json').read_text())
-        self.assertEqual(receipt['status'], 'PASS')
+        self.assertEqual(receipt['status'], 'FAILED')
         self.assertIsNone(receipt.get('instances_sha256'))
-        self.assertIn('settings.get', eden.calls)
+        self.assertNotIn('settings.get', eden.calls)
 
     def test_named_pass_row_reruns_and_unnamed_pass_row_is_skipped(self):
         self.plan['rows'] = [
@@ -2080,6 +2086,8 @@ class RunnerTests(unittest.TestCase):
         producer = json.loads((out / 'producer.json').read_text())
         dependent = json.loads((out / 'dependent.json').read_text())
         self.assertEqual((producer['status'], dependent['status']), ('PASS', 'PASS'))
+        self.assertIsInstance(producer.get('inputs_identity'), str)
+        self.assertEqual(producer.get('inputs_identity'), dependent.get('inputs_identity'))
         self.assertIsInstance(producer.get('plan_identity'), str)
         self.assertEqual(producer.get('plan_identity'), dependent.get('plan_identity'))
         self.assertEqual(producer.get('instances_sha256'), sha(instances))
@@ -2097,6 +2105,8 @@ class RunnerTests(unittest.TestCase):
         producer = json.loads((out / 'producer.json').read_text())
         dependent = json.loads((out / 'dependent.json').read_text())
         self.assertEqual((producer['status'], dependent['status']), ('PASS', 'PASS'))
+        self.assertIsInstance(producer.get('inputs_identity'), str)
+        self.assertEqual(producer.get('inputs_identity'), dependent.get('inputs_identity'))
         self.assertIsInstance(producer.get('plan_identity'), str)
         self.assertEqual(producer.get('plan_identity'), dependent.get('plan_identity'))
         self.assertNotEqual(producer['manifest_sha256'], dependent['manifest_sha256'])
@@ -2135,6 +2145,138 @@ class RunnerTests(unittest.TestCase):
         receipt = json.loads((out / 'packet-gate.json').read_text())
         self.assertIsInstance(receipt.get('plan_identity'), str)
         self.assertEqual(receipt.get('plan_identity'), runner.plan_identity(runner.expand_library(copy.deepcopy(self.plan))))
+
+    def test_changed_hook_blocks_dependent_then_selected_producer_refreshes_it(self):
+        out, _ = self._identity_dependency_plan()
+        self.plan['rows'][0]['steps'] = [{'run': 'producer.py:run'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        hook = self.dir / 'producer.py'
+        hook.write_text('def run(ctx): return {"version": 1}\n')
+        self.assertEqual(self.make(FakeEden({})).run(only={'producer'}), 'DONE')
+        old = json.loads((out / 'producer.json').read_text())
+        self.assertIsInstance(old.get('inputs_identity'), str)
+        hook.write_text('def run(ctx): return {"version": 2}\n')
+        eden = FakeEden({})
+        self.assertEqual(self.make(eden).run(only={'dependent'}), 'FAILED')
+        refused = json.loads((out / 'dependent.json').read_text())
+        self.assertEqual(refused.get('error'), 'NOT RUN (setup): needs "seed" from row producer, '
+                                             'whose receipt is from another packet or another Up')
+        self.assertTrue(refused.get('not_executed'))
+        self.assertNotIn('settings.get', eden.calls)
+        eden = FakeEden({})
+        self.assertEqual(self.make(eden).run(only={'producer', 'dependent'}), 'DONE')
+        self.assertEqual(eden.calls.count('settings.get'), 1)
+        new = json.loads((out / 'producer.json').read_text())
+        dependent = json.loads((out / 'dependent.json').read_text())
+        self.assertNotEqual(old['inputs_identity'], new['inputs_identity'])
+        self.assertEqual(new['inputs_identity'], dependent['inputs_identity'])
+        self.assertLess(new['started'], dependent['started'])
+
+    def test_changed_fixture_data_blocks_the_dependent_before_its_call(self):
+        out, _ = self._identity_dependency_plan()
+        fixture = self.dir / 'fixture.json'
+        fixture.write_text('{"behavior": 1}\n')
+        self.assertEqual(self.make(FakeEden({})).run(only={'producer'}), 'DONE')
+        source = json.loads((out / 'producer.json').read_text())
+        self.assertIsInstance(source.get('inputs_identity'), str)
+        fixture.write_text('{"behavior": 7}\n')
+        eden = FakeEden({})
+        self.assertEqual(self.make(eden).run(only={'dependent'}), 'FAILED')
+        refused = json.loads((out / 'dependent.json').read_text())
+        self.assertTrue(refused.get('not_executed'))
+        self.assertIn('whose receipt is from another packet or another Up', refused.get('error', ''))
+        self.assertNotIn('settings.get', eden.calls)
+
+    def _gif_dependency_fixture(self):
+        class GifEden(FakeEden):
+            def request(self, method, params):
+                if method == 'recording.start':
+                    self.calls.append(method)
+                    self.gif = dict(params)
+                    return {'ok': True, 'result': {'state': 'recording'}}
+                if method == 'recording.stop':
+                    self.calls.append(method)
+                    width = self.gif['width']
+                    images = [Image.new('RGB', (width, max(1, width * 9 // 16)), color)
+                              for color in (RED, BLUE)]
+                    images[0].save(self.gif['path'], save_all=True, append_images=images[1:],
+                                   duration=80, loop=0)
+                    return {'ok': True, 'result': {'state': 'finished'}}
+                if method == 'recording.status':
+                    self.calls.append(method)
+                    return {'ok': True, 'result': {'state': 'finished', 'frames': 2, 'dropped_frames': 0}}
+                return super().request(method, params)
+
+        out, _ = self._identity_dependency_plan()
+        self.plan['root'] = str(self.dir)
+        self.plan['rows'][0]['steps'] = [
+            {'gif': {'name': 'moment', 'preset': 'evidence', 'fps': 12, 'out': 'clips/moment.gif', 'steps': []}}]
+        self.manifest.write_text(json.dumps(self.plan))
+        (self.dir / 'clips').mkdir()
+        neighbor = self.dir / 'clips' / 'fixture.dat'
+        neighbor.write_text('before')
+        return out, neighbor, GifEden
+
+    def test_a_producers_named_gif_does_not_block_its_dependent(self):
+        out, _, gif_client = self._gif_dependency_fixture()
+        eden = gif_client({})
+        self.assertEqual(self.make(eden).run(), 'DONE')
+        producer = json.loads((out / 'producer.json').read_text())
+        dependent = json.loads((out / 'dependent.json').read_text())
+        self.assertEqual((producer['status'], dependent['status']), ('PASS', 'PASS'))
+        self.assertTrue((self.dir / 'clips/moment.gif').is_file())
+        self.assertIsInstance(producer.get('inputs_identity'), str)
+        self.assertEqual(producer.get('inputs_identity'), dependent.get('inputs_identity'))
+        self.assertIn('recording.start', eden.calls)
+        self.assertIn('recording.stop', eden.calls)
+        self.assertIn('settings.get', eden.calls)
+
+    def test_an_unnamed_file_beside_a_gif_blocks_its_dependent_when_changed(self):
+        out, neighbor, gif_client = self._gif_dependency_fixture()
+        self.assertEqual(self.make(gif_client({})).run(only={'producer'}), 'DONE')
+        self.assertTrue((self.dir / 'clips/moment.gif').is_file())
+        neighbor.write_text('after')
+        eden = gif_client({})
+        self.assertEqual(self.make(eden).run(only={'dependent'}), 'FAILED')
+        dependent = json.loads((out / 'dependent.json').read_text())
+        self.assertTrue(dependent.get('not_executed'))
+        self.assertIn('whose receipt is from another packet or another Up', dependent.get('error', ''))
+        self.assertNotIn('settings.get', eden.calls)
+
+    def test_an_acquired_reference_does_not_block_the_dependent(self):
+        out, _ = self._identity_dependency_plan()
+        self.plan['gates']['new'] = {'kind': 'image', 'reference': 'refs/new.png', 'roi': [0, 0, 64, 36],
+                                     'acquire': True, 'cap': 3, 'interval': .05}
+        self.plan['rows'][0]['steps'] = [{'gate': 'new'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        self.assertEqual(self.make(FakeEden({})).run(only={'producer'}), 'REVIEW')
+        producer = json.loads((out / 'producer.json').read_text())
+        self.assertIsInstance(producer.get('inputs_identity'), str)
+        self.assertTrue((self.dir / 'refs/new.png').is_file())
+        eden = FakeEden({})
+        self.assertEqual(self.make(eden).run(only={'dependent'}), 'DONE')
+        dependent = json.loads((out / 'dependent.json').read_text())
+        self.assertEqual(producer['inputs_identity'], dependent['inputs_identity'])
+        self.assertIn('settings.get', eden.calls)
+
+    def test_fresh_processes_compute_the_same_inputs_identity(self):
+        self.manifest.write_text(json.dumps(self.plan))
+        code = ('import json, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); '
+                'import runner, packet_gate; p = Path(sys.argv[2]); '
+                'print(packet_gate.inputs_identity(p.parent, runner.expand_library(json.loads(p.read_text()))))')
+        command = [sys.executable, '-I', '-B', '-c', code, str(Path(runner.__file__).parent), str(self.manifest)]
+        first = subprocess.run(command, capture_output=True, text=True)
+        second = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertRegex(first.stdout.strip(), r'^[a-f0-9]{64}$')
+        self.assertEqual(first.stdout, second.stdout)
+
+    def test_packet_gate_receipt_carries_inputs_identity(self):
+        result = runner.main(['dry-run', str(self.manifest), '--out', str(self.dir / 'out')])
+        self.assertEqual(result, 0)
+        gate = json.loads((self.dir / 'out/packet-gate.json').read_text())
+        self.assertIsInstance(gate.get('inputs_identity'), str)
 
     def _third_row_recovers_to_red(self):
         original = self.dir / 'segments/to-red.edenmacro.json'
