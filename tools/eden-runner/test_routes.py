@@ -3599,6 +3599,7 @@ class WirelessRoomTests(unittest.TestCase):
         result = self.run_room(unpublished_create='allow')
         self.assertEqual(result['entered_at'], 'stage-a')
         self.assertEqual(self.io.actions, ['lobby-a', 'lobby-first-tile', 'lobby-a', 'lobby-ready'])
+        self.assertEqual(result['create_witness'], 'not observed: the route entered after the Create form')
 
     def test_entry_from_the_published_create_form(self):
         self.io.phase = 'form'

@@ -1204,8 +1204,9 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         placed_by = 'already placed'
     return _save(ctx, 'routes-wireless-room', {
         'block': 'wireless_room', 'screens': screens, 'create_form': state['create_form'],
-        'create_witness': ('none: unpublished Create form allowed by the caller'
-                           if state['create_form'] == 'unpublished' else 'ldn.create'),
+        'create_witness': {'unpublished': 'none: unpublished Create form allowed by the caller',
+                           None: 'not observed: the route entered after the Create form'}.get(
+                               state['create_form'], 'ldn.create'),
         'confirm_presses': state['confirm_presses'], 'stage_presses': state['stage_presses'], 'tile': tile,
         'placed_by': placed_by, 'chord_sent': state['chord_sent'], 'chord_fence': state['chord_fence'],
         'waiting': {key: waiting_ui.get(key, 'unknown')
