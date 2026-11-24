@@ -755,8 +755,9 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
-def play(ctx, name):
+def play(ctx, name, *, among=None):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
+    # RED: the declared set is not enforced yet.
     path, sha, cap = macro_file(name)
     try:
         ctx.call('macro.play', {'path': str(path)})

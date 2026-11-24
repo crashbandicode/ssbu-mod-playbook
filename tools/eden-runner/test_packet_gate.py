@@ -1938,6 +1938,40 @@ fn elsewhere() { write!(out, "outside=1"); }
             '    r.play(ctx, "tap-a1")\n    r.play(ctx, "smash-main")\n')
         self.assertEqual(self.errors(), [])
 
+    def test_a_declared_set_of_play_names_is_checked(self):
+        self.plan['segments'].update({'take-p1': {'file': 'p1.json'}, 'take-cpu': {'file': 'cpu.json'}})
+
+        def gate(source):
+            (self.base / 'steps.py').write_text(source)
+            result = packet_gate.check(self.plan, self.base, self.plan)
+            return result['errors'], result['warnings']
+
+        warning = ['G8 steps.py: 1 play call(s) with a computed name or unknown callee are not checked']
+        head = 'def ok(ctx, name="take-p1"):\n'
+        # No declaration: the computed name is not checked, and the gate says so.
+        self.assertEqual(gate(head + '    ctx.play(name)\n'), ([], warning))
+        # A declared closed set whose names all resolve is checked: no warning.
+        self.assertEqual(gate(head + '    ctx.play(name, among=("take-p1", "take-cpu"))\n'), ([], []))
+        self.assertEqual(gate(head + '    ctx.play(name, among=["take-p1"])\n'), ([], []))
+        # A set written once at module level.
+        self.assertEqual(gate('TAKES = ("take-p1", "take-cpu")\n' + head + '    ctx.play(name, among=TAKES)\n'), ([], []))
+        # A declared name that does not resolve is refused.
+        self.assertEqual(gate(head + '    ctx.play(name, among=("take-p1", "take-p2"))\n'),
+                         (['G8 steps.py: ctx.play among "take-p2" names no segment of this plan'], []))
+        # routes.play is checked against the routes library, not the plan.
+        route = 'import routes\ndef ok(ctx, name="tap-a1"):\n'
+        self.assertEqual(gate(route + '    routes.play(ctx, name, among=("tap-a1", "smash-main"))\n'), ([], []))
+        self.assertEqual(gate(route + '    routes.play(ctx, name, among=("tap-a1", "take-p1"))\n'),
+                         (['G8 steps.py: routes.play among "take-p1" names no routes library macro'], []))
+        # A set the gate cannot read is no declaration: built at run time, a parameter, a name bound twice, empty.
+        for among in ('names()', 'takes', '()', 'TWICE', '("take-p1", 3)'):
+            source = ('TWICE = ("take-p1",)\nTWICE = ("take-cpu",)\n'
+                      'def ok(ctx, name="take-p1", takes=("take-p1",)):\n' f'    ctx.play(name, among={among})\n')
+            self.assertEqual(gate(source), ([], warning), among)
+        # A written name outside its own set is refused.
+        self.assertEqual(gate('def ok(ctx):\n    ctx.play("take-cpu", among=("take-p1",))\n'),
+                         (['G8 steps.py: ctx.play("take-cpu") is not among the names it declares'], []))
+
     def test_a_hook_that_reads_a_key_the_build_does_not_write_is_refused(self):
         (self.base / 'steps.py').write_text(
             'def ok(ctx):\n    values = {}\n    return values.get("recording.page.rolle"), values["evidence.path"]\n')

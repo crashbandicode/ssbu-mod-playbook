@@ -3542,5 +3542,32 @@ class BridgeAtShotTests(unittest.TestCase):
             routes._switch_hw = saved
 
 
+class DeclaredPlayTests(unittest.TestCase):
+    """A play that declares the names it may take (`among=`) stops before any input on another name."""
+
+    def test_a_segment_play_outside_its_declared_set_stops(self):
+        fake = mock.Mock()
+        fake.instances = {'a': {}}
+        ctx = runner.StepContext(fake, 'a')
+        ctx.play('take-p1', among=('take-p1', 'take-cpu'))
+        ctx.play('anything')
+        self.assertEqual(fake.play.call_args_list, [mock.call('a', 'take-p1'), mock.call('a', 'anything')])
+        with self.assertRaisesRegex(RuntimeError, 'take-p2 is not among the names this step declares'):
+            ctx.play('take-p2', among=('take-p1', 'take-cpu'))
+        self.assertEqual(fake.play.call_count, 2)
+
+    def test_a_route_play_outside_its_declared_set_stops(self):
+        ctx = mock.Mock()
+        ctx.on = 'a'
+        routes.play(ctx, 'tap-a1', among=('tap-a1',))
+        self.assertEqual([call.args[0] for call in ctx.call.call_args_list], ['macro.play'])
+        ctx.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, 'smash-main is not among the names this step declares'):
+            routes.play(ctx, 'smash-main', among=('tap-a1',))
+        ctx.call.assert_not_called()
+        routes.play(ctx, 'smash-main')
+        self.assertEqual(ctx.call.call_count, 1)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

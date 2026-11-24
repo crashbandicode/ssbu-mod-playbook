@@ -1157,7 +1157,8 @@ class StepContext:
     def shot(self, name):
         return self.runner.shot(self.on, name)
 
-    def play(self, segment):
+    def play(self, segment, *, among=None):
+        # RED: the declared set is not enforced yet.
         return self.runner.play(self.on, segment)
 
     def gate(self, name):
