@@ -5305,8 +5305,15 @@ class DashboardRouteTests(unittest.TestCase):
             self.room_ready = 'yes'
             self.room_ready_after = None
             self.form_ready = 'yes'
+            self.dashboard_dialog = 'none'
+            self.a_delay = None
+            self.a_sent_at = None
+            self.close_after_a = False
 
         def read(self, provider, cap):
+            if (self.phase == 'main' and self.a_sent_at is not None and self.a_delay is not None
+                    and self.clock() >= self.a_sent_at + self.a_delay):
+                self.phase = 'rooms'
             sample = super().read(provider, cap)
             if provider == 'ssbu.ui':
                 values = sample.values
@@ -5321,6 +5328,9 @@ class DashboardRouteTests(unittest.TestCase):
                     else:
                         values.pop('input.ready', None)
                     if self.dashboard == 'open':
+                        values['dialog'] = self.dashboard_dialog
+                        if self.main_owner is None:
+                            values.pop('input.owner', None)
                         if self.missing_dashboard_ready:
                             values.pop('input.ready', None)
                         values['focus.id'] = ('dashboard.local_wireless' if self.dashboard_index == self.local_index
@@ -5355,7 +5365,13 @@ class DashboardRouteTests(unittest.TestCase):
                     elif not self.stuck_down:
                         self.dashboard_index += 1
                 elif self.dashboard_index == self.local_index and self.dashboard == 'open':
-                    self.phase = 'rooms'
+                    if self.close_after_a:
+                        self.close_after_a = False
+                        self.dashboard = 'closed'
+                    elif self.a_delay is not None:
+                        self.a_sent_at = self.clock()
+                    else:
+                        self.phase = 'rooms'
                 else:
                     raise AssertionError('A sent away from Local Wireless')
                 return
@@ -5448,6 +5464,83 @@ class DashboardRouteTests(unittest.TestCase):
         result = self.run_route()
         self.assertEqual(self.io.actions.count('tap-zr1'), 2)
         self.assertTrue(result['list_ready'])
+
+    def test_dashboard_a_is_one_shot_when_the_source_never_changes(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index, self.io.a_delay = 'open', 2, 100
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_route(guest)
+                self.assertEqual(caught.exception.step, 'dashboard-a')
+                self.assertIn('no transition within cap', caught.exception.reason)
+                self.assertEqual(self.io.actions, ['lobby-a'])
+                self.assertEqual(self.io.pending, 'lobby-a')
+
+    def test_dashboard_a_waits_for_a_slow_list_without_repeating(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index, self.io.a_delay = 'open', 2, 10
+                result = self.run_route(guest)
+                self.assertEqual(self.io.actions.count('lobby-a'), 1 if guest else 3)
+                self.assertEqual(next(step for step in result['steps'] if step['name'] == 'dashboard-a')['sends'], 1)
+                self.assertGreaterEqual(self.now, 10)
+
+    def test_reopened_dashboard_cannot_send_a_second_dashboard_a(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index, self.io.close_after_a = 'open', 2, True
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_route(guest)
+                self.assertEqual(caught.exception.step, 'dashboard-a')
+                self.assertEqual(self.io.actions, ['lobby-a', 'tap-zr1'])
+
+    def test_dashboard_presses_require_native_owner_and_no_dialog(self):
+        for guest in (False, True):
+            for owner, dialog in (('popup', 'confirmation'), ('native', 'confirmation'),
+                                  (None, 'none'), ('unknown', 'none')):
+                for index in (0, 2):
+                    with self.subTest(guest=guest, owner=owner, dialog=dialog, index=index):
+                        self.io = self.IO()
+                        self.now = 0
+                        self.io.dashboard, self.io.dashboard_index = 'open', index
+                        self.io.main_owner, self.io.dashboard_dialog = owner, dialog
+                        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                            self.run_route(guest)
+                        self.assertNotEqual(caught.exception.step, 'locate')
+                        self.assertIn('not ready', caught.exception.reason)
+                        self.assertIn('last read', caught.exception.reason)
+                        self.assertEqual(self.io.actions, [])
+
+    def test_reopened_dashboard_records_each_repeated_step_as_a_stall(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.close_after_down = True
+                result = self.run_route(guest)
+                self.assertEqual(self.io.actions[:6], ['tap-zr1', 'main-menu-down', 'tap-zr1',
+                                                       'main-menu-down', 'main-menu-down', 'lobby-a'])
+                self.assertEqual(result['result'], 'PASS with 2 stalls')
+                self.assertEqual([(item['kind'], item['step'], item['send'], item['target'])
+                                  for item in result['stalls']],
+                                 [('repeat', 'open-dashboard', 2, repr(('top', 'top'))),
+                                  ('repeat', 'dashboard-down-0', 2, repr(('dashboard.item0', '0')))])
+
+    def test_clean_dashboard_navigation_has_no_stalls(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                result = self.run_route(guest)
+                self.assertEqual(self.io.actions[:4], ['tap-zr1', 'main-menu-down', 'main-menu-down', 'lobby-a'])
+                self.assertEqual(result['stalls'], [])
+                self.assertEqual(result['result'], 'PASS')
 
     def test_entry_with_the_dashboard_open_resumes_at_its_focus(self):
         self.io.dashboard, self.io.dashboard_index = 'open', 1

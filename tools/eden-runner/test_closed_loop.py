@@ -40,6 +40,25 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_a_step_repeated_after_the_route_went_back_is_a_stall(self):
+        fake = Script(lambda f: ('a', 'b', 'a', 'done')[min(len(f.sends), 3)])
+        result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')])
+        self.assertEqual([name for name, _ in fake.sends], ['a', 'b', 'a'])
+        self.assertEqual(result['stalls'], [{'kind': 'repeat', 'step': 'a', 'send': 2, 'target': 'None'}])
+
+    def test_a_resend_within_one_visit_is_one_event_not_two(self):
+        fake = Script(lambda f: 'done' if len(f.sends) >= 2 else 'a')
+        result = fake.run([step('a', 'a', 'done', lost_after=2)])
+        self.assertEqual(len(fake.sends), 2)
+        self.assertEqual(len(result['stalls']), 1)
+        self.assertEqual(result['stalls'][0].get('kind', 'resend'), 'resend')
+
+    def test_ordinary_progress_through_distinct_steps_has_no_stall(self):
+        fake = Script(lambda f: ('a', 'b', 'done')[min(len(f.sends), 2)])
+        result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')])
+        self.assertEqual([name for name, _ in fake.sends], ['a', 'b'])
+        self.assertEqual(result['stalls'], [])
+
     def test_a_locate_predicate_can_stop_with_a_complete_step_receipt(self):
         fake = Script(lambda f: 'unsupported')
 

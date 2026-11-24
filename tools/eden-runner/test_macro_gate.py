@@ -1,5 +1,6 @@
 """Offline tests for the shared bounded macro dispatch gate."""
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -306,3 +307,60 @@ class MacroGateTests(unittest.TestCase):
             self.assertTrue(self.dispatch(requalify=lambda remaining: True))
         self.assertEqual(len(self.events), 1)
         self.assertEqual(self.events[0]['outcome'], 'requalified, accepted')
+
+
+class RealTimeRequalificationTests(unittest.TestCase):
+    def test_blocked_requalification_is_abandoned_with_one_event(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+                events, sent, polls = [], [], []
+
+                def call(method, params=None):
+                    if method == 'macro.status':
+                        polls.append(1)
+                        return {'state': 'playing' if len(polls) == 1 else 'idle'}
+                    sent.append(params)
+
+                def witness(remaining):
+                    entered.set()
+                    try:
+                        release.wait(.8)
+                        if raises:
+                            raise RuntimeError('late error')
+                        return True
+                    finally:
+                        exited.set()
+
+                try:
+                    started = time.monotonic()
+                    with mock.patch.object(macro_gate, 'IDLE_CAP', .35):
+                        with self.assertRaises(closed_loop.DispatchRejected):
+                            macro_gate.dispatch(call, Path('/macro'), name='test',
+                                                requalify=witness, on_event=events.append)
+                    elapsed = time.monotonic() - started
+                    self.assertTrue(entered.is_set())
+                    self.assertLessEqual(elapsed, .60)
+                    self.assertEqual(sent, [])
+                    self.assertEqual([event['outcome'] for event in events],
+                                     ['not sent: requalification did not answer within the bound'])
+                finally:
+                    release.set()
+                    self.assertTrue(exited.wait(1))
+                self.assertEqual(sent, [])
+                self.assertEqual(len(events), 1)
+
+    def test_requalification_which_answers_in_time_sends_once(self):
+        calls, events = [], []
+
+        def call(method, params=None):
+            calls.append(method)
+            if method == 'macro.status':
+                return {'state': 'playing' if calls.count(method) == 1 else 'idle'}
+            return {}
+
+        with mock.patch.object(macro_gate, 'IDLE_CAP', .5):
+            self.assertTrue(macro_gate.dispatch(call, Path('/macro'), name='test',
+                                                requalify=lambda remaining: True, on_event=events.append))
+        self.assertEqual(calls.count('macro.play'), 1)
+        self.assertEqual([event['outcome'] for event in events], ['requalified, accepted'])

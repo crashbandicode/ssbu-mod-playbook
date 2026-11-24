@@ -1367,6 +1367,53 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(run.row_macro_waits), 1)
         self.assertEqual(run.row_macro_waits[0]['outcome'], 'not sent: the bound passed during requalification')
 
+    def test_a_blocked_status_start_gate_recheck_cannot_outlive_the_idle_budget(self):
+        run, eden, now = self.waiting_run()
+        run.plan['segments']['to-red']['start_gate'] = 'red'
+        run.plan['gates']['red'] = {'kind': 'status', 'cap': 40, 'expect': {'running': True}}
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        original = eden.request
+        status_calls = []
+
+        def request(method, params):
+            if method == 'macro.status':
+                eden.calls.append(method)
+                return {'ok': True, 'result': {'state': 'playing' if now[0] < 14.4 else 'idle'}}
+            if method == 'status':
+                status_calls.append(method)
+                if len(status_calls) == 2:
+                    entered.set()
+                    try:
+                        release.wait(.8)
+                        now[0] += 4
+                    finally:
+                        exited.set()
+                return {'ok': True, 'result': {'running': True}}
+            return original(method, params)
+
+        def expire():
+            if entered.wait(1):
+                now[0] = 15
+
+        eden.request = request
+        timer = threading.Thread(target=expire)
+        timer.start()
+        try:
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                run.play('a', 'to-red')
+            rejected_at = now[0]
+            self.assertTrue(entered.is_set())
+            self.assertLessEqual(rejected_at, 15.25)
+            self.assertNotIn('macro.play', eden.calls)
+            self.assertEqual([event['outcome'] for event in run.row_macro_waits],
+                             ['not sent: requalification did not answer within the bound'])
+        finally:
+            release.set()
+            timer.join(1)
+            self.assertTrue(exited.wait(1))
+        self.assertFalse(timer.is_alive())
+        self.assertNotIn('macro.play', eden.calls)
+
     def test_gate_recovery_after_a_wait_needs_the_segments_own_start_gate(self):
         run, eden, _ = self.waiting_run()
         run.plan['gates']['red']['recover'] = 'to-red'
