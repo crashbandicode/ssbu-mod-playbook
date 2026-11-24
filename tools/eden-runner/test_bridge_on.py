@@ -289,7 +289,8 @@ class BridgeOnTests(unittest.TestCase):
         self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
         self.journal.unlink()
         prior = self.row / 'routes-bridge-on-prior.json'
-        prior.write_text(json.dumps({'witness': 'trace', 'chord': {'event': STUB_EVENTS[3]}}))
+        prior.write_text(json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]},
+                                     'capture': {'port': 6980}}))
         run = self.out / 'bridge-run'
         run.mkdir()
         (run / 'bridge.log').write_text(STUB_PREAMBLE)
@@ -360,8 +361,22 @@ class BridgeOnTests(unittest.TestCase):
         self.journal.unlink()
         prior = self.row / 'routes-bridge-on-invalid.json'
         for contents in (None, '{not-json}', json.dumps({'witness': 'stub-on',
-                         'chord': {'chord': 'pad', 'event': STUB_EVENTS[3], 'pre_chord': {}}, 'title': {}}),
-                         json.dumps({'witness': 'trace', 'chord': {'event': 'another event'}})):
+                         'chord': {'chord': 'pad', 'event': STUB_EVENTS[3], 'pre_chord': {}}, 'title': {},
+                         'capture': {'port': 6980}}),
+                         json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': 'another event'},
+                                     'capture': {'port': 6980}}),
+                         json.dumps({'witness': 'trace',
+                                     'chord': {'chord': 'already on', 'event': STUB_EVENTS[3]},
+                                     'capture': {'port': 6980}}),
+                         json.dumps({'witness': 'trace',
+                                     'chord': {'chord': 'already on', 'stock': STOCK, 'event': STUB_EVENTS[3]},
+                                     'capture': {'port': 6980}}),
+                         json.dumps({'witness': 'trace', 'chord': {'event': STUB_EVENTS[3]},
+                                     'capture': {'port': 6980}}),
+                         json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]}}),
+                         json.dumps({'witness': 'stub-on',
+                                     'chord': {'chord': 'pad', 'event': STUB_EVENTS[3], 'pre_chord': {}},
+                                     'title': {'matched': 'prompt'}, 'capture': {'port': 6981}})):
             with self.subTest(contents=contents):
                 if contents is None:
                     prior.unlink(missing_ok=True)
@@ -377,6 +392,8 @@ class BridgeOnTests(unittest.TestCase):
         first = self.invoke(port=6980)
         prior = self.row / 'routes-bridge-on.json'
         self.assertTrue(prior.is_file())
+        self.assertEqual(first['capture']['port'], 6980)
+        self.assertEqual(first['chord']['chord'], 'pad')
         presses = len([1 for method, args in self.calls if method == 'input.button' and args['state'] == 'press'])
         run = self.out / 'bridge-run'
         with (run / 'bridge.lock').open('w') as lock:
@@ -395,13 +412,17 @@ class BridgeOnTests(unittest.TestCase):
         self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
         older = self.row / 'routes-bridge-on.json'
         newer = self.row / 'routes-bridge-on-2.json'
-        corrupt = self.row / 'routes-bridge-on-3.json'
-        older.write_text(json.dumps({'witness': 'trace', 'chord': {'event': STUB_EVENTS[3]}}))
+        wrong_port = self.row / 'routes-bridge-on-3.json'
+        corrupt = self.row / 'routes-bridge-on-4.json'
+        older.write_text(json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]},
+                                     'capture': {'port': 6980}}))
         newer.write_text(json.dumps({'witness': 'stub-on',
             'chord': {'event': STUB_EVENTS[3], 'chord': 'pad', 'pre_chord': {}},
-            'title': {'matched': 'prompt', 'frame': 31}}))
+            'title': {'matched': 'prompt', 'frame': 31}, 'capture': {'port': 6980}}))
+        wrong_port.write_text(json.dumps({'witness': 'trace', 'chord': {'stock': STOCK, 'event': STUB_EVENTS[3]},
+                                          'capture': {'port': 6981}}))
         corrupt.write_text('{bad')
-        for index, path in enumerate((older, newer, corrupt), 1):
+        for index, path in enumerate((older, newer, wrong_port, corrupt), 1):
             os.utime(path, ns=(index * 1_000_000_000, index * 1_000_000_000))
         receipt = self.invoke(port=6980)
         self.assertEqual(receipt['chord'].get('qualified_by', {}).get('receipt'), str(newer))
