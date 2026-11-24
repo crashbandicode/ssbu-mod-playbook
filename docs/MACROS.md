@@ -506,7 +506,10 @@ every still taken inside a row, including image-gate polling stills, as a
 capture with one `status` call after each. Without a game-frame source the
 freshness is `unverified` and remains usable; that is not frame-freshness proof.
 The judge is shown only usable row stills and clip frames; excluded stills are
-listed in the job and the receipt.
+listed in the job and the receipt. A judged row with no usable image is
+unverified. A verdict is taken only from a judge run that exited successfully
+and wrote it in that run; earlier verdict files are kept as
+`verdict.attempt-<n>.json`.
 The still's own recorded path selects its capture; otherwise use
 `--capture <row>:<file>` to name its source, or omit it when the hash matches
 exactly one capture. An ambiguous hash is refused.

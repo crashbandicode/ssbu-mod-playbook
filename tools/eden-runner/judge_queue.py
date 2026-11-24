@@ -333,6 +333,15 @@ def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_s
 
 
 # ---- the worker ----------------------------------------------------------------------------------------------------
+def archive_verdict(folder):
+    out = Path(folder) / 'verdict.json'
+    if out.exists():
+        attempt = 1
+        while (Path(folder) / f'verdict.attempt-{attempt}.json').exists():
+            attempt += 1
+        out.rename(Path(folder) / f'verdict.attempt-{attempt}.json')
+
+
 def run_judge(job_path, job):
     out = Path(job['dir']) / 'verdict.json'
     cmd = job.get('judge_cmd')
@@ -346,11 +355,16 @@ def run_judge(job_path, job):
                               capture_output=True, text=True, timeout=job.get('timeout_s', JUDGE_TIMEOUT_S))
     except subprocess.TimeoutExpired:
         return {'verdict': 'UNSURE', 'reason': 'judge timed out', 'shots_cited': [], 'model': None}
+    if proc.returncode:
+        return {'verdict': 'UNSURE', 'reason': f'judge failed (exit {proc.returncode}): {(proc.stderr or "")[-300:]}',
+                'shots_cited': [], 'model': None}
     try:
         verdict = json.loads(out.read_text())
     except (OSError, ValueError):
         return {'verdict': 'UNSURE', 'reason': f'judge gave no verdict (exit {proc.returncode}): '
                 f'{(proc.stderr or "")[-300:]}', 'shots_cited': [], 'model': None}
+    if not isinstance(verdict, dict):
+        return {'verdict': 'UNSURE', 'reason': f'invalid verdict {verdict!r}', 'shots_cited': [], 'model': None}
     if verdict.get('verdict') not in ('PASS', 'FAIL', 'UNSURE'):
         verdict = {**verdict, 'verdict': 'UNSURE', 'reason': f'invalid verdict {verdict.get("verdict")!r}'}
     return verdict
@@ -399,13 +413,17 @@ def work(job_path):
         job['frame_error'] = frame_error
     job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
     try:
+        archive_verdict(folder)
         check = clip_check(job, frames)
         if not check.get('ok', True):
             verdict = {'verdict': 'FAIL', 'reason': f'clip check: {check["reason"]}', 'shots_cited': [],
                        'model': 'clip-check'}
-        elif not job['judge_shots'] and job['excluded_shots']:
+        elif not job['judge_shots']:
+            reason = (f"{len(job['excluded_shots'])} unusable still(s) excluded" if job['excluded_shots']
+                      else 'no row still and no clip frame'
+                           + (f"; clip: {job['frame_error']}" if job.get('frame_error') else ''))
             verdict = {'verdict': 'UNSURE',
-                       'reason': f"no usable image for the judge: {len(job['excluded_shots'])} unusable still(s) excluded",
+                       'reason': f'no usable image for the judge: {reason}',
                        'shots_cited': [], 'model': None}
         else:
             verdict = run_judge(job_path, job)
