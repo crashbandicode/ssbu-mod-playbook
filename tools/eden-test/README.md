@@ -39,8 +39,11 @@ file directly in the run's own stage folder `/home/intpa/eden-runs/_eden-test/st
 local file is never copied there. The host refuses a base that is missing, is for another host, is a symlink, or
 pins another Eden AppImage than its shared base does, and starts nothing. A base without a `trace` section needs no
 `--elf` and no trace points: use one for a stub-on run on a host whose shared base is a trace base. The shared base
-is only read. On a machine that reaches the host over ssh (`--ssh` or `hosts.json`), a local file given as `--from`
-is refused even when it names that host.
+is only read. Which machine a go runs on comes from that machine's own shared base: when it names the `--host`,
+the go runs there with any local `--from`; when it names another host, the go is sent over ssh (`--ssh` or
+`hosts.json`) and a local file given as `--from` is neither opened nor copied. With no ssh name, or with a
+`hosts.json` or shared base that cannot be read, go stops and starts nothing. A local copy of a host's base never
+makes a machine that host.
 The repository does not ship a `base.json` template; it is maintained on
 each host. Add `"notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md",
 "to": "tr-primary-2"}` to that base, without an `ssh` key. Notifications

@@ -1720,15 +1720,42 @@ def _go_target_rsync(command):
 _GO_BASE_NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*\.json'
 
 
-def _go_route(args):
-    """The ssh name this machine reaches args.host by (--ssh or hosts.json), or None. A machine that has one is the
-    controller for that host, not the host."""
-    hosts = RUNS / '_eden-test' / 'hosts.json'
+def _go_this_host():
+    """The host this machine is, by its shared base, or None when it has no shared base. A local copy of another
+    host's base never answers this. A shared base that cannot say is a stop, not a guess."""
+    shared = RUNS / '_eden-test' / 'base.json'
+    if not shared.exists():
+        return None
     try:
-        mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
-    except (OSError, ValueError):
-        mapping = {}
-    return args.ssh or (mapping.get(args.host) if isinstance(mapping, dict) else None)
+        config = json.loads(shared.read_text())
+        host = config.get('host') if isinstance(config, dict) else None
+        if not isinstance(host, str) or not host:
+            raise ValueError('it names no host')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'this machine\'s shared base {shared} cannot say which host this is: {error}; '
+                         'nothing was started') from error
+    return host
+
+
+def _go_route(args):
+    """The ssh name this machine reaches args.host by: --ssh, else its hosts.json entry, else None. A hosts.json
+    that exists and cannot be read is a stop: it must not look like a machine with no route."""
+    if args.ssh:
+        return args.ssh
+    hosts = RUNS / '_eden-test' / 'hosts.json'
+    if not hosts.exists():
+        return None
+    try:
+        mapping = json.loads(hosts.read_text())
+        if not isinstance(mapping, dict):
+            raise ValueError('it is not an object of host names')
+        route = mapping.get(args.host)
+        if route is not None and (not isinstance(route, str) or not route):
+            raise ValueError(f'its entry for {args.host!r} is not an ssh name')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot find the ssh name for host {args.host!r}: {hosts} cannot be used: {error}; '
+                         'nothing was started') from error
+    return route
 
 
 def _go_remote_base(args):
@@ -1953,11 +1980,28 @@ def cmd_go(args):
     if args.token:  # a controller sent this go here: it runs on this machine or not at all
         _go_received_base(args)
     else:
-        base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
-        here = base.is_file() and json.loads(base.read_text()).get('host') == args.host
-        # A machine that reaches the host over ssh is its controller: a local file that names the host is no proof
-        # of being that host, so --from goes to the host as a path there.
-        if not here or (args.from_config and _go_route(args)):
+        # Which machine this is comes from its own shared base, never from the base the go names: a local copy of
+        # the host's base does not make this machine the host.
+        shared = RUNS / '_eden-test' / 'base.json'
+        this_host = _go_this_host()
+        if this_host == args.host:
+            remote = False  # this is the host: any local --from, as before; an ssh name is not needed
+        elif _go_route(args):
+            remote = True  # the host is elsewhere: --from is a path there, and a local file is not opened
+        elif this_host is not None:
+            raise SystemExit(
+                f'this machine is host {this_host!r} by its shared base {shared}, not {args.host!r}, and it has no '
+                f'ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'nothing was started')
+        else:
+            # A machine with no shared base and no route (a test folder, a first set-up): the base decides.
+            base = Path(args.from_config) if args.from_config else shared
+            try:
+                config = json.loads(base.read_text()) if base.is_file() else None
+                remote = not isinstance(config, dict) or config.get('host') != args.host
+            except (OSError, ValueError) as error:
+                raise SystemExit(f'the base {base} cannot be read: {error}; nothing was started') from error
+        if remote:
             _go_trace(args)
             lineup = _go_card_lineup(args)
             return _go_remote(args, lineup)
