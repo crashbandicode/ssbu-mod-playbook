@@ -46,9 +46,9 @@ STUB_BOOT = '0xa1e80deccd2a9a15'
 FOREIGN_BOOT = '0x1111111111111111'
 RUN1 = (Path(__file__).parent / 'fixtures' / 'bridge-on' / 'stub-on-yoga-e-run1' / 'bridge.log').read_text().splitlines(keepends=True)
 RUN1_PREAMBLE = ''.join(RUN1[:3])
-RUN1_OPENING = ''.join(RUN1[51:99])
-RUN1_LAST_OPENING = ''.join(RUN1[99:147])
-RUN1_PROMPT = ''.join(RUN1[147:195])
+RUN1_OPENING = ''.join(RUN1[52:101])
+RUN1_LAST_OPENING = ''.join(RUN1[101:150])
+RUN1_PROMPT = ''.join(RUN1[150:199])
 RUN1_BOOT = '0x1dc637526fb29a71'
 
 
@@ -164,6 +164,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def sample(self, *, active='yes', boot=STUB_BOOT, screen='title', fields=None):
         text = STUB_UI.replace(STUB_BOOT, boot)
+        if boot == RUN1_BOOT:
+            text = re.sub(r'^\[Bridge\] req providers result=.*$', RUN1[52].rstrip('\n'), text, flags=re.MULTILINE)
         text = text.replace('observation.active=yes', f'observation.active={active}')
         text = text.replace('screen=title', f'screen={screen}')
         for key, value in (fields or {}).items():
@@ -200,6 +202,15 @@ class BridgeOnTests(unittest.TestCase):
 
     def macro_attempts(self):
         return [args for method, args in self.calls if method == 'macro.play']
+
+    def assert_fresh_offsets(self, title, prefix, reply, index):
+        boundary = len(prefix.encode())
+        self.assertEqual(title['skip']['fresh'], {
+            'request_bytes_before': boundary,
+            'providers_reply_offset': boundary,
+            'block_begin_offset': boundary + len(reply.splitlines(keepends=True)[0].encode()),
+            'block_index': index,
+        })
 
     def invoke(self, **kwargs):
         with patch('time.monotonic', side_effect=lambda: self.seconds), \
@@ -493,8 +504,44 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(len(self.macro_attempts()), 1)
         self.assertEqual((title['skip']['sent_on']['rev'], title['skip']['sent_on']['frame'],
                           title['skip']['sent_on']['wall']), (1193, 7849, 506147525))
-        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 1, 'block_index': 1})
+        self.assert_fresh_offsets(title, RUN1_PREAMBLE + RUN1_OPENING, RUN1_LAST_OPENING, 1)
         self.assertEqual((title['matched'], title['frame']), ('prompt', 7860))
+
+    def split_recheck(self, prompt_after_skip):
+        self.recorded_opening(prompt_after_skip=prompt_after_skip)
+        lines = RUN1_LAST_OPENING.splitlines(keepends=True)
+        self.stub_samples = [RUN1_OPENING + ''.join(lines[:-1]), lines[-1]]
+        self.stub_default = ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_reply_begun_before_the_recheck_sends_nothing(self):
+        self.split_recheck(False)
+
+    def test_bridge_on_stub_on_reply_begun_before_recheck_cannot_unlock_modelled_prompt(self):
+        self.split_recheck(True)
+
+    def test_bridge_on_stub_on_recheck_reply_without_its_providers_fence_sends_nothing(self):
+        self.recorded_opening(prompt_after_skip=False)
+        no_fence = ''.join(RUN1_LAST_OPENING.splitlines(keepends=True)[1:])
+        self.stub_samples, self.stub_default = [RUN1_OPENING, no_fence], ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+
+    def test_bridge_on_stub_on_first_opening_begun_before_its_request_is_not_fresh(self):
+        self.recorded_opening(prompt_after_skip=False)
+        lines = RUN1_OPENING.splitlines(keepends=True)
+        self.stub_preamble = RUN1_PREAMBLE + ''.join(lines[:-1])
+        self.stub_samples, self.stub_default = [lines[-1]], ''
+        with self.assertRaisesRegex(RuntimeError, 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent'):
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertFalse(any(method == 'macro.status' for method, _ in self.calls))
 
     def test_bridge_on_stub_on_opening_gone_at_the_recheck_sends_nothing(self):
         self.recorded_opening(prompt_after_skip=False)
@@ -553,7 +600,7 @@ class BridgeOnTests(unittest.TestCase):
         title = self.invoke(port=6980)['title']
         self.assertEqual(len(self.macro_attempts()), 1)
         self.assertEqual(title['skip']['sent_on']['frame'], 7849)
-        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 1, 'block_index': 1})
+        self.assert_fresh_offsets(title, RUN1_PREAMBLE + RUN1_OPENING, RUN1_LAST_OPENING, 1)
 
     def test_bridge_on_stub_on_retries_confirmation_after_a_silent_recheck(self):
         self.recorded_opening()
@@ -561,7 +608,7 @@ class BridgeOnTests(unittest.TestCase):
         title = self.invoke(port=6980)['title']
         self.assertEqual(len(self.macro_attempts()), 1)
         self.assertEqual(title['skip']['sent_on']['frame'], 7849)
-        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 2, 'block_index': 2})
+        self.assert_fresh_offsets(title, RUN1_PREAMBLE + RUN1_OPENING * 2, RUN1_LAST_OPENING, 2)
         self.assertGreaterEqual(self.request_times[2] - self.request_times[1], 2)
 
     def test_bridge_on_stub_on_fresh_indices_include_preexisting_blocks(self):
@@ -570,7 +617,7 @@ class BridgeOnTests(unittest.TestCase):
         self.stub_samples, self.stub_default = [RUN1_OPENING, RUN1_LAST_OPENING], ''
         title = self.invoke(port=6980)['title']
         self.assertEqual(len(self.macro_attempts()), 1)
-        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 2, 'block_index': 2})
+        self.assert_fresh_offsets(title, RUN1_PREAMBLE + RUN1_OPENING * 2, RUN1_LAST_OPENING, 2)
 
     def test_bridge_on_stub_on_preexisting_prompt_still_qualifies(self):
         self.recorded_opening(prompt_after_skip=False)
