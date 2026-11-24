@@ -3282,36 +3282,52 @@ def _bridge_on_owned_listener(ctx, port):
     return listener
 
 
+def _bridge_on_ui_blocks_since_hello(text, hello):
+    lines = text.splitlines()
+    try:
+        start = lines.index(hello)
+    except ValueError:
+        raise RuntimeError('bridge_on (stub on): bridge greeting disappeared from capture log') from None
+    segment = []
+    for line in lines[start:]:
+        if segment and state_gate.BOUNDARY.search(line):
+            yield from state_gate.blocks('\n'.join(segment), native_picker.UI)
+            segment = []
+        segment.append(line)
+    yield from state_gate.blocks('\n'.join(segment), native_picker.UI)
+
+
 def _bridge_on_stub_title(ctx, hello):
     match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
     if match is None:
         raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
     boot = match[1]
+    log = instance_path(ctx, 'bridge_log')
     until = time.monotonic() + 10
+    next_request = 0
     timeout = 'bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting'
     while (remaining := until - time.monotonic()) > 0:
         ctx.check_stop()
-        io = BridgePickerIO(ctx)
-        try:
-            sample = io.read(native_picker.UI, remaining)
-        except RuntimeError:
-            if time.monotonic() >= until:
-                raise RuntimeError(timeout) from None
-            raise
-        values = sample.values
-        if sample.block['boot'] != boot or values.get('observation.active') != 'yes':
-            time.sleep(min(.05, max(0, until - time.monotonic())))
-            continue
-        matched = next((name for name, criteria in (
-            ('prompt', TITLE_PROMPT), ('opening', TITLE_OPENING), ('title', _TITLE_WITHOUT_PROMPT),
-        ) if _fields_match(sample, criteria)), None)
-        if matched is None:
-            raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
-                               f"{values.get('screen')}/{values.get('focus')}, not the Title")
-        native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
-        return {'rev': sample.block['rev'], 'boot': sample.block['boot'],
-                **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
-                'matched': matched}
+        now = time.monotonic()
+        if now >= next_request:
+            bridge_v2(ctx, 'providers', 'state ssbu.ui')
+            next_request = now + .1
+        for block in _bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello):
+            values = block['values']
+            if block['boot'] != boot or values.get('observation.active') != 'yes':
+                continue
+            sample = native_picker.Sample(block, 0)
+            matched = next((name for name, criteria in (
+                ('prompt', TITLE_PROMPT), ('opening', TITLE_OPENING), ('title', _TITLE_WITHOUT_PROMPT),
+            ) if _fields_match(sample, criteria)), None)
+            if matched is None:
+                raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
+                                   f"{values.get('screen')}/{values.get('focus')}, not the Title")
+            native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+            return {'rev': block['rev'], 'boot': block['boot'],
+                    **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
+                    'matched': matched}
+        time.sleep(min(.05, max(0, until - time.monotonic())))
     raise RuntimeError(timeout)
 
 
@@ -3420,7 +3436,10 @@ def bridge_on(ctx, port=None, cap=60):
             raise RuntimeError(f'bridge install line lacks {want}: {install}')
     if not re.search(r'\btoggle_gen=[1-9][0-9]*\b', hello):
         raise RuntimeError(f'bridge greeting lacks a positive On generation: {hello}')
-    title = _bridge_on_stub_title(ctx, hello) if trace is None else None
+    title = None
+    if trace is None:
+        title = ({'checked': False, 'reason': 'bridge already On before this call'}
+                 if chord['chord'] == 'already on' else _bridge_on_stub_title(ctx, hello))
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:

@@ -318,6 +318,14 @@ class BridgeOnTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
             self.invoke(port=6980)
 
+    def test_bridge_on_stub_on_ignores_a_bad_crc_before_the_title(self):
+        self.configure_stub()
+        bad = re.sub(r'crc=[0-9a-f]{8}', 'crc=00000000', self.sample(screen='main'))
+        self.assertEqual(state_gate.blocks(bad, 'ssbu.ui'), [])
+        self.stub_default = bad + ''.join(STUB_CAPTURE[11:])
+        receipt = self.invoke(port=6980)
+        self.assertEqual(receipt['title']['matched'], 'prompt')
+
     def test_bridge_on_stub_on_refuses_a_listener_owned_by_another_pid(self):
         self.configure_stub()
         self.listener = 'LISTEN users:(("other",pid=999,fd=5))'

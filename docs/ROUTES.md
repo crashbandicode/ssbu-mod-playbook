@@ -89,6 +89,7 @@ running and loading status, no input since `game.load`, and listener ownership b
 Title is named by the bridge only after it is On (the first active `ssbu.ui` observation). Before the chord the
 evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
 the attract loop.
+If the bridge is already On, the route sends no chord and records that it did not check the Title.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
 within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.
