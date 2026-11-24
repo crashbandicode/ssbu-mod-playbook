@@ -5123,6 +5123,114 @@ class LoadStepTests(unittest.TestCase):
         self.assertEqual(fn.__name__, 'lan_pair')
 
 
+class WirelessRoomListTests(unittest.TestCase):
+    class IO(WirelessRoomTests.IO):
+        def __init__(self):
+            super().__init__()
+            self.main_focus = 'top'
+            self.lost_main = 0
+            self.focus_after_send = None
+
+        def read(self, provider, cap):
+            sample = super().read(provider, cap)
+            if provider == 'ssbu.ui' and self.phase == 'main':
+                sample.values.update({'focus': self.main_focus, 'screen.layer': 'main'})
+            if provider == 'ssbu.ui' and self.phase == 'rooms':
+                sample.values['input.ready'] = 'yes'
+            return sample
+
+        def send(self, macro):
+            if macro == 'lobby-open-room-list' and self.lost_main:
+                self.lost_main -= 1
+                self.room_list_missing = True
+                super().send(macro)
+                self.room_list_missing = False
+                if self.focus_after_send is not None:
+                    self.main_focus = self.focus_after_send
+                return
+            super().send(macro)
+
+    setUp = WirelessRoomTests.setUp
+    call = WirelessRoomTests.call
+
+    def run_list(self):
+        def sleep(seconds):
+            self.now += seconds
+
+        self.io.clock = lambda: self.now
+        with mock.patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+                mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
+                mock.patch.object(routes.time, 'sleep', side_effect=sleep):
+            return routes.wireless_room_list(self.ctx, ready_cap=3)
+
+    def test_main_menu_opens_room_list_with_one_macro(self):
+        result = self.run_list()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list'])
+        self.assertEqual(result['entered_at'], 'open-room-list')
+        self.assertEqual(result['room_list']['screen'], 'ldn.room_list')
+        self.assertEqual(result['room_list']['focus.id'], 'ldn.create_room')
+        self.assertEqual(result['room_list']['focus.index'], '0')
+        self.assertEqual(result['room_list']['input.ready'], 'yes')
+        self.assertEqual(result['steps'][0]['sends'], 1)
+
+    def test_already_on_room_list_sends_nothing(self):
+        self.io.phase = 'rooms'
+        result = self.run_list()
+        self.assertEqual(self.io.actions, [])
+        self.assertEqual(result['entered_at'], 'done')
+        self.assertEqual(result['room_list']['screen'], 'ldn.room_list')
+
+    def test_a_lost_macro_is_resent_only_on_the_same_main_menu_target(self):
+        self.io.lost_main = 1
+        result = self.run_list()
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'lobby-open-room-list'])
+        self.assertEqual(result['steps'][0]['sends'], 2)
+        self.assertTrue(result['stalls'])
+
+    def test_changed_main_menu_focus_stops_without_a_second_send(self):
+        self.io.lost_main = 1
+        self.io.focus_after_send = 'other'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_list()
+        self.assertEqual(caught.exception.step, 'open-room-list')
+        self.assertIn('target changed', caught.exception.reason)
+        self.assertEqual(self.io.actions, ['lobby-open-room-list'])
+
+    def test_main_menu_not_ready_never_sends(self):
+        self.io.ready_no_phase = 'main'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_list()
+        self.assertEqual(caught.exception.step, 'open-room-list')
+        self.assertEqual(self.io.actions, [])
+
+    def test_entry_past_the_room_list_stops_on_locate(self):
+        for phase, screen in (('waiting', 'ldn.waiting'), ('stage', 'stage_select'),
+                              ('css', 'css.smash'), ('confirm_form', 'ldn.create')):
+            with self.subTest(screen=screen):
+                self.io = self.IO()
+                self.io.phase = phase
+                self.now = 0
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_list()
+                self.assertEqual(caught.exception.step, 'locate')
+                self.assertIn(screen, caught.exception.reason)
+                self.assertEqual(self.io.actions, [])
+
+    def test_success_and_stop_receipts_explain_the_unread_presses(self):
+        warning = ('lobby-open-room-list sends ZR, Down, Down, A with no read between them; '
+                   'the bridge does not publish the dashboard overlay')
+        result = self.run_list()
+        self.assertEqual(result['unread_presses'], warning)
+        self.assertEqual(json.loads((self.row / 'routes-wireless-room-list.json').read_text())['unread_presses'],
+                         warning)
+        self.io = self.IO()
+        self.io.phase = 'waiting'
+        with self.assertRaises(routes.closed_loop.RouteStopped):
+            self.run_list()
+        stop = json.loads((self.row / 'routes-wireless-room-list-stop.json').read_text())
+        self.assertEqual(stop['unread_presses'], warning)
+
+
 class OnlineTests(unittest.TestCase):
     A1 = ('[auto] broker started title=01006A800016E000 lan=192.168.0.222 local_only=false\n'
           '[coord] leading epoch=137 tcp=192.168.0.222:35095\n'
