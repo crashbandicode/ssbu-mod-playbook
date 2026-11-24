@@ -952,9 +952,11 @@ def _cases(plan, base, errors, warnings):
         is_test = (('role' in row or ('start' in row and 'end' in row)) and row_role(row) == 'test')
         for step in _steps(row.get('steps')):
             spec = step.get('run')
-            if not isinstance(spec, str) or not step.get('effect') or spec.startswith('fixtures:'):
+            if not isinstance(spec, str) or not step.get('effect'):
                 continue
             module, separator, hook = spec.partition(':')
+            if module == 'fixtures' and separator and not is_test:
+                continue
             shared_module = module if is_test and separator and module in shared_hook_names() else None
             case_root = root
             shared = None

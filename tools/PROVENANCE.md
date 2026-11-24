@@ -257,3 +257,6 @@ Host tests only; no runtime acceptance.
 
 2026-11-24: `eden-runner/packet_gate.py` G9 supports shared-hook
 `EFFECT_JUDGES` and library cases. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/packet_gate.py` G9 checks fixture effect hooks in
+test rows under the shared-hook case rules. Host tests only; no runtime acceptance.
