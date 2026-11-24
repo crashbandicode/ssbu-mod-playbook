@@ -23,14 +23,16 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zlib
 from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFile
 except ImportError:
     Image = None
+    ImageFile = None
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -52,6 +54,7 @@ def effect_evidence(value):
 NO_EFFECT_DIFF = 3.0      # mean abs RGB diff (0-255, 320x180) below which two frames are "the same picture"
 JUDGE_TIMEOUT_S = 600
 FRAME_NAMES = ('start', 'mid', 'end')
+_IMAGE_VERIFY_LOCK = threading.RLock()
 
 
 # ---- status rules (pure; host-tested) ------------------------------------------------------------------------------
@@ -328,10 +331,18 @@ def image_issue(path, *, previews=None):
     try:
         if Image is None:
             return None if _png_decodes(path) else 'not a decodable image'
-        with Image.open(path) as image:
-            image.load()
-            if previews is not None:
-                previews[str(Path(path))] = image.convert('RGB').resize((320, 180), Image.Resampling.BOX)
+        with _IMAGE_VERIFY_LOCK:
+            truncated = ImageFile.LOAD_TRUNCATED_IMAGES
+            try:
+                ImageFile.LOAD_TRUNCATED_IMAGES = False
+                with Image.open(path) as image:
+                    image.verify()
+                with Image.open(path) as image:
+                    image.load()
+                    if previews is not None:
+                        previews[str(Path(path))] = image.convert('RGB').resize((320, 180), Image.Resampling.BOX)
+            finally:
+                ImageFile.LOAD_TRUNCATED_IMAGES = truncated
         return None
     except Exception:  # noqa: BLE001 - any unreadable or unsupported image is excluded
         return 'not a decodable image'
