@@ -351,9 +351,9 @@ class BridgePickerIO:
                     try:
                         current = self.read(provider, cap)
                     except Exception as error:
-                        if self.routes.macro_gate.stop(error):
-                            raise
                         check = getattr(self.ctx, 'check_stop', None)
+                        if self.routes.macro_gate.stop(error, check):
+                            raise
                         if check is not None:
                             check()
                         raise closed_loop.DispatchRejected(
@@ -385,7 +385,8 @@ class BridgePickerIO:
             else:
                 self.routes.play(self.ctx, segment, requalify=requalify if witness else None, until=until)
         except Exception as error:
-            if isinstance(error, closed_loop.DispatchRejected) or self.routes.macro_gate.stop(error):
+            if (isinstance(error, closed_loop.DispatchRejected)
+                    or self.routes.macro_gate.stop(error, getattr(self.ctx, 'check_stop', None))):
                 self.pending.pop(self.ctx.on, None)
                 self.in_flight = False
             raise

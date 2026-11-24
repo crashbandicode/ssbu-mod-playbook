@@ -9,8 +9,16 @@ IDLE_CAP = 15.0
 BLIND = object()
 
 
-def stop(error):
-    return any(base.__name__ == 'StopRun' for base in type(error).__mro__)
+def stop(error, check=None):
+    if any(base.__name__ == 'StopRun' for base in type(error).__mro__):
+        return True
+    code = getattr(getattr(check, '__func__', check), '__code__', None)
+    trace = error.__traceback__
+    while code is not None and trace is not None:
+        if trace.tb_frame.f_code is code:
+            return True
+        trace = trace.tb_next
+    return False
 
 
 def bounded_call(call, method, cap, check=None):
@@ -41,7 +49,7 @@ def bounded_call(call, method, cap, check=None):
 def busy(call, remaining, note=None, check=None, is_stop=None):
     answered, status = bounded_call(call, 'macro.status', remaining, check=check)
     if not answered and status is not None:
-        if stop(status) or is_stop is not None and is_stop(status):
+        if stop(status, check) or is_stop is not None and is_stop(status):
             raise status
         if check is not None:
             check()
@@ -62,7 +70,7 @@ def busy(call, remaining, note=None, check=None, is_stop=None):
                 return None
         return f'macro.status not understood: {repr(status)[:160]}'
     except Exception as error:
-        if stop(error) or is_stop is not None and is_stop(error):
+        if stop(error, check) or is_stop is not None and is_stop(error):
             raise
         if check is not None:
             check()
@@ -129,7 +137,7 @@ def dispatch(call, path, *, name, requalify=None, until=None, on_event=None, not
             try:
                 needed = requalify()
             except Exception as error:
-                if stop(error) or is_stop is not None and is_stop(error):
+                if stop(error, check) or is_stop is not None and is_stop(error):
                     raise
                 check_cancelled()
                 emit(f'not sent: {error}')

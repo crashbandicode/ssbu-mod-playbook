@@ -148,6 +148,37 @@ class MacroGateTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_a_one_shot_stop_from_the_check_is_not_mistaken_for_a_status_or_witness_failure(self):
+        class Cancelled(RuntimeError):
+            pass
+
+        for phase in ('status', 'requalification'):
+            with self.subTest(phase=phase):
+                self.now, self.polls, self.sent, self.events = 0.0, [], [], []
+                armed = False
+
+                def check():
+                    nonlocal armed
+                    if armed:
+                        armed = False
+                        raise Cancelled('one-shot STOP')
+
+                def interrupted():
+                    nonlocal armed
+                    armed = True
+                    check()
+
+                if phase == 'status':
+                    self.status = interrupted
+                    requalify = lambda: True
+                else:
+                    self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
+                    requalify = interrupted
+                with self.assertRaisesRegex(Cancelled, 'one-shot STOP'):
+                    self.dispatch(requalify=requalify, check=check)
+                self.assertEqual(self.sent, [])
+                self.assertEqual(self.events, [])
+
     def test_a_slow_first_idle_poll_counts_as_a_wait(self):
         def status():
             self.now += 3

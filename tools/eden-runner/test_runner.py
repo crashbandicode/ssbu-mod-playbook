@@ -1276,6 +1276,33 @@ class RunnerTests(unittest.TestCase):
                 run.gate('a', 'red')
         self.assertNotIn('macro.play', eden.calls)
 
+    def test_a_stop_from_the_recovery_gate_recheck_is_not_mistaken_for_a_failed_gate(self):
+        class Cancelled(RuntimeError):
+            pass
+
+        run, eden, _ = self.waiting_run()
+        run.plan['gates']['red']['recover'] = 'to-red'
+        calls, armed = [], [False]
+
+        def stop():
+            if armed[0]:
+                armed[0] = False
+                raise Cancelled('one-shot STOP')
+
+        def gate(on, name):
+            calls.append(name)
+            if len(calls) == 1:
+                raise RuntimeError('not red')
+            armed[0] = True
+            stop()
+
+        with mock.patch.object(run, 'check_stop', stop), \
+                mock.patch.object(run, 'check_gate', side_effect=gate):
+            with self.assertRaisesRegex(Cancelled, 'one-shot STOP'):
+                run.gate('a', 'red')
+        self.assertNotIn('macro.play', eden.calls)
+        self.assertEqual(getattr(run, 'row_macro_waits', []), [])
+
     def test_play_library_uses_the_same_gate(self):
         run, eden, _ = self.waiting_run()
         entry = {'file': 'segments/to-red.edenmacro.json', 'sha256': sha(self.dir / 'segments/to-red.edenmacro.json'),

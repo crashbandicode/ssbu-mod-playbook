@@ -155,6 +155,32 @@ class IORequalificationTests(unittest.TestCase):
         self.assertFalse(self.io.in_flight)
         self.assertEqual(self.runner.setup_metrics['stalls'], [])
 
+    def test_a_one_shot_check_stop_during_requalification_is_preserved(self):
+        class Cancelled(RuntimeError):
+            pass
+
+        armed = False
+
+        def stop():
+            nonlocal armed
+            if armed:
+                armed = False
+                raise Cancelled('one-shot STOP')
+
+        def read(provider, cap):
+            nonlocal armed
+            armed = True
+            self.ctx.check_stop()
+
+        self.ctx.check_stop = stop
+        self.read = read
+        with self.assertRaisesRegex(Cancelled, 'one-shot STOP'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(self.runner.setup_metrics['stalls'], [])
+
     def test_every_witness_provider_must_remain_unchanged(self):
         self.io._record(tile(1, at='7', token='placed'))
         self.after_tile = tile(2, at='12', token='placed')

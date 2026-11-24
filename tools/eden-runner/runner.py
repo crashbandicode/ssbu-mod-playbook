@@ -1914,7 +1914,9 @@ class Runner:
                 def still_needed():
                     try:
                         self.check_gate(on, name)
-                    except RuntimeError:
+                    except RuntimeError as error:
+                        if macro_gate.stop(error, self.check_stop):
+                            raise
                         return True
                     return False
 
