@@ -262,3 +262,9 @@ SHA-256 `8033bb93846cb19243e8dcc86f178b5ecda23fa375eb584f1e5bdf23cdcf05ce`. It h
 `fn encode` inside `impl Sample` (line 994), the real state-block writer after it, and the two test
 module declarations the file ends with.
 Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/packet_gate.py` G9 supports shared-hook
+`EFFECT_JUDGES` and library cases. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/packet_gate.py` G9 checks fixture effect hooks in
+test rows under the shared-hook case rules. Host tests only; no runtime acceptance.

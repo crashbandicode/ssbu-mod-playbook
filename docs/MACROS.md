@@ -436,8 +436,16 @@ relative line-file paths), `expect` (`accept` or `reject`), and optionally
 must hold only case JSON files, with data files in other formats or outside it.
 The judge returns evidence for accept; a reject
 raises or returns a non-evidence value. A test effect hook with no cases warns,
-or refuses when the plan sets `require_cases: true`. Setup rows, effect gates
-and shared `fixtures:` hooks are not asked for cases.
+or refuses when the plan sets `require_cases: true`. Non-effect setup steps
+and effect gates are not asked for cases.
+
+Shared effect hooks can declare a module-level literal `EFFECT_JUDGES` mapping
+each hook name to `{"judge": "function", "cases": "folder"}`. The judge is a
+function in the same module, which the hook calls by name; its cases live under
+`tools/eden-runner/library/cases/<folder>`. The gate runs them automatically;
+packets must not declare `cases` on a shared hook. Effect hooks of every shared
+module, including `fixtures`, are asked in test rows; fixture hooks in setup
+rows are not.
 
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
