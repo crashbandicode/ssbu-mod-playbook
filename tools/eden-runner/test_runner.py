@@ -1238,13 +1238,15 @@ class RunnerTests(unittest.TestCase):
         path = run.out / 'r1' / capture['file']
         record = run.still_records[str(path)]
         journal = json.loads((run.out / 'stills.jsonl').read_text())
-        self.assertEqual(set(capture), {'name', 'file', 'sha256', 'utc', 'status'})
+        self.assertEqual(set(capture), {'name', 'file', 'sha256', 'utc', 'status', 'fresh'})
         self.assertEqual(capture['file'], record['file'])
         self.assertEqual(capture['file'], journal['file'])
         self.assertEqual(capture['sha256'], record['sha256'])
         self.assertEqual(capture['sha256'], journal['sha256'])
         self.assertEqual(capture['sha256'], sha(path))
         self.assertEqual(record['status'], 'fresh')
+        self.assertEqual(capture['fresh'], {key: value for key, value in record.items()
+                                            if isinstance(value, (str, int, float, bool, type(None)))})
 
     def test_shot_keeps_the_boot_across_a_long_log(self):
         bridge = self.dir / 'bridge.log'

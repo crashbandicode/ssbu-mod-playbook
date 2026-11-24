@@ -93,6 +93,34 @@ def receipt(folder, row):
 
 
 class StatusRules(unittest.TestCase):
+    def test_freshness_selection_uses_citations_or_before_and_expected_fallback(self):
+        select = getattr(jq, 'evidence_blockers', None)
+        self.assertTrue(callable(select))
+        good = {'status': 'unverified', 'reason': 'no game frame source'}
+        bad = {'status': 'error', 'reason': 'journal failed'}
+        shots = [{'phase': 'before', 'path': '/before.png', 'label': 'before:base', 'fresh': bad},
+                 {'phase': 'step', 'path': '/diagnostic.png', 'label': 'step:diagnostic', 'fresh': bad},
+                 {'phase': 'after', 'path': '/after.png', 'label': 'after:result', 'fresh': good}]
+        for cited, expected in ((['/after.png'], []), (['step:diagnostic'], ['step:diagnostic']),
+                                ([], ['before:base']), (['not-a-shot'], ['before:base']),
+                                (['/after.png', 'not-a-shot'], ['before:base'])):
+            with self.subTest(cited=cited):
+                blockers = select(shots, {'verdict': 'PASS', 'shots_cited': cited})
+                self.assertEqual([item['source'] for item in blockers], expected)
+        old = [{key: value for key, value in shot.items() if key != 'fresh'} for shot in shots]
+        self.assertEqual(select(old, {'verdict': 'PASS', 'shots_cited': []}), [])
+        mixed = [shots[0], {key: value for key, value in shots[-1].items() if key != 'fresh'}]
+        blockers = select(mixed, {'verdict': 'PASS', 'shots_cited': ['/after.png']})
+        self.assertEqual(len(blockers), 1)
+        self.assertIn('no freshness record', blockers[0]['text'])
+        shots[-1]['fresh'] = bad
+        fallback = select(shots, {'shots_cited': []})
+        self.assertEqual(fallback[0]['text'], 'still /before.png is not usable evidence: journal failed')
+        self.assertEqual([item['source'] for item in fallback],
+                         ['before:base', 'after:result'])
+        self.assertEqual([item['source'] for item in select(shots[:2], {'shots_cited': []})],
+                         ['before:base', 'step:diagnostic'])
+
     def test_clip_frames_use_the_rows_real_length(self):
         # 2026-11-18: GStreamer reported CPU-F001's per-row file as 8.3 s against an 11.4 s row, so "clip end" fell
         # before the effect stills; the positions now come from the receipt's span in the file's own time
@@ -182,6 +210,183 @@ class RunnerEffects(unittest.TestCase):
         captures = receipt(folder, row).get('captures')
         self.assertTrue(captures)
         return folder / 'out' / row / captures[0]['file']
+
+    def visual_fresh_run(self, state):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        count = 2 if state in ('same', 'refused') else 1
+        engine = make_plan(folder, [{'id': 'a', 'outcome': 'visual',
+                                     'steps': [{'shot': 'same'} for _ in range(count)]}])
+        if state in ('fresh', 'same', 'refused'):
+            bridge = folder / 'bridge.log'
+            engine.instances['sw']['bridge_log'] = str(bridge)
+            frames = iter([1000, 1200 if state == 'refused' else 1060])
+            client = engine.clients['sw']
+            request = client.request
+
+            def call(method, params=None):
+                if method == 'ui.screenshot':
+                    frame = next(frames)
+                    with bridge.open('a') as stream:
+                        stream.write(f'[Bridge] boot=0xabc frame={frame} wall={frame * 17}\n')
+                return request(method, params)
+
+            client.request = call
+        if state == 'error':
+            (engine.out / 'stills.jsonl').mkdir()
+        self.assertEqual(engine.run(), 'DONE')
+        capture = receipt(folder, 'a')['captures'][-1]
+        return folder, engine.out / 'a' / capture['file']
+
+    def test_record_read_requires_usable_freshness_for_pass_and_fail(self):
+        for state in ('fresh', 'same', 'unverified', 'refused', 'error', 'missing'):
+            with self.subTest(state=state):
+                folder, still = self.visual_fresh_run(state)
+                before = receipt(folder, 'a')
+                capture = before['captures'][-1]
+                if state == 'missing':
+                    capture.pop('fresh', None)
+                    (folder / 'out/a.json').write_text(json.dumps(before))
+                else:
+                    self.assertEqual((capture.get('fresh') or {}).get('status'), state)
+                before = receipt(folder, 'a')
+                if state in ('refused', 'error', 'missing'):
+                    for verdict in ('PASS', 'FAIL'):
+                        result = self.record_read(folder, still, verdict=verdict)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f'the capture a/{still.name} is not usable evidence:', result.stderr)
+                        self.assertIn('no freshness record' if state == 'missing'
+                                      else runner.still_fresh.unusable_reason(capture['fresh']), result.stderr)
+                        self.assertEqual(receipt(folder, 'a'), before)
+                else:
+                    result = self.record_read(folder, still)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(receipt(folder, 'a')['visual_read']['capture']['fresh'], capture['fresh'])
+
+    def test_visual_read_and_judge_pass_preserve_evidence_blockers(self):
+        folder, still = self.visual_fresh_run('unverified')
+        current = receipt(folder, 'a')
+        blocker = {'kind': 'evidence', 'source': 'after', 'text': 'still cannot be trusted'}
+        current['blockers'].append(blocker)
+        (folder / 'out/a.json').write_text(json.dumps(current))
+        result = self.record_read(folder, still)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = receipt(folder, 'a')
+        self.assertEqual((after['status'], after['review_kind'], after['blockers']),
+                         ('RAN-UNVERIFIED', 'unverified', [blocker]))
+        refused = self.record_read(folder, still)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('the row has no pending visual read', refused.stderr)
+        jq.apply_verdict(after, {'ok': True}, {'verdict': 'PASS', 'reason': 'visible'}, {})
+        self.assertEqual((after['status'], after['blockers']), ('RAN-UNVERIFIED', [blocker]))
+
+    def test_async_verdict_cannot_use_errored_stills(self):
+        for broken, word in ((False, 'PASS'), (True, 'PASS'), (True, 'FAIL')):
+            with self.subTest(broken=broken, word=word):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                folder = Path(tmp.name)
+                row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': f'say {word}',
+                       'steps': [{'shot': 'before'}, {'shot': 'after'}],
+                       'shots': [{'name': 'before', 'phase': 'before'}, {'name': 'after', 'phase': 'after'}]}
+                engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60},
+                                   known_issues={'known': {'title': 'known', 'reason': 'stand-in judge: FAIL',
+                                                           'rows': ['a']}})
+                if broken:
+                    (engine.out / 'stills.jsonl').mkdir()
+                self.assertEqual(engine.run(), 'DONE')
+                result = receipt(folder, 'a')
+                self.assertEqual(result['judge']['verdict'], word)
+                job = json.loads((engine.out / 'judge/jobs/a.json').read_text())
+                self.assertEqual([shot.get('fresh', {}).get('status') for shot in job['shots']],
+                                 ['error', 'error'] if broken else ['unverified', 'unverified'])
+                if broken:
+                    self.assertEqual((result['status'], result['review'], result['review_kind']),
+                                     ('RAN-UNVERIFIED', True, 'unverified'))
+                    blockers = [item for item in result['blockers'] if item['kind'] == 'evidence']
+                    self.assertEqual(len(blockers), 2)
+                    for shot in job['shots']:
+                        self.assertTrue(any(shot['path'] in item['text'] for item in blockers))
+                    self.assertNotIn('known_issue', result)
+                else:
+                    self.assertEqual(result['status'], 'PASS')
+                    self.assertEqual(result['blockers'], [])
+
+    def test_async_judge_refuses_a_frozen_after_and_ignores_uncited_diagnostic(self):
+        for stale in (True, False):
+            with self.subTest(stale=stale):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                folder = Path(tmp.name)
+                names = ('before', 'same-step', 'same-after') if stale else ('before', 'diagnostic', 'after')
+                row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': 'say PASS',
+                       'steps': [{'shot': name} for name in names],
+                       'shots': [{'name': name, 'phase': phase}
+                                 for name, phase in zip(names, ('before', 'step', 'after'))]}
+                engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60})
+                if stale:
+                    bridge = folder / 'bridge.log'
+                    engine.instances['sw']['bridge_log'] = str(bridge)
+                    frames = iter((1000, 1000, 1200))
+                    client = engine.clients['sw']
+                    request = client.request
+
+                    def call(method, params=None):
+                        if method == 'ui.screenshot':
+                            frame = next(frames)
+                            with bridge.open('a') as stream:
+                                stream.write(f'[Bridge] boot=0xabc frame={frame} wall={frame * 17}\n')
+                        return request(method, params)
+
+                    client.request = call
+                else:
+                    record = engine.stills.record
+
+                    def record_without_diagnostic(on, path, reply, frame):
+                        if 'diagnostic' in path.name:
+                            raise OSError('diagnostic journal failure')
+                        return record(on, path, reply, frame)
+
+                    engine.stills.record = record_without_diagnostic
+                    (folder / 'judge.py').write_text(JUDGE.replace(
+                        '[s["path"] for s in job["shots"]]',
+                        '[s["path"] for s in job["shots"] if s["phase"] in ("before", "after")]'))
+                self.assertEqual(engine.run(), 'DONE')
+                result = receipt(folder, 'a')
+                self.assertEqual(result['judge']['verdict'], 'PASS')
+                job = json.loads((engine.out / 'judge/jobs/a.json').read_text())
+                if stale:
+                    self.assertEqual((job['shots'][-1].get('fresh') or {}).get('status'), 'refused')
+                    self.assertEqual(result['status'], 'RAN-UNVERIFIED')
+                    self.assertTrue(any(item['kind'] == 'evidence' and job['shots'][-1]['path'] in item['text']
+                                        for item in result['blockers']))
+                else:
+                    self.assertEqual((job['shots'][1].get('fresh') or {}).get('status'), 'error')
+                    self.assertEqual(result['status'], 'PASS')
+                    self.assertEqual(result['blockers'], [])
+
+    def test_legacy_job_without_freshness_records_keeps_its_verdict(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': 'say PASS',
+               'steps': [{'shot': 'before'}, {'shot': 'after'}],
+               'shots': [{'name': 'before', 'phase': 'before'}, {'name': 'after', 'phase': 'after'}]}
+        engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60})
+        self.assertEqual(engine.run(), 'DONE')
+        job_path = engine.out / 'judge/jobs/a.json'
+        job = json.loads(job_path.read_text())
+        for shot in job['shots']:
+            shot.pop('fresh', None)
+        job_path.write_text(json.dumps(job))
+        current = receipt(folder, 'a')
+        current.update(status='RAN-UNVERIFIED', judge={'state': 'pending'},
+                       blockers=[{'kind': 'visual', 'source': 'row', 'text': 'visual read pending'}])
+        (engine.out / 'a.json').write_text(json.dumps(current))
+        jq.work(job_path)
+        result = receipt(folder, 'a')
+        self.assertEqual((result['status'], result['judge']['verdict'], result['blockers']), ('PASS', 'PASS', []))
 
     def test_unverified_hook_markers_never_become_pass_without_a_judge(self):
         for value, marker in (({'file': None, 'grade': 'NEEDS VISUAL READ'}, 'NEEDS VISUAL READ'),
