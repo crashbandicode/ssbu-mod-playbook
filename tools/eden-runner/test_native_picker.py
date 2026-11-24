@@ -134,7 +134,7 @@ class IORequalificationTests(unittest.TestCase):
         self.send()
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.reads), 1)
-        self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'], 'requalified, sent')
+        self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'], 'requalified, accepted')
 
     def test_a_changed_bridge_connection_cannot_authorise_the_input(self):
         self.after = native(2, epoch=2, screen='css.training', **{'screen.context': 'training'})
@@ -195,6 +195,33 @@ class IORequalificationTests(unittest.TestCase):
         self.assertEqual(len(self.reads), 1)
         self.assertAlmostEqual(self.reads[0][1], 1.5 - self.sent[0][0])
         self.assertEqual(len(self.sent), 1)
+
+    def test_requalification_read_is_capped_by_the_remaining_gate_budget(self):
+        self.free_at = 14.2
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.reads), 1)
+        self.assertAlmostEqual(self.reads[0][1], 15.0 - self.sent[0][0])
+        self.assertLess(self.reads[0][1], 2.0)
+
+    def test_each_witness_read_shares_the_remaining_gate_budget(self):
+        self.free_at = 13.6
+        self.io._record(tile(1, at='7', token='placed'))
+        self.after_tile = tile(2, at='7', token='placed')
+        read = self.read
+
+        def slow_read(provider, cap):
+            sample = read(provider, cap)
+            if provider == 'ssbu.ui':
+                self.now += .8
+            return sample
+
+        self.read = slow_read
+        self.send()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual([provider for provider, _, _ in self.reads], ['ssbu.ui', 'tile.cursor'])
+        self.assertAlmostEqual(self.reads[1][1], self.reads[0][1] - .8)
+        self.assertGreater(self.reads[1][1], 0)
 
     def test_an_idle_channel_sends_at_once_as_before(self):
         self.free_at = 0

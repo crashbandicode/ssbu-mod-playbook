@@ -1322,7 +1322,7 @@ class RunnerTests(unittest.TestCase):
         run.run()
         receipt = json.loads((run.out / 'r1.json').read_text())
         self.assertEqual(len(receipt['macro_waits']), 1)
-        self.assertEqual(receipt['macro_waits'][0]['outcome'], 'sent: the caller declared no witness')
+        self.assertEqual(receipt['macro_waits'][0]['outcome'], 'the caller declared no witness, accepted')
         rows = (run.out / 'r1' / 'stall-events.jsonl').read_text().splitlines()
         self.assertEqual(len(rows), 1)
         self.assertEqual(json.loads(rows[0])['block'], 'runner')
@@ -1334,6 +1334,93 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(eden.calls.count('macro.play'), 1)
         self.assertNotIn('macro.status', eden.calls)
         self.assertEqual(now[0], 0)
+
+    def test_a_start_gate_recheck_that_outlasts_the_budget_sends_nothing(self):
+        run, eden, now = self.waiting_run()
+        run.plan['segments']['to-red']['start_gate'] = 'red'
+        run.plan['gates']['red']['cap'] = 40
+        caps = []
+
+        def check(on, gate, name):
+            caps.append(gate['cap'])
+            if len(caps) == 2:
+                now[0] += 15
+            return True
+
+        with mock.patch.object(run, 'check_gate_spec', side_effect=check):
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                run.play('a', 'to-red')
+        self.assertEqual(len(caps), 2)
+        self.assertLess(caps[1], 15)
+        self.assertEqual(run.plan['gates']['red']['cap'], 40)
+        self.assertNotIn('macro.play', eden.calls)
+        self.assertEqual(len(run.row_macro_waits), 1)
+        self.assertEqual(run.row_macro_waits[0]['outcome'], 'not sent: the bound passed during requalification')
+
+    def test_gate_recovery_after_a_wait_needs_the_segments_own_start_gate(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['gates']['blue'] = {**run.plan['gates']['red'], 'recover': None}
+        run.plan['segments']['to-red']['start_gate'] = 'blue'
+        checks = []
+
+        def check(on, name, **options):
+            checks.append(name)
+            if name == 'red':
+                raise RuntimeError('not red')
+            raise RuntimeError('not blue')
+
+        with mock.patch.object(run, 'check_gate', side_effect=check):
+            with self.assertRaisesRegex(RuntimeError, r'to-red.*blue'):
+                run.gate('a', 'red')
+        self.assertEqual(checks, ['red', 'red', 'blue'])
+        self.assertNotIn('macro.play', eden.calls)
+        self.assertEqual(len(run.row_macro_waits), 1)
+        self.assertIn('not sent:', run.row_macro_waits[0]['outcome'])
+
+    def test_gate_recovery_after_a_wait_sends_when_both_gates_qualify(self):
+        run, eden, now = self.waiting_run()
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['gates']['red']['cap'] = 40
+        run.plan['gates']['blue'] = {**run.plan['gates']['red'], 'recover': None}
+        run.plan['segments']['to-red']['start_gate'] = 'blue'
+        checks = []
+
+        def check(on, name, **options):
+            checks.append((name, options))
+            if name == 'red' and sum(checked == 'red' for checked, _ in checks) < 3:
+                if len(checks) == 2:
+                    now[0] += 2
+                raise RuntimeError('not red')
+            return True
+
+        with mock.patch.object(run, 'check_gate', side_effect=check):
+            run.gate('a', 'red')
+        self.assertEqual([name for name, _ in checks], ['red', 'red', 'blue', 'red'])
+        self.assertAlmostEqual(checks[1][1]['cap'] - checks[2][1]['cap'], 2)
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertEqual(run.row_macro_waits[0]['outcome'], 'requalified, accepted')
+
+    def test_a_rejected_dispatch_after_requalification_is_recorded_as_rejected(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['segments']['to-red']['start_gate'] = 'red'
+        original = eden.request
+
+        def request(method, params):
+            if method == 'macro.play':
+                eden.calls.append(method)
+                return {'ok': False, 'error': 'input_busy'}
+            return original(method, params)
+
+        eden.request = request
+        with mock.patch.object(run, 'check_gate', return_value=True):
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                run.play('a', 'to-red')
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertIsNone(eden.playing)
+        self.assertEqual(len(run.row_macro_waits), 1)
+        self.assertIn('requalified, rejected:', run.row_macro_waits[0]['outcome'])
+        self.assertIn('input_busy', run.row_macro_waits[0]['outcome'])
 
     def test_shot_records_the_game_frame_and_edens_reply(self):
         bridge = self.dir / 'bridge.log'

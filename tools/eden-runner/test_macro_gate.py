@@ -53,26 +53,28 @@ class MacroGateTests(unittest.TestCase):
         self.assertTrue(self.dispatch(requalify=macro_gate.BLIND))
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(self.events), 1)
-        self.assertEqual(self.events[0]['outcome'], 'sent: the caller declared no witness')
+        self.assertEqual(self.events[0]['outcome'], 'the caller declared no witness, accepted')
 
     def test_busy_then_idle_requalifies_once_before_sending(self):
         witness = mock.Mock(return_value=True)
         self.assertTrue(self.dispatch(requalify=witness))
-        witness.assert_called_once_with()
+        witness.assert_called_once()
+        self.assertAlmostEqual(witness.call_args.args[0], 15 - self.now)
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.events[0]['outcome'], 'requalified, sent')
+        self.assertEqual(self.events[0]['outcome'], 'requalified, accepted')
         self.assertEqual(len(self.events), 1)
 
     def test_requalification_can_return_no_longer_needed(self):
         witness = mock.Mock(return_value=False)
         self.assertFalse(self.dispatch(requalify=witness))
-        witness.assert_called_once_with()
+        witness.assert_called_once()
+        self.assertAlmostEqual(witness.call_args.args[0], 15 - self.now)
         self.assertEqual(self.sent, [])
         self.assertEqual(len(self.events), 1)
         self.assertEqual(self.events[0]['outcome'], 'not sent: no longer needed')
 
     def test_a_requalification_error_is_recorded_once_and_propagated(self):
-        def refuse():
+        def refuse(remaining):
             raise RuntimeError('screen changed')
 
         with self.assertRaisesRegex(RuntimeError, 'screen changed'):
@@ -114,7 +116,7 @@ class MacroGateTests(unittest.TestCase):
                 def stopped_status():
                     raise StopRun('STOP-INPUT')
 
-                def requalify():
+                def requalify(remaining):
                     if phase == 'requalification':
                         raise StopRun('STOP-INPUT')
                     return True
@@ -170,10 +172,10 @@ class MacroGateTests(unittest.TestCase):
 
                 if phase == 'status':
                     self.status = interrupted
-                    requalify = lambda: True
+                    requalify = lambda remaining: True
                 else:
                     self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
-                    requalify = interrupted
+                    requalify = lambda remaining: interrupted()
                 with self.assertRaisesRegex(Cancelled, 'one-shot STOP'):
                     self.dispatch(requalify=requalify, check=check)
                 self.assertEqual(self.sent, [])
@@ -188,7 +190,7 @@ class MacroGateTests(unittest.TestCase):
         self.assertTrue(self.dispatch(requalify=macro_gate.BLIND))
         self.assertEqual(len(self.polls), 1)
         self.assertEqual(len(self.events), 1)
-        self.assertEqual(self.events[0]['outcome'], 'sent: the caller declared no witness')
+        self.assertEqual(self.events[0]['outcome'], 'the caller declared no witness, accepted')
         self.assertEqual(self.events[0]['seconds'], 3)
 
     def test_an_event_sink_exception_does_not_change_the_send_decision(self):
@@ -201,7 +203,7 @@ class MacroGateTests(unittest.TestCase):
         self.assertTrue(self.dispatch(requalify=macro_gate.BLIND, on_event=broken))
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0]['outcome'], 'sent: the caller declared no witness')
+        self.assertEqual(seen[0]['outcome'], 'the caller declared no witness, accepted')
 
     def test_an_event_sink_exception_cannot_turn_a_refusal_into_a_send(self):
         seen = []
@@ -215,3 +217,64 @@ class MacroGateTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0]['outcome'], 'not sent: no witness to requalify after the wait')
+
+    def test_requalification_receives_only_the_remaining_budget(self):
+        seen = []
+
+        def witness(remaining):
+            seen.append(remaining)
+            return True
+
+        self.assertTrue(self.dispatch(requalify=witness, until=4.0))
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], 4.0 - self.now)
+        self.assertGreater(seen[0], 0)
+        self.assertEqual(self.events[0]['outcome'], 'requalified, accepted')
+
+    def test_requalification_that_outlasts_the_bound_never_sends(self):
+        for until in (None, 4.0):
+            with self.subTest(until=until):
+                self.now, self.polls, self.sent, self.events = 0.0, [], [], []
+                seen = []
+
+                def witness(remaining):
+                    seen.append(remaining)
+                    self.now += remaining + .1
+                    return True
+
+                with self.assertRaises(closed_loop.DispatchRejected):
+                    self.dispatch(requalify=witness, until=until)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(self.sent, [])
+                self.assertEqual(len(self.events), 1)
+                self.assertEqual(self.events[0]['outcome'], 'not sent: the bound passed during requalification')
+
+    def test_rejected_dispatch_after_requalification_is_recorded_as_rejected(self):
+        original = self.call
+
+        def call(method, params=None):
+            if method == 'macro.play':
+                raise RuntimeError('input_busy')
+            return original(method, params)
+
+        with mock.patch.object(self, 'call', side_effect=call):
+            with self.assertRaises(closed_loop.DispatchRejected):
+                self.dispatch(requalify=lambda remaining: True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.events), 1)
+        self.assertIn('requalified, rejected: input_busy', self.events[0]['outcome'])
+
+    def test_unknown_dispatch_error_after_requalification_is_recorded_as_delivery_unknown(self):
+        original = self.call
+
+        def call(method, params=None):
+            if method == 'macro.play':
+                raise RuntimeError('socket closed')
+            return original(method, params)
+
+        with mock.patch.object(self, 'call', side_effect=call):
+            with self.assertRaisesRegex(RuntimeError, 'socket closed'):
+                self.dispatch(requalify=lambda remaining: True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]['outcome'], 'requalified, delivery unknown: socket closed')

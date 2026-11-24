@@ -432,7 +432,7 @@ class SetupCallsR2Tests(unittest.TestCase):
 
             def send(macro, until=None):
                 witness = dict(menu.menu)
-                routes.play(ctx, macro, requalify=lambda: menu.menu == witness, until=until)
+                routes.play(ctx, macro, requalify=lambda remaining: menu.menu == witness, until=until)
                 original(macro, until=until)
 
             menu.send = send

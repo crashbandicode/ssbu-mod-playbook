@@ -157,7 +157,7 @@ class PlayIdleTests(unittest.TestCase):
 
     def test_play_waits_while_a_macro_is_playing_then_sends_once(self):
         self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
-        self.assertEqual(self.play(requalify=lambda: True), 'sha')
+        self.assertEqual(self.play(requalify=lambda remaining: True), 'sha')
         self.assertEqual(len(self.sent), 1)
         self.assertGreaterEqual(self.sent[0][0], .4)
         self.assertGreater(len(self.status_calls), 1)
@@ -177,14 +177,14 @@ class PlayIdleTests(unittest.TestCase):
 
     def test_play_records_one_stall_event_for_a_wait_over_a_second(self):
         self.status = lambda: {'state': 'recording'} if self.now < 1.2 else {'state': 'finished'}
-        self.play(requalify=lambda: True)
+        self.play(requalify=lambda remaining: True)
         self.assertEqual(len(self.sent), 1)
         stalls = self.runner.setup_metrics['stalls']
         self.assertEqual(len(stalls), 1)
         event = stalls[0]
         self.assertEqual((event['kind'], event['block'], event['step'], event['why']),
                          ('idle-wait', 'play', 'training-input', 'macro recording'))
-        self.assertEqual(event['outcome'], 'requalified, sent')
+        self.assertEqual(event['outcome'], 'requalified, accepted')
         self.assertGreater(event['seconds'], 1)
         self.assertGreater(event['waits'], 1)
         self.assertIn('utc', event)
@@ -212,7 +212,7 @@ class PlayIdleTests(unittest.TestCase):
     def test_a_stall_journal_failure_is_logged_without_changing_the_send(self):
         self.status = lambda: {'state': 'playing'} if self.now < 1.2 else {'state': 'idle'}
         self.ctx.row_dir = self.row / 'missing'
-        self.play(requalify=lambda: True)
+        self.play(requalify=lambda remaining: True)
         self.assertEqual(len(self.sent), 1)
         self.runner.wait_macro.assert_called_once_with('a', 3)
         self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
@@ -243,7 +243,7 @@ class PlayIdleTests(unittest.TestCase):
                 def stopped_status():
                     raise StopRun('STOP-INPUT')
 
-                def requalify():
+                def requalify(remaining):
                     if phase == 'requalification':
                         raise StopRun('STOP-INPUT')
                     return True
