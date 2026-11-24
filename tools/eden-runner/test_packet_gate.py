@@ -36,7 +36,8 @@ writeln!(out, "phase={phase}");
 ("wizard.step", fields.wizard_step);
 writeln!(out, "wizard.x={x}\nwizard.y={y}");
 ''',
-            'src/proto2.rs': 'writeln!(out, "screen={}", screen);\n',
+            'src/proto2.rs': ('writeln!(out, "screen={}", screen);\n'
+                              'writeln!(out, "ui.focus={}", focus);\n'),
         }
         for name, content in files.items():
             path = self.tree / name
@@ -202,6 +203,70 @@ writeln!(out, "wizard.x={x}\nwizard.y={y}");
         self.assertEqual(packet_gate.packet_digest(self.base), initial)
         (self.base / 'steps.py').write_text('def ok(ctx):\n    return False\n')
         self.assertNotEqual(packet_gate.packet_digest(self.base), initial)
+
+    def test_a_fixture_step_gives_what_a_later_row_needs(self):
+        self.plan['rows'] = [
+            {'id': 'switch', 'steps': [{'run': 'fixtures:recording_role', 'args': {'role': 'player'}}]},
+            {'id': 'consumer', 'needs': ['recording.role=player'], 'steps': []},
+        ]
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['rows']['consumer']['provided_by'], {'recording.role=player': 'switch'})
+        self.plan['rows'][0]['steps'][0]['args']['role'] = 'cpu'
+        self.assertEqual(self.errors(), [
+            'G6 row consumer: needs "recording.role=player" but recording.role is "cpu" (set by switch)'])
+
+    def test_a_seeded_room_step_gives_all_three_room_tokens(self):
+        self.plan['rows'] = [
+            {'id': 'room', 'steps': [{'run': 'fixtures:seeded_room',
+                                      'args': {'behavior': 7, 'stage': 3}}]},
+            {'id': 'consumer', 'needs': ['lobby.practice=on', 'partner.behavior=7', 'lobby.stage=3'], 'steps': []},
+        ]
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['rows']['consumer']['provided_by'], {
+            'lobby.practice=on': 'room', 'partner.behavior=7': 'room', 'lobby.stage=3': 'room'})
+        self.plan['rows'][0]['steps'][0]['args']['behavior'] = 1
+        self.assertEqual(self.errors(), [
+            'G6 row consumer: needs "partner.behavior=7" but partner.behavior is "1" (set by room)'])
+
+    def test_a_hook_that_plays_a_macro_nobody_defines_is_refused(self):
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    ctx.play("missing")\n')
+        self.assertEqual(self.errors(),
+                         ['G8 steps.py: plays "missing", which is neither a segment of this plan nor a library macro'])
+        self.plan['segments']['missing'] = {'file': 'x.json'}
+        self.assertEqual(self.errors(), [])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    routes.play(ctx, "tap-a1")\n')
+        self.assertEqual(self.errors(), [])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    other.play(ctx, "missing-too")\n')
+        self.assertEqual(self.errors(),
+                         ['G8 steps.py: plays "missing-too", which is neither a segment of this plan nor a library macro'])
+        (self.base / 'steps.py').write_text('def ok(ctx, name="x"):\n    ctx.play(name)\n    ctx.play(name)\n')
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['warnings'], ['G8 steps.py: 2 play call(s) with a computed name are not checked'])
+
+    def test_a_hook_that_reads_a_key_the_build_does_not_write_is_refused(self):
+        (self.base / 'steps.py').write_text(
+            'def ok(ctx):\n    values = {}\n    return values.get("recording.page.rolle"), values["evidence.path"]\n')
+        error = 'G2 steps.py: reads "recording.page.rolle", which the target does not write'
+        self.assertEqual(self.errors(), [error])
+        self.plan['reads_ignore'] = [{'key': 'recording.page.rolle', 'reason': ''}]
+        self.assertEqual(self.errors(), [error])
+        self.plan['reads_ignore'] = [{'key': 'recording.page.rolle', 'reason': 'planned'}]
+        self.assertEqual(self.errors(), [])
+
+    def test_an_available_provider_file_still_contributes_when_a_sibling_is_missing(self):
+        self.git('rm', '-q', 'src/model/record_place.rs')
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'partial provider')
+        self.plan['target']['plugin']['commit'] = self.git('rev-parse', 'HEAD').stdout.strip()
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("zone.lefft")\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "zone.lefft", which the target does not write'])
+
+    def test_the_read_net_includes_declared_bridge_providers(self):
+        self.plan['target']['providers'] = {'native.ui': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values["ui.focuz"]\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "ui.focuz", which the target does not write'])
 
     @unittest.skipUnless(os.environ.get('PACKET_GATE_TR_TREE') and os.environ.get('PACKET_GATE_WITNESS'),
                          'recorded TrainingRooms witness not supplied')
