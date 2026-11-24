@@ -58,8 +58,10 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertGreaterEqual(fake.sends[1][1] - fake.sends[0][1], 4)
         self.assertEqual(result['steps'][0]['sends'], 2)
         self.assertEqual(fake.finishes, 2)
+        # The lost send is confirmed only by the read that authorises the resend: read, finish, send.
         index = fake.events.index(('finish',))
-        self.assertEqual(fake.events[index + 1][0], 'read')
+        self.assertEqual(fake.events[index - 1], ('read', 'source'))
+        self.assertEqual(fake.events[index + 1][0], 'send')
 
     def test_a_lost_input_is_resent_only_on_the_same_target(self):
         fake = Script(lambda f: ('done', None) if len(f.sends) >= 2 else ('source', 'tile-0'))
@@ -296,7 +298,26 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual([macro for macro, _ in fake.sends], ['send-source', 'send-source'])
         for index, event in enumerate(fake.events):
             if event[0] == 'send':
-                self.assertEqual(fake.events[index - 1], ('read', 'source'))
+                before = [item for item in fake.events[:index] if item != ('finish',)]
+                self.assertEqual(before[-1], ('read', 'source'))
+
+    def test_a_target_that_changes_on_the_last_read_before_the_resend_keeps_the_input_unconfirmed(self):
+        # Lost on tile-0 for lost_after, same on the preflight read, then tile-1 on the read that would
+        # authorise the resend: no resend, no finish, a stop that names the changed target.
+        def state(fake):
+            if not fake.sends:
+                return ('source', 'tile-0')
+            reads_after = sum(1 for item in fake.events[fake.events.index(('send', 'press')):] if item[0] == 'read')
+            # Reads 1 to 3 time the loss, read 4 is the preflight; from read 5 the hand is on another tile.
+            return ('source', 'tile-0') if reads_after < 4 else ('source', 'tile-1')
+        fake = Script(state)
+        item = Step('press', lambda o: o[0] == 'source', lambda o: o[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda o: o[1])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertIn('source target changed after the send', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
 
     def test_a_different_overlapping_step_after_send_jumps_back(self):
         fake = Script(lambda f: 'shared' if len(f.sends) < 2 else 'done')

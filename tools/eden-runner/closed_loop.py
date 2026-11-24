@@ -95,18 +95,26 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
             on_step(step.name)
         ready_deadline = started + step.ready_cap
         while True:
+            # While a retry is prepared the earlier send is still unconfirmed: it is confirmed only by a
+            # transition seen here, or just before the resend on the same target.
             if done(step, obs):
+                if retry is not None:
+                    finish()
                 record['ms'] += round((clock() - started) * 1000)
                 index += 1
                 if index < len(steps):
                     obs = observe()
                 break
             if done(steps[-1], obs):
+                if retry is not None:
+                    finish()
                 record['ms'] += round((clock() - started) * 1000)
                 return receipt()
             at = step.at(obs)
             other = matching(obs, index)
             if not at and other is not None:
+                if retry is not None:
+                    finish()
                 record['ms'] += round((clock() - started) * 1000)
                 index = other
                 break
@@ -124,6 +132,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                             stop(step.name, f'not ready: last read {obs!r}')
                         obs = wait(ready_deadline)
                         continue
+                    finish()
                     stall(retry['event'], obs)
                     retry = None
                 if record['sends'] >= step.sends:
@@ -194,7 +203,6 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                             if (not fresh_done and not fresh_final_done
                                     and matching(fresh, index) is None and step.at(fresh)
                                     and target(step, fresh) == witness):
-                                finish()
                                 retry = {'witness': witness, 'event': event, 'changed_since': None}
                                 obs = observe()
                                 ready_deadline = clock() + step.ready_cap
