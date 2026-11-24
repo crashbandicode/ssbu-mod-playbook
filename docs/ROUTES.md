@@ -55,6 +55,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
+| `wireless_room` `{ready_cap}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; each step awaits its screen, sends once, awaits the transition, resends a lost input at most 3 times and otherwise stops on a named step with `routes-wireless-room-stop.json` |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
@@ -83,6 +84,14 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `chord` `{name}` | Training | the chord pressed in one frame, and for `tr-save`/`tr-load` TrainingRooms' `state saved`/`state placed` line after it |
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
+
+### Closed-loop steps (`closed_loop.py`)
+
+Look for the current screen and start there; wait for the step's fresh ready observation before acting.
+After a send, wait for the transition. A continuously observed source counts as a lost input:
+finish it and resend, up to three sends total (some steps allow fewer). If observations stay unreadable
+or in flight until the cap, stop on the named step without confirming or pressing again.
+This closed-loop route is host-tested only, not flown.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
 within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.
