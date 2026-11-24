@@ -77,7 +77,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release after the fence when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, game, perfect, allow_stopped, count}` | named practice game with an armed attempt tracepoint | matching markers, CPU kinds, sequence/frame bounds, and running state |
-| `bridge_on` `{port, cap}` | title-screen trace or bridge already on | own listening event before detached capture, greeting and backup reply; backup refusal is recorded, not a block failure |
+| `bridge_on` `{port, cap}` | title-screen trace, stub-on no-input boot, or bridge already on | own listening event before detached capture, greeting and backup reply; stub-on also checks listener ownership and the first active Title prompt when it sends the chord; backup refusal is recorded, not a block failure |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
 | `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded; cap defaults to 240 seconds |
@@ -138,6 +138,19 @@ The `lobby-a` press stays 9 frames (commit 2537dd5). Its stated reason, that a 4
 misreading of the early press: both lengths are lost when sent before the picker takes input, and a 4-frame tap sent
 late did reach the fighter select (proof-lobby-17060a5e-3). 9 frames is kept only because it is the length flown in
 every later successful transition; it is not evidence against the 4-frame tap.
+
+`bridge_on` accepts a trace witness or, on Linux Eden hosts with the stub on, checks boot-default chord readiness,
+running and loading status, no input since `game.load`, and listener ownership before capture. With the stub on, the
+Title prompt is named by the bridge only after it is On. Before the chord the
+evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
+the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.
+Opening playback is not the prompt and can extend the readiness wait to 180 seconds.
+With the stub on, the greeting, the install line and the Title read come from the latest complete connection in the capture log; a connection change after that greeting stops the step.
+If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event,
+the same port and the same boot: a stub-on receipt with its pre-On evidence and its Title prompt read, or a trace
+receipt with its stock opening witness.
+A chord that brings no toggle stops the step; it is not retried.
+The first stub-on receipt in a row is `routes-bridge-on.json`; repeats are `routes-bridge-on-2.json` and so on.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
 within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.

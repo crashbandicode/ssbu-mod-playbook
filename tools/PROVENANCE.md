@@ -230,3 +230,10 @@ with packet inputs are refused and do not gain that exclusion.
 2026-11-24: `eden-runner/runner.py` binds visual reads to the still's own capture, an explicit source,
 or a unique matching capture; duplicate hashes no longer select an arbitrary receipt. Judge verdicts
 clear visual blockers only, leaving deterministic blockers unresolved. Host tests only.
+
+2026-11-24: `eden-runner/fixtures/bridge-on/stub-on-yoga-71158421/bridge.log` copies lines 1–40 from
+`rc15-i2-71158421-yoga-1/out/bridge-run/bridge.log`; SHA-256
+`0f47489cad7530d5e5f6e1aefb95399f6cc13ee0265dfd72b84bbabb0f6ca076`.
+`events.log` copies lines 1–4 from that run's `out/post-run-offline/user/sdmc/ultimate/ssbu-hw-bridge/events.log`;
+SHA-256 `c80f086732a0ef13253a2edccb7d66ce1b07d525768278a5e0ae73a90992804d`.
+These are host test inputs, not runtime acceptance of this change.
