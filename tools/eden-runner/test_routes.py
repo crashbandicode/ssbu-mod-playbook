@@ -6285,12 +6285,12 @@ class DashboardRouteTests(unittest.TestCase):
                     reason = (f'the dashboard cursor is on {name} (index {index}), not above Local Wireless; '
                               'the route does not move it upward')
                     self.assertEqual(caught.exception.step, 'dashboard-focus')
-                    self.assertIn(reason, caught.exception.reason)
+                    self.assertEqual(reason, caught.exception.reason)
                     self.assertEqual(self.io.actions, [])
                     filename = 'routes-wireless-room-list-stop.json' if guest else 'routes-wireless-room-stop.json'
                     stop = json.loads((self.row / filename).read_text())
                     self.assertEqual(stop['step'], 'dashboard-focus')
-                    self.assertIn(reason, stop['reason'])
+                    self.assertEqual(reason, stop['reason'])
 
     def test_dashboard_down_may_land_directly_on_local_wireless(self):
         for guest in (False, True):
@@ -6584,6 +6584,28 @@ class DashboardRouteTests(unittest.TestCase):
                 self.io.focus_after_a, self.io.a_delay = True, 10
                 self.run_route(guest)
                 self.assertNotIn('main-menu-down', self.io.actions)
+
+    def test_after_a_a_lower_dashboard_focus_does_not_break_the_latch(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index, self.io.a_delay = 'open', 3, 10
+                send = self.io.send
+
+                def move_after_a(macro):
+                    send(macro)
+                    if macro == 'lobby-a' and self.io.phase == 'main':
+                        self.io.dashboard_index = 4
+
+                self.io.send = move_after_a
+                result = self.run_route(guest)
+                self.assertTrue(result['result'].startswith('PASS'))
+                a = self.io.events.index(('send', 'lobby-a'))
+                ready = next(i for i, event in enumerate(self.io.events[a + 1:], a + 1)
+                             if event[:2] == ('read', 'ssbu.ui') and event[2].get('screen') == 'ldn.room_list'
+                             and event[2].get('input.ready') == 'yes')
+                self.assertFalse(any(event[0] == 'send' for event in self.io.events[a + 1:ready]))
 
     def test_after_a_list_must_be_ready_before_the_step_completes(self):
         for guest in (False, True):

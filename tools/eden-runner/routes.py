@@ -1478,6 +1478,7 @@ def _wireless_placed(tile):
 DASHBOARD_KEY = 'dashboard'
 DASHBOARD_FOCUS = 'dashboard.'
 DASHBOARD_LOCAL_WIRELESS = 'dashboard.local_wireless'
+DASHBOARD_ABOVE_LOCAL_WIRELESS = ('dashboard.back', 'dashboard.collection')
 # What an open dashboard that takes input publishes (the bridge author's table, 2026-11-24): owner and dialog both
 # read `dashboard`. The Main Menu's own native/none on an open dashboard is a contradiction and gets no press.
 DASHBOARD_OWNERS = ('dashboard',)
@@ -1535,7 +1536,16 @@ def _wireless_observer(ctx, io, screens, state):
 
 def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
     def dashboard(obs):
-        return active(obs, 'main_menu') and obs['ui'].get(DASHBOARD_KEY) == 'open'
+        ui = obs['ui']
+        opened = active(obs, 'main_menu') and ui.get(DASHBOARD_KEY) == 'open'
+        name = ui.get('focus.id')
+        if (opened and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
+                and name not in (*DASHBOARD_ABOVE_LOCAL_WIRELESS, DASHBOARD_LOCAL_WIRELESS)):
+            raise closed_loop.RouteStopped(
+                route, 'dashboard-focus',
+                f'the dashboard cursor is on {name} (index {ui.get("focus.index")}), '
+                'not above Local Wireless; the route does not move it upward', {})
+        return opened
 
     def dashboard_ready(obs):
         ui = obs['ui']
@@ -1563,18 +1573,17 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
         'open-dashboard', open_at, dashboard, 'tap-zr1', cap=25, ready_cap=ready_cap, lost_after=6,
         target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer')),
         screen=lambda o: active(o, 'main_menu'))]
-    for i in range(6):
-        def down_at(obs, index=i):
-            ui = obs['ui']
-            name = ui.get('focus.id')
-            return (available() and dashboard_ready(obs)
-                    and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
-                    and name != DASHBOARD_LOCAL_WIRELESS and ui.get('focus.index') == str(index))
+    for item in DASHBOARD_ABOVE_LOCAL_WIRELESS:
+        def down_at(obs, item=item):
+            return available() and dashboard_ready(obs) and obs['ui'].get('focus.id') == item
 
-        def down_done(obs, index=i):
-            return dashboard(obs) and obs['ui'].get('focus.index') == str(index + 1)
+        def down_done(obs, item=item):
+            name = obs['ui'].get('focus.id')
+            return (dashboard(obs) and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
+                    and name != item)
 
-        steps.append(closed_loop.Step(f'dashboard-down-{i}', down_at, down_done, 'main-menu-down',
+        steps.append(closed_loop.Step(f'dashboard-down-{item.removeprefix(DASHBOARD_FOCUS)}',
+                                      down_at, down_done, 'main-menu-down',
                                       cap=25, lost_after=6, target=focus))
     steps.append(closed_loop.Step(
         'dashboard-a', lambda o: (available() and dashboard_ready(o)
@@ -1676,7 +1685,8 @@ def wireless_room_list(ctx, ready_cap=60):
                         'not ready: ldn.room_list did not publish input.ready=yes within 20 s',
                         {**outcome, 'step': 'room-list-ready'})
         except closed_loop.RouteStopped as error:
-            reason = (error.reason if error.reason.startswith('unsupported reader: the bridge does not publish')
+            reason = (error.reason if error.step == 'dashboard-focus'
+                      or error.reason.startswith('unsupported reader: the bridge does not publish')
                       else f'{error.reason}; last screen {state["last_ui"].get("screen")!r}')
             if error.step == 'dashboard-a' and error.reason.startswith('no transition within cap'):
                 reason += ('; the room list was reached but never read ready' if state.get('room_list_seen')

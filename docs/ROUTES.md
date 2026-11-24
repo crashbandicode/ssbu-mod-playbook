@@ -116,9 +116,12 @@ have not yet been confirmed in a live run.
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
 A route starting on a recognised but unready screen waits in that screen's step and stops there, not on `locate`,
 if readiness never arrives; this was found by replaying `rc15-i2-71158421-xps-stop-1`.
-The wireless dashboard path reads before each press: ZR, Down, Down, A on the flown layout, or as many
-observed Down steps as needed. The proposed `dashboard`, `dashboard.*` focus and
-`dashboard.local_wireless` keys are unflown; without `dashboard` the route stops before ZR.
+The wireless dashboard path reads before each press: ZR, Down, Down, A on the recorded layout.
+The recorded items are `dashboard.back` (1), `dashboard.collection` (2), `dashboard.local_wireless` (3),
+`dashboard.news` (4), `dashboard.options` (5), and `dashboard.help` (6). Down is sent only on `back` or
+`collection`, guided by `focus.id`; a lower or unknown dashboard item stops without moving upward.
+These keys were recorded on a game once; the route remains unflown with a bridge publishing them.
+Without `dashboard` the route stops before ZR.
 Main, dashboard, room list and Create form require `input.ready=yes`; only the tile-gated pickers accept
 an absent readiness key. The guest waits up to 20 seconds for a positively ready room list without input.
 Dashboard Down and A also require what an open, input-taking dashboard publishes: `input.owner=dashboard` and
