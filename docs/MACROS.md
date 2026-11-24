@@ -493,7 +493,8 @@ Record a visual read with
 The still must be inside the row folder and match a runner capture from the same
 plan and instances file; a copied capture also needs the same inputs identity.
 The read stores the capture's name, hash, UTC time, scalar status snapshot and
-freshness record. Both PASS and FAIL reads require a usable capture; a judge's
+freshness record. A read is refused when its still fails the same image integrity
+and full-load checks as the judge. Both PASS and FAIL reads require a usable capture; a judge's
 PASS or FAIL requires usable stills on which the verdict rests. Refused or
 errored stills cannot establish either result; a judged verdict that rests on
 them leaves evidence blockers. A job written without freshness records also

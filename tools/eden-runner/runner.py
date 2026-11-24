@@ -3413,6 +3413,10 @@ def record_read(manifest, out, row_id, reader, verdict, text, still, capture=Non
         if not still_fresh.usable(selected.get('fresh')):
             raise ValueError(f"the capture {selected['row']}/{selected['file']} is not usable evidence: "
                              f"{still_fresh.evidence_issue(selected.get('fresh'))}")
+        issue = judge_queue.image_issue(still)
+        if issue is not None:
+            raise ValueError(f"the capture {selected['row']}/{selected['file']} is not usable evidence: "
+                             f"still file is {issue}")
         read['capture'] = selected
         previous = receipt.get('visual_read')
         history = list(receipt.get('visual_reads') or [])
