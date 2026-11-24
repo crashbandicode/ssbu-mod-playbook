@@ -76,6 +76,9 @@ write!(text, "hold dir={dir} polls={polls} fires={fires} jump={}");
 write!(text, "room.panel row={row} index={index}");
 write!(text, "room.panel applied partners={partners} behavior={behavior}");
 write!(text, "clip ctx={} total={} in={} out={}");
+for side in ["p1", "cpu"] {
+    write!(text, "seat owner.{side}={}", 1);
+}
 ''',
             'src/proto2.rs': ('writeln!(out, "screen={}", screen);\n'
                               'writeln!(out, "ui.focus={}", focus);\n'),
@@ -566,6 +569,17 @@ write!(text, "clip ctx={} total={} in={} out={}");
         self.assertEqual(self.errors(), [])
         self.assertIn('writes lane.{lane}.frames with lane = 2 to 3', self.refused('tr.practice:lane.4.frames'))
         self.refused('tr.practice:lane.1.frames')
+
+    def test_an_event_line_with_a_format_key_names_its_event(self):
+        self.plan['rows'][0]['reads'] = ['tr.event:seat owner.p1', 'tr.event:seat owner.cpu', 'tr.event:owner.cpu']
+        self.assertEqual(self.errors(), [])
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/bridge_events.rs'])
+        self.assertEqual({key for key in keys if 'owner' in key},
+                         {'owner.p1', 'owner.cpu', 'seat owner.p1', 'seat owner.cpu'})
+        self.plan['rows'][0]['reads'] = ['tr.event:seat owner.p2']
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('tr.event:seat owner.p2 is not written by plugin', errors[0])
 
     def test_a_hook_read_of_a_format_key_is_checked_against_its_values(self):
         (self.base / 'steps.py').write_text(
