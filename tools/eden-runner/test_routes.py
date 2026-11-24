@@ -2900,6 +2900,8 @@ class WirelessRoomTests(unittest.TestCase):
             self.read_caps = []
             self.stage_tile_after_send = None
             self.fail_stage_dispatch = False
+            self.busy_macro = None
+            self.busy_left = 0
             self.pending = None
             self.css_tile_delay = 0
             self.css_since = None
@@ -3073,6 +3075,9 @@ class WirelessRoomTests(unittest.TestCase):
             self.events.append(('send', macro))
             self.actions.append(macro)
             self.pending = macro
+            if macro == self.busy_macro and self.busy_left:
+                self.busy_left -= 1
+                raise RuntimeError('macro.play busy')
             if macro == 'lobby-a' and self.phase == 'stage' and self.fail_stage_dispatch:
                 raise RuntimeError('no reply to macro.play')
             if macro == 'lobby-open-room-list' and self.phase == 'main':
@@ -3148,9 +3153,20 @@ class WirelessRoomTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.row = Path(self.temp.name)
-        self.ctx = types.SimpleNamespace(row_dir=self.row, check_stop=lambda: None)
+        self.ctx = types.SimpleNamespace(row_dir=self.row, check_stop=lambda: None, call=self.call)
         self.io = self.IO()
         self.now = 0.0
+        self.status_script = None
+        self.macro_status_calls = []
+
+    def call(self, method):
+        if method == 'macro.status':
+            self.macro_status_calls.append((self.now, self.io.phase))
+            result = self.status_script() if self.status_script else {'state': 'finished'}
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return {}
 
     def run_room(self, *, unpublished_create=None):
         def sleep(seconds):
@@ -3590,6 +3606,73 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(result['stage_presses'], 2)
         self.assertEqual(next(s for s in result['steps'] if s['name'] == 'stage-a')['sends'], 2)
 
+    def test_a_step_sent_while_eden_reports_a_macro_playing_waits(self):
+        self.io.phase = 'stage'
+        self.status_script = lambda: {'state': 'playing' if self.now - self.io.stage_since < 3 else 'finished'}
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertGreaterEqual(self.io.stage_send_times[0] - self.io.stage_since, 3)
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        event, = result['stalls']
+        self.assertEqual((event['kind'], event['step'], event['why']), ('idle-wait', 'stage-a', 'macro playing'))
+        record = next(item for item in result['steps'] if item['name'] == 'stage-a')
+        self.assertEqual(record['idle_waits'], 1)
+        self.assertGreaterEqual(record['idle_wait_ms'], 3000)
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{**event, 'block': 'wireless_room'}])
+
+    def test_a_macro_that_never_finishes_stops_on_the_step_with_the_receipt(self):
+        self.io.phase = 'stage'
+        self.status_script = lambda: {'state': 'playing'}
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertIn('input channel busy', caught.exception.reason)
+        self.assertEqual(self.io.actions, [])
+        self.assertIsNone(self.io.pending)
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['input_channel'], 'macro playing')
+        self.assertEqual(stop['result'], 'STOPPED with 1 stall')
+
+    def test_an_unavailable_macro_status_sends_nothing(self):
+        for reply in (RuntimeError('offline'), None):
+            with self.subTest(reply=reply):
+                self.io = self.IO()
+                self.io.phase = 'stage'
+                self.now = 0.0
+                self.status_script = lambda: reply
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_room(unpublished_create='allow')
+                self.assertEqual(caught.exception.step, 'stage-a')
+                self.assertEqual(self.io.actions, [])
+                stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+                self.assertIn('macro.status unavailable:', stop['input_channel'])
+
+    def test_a_busy_macro_play_reply_is_not_a_blind_resend(self):
+        self.io.phase = 'stage'
+        self.io.busy_macro, self.io.busy_left = 'lobby-a', 1
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.actions.count('lobby-a'), 2)
+        self.assertEqual(self.io.stage_count, 1)
+        attempts = [i for i, event in enumerate(self.io.events) if event == ('send', 'lobby-a')]
+        self.assertTrue(any(event[:2] == ('read', 'ssbu.ui') for event in
+                            self.io.events[attempts[0] + 1:attempts[1]]))
+        record = next(item for item in result['steps'] if item['name'] == 'stage-a')
+        self.assertEqual((record['sends'], record['busy_rejections']), (1, 1))
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        self.assertEqual(result['stalls'][0]['kind'], 'busy-rejected')
+
+    def test_a_busy_create_confirm_does_not_start_the_retry_cooldown(self):
+        self.io.phase = 'form'
+        self.io.form_screen = 'ldn.create'
+        self.io.busy_macro, self.io.busy_left = 'tap-plus1', 1
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.actions.count('tap-plus1'), 2)
+        self.assertLess(self.io.confirm_sent_at, 2)
+        self.assertEqual(result['confirm_presses'], 1)
+        record = next(item for item in result['steps'] if item['name'] == 'confirm-create')
+        self.assertEqual((record['sends'], record['busy_rejections']), (1, 1))
+
     def test_open_create_presses_only_on_the_create_row(self):
         self.io.phase = 'rooms'
         self.run_room(unpublished_create='allow')
@@ -3853,7 +3936,7 @@ class WirelessRoomTests(unittest.TestCase):
         log = self.row / 'bridge.log'
         log.write_text('previous\nlast non-empty line\n\n')
         self.ctx.instance = {'bridge_log': str(log)}
-        self.ctx.call = lambda method: {'game_fps': 50}
+        self.ctx.call = lambda method: {'game_fps': 50} if method == 'status' else {'state': 'finished'}
         self.io.lost_stage_sends = 1
         result = self.run_room(unpublished_create='allow')
         self.assertEqual(result['result'], 'PASS with 1 stall')
