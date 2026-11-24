@@ -98,6 +98,11 @@ the handoff unverified with the observed ports, holder and time, and a saved-por
 join refuses it. A later successful host check on that port makes it valid
 again and retains the disproof in the handoff's history (up to five).
 Missing listener or identity data does not disprove an earlier handoff.
+Before a join uses a saved port, it also checks that the saved host instance
+in this run currently owns that UDP listener; missing host identity or listener
+data refuses the join, while a different owned port marks the handoff
+disproved on a best-effort basis. For a host on another machine (not an
+instance in the guest's run), give the port in the row instead.
 An explicitly occupied port stops before Host. A rejected edited flag stops
 a nondefault port, and a room-creation failure names the requested or
 default-port holder when known. The port-field cause and the new behavior

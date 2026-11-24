@@ -902,7 +902,10 @@ def udp_listeners(run=subprocess.run):
 
 
 def _instance_pids(ctx):
-    instance = getattr(ctx, 'instance', None)
+    return _instance_record_pids(getattr(ctx, 'instance', None))
+
+
+def _instance_record_pids(instance):
     if not isinstance(instance, dict):
         return None
     pids = set()
@@ -978,13 +981,19 @@ class RoomPortDisproved(RuntimeError):
         self.holder = holder
 
 
-def _owned_room_port(ctx, port):
+class RoomPortUnverified(RuntimeError):
+    def __init__(self, reason, port):
+        super().__init__(f'frontend_room: {reason}; room port {port} is not verified')
+        self.reason = reason
+
+
+def _owned_room_port(ctx, port, pid_source=None):
     listeners = udp_listeners()
     if listeners is None:
-        raise RuntimeError(f"frontend_room: cannot read this host's UDP listeners; room port {port} is not verified")
-    pids = _instance_pids(ctx)
+        raise RoomPortUnverified("cannot read this host's UDP listeners", port)
+    pids = _instance_pids(ctx) if pid_source is None else pid_source()
     if pids is None:
-        raise RuntimeError(f'frontend_room: cannot tell which processes belong to this Eden; room port {port} is not verified')
+        raise RoomPortUnverified('cannot tell which processes belong to this Eden', port)
     bound_ports = sorted({entry['port'] for entry in listeners if entry['pid'] in pids})
     if int(port) not in bound_ports:
         message = (f'frontend_room: the room is connected but this Eden listens on UDP {bound_ports}, '
@@ -1184,6 +1193,34 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                    f"the host route found this Eden no longer listening on it at {disproved['utc']}")
             raise RuntimeError(f'frontend_room: join refuses the saved room port {saved_port}: '
                                'frontend-room.json does not say it was verified')
+        if saved_port is None:
+            return None
+        host = saved.get('instance')
+        host_name = host if isinstance(host, str) and host else '<unknown>'
+        instances = getattr(ctx.runner, 'instances', {})
+        prefix = f'frontend_room: join cannot confirm that {host_name} still hosts the saved room port {saved_port}'
+        suffix = '; pass the port in the row to join without the saved handoff'
+        if not isinstance(host, str) or not host:
+            raise RuntimeError(f'{prefix} (saved handoff has no instance){suffix}')
+        if not isinstance(instances, dict) or host not in instances:
+            raise RuntimeError(f'{prefix} (instance is not in this run){suffix}')
+        if (type(saved_port) is not int and not (isinstance(saved_port, str)
+                and saved_port.isascii() and saved_port.isdecimal())) or not 1 <= int(saved_port) <= 65535:
+            raise RuntimeError(f'{prefix} (saved port is invalid){suffix}')
+        try:
+            _owned_room_port(ctx, saved_port, lambda: _instance_record_pids(instances[host]))
+        except RoomPortUnverified as error:
+            raise RuntimeError(f'{prefix} ({error.reason}){suffix}') from error
+        except RoomPortDisproved as error:
+            message = f'frontend_room: join refuses the saved room port {saved_port}: {host} listens on UDP {error.bound_ports}'
+            if error.holder:
+                message += f'; UDP {saved_port} is held by {_udp_holder_text(error.holder)}'
+            disproof = RoomPortDisproved(message, error.bound_ports, error.holder)
+            try:
+                invalidate_handoff(disproof)
+            except OSError:
+                pass
+            raise disproof from error
         return saved_port
 
     def same_saved_port(port):
@@ -1204,24 +1241,29 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             handoff['history'] = history
         _write_room_handoff(room_file, handoff)
 
+    def invalidate_handoff(error):
+        invalid = {**saved, 'port_verified': False,
+                   'disproved': {'utc': datetime.now(timezone.utc).isoformat(),
+                                 'bound_ports': error.bound_ports, 'holder': error.holder,
+                                 'reason': str(error)}}
+        history = saved_history()
+        if history:
+            invalid['history'] = history
+        _write_room_handoff(room_file, invalid)
+
     def verify_host_port(port):
         try:
             return _owned_room_port(ctx, port)
         except RoomPortDisproved as error:
             if same_saved_port(port):
-                invalid = {**saved, 'port_verified': False,
-                           'disproved': {'utc': datetime.now(timezone.utc).isoformat(),
-                                         'bound_ports': error.bound_ports, 'holder': error.holder,
-                                         'reason': str(error)}}
-                history = saved_history()
-                if history:
-                    invalid['history'] = history
                 try:
-                    _write_room_handoff(room_file, invalid)
+                    invalidate_handoff(error)
                 except OSError as write_error:
                     message = f'{error}; the saved handoff could not be invalidated: {write_error}'
                     raise RoomPortDisproved(message, error.bound_ports, error.holder) from error
             raise
+
+    verified_saved_port = saved_join_port() if role == 'join' and requested_port is None else None
 
     def reuse(connected, dismissed):
         widget, title, count = connected
@@ -1234,7 +1276,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                          if head is not None and head.find(' - ') != head.rfind(' - ') else '')
             raise RuntimeError(f'frontend_room: this Eden is connected to another room: expected "{expected_name}", '
                                f'saw "{title}"{ambiguous}')
-        saved_port = saved_join_port() if role == 'join' and requested_port is None else saved.get('port')
+        saved_port = verified_saved_port if role == 'join' and requested_port is None else saved.get('port')
         if role == 'host' and requested_port is not None and saved_port is not None \
                 and str(requested_port) != str(saved_port):
             raise RuntimeError(f"frontend_room: this Eden's room was saved with port {saved_port}, "
@@ -1278,14 +1320,15 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         actual_port = _frontend_dialog_value(ctx, tree, anchor, 'port')
         port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
         dialog_name = _frontend_dialog_value(ctx, tree, anchor, 'room_name') if role == 'host' else None
-        comparable_port = (int(requested_port) if isinstance(requested_port, str) and requested_port.isascii()
-                           and requested_port.isdecimal() else requested_port)
+        comparison_port = requested_port if requested_port is not None else verified_saved_port
+        comparable_port = (int(comparison_port) if isinstance(comparison_port, str) and comparison_port.isascii()
+                           and comparison_port.isdecimal() else comparison_port)
         if ((role == 'host' and requested_name is not None and dialog_name is not None
              and requested_name != dialog_name)
-                or (requested_port is not None and port is not None and comparable_port != port)):
+                or (comparison_port is not None and port is not None and comparable_port != port)):
             if role == 'join':
                 raise RuntimeError(f'frontend_room: the open Direct Connect dialog is on port {port}, '
-                                   f'not the requested port {requested_port}')
+                                   f'not the requested port {comparison_port}')
             raise RuntimeError(f'frontend_room: the open Create Room dialog is for room "{dialog_name}" on port '
                                f'{port}, not the requested room "{requested_name}" on port {requested_port}')
         if role == 'host' and port is None and requested_port is not None:
@@ -1307,7 +1350,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         dismissed = None
     else:
         if port is None:
-            port = free_udp_port() if role == 'host' else saved_join_port()
+            port = free_udp_port() if role == 'host' else verified_saved_port
         if port is None:
             raise RuntimeError('frontend_room: join needs a port or the frontend-room.json of this run')
         if role == 'host' and room_name is None:
