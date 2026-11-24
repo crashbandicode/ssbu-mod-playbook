@@ -3328,9 +3328,11 @@ class WirelessRoomTests(unittest.TestCase):
 
     def test_form_settle_read_error_names_the_error_and_sends_no_confirm(self):
         self.io.ui_fault_at = 'form_settle'
-        with self.assertRaisesRegex(RuntimeError, 'Create form.*no fenced bridge reply for state ssbu.ui'):
+        with self.assertRaisesRegex(RuntimeError, 'Create form.*no fenced bridge reply for state ssbu.ui') as caught:
             self.run_room(unpublished_create='allow')
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1'])
+        self.assertGreater(next(step for step in caught.exception.receipt['steps']
+                                if step['name'] == 'open-create')['unanswered'], 0)
 
     def test_screen_read_error_or_missing_screen_refuses_other_inputs(self):
         prefix = ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a']
@@ -3780,7 +3782,8 @@ class WirelessRoomTests(unittest.TestCase):
         stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
         self.assertEqual((stop['step'], stop['sends']), ('stage-a', 1))
         self.assertIn('screens', stop)
-        self.assertIn('error', stop['last_ui'])
+        self.assertEqual(stop['last_ui']['screen'], 'stage_select')
+        self.assertIn('no fenced bridge reply', stop['last_error'])
         self.assertIn('last_tile', stop)
 
     def test_three_lost_stage_presses_stop_on_stage_a(self):

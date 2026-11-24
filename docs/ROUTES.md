@@ -88,10 +88,16 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
+The Stage Select A gate requires a settled `tile.cursor` with numeric `at == hovered` and both `p1.token`
+and `local.token` held. Every wireless press also requires `input.ready=yes` whenever the bridge publishes that
+key; never press on the screen name alone.
 After a send, wait for the transition. A continuously observed source with the same target counts as a lost input:
 finish it and resend, up to three sends total (some steps allow fewer). A continuously changed target stops without
 confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
 If observations stay unreadable or in flight until the cap, stop on the named step without confirming or pressing again.
+Every wireless bridge read gets at least 2 seconds. An unanswered read preserves the last answered read and the
+source timer, but cannot authorise input; at the deadline one grace read may witness completion or a qualified retry.
+Training settle reads also have a 2-second floor and may finish up to 2 seconds after their settle cap.
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
@@ -107,6 +113,14 @@ record `kind`, `step`, `start`, `error`, `screen`, `seconds`, `frame`, `wall`, `
 Receipts say `PASS`, `PASS with 1 stall`, or `PASS with N stalls` (and corresponding `STOPPED` forms on failure);
 the row folder also receives `stall-events.jsonl`. The flight owner copies that file into the root-cause folder.
 This closed-loop route is host-tested only, not flown.
+
+**Why (2026-11-23/24):** the three stalled flights pressed A 5 to 12 frames after the first `stage_select` block,
+before the picker took input, and the wait's last read had a 1 ms cap; see
+`smash-training-lobby/artifacts/phase23/route-hardening/stage-stall/ROOT-CAUSE.md`.
+The `lobby-a` press stays 9 frames (commit 2537dd5). Its stated reason, that a 4-frame tap did not confirm, was a
+misreading of the early press: both lengths are lost when sent before the picker takes input, and a 4-frame tap sent
+late did reach the fighter select (proof-lobby-17060a5e-3). 9 frames is kept only because it is the length flown in
+every later successful transition; it is not evidence against the 4-frame tap.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
 within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.
