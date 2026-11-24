@@ -7,6 +7,8 @@ The slow clock adds `delay` seconds to every read of `time.monotonic`, `time.tim
 through the `time` module (the way the runner's code reads them): the n-th read returns the real value plus
 n * delay. That is a loaded host as the code under test sees it: time passes between two reads. Nothing sleeps, so
 the run is not slower. A clock a test injects itself is not touched, so a converted test is unaffected.
+A test counts when anything of it fails slowed: the method, one of its subtests, or a fixture of its class or
+module.
 A clock bound as a default argument (`clock=time.monotonic`) in a module of the tools folders is slowed too.
 Not covered: `from time import monotonic` (none in the runner at 1672ff52), a clock stored in a module global or
 an instance attribute before the slow run starts, and real sleeps.
@@ -32,11 +34,19 @@ def load(path):
     return module
 
 
+RANK = {'ok': 0, 'skip': 1, 'fail': 2, 'error': 3}
+
+
 def run(module):
-    """{test id: 'ok' | 'fail' | 'error' | 'skip'} and the first line of each failure."""
+    """One run of the module's tests, per test method.
+
+    Returns {test id: 'ok' | 'fail' | 'error' | 'skip'}, the last line of each test's first failure, the failed
+    subcases per test, and the class and module fixtures that failed. unittest reports a subtest's failure and a
+    fixture's failure under ids of their own; here a subtest counts for its test method, and a fixture for every
+    test of its class or module. An id that fits no test is kept as an entry of its own."""
     suite = unittest.defaultTestLoader.loadTestsFromModule(module)
     result = unittest.TestResult()
-    outcome, why = {}, {}
+    outcome, why, cases, fixtures = {}, {}, {}, []
 
     def ids(node):
         for item in node:
@@ -45,15 +55,38 @@ def run(module):
             else:
                 yield item.id()
 
+    def mark(name, kind, line):
+        if RANK[kind] > RANK[outcome.get(name, 'ok')]:
+            outcome[name] = kind
+        outcome.setdefault(name, kind)
+        why.setdefault(name, line)
+
     for name in ids(suite):
         outcome[name] = 'ok'
+    known = set(outcome)
     suite.run(result)
     for kind, entries in (('fail', result.failures), ('error', result.errors), ('skip', result.skipped)):
         for test, text in entries:
-            outcome[test.id()] = kind
             lines = [line for line in str(text).strip().splitlines() if line.strip()]
-            why[test.id()] = lines[-1][:240] if lines else ''
-    return outcome, why
+            line = lines[-1][:240] if lines else ''
+            parent = getattr(test, 'test_case', None)
+            if parent is not None:
+                if kind == 'skip':
+                    continue
+                mark(parent.id(), kind, line)
+                describe = getattr(test, '_subDescription', None)
+                cases.setdefault(parent.id(), []).append(f'{describe() if describe else test}: {line}')
+            elif test.id() in known:
+                mark(test.id(), kind, line)
+            else:
+                # A class or module fixture: 'setUpClass (module.Class)', 'setUpModule (module)'.
+                description = test.id()
+                owner = description[description.find('(') + 1:description.rfind(')')] if '(' in description else ''
+                owned = [name for name in known if owner and name.startswith(owner + '.')]
+                fixtures.append(description)
+                for name in owned or [description]:
+                    mark(name, kind, f'{description}: {line}')
+    return outcome, why, cases, fixtures
 
 
 def bind_defaults(real, slowed_clock, folder):
@@ -98,7 +131,7 @@ def main():
     parser.add_argument('--json', type=Path)
     args = parser.parse_args()
     module = load(args.module.resolve())
-    plain, plain_why = run(module)
+    plain, plain_why, plain_cases, plain_fixtures = run(module)
     real = {name: getattr(time, name) for name in NAMES}
     reads = {name: 0 for name in NAMES}
 
@@ -113,26 +146,30 @@ def main():
         setattr(time, name, slowed_clock[name])
     undo, bound = bind_defaults(real, slowed_clock, args.module.resolve().parent)
     try:
-        slowed, slow_why = run(module)
+        slowed, slow_why, slow_cases, slow_fixtures = run(module)
     finally:
         for name in NAMES:
             setattr(time, name, real[name])
         for restore in undo:
             restore()
-    depends = sorted(name for name in plain if plain[name] == 'ok' and slowed.get(name) != 'ok')
+    depends = sorted(name for name in {*plain, *slowed}
+                     if plain.get(name, 'ok') == 'ok' and slowed.get(name, 'ok') != 'ok')
     broken = sorted(name for name in plain if plain[name] in ('fail', 'error'))
     report = {'module': str(args.module), 'delay': args.delay, 'tests': len(plain),
               'plain': {kind: sum(1 for value in plain.values() if value == kind) for kind in ('ok', 'fail', 'error', 'skip')},
               'clock_reads_in_slow_run': reads, 'default_bound_clocks_slowed': bound,
-              'depends_on_wall_time': [{'test': name, 'slow': slowed.get(name), 'why': slow_why.get(name, '')}
-                                       for name in depends],
-              'failing_without_delay': [{'test': name, 'why': plain_why.get(name, '')} for name in broken]}
+              'depends_on_wall_time': [{'test': name, 'slow': slowed.get(name), 'why': slow_why.get(name, ''),
+                                        'cases': slow_cases.get(name, [])} for name in depends],
+              'failing_without_delay': [{'test': name, 'why': plain_why.get(name, ''),
+                                         'cases': plain_cases.get(name, [])} for name in broken],
+              'fixture_failures_slowed': slow_fixtures, 'fixture_failures_plain': plain_fixtures}
     if args.json:
         args.json.write_text(json.dumps(report, indent=1) + '\n')
     print(f'{args.module.name}: {len(plain)} tests, plain {report["plain"]}, slow-clock reads {sum(reads.values())}, '
           f'depend on wall time: {len(depends)}')
     for entry in report['depends_on_wall_time']:
-        print(f'  WALL  {entry["test"].split(".", 1)[-1]}: {entry["why"]}')
+        subcases = f' [{len(entry["cases"])} subcases]' if entry['cases'] else ''
+        print(f'  WALL  {entry["test"].split(".", 1)[-1]}{subcases}: {entry["why"]}')
     for entry in report['failing_without_delay']:
         print(f'  PLAIN-FAIL  {entry["test"].split(".", 1)[-1]}: {entry["why"]}')
     return int(bool(depends or broken))
