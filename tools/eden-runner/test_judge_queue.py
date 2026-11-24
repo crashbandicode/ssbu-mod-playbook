@@ -1,9 +1,12 @@
 """Checked effects, the async judge, the clip check and the consecutive-failure stop rule (judge_queue.py + runner)."""
 import hashlib
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -330,6 +333,198 @@ class WorkerJudgeInput(unittest.TestCase):
         self.assertTrue((self.workdir / 'verdict.attempt-1.json').is_file())
         self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), old)
         self.assertFalse((self.workdir / 'verdict.json').exists())
+
+    def test_retry_with_unreadable_shot_snapshot_withdraws_prior_pass(self):
+        for mode in ('missing', 'invalid-json', 'not-list'):
+            with self.subTest(snapshot=mode):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.workdir = Path(tmp.name)
+                _, first, marker = self.prepare_verdict_retry()
+                original_job = self.job_path.read_bytes()
+                first_done = json.loads((self.workdir / 'done.json').read_text())
+                snapshot = self.workdir / 'row-shots.json'
+                if mode == 'missing':
+                    snapshot.rename(self.workdir / 'row-shots.hold')
+                else:
+                    snapshot.write_text('{' if mode == 'invalid-json' else '{"shots": []}')
+                with mock.patch.object(jq, 'clip_check', side_effect=AssertionError('must not check')), \
+                     mock.patch.object(jq, 'run_judge', side_effect=AssertionError('must not judge')):
+                    try:
+                        verdict = jq.work(self.job_path)
+                    except Exception as error:
+                        self.fail(f'work raised on {mode}: {error!r}')
+                self.assertFalse(marker.exists())
+                self.assertEqual(verdict['verdict'], 'UNSURE')
+                self.assertTrue(verdict['reason'].startswith('row shots snapshot unreadable: '))
+                self.assertEqual((verdict['shots_cited'], verdict['model']), ([], None))
+                result = json.loads(self.receipt_path.read_text())
+                self.assertEqual((result['status'], result['judge']['verdict']), ('RAN-UNVERIFIED', 'UNSURE'))
+                self.assertIn(verdict['reason'], result['status_reason'])
+                self.assertNotIn('retry', result['judge'])
+                self.assertNotIn('previous', result['judge'])
+                self.assertEqual(self.job_path.read_bytes(), original_job)
+                done = json.loads((self.workdir / 'done.json').read_text())
+                self.assertEqual(done['verdict'], verdict)
+                self.assertEqual(done['clip_check'], {'ok': True, 'error': verdict['reason']})
+                self.assertEqual(done['excluded_shots'], [])
+                for name, expected in (('verdict', first), ('done', first_done)):
+                    archive = self.workdir / f'{name}.attempt-1.json'
+                    self.assertTrue(archive.is_file())
+                    self.assertEqual(json.loads(archive.read_text()), expected)
+                self.assertFalse((self.workdir / 'verdict.json').exists())
+
+    def test_killed_retry_leaves_pending_receipt_and_archived_results(self):
+        _, first, marker = self.prepare_verdict_retry()
+        previous = json.loads(self.receipt_path.read_text())['judge']
+        first_done = json.loads((self.workdir / 'done.json').read_text())
+        (self.folder / 'judge.py').write_text(
+            'import time\nfrom pathlib import Path\n'
+            'Path(__file__).with_name("judge-ran.json").write_text("started")\ntime.sleep(60)\n')
+        worker = subprocess.Popen([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                                   str(self.job_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline and worker.poll() is None:
+                time.sleep(0.02)
+            self.assertTrue(marker.is_file(), 'retry did not reach the stand-in judge')
+            pending = json.loads(self.receipt_path.read_text())
+            self.assertEqual((pending['status'], pending['status_reason'], pending.get('review')),
+                             ('RAN-UNVERIFIED', 'judge pending (retry)', True))
+            self.assertEqual(pending['judge'],
+                             {'state': 'pending', 'retry': True,
+                              'previous': {'verdict': first['verdict'], 'landed': previous['landed']}})
+            self.assertFalse((self.workdir / 'verdict.json').exists())
+            self.assertFalse((self.workdir / 'done.json').exists())
+            self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+            self.assertEqual(json.loads((self.workdir / 'done.attempt-1.json').read_text()), first_done)
+        finally:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.communicate(timeout=5)
+        self.assertNotEqual(worker.returncode, 0)
+        pending = json.loads(self.receipt_path.read_text())
+        self.assertEqual((pending['status'], pending['judge']['state']), ('RAN-UNVERIFIED', 'pending'))
+
+    def test_retry_preserves_failed_gate_before_and_after_judge(self):
+        self.prepare_verdict_retry()
+        result = json.loads(self.receipt_path.read_text())
+        result.update(gates_status='FAILED', status='FAILED', status_reason='deterministic gate failed')
+        self.receipt_path.write_text(json.dumps(result))
+        check = jq.clip_check
+
+        def observe(job, frames):
+            pending = json.loads(self.receipt_path.read_text())
+            self.assertEqual((pending['status'], pending['status_reason'], pending['judge']['state']),
+                             ('FAILED', 'deterministic gate failed', 'pending'))
+            return check(job, frames)
+
+        with mock.patch.object(jq, 'clip_check', side_effect=observe):
+            verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual(verdict['verdict'], 'PASS')
+        self.assertEqual((result['status'], result['status_reason']), ('FAILED', 'deterministic gate failed'))
+
+    def test_successful_retry_lands_new_result_without_pending_metadata(self):
+        _, first, _ = self.prepare_verdict_retry()
+        previous_done = json.loads((self.workdir / 'done.json').read_text())
+        (self.folder / 'judge.py').write_text(
+            'import json,sys\njson.dump({"verdict":"FAIL","reason":"new result","shots_cited":[]},'
+            'open(sys.argv[sys.argv.index("--out")+1],"w"))\n')
+        verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual((verdict['verdict'], result['status'], result['judge']['state']), ('FAIL', 'FAILED', 'done'))
+        self.assertNotIn('retry', result['judge'])
+        self.assertNotIn('previous', result['judge'])
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        self.assertTrue((self.workdir / 'done.attempt-1.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'done.attempt-1.json').read_text()), previous_done)
+        self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
+
+    def test_first_pass_does_not_change_receipt_before_judge(self):
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('result', 'after', 220, good)]
+        original = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'status_reason': 'judge pending',
+                    'judge': {'state': 'pending', 'job': 'original'}, 'blockers': []}
+        self.receipt_path.write_text(json.dumps(original))
+        self.job_path.write_text(json.dumps({
+            'row': 'a', 'shots': shots, 'clip': None, 'dir': str(self.workdir), 'receipt': str(self.receipt_path),
+            'plan_dir': str(self.folder), 'judge_cmd': 'judge.py', 'expected': 'after:result'}))
+        run = jq.run_judge
+        seen = []
+
+        def observe(path, job):
+            seen.append(json.loads(self.receipt_path.read_text()))
+            return run(path, job)
+
+        with mock.patch.object(jq, 'run_judge', side_effect=observe):
+            verdict = jq.work(self.job_path)
+        self.assertEqual(seen, [original])
+        self.assertEqual(verdict['verdict'], 'PASS')
+        self.assertEqual(json.loads(self.receipt_path.read_text())['judge']['state'], 'done')
+        self.assertEqual(list(self.workdir.glob('*.attempt-*.json')), [])
+
+    def test_label_error_is_merged_as_unsure(self):
+        bad = self.shot('bad', 'before', 20, {'status': 'fresh'})
+        bad.pop('name')
+        try:
+            _, result, done, verdict, marker = self.run_worker([bad], 'NO-CITE')
+        except Exception as error:
+            self.fail(f'work raised on bad label: {error!r}')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertIn("judge worker error: KeyError('name')", verdict['reason'])
+        self.assertEqual(done['verdict'], verdict)
+
+    def test_job_write_error_is_merged_as_unsure(self):
+        _, first, marker = self.prepare_verdict_retry()
+        original = self.job_path.read_bytes()
+        write = Path.write_text
+
+        def deny_job(path, *args, **kwargs):
+            if path == self.job_path:
+                raise OSError('cannot write job')
+            return write(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'write_text', autospec=True, side_effect=deny_job):
+            try:
+                verdict = jq.work(self.job_path)
+            except Exception as error:
+                self.fail(f'work raised on job write: {error!r}')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], json.loads(self.receipt_path.read_text())['status']),
+                         ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertIn("judge worker error: OSError('cannot write job')", verdict['reason'])
+        self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        self.assertEqual(self.job_path.read_bytes(), original)
+
+    def test_retry_receipt_write_error_does_not_run_judge(self):
+        _, first, marker = self.prepare_verdict_retry()
+        merge = jq.merge_receipt
+        calls = []
+
+        def fail_once(path, update):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError('cannot mark retry pending')
+            return merge(path, update)
+
+        with mock.patch.object(jq, 'merge_receipt', side_effect=fail_once):
+            try:
+                verdict = jq.work(self.job_path)
+            except Exception as error:
+                self.fail(f'work raised on retry receipt write: {error!r}')
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], json.loads(self.receipt_path.read_text())['status']),
+                         ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertIn("judge worker error: OSError('cannot mark retry pending')", verdict['reason'])
+        self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
 
     def test_non_object_and_missing_verdict_are_not_trusted(self):
         for body, reason in (('[]', 'invalid verdict'), ('', 'judge gave no verdict (exit 0)')):
