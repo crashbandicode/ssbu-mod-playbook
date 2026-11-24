@@ -1,0 +1,40 @@
+[Adapter] bridge connected boot=0xa1e80deccd2a9a15
+[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0-rc.15 port=6980 guards=0x7ffffff boot=0xa1e80deccd2a9a15 uptime_ms=474261363 reconnects=0 event_latest=2 state_api=1 toggle_gen=1 toggle_reason=pad_chord refusals=0 last_refusal=none frame=10 wall=474261363
+474066032 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=installed indicator=hooked native_ui=installed chord=deferred toggle=off reason=boot_default fixture=closed deluxe=registered heap_register=43 guards=0x7ffffff tr_export=available server=started result=installed heap_allocations=51 heap_install=51 frame=0 wall=0
+[Bridge] req backup result=ok files=18 bytes=64620 frame=11 wall=474261483
+[Bridge] file_end name=settings.json bytes=43850 sha256=cedf5b77a13625ffb327fbba79e59d2fd800d229b544464f523fb85d7c79edd6 result=ok frame=11 wall=474261580 mirrored=true
+[Bridge] req events result=ok on=1 latest=2 frame=11 wall=474261580
+[Bridge] provider name=tile.cursor schema_id=3 version=1 rev=1 dropped=0 toggle_gen=1 frame=30 wall=474261687
+[Bridge] provider name=tr.menu schema_id=1 version=1 rev=1 dropped=0 toggle_gen=1 frame=30 wall=474261687
+[Bridge] provider name=tr.practice schema_id=2 version=1 rev=1 dropped=0 toggle_gen=1 frame=30 wall=474261687
+[Bridge] provider name=ssbu.ui schema_id=2 version=1 rev=3 dropped=0 toggle_gen=1 frame=30 wall=474261688
+[Bridge] req providers result=ok count=4 boot=0xa1e80deccd2a9a15 frame=30 wall=474261689
+[Bridge] state begin name=ssbu.ui schema=ssbu.ui/1 rev=4 boot=0xa1e80deccd2a9a15 lines=27 filtered=0 frame=31 wall=474261702
+[Bridge] state.0 schema=ssbu.ui/1 frame=31 wall=474261703
+[Bridge] state.1 rev=4 frame=31 wall=474261703
+[Bridge] state.2 boot=0xa1e80deccd2a9a15 frame=31 wall=474261704
+[Bridge] state.3 ack=0 frame=31 wall=474261704
+[Bridge] state.4 ack.result=unsupported frame=31 wall=474261704
+[Bridge] state.5 focus=title.press_any frame=31 wall=474261704
+[Bridge] state.6 observation=23 frame=31 wall=474261705
+[Bridge] state.7 observation.active=yes frame=31 wall=474261705
+[Bridge] state.8 screen=title frame=31 wall=474261705
+[Bridge] state.9 screen.tab=unknown frame=31 wall=474261705
+[Bridge] state.10 screen.layer=unknown frame=31 wall=474261705
+[Bridge] state.11 screen.context=unknown frame=31 wall=474261706
+[Bridge] state.12 focus.source=native frame=31 wall=474261706
+[Bridge] state.13 focus.id=press_any frame=31 wall=474261706
+[Bridge] state.14 focus.index=0 frame=31 wall=474261706
+[Bridge] state.15 focus.label="Press Any Button" frame=31 wall=474261706
+[Bridge] state.16 dialog=none frame=31 wall=474261707
+[Bridge] state.17 input.owner=native frame=31 wall=474261707
+[Bridge] state.18 ldn.role=unknown frame=31 wall=474261707
+[Bridge] state.19 ldn.members=unknown frame=31 wall=474261707
+[Bridge] state.20 ldn.request_pending=unknown frame=31 wall=474261707
+[Bridge] state.21 ldn.prompt=unknown frame=31 wall=474261708
+[Bridge] state.22 ldn.scan.generation=unknown frame=31 wall=474261709
+[Bridge] state.23 ldn.room.bssid=unknown frame=31 wall=474261709
+[Bridge] state.24 ldn.room.session=unknown frame=31 wall=474261710
+[Bridge] state.25 ldn.room.ready=unknown frame=31 wall=474261710
+[Bridge] state.26 menu.admission=qualified_offline frame=31 wall=474261710
+[Bridge] state end name=ssbu.ui rev=4 crc=e4aa5b9c frame=31 wall=474261710

@@ -3077,6 +3077,10 @@ def _bridge_on_events(ctx):
     return path.read_text().splitlines() if path.is_file() else []
 
 
+def _bridge_on_listener_owner(_port):
+    return ''
+
+
 class BridgeOnChordHoldError(RuntimeError):
     pass
 
