@@ -529,7 +529,8 @@ class SetupReworkTests(unittest.TestCase):
         self.assertIsNone(switch_hw.fighters_response(lines[:-1]))
         self.assertIsNone(switch_hw.fighters_response([old, reply, body0, summary]))
         self.assertIsNone(switch_hw.fighters_response(lines + [reply, body0]))
-        with self.assertRaisesRegex(RuntimeError, 'fighters'):
+        with patch.object(switch_hw, 'time', self.clock), \
+             self.assertRaisesRegex(RuntimeError, 'fighters'):
             switch_hw.fighters_now(self.root, cap=0.01)
 
         self.log.write_text(old + '\n')
