@@ -105,6 +105,24 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(fake.finishes, 0)
         self.assertEqual(caught.exception.receipt['stalls'], [])
 
+    def test_a_retry_read_that_overruns_the_cap_never_finishes_or_resends(self):
+        reads_at_three = []
+
+        def observe(f):
+            if f.sends and f.now == 3:
+                reads_at_three.append(True)
+                if len(reads_at_three) == 2:
+                    f.now = 6
+            return 'source'
+
+        fake = Script(observe)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=5, lost_after=2)])
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['stalls'], [])
+
     def test_a_send_error_stops_with_delivery_unknown(self):
         fake = Script(lambda f: 'source')
 

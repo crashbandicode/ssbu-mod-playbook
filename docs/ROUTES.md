@@ -88,9 +88,10 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
-After a send, wait for the transition. A continuously observed source counts as a lost input:
-finish it and resend, up to three sends total (some steps allow fewer). If observations stay unreadable
-or in flight until the cap, stop on the named step without confirming or pressing again.
+After a send, wait for the transition. A continuously observed source with the same target counts as a lost input:
+finish it and resend, up to three sends total (some steps allow fewer). A continuously changed target stops without
+confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
+If observations stay unreadable or in flight until the cap, stop on the named step without confirming or pressing again.
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
@@ -99,7 +100,12 @@ recognised native-owned screen, with at most three starts per phase per call. Co
 state stop with `routes-reach-training-stop.json`. The overall cap is checked between phases; a running phase ends
 on its own caps. This phase recovery is host-tested only.
 A Training fighter select reached without a recorded stage is not trusted: the route returns to Main and picks the stage again.
-`ready` waits 30 s of unchanged CSS before its single resend; what a second Plus does while the room is still loading has not been observed in a game.
+`ready` is sent once; a second Plus stays out until a flown run has measured that load.
+Wireless stall events record `step`, `send`, `seconds_on_source`, `target`, `screen`, `frame`, `wall`, `rev`,
+`tile`, `last_bridge_line`, `eden_frame_ms` and available `eden_fps`, and `utc`. Training retry/recovery events
+record `kind`, `step`, `start`, `error`, `screen`, `seconds`, `frame`, `wall`, `rev`, `last_bridge_line` and `utc`.
+Receipts say `PASS`, `PASS with 1 stall`, or `PASS with N stalls` (and corresponding `STOPPED` forms on failure);
+the row folder also receives `stall-events.jsonl`. The flight owner copies that file into the root-cause folder.
 This closed-loop route is host-tested only, not flown.
 
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog

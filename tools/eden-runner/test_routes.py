@@ -2853,6 +2853,8 @@ class WirelessRoomTests(unittest.TestCase):
             self.confirm_form_reads = 0
             self.confirm_form_only_first = False
             self.confirm_reads = 0
+            self.confirm_sent_at = None
+            self.confirm_read_delay_after_cap = 0
             self.stage_context_unknown_reads = 0
             self.unpublished_confirms = 0
             self.confirm_errors_before_unknown = 0
@@ -2971,6 +2973,9 @@ class WirelessRoomTests(unittest.TestCase):
                         self.events.append(('read_error', provider, error))
                         raise RuntimeError(error)
                 if self.phase == 'confirm_form':
+                    if (self.confirm_read_delay_after_cap and self.confirm_count == 1
+                            and self.clock() - self.confirm_sent_at >= 20):
+                        routes.time.sleep(self.confirm_read_delay_after_cap)
                     if self.confirm_reads >= self.confirm_form_reads:
                         self.phase = 'css' if self.direct_css else 'stage'
                     else:
@@ -3023,6 +3028,8 @@ class WirelessRoomTests(unittest.TestCase):
                     self.phase = 'form'
             elif macro == 'tap-plus1' and self.phase in ('form', 'confirm_form', 'unpublished', 'wrong'):
                 self.confirm_count += 1
+                if self.confirm_count == 1:
+                    self.confirm_sent_at = self.clock()
                 if self.wrong_confirm_screen:
                     self.phase = 'wrong'
                 elif self.confirm_count <= self.unpublished_confirms:
@@ -3518,6 +3525,16 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.stage_count, 2)
         self.assertEqual(result['stage_presses'], 2)
         self.assertEqual(next(s for s in result['steps'] if s['name'] == 'stage-a')['sends'], 2)
+
+    def test_the_create_confirm_retry_keeps_its_witnessed_deadline_behavior(self):
+        self.io.form_screen = 'ldn.create'
+        self.io.confirm_form_reads = 1000
+        self.io.confirm_form_only_first = True
+        self.io.confirm_read_delay_after_cap = .2
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.actions.count('tap-plus1'), 2)
+        self.assertEqual(result['confirm_presses'], 2)
+        self.assertEqual(result['waiting']['ldn.role'], 'host')
 
     def test_stage_a_needs_the_held_stage_token(self):
         for token in ('unknown', 'none', None):

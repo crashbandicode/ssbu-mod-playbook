@@ -40,6 +40,7 @@ import sys
 import time
 import unicodedata
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -71,6 +72,40 @@ def _sha256(path):
 def _save(ctx, name, value):
     (Path(ctx.row_dir) / f'{name}.json').write_text(json.dumps(value, indent=1, default=str) + '\n')
     return value
+
+
+def _bridge_tail(ctx):
+    try:
+        with instance_path(ctx, 'bridge_log').open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            position, tail = stream.tell(), b''
+            while position:
+                size = min(position, 8192)
+                position -= size
+                stream.seek(position)
+                tail = stream.read(size) + tail
+                lines = tail.split(b'\n')
+                for line in reversed(lines if position == 0 else lines[1:]):
+                    if line.strip():
+                        return line.decode('utf-8', errors='replace').rstrip('\r')
+    except (AttributeError, KeyError, OSError):
+        return None
+    return None
+
+
+def _stall_result(ok, stalls):
+    result = 'PASS' if ok else 'STOPPED'
+    count = len(stalls)
+    return f'{result} with {count} {"stall" if count == 1 else "stalls"}' if count else result
+
+
+def _append_stall(ctx, block, event):
+    with (Path(ctx.row_dir) / 'stall-events.jsonl').open('a', encoding='utf-8') as stream:
+        stream.write(json.dumps({**event, 'block': block}, default=str) + '\n')
+
+
+def _stall_utc():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def routes_index():
@@ -938,7 +973,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                                'room_matched': True if room_name is not None else None})
 
 
-def _wireless_read(ctx, io, provider, cap, screens):
+def _wireless_read(ctx, io, provider, cap, screens, *, on_sample=None):
     ctx.check_stop()
     try:
         sample = io.read(provider, cap)
@@ -950,6 +985,8 @@ def _wireless_read(ctx, io, provider, cap, screens):
     if (block.get('name') != provider or block.get('schema') != provider + '/1'
             or block.get('filtered') or block.get('rev', 0) <= 0):
         raise RuntimeError(f'{provider}: incomplete bridge state: {block}')
+    if on_sample:
+        on_sample(sample)
     values = dict(block['values'])
     if provider == 'ssbu.ui':
         screen = values.get('screen', 'unknown')
@@ -988,10 +1025,13 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
     state = {'last_ui': {}, 'last_tile': None, 'form_pending': False, 'form_ready': False,
              'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
              'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
-             'prefinished': False, 'current': None}
+             'prefinished': False, 'current': None, 'ui_clock': {}}
+
+    def remember_ui(sample):
+        state['ui_clock'] = {key: sample.block.get(key) for key in ('frame', 'wall', 'rev')}
 
     def observe():
-        ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens)
+        ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens, on_sample=remember_ui)
         state['last_ui'] = ui
         tile = None
         if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
@@ -1084,7 +1124,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
     def stage_at(obs):
         tile = obs['tile'] or {}
         return (available() and local(obs, 'stage_select') and tile.get('screen') == 'sss'
-                and tile.get('settled') == '1' and hovered(tile))
+                and tile.get('settled') == '1' and tile.get('local.token') == 'held' and hovered(tile))
 
     def hand_at(obs):
         tile = obs['tile'] or {}
@@ -1102,21 +1142,27 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
     def waiting(obs):
         return (active(obs, 'ldn.waiting') and obs['ui'].get('ldn.role') == 'host')
 
+    ready_wait_cap = max(ready_cap + 10, 45)
     steps = [
         closed_loop.Step('open-room-list',
                          lambda o: available() and active(o, 'main_menu') and o['ui'].get('input.owner') == 'native',
-                         lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6),
+                         lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6,
+                         target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer'))),
         closed_loop.Step('open-create', lambda o: active(o, 'ldn.room_list'), create_done, 'tap-a1',
                          cap=15, lost_after=5, before_send=begin_create),
         closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
                          cap=20, lost_after=0, sends=2, before_send=begin_confirm),
         closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
-                         cap=60, ready_cap=20, lost_after=6),
+                         cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at')),
         closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
-                         cap=5, ready_cap=30, lost_after=3, before_send=fence_chord),
-        closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4),
-        closed_loop.Step('ready', placed, waiting, 'lobby-ready', cap=max(ready_cap + 10, 45),
-                         lost_after=30, sends=2),
+                         cap=5, ready_cap=30, lost_after=3, before_send=fence_chord,
+                         target=lambda o: ((o['tile'] or {}).get('at'), (o['tile'] or {}).get('hovered'))),
+        closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4,
+                         target=lambda o: (o['tile'] or {}).get('at')),
+        closed_loop.Step('ready', placed, waiting, 'lobby-ready', cap=ready_wait_cap,
+                         lost_after=ready_wait_cap + 1, sends=1,
+                         target=lambda o: ((o['tile'] or {}).get('p1.placed.at'),
+                                           (o['tile'] or {}).get('local.placed.at'))),
     ]
 
     def send(macro):
@@ -1144,9 +1190,25 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         if name == 'confirm-create' and state['create_form'] is None:
             state['create_form'] = 'ldn.create'
 
+    def on_stall(event, obs):
+        result = {
+            **event, 'kind': 'resend', 'screen': obs['ui'].get('screen'), **state['ui_clock'],
+            'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_frame_ms': None, 'utc': _stall_utc(),
+        }
+        try:
+            status = ctx.call('status') or {}
+            fps = status.get('game_fps') if isinstance(status, dict) else None
+            if isinstance(fps, (int, float)) and math.isfinite(fps) and fps > 0:
+                result['eden_fps'] = fps
+                result['eden_frame_ms'] = 1000 / fps
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            pass
+        _append_stall(ctx, 'wireless_room', result)
+        return result
+
     try:
         outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
-                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step)
+                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall)
     except closed_loop.RouteStopped as error:
         reason = error.reason
         if (error.step == 'confirm-create' and state['confirm_presses'] == 1
@@ -1189,7 +1251,12 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
             'block': 'wireless_room', 'ok': False, 'step': error.step, 'reason': reason, 'sends': sends,
             'screens': screens, 'last_ui': state['last_ui'], 'last_tile': state['last_tile'],
             'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
+            'stalls': error.receipt['stalls'], 'result': _stall_result(False, error.receipt['stalls']),
         }
+        dispatch = next((entry.get('dispatch') for entry in error.receipt['steps'] if entry['name'] == error.step),
+                        None)
+        if dispatch is not None:
+            stop_receipt['dispatch'] = error.receipt['dispatch'] = dispatch
         if reason.startswith('unsupported reader: the Create form is not published as ldn.create'):
             stop_receipt['unsupported_reader'] = 'ldn.create'
         _save(ctx, 'routes-wireless-room-stop', stop_receipt)
@@ -1213,6 +1280,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
                     for key in ('screen', 'ldn.role', 'ldn.members', 'observation.active')},
         'ldn.members': waiting_ui.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),
         'entered_at': outcome['entered_at'], 'steps': outcome['steps'],
+        'stalls': outcome['stalls'], 'result': _stall_result(True, outcome['stalls']),
     })
 
 
@@ -5046,6 +5114,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
               'pick_fighters', 'enter_training', 'set_cpu')
     skipped, timings, receipts = list(phases), {}, {}
     starts, recovered, errors = {}, [], {}
+    stalls, retry_evidence, phase_elapsed = [], {}, {}
     io, ui, last_ui = None, None, None
     known_stage = expected(ctx).get('stage_id')
     css_picked, retry_same = False, None
@@ -5062,7 +5131,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
             'block': 'reach_training', 'ok': False, 'step': step, 'reason': reason,
             'starts': dict(starts), 'recovered': list(recovered), 'last_ui': last_ui,
             'phases': dict(receipts), 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)},
-            'pending': pending(),
+            'pending': pending(), 'stalls': list(stalls), 'result': _stall_result(False, stalls),
         }
         _save(ctx, 'routes-reach-training-stop', receipt)
         raise closed_loop.RouteStopped('reach_training', step, reason, receipt)
@@ -5071,11 +5140,19 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         if time.monotonic() >= until:
             stop('deadline', reason)
 
+    def phase_stall(kind, name, evidence):
+        event = {'kind': kind, 'step': name, **evidence,
+                 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
+        _append_stall(ctx, 'reach_training', event)
+        stalls.append(event)
+
     def phase(name):
         nonlocal css_picked, known_stage
         deadline(f'deadline expired before {name}')
         if starts.get(name, 0) >= 3:
             stop(name, f'no transition after 3 starts; last error: {errors.get(name, "none")}')
+        if name in retry_evidence:
+            phase_stall('phase-retry', name, retry_evidence.pop(name))
         recovered[:] = [item for item in recovered if item != name]
         starts[name] = starts.get(name, 0) + 1
         begin = time.monotonic()
@@ -5098,7 +5175,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
             else:
                 value = _set_fighter(ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
         finally:
-            timings[name] = timings.get(name, 0) + round((time.monotonic() - begin) * 1000)
+            phase_elapsed[name] = time.monotonic() - begin
+            timings[name] = timings.get(name, 0) + round(phase_elapsed[name] * 1000)
         receipts[name] = value
         if name in skipped:
             skipped.remove(name)
@@ -5256,8 +5334,14 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                 if fatal(error):
                     stop(name, str(error))
                 after = settle(name, str(error), screen)
+                block = getattr(ui, 'block', {})
+                retry_evidence[name] = {
+                    'start': starts[name], 'error': str(error), 'screen': after, 'seconds': phase_elapsed[name],
+                    **{key: block.get(key) for key in ('frame', 'wall', 'rev')},
+                }
                 if later(name, screen, after):
                     recovered.append(name)
+                    phase_stall('phase-recovered', name, retry_evidence[name])
                 elif after == screen:
                     retry_same = (name, screen)
                 if after != 'css.training':
@@ -5276,6 +5360,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
         'starts': starts, 'recovered': recovered, 'retries': {key: count - 1 for key, count in starts.items()
                                                             if count > 1},
+        'stalls': stalls, 'result': _stall_result(True, stalls),
     })
 
 
