@@ -4110,6 +4110,10 @@ def _bridge_on_ui_blocks_since_hello(text, hello, start):
                 segment = []
 
 
+def _bridge_on_skip_opening(ctx, block, state):
+    return None
+
+
 def _bridge_on_stub_title(ctx, hello, start):
     match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
     if match is None:

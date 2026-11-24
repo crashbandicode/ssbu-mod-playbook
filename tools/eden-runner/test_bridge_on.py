@@ -44,6 +44,11 @@ STUB_PREAMBLE = ''.join(STUB_CAPTURE[:6])
 STUB_UI = ''.join(STUB_CAPTURE[6:])
 STUB_BOOT = '0xa1e80deccd2a9a15'
 FOREIGN_BOOT = '0x1111111111111111'
+RUN1 = (Path(__file__).parent / 'fixtures' / 'bridge-on' / 'stub-on-yoga-e-run1' / 'bridge.log').read_text().splitlines(keepends=True)
+RUN1_PREAMBLE = ''.join(RUN1[:3])
+RUN1_OPENING = ''.join(RUN1[51:99])
+RUN1_PROMPT = ''.join(RUN1[147:195])
+RUN1_BOOT = '0x1dc637526fb29a71'
 
 
 class BridgeOnTests(unittest.TestCase):
@@ -61,7 +66,8 @@ class BridgeOnTests(unittest.TestCase):
         self.instance = {'trace_jsonl': str(self.trace), 'bridge_events': str(self.events), 'profile': str(self.root)}
         self.ctx = SimpleNamespace(on='offline', row_dir=str(self.row), instance=self.instance,
                                    runner=SimpleNamespace(instances={'offline': self.instance}),
-                                   check_stop=lambda: None, call=self.call)
+                                   check_stop=lambda: None, call=self.call, log=lambda _: None)
+        self.ctx.runner.wait_macro = lambda *_: None
         self.calls = []
         self.seconds = 0.0
         self.popen = []
@@ -77,9 +83,16 @@ class BridgeOnTests(unittest.TestCase):
         self.chord_started = None
         self.toggle_enabled = True
         self.sleep_hook = None
+        self.prompt_after_skip = False
+        self.macro_error = None
+        self.recorded_open_seen = False
 
     def call(self, name, args=None):
         self.calls.append((name, args))
+        if name == 'macro.status':
+            return {'state': 'idle'}
+        if name == 'macro.play' and self.macro_error:
+            raise RuntimeError(self.macro_error)
         if name == 'input.button' and args['state'] == 'press' and self.chord_started is None:
             self.chord_started = self.seconds
         if name == 'trace.arm':
@@ -137,6 +150,12 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(requests, ('providers', 'state ssbu.ui'))
         self.bridge_requests.append(requests)
         sample = self.stub_samples.pop(0) if self.stub_samples else self.stub_default
+        if self.prompt_after_skip and any(method == 'macro.play' for method, _ in self.calls):
+            sample = RUN1_PROMPT
+        if sample == RUN1_OPENING:
+            if self.recorded_open_seen:
+                return
+            self.recorded_open_seen = True
         with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
             stream.write(sample)
 
@@ -169,6 +188,15 @@ class BridgeOnTests(unittest.TestCase):
         return self.sample(fields={'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
                                    'focus.index': 'unknown', 'focus.label': 'unknown',
                                    'input.owner': 'unknown', 'dialog': 'unknown'})
+
+    def recorded_opening(self, *, prompt_after_skip=True):
+        self.configure_stub()
+        self.stub_preamble = RUN1_PREAMBLE
+        self.stub_default = RUN1_OPENING
+        self.prompt_after_skip = prompt_after_skip
+
+    def macro_attempts(self):
+        return [args for method, args in self.calls if method == 'macro.play']
 
     def invoke(self, **kwargs):
         with patch('time.monotonic', side_effect=lambda: self.seconds), \
@@ -363,30 +391,114 @@ class BridgeOnTests(unittest.TestCase):
     def test_bridge_on_stub_on_does_not_accept_the_opening_playback(self):
         self.configure_stub()
         self.stub_samples, self.stub_default = [self.opening()], ''
-        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 180 s.*title/title.opening_playback.*rev=4 frame=31'):
+        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=4 frame=31.*within 10 s.*title/title.opening_playback'):
             self.invoke(port=6980)
-        self.assertGreaterEqual(self.seconds, 180)
+        self.assertLess(self.seconds, 20)
+        self.assertEqual(len(self.macro_attempts()), 1)
         self.assertFalse((self.row / 'routes-bridge-on.json').exists())
 
     def test_bridge_on_stub_on_waits_through_the_opening_for_the_prompt(self):
         self.configure_stub()
-        self.stub_samples = [self.opening()] + [''] * 110 + [STUB_UI]
+        self.stub_samples = [self.opening()] + [''] * 4 + [STUB_UI]
         self.stub_default = ''
         receipt = self.invoke(port=6980)
         self.assertEqual(receipt['title']['matched'], 'prompt')
-        self.assertGreater(receipt['title'].get('waited_s', 0), 10)
+        self.assertLess(receipt['title'].get('waited_s', 100), 10)
+        self.assertEqual(len(self.macro_attempts()), 1)
         self.assertEqual(receipt['title'].get('not_yet'), [{
             'rev': 4, 'frame': 31, 'screen': 'title', 'screen.context': 'opening',
             'focus': 'title.opening_playback'}])
 
     def test_bridge_on_stub_on_resets_prompt_deadline_after_opening_handoff(self):
         self.configure_stub()
-        self.stub_samples = [self.opening()] + [''] * 110 + [self.title_without_prompt()]
+        self.stub_samples = [self.opening()] + [''] * 4 + [self.title_without_prompt()]
         self.stub_default = ''
-        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
+        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press.*within 10 s.*title/title'):
             self.invoke(port=6980)
-        self.assertGreater(self.seconds, 20)
-        self.assertLess(self.seconds, 30)
+        self.assertLess(self.seconds, 20)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_skips_the_opening_with_one_press(self):
+        """The lines are recorded; the prompt's order after the press is modelled."""
+        self.recorded_opening()
+        try:
+            receipt = self.invoke(port=6980)
+        except RuntimeError as error:
+            self.fail(f'expected one skip and a prompt: {error}')
+        self.assertEqual(len(self.macro_attempts()), 1)
+        title = receipt['title']
+        skip = title.get('skip')
+        self.assertIsInstance(skip, dict)
+        self.assertEqual(skip['button'], 'plus')
+        self.assertEqual(skip['sent_on'], {'rev': 12, 'frame': 72, 'wall': 506017830,
+                                          'screen': 'title', 'screen.context': 'opening',
+                                          'focus': 'title.opening_playback'})
+        self.assertTrue(skip['send'])
+        self.assertLess(skip['prompt_after_s'], 10)
+        self.assertEqual((title['matched'], title['frame'], title['boot']), ('prompt', 7860, RUN1_BOOT))
+
+    def test_bridge_on_stub_on_never_presses_twice(self):
+        self.recorded_opening(prompt_after_skip=False)
+        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=12 frame=72.*within 10 s'):
+            self.invoke(port=6980)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_does_not_press_on_other_screens(self):
+        self.configure_stub()
+        receipt = self.invoke(port=6980)
+        self.assertIsNone(receipt['title'].get('skip', 'missing'))
+        self.assertEqual(self.macro_attempts(), [])
+
+    def test_bridge_on_stub_on_never_presses_old_or_foreign_opening(self):
+        self.recorded_opening(prompt_after_skip=False)
+        self.stub_samples = [RUN1_OPENING + RUN1_PROMPT]
+        receipt = self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertIsNone(receipt['title'].get('skip', 'missing'))
+
+    def test_bridge_on_stub_on_never_presses_opening_on_foreign_boot(self):
+        self.configure_stub()
+        self.stub_samples = [self.sample(boot=FOREIGN_BOOT, fields={
+            'screen.context': 'opening', 'focus': 'title.opening_playback', 'focus.id': 'opening_playback'}), STUB_UI]
+        receipt = self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertIsNone(receipt['title'].get('skip', 'missing'))
+
+    def test_bridge_on_stub_on_never_presses_prior_connection_opening(self):
+        self.recorded_opening(prompt_after_skip=False)
+        self.stub_preamble = self.stub_connection() + self.opening() + RUN1_PREAMBLE
+        self.stub_default = RUN1_PROMPT
+        receipt = self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertIsNone(receipt['title'].get('skip', 'missing'))
+
+    def test_bridge_on_stub_on_skip_delivery_unknown_stops_without_resend(self):
+        self.recorded_opening()
+        self.macro_error = 'simulated delivery unknown'
+        with self.assertRaisesRegex(RuntimeError, 'delivery unknown'):
+            self.invoke(port=6980)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_skip_guard_refuses_repeat_and_wrong_screen(self):
+        blocks = list(routes._bridge_on_ui_blocks_since_hello(''.join(RUN1), RUN1[1].rstrip('\n'), 1))
+        opening, prompt = blocks[1], blocks[-1]
+        with self.assertRaisesRegex(RuntimeError, 'opening skip was already sent'):
+            routes._bridge_on_skip_opening(self.ctx, opening, {'boot': RUN1_BOOT, 'sent': True})
+        with self.assertRaisesRegex(RuntimeError, 'refusing the opening skip on title/title.press_any'):
+            routes._bridge_on_skip_opening(self.ctx, prompt, {'boot': RUN1_BOOT, 'sent': False})
+
+    def test_bridge_on_stub_on_skip_follows_chord_without_earlier_input(self):
+        self.recorded_opening()
+        try:
+            receipt = self.invoke(port=6980)
+        except RuntimeError as error:
+            self.fail(f'expected skip after chord: {error}')
+        self.assertEqual(receipt['chord']['pre_chord']['journal']['inputs_after_load'], 0)
+        inputs = [(method, args.get('button'), args.get('state')) for method, args in self.calls
+                  if method in ('input.button', 'macro.play')]
+        buttons = ('lstick', 'rstick', 'zl', 'zr')
+        self.assertEqual(inputs, [('input.button', b, 'press') for b in buttons]
+                         + [('input.button', b, 'release') for b in buttons] + [('macro.play', None, None)])
 
     def test_bridge_on_stub_on_already_on_without_a_qualified_receipt_refuses(self):
         first, prior = self.cold_stub_receipt()
