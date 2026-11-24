@@ -185,3 +185,10 @@ Retired practice-mode and hitbox slots are handled from `practice_games.rs` and 
 
 2026-11-22: `library/routes/tr-setting-widths.json` records the product row widths from TrainingRooms
 `7d962416` `src/model/factory.rs` DEFS, cross-checked against its product-written settings fixture.
+
+2026-11-24: `routes.LogCursor` returns each line once. The held cursor compared the paths size, taken before its
+read, with its position after it, so an append during the read looked like a truncation and the log came back from
+its first line (A1 trace boot `rc15-a1-trace-2ddba1f-xps-2`: eleven times in one receipt, the file itself only
+appended to). The cursor now checks the open file after the read, knows a file by device and inode, and finds the
+text it read last in a replaced file. `test_routes.py` `LogCursorTests` are host tests on temporary files, one with
+a writer thread; no runtime acceptance is claimed.

@@ -94,19 +94,35 @@ def instance_path(ctx, key):
 # --- a log reader that follows rotation -----------------------------------------------------------------------------
 
 class LogCursor:
-    """Read the lines a file gains from now on, across rotation and truncation.
+    """Read the lines a file gains from now on, each line once, across rotation, truncation and replacement.
 
-    The cursor keeps the open handle of the file it started on. When the path is renamed away (rotation: a new inode
-    at the path), it first drains what the old handle still has, then opens the new file from its start. When the
-    same file shrinks (truncation), it reads from 0. Lines are returned whole; a partial last line waits for its
-    newline. `mark()` restarts from the current end, so a wait sees only lines written after the input it follows.
+    The cursor keeps the open handle of the file it started on. It knows its file by device and inode, and it keeps
+    the last bytes it read (`anchor`, up to ANCHOR bytes ending at its offset).
+    - Appends: a read returns the whole lines after the offset; a partial last line waits for its newline.
+    - Another file at the path (rotation, or a rewrite through a temporary file): it first drains what the old handle
+      still has, then reads the new file. A new file that carries the text the cursor read last is continued after
+      that text; any other file is read from its start.
+    - The same file cut short or written again from its start: the same rule. A file counts as cut short only by its
+      own size after the read, never by a size taken before it: a writer that appends during the read does not
+      restart the cursor.
+    A partial line of a file that ended is returned as its own line. `rotations` counts the replacements. `mark()`
+    restarts from the current end, so a wait sees only lines written after the input it follows.
+
+    Limit: the cursor knows only the ANCHOR bytes it read last. A new file that keeps older lines without them is
+    taken for a new log and read from its start. For a file shorter than ANCHOR the cursor knows all of it: a new
+    file that is that text cut short gives nothing, any other is a new log.
     """
+
+    ANCHOR = 4096  # bytes of the text read last, kept to find it again in a replaced file
+    CHECK = 64     # bytes before the offset compared on every read, to notice a file written again in place
 
     def __init__(self, path, from_start=False, hold=None):
         self.path = Path(path)
         self.handle = None
+        self.identity = None
         self.inode = None
         self.offset = 0
+        self.anchor = b''
         self.pending = b''
         self.backlog = []
         self.rotations = 0
@@ -116,76 +132,131 @@ class LogCursor:
         self.hold = (os.name != 'nt') if hold is None else hold
         self._open(seek_end=not from_start)
 
+    def _open_path(self):
+        try:
+            return open(self.path, 'rb')
+        except OSError:
+            return None
+
+    @staticmethod
+    def _identity(f):
+        stat = os.fstat(f.fileno())
+        return stat.st_dev, stat.st_ino
+
+    def _tail(self, f, end):
+        """The bytes of f just before `end`, at most ANCHOR of them."""
+        begin = max(0, end - self.ANCHOR)
+        f.seek(begin)
+        return f.read(end - begin)
+
+    def _start_at(self, f, at):
+        self.identity = self._identity(f)
+        self.inode = self.identity[1]
+        self.offset, self.anchor = at, self._tail(f, at)
+
     def _open(self, seek_end):
-        if not self.hold:
-            try:
-                stat = os.stat(self.path)
-            except OSError:
-                self.inode, self.offset = None, 0
-                return
-            self.inode, self.offset = stat.st_ino, (stat.st_size if seek_end else 0)
-            return
         if self.handle is not None:
             self.handle.close()
             self.handle = None
-        try:
-            self.handle = open(self.path, 'rb')
-        except OSError:
-            self.inode = None
+        f = self._open_path()
+        if f is None:
+            self.identity, self.inode, self.offset, self.anchor = None, None, 0, b''
             return
-        self.inode = os.fstat(self.handle.fileno()).st_ino
-        if seek_end:
-            self.handle.seek(0, os.SEEK_END)
+        self._start_at(f, os.fstat(f.fileno()).st_size if seek_end else 0)
+        if self.hold:
+            self.handle = f
+        else:
+            f.close()
 
     def mark(self):
         self.pending = b''
         self.backlog = []
         self._open(seek_end=True)
 
-    def _read_unheld(self):
-        try:
-            now = os.stat(self.path)
-        except OSError:
-            return b''
-        if self.inode is None or now.st_ino != self.inode or now.st_size < self.offset:
-            if self.inode is not None:
-                self.rotations += 1
-            self.inode, self.offset = now.st_ino, 0
-        try:
-            with open(self.path, 'rb') as f:
-                f.seek(self.offset)
-                data = f.read()
-        except OSError:
-            return b''
+    def _continues(self, f):
+        """True when f still holds, just before the cursor's offset, the bytes the cursor read last."""
+        if self._identity(f) != self.identity or os.fstat(f.fileno()).st_size < self.offset:
+            return False
+        want = self.anchor[-self.CHECK:]
+        f.seek(self.offset - len(want))
+        return f.read(len(want)) == want
+
+    def _resume(self, f):
+        """Where unread text starts in a file that is not the cursor's own: after the text read last, else 0."""
+        anchor = self.anchor
+        if not anchor:
+            return 0
+        if self.offset == len(anchor):  # the anchor is the cursor's file from its first byte
+            f.seek(0)
+            head = f.read(len(anchor) + 1)
+            if head.startswith(anchor):
+                return len(anchor)
+            return len(head) if anchor.startswith(head) else 0  # the read text cut short holds nothing new
+        f.seek(self.offset - len(anchor))
+        if f.read(len(anchor)) == anchor:
+            return self.offset
+        f.seek(0)
+        at = f.read().rfind(anchor)
+        return at + len(anchor) if at >= 0 else 0
+
+    def _take(self, f):
+        """The bytes of f after the offset, and the offset moved past them."""
+        f.seek(self.offset)
+        data = f.read()
         self.offset += len(data)
+        self.anchor = (self.anchor + data)[-self.ANCHOR:]
         return data
 
-    def read(self):
-        if not self.hold:
-            data = self.pending + self._read_unheld()
-            lines = data.split(b'\n')
-            self.pending = lines.pop()
-            return [line.decode('utf-8', 'replace').rstrip('\r') for line in lines if line.strip()]
-        chunks = []
-        if self.handle is None:
-            self._open(seek_end=False)
+    def _replaced(self, f):
+        """Make f the cursor's file and return what it has to give: a line break when f is read from its start."""
+        if self.identity is not None:
+            self.rotations += 1
+        at = self._resume(f)
+        self._start_at(f, at)
+        return (b'' if at else b'\n') + self._take(f)
+
+    def _read_unheld(self):
+        f = self._open_path()
+        if f is None:
+            return b''
+        with f:
+            return self._take(f) if self._continues(f) else self._replaced(f)
+
+    def _read_held(self):
+        if self.handle is None:  # the file was not there yet, or close() was called
+            self.handle = self._open_path()
             if self.handle is None:
-                return []
+                return b''
+        before = self.offset, self.anchor
+        data = self._take(self.handle)
+        if not self._continues_from(self.handle, before):
+            self.offset, self.anchor = before
+            data = self._replaced(self.handle)
         try:
             now = os.stat(self.path)
         except OSError:
-            now = None
-        chunks.append(self.handle.read())
-        if now is not None and now.st_ino != self.inode:
-            self.rotations += 1
-            self._open(seek_end=False)  # the new file: everything in it is new
-            if self.handle is not None:
-                chunks.append(self.handle.read())
-        elif now is not None and now.st_size < self.handle.tell():
-            self.rotations += 1
-            self.handle.seek(0)
-            chunks.append(self.handle.read())
-        data = self.pending + b''.join(chunks)
+            return data
+        if (now.st_dev, now.st_ino) != self.identity:
+            f = self._open_path()
+            if f is not None and self._identity(f) != self.identity:
+                self.handle.close()
+                self.handle = f
+                data += self._replaced(f)  # the new file, after what the old handle still had
+            elif f is not None:
+                f.close()
+        return data
+
+    def _continues_from(self, f, before):
+        """`_continues` for the offset and anchor the cursor had before a read that already moved them."""
+        after = self.offset, self.anchor
+        self.offset, self.anchor = before
+        try:
+            return self._continues(f)
+        finally:
+            self.offset, self.anchor = after
+
+    def read(self):
+        data = self.pending + (self._read_held() if self.hold else self._read_unheld())
         lines = data.split(b'\n')
         self.pending = lines.pop()
         return [line.decode('utf-8', 'replace').rstrip('\r') for line in lines if line.strip()]

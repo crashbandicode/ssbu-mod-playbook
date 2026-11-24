@@ -130,10 +130,18 @@ another state source for visibility, focus and positions.
 
 ## Logs that rotate
 
-`routes.LogCursor(path)` keeps the file it started on open:
-- **Rotation:** on a rename it drains the old file, then reads the new one from its start.
-- **Truncation:** when the file shrinks, it reads from 0.
+`routes.LogCursor(path)` keeps the file it started on open and returns each line once:
+- **Rotation:** on a rename it drains the old file, then reads the new one.
+- **Truncation or a rewrite in place:** it checks the file's own size and the bytes before its offset after each
+  read. A writer that appends during a read is not a truncation.
+- **A replaced file:** when the new file carries the text the cursor read last, the cursor continues after that
+  text; any other file is read from its start. A partial line of the old file is returned as its own line.
+- **`rotations`** counts the replacements; a route that must not span one checks it.
 - **Waiting:** `wait(regex, cap)` returns the first new matching line and keeps later lines for the next wait.
+  `mark()` drops them and restarts at the file's end.
+- **Limit:** the cursor remembers the last 4 KiB it read. A new file that repeats older lines without them is read
+  from its start, and a new file whose whole text so far repeats the start of a short old file gives nothing
+  until it differs.
 
 Use it for any plugin log a wait reads. TrainingRooms' `practice-diagnostics.log` rotates at 128 KiB.
 
