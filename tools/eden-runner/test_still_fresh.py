@@ -301,6 +301,15 @@ class StillFreshTests(unittest.TestCase):
         self.assertEqual(one['path'], str(self.root / one['file']))
         self.assertTrue(one['utc'])
 
+    def test_loading_a_journal_skips_only_records_with_a_later_matching_retraction(self):
+        first = self.record(self.frame(1000), data=b'first')
+        second = self.record(self.frame(1001), data=b'second')
+        replacement = {**first, 'frame': 1002}
+        self.ledger.append({'retract': first['file'], 'sha256': first['sha256'],
+                            'reason': 'written by a superseded gate check', 'utc': 'later'})
+        self.ledger.append(replacement)
+        self.assertEqual(self.fresh.load(self.root / 'stills.jsonl'), [second, replacement])
+
     def test_the_threshold_is_configurable(self):
         self.ledger = self.fresh.Ledger(self.root, frames=60)
         self.record(self.frame(1000))
