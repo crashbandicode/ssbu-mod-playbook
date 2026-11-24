@@ -1602,6 +1602,9 @@ class Lifecycle:
                     f"{self.c['label']} → {spec.get('to', self.c['owner'])} | {text}\n")
             if spec.get('ssh'):
                 with SshMux(spec['ssh'], evidence_dir=self.directory, receipt_dir=self.directory) as mux:
+                    for diagnosis in getattr(mux, 'diagnoses', ()):
+                        self.record('ssh-diagnosis', {'line': diagnosis.get('reported_line',
+                                                                           ssh_diagnosis_with_receipt(diagnosis))})
                     try:
                         done = subprocess.run(['ssh', '-T', *mux.rider_args, spec['ssh'],
                                                'cat >> ' + shlex.quote(spec['file'])],
@@ -3334,11 +3337,17 @@ class SshMux:
         self.receipt_dir = receipt_dir if receipt_dir is not None else evidence_dir
         self.allow_master_retry = allow_master_retry
         self.root = Path(os.environ.get('XDG_RUNTIME_DIR') or tempfile.gettempdir()) / f'eden-ssh-{os.getpid()}'
+        control_path = self.root / '%C'
+        # 104 - 17 = 87; OpenSSH adds a period and 16 random characters.
+        # Observed: unix_listener: path "...aaaaaaaa.RjJd3QMxzb3tMlbu" too long for Unix domain socket
+        require(len(os.fsencode(self.root)) + 1 + 40 <= 87,
+                f'SSH control path too long: {control_path}; set XDG_RUNTIME_DIR to a short directory')
         self.key = None
         self.entered = False
         self.attempt_deadline = None
         self.open_generation = 0
         self.master_log = None
+        self.diagnoses = []
 
     @property
     def rider_args(self):
@@ -3362,6 +3371,8 @@ class SshMux:
                                       ssh_options=self.options, ssh_bin=self.ssh_bin, windows=self.windows,
                                       allow_retry=False)
             diagnosis = ssh_record(diagnosis, 'ssh', 'master configuration', self.receipt_dir)
+            diagnosis['reported_line'] = ssh_diagnosis_with_receipt(diagnosis)
+            self.diagnoses.append(diagnosis)
             raise LedgerTransport([diagnosis], 'SSH master configuration failed')
         path = Path(match.group(1).strip())
         require(path.parent == self.root and path.name != '%C', 'Unsafe SSH control path')
@@ -3515,9 +3526,12 @@ class SshMux:
                     else:
                         line += '; retry: no (no durable receipt)'
                     diagnosis['line'] = line
+                diagnosis['reported_line'] = ssh_diagnosis_with_receipt(diagnosis)
+                self.diagnoses.append(diagnosis)
                 diagnoses.append(diagnosis)
                 if attempt or not self.allow_master_retry or not diagnosis.get('transient', False):
                     raise LedgerTransport(diagnoses, 'SSH master failed')
+                print(diagnosis['reported_line'], file=sys.stderr, flush=True)
 
     def __exit__(self, exc_type, exc, traceback):
         with self._lock:

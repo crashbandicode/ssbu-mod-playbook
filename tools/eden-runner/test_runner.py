@@ -110,7 +110,7 @@ def ctx_ssh_lifecycle():
 
 class CtxSshTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='ctx-ssh-test-')
+        self.temporary = tempfile.TemporaryDirectory(prefix='ctx-ssh-test-', dir='/tmp')
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.life = ctx_ssh_lifecycle()

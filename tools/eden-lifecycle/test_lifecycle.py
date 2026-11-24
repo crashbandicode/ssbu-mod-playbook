@@ -3122,6 +3122,33 @@ class SshDiagnosisTests(unittest.TestCase):
                               controller.state['notify_errors'][0]['error'])
                 self.assertEqual((notify_dir / 'ssh-diag.md').is_file(), code == 255)
 
+    def test_notify_journals_diagnosis_when_master_retry_succeeds(self):
+        with tempfile.TemporaryDirectory(prefix='notify-retry-') as temporary:
+            receipt = Path(temporary) / 'ssh-diag.md'
+            line = f'ssh diag packet loss; retry: yes, once; ssh-diag receipt: {receipt}'
+            class RetriedMux:
+                rider_args = []
+                diagnoses = [{'line': 'ssh diag packet loss; retry: yes, once', 'receipt': str(receipt),
+                              'reported_line': line}]
+                def __init__(self, *_args, **_kwargs):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+            controller = life.Lifecycle.__new__(life.Lifecycle)
+            controller.c = {'notify': {'ssh': 'fake-host', 'file': '/fake/notice'},
+                            'label': 'fixture', 'owner': 'test'}
+            controller.directory, controller.state = Path(temporary), {}
+            controller.record = unittest.mock.Mock()
+            controller.write = unittest.mock.Mock()
+            with patch.object(life, 'SshMux', RetriedMux), \
+                    patch.object(life.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+                controller.notify('ready')
+            run.assert_called_once()
+            controller.record.assert_called_once_with('ssh-diagnosis', {'line': line})
+            self.assertFalse(controller.state.get('notify_errors'))
+
     def test_receipt_write_failure_does_not_mask_forward_stop(self):
         with tempfile.TemporaryDirectory(prefix='receipt-readonly-') as temporary:
             response = subprocess.CompletedProcess([], 255, '', 'connection reset')
@@ -3499,7 +3526,7 @@ class SshMuxTests(unittest.TestCase):
         case = next(case for case in health_path_cases() if case[0] == 'healthy-loss')
         _, facts, ping, _, expected_cause = case
         for mode in ('primary', 'fallback', 'none'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='master-receipt-') as temporary:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='master-receipt-', dir='/tmp') as temporary:
                 root = Path(temporary)
                 primary, state, temp = root / 'run', root / 'state', root / 'temp'
                 primary.mkdir()
@@ -3538,7 +3565,7 @@ class SshMuxTests(unittest.TestCase):
                 with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(root), 'XDG_STATE_HOME': str(state)}), \
                         patch.object(life.tempfile, 'gettempdir', return_value=str(temp)), \
                         patch.object(life, 'ssh_diagnosis', side_effect=diagnose), \
-                        patch('sys.stderr', new=io.StringIO()):
+                        patch('sys.stderr', new=io.StringIO()) as stderr:
                     if mode == 'none':
                         with self.assertRaises(life.LedgerTransport) as error:
                             with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=root / 'evidence',
@@ -3550,14 +3577,44 @@ class SshMuxTests(unittest.TestCase):
                         self.assertEqual(len(attempts), 1)
                     else:
                         with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=root / 'evidence',
-                                          receipt_dir=primary):
-                            pass
+                                          receipt_dir=primary) as mux:
+                            self.assertEqual(len(mux.diagnoses), 1)
+                            self.assertIn(f'ssh-diag receipt: {receipt}', mux.diagnoses[0]['reported_line'])
                         self.assertEqual(len(attempts), 2)
                         self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                        self.assertIn(expected_cause, stderr.getvalue())
+                        self.assertIn(f'ssh-diag receipt: {receipt}', stderr.getvalue())
+
+    def test_control_path_length_guard_precedes_all_ssh(self):
+        calls = unittest.mock.Mock()
+        starts = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
+            long_root = Path(temporary) / ('x' * 90)
+            with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(long_root)}):
+                with self.assertRaises(life.Refused) as error:
+                    real_ssh_mux('fake-host', run=calls, popen=starts)
+            template = long_root / f'eden-ssh-{os.getpid()}' / '%C'
+            self.assertEqual(str(error.exception),
+                             f'SSH control path too long: {template}; set XDG_RUNTIME_DIR to a short directory')
+            calls.assert_not_called()
+            starts.assert_not_called()
+
+        max_parent = 87 - len(os.fsencode(f'/eden-ssh-{os.getpid()}')) - 1 - 40
+        for length in (max_parent, max_parent + 1):
+            runtime = '/' + 'x' * (length - 1)
+            with self.subTest(runtime_bytes=length), patch.dict(os.environ, {'XDG_RUNTIME_DIR': runtime}):
+                if length == max_parent:
+                    mux = real_ssh_mux('fake-host', run=calls, popen=starts)
+                    self.assertEqual(len(os.fsencode(mux.root)) + 1 + 40, 87)
+                else:
+                    with self.assertRaisesRegex(life.Refused, 'SSH control path too long:'):
+                        real_ssh_mux('fake-host', run=calls, popen=starts)
+        calls.assert_not_called()
+        starts.assert_not_called()
 
     def test_real_classifier_target_health_matrix_for_master(self):
         for label, facts, ping, expected_attempts, expected_cause in health_path_cases():
-            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='emux-') as tmp, \
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as tmp, \
                     patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
                 attempts, diagnoses = [], []
                 run = target_fixture_run(facts, [], ping)
@@ -3597,7 +3654,7 @@ class SshMuxTests(unittest.TestCase):
     def test_real_overloaded_target_stops_master_after_one_attempt(self):
         facts = {'load1': 48, 'cores': 8, 'memAvailMiB': 150, 'oomKills5m': 2,
                  'sshdProcesses': 5, 'sshdUnauth': 0, 'maxStartups': '10:30:100', 'maxStartupsLines': 0}
-        with tempfile.TemporaryDirectory(prefix='emux-') as tmp, patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as tmp, patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
             attempts = []
             run = target_fixture_run(facts, [])
             class Process:
@@ -3640,7 +3697,7 @@ class SshMuxTests(unittest.TestCase):
                 template = next(item for item in argv if item.startswith('ControlPath='))[len('ControlPath='):]
                 return subprocess.CompletedProcess(argv, 0, 'controlpath ' + template.replace('%C', 'resolved') + '\n', '')
             return subprocess.CompletedProcess(argv, 0, '', '')
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
             stale = Path(temporary) / 'eden-ssh-999999999'
             stale.mkdir()
@@ -3683,7 +3740,7 @@ class SshMuxTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 255, '', 'cannot read configuration')
         diagnosis = {'line': 'ssh diag fake: not established', 'transient': False,
                      'cause': 'not established', 'phase': 'unknown', 'evidence': '/tmp/diag'}
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
                 patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
             with self.assertRaisesRegex(life.LedgerTransport, 'ssh diag fake: not established'):
@@ -3710,7 +3767,7 @@ class SshMuxTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, '', '')
         diagnosis = {'line': 'ssh diag fake: host key', 'transient': False,
                      'cause': 'host key', 'phase': 'kex', 'evidence': '/tmp/diag'}
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
                 patch.object(life, 'ssh_diagnosis', return_value=diagnosis):
             with self.assertRaisesRegex(life.Refused, 'ssh diag fake: host key'):
@@ -3719,7 +3776,7 @@ class SshMuxTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def _expired_master_ledger(self, restart_ok):
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
             checks, masters, riders = [], [], []
             class Process:
@@ -3762,9 +3819,10 @@ class SshMuxTests(unittest.TestCase):
                         else:
                             with self.assertRaises(life.LedgerTransport) as error:
                                 life.ledger_forward('fake-host', 'read', config, run=run)
+                            receipt = str(Path(temporary) / 'ssh-diag.md')
                             self.assertEqual(error.exception.diagnoses,
-                                             [{**diagnosis, 'stop': 'SSH master failed',
-                                               'receipt': str(Path(temporary) / 'ssh-diag.md')}])
+                                             [{**diagnosis, 'stop': 'SSH master failed', 'receipt': receipt,
+                                               'reported_line': diagnosis['line'] + f'; ssh-diag receipt: {receipt}'}])
                             self.assertEqual(len((Path(temporary) / 'ssh-diag.md').read_text().splitlines()), 1)
                     self.assertEqual(len(masters), 2)
                     self.assertEqual(len(riders), 1 if restart_ok else 0)
@@ -3810,8 +3868,11 @@ class SshLoopbackTests(unittest.TestCase):
                 sock.bind(('127.0.0.1', 0))
                 return sock.getsockname()[1]
 
-        with tempfile.TemporaryDirectory(prefix='ssh-auth-rig-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
             root = Path(temporary)
+            runtime_length = 87 - len(os.fsencode(f'/eden-ssh-{os.getpid()}')) - 1 - 40
+            runtime = root / ('x' * (runtime_length - len(os.fsencode(root)) - 1))
+            runtime.mkdir(mode=0o700)
             key = root / 'key'
             subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)],
                            check=True, capture_output=True, timeout=10)
@@ -3870,9 +3931,10 @@ class SshLoopbackTests(unittest.TestCase):
                     self.fail(f'unprivileged sshd failed: {(root / "sshd.log").read_text()}')
                 pass_port = proxy(False)
                 started = time.monotonic()
-                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
+                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(runtime)}):
                     with real_ssh_mux('127.0.0.1', run=run, ssh_bin='/usr/bin/ssh',
                                       ssh_options=options(pass_port), evidence_dir=root / 'pass-evidence') as mux:
+                        self.assertEqual(len(os.fsencode(mux.root)) + 1 + 40, 87)
                         rider = subprocess.run(['/usr/bin/ssh', *mux.rider_args, '127.0.0.1', 'exit'],
                                                capture_output=True, text=True, timeout=5)
                         self.assertEqual(rider.returncode, 0, rider.stderr)
@@ -3897,7 +3959,7 @@ class SshLoopbackTests(unittest.TestCase):
                         self.process.kill()
                 evidence = Path(os.environ.get('EDEN_TEST_EVIDENCE_DIR') or root / 'stall-evidence')
                 started = time.monotonic()
-                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), patch('sys.stderr', new=io.StringIO()):
+                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(runtime)}), patch('sys.stderr', new=io.StringIO()):
                     with self.assertRaises(life.LedgerTransport) as caught:
                         with real_ssh_mux('127.0.0.1', run=run, ssh_bin='/usr/bin/ssh',
                                           popen=TimedProcess, ssh_options=options(stall_port),
@@ -3947,7 +4009,7 @@ class SshLoopbackTests(unittest.TestCase):
             self.assertEqual(remaining, [])
 
     def _stall(self, banner, expected):
-        with tempfile.TemporaryDirectory(prefix='es-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
             listener = socket.socket()
             listener.bind(('127.0.0.1', 0))
             listener.listen()
