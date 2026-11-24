@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -21,6 +22,41 @@ import routes  # noqa: E402
 import routes_online  # noqa: E402
 import runner  # noqa: E402
 import test_native_picker as picker_fixtures  # noqa: E402
+
+
+class BoundedControlTests(unittest.TestCase):
+    def blocked_call(self):
+        release, entered, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def call(method):
+            entered.set()
+            try:
+                release.wait(5)
+                return {'state': 'finished'}
+            finally:
+                finished.set()
+
+        def cleanup():
+            release.set()
+            if entered.is_set():
+                self.assertTrue(finished.wait(1), 'control-call thread did not exit')
+
+        self.addCleanup(cleanup)
+        return types.SimpleNamespace(call=call)
+
+    def test_bounded_call_returns_within_its_cap_when_the_control_call_hangs(self):
+        ctx = self.blocked_call()
+        started = time.monotonic()
+        answered, _ = routes._bounded_call(ctx, 'macro.status', 0.3)
+        self.assertFalse(answered)
+        self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_eden_macro_busy_reports_an_unanswered_status_as_busy(self):
+        ctx = self.blocked_call()
+        started = time.monotonic()
+        reason = routes._eden_macro_busy(ctx, 0.25)
+        self.assertIn('macro.status not answered within', reason)
+        self.assertLess(time.monotonic() - started, 0.6)
 
 
 class MacroDispatchTests(unittest.TestCase):
@@ -3214,6 +3250,58 @@ class WirelessRoomTests(unittest.TestCase):
                 mock.patch.object(routes.time, 'sleep', side_effect=sleep):
             options = {} if unpublished_create is None else {'unpublished_create': unpublished_create}
             return routes.wireless_room(self.ctx, ready_cap=3, **options)
+
+    def blocked_control(self, blocked_method):
+        release, entered, finished = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+
+        def call(method):
+            calls.append(method)
+            if method == blocked_method:
+                entered.set()
+                try:
+                    release.wait(5)
+                    return {'state': 'finished'}
+                finally:
+                    finished.set()
+            return {'state': 'playing'} if method == 'macro.status' else {}
+
+        def cleanup():
+            release.set()
+            if entered.is_set():
+                self.assertTrue(finished.wait(1), 'control-call thread did not exit')
+
+        self.addCleanup(cleanup)
+        return call, calls
+
+    def test_a_hanging_macro_status_stops_the_route_within_the_idle_bound(self):
+        self.io.phase = 'stage'
+        self.io.clock = time.monotonic
+        self.ctx.call, _ = self.blocked_control('macro.status')
+        started = time.monotonic()
+        with mock.patch.object(routes, 'BridgePickerIO', return_value=self.io):
+            with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                routes.wireless_room(self.ctx, unpublished_create='allow', idle_cap=0.6)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertEqual(self.io.actions, [])
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertIn('macro.status not answered within', stop['input_channel'])
+
+    def test_the_stall_diagnostic_status_call_cannot_delay_a_stop(self):
+        self.io.phase = 'stage'
+        self.io.clock = time.monotonic
+        self.ctx.call, calls = self.blocked_control('status')
+        started = time.monotonic()
+        with mock.patch.object(routes, 'BridgePickerIO', return_value=self.io):
+            with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                routes.wireless_room(self.ctx, unpublished_create='allow', idle_cap=1.2)
+        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertNotIn('status', calls)
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['stalls'][0]['kind'], 'idle-wait')
+        self.assertIsNone(stop['stalls'][0]['eden_frame_ms'])
 
     def test_an_unpublished_create_form_is_refused_by_default(self):
         with self.assertRaises(routes.closed_loop.RouteStopped) as caught:

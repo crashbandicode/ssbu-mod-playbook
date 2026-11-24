@@ -40,6 +40,54 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_each_idle_poll_gets_only_the_remaining_budget(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        calls = []
+
+        def idle(remaining):
+            calls.append((fake.now, remaining))
+            return 'macro playing' if len(calls) <= 3 else None
+
+        result = fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=5)
+        self.assertEqual(fake.sends, [('press', 3)])
+        self.assertEqual(calls[0], (0, 5))
+        for when, remaining in calls:
+            self.assertAlmostEqual(remaining, 5 - when)
+        self.assertEqual(result['stalls'][0]['kind'], 'idle-wait')
+
+    def test_two_slow_answers_cannot_pass_the_bound(self):
+        fake = Script(lambda f: 'source')
+        calls = []
+
+        def idle(remaining):
+            calls.append(remaining)
+            fake.now += min(8.25, remaining)
+            return 'macro playing' if remaining >= 8.25 else 'macro.status not answered'
+
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=15)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], 15)
+        self.assertAlmostEqual(calls[1], 15 - 8.25 - 1)
+        self.assertLessEqual(fake.now, 15.55)
+        self.assertEqual(fake.sends, [])
+        self.assertIn('input channel busy', caught.exception.reason)
+
+    def test_a_first_poll_that_never_answers_stops_at_the_bound(self):
+        fake = Script(lambda f: 'source')
+        caps = []
+
+        def idle(remaining):
+            caps.append(remaining)
+            fake.now += remaining
+            return 'macro.status not answered'
+
+        with self.assertRaises(RouteStopped):
+            fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=15)
+        self.assertEqual(caps, [15])
+        self.assertEqual(fake.now, 15)
+        self.assertEqual(fake.sends, [])
+
     def test_a_plain_error_containing_busy_is_delivery_unknown_and_never_resent(self):
         for message in ('input.reset: input_busy', 'macro.play busy'):
             with self.subTest(message=message):
