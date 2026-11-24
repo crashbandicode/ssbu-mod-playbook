@@ -401,18 +401,51 @@ def _target(plan, base, errors):
             errors.append(f'G2 target: {label} must be an object')
             continue
         tree, commit = spec.get('tree'), spec.get('commit')
-        if not isinstance(tree, str) or not Path(tree).is_absolute() or not Path(tree).is_dir():
+        if not isinstance(tree, str) or not Path(tree).is_absolute():
             errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
             continue
         if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
             errors.append(f'G2 target: {label}.commit must be 40 lower-case hex characters')
+            continue
+        staged = base.parent.parent / '_eden-test' / 'stage' / base.parent.name / 'targets' / commit
+        if base.name == 'rows' and (staged.exists() or staged.is_symlink()):
+            try:
+                paths = [base.parent.parent / '_eden-test',
+                         base.parent.parent / '_eden-test' / 'stage',
+                         base.parent.parent / '_eden-test' / 'stage' / base.parent.name,
+                         staged.parent, staged]
+                if any(path.is_symlink() for path in paths):
+                    raise ValueError('symlink in staged path')
+                if (staged.is_symlink() or not staged.is_dir() or not (staged / '.git').is_dir()
+                        or (staged / '.git').is_symlink()):
+                    raise ValueError('not a directory')
+                head = _git(staged, 'rev-parse', 'HEAD').stdout.decode('utf-8').strip()
+                if head != commit:
+                    errors.append(f'G2 target: {label} staged tree {staged} is at {head}, not {commit}')
+                    continue
+                status = _git(staged, '--no-optional-locks', 'status', '--porcelain',
+                              '--untracked-files=all', '--ignored').stdout.decode('utf-8', errors='replace')
+                if status.strip():
+                    errors.append(f'G2 target: {label} staged tree {staged} changed after staging: '
+                                  f'{status.splitlines()[0]}')
+                    continue
+            except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+                errors.append(f'G2 target: {label} staged tree {staged} cannot be read: {error}')
+                continue
+            tree = str(staged)
+        elif not Path(tree).is_dir():
+            if Path(tree).exists():
+                errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
+            else:
+                errors.append(f'G2 target: {label}.tree {tree} does not exist on this host and '
+                              f'the run has no staged tree for {commit}')
             continue
         try:
             _git(tree, 'cat-file', '-e', f'{commit}^{{commit}}')
         except (OSError, subprocess.SubprocessError):
             errors.append(f'G2 target: {label}.commit {commit} is not a commit in {tree}')
             continue
-        repos[name] = spec
+        repos[name] = dict(spec, tree=tree)
         if name == 'plugin' and not re.fullmatch(r'[0-9a-fA-F]{64}', str(spec.get('nro_sha256', ''))):
             errors.append('G2 target: plugin.nro_sha256 must be 64 hex characters')
     settings = None
@@ -663,18 +696,18 @@ def _bindings(plan, base, settings, errors, warnings):
                               'without a "binding"')
 
 
-def _strings(value):
+def _strings(value, location=()):
     if isinstance(value, str):
-        yield value
+        yield location, value
     elif isinstance(value, dict):
-        for child in value.values():
-            yield from _strings(child)
+        for key, child in value.items():
+            yield from _strings(child, (*location, key))
     elif isinstance(value, list):
-        for child in value:
-            yield from _strings(child)
+        for index, child in enumerate(value):
+            yield from _strings(child, (*location, index))
 
 
-def _paths(plan, base, raw, modules, errors):
+def _paths(plan, base, raw, modules, repos, errors):
     allowed = {item['path'] for item in plan.get('allow_paths', [])
                if isinstance(item, dict) and isinstance(item.get('path'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
@@ -691,7 +724,17 @@ def _paths(plan, base, raw, modules, errors):
               and not re.search(r'\s|<', value) and not Path(value).exists()):
             errors.append(f'G4 rows.json: missing file {value}')
 
-    for value in _strings(raw):
+    for location, value in _strings(raw):
+        name = None
+        if len(location) == 3 and location[0] == 'target' and location[1] in ('plugin', 'bridge') \
+                and location[2] == 'tree':
+            name = location[1]
+        elif len(location) == 4 and location[:2] == ('target', 'repos') and location[3] == 'tree':
+            name = location[2]
+        if name in repos and base.name == 'rows':
+            staged = base.parent.parent / '_eden-test' / 'stage' / base.parent.name / 'targets' / repos[name]['commit']
+            if repos[name]['tree'] == str(staged):
+                continue
         check_path(value, 'rows.json', True)
     for module in sorted(modules):
         path = (base / module).resolve()
@@ -1026,7 +1069,7 @@ def check(plan, base, raw):
         report['emitted'] = _reads(plan, repos, errors, providers)
         _bindings(plan, base, settings, errors, report['warnings'])
         _hook_checks(plan, base, modules, repos, errors, report['warnings'], providers)
-    _paths(plan, base, raw, modules, errors)
+    _paths(plan, base, raw, modules, repos, errors)
     report['rows'] = _needs(plan, errors)
     _effects(plan, errors)
     report['cases'] = _cases(plan, base, errors, report['warnings'])

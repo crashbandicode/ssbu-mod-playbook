@@ -5,7 +5,9 @@ import importlib.util
 import inspect
 import io
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -142,6 +144,197 @@ class TargetNroTests(unittest.TestCase):
                           eden_test.check_run(run, skip_setup_plan=True))
             nro.write_bytes(b'binary ' + commit[:8].encode() + b' payload')
             self.assertEqual(eden_test.check_run(run, skip_setup_plan=True), [])
+
+
+class TargetStageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.writable_directories)
+        self.root = Path(self.tmp.name)
+        self.runs = self.root / 'runs'
+        self.repo = self.root / 'producer'
+        self.repo.mkdir()
+        self.git('init', '-q')
+        (self.repo / 'tracked.txt').write_text('old\n')
+        self.git('add', 'tracked.txt')
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'parent')
+        self.parent = self.git('rev-parse', 'HEAD').stdout.strip()
+        (self.repo / 'tracked.txt').write_text('new\n')
+        self.git('add', 'tracked.txt')
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'child')
+        self.commit = self.git('rev-parse', 'HEAD').stdout.strip()
+
+    def git(self, *args):
+        return subprocess.run(['git', '--no-optional-locks', '-C', str(self.repo), *args],
+                              check=True, capture_output=True, text=True)
+
+    def writable_directories(self):
+        for directory, names, _ in os.walk(self.root, topdown=True, followlinks=False):
+            path = Path(directory)
+            path.chmod(path.stat().st_mode | 0o700)
+            names[:] = [name for name in names if not (path / name).is_symlink()]
+
+    def repository_fingerprint(self):
+        paths = []
+        for path in sorted((self.repo / '.git').rglob('*')):
+            info = path.lstat()
+            paths.append((str(path.relative_to(self.repo)), info.st_size, info.st_mtime_ns))
+        return (paths, self.git('status', '--porcelain', '--untracked-files=all', '--ignored').stdout)
+
+    def test_pack_is_one_commit_and_never_modifies_producer(self):
+        before = self.repository_fingerprint()
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        self.assertGreater(packed['bytes'], 0)
+        self.assertEqual(packed['pack_sha256'], sha(packed['pack_file']))
+        self.assertEqual(self.repository_fingerprint(), before)
+        result = eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)
+        self.assertEqual(result['cache'], 'built')
+        cache = self.runs / '_eden-test' / 'target-cache' / self.commit
+        parent = subprocess.run(['git', '-C', str(cache), 'cat-file', '-e', self.parent],
+                                capture_output=True)
+        self.assertNotEqual(parent.returncode, 0)
+        self.assertEqual(self.repository_fingerprint(), before)
+
+    def test_cache_reuse_is_hardlinked_readonly_and_unstage_leaves_cache(self):
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        first = eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)
+        second = eden_test.stage_target(self.commit, 'run-02', runs=self.runs)
+        self.assertEqual((first['cache'], second['cache']), ('built', 'reused'))
+        cache = self.runs / '_eden-test' / 'target-cache' / self.commit
+        staged = Path(second['staged'])
+        self.assertEqual((cache / 'tracked.txt').stat().st_ino, (staged / 'tracked.txt').stat().st_ino)
+        for tree in (cache, staged):
+            for directory, names, files in os.walk(tree):
+                for path in (Path(directory), *(Path(directory) / name for name in [*names, *files])):
+                    if not path.is_symlink():
+                        self.assertEqual(path.stat().st_mode & 0o222, 0, str(path))
+        with self.assertRaises(PermissionError):
+            (staged / 'tracked.txt').write_text('not permitted')
+        mode = (cache / 'tracked.txt').stat().st_mode
+        eden_test.unstage_targets('run-02', runs=self.runs)
+        self.assertFalse(staged.exists())
+        self.assertTrue(cache.exists())
+        self.assertEqual((cache / 'tracked.txt').stat().st_mode, mode)
+        self.assertTrue(eden_test.probe_target(self.commit, runs=self.runs))
+        self.assertEqual(eden_test.stage_target(self.commit, 'run-01', runs=self.runs)['cache'], 'reused')
+
+    def test_tampered_cache_is_rejected_and_rebuilt(self):
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)
+        cache_parent = self.runs / '_eden-test' / 'target-cache'
+        cache = cache_parent / self.commit
+        cache.chmod(cache.stat().st_mode | 0o700)
+        (cache / 'unknown.txt').write_text('tampered')
+        self.assertFalse(eden_test.probe_target(self.commit, runs=self.runs))
+        result = eden_test.stage_target(self.commit, 'run-02', packed['pack_file'], runs=self.runs)
+        self.assertEqual(result['cache'], 'built')
+        rejected = list(cache_parent.glob('.rejected-' + self.commit + '-*'))
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual((rejected[0] / 'unknown.txt').read_text(), 'tampered')
+        self.assertTrue(eden_test.probe_target(self.commit, runs=self.runs))
+
+    def test_missing_and_wrong_pack_leave_no_cache(self):
+        with self.assertRaisesRegex(ValueError, 'no valid cache or pack'):
+            eden_test.stage_target(self.commit, 'run-01', runs=self.runs)
+        old = eden_test.pack_target(self.repo, self.parent, self.root / 'packs')
+        with self.assertRaises((ValueError, subprocess.SubprocessError)):
+            eden_test.stage_target(self.commit, 'run-01', old['pack_file'], runs=self.runs)
+        cache_parent = self.runs / '_eden-test' / 'target-cache'
+        self.assertFalse((cache_parent / self.commit).exists())
+        self.assertEqual(list(cache_parent.glob('.tmp-*')), [])
+
+    def test_tampered_cache_without_pack_is_preserved_as_rejected(self):
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)
+        parent = self.runs / '_eden-test' / 'target-cache'
+        cache = parent / self.commit
+        cache.chmod(cache.stat().st_mode | 0o700)
+        (cache / 'unknown.txt').write_text('tampered')
+        with self.assertRaisesRegex(ValueError, 'no valid cache or pack'):
+            eden_test.stage_target(self.commit, 'run-02', runs=self.runs)
+        self.assertFalse(cache.exists())
+        self.assertEqual(len(list(parent.glob('.rejected-' + self.commit + '-*'))), 1)
+
+    def test_cache_is_reused_by_a_fresh_process(self):
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        program = ('import json,sys; sys.path.insert(0,sys.argv[1]); import eden_test; '
+                   'print(json.dumps(eden_test.stage_target(sys.argv[3],sys.argv[4],'
+                   'None if sys.argv[5] == "-" else sys.argv[5],runs=sys.argv[2])))')
+        def call(label, pack):
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', program,
+                                     str(Path(eden_test.__file__).parent), str(self.runs), self.commit, label, pack],
+                                    capture_output=True, text=True, check=True, timeout=60)
+            return json.loads(result.stdout)
+        first = call('run-01', packed['pack_file'])
+        second = call('run-02', '-')
+        self.assertEqual((first['cache'], second['cache']), ('built', 'reused'))
+        self.assertEqual((Path(first['staged']) / 'tracked.txt').stat().st_ino,
+                         (Path(second['staged']) / 'tracked.txt').stat().st_ino)
+
+    def test_checkout_does_not_run_inherited_smudge_filters(self):
+        (self.repo / '.gitattributes').write_text('tracked.txt filter=refuse\n')
+        self.git('add', '.gitattributes')
+        self.git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'attributes')
+        commit = self.git('rev-parse', 'HEAD').stdout.strip()
+        packed = eden_test.pack_target(self.repo, commit, self.root / 'packs')
+        gitconfig = self.root / 'global.gitconfig'
+        gitconfig.write_text('[filter "refuse"]\n    smudge = /bin/false\n    required = true\n')
+        with mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': str(gitconfig)}):
+            receipt = eden_test.stage_target(commit, 'run-01', packed['pack_file'], runs=self.runs)
+        self.assertEqual((Path(receipt['staged']) / 'tracked.txt').read_text(), 'new\n')
+
+    def test_changed_existing_staged_tree_is_never_replaced(self):
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        result = eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)
+        staged = Path(result['staged'])
+        staged.chmod(staged.stat().st_mode | 0o700)
+        (staged / 'extra.txt').write_text('tampered')
+        with self.assertRaisesRegex(ValueError, 'staged tree .* changed after staging'):
+            eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)
+        self.assertEqual((staged / 'extra.txt').read_text(), 'tampered')
+
+    def test_stage_and_unstage_cli_use_injected_runs(self):
+        packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
+        output = io.StringIO()
+        with mock.patch.object(eden_test, 'RUNS', self.runs), redirect_stdout(output):
+            self.assertEqual(eden_test.main(['stage-target', '--commit', self.commit, '--label', 'run-01',
+                                             '--pack', packed['pack_file']]), 0)
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt['cache'], 'built')
+            self.assertEqual(eden_test.main(['stage-target', '--commit', self.commit, '--label', 'run-01',
+                                             '--probe']), 0)
+            self.assertEqual(eden_test.main(['unstage-targets', '--label', 'run-01']), 0)
+        self.assertFalse(Path(receipt['staged']).exists())
+        self.assertTrue((self.runs / '_eden-test' / 'target-cache' / self.commit).exists())
+
+    def test_stage_and_unstage_refuse_symlinked_run_directory(self):
+        foreign = self.root / 'foreign'
+        (foreign / 'targets').mkdir(parents=True)
+        keep = foreign / 'targets' / 'keep.txt'
+        keep.write_text('not ours')
+        stage = self.runs / '_eden-test' / 'stage'
+        stage.mkdir(parents=True)
+        (stage / 'run-01').symlink_to(foreign, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'symlink in target directory'):
+            eden_test.unstage_targets('run-01', runs=self.runs)
+        with self.assertRaisesRegex(ValueError, 'symlink in target directory'):
+            eden_test.stage_target(self.commit, 'run-01', runs=self.runs)
+        self.assertEqual(keep.read_text(), 'not ours')
+
+    def test_probe_refuses_an_incoming_pack_symlink(self):
+        foreign = self.root / 'foreign.pack'
+        foreign.write_text('not ours')
+        incoming = self.runs / '_eden-test' / 'stage' / 'run-01' / 'targets' / '.incoming'
+        incoming.mkdir(parents=True)
+        pack = incoming / (self.commit + '.pack')
+        pack.symlink_to(foreign)
+        with mock.patch.object(eden_test, 'RUNS', self.runs):
+            with self.assertRaisesRegex(SystemExit, 'symlink in target pack'):
+                eden_test.main(['stage-target', '--commit', self.commit, '--label', 'run-01', '--probe'])
+        with self.assertRaisesRegex(ValueError, 'symlink in target pack'):
+            eden_test.stage_target(self.commit, 'run-01', pack, runs=self.runs)
+        self.assertEqual(foreign.read_text(), 'not ours')
 
 
 class SetupFixtureTests(unittest.TestCase):
@@ -1846,6 +2039,136 @@ class EdenTestTests(unittest.TestCase):
         self.assertIn(f'REPORT-{label}.md', output.getvalue())
         self.assertIn(f'run /home/intpa/eden-runs/{label} --rows <id>', output.getvalue())
         self.assertIn(f'down /home/intpa/eden-runs/{label}', output.getvalue())
+
+    def test_go_remote_ships_named_targets_before_go_and_reuses_cache(self):
+        repo = self.dir / 'source'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
+        git('init', '-q')
+        (repo / 'source.txt').write_text('plugin')
+        git('add', 'source.txt')
+        git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'plugin')
+        plugin = git('rev-parse', 'HEAD').stdout.strip()
+        (repo / 'source.txt').write_text('bridge')
+        git('add', 'source.txt')
+        git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'bridge')
+        bridge = git('rev-parse', 'HEAD').stdout.strip()
+        plan = {'target': {'plugin': {'tree': str(repo), 'commit': plugin, 'nro_sha256': 'a' * 64},
+                           'bridge': {'tree': str(repo), 'commit': bridge}}, 'rows': []}
+        rowfile = self.rows / 'rows.json'
+        rowfile.write_text(json.dumps(plan))
+        original_rows = rowfile.read_bytes()
+        events = []
+        original_run = subprocess.run
+        original_pack = eden_test.pack_target
+        def pack(tree, commit, directory):
+            events.append(('pack', commit))
+            return original_pack(tree, commit, directory)
+        def run(command, **kwargs):
+            if command[0] == 'rsync' and command[-1].endswith('.pack'):
+                self.assertIn('ProxyCommand=/bin/false', ' '.join(command))
+                self.assertIn('--partial', command)
+                self.assertIn('--stats', command)
+                events.append(('pack-rsync', command[-1]))
+                return subprocess.CompletedProcess(command, 0, 'Total bytes sent: 1,234\n', '')
+            if command[0] != 'ssh':
+                return original_run(command, **kwargs)
+            self.assertIn('ProxyCommand=/bin/false', command)
+            commit = command[command.index('--commit') + 1]
+            probe = '--probe' in command
+            events.append(('probe' if probe else 'stage', commit))
+            if probe:
+                return subprocess.CompletedProcess(command, 4 if commit == plugin else 0, '', '')
+            self.assertEqual('--pack' in command, commit == plugin)
+            result = {'commit': commit, 'cache': 'built' if commit == plugin else 'reused'}
+            return subprocess.CompletedProcess(command, 0, json.dumps(result) + '\n', '')
+        def fake_sh(command, log=None):
+            self.assertIn('ProxyCommand=/bin/false', ' '.join(command))
+            if command[0] == 'rsync':
+                kind = 'pack-rsync' if command[-1].endswith('.pack') else 'rsync'
+                events.append((kind, command[-1]))
+                if kind == 'pack-rsync':
+                    self.assertIn('--partial', command)
+            elif command[0] == 'ssh':
+                events.append(('go', None))
+            elif command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps(
+                    {'token': 'b' * 32, 'code': 0, 'counts': {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}}))
+            elif command[0] == 'scp':
+                Path(command[-1]).write_text('report')
+            return 0
+        output = io.StringIO()
+        with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex='b' * 32)), \
+                mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
+                mock.patch.object(eden_test.subprocess, 'run', side_effect=run), \
+                mock.patch.object(eden_test, 'sh', side_effect=fake_sh), redirect_stdout(output):
+            self.assertEqual(eden_test.main(self.go_args(host='xps', rows=rowfile) + ['--ssh', 'mapped-xps']), 0)
+        kinds = [event[0] for event in events]
+        self.assertEqual(kinds[:3], ['pack', 'pack', 'rsync'])
+        self.assertEqual([event[0] for event in events if event[0] in ('probe', 'pack-rsync', 'stage')],
+                         ['probe', 'pack-rsync', 'stage', 'probe', 'stage'])
+        self.assertLess(kinds.index('stage'), kinds.index('go'))
+        self.assertEqual(sum(event[0] == 'pack-rsync' for event in events), 1)
+        self.assertIn('1234 bytes shipped', output.getvalue())
+        self.assertEqual(rowfile.read_bytes(), original_rows)
+
+    def test_go_remote_missing_commit_stops_before_mux_or_remote_command(self):
+        repo = self.dir / 'source'
+        repo.mkdir()
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
+        (self.rows / 'rows.json').write_text(json.dumps(
+            {'target': {'plugin': {'tree': str(repo), 'commit': 'a' * 40, 'nro_sha256': 'b' * 64}}, 'rows': []}))
+        with mock.patch.object(eden_test, 'SshMux') as mux, mock.patch.object(eden_test, 'sh') as sh:
+            with self.assertRaisesRegex(SystemExit, 'target plugin:'):
+                eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
+        mux.assert_not_called()
+        sh.assert_not_called()
+
+    def test_go_target_pack_rsync_failure_reports_exit_before_go(self):
+        commit = 'a' * 40
+        args = self.go_new_args()
+        targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
+        packs = {commit: {'pack_file': str(self.dir / 'pack'), 'bytes': 20}}
+        with mock.patch.object(eden_test, '_go_sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, '_go_target_ssh', return_value=(4, '')), \
+                mock.patch.object(eden_test, '_go_target_rsync', return_value=(23, None)):
+            with self.assertRaisesRegex(SystemExit, r'target plugin pack rsync failed \(23\)'):
+                eden_test._go_remote_with_mux(args, None, 'fake-host', FakeMux('fake-host'), targets, packs)
+        self.assertEqual(sh.call_count, 1)
+
+    def test_go_remote_with_mux_packs_targets_when_called_directly(self):
+        repo = self.dir / 'direct-source'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
+        git('init', '-q')
+        (repo / 'file').write_text('fixture')
+        git('add', 'file')
+        git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'fixture')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        (self.rows / 'rows.json').write_text(json.dumps(
+            {'target': {'plugin': {'tree': str(repo), 'commit': commit, 'nro_sha256': 'a' * 64}}, 'rows': []}))
+        args = self.go_new_args()
+        def remote(host, mux, argv, timeout):
+            if '--probe' in argv:
+                return 4, ''
+            return 0, json.dumps({'commit': commit, 'cache': 'built'})
+        def sh(command):
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps(
+                    {'token': 'c' * 32, 'code': 0, 'counts': {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}}))
+            elif command[0] == 'scp':
+                Path(command[-1]).write_text('report')
+            return 0
+        with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex='c' * 32)), \
+                mock.patch.object(eden_test, '_go_sh', side_effect=sh), \
+                mock.patch.object(eden_test, '_go_target_ssh', side_effect=remote), \
+                mock.patch.object(eden_test, '_go_target_rsync', return_value=(0, 45)) as rsync, \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test._go_remote_with_mux(args, None, 'fake-host', FakeMux('fake-host')), 0)
+        pack_path = Path(rsync.call_args.args[0][-2])
+        self.assertFalse(pack_path.exists())
 
     def test_go_remote_uses_host_map_and_file_rows(self):
         hosts = eden_test.RUNS / '_eden-test/hosts.json'

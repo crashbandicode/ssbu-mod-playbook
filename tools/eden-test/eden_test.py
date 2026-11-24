@@ -98,6 +98,228 @@ def sh(argv, log=None):
     return done.returncode
 
 
+def _target_commit(commit):
+    if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise ValueError('target commit must be 40 lower-case hex characters')
+
+
+def _target_label(label):
+    if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{1,63}', label):
+        raise ValueError('invalid target stage label')
+
+
+def _target_git(tree, *args, timeout=600, env=None):
+    result = subprocess.run(['git', '--no-optional-locks', '-C', str(tree), *args],
+                            capture_output=True, text=True, timeout=timeout, env=env)
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or f'git exit {result.returncode}')
+    return result.stdout.strip()
+
+
+def _strict_target(tree, commit):
+    tree = Path(tree)
+    try:
+        if tree.is_symlink() or not tree.is_dir() or not (tree / '.git').is_dir() or (tree / '.git').is_symlink():
+            raise ValueError('not a checkout directory')
+        env = _target_build_environment()
+        head = _target_git(tree, 'rev-parse', 'HEAD', timeout=120, env=env)
+        if head != commit:
+            raise ValueError(f'is at {head}, not {commit}')
+        status = _target_git(tree, 'status', '--porcelain', '--untracked-files=all', '--ignored', timeout=120, env=env)
+        if status:
+            raise ValueError(f'changed after staging: {status.splitlines()[0]}')
+        _target_git(tree, 'cat-file', '-e', f'{commit}^{{commit}}', timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f'cannot be read: {error}') from error
+
+
+def _target_build_environment():
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', GIT_TERMINAL_PROMPT='0')
+    return env
+
+
+def _readonly_target(root):
+    for directory, names, files in os.walk(root, topdown=False, followlinks=False):
+        for name in [*files, *names]:
+            path = Path(directory) / name
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o222)
+        Path(directory).chmod(Path(directory).stat().st_mode & ~0o222)
+
+
+def _remove_target_tree(root):
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f'not an owned target directory: {root}')
+    for directory, names, _ in os.walk(root, topdown=True, followlinks=False):
+        path = Path(directory)
+        path.chmod(path.stat().st_mode | 0o700)
+        names[:] = [name for name in names if not (path / name).is_symlink()]
+    shutil.rmtree(root)
+
+
+def _target_size(root):
+    files, size = 0, 0
+    for directory, _, names in os.walk(root, followlinks=False):
+        for name in names:
+            files += 1
+            size += (Path(directory) / name).lstat().st_size
+    return files, size
+
+
+def _owned_target_directory(runs, parts, create=False):
+    path = Path(runs)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f'symlink in target directory: {path}')
+        if create:
+            path.mkdir(exist_ok=True)
+        elif not path.exists():
+            return None
+        if not path.is_dir():
+            raise ValueError(f'not a target directory: {path}')
+    return path
+
+
+def _incoming_target(commit, label, runs, create=False):
+    parent = _owned_target_directory(runs, ('_eden-test', 'stage', label, 'targets', '.incoming'), create=create)
+    if parent is None:
+        return None
+    pack = parent / f'{commit}.pack'
+    if pack.is_symlink():
+        raise ValueError(f'symlink in target pack: {pack}')
+    return pack
+
+
+def pack_target(tree, commit, out_dir):
+    _target_commit(commit)
+    tree, out_dir = Path(tree), Path(out_dir)
+    if not tree.is_absolute() or not tree.is_dir():
+        raise ValueError(f'target tree is not an existing absolute directory: {tree}')
+    _target_git(tree, 'cat-file', '-e', f'{commit}^{{commit}}', timeout=20)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pack = out_dir / f'{commit}.pack'
+    environment = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
+    rev = subprocess.Popen(['nice', '-n', '19', 'git', '-C', str(tree),
+                            'rev-list', '--objects', '--no-walk', commit],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+    try:
+        with pack.open('wb') as stream:
+            writer = subprocess.Popen(['nice', '-n', '19', 'git', '-C', str(tree), 'pack-objects', '--stdout'],
+                                      stdin=rev.stdout, stdout=stream, stderr=subprocess.PIPE, env=environment)
+            rev.stdout.close()
+            rev.stdout = None
+            try:
+                _, pack_error = writer.communicate(timeout=600)
+                _, rev_error = rev.communicate(timeout=10)
+            except BaseException:
+                writer.kill()
+                rev.kill()
+                writer.wait()
+                rev.wait()
+                raise
+        if rev.returncode or writer.returncode:
+            detail = (rev_error + pack_error).decode('utf-8', errors='replace').strip()
+            raise ValueError(f'packing {commit} failed: {detail or f"git exits {rev.returncode}/{writer.returncode}"}')
+        return {'commit': commit, 'pack_file': str(pack), 'pack_sha256': sha256(pack), 'bytes': pack.stat().st_size}
+    except BaseException:
+        if rev.poll() is None:
+            rev.kill()
+            rev.wait()
+        pack.unlink(missing_ok=True)
+        raise
+
+
+def probe_target(commit, runs=RUNS):
+    _target_commit(commit)
+    parent = _owned_target_directory(runs, ('_eden-test', 'target-cache'))
+    if parent is None:
+        return False
+    cache = parent / commit
+    if not cache.exists() and not cache.is_symlink():
+        return False
+    try:
+        _strict_target(cache, commit)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def stage_target(commit, label, pack=None, runs=RUNS):
+    _target_commit(commit)
+    _target_label(label)
+    runs = Path(runs)
+    cache_parent = _owned_target_directory(runs, ('_eden-test', 'target-cache'), create=True)
+    cache = cache_parent / commit
+    targets = _owned_target_directory(runs, ('_eden-test', 'stage', label, 'targets'), create=True)
+    staged = targets / commit
+    if pack is not None and Path(pack) == targets / '.incoming' / f'{commit}.pack':
+        _incoming_target(commit, label, runs)
+    if staged.exists() or staged.is_symlink():
+        try:
+            _strict_target(staged, commit)
+        except ValueError as error:
+            raise ValueError(f'staged tree {staged} {error}') from error
+    built = False
+    if cache.exists() or cache.is_symlink():
+        try:
+            _strict_target(cache, commit)
+        except ValueError:
+            suffix = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + f'-{time.time_ns()}'
+            cache.rename(cache_parent / f'.rejected-{commit}-{suffix}')
+    if not cache.exists():
+        if pack is None:
+            raise ValueError(f'no valid cache or pack for target {commit}')
+        temporary = cache_parent / f'.tmp-{commit}-{os.getpid()}'
+        temporary.mkdir()
+        try:
+            env = _target_build_environment()
+            subprocess.run(['git', 'init', '-q', '--template=', str(temporary)], capture_output=True, text=True,
+                           check=True, timeout=120, env=env)
+            with Path(pack).open('rb') as stream:
+                subprocess.run(['git', '-C', str(temporary), 'index-pack', '--stdin'], stdin=stream,
+                               capture_output=True, check=True, timeout=600, env=env)
+            if _target_git(temporary, 'cat-file', '-t', commit, env=env) != 'commit':
+                raise ValueError(f'pack does not contain commit {commit}')
+            (temporary / '.git' / 'shallow').write_text(commit + '\n')
+            _target_git(temporary, 'checkout', '-q', '--detach', commit, env=env)
+            _strict_target(temporary, commit)
+            _readonly_target(temporary)
+            temporary.rename(cache)
+            built = True
+        finally:
+            if temporary.exists():
+                _remove_target_tree(temporary)
+    _readonly_target(cache)
+    if not staged.exists():
+        temporary = targets / f'.tmp-{commit}-{os.getpid()}'
+        try:
+            shutil.copytree(cache, temporary, symlinks=True, copy_function=os.link)
+            _readonly_target(temporary)
+            _strict_target(temporary, commit)
+            temporary.rename(staged)
+        finally:
+            if temporary.exists():
+                _remove_target_tree(temporary)
+    _strict_target(staged, commit)
+    files, size = _target_size(staged)
+    if pack is not None and Path(pack) == targets / '.incoming' / f'{commit}.pack':
+        Path(pack).unlink(missing_ok=True)
+    return {'commit': commit, 'cache': 'built' if built else 'reused', 'staged': str(staged),
+            'files': files, 'bytes': size}
+
+
+def unstage_targets(label, runs=RUNS):
+    _target_label(label)
+    targets = _owned_target_directory(runs, ('_eden-test', 'stage', label, 'targets'))
+    if targets is not None:
+        _remove_target_tree(targets)
+
+
 def cmd_new(args):
     previous = json.loads(Path(args.from_config).read_text())
     run = RUNS / args.label
@@ -1416,6 +1638,79 @@ def _pwsh_arg(value):
     return "'" + value.replace("'", "''") + "'"
 
 
+def _go_targets(rows):
+    rows = Path(rows)
+    path = rows / 'rows.json' if rows.is_dir() else rows
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot read rows plan {path}: {error}') from error
+    if not isinstance(plan, dict):
+        raise SystemExit(f'rows plan {path} must be an object')
+    if 'target' not in plan:
+        return []
+    target = plan['target']
+    if not isinstance(target, dict):
+        raise SystemExit('target must be an object')
+    repos = target.get('repos', {})
+    if not isinstance(repos, dict):
+        raise SystemExit('target repos must be an object')
+    specs = [('plugin', target.get('plugin'))]
+    if 'bridge' in target:
+        specs.append(('bridge', target['bridge']))
+    specs.extend((f'repos.{name}', spec) for name, spec in repos.items())
+    found = []
+    for label, spec in specs:
+        if not isinstance(spec, dict):
+            raise SystemExit(f'target {label} must be an object')
+        tree, commit = spec.get('tree'), spec.get('commit')
+        try:
+            _target_commit(commit)
+            if not isinstance(tree, str) or not Path(tree).is_absolute() or not Path(tree).is_dir():
+                raise ValueError(f'tree {tree!r} is not an existing absolute directory')
+            _target_git(tree, 'cat-file', '-e', f'{commit}^{{commit}}', timeout=20)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            raise SystemExit(f'target {label}: {error}') from error
+        found.append({'label': label, 'tree': tree, 'commit': commit})
+    return found
+
+
+def _go_target_ssh(host, mux, remote, timeout):
+    mux.ensure()
+    command = ['ssh', *mux.rider_args, host, *(_pwsh_arg(arg) for arg in remote)]
+    print('$ ' + shlex.join(command), flush=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f'target staging SSH failed: {error}') from error
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    return result.returncode, result.stdout
+
+
+def _go_target_rsync(command):
+    print('$ ' + shlex.join(command), flush=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f'target pack rsync failed: {error}') from error
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    match = re.search(r'(?m)^Total bytes sent:\s*([0-9,]+)', result.stdout)
+    return result.returncode, int(match.group(1).replace(',', '')) if match else None
+
+
+def _go_pack_targets(targets, directory):
+    packs = {}
+    for target in targets:
+        if target['commit'] not in packs:
+            try:
+                packs[target['commit']] = pack_target(target['tree'], target['commit'], directory)
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                raise SystemExit(f'target {target["label"]}: {error}') from error
+    return packs
+
+
 def _go_remote(args, lineup):
     hosts = RUNS / '_eden-test' / 'hosts.json'
     mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
@@ -1424,12 +1719,28 @@ def _go_remote(args, lineup):
         raise SystemExit(f'no SSH host for {args.host!r}; use --ssh or add it to {hosts}')
     if host.startswith('-'):
         raise SystemExit(f'invalid SSH host {host!r}')
+    try:
+        _target_label(args.label)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
-    with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
-        return _go_remote_with_mux(args, lineup, host, mux)
+    with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
+        packs = _go_pack_targets(targets, directory)
+        with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
+            return _go_remote_with_mux(args, lineup, host, mux, targets, packs)
 
 
-def _go_remote_with_mux(args, lineup, host, mux):
+def _go_remote_with_mux(args, lineup, host, mux, targets=None, packs=None):
+    if targets is None:
+        try:
+            _target_label(args.label)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        targets = _go_targets(args.rows)
+    if packs is None:
+        with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
+            return _go_remote_with_mux(args, lineup, host, mux, targets, _go_pack_targets(targets, directory))
     stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
     commands = [
         ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
@@ -1444,12 +1755,48 @@ def _go_remote_with_mux(args, lineup, host, mux):
         commands.append(['rsync', '-a', '--mkpath', str(rows) + '/', f'{host}:{stage}/rows/'])
     else:
         commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
-    for command in commands:
+    script = f'{stage}/tools/eden-test/eden_test.py'
+    for index, command in enumerate(commands):
         mux.ensure()
         command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
         if code := _go_sh(command):
             raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}')
-    script = f'{stage}/tools/eden-test/eden_test.py'
+        if index == 0:
+            staged_commits = {}
+            for target in targets:
+                commit, label = target['commit'], target['label']
+                if commit in staged_commits:
+                    print(f'target {label} {commit[:12]}: cache reused, 0 bytes shipped in 0.0 s')
+                    continue
+                started = time.monotonic()
+                helper = ['/usr/bin/python3', '-I', '-B', script, 'stage-target',
+                          '--commit', commit, '--label', args.label]
+                code, _ = _go_target_ssh(host, mux, [*helper, '--probe'], 180)
+                if code not in (0, 4):
+                    raise SystemExit(f'target {label} cache probe failed ({code})')
+                sent = 0
+                if code == 4:
+                    pack = packs[commit]
+                    incoming = f'{stage}/targets/.incoming/{commit}.pack'
+                    transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--partial', '--stats',
+                                '--mkpath', pack['pack_file'], f'{host}:{incoming}']
+                    mux.ensure()
+                    failure, sent = _go_target_rsync(transfer)
+                    if failure:
+                        raise SystemExit(f'target {label} pack rsync failed ({failure}): {shlex.join(transfer)}')
+                    helper.extend(('--pack', incoming))
+                code, output = _go_target_ssh(host, mux, helper, 900)
+                if code:
+                    raise SystemExit(f'target {label} staging failed ({code})')
+                try:
+                    result = json.loads(output.strip().splitlines()[-1])
+                    if result['commit'] != commit or result['cache'] not in ('built', 'reused'):
+                        raise ValueError('invalid target receipt')
+                except (ValueError, KeyError, IndexError, TypeError) as error:
+                    raise SystemExit(f'target {label} returned invalid staging receipt') from error
+                staged_commits[commit] = result
+                print(f'target {label} {commit[:12]}: cache {result["cache"]}, '
+                      f'{sent if sent is not None else "unknown"} bytes shipped in {time.monotonic() - started:.1f} s')
     remote = ['/usr/bin/python3', '-I', '-B', script, 'go', '--host', args.host, '--label', args.label]
     for nro in args.nro:
         remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
@@ -1646,6 +1993,13 @@ def main(argv=None):
     p.add_argument('--from', dest='from_config')
     p.add_argument('--ssh')
     p.add_argument('--token', help=argparse.SUPPRESS)
+    p = sub.add_parser('stage-target', help='build or reuse a target cache and stage it for a run')
+    p.add_argument('--commit', required=True)
+    p.add_argument('--label', required=True)
+    p.add_argument('--pack')
+    p.add_argument('--probe', action='store_true', help=argparse.SUPPRESS)
+    p = sub.add_parser('unstage-targets', help='remove the run target trees, retaining the cache')
+    p.add_argument('--label', required=True)
     sub.add_parser('pace').add_argument('run', type=Path)
     sub.add_parser('report').add_argument('run', type=Path)
     p = sub.add_parser('down')
@@ -1667,6 +2021,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.mode == 'go':
         return cmd_go(args)
+    if args.mode == 'stage-target':
+        try:
+            _target_label(args.label)
+            if args.probe:
+                _target_commit(args.commit)
+                _incoming_target(args.commit, args.label, RUNS, create=True)
+                return 0 if probe_target(args.commit, runs=RUNS) else 4
+            print(json.dumps(stage_target(args.commit, args.label, args.pack, runs=RUNS)))
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            raise SystemExit(f'stage-target: {error}') from error
+    elif args.mode == 'unstage-targets':
+        try:
+            unstage_targets(args.label, runs=RUNS)
+        except (ValueError, OSError) as error:
+            raise SystemExit(f'unstage-targets: {error}') from error
     if args.mode == 'new':
         cmd_new(args)
     elif args.mode == 'check':

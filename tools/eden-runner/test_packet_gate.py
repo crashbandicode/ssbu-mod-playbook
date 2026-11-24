@@ -13,7 +13,9 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'eden-test'))
 import packet_gate  # noqa: E402
+import eden_test  # noqa: E402
 
 
 class PacketGateTests(unittest.TestCase):
@@ -73,6 +75,107 @@ write!(text, "clip ctx={} total={} in={} out={}");
 
     def errors(self):
         return packet_gate.check(self.plan, self.base, self.plan)['errors']
+
+    def target_run_layout(self):
+        runs = Path(self.tmp.name) / 'runs'
+        target = runs / 'run-01' / 'rows'
+        target.parent.mkdir(parents=True)
+        self.base.rename(target)
+        self.base = target
+        def cleanup():
+            for directory, names, _ in os.walk(runs, topdown=True, followlinks=False):
+                path = Path(directory)
+                path.chmod(path.stat().st_mode | 0o700)
+                names[:] = [name for name in names if not (path / name).is_symlink()]
+        self.addCleanup(cleanup)
+        return runs
+
+    def test_staged_target_supplies_reads_and_preserves_packet_identity(self):
+        runs = self.target_run_layout()
+        self.plan['rows'][0]['reads'] = ['tr.menu:ack']
+        before = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(before['errors'], [])
+        tracked = self.tree / 'src/model/bridge_state.rs'
+        tracked.write_text(tracked.read_text() + '\n// producer work in progress\n')
+        dirty = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(dirty['errors'], [])
+        packed = eden_test.pack_target(self.tree, self.commit, Path(self.tmp.name) / 'packs')
+        receipt = eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=runs)
+        staged = Path(receipt['staged'])
+        with mock.patch.object(packet_gate, '_git', wraps=packet_gate._git) as git:
+            after = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(after['errors'], [])
+        self.assertEqual((after['packet_sha256'], after['inputs_identity']),
+                         (before['packet_sha256'], before['inputs_identity']))
+        self.assertIn('ack', after['emitted']['tr.menu'])
+        self.assertTrue(any(Path(call.args[0]) == staged and call.args[1] == 'show'
+                            for call in git.call_args_list))
+        missing = str(Path(self.tmp.name) / 'not-on-this-host')
+        self.plan['target']['plugin']['tree'] = missing
+        self.plan['target']['bridge']['tree'] = missing
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['target']['plugin']['tree'], missing)
+        self.assertIn('ack', result['emitted']['tr.menu'])
+        self.plan['rows'][0]['unrelated_path'] = missing
+        self.assertIn(f'G4 rows.json: missing file {missing}', self.errors())
+
+    def test_staged_head_mismatch_refuses_even_when_requested_object_exists(self):
+        runs = self.target_run_layout()
+        original = self.commit
+        (self.tree / 'new.txt').write_text('new commit')
+        self.git('add', 'new.txt')
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'new')
+        other = self.git('rev-parse', 'HEAD').stdout.strip()
+        stage = runs / '_eden-test' / 'stage' / 'run-01' / 'targets' / original
+        stage.parent.mkdir(parents=True)
+        subprocess.run(['git', 'clone', '-q', '--no-hardlinks', str(self.tree), str(stage)],
+                       check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(stage), 'cat-file', '-e', original],
+                       check=True, capture_output=True)
+        errors = self.errors()
+        self.assertIn(f'G2 target: plugin staged tree {stage} is at {other}, not {original}', errors)
+
+    def test_staged_tracked_untracked_and_ignored_changes_refused(self):
+        runs = self.target_run_layout()
+        (self.tree / '.gitignore').write_text('ignored.tmp\n')
+        self.git('add', '.gitignore')
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'ignore')
+        commit = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['plugin']['commit'] = commit
+        self.plan['target']['bridge']['commit'] = commit
+        packed = eden_test.pack_target(self.tree, commit, Path(self.tmp.name) / 'packs')
+        receipt = eden_test.stage_target(commit, 'run-01', packed['pack_file'], runs=runs)
+        staged = Path(receipt['staged'])
+        staged.chmod(staged.stat().st_mode | 0o700)
+        for name in ('untracked.tmp', 'ignored.tmp'):
+            path = staged / name
+            path.write_text('new')
+            self.assertTrue(any(error.startswith(f'G2 target: plugin staged tree {staged} changed after staging:')
+                                for error in self.errors()), name)
+            path.unlink()
+        tracked = staged / 'src/model/bridge_state.rs'
+        tracked.chmod(tracked.stat().st_mode | 0o200)
+        tracked.write_text('edited\n')
+        self.assertTrue(any(error.startswith(f'G2 target: plugin staged tree {staged} changed after staging:')
+                            for error in self.errors()))
+
+    def test_missing_producer_names_absent_staged_tree(self):
+        self.target_run_layout()
+        missing = str(Path(self.tmp.name) / 'missing')
+        self.plan['target']['plugin']['tree'] = missing
+        self.assertIn(f'G2 target: plugin.tree {missing} does not exist on this host and '
+                      f'the run has no staged tree for {self.commit}', self.errors())
+
+    def test_staged_tree_through_a_symlink_is_not_adopted(self):
+        runs = self.target_run_layout()
+        packed = eden_test.pack_target(self.tree, self.commit, Path(self.tmp.name) / 'packs')
+        eden_test.stage_target(self.commit, 'run-02', packed['pack_file'], runs=runs)
+        stage = runs / '_eden-test' / 'stage'
+        (stage / 'run-01').symlink_to(stage / 'run-02', target_is_directory=True)
+        staged = stage / 'run-01' / 'targets' / self.commit
+        self.assertIn(f'G2 target: plugin staged tree {staged} cannot be read: symlink in staged path',
+                      self.errors())
 
     def test_inputs_identity_covers_files_and_excludes_runner_writebacks(self):
         identity = getattr(packet_gate, 'inputs_identity', None)
@@ -938,7 +1041,8 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.plan['target']['repos']['tile']['tree'] = 'relative'
         self.assertIn('G2 target: repos.tile.tree must be an existing absolute directory', self.errors())
         self.plan['target']['repos']['tile']['tree'] = str(tree / 'missing')
-        self.assertIn('G2 target: repos.tile.tree must be an existing absolute directory', self.errors())
+        self.assertIn(f'G2 target: repos.tile.tree {tree / "missing"} does not exist on this host and '
+                      f'the run has no staged tree for {commit}', self.errors())
         self.plan['target']['repos']['tile'] = 'bad'
         self.assertIn('G2 target: repos.tile must be an object', self.errors())
         self.plan['target']['repos'] = []
