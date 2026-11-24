@@ -254,3 +254,11 @@ and commit, `src/native_ui/pause_focus.rs` lines 26–63 and 65–71; full blob 
 commit `ed2655d4`, `src/native_ui/mod.rs` lines 507–524, 634–711 and 714–720; full blob SHA-256
 `265aa2441a219d917066d3ed60a090836dce15cacb90fe7f51ed7f7133d9df4e`.
 Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/test-data/bridge-ui/95abb28/src/native_ui/mod.rs` excerpts
+`/home/intpa/ssbu-hw-bridge` commit `95abb2829574c49f28789cd2a9c3df63a1181d0b`,
+`src/native_ui/mod.rs` lines 15, 982–1117 and 1388–1391, joined in that order and unchanged; full blob
+SHA-256 `8033bb93846cb19243e8dcc86f178b5ecda23fa375eb584f1e5bdf23cdcf05ce`. It holds the test-only
+`fn encode` inside `impl Sample` (line 994), the real state-block writer after it, and the two test
+module declarations the file ends with.
+Host tests only; no runtime acceptance.

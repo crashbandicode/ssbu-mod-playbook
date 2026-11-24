@@ -475,6 +475,18 @@ block writer and the pause helper when available; values of `screen` and
 `focus.source` are not keys. Without `block`, dotted string literals are keys
 unless a provider sets `whole_literals: false`, as the `bridge` provider does.
 
+Every provider skips test-only code. An item is test-only when its `cfg`
+condition cannot hold outside a test build: `#[cfg(test)]`,
+`#[cfg(all(test, not(target_os = "switch")))]`. Such an item is left out
+wherever it stands (a test module at the end of a file, a test-only `fn` inside
+an `impl`), and the source after it is still read. An item under
+`#[cfg(any(test, target_os = "switch"))]` or `#[cfg(not(test))]` is console code
+and is read; a feature or a target in a condition is not followed. The
+extractor refuses a file with `could not be scanned` when it cannot read a
+condition, when a test-only attribute stands on something that is not an item
+(a field, a statement, a match arm), when a test-only item never closes, or
+when the file or a module is test-only as a whole (`#![cfg(test)]`).
+
 Without `block`, a key the source builds in a format string, such as
 `writeln!(out, "cpu.{entry}.ai_thinks={count}")`, is accepted for the values the
 gate can read from the loop that binds each `{name}`:
