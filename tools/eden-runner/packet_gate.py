@@ -505,10 +505,9 @@ def _template_hint(tree, commit, files, key):
     """For a refused read: the format-string key it has the shape of, and what that template writes; '' if none."""
     for path in files:
         try:
-            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
-        except (OSError, UnicodeError, subprocess.SubprocessError):
+            text = _without_test_items(_git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8'))
+        except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
             continue
-        text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
         for template, line, said, reason in _template_keys(text)[1]:
             pieces = re.split(r'(\{[^{}]*\})', template)
             if not any(re.search(r'[a-z0-9_]', piece) for piece in pieces if not piece.startswith('{')):
@@ -534,7 +533,10 @@ def emitted_keys(tree, commit, files, whole_literals=True):
         except subprocess.CalledProcessError as error:
             detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
             raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
-        text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
+        try:
+            text = _without_test_items(text)
+        except ValueError as error:
+            raise ValueError(f'{path} at {commit[:8]}: {error}') from error
         for literal in re.findall(r'"((?:\\.|[^"\\])*)"', text):
             found = re.findall(r'(?:^|\\n| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal)
             keys.update(found)
@@ -603,6 +605,156 @@ def _rust_lex(text):
                 continue
         code[start:i] = ['\n' if ch == '\n' else ' ' for ch in text[start:i]]
     return ''.join(code), literals
+
+
+_CFG = re.compile(r'#\s*(!?)\s*\[\s*cfg\s*\(')
+_TEST_ITEM = re.compile(r'(?:pub(?:\s*\([^()]*\))?\s+)?(?:(?:default|const|async|unsafe|extern)\s+)*'
+                        r'(fn|mod|struct|enum|union|impl|trait|extern|macro_rules|use|const|static|type)\b')
+
+
+def _test_item_end(code, pos, to_semicolon):
+    """The offset after the item that starts at `pos` in lexed code: after the `;` that ends it, or after the
+    closing brace of its body. `use`, `const`, `static` and `type` items end at their `;` only."""
+    size = len(code)
+    paren = bracket = angle = depth = 0
+    while pos < size:
+        char = code[pos]
+        if to_semicolon:
+            if char in '([{':
+                depth += 1
+            elif char in ')]}':
+                depth -= 1
+                if depth < 0:
+                    break
+            elif char == ';' and not depth:
+                return pos + 1
+        elif char == '(':
+            paren += 1
+        elif char == ')':
+            paren -= 1
+        elif char == '[':
+            bracket += 1
+        elif char == ']':
+            bracket -= 1
+        elif char == '<':
+            angle += 1
+        elif char == '>':
+            if angle and code[pos - 1] != '-':
+                angle -= 1
+        elif not (paren or bracket or angle):
+            if char == ';':
+                return pos + 1
+            if char == '}':
+                break
+            if char == '{':
+                depth = 1
+                pos += 1
+                while pos < size and depth:
+                    depth += (code[pos] == '{') - (code[pos] == '}')
+                    pos += 1
+                if depth:
+                    break
+                return pos
+        if paren < 0 or bracket < 0:
+            break
+        pos += 1
+    raise ValueError('could not be scanned')
+
+
+def _cfg_outside_tests(predicate):
+    """Whether a `cfg` predicate (lexed, so `feature = "x"` reads `feature =`) can hold in a build that is not a
+    test build: False when it cannot, so the item is test-only; True when it always holds; None when that depends
+    on a feature, the target or anything else the gate does not follow."""
+    tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*|[(),=]', predicate)
+    pos = 0
+
+    def parse():
+        nonlocal pos
+        name = tokens[pos]
+        if name in '(),=':
+            raise ValueError
+        pos += 1
+        if pos < len(tokens) and tokens[pos] == '(':
+            pos += 1
+            parts = []
+            while tokens[pos] != ')':
+                parts.append(parse())
+                if tokens[pos] == ',':
+                    pos += 1
+                elif tokens[pos] != ')':
+                    raise ValueError
+            pos += 1
+            if name == 'not' and len(parts) == 1:
+                return None if parts[0] is None else not parts[0]
+            if name == 'any':
+                return True if True in parts else None if None in parts else False
+            if name == 'all':
+                return False if False in parts else None if None in parts else True
+            return None
+        if pos < len(tokens) and tokens[pos] == '=':
+            pos += 1
+            return None
+        return False if name == 'test' else None
+
+    try:
+        value = parse()
+        if pos != len(tokens):
+            raise ValueError
+    except (IndexError, ValueError):
+        raise ValueError('could not be scanned') from None
+    return value
+
+
+def _without_test_items(text):
+    """Rust source with every test-only item blanked, line breaks kept: the `#[cfg(...)]` attribute, any attributes
+    after it, and the item itself up to the `;` that ends it or the closing brace of its body. An item is test-only
+    when its condition cannot hold outside a test build: `cfg(test)`, `cfg(all(test, ...))`. An item under
+    `cfg(any(test, target_os = "switch"))` or `cfg(not(test))` is built for the console and stays.
+
+    What the gate cannot follow fails loudly as `could not be scanned`: a condition it cannot read, a test-only
+    attribute on something that is not an item (a field, a statement, a match arm), a test-only item that never
+    closes, and a file or module that is test-only as a whole (`#![cfg(test)]`)."""
+    if not (_CFG.search(text) and 'test' in text):
+        return text
+    code, _ = _rust_lex(text)
+    kept = list(text)
+    size = len(code)
+    done = 0
+    for attribute in _CFG.finditer(code):
+        if attribute.start() < done:
+            continue
+        depth, pos = 1, attribute.end()
+        while pos < size and depth:
+            depth += (code[pos] == '(') - (code[pos] == ')')
+            pos += 1
+        closing = re.compile(r'\s*\]').match(code, pos)
+        if depth or not closing:
+            raise ValueError('could not be scanned')
+        if _cfg_outside_tests(code[attribute.end():pos - 1]) is not False:
+            continue
+        if attribute.group(1):
+            raise ValueError('could not be scanned')
+        pos = closing.end()
+        while True:
+            while pos < size and code[pos].isspace():
+                pos += 1
+            more = re.compile(r'#\s*\[').match(code, pos)
+            if not more:
+                break
+            depth, pos = 1, more.end()
+            while pos < size and depth:
+                depth += (code[pos] == '[') - (code[pos] == ']')
+                pos += 1
+            if depth:
+                raise ValueError('could not be scanned')
+        item = _TEST_ITEM.match(code, pos)
+        if not item:
+            raise ValueError('could not be scanned')
+        done = _test_item_end(code, pos, item.group(1) in ('use', 'const', 'static', 'type'))
+        for index in range(attribute.start(), done):
+            if kept[index] != '\n':
+                kept[index] = ' '
+    return ''.join(kept)
 
 
 def _rust_function_bodies(text):
@@ -708,7 +860,10 @@ def _provider_keys(tree, commit, source, partial=False):
                 continue
             detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
             raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
-        texts.append(re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0])
+        try:
+            texts.append(_without_test_items(text))
+        except ValueError as error:
+            raise ValueError(f'{error} at {commit[:8]}') from error
     keys = set()
     found = False
     for text in texts:
@@ -732,6 +887,7 @@ def _provider_keys(tree, commit, source, partial=False):
             text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
         except subprocess.CalledProcessError:
             continue
+        text = _without_test_items(text)
         list(_rust_function_bodies(text))
         keys.update(_block_keys(text))
     return keys
