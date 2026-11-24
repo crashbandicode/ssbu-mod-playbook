@@ -1581,11 +1581,8 @@ class Runner:
                           if isinstance(status, dict) else None)
             except Exception:  # noqa: BLE001 - a missing status does not invalidate a screenshot
                 status = None
-            fresh = self.still_records[str(path)]
-            keys = (('status', 'reason') if fresh['status'] == 'error' else
-                    ('status', 'reason', 'boot', 'frame', 'wall', 'unchanged_frames', 'first_identical'))
             self.captures.append({'name': name, 'file': path.name, 'sha256': digest(path), 'utc': utc,
-                                  'status': status, 'fresh': {key: fresh[key] for key in keys}})
+                                  'status': status})
         if self._arm_frames:
             try:
                 data = path.read_bytes()

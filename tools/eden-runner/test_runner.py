@@ -1223,37 +1223,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(record['status'], 'fresh')
         self.assertEqual(json.loads((run.out / 'stills.jsonl').read_text().splitlines()[0]), record)
 
-    def test_a_row_capture_entry_carries_the_freshness_record(self):
+    def test_a_row_capture_and_its_freshness_record_name_the_same_bytes(self):
         bridge = self.dir / 'bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)
         self.plan['rows'] = [{'id': 'r1', 'start': 'blue', 'end': 'blue',
-                              'steps': [{'shot': 'first'}, {'shot': 'frozen'}, {'shot': 'error'}]}]
+                              'steps': [{'shot': 'first'}]}]
         self.manifest.write_text(json.dumps(self.plan))
-        run = self.make(FreshEden(bridge, [1000, 1200, 1300], [BLUE, BLUE, RED]))
-        original, calls = run.stills.record, []
-
-        def record(*args, **kwargs):
-            calls.append(True)
-            if len(calls) == 3:
-                raise OSError('ledger unavailable')
-            return original(*args, **kwargs)
-
-        with mock.patch.object(run.stills, 'record', side_effect=record), \
-                mock.patch.object(runner.Runner, 'bridge_at_shot', return_value={}):
+        run = self.make(FreshEden(bridge, [1000], [BLUE]))
+        with mock.patch.object(runner.Runner, 'bridge_at_shot', return_value={}):
             run.run()
         receipt = json.loads((run.out / 'r1.json').read_text())
-        captures = {capture['name']: capture for capture in receipt['captures']}
-        records = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
-        keys = ('status', 'reason', 'boot', 'frame', 'wall', 'unchanged_frames', 'first_identical')
-        for name, expected, record in zip(('first', 'frozen'), ('fresh', 'refused'), records):
-            capture = captures[name]
-            self.assertEqual(capture['fresh'], {key: record[key] for key in keys})
-            self.assertEqual(capture['fresh']['status'], expected)
-            self.assertEqual(capture['sha256'], record['sha256'])
-            self.assertEqual(capture['file'], record['file'])
-        self.assertEqual(set(captures['error']['fresh']), {'status', 'reason'})
-        self.assertEqual(captures['error']['fresh']['status'], 'error')
-        self.assertIn('ledger unavailable', captures['error']['fresh']['reason'])
+        self.assertEqual(len(receipt['captures']), 1)
+        capture = receipt['captures'][0]
+        path = run.out / 'r1' / capture['file']
+        record = run.still_records[str(path)]
+        journal = json.loads((run.out / 'stills.jsonl').read_text())
+        self.assertEqual(set(capture), {'name', 'file', 'sha256', 'utc', 'status'})
+        self.assertEqual(capture['file'], record['file'])
+        self.assertEqual(capture['file'], journal['file'])
+        self.assertEqual(capture['sha256'], record['sha256'])
+        self.assertEqual(capture['sha256'], journal['sha256'])
+        self.assertEqual(capture['sha256'], sha(path))
+        self.assertEqual(record['status'], 'fresh')
 
     def test_shot_keeps_the_boot_across_a_long_log(self):
         bridge = self.dir / 'bridge.log'
