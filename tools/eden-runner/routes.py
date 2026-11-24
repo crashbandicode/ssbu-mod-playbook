@@ -3077,8 +3077,14 @@ def _bridge_on_events(ctx):
     return path.read_text().splitlines() if path.is_file() else []
 
 
-def _bridge_on_listener_owner(_port):
-    return ''
+def _bridge_on_listener_owner(port):
+    """Read Linux Eden listener ownership; ss must be available on the Eden host."""
+    try:
+        return subprocess.check_output(['ss', '-ltnp', f'sport = :{port}'], text=True, timeout=4)
+    except FileNotFoundError:
+        raise RuntimeError('bridge_on (stub on): ss is not available') from None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f'bridge_on (stub on): ss failed: {exc}') from exc
 
 
 class BridgeOnChordHoldError(RuntimeError):
@@ -3179,6 +3185,11 @@ def _bridge_on_cold_enable(ctx, trace):
     if witness is None:
         raise RuntimeError("No live stock opening owner and boot-default chord readiness")
     _bridge_on_chord(ctx)
+    event = _bridge_on_fresh_transition(ctx, before)
+    return _save(ctx, "cold-opening-chord", {"stock": witness, "event": event})
+
+
+def _bridge_on_fresh_transition(ctx, before):
     until = time.monotonic() + 10
     while time.monotonic() < until:
         ctx.check_stop()
@@ -3189,9 +3200,119 @@ def _bridge_on_cold_enable(ctx, trace):
         if transitions:
             if len(transitions) != 1 or not re.search(r"phase=on gen=1 .*\bsource=pad_chord\b", transitions[0]):
                 raise RuntimeError(f"Unexpected cold chord transition: {transitions!r}")
-            return _save(ctx, "cold-opening-chord", {"stock": witness, "event": transitions[0]})
+            return transitions[0]
         time.sleep(0.05)
     raise RuntimeError("No fresh pad-chord On event within 10 seconds")
+
+
+def _bridge_on_control_journal(ctx):
+    message = "bridge_on (stub on): no control journal with this boot's game.load: cannot show the game has had no input"
+    try:
+        path = instance_path(ctx, 'control_log')
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        if any(not isinstance(row, dict) or (row.get('event') == 'request'
+               and not isinstance(row.get('method'), str)) for row in rows):
+            raise ValueError('invalid control journal row')
+        requests = [row for row in rows if row.get('event') == 'request']
+        loads = [i for i, row in enumerate(requests) if row.get('method') == 'game.load']
+        if not loads:
+            raise ValueError('no game.load')
+    except (KeyError, OSError, UnicodeError, ValueError):
+        raise RuntimeError(message) from None
+    load = requests[loads[-1]]
+    after = requests[loads[-1] + 1:]
+    for row in after:
+        method = row['method']
+        if method == 'macro.play' or (method.startswith('input.') and method not in ('input.schema', 'input.reset')):
+            raise RuntimeError(f"bridge_on (stub on): input was sent since game.load ({method} at {row.get('time')}): "
+                               "the game may have left the opening, Title and attract screens")
+    return {'path': str(path), 'game_load_time': load.get('time'),
+            'requests_after_load': len(after), 'inputs_after_load': 0}
+
+
+def _bridge_on_stub_enable(ctx):
+    before = _bridge_on_events(ctx)
+    existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
+    if existing is not None:
+        return {'chord': 'already on', 'event': existing}
+    until = time.monotonic() + 54
+    missing = []
+    while time.monotonic() < until:
+        ctx.check_stop()
+        before = _bridge_on_events(ctx)
+        existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
+        if existing is not None:
+            return {'chord': 'already on', 'event': existing}
+        _bridge_on_control_journal(ctx)
+        install = next((line for line in reversed(before) if 'toggle=off reason=boot_default' in line), None)
+        ready = next((line for line in reversed(before) if re.fullmatch(r'\d+ \[Bridge\] chord ready', line)), None)
+        status = ctx.call('status') or {}
+        if not isinstance(status, dict):
+            status = {}
+        status = {key: status.get(key) for key in ('running', 'loading_complete')}
+        journal = _bridge_on_control_journal(ctx)
+        missing = [name for name, good in (
+            ('install', install is not None), ('chord_ready', ready is not None),
+            ('running', status['running'] is True), ('loading_complete', status['loading_complete'] is True),
+        ) if not good]
+        if not missing:
+            break
+        time.sleep(min(.1, max(0, until - time.monotonic())))
+    else:
+        raise RuntimeError(f"bridge_on (stub on): not ready for the chord: {', '.join(missing)}")
+    _bridge_on_chord(ctx)
+    event = _bridge_on_fresh_transition(ctx, before)
+    return {'chord': 'pad', 'witness': 'stub-on',
+            'pre_chord': {'install': install, 'chord_ready': ready, 'status': status, 'journal': journal},
+            'event': event}
+
+
+def _bridge_on_owned_listener(ctx, port):
+    try:
+        path = instance_path(ctx, 'control_log').parent / 'run.json'
+        pid = json.loads(path.read_text())['owned_pids'][0]['pid']
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError('invalid owned pid')
+    except (KeyError, IndexError, TypeError, ValueError, OSError, UnicodeError) as exc:
+        raise RuntimeError(f'bridge_on (stub on): cannot read owned Eden pid from run.json: {exc}') from exc
+    listener = _bridge_on_listener_owner(port)
+    if f'pid={pid},' not in listener:
+        raise RuntimeError(f"bridge_on (stub on): port {port} is not bound by the owned Eden (pid {pid}): "
+                           f"{listener.strip() or 'no listener'}")
+    return listener
+
+
+def _bridge_on_stub_title(ctx, hello):
+    match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
+    if match is None:
+        raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
+    boot = match[1]
+    until = time.monotonic() + 10
+    timeout = 'bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting'
+    while (remaining := until - time.monotonic()) > 0:
+        ctx.check_stop()
+        io = BridgePickerIO(ctx)
+        try:
+            sample = io.read(native_picker.UI, remaining)
+        except RuntimeError:
+            if time.monotonic() >= until:
+                raise RuntimeError(timeout) from None
+            raise
+        values = sample.values
+        if sample.block['boot'] != boot or values.get('observation.active') != 'yes':
+            time.sleep(min(.05, max(0, until - time.monotonic())))
+            continue
+        matched = next((name for name, criteria in (
+            ('prompt', TITLE_PROMPT), ('opening', TITLE_OPENING), ('title', _TITLE_WITHOUT_PROMPT),
+        ) if _fields_match(sample, criteria)), None)
+        if matched is None:
+            raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
+                               f"{values.get('screen')}/{values.get('focus')}, not the Title")
+        native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+        return {'rev': sample.block['rev'], 'boot': sample.block['boot'],
+                **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
+                'matched': matched}
+    raise RuntimeError(timeout)
 
 
 def free_port(first=6980, last=7079, host='0.0.0.0'):
@@ -3218,19 +3339,22 @@ def free_udp_port(first=24872, last=24971):
 
 def bridge_on(ctx, port=None, cap=60):
     """Turn the bridge on at the title screen and start its detached playbook capture."""
-    try:
-        if not ctx.instance.get('trace_jsonl'):
-            raise KeyError('trace_jsonl')
-        trace = instance_path(ctx, 'trace_jsonl')
-    except KeyError:
-        raise RuntimeError('bridge_on needs a trace run: the title-screen witness is a trace point '
-                           '(start Eden with a trace config and the GDB stub off)') from None
+    trace = None
+    if ctx.instance.get('trace_jsonl'):
+        try:
+            trace = instance_path(ctx, 'trace_jsonl')
+        except KeyError:
+            raise RuntimeError('bridge_on needs a trace run: the title-screen witness is a trace point '
+                               '(start Eden with a trace config and the GDB stub off)') from None
+    elif str((ctx.call('settings.get', {'key': 'core.use_gdbstub'}) or {}).get('value')).lower() != 'true':
+        raise RuntimeError('bridge_on needs a trace run (GDB stub off) or a stub-on run '
+                           '(core.use_gdbstub true); this instance is neither')
     if port is None:
         try:
             port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())
         except (KeyError, OSError, ValueError):
             raise RuntimeError('bridge_on needs a port argument or an integer in profile port.txt') from None
-    chord = _bridge_on_cold_enable(ctx, trace)
+    chord = _bridge_on_cold_enable(ctx, trace) if trace is not None else _bridge_on_stub_enable(ctx)
     until = time.monotonic() + 5
     listening = last_listen = None
     pattern = re.compile(r'\[Bridge\] listening port=' + re.escape(str(port)) + r'\b')
@@ -3247,6 +3371,7 @@ def bridge_on(ctx, port=None, cap=60):
                            f'expected "[Bridge] listening port={port}" in its own events log, '
                            f'saw: {last_listen or "no listen line"}. Another process holds the port: '
                            'give the run its own free port (port.txt) and boot again. No capture was started.')
+    listener = _bridge_on_owned_listener(ctx, port) if trace is None else None
     run = Path(ctx.row_dir).parent / 'bridge-run'
     (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
     log = run / 'bridge.log'
@@ -3295,6 +3420,7 @@ def bridge_on(ctx, port=None, cap=60):
             raise RuntimeError(f'bridge install line lacks {want}: {install}')
     if not re.search(r'\btoggle_gen=[1-9][0-9]*\b', hello):
         raise RuntimeError(f'bridge greeting lacks a positive On generation: {hello}')
+    title = _bridge_on_stub_title(ctx, hello) if trace is None else None
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:
@@ -3304,11 +3430,15 @@ def bridge_on(ctx, port=None, cap=60):
         if backup is not None:
             break
         time.sleep(0.1)
-    return _save(ctx, 'routes-bridge-on', {
+    receipt = {
         'block': 'bridge_on', 'chord': chord, 'listening': listening, 'hello': hello, 'install': install, 'backup': backup,
         'backup_open': bool(backup and re.search(r'\[Bridge\] req backup result=ok(?: |$)', backup)),
         'capture': {'pid': pid, 'port': port, 'bridge_log': str(log)}, 'reused': reused,
-    })
+        'witness': 'stub-on' if trace is None else 'trace',
+    }
+    if trace is None:
+        receipt.update(listener=listener, title=title)
+    return _save(ctx, 'routes-bridge-on', receipt)
 
 
 def _apply_settings(ctx, data, cap=30):
