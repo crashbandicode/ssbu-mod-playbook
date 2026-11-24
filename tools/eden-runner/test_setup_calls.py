@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fake_clock
 import native_picker as picker
 import routes
 import test_native_picker as recorded
@@ -412,6 +413,7 @@ def retrying_menu(ctx, advance):
 
 class SetupCallsR2Tests(unittest.TestCase):
     def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker)
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.bridge = Path(self.dir.name) / 'bridge'
