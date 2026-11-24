@@ -482,10 +482,25 @@ gate can read from the loop that binds each `{name}`:
 
 A number is one written out or the one integer `const` of that name in the
 file. So with `CPU_ENTRIES = 8` and `.skip(1)` the gate accepts `cpu.1.ai_thinks`
-to `cpu.7.ai_thinks` and refuses `cpu.0`, `cpu.8` and `cpu.04`. A placeholder
-bound any other way (a function parameter, a slice, another iterator adapter, a
-name bound again inside the loop, a `{name:…}` format) writes no key; the G2
-error for a read of that shape names the template, its line and the reason.
+to `cpu.7.ai_thinks` and refuses `cpu.0`, `cpu.8` and `cpu.04`. Placeholders
+bound by the same loop are taken together, pass by pass: a loop over
+`[("player", "left"), ("partner", "right")]` writing `{group}.{kind}` gives
+`player.left` and `partner.right` only. Placeholders of different loops combine.
+
+A template writes no key when the gate cannot show which values reach the
+write:
+
+- a placeholder bound any other way (a function parameter, a slice, another
+  iterator adapter);
+- a `mut` binding;
+- a loop with a `break`, `continue` or `return` in it;
+- the name used inside its loop before the key is written (a condition on it,
+  arithmetic, a new binding).
+
+The G2 error for a read of that shape names the template, its line and the
+reason. A `{name:…}` format or a positional `{}` in a key is not read as a
+template. The gate does not follow which branch runs otherwise: a key written
+under a condition on something else counts as written.
 The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means

@@ -418,22 +418,26 @@ def _template_loop_values(loop, path, name, code, close, strings):
 
 
 def _template_values(name, at, arguments, code, close, strings, loops):
-    """What `name` can hold in a format string at `at`: (values, how to say them) or (None, why not)."""
+    """What `name` can hold in a format string at `at`, one value per pass of the loop that binds it: (values, how
+    to say them, that loop) or (None, why they cannot be told, None). Anything that could make the written values
+    differ from the loop's own is refused: the gate does not follow arithmetic, conditions or early exits."""
     if re.search(r'\b' + name + r'\s*=(?!=)', arguments):
-        return None, f'{name} is a named argument of the macro'
+        return None, f'{name} is a named argument of the macro', None
     for loop in sorted((loop for loop in loops if loop['open'] < at < loop['close']), key=lambda loop: -loop['open']):
         if not re.search(r'\b' + name + r'\b', loop['pattern']):
             continue
+        if re.search(r'\bmut\s+' + name + r'\b', loop['pattern']):
+            return None, f'{name} is a mutable binding', None
         path = _template_path(loop['pattern'], name)
         if path is None:
-            return None, f'the loop pattern that binds {name} is not a name or a tuple of names'
-        between = code[loop['open']:at]
-        if (re.search(r'\blet\b[^=;]*\b' + name + r'\b[^=;]*=', between)
-                or re.search(r'\|[^|;{}]*\b' + name + r'\b[^|;{}]*\|', between)
-                or re.search(r'\b' + name + r'\b[^;{}=]*=>', between)):
-            return None, f'{name} is bound again inside its loop'
-        return _template_loop_values(loop, path, name, code, close, strings)
-    return None, f'no loop around the key binds {name}'
+            return None, f'the loop pattern that binds {name} is not a name or a tuple of names', None
+        if re.search(r'\b(?:break|continue|return)\b', code[loop['open']:loop['close']]):
+            return None, 'its loop can stop or skip a pass (break, continue or return)', None
+        if re.search(r'\b' + name + r'\b', code[loop['open']:at]):
+            return None, f'{name} is used inside its loop before the key is written', None
+        values, said = _template_loop_values(loop, path, name, code, close, strings)
+        return values, said, loop if values is not None else None
+    return None, f'no loop around the key binds {name}', None
 
 
 def _template_keys(text):
@@ -465,17 +469,26 @@ def _template_keys(text):
             names = list(dict.fromkeys(re.findall(r'\{(' + _TEMPLATE_NAME + r')\}', template)))
             if not names:
                 continue
-            combos, said, reason = [{}], [], None
+            bound, reason = {}, None
             for name in names:
-                values, detail = _template_values(name, start, arguments, code, close, strings, loops)
+                values, detail, loop = _template_values(name, start, arguments, code, close, strings, loops)
                 if values is None:
                     reason = detail
                     break
-                if len(combos) * len(values) > _TEMPLATE_LIMIT:
+                bound.setdefault(loop['open'], []).append((name, values, detail))
+            # Placeholders of one loop belong together, pass by pass; only different loops combine.
+            combos, said = [{}], []
+            for group in bound.values() if reason is None else ():
+                if len({len(values) for _, values, _ in group}) != 1:
+                    reason = 'placeholders of one loop give lists of different lengths'
+                    break
+                passes = [{name: values[index] for name, values, _ in group} for index in range(len(group[0][1]))]
+                if len(combos) * len(passes) > _TEMPLATE_LIMIT:
                     reason = f'it would write more than {_TEMPLATE_LIMIT} keys'
                     break
-                combos = [{**combo, name: value} for combo in combos for value in values]
-                said.append(detail)
+                combos = [{**combo, **one} for combo in combos for one in passes]
+                details = ' and '.join(detail for _, _, detail in group)
+                said.append(details + (', pass by pass' if len(group) > 1 else ''))
             notes.append((template, text.count('\n', 0, start) + 1, ', '.join(said), reason))
             if reason is not None:
                 continue
