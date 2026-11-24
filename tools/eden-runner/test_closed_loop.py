@@ -133,15 +133,77 @@ class ClosedLoopTests(unittest.TestCase):
         fake.run([recover, latched])
         self.assertEqual([name for name, _ in fake.sends], ['recover', 'a'])
 
-    def test_a_latched_step_ends_when_the_final_step_is_done(self):
+    def test_a_latched_step_is_not_ended_by_the_final_step(self):
         fake = Script(lambda f: 'final' if f.sends else 'source')
         latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
                        'a', cap=5, latch=True)
         final = step('last', 'elsewhere', 'final')
-        result = fake.run([latched, final])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([latched, final])
+        self.assertEqual(caught.exception.step, 'latched')
         self.assertEqual(fake.sends, [('a', 0)])
-        self.assertEqual(fake.finishes, 1)
-        self.assertTrue(result['steps'][-1]['skipped'])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_idle_poll_cannot_outlive_a_first_send_window(self):
+        for delay in (.2, .8):
+            with self.subTest(delay=delay):
+                now, sent, caps = [0.0], [], []
+
+                def observe():
+                    return 'done' if sent else 'source' if now[0] >= 2.7 - 1e-9 else 'waiting'
+
+                def idle(cap):
+                    caps.append(cap)
+                    now[0] += delay
+                    return None
+
+                item = Step('press', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                            'a', cap=5, ready_cap=3, screen=lambda obs: obs == 'waiting')
+                args = ('fixture', [item], observe, lambda macro: sent.append((macro, now[0])), lambda: None)
+                options = dict(clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+                               poll=.3, idle=idle)
+                if delay == .8:
+                    with self.assertRaises(RouteStopped) as caught:
+                        run(*args, **options)
+                    self.assertIn('not ready', caught.exception.reason)
+                    self.assertIn('the send window closed while the input channel was polled', caught.exception.reason)
+                    self.assertEqual(sent, [])
+                else:
+                    run(*args, **options)
+                    self.assertEqual(len(sent), 1)
+                    self.assertLess(sent[0][1], 3)
+                self.assertAlmostEqual(caps[0], .3)
+
+    def test_idle_poll_cannot_outlive_a_resend_window(self):
+        for delay in (.2, .8):
+            with self.subTest(delay=delay):
+                now, sent, caps = [0.0], [], []
+
+                def observe():
+                    return 'done' if len(sent) >= 2 else 'source'
+
+                def idle(cap):
+                    caps.append(cap)
+                    if sent:
+                        now[0] += delay
+                    return None
+
+                item = Step('press', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                            'a', cap=3.5, lost_after=2)
+                args = ('fixture', [item], observe, lambda macro: sent.append((macro, now[0])), lambda: None)
+                options = dict(clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+                               poll=1, idle=idle)
+                if delay == .8:
+                    with self.assertRaises(RouteStopped) as caught:
+                        run(*args, **options)
+                    self.assertIn('no transition within cap', caught.exception.reason)
+                    self.assertIn('the send window closed while the input channel was polled', caught.exception.reason)
+                    self.assertEqual(len(sent), 1)
+                else:
+                    run(*args, **options)
+                    self.assertEqual(len(sent), 2)
+                    self.assertLess(sent[1][1], 3.5)
+                self.assertAlmostEqual(caps[-1], .5)
 
     def test_a_latched_step_does_not_confirm_an_unanswered_or_late_read(self):
         for late in (False, True):

@@ -1481,6 +1481,96 @@ class RunnerTests(unittest.TestCase):
             worker.join(1)
             self.assertFalse(worker.is_alive())
 
+    def test_a_gate_superseded_before_publication_writes_no_freshness_line(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        entered, release, errors = threading.Event(), threading.Event(), []
+        sha256 = runner.still_fresh.hashlib.sha256
+
+        def digest(data=b''):
+            if threading.current_thread() is old:
+                entered.set()
+                release.wait(2)
+            return sha256(data)
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'red')
+            except Exception as error:
+                errors.append(error)
+
+        old = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner.still_fresh.hashlib, 'sha256', side_effect=digest), \
+                    mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                old.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'red')
+                release.set()
+                old.join(1)
+            self.assertFalse(old.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            rows = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(set(run.still_records), {rows[0]['path']})
+        finally:
+            release.set()
+            old.join(1)
+            self.assertFalse(old.is_alive())
+
+    def test_gate_publication_and_supersession_are_serialized(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        entered, release, successor_started = threading.Event(), threading.Event(), threading.Event()
+        errors, paths = [], {}
+        append = run.stills.append
+
+        def delayed_append(record):
+            paths[threading.current_thread().name] = record['path']
+            if threading.current_thread() is old:
+                entered.set()
+                release.wait(2)
+            return append(record)
+
+        def gate():
+            try:
+                if threading.current_thread() is successor:
+                    successor_started.set()
+                run.check_gate('a', 'red')
+            except Exception as error:
+                errors.append(error)
+
+        old = threading.Thread(target=gate, name='old')
+        successor = threading.Thread(target=gate, name='successor')
+        try:
+            with mock.patch.object(run.stills, 'append', side_effect=delayed_append), \
+                    mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                old.start()
+                self.assertTrue(entered.wait(1))
+                successor.start()
+                self.assertTrue(successor_started.wait(1))
+                successor.join(.1)
+                waited_for_append = successor.is_alive()
+                release.set()
+                old.join(1)
+                successor.join(1)
+            self.assertFalse(old.is_alive())
+            self.assertFalse(successor.is_alive())
+            self.assertTrue(waited_for_append)
+            rows = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
+            self.assertEqual([row['path'] for row in rows], [paths['old'], paths['successor']])
+            self.assertEqual(set(run.still_records), set(paths.values()))
+            self.assertTrue(all(isinstance(error, routes.closed_loop.DispatchRejected) for error in errors))
+        finally:
+            release.set()
+            old.join(1)
+            successor.join(1)
+            self.assertFalse(old.is_alive())
+            self.assertFalse(successor.is_alive())
+
     def test_a_superseded_hook_cannot_change_gate_evidence(self):
         eden = FakeEden({})
         run = self.make(eden)

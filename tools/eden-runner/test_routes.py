@@ -6304,6 +6304,62 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(self.io.actions, ['lobby-a'])
                 self.assertEqual(self.io.pending, 'lobby-a')
 
+    def test_dashboard_a_does_not_accept_waiting_without_a_ready_room_list(self):
+        self.io.dashboard, self.io.dashboard_index = 'open', 2
+        send = self.io.send
+
+        def jump_to_waiting(macro):
+            send(macro)
+            if macro == 'lobby-a':
+                self.io.phase = 'waiting'
+
+        self.io.send = jump_to_waiting
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_route(guest=False)
+        self.assertEqual(caught.exception.step, 'dashboard-a')
+        self.assertIn('the room list did not appear', caught.exception.reason)
+        self.assertEqual(self.io.actions, ['lobby-a'])
+
+    def test_dashboard_idle_poll_cannot_outlive_the_send_window(self):
+        for guest in (False, True):
+            for delay in (0, .8):
+                with self.subTest(guest=guest, delay=delay):
+                    self.io = self.IO()
+                    self.now = 0
+                    read, send = self.io.read, self.io.send
+                    times, polls = [], []
+
+                    def timed_read(provider, cap):
+                        sample = read(provider, cap)
+                        if provider == 'ssbu.ui' and self.io.phase == 'main' and self.now < 2.7 - 1e-9:
+                            sample.block['values']['input.ready'] = 'no'
+                        return sample
+
+                    def timed_send(macro):
+                        times.append((macro, self.now))
+                        return send(macro)
+
+                    def call(method):
+                        if method == 'macro.status' and not self.io.actions:
+                            polls.append(self.now)
+                            self.now += delay
+                        return {'state': 'finished'}
+
+                    self.io.read, self.io.send, self.ctx.call = timed_read, timed_send, call
+                    if delay:
+                        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                            self.run_route(guest)
+                        self.assertEqual(caught.exception.step, 'open-dashboard')
+                        self.assertIn('the send window closed while the input channel was polled',
+                                      caught.exception.reason)
+                        self.assertEqual(times, [])
+                    else:
+                        self.run_route(guest)
+                        self.assertEqual(times[0][0], 'tap-zr1')
+                        self.assertAlmostEqual(times[0][1], 2.7)
+                        self.assertEqual(sum(macro == 'tap-zr1' for macro, _ in times), 1)
+                    self.assertAlmostEqual(polls[0], 2.7)
+
     def test_dashboard_a_waits_for_a_slow_list_without_repeating(self):
         for guest in (False, True):
             with self.subTest(guest=guest):
