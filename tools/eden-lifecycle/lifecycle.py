@@ -98,7 +98,7 @@ class Refused(RuntimeError):
 class LedgerTransport(Refused):
     def __init__(self, diagnoses):
         if isinstance(diagnoses, str):
-            diagnoses = [{'line': diagnoses, 'cause': 'unknown', 'transient': False, 'phase': 'none',
+            diagnoses = [{'line': diagnoses, 'cause': 'unknown', 'transient': False, 'phase': 'unknown',
                           'evidence': ''}]
         self.diagnoses = diagnoses
         self.transient = bool(diagnoses[-1]['transient'])
@@ -529,10 +529,11 @@ def foreign_edens(admission):
 
 
 class Ledger:
-    def __init__(self, path, host, owner, token, remote=None, *, label=None, exclusive_host=False):
+    def __init__(self, path, host, owner, token, remote=None, *, label=None, exclusive_host=False, state_dir=None):
         self.path, self.host, self.owner, self.token = str(path), host, owner, token
         self.remote, self.label = remote, label
         self.exclusive_host = exclusive_host
+        self.state_dir = state_dir
 
     def operate(self, operation, stale_claim_hours=None, admission=None, *, approver=None):
         if globals().get('_LEDGER_BRIDGE'):
@@ -540,7 +541,8 @@ class Ledger:
         if self.remote:
             config = {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
                       'stale_claim_hours': stale_claim_hours, 'admission': admission,
-                      'label': self.label, 'approver': approver, 'exclusive_host': self.exclusive_host}
+                      'label': self.label, 'approver': approver, 'exclusive_host': self.exclusive_host,
+                      'state_dir': str(self.state_dir) if self.state_dir is not None else None}
             return ledger_forward(self.remote, operation, config)
         path = safe_absolute(self.path)
         require(path.is_file(), 'Authoritative ledger must already exist')
@@ -1594,11 +1596,20 @@ class Lifecycle:
             line = (f"\n## {datetime.now(timezone.utc):%H:%M:%S}Z {spec.get('from', 'eden-lifecycle')} "
                     f"{self.c['label']} → {spec.get('to', self.c['owner'])} | {text}\n")
             if spec.get('ssh'):
-                with SshMux(spec['ssh']) as mux:
-                    done = subprocess.run(['ssh', '-T', *mux.rider_args, spec['ssh'],
-                                           'cat >> ' + shlex.quote(spec['file'])],
-                                          input=line, capture_output=True, text=True, timeout=10)
-                require(done.returncode == 0, 'notify SSH failed: ' + (done.stderr or '')[-500:])
+                with SshMux(spec['ssh'], evidence_dir=self.directory) as mux:
+                    try:
+                        done = subprocess.run(['ssh', '-T', *mux.rider_args, spec['ssh'],
+                                               'cat >> ' + shlex.quote(spec['file'])],
+                                              input=line, capture_output=True, text=True, timeout=10)
+                    except subprocess.TimeoutExpired as error:
+                        diagnosis = ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
+                        ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'notify'}, self.directory)
+                        raise Refused(f'notify SSH failed: {error}; {diagnosis["line"]}') from error
+                    diagnosis = ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
+                    if diagnosis:
+                        ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'notify'}, self.directory)
+                    require(done.returncode == 0, 'notify SSH failed: ' + (done.stderr or '')[-500:] +
+                            (f'; {diagnosis["line"]}' if diagnosis else ''))
             else:
                 path = safe_absolute(spec['file'])
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1650,7 +1661,7 @@ class Lifecycle:
     def ledger(self, token=None):
         return self.injected_ledger if self.injected_ledger is not None else Ledger(
             self.c['ledger'], self.c['host'], self.c['owner'], token or self.state['token'], self.c.get('ledger_ssh'),
-            label=self.c['label'], exclusive_host=self.c.get('exclusive_host', False))
+            label=self.c['label'], exclusive_host=self.c.get('exclusive_host', False), state_dir=self.directory)
 
     def reserve_exclusive(self, approver):
         require(self.c.get('exclusive_host'), 'Exclusive reservation requires exclusive_host=true')
@@ -1789,7 +1800,8 @@ class Lifecycle:
         if self.injected_ledger is not None:
             return getattr(self.injected_ledger, 'open_text', '')
         if self.c.get('ledger_ssh'):
-            info = Ledger(self.c['ledger'], self.c['host'], self.c['owner'], '0' * 32, self.c.get('ledger_ssh')).inspect()
+            info = Ledger(self.c['ledger'], self.c['host'], self.c['owner'], '0' * 32,
+                          self.c.get('ledger_ssh'), state_dir=self.directory).inspect()
             return '\n'.join(info.get('open') or [])
         path = safe_absolute(self.c['ledger'])
         require(path.is_file(), 'Authoritative ledger must already exist')
@@ -2879,16 +2891,14 @@ class Lifecycle:
 
 
 def ssh_phase(text):
-    if not text or not text.strip():
-        return 'unknown'
-    for pattern, phase in ((r'Connecting to', 'none'),
-                           (r'Connection established', 'tcp'),
-                           (r'Remote protocol version', 'banner'),
-                           (r'SSH2_MSG_NEWKEYS received', 'kex'),
-                           (r'Authenticated to', 'auth')):
-        if not re.search(pattern, text, re.I):
+    for pattern, phase in ((r'Authenticated to|Entering interactive session', 'session'),
+                           (r'SSH2_MSG_NEWKEYS received', 'auth'),
+                           (r'Remote protocol version', 'kex'),
+                           (r'Connection established', 'banner'),
+                           (r'Connecting to', 'tcp')):
+        if re.search(pattern, text or '', re.I):
             return phase
-    return 'session'
+    return 'unknown'
 
 
 def target_healthy(diag_login, target):
@@ -3101,17 +3111,22 @@ $os = Get-CimInstance Win32_OperatingSystem
 
 def ssh_diagnosis(host, run=subprocess.run, evidence_dir=None, tcp=None, ssh_options=(),
                   attempt_log=None, mux_dir=None, ssh_bin='ssh', windows=False, allow_retry=True,
-                  attempt_timed_out=False, attempt_killed=False):
+                  attempt_timed_out=False, attempt_killed=False, rider=False):
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
     directory = Path(evidence_dir) if evidence_dir is not None else (
         Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'eden-lifecycle' / 'ssh-diag')
-    directory.mkdir(parents=True, exist_ok=True)
-    evidence = directory / ('ssh-' + uuid.uuid4().hex + '.log')
     try:
         text = Path(attempt_log).read_text(encoding='utf-8', errors='replace') if attempt_log else ''
     except OSError:
         text = ''
-    evidence.write_text(text, encoding='utf-8')
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        evidence = directory / ('ssh-' + uuid.uuid4().hex + '.log')
+        evidence.write_text(text, encoding='utf-8')
+    except OSError:
+        directory = Path(tempfile.mkdtemp(prefix='eden-ssh-diag-'))
+        evidence = directory / ('ssh-' + uuid.uuid4().hex + '.log')
+        evidence.write_text(text, encoding='utf-8')
     phase = ssh_phase(text)
     probe_log = evidence.with_suffix('.log.diag')
     direct = ['-T', *SSH_OPTIONS, *ssh_options, '-o', 'ControlPath=none']
@@ -3184,15 +3199,65 @@ def ssh_diagnosis(host, run=subprocess.run, evidence_dir=None, tcp=None, ssh_opt
                                           rtt_match.group(3) if rtt_match else None,
                                           attempt_timed_out, attempt_killed)
     sockets = _control_socket_count(mux_dir)
-    line = (f'ssh diag {socket.gethostname()} -> {host} ({hostname}): attempt phase {phase}; '
+    attempt_phase = f'{phase} (rider on an open master)' if rider and phase == 'session' else phase
+    line = (f'ssh diag {socket.gethostname()} -> {host} ({hostname}): attempt phase {attempt_phase}; '
             f'message {message or "none"}; diag login {diag_login}; tcp22 {tcp_status}; ping loss {loss} avg {avg}; '
             f'IPQoS=none probe {qos_status}; target {target_display}; '
             f'local ssh processes {_ssh_process_count(host, hostname, run)}; control sockets {sockets}; '
             f'cause: {cause}; retry: {"yes, once" if transient and allow_retry else "no"}; evidence {evidence}')
-    with (directory / 'ssh-diag.md').open('a', encoding='utf-8') as stream:
-        stream.write(line + '\n')
     print(line, file=sys.stderr, flush=True)
     return {'line': line, 'transient': transient, 'phase': phase, 'cause': cause, 'evidence': str(evidence)}
+
+
+def ssh_receipt(diagnosis, where=None):
+    directory = Path(where) if where is not None else (
+        Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'eden-lifecycle' / 'ssh-diag')
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / 'ssh-diag.md').open('a', encoding='utf-8') as stream:
+            line = str(diagnosis['line']).replace('\r', ' ').replace('\n', ' ')
+            stream.write(f"{stamp()} {diagnosis.get('kind', 'ssh')} {diagnosis.get('what', 'connection')} : {line}\n")
+    except OSError:
+        pass
+
+
+def ssh_master_dead(mux):
+    try:
+        return mux._control('check').returncode != 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+
+
+def ssh_transport_failure(mux, kind, returncode, stderr, timed_out=False):
+    if kind == 'ssh':
+        failed = timed_out or returncode == 255
+    elif kind == 'rsync':
+        failed = timed_out or returncode in (255, 10, 12, 30, 35)
+    elif kind == 'scp':
+        failed = timed_out or returncode == 255 or (returncode != 0 and (
+            re.search(r'Connection (?:closed|reset|refused|timed out)|lost connection|Broken pipe|ssh: ',
+                      stderr or '', re.I) or ssh_master_dead(mux)))
+    else:
+        raise ValueError(f'Unknown SSH rider kind {kind!r}')
+    if not failed:
+        return None
+    log = getattr(mux, 'master_log', None)
+    try:
+        if log is not None and not Path(log).is_file():
+            log = None
+    except OSError:
+        log = None
+    try:
+        diagnosis = ssh_diagnosis(mux.host, run=getattr(mux, 'run', subprocess.run),
+                                  evidence_dir=getattr(mux, 'evidence_dir', None),
+                                  ssh_options=getattr(mux, 'options', ()), attempt_log=log,
+                                  mux_dir=getattr(mux, 'root', None), ssh_bin=getattr(mux, 'ssh_bin', 'ssh'),
+                                  windows=getattr(mux, 'windows', False), allow_retry=False,
+                                  attempt_timed_out=timed_out, rider=True)
+        return {**diagnosis, 'transient': False}
+    except OSError as error:
+        return {'line': f'ssh diag {mux.host}: unavailable ({error})', 'transient': False,
+                'phase': 'unknown', 'cause': 'diagnosis unavailable'}
 
 
 class SshMux:
@@ -3200,6 +3265,7 @@ class SshMux:
     _directories = {}
     _references = {}
     _ready = set()
+    _master_logs = {}
     _sequence = 0
 
     def __init__(self, host, run=subprocess.run, ssh_options=(), ssh_bin='ssh', windows=False,
@@ -3212,6 +3278,7 @@ class SshMux:
         self.entered = False
         self.attempt_deadline = None
         self.open_generation = 0
+        self.master_log = None
 
     @property
     def rider_args(self):
@@ -3234,6 +3301,7 @@ class SshMux:
             diagnosis = ssh_diagnosis(self.host, run=self.run, evidence_dir=self.evidence_dir,
                                       ssh_options=self.options, ssh_bin=self.ssh_bin, windows=self.windows,
                                       allow_retry=False)
+            ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'master configuration'}, self.evidence_dir)
             raise LedgerTransport([diagnosis])
         path = Path(match.group(1).strip())
         require(path.parent == self.root and path.name != '%C', 'Unsafe SSH control path')
@@ -3319,6 +3387,7 @@ class SshMux:
             if self.key in self._ready:
                 try:
                     if self._control('check').returncode == 0:
+                        self.master_log = self._master_logs.get(self.key)
                         return
                 except (OSError, subprocess.TimeoutExpired):
                     pass
@@ -3346,6 +3415,7 @@ class SshMux:
                     remaining = deadline - time.monotonic()
                     if result == 0 and remaining > 0 and self._control('check', min(3, remaining)).returncode == 0:
                         self._ready.add(self.key)
+                        self.master_log = self._master_logs[self.key] = log
                         self.attempt_deadline = deadline
                         self.open_generation += 1
                         return
@@ -3375,6 +3445,7 @@ class SshMux:
                                           ssh_options=self.options, attempt_log=log, mux_dir=self.root,
                                           ssh_bin=self.ssh_bin, windows=self.windows, allow_retry=attempt == 0,
                                           attempt_timed_out=attempt_timed_out, attempt_killed=attempt_killed)
+                ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'master'}, self.evidence_dir)
                 diagnoses.append(diagnosis)
                 if attempt or not diagnosis['transient']:
                     raise LedgerTransport(diagnoses)
@@ -3394,6 +3465,7 @@ class SshMux:
                 except (OSError, subprocess.TimeoutExpired):
                     pass
                 self._ready.discard(self.key)
+                self._master_logs.pop(self.key, None)
             root = str(self.root)
             self._directories[root] -= 1
             if not self._directories[root]:
@@ -3416,19 +3488,23 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
     packet = {'mode': mode, 'config': config, 'execute': execute, 'source': source,
               'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause,
               'keep_state': keep_state, 'evidence_dir': evidence_dir}
-    with SshMux(host, run=run) as mux:
+    with SshMux(host, run=run, evidence_dir=config.get('state_dir')) as mux:
         mux.ensure()
         log = mux.root / ('rider-' + uuid.uuid4().hex + '.log')
         command = ['ssh', '-T', *mux.rider_args, '-vvv', '-E', str(log), host,
                    '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
         try:
             done = run(command, input=json.dumps(packet), capture_output=True, text=True, timeout=900)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            diagnosis = ssh_diagnosis(host, run=run, attempt_log=log, mux_dir=mux.root, allow_retry=False)
-            raise Refused('SSH lifecycle failed: ' + diagnosis['line']) from error
-        if done.returncode == 255:
-            diagnosis = ssh_diagnosis(host, run=run, attempt_log=log, mux_dir=mux.root, allow_retry=False)
-            raise Refused('SSH lifecycle failed: ' + diagnosis['line'])
+        except subprocess.TimeoutExpired as error:
+            diagnosis = ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
+            ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'lifecycle {mode}'}, config.get('state_dir'))
+            raise Refused(f'SSH lifecycle failed: {error}; {diagnosis["line"]}') from error
+        except OSError as error:
+            raise Refused(f'SSH lifecycle failed: {error}') from error
+        diagnosis = ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
+        if diagnosis:
+            ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'lifecycle {mode}'}, config.get('state_dir'))
+            raise Refused('SSH lifecycle failed: ' + (done.stderr or '')[-2000:] + '; ' + diagnosis['line'])
         require(done.returncode == 0, 'SSH lifecycle failed: ' + done.stderr[-2000:] + done.stdout[-2000:])
         return json.loads(done.stdout)
 
@@ -3442,50 +3518,39 @@ def ledger_forward(host, operation, config, run=subprocess.run):
     encoded = base64.b64encode(script.encode('utf-16-le')).decode()
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
     packet = {'mode': 'ledger-' + operation, 'config': config, 'execute': True, 'source': source}
-    diagnoses = []
     started = time.monotonic()
-    with SshMux(host, run=run) as mux:
+    with SshMux(host, run=run, evidence_dir=config.get('state_dir')) as mux:
         deadline = mux.attempt_deadline or started + LEDGER_ATTEMPT_SECONDS
-        for attempt in range(2):
-            if attempt:
-                deadline = time.monotonic() + LEDGER_ATTEMPT_SECONDS
-            generation = mux.open_generation
-            try:
-                mux.ensure()
-            except LedgerTransport as error:
-                raise LedgerTransport([*diagnoses, *error.diagnoses]) from error
-            if mux.open_generation != generation:
-                deadline = mux.attempt_deadline
-            log = mux.root / ('rider-' + uuid.uuid4().hex + '.log')
-            command = ['ssh', '-T', *mux.rider_args, '-vvv', '-E', str(log), host,
-                       '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
-            attempt_timed_out = attempt_killed = operation_started = False
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, LEDGER_ATTEMPT_SECONDS)
-                operation_started = True
-                done = run(command, input=json.dumps(packet), capture_output=True, text=True,
-                           timeout=remaining)
-                if done.returncode not in (0, 255):
-                    raise Refused('SSH lifecycle failed: ' + (done.stderr or '')[-2000:] + (done.stdout or '')[-2000:])
-                if done.returncode == 0:
-                    try:
-                        result = json.loads(done.stdout)
-                        if not isinstance(result, dict):
-                            raise ValueError('ledger reply is not an object')
-                        return result
-                    except (ValueError, TypeError):
-                        pass
-            except subprocess.TimeoutExpired:
-                attempt_timed_out, attempt_killed = True, operation_started
-            except OSError:
-                pass
-            diagnosis = ssh_diagnosis(host, run=run, attempt_log=log, mux_dir=mux.root, allow_retry=attempt == 0,
-                                      attempt_timed_out=attempt_timed_out, attempt_killed=attempt_killed)
-            diagnoses.append(diagnosis)
-            if attempt or not diagnosis['transient']:
-                raise LedgerTransport(diagnoses)
+        generation = mux.open_generation
+        mux.ensure()
+        if mux.open_generation != generation:
+            deadline = mux.attempt_deadline
+        log = mux.root / ('rider-' + uuid.uuid4().hex + '.log')
+        command = ['ssh', '-T', *mux.rider_args, '-vvv', '-E', str(log), host,
+                   '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, LEDGER_ATTEMPT_SECONDS)
+            done = run(command, input=json.dumps(packet), capture_output=True, text=True, timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            diagnosis = ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
+            ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'ledger {operation}'}, config.get('state_dir'))
+            raise LedgerTransport([diagnosis]) from error
+        except OSError as error:
+            raise Refused(f'SSH lifecycle failed: {error}') from error
+        diagnosis = ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
+        if diagnosis:
+            ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'ledger {operation}'}, config.get('state_dir'))
+            raise LedgerTransport([diagnosis])
+        require(done.returncode == 0, 'SSH lifecycle failed: ' + (done.stderr or '')[-2000:] + (done.stdout or '')[-2000:])
+        try:
+            result = json.loads(done.stdout)
+            if not isinstance(result, dict):
+                raise ValueError('ledger reply is not an object')
+            return result
+        except (ValueError, TypeError) as error:
+            raise Refused(f'SSH lifecycle failed: invalid ledger reply: {error}') from error
 
 
 def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
@@ -3546,19 +3611,11 @@ def remote_main(packet):
 def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
                     watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
     # SSH exec is always non-login/noninteractive (-T, explicit MSI pwsh -NoProfile).
-    # 1312 is a pre-launch Windows logon failure: retry ONCE, never replay a claim/Up.
-    # It is a Windows logon error after SSH succeeds, not an SSH transport failure.
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes')
-    with SshMux(host, ssh_options=options, windows=True) as mux:
-        for attempt in range(2):
-            mux.ensure()
-            try:
-                return _forward_windows_once(host, mode, config, execute, popen, ledger_factory,
-                                              watchdog_rounds, watchdog_pause, keep_state, evidence_dir, mux=mux)
-            except Refused as error:
-                if not (attempt == 0 and getattr(error, 'transport_not_started', False)
-                        and 'CreateProcessAsUserW failed: 1312' in str(error)):
-                    raise
+    with SshMux(host, ssh_options=options, windows=True, evidence_dir=config.get('state_dir')) as mux:
+        mux.ensure()
+        return _forward_windows_once(host, mode, config, execute, popen, ledger_factory,
+                                     watchdog_rounds, watchdog_pause, keep_state, evidence_dir, mux=mux)
 
 
 def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
@@ -3596,6 +3653,14 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
     error_thread.start()
     end = time.monotonic() + 900
     token_seen = bound = None
+    def failed(message, code, timed_out=False):
+        diagnosis = ssh_transport_failure(mux, 'ssh', code, ''.join(errors), timed_out=timed_out)
+        if diagnosis:
+            ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'Windows lifecycle {mode}'}, config.get('state_dir'))
+            message += '; ' + diagnosis['line']
+        error = Refused(message)
+        error.transport_not_started = token_seen is None
+        return error
     try:
         process.stdin.write(json.dumps({'mode': mode, 'config': config, 'execute': execute,
                                        'source': source, 'ledger_bridge': True,
@@ -3604,17 +3669,19 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
         process.stdin.flush()
         while True:
             remaining = end - time.monotonic()
-            require(remaining > 0, 'Windows SSH lifecycle deadline; use down with the same journal')
+            if remaining <= 0:
+                raise failed('Windows SSH lifecycle deadline; use down with the same journal', None, True)
             try:
                 line = messages.get(timeout=remaining)
             except queue.Empty:
-                raise Refused('Windows SSH lifecycle deadline; use down with the same journal')
+                raise failed('Windows SSH lifecycle deadline; use down with the same journal', None, True)
             if line is None:
-                process.wait(timeout=3)
+                try:
+                    code = process.wait(timeout=3)
+                except subprocess.TimeoutExpired as cause:
+                    raise failed('Windows SSH disconnected: process did not exit', None, True) from cause
                 error_thread.join(timeout=2)
-                error = Refused('Windows SSH disconnected: ' + ''.join(errors)[-2000:])
-                error.transport_not_started = token_seen is None
-                raise error
+                raise failed('Windows SSH disconnected: ' + ''.join(errors)[-2000:], code)
             message = json.loads(line)
             if 'ledger_request' in message:
                 request = message['ledger_request']
@@ -3630,6 +3697,8 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
                 require(mode not in ('status', 'preflight') or request['operation'] == 'read',
                         'Preflight/status cannot mutate a ledger')
                 ledger = ledger_factory(config['ledger'], 'ally', config['owner'], token, config.get('ledger_ssh'))
+                if hasattr(ledger, 'state_dir'):
+                    ledger.state_dir = config.get('state_dir')
                 try:
                     result = ledger.operate(request['operation'], request.get('stale_claim_hours'), request.get('admission'))
                     reply = {'result': result}
@@ -3640,15 +3709,23 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
                 process.stdin.write(json.dumps(reply) + '\n')
                 process.stdin.flush()
             elif 'lifecycle_result' in message:
-                require(process.wait(timeout=15) == 0, 'Windows SSH failed after reply')
+                try:
+                    code = process.wait(timeout=15)
+                except subprocess.TimeoutExpired as cause:
+                    raise failed('Windows SSH failed after reply: process did not exit', None, True) from cause
+                if code != 0:
+                    error_thread.join(timeout=2)
+                    raise failed('Windows SSH failed after reply', code)
                 return message['lifecycle_result']
             else:
                 raise Refused(message.get('lifecycle_error', 'Unknown Windows protocol response'))
     except BrokenPipeError as cause:
         error_thread.join(timeout=2)
-        error = Refused('Windows SSH disconnected: ' + ''.join(errors)[-2000:] + str(cause))
-        error.transport_not_started = token_seen is None
-        raise error from cause
+        try:
+            code = process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            raise failed('Windows SSH disconnected: ' + ''.join(errors)[-2000:] + str(cause), None, True) from cause
+        raise failed('Windows SSH disconnected: ' + ''.join(errors)[-2000:] + str(cause), code) from cause
     finally:
         if process.poll() is None:
             process.kill()  # Only this SSH transport; the task Job survives for explicit down/hard cap.
@@ -3695,7 +3772,8 @@ def main(argv=None):
                            dispatch('reserve-exclusive', packet, True))
             else:
                 ledger = Ledger(config['ledger'], config['host'], config['owner'], uuid.uuid4().hex,
-                                config.get('ledger_ssh') or args.ssh, label=config['label'])
+                                config.get('ledger_ssh') or args.ssh, label=config['label'],
+                                state_dir=config.get('state_dir'))
                 receipt = ledger.operate('reserve', approver=args.approver)
             print(json.dumps(receipt, indent=2))
             return 0

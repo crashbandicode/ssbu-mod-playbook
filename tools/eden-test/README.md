@@ -23,6 +23,10 @@ The receipt is in `config.json` (`card_lineup`, `staged_plugins`, `superseded_ba
 On an Eden host the default folder does not exist, so `go` needs `--card-lineup <dir>`; remote dispatch copies the lineup and passes it.
 Remote `go` also packs each named target commit without modifying its producer
 repository and stages a read-only checkout under the run's owned stage path.
+Transport failures in staging, remote go and result/report transfers are
+diagnosed once, with a local receipt under `RUNS/_eden-test/ssh-diag/<label>/`;
+the failed operation is not replayed. A lost remote-go connection may leave
+the run active: check the host before starting another.
 Hosts keep a commit-addressed cache; subsequent runs hardlink the checkout
 instead of transferring it again. The packet itself is unchanged; the run
 config records the commits that must be gated from staged trees. A run made

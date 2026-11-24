@@ -38,6 +38,9 @@ class FakeMux:
     def ensure(self):
         pass
 
+    def _control(self, operation):
+        return subprocess.CompletedProcess(['ssh', '-O', operation], 0, '', '')
+
 
 def setUpModule():
     mux = mock.patch.object(eden_test, 'SshMux', FakeMux)
@@ -2625,6 +2628,143 @@ class EdenTestTests(unittest.TestCase):
                             self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
                 pack.assert_not_called()
 
+    def test_real_target_probe_transport_diagnoses_once_and_does_not_retry(self):
+        commit = 'a' * 40
+        targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
+        diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+        for code in (255, 1):
+            with self.subTest(code=code):
+                receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+                receipt.unlink(missing_ok=True)
+                response = subprocess.CompletedProcess(['ssh'], code, '', 'connection reset')
+                with mock.patch.object(eden_test, '_go_sh', return_value=0), \
+                        mock.patch.object(eden_test.subprocess, 'run', return_value=response) as probe, \
+                        mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag, \
+                        redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        eden_test._go_remote_with_mux(
+                            self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
+                self.assertIn('target plugin cache probe failed: connection reset', str(error.exception))
+                self.assertEqual('ssh diag named' in str(error.exception), code == 255)
+                self.assertEqual(probe.call_count, 1)
+                self.assertEqual(diag.call_count, int(code == 255))
+                self.assertEqual(receipt.exists(), code == 255)
+                if receipt.exists():
+                    self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                    self.assertIn(' ssh target probe : ssh diag named', receipt.read_text())
+                    self.assertFalse(diag.call_args.kwargs['allow_retry'])
+
+    def test_go_rider_transfers_and_remote_go_distinguish_transport_from_application(self):
+        diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+        token = 'f' * 32
+        for stage, transport in (('rsync', True), ('rsync', False), ('go', True),
+                                 ('result', True), ('result', False), ('report', True), ('report', False)):
+            with self.subTest(stage=stage, transport=transport):
+                receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+                receipt.unlink(missing_ok=True)
+                calls = []
+                def sh(command):
+                    kind = command[0]
+                    what = ('result' if kind == 'scp' and command[-2].endswith('/go-result.json') else
+                            'report' if kind == 'scp' else 'go' if kind == 'ssh' else 'rsync')
+                    calls.append(what)
+                    if what == stage:
+                        code = 255 if transport else 23 if what == 'rsync' else 1
+                        return eden_test._ExitCode(code, 'Connection reset' if transport else 'application failure')
+                    if what == 'result':
+                        Path(command[-1]).write_text(json.dumps({'token': token, 'code': 0, 'counts': {}}))
+                    elif what == 'report':
+                        Path(command[-1]).write_text('report')
+                    return 0
+                with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex=token)), \
+                        mock.patch.object(eden_test, '_go_sh', side_effect=sh), \
+                        mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag, \
+                        redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        eden_test._go_remote_with_mux(
+                            self.remote_args(), None, 'fake-host', FakeMux('fake-host'), [], self.dir)
+                self.assertEqual(calls.count(stage), 1)
+                self.assertEqual(diag.call_count, int(transport))
+                self.assertEqual('ssh diag named' in str(error.exception), transport)
+                self.assertEqual(receipt.exists(), transport)
+                if transport:
+                    self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                if stage == 'go':
+                    self.assertIn('the remote go may be running; check the host before starting another',
+                                  str(error.exception))
+                    self.assertNotIn('result', calls)
+
+    def test_target_pack_rsync_transport_is_diagnosed_without_replay(self):
+        commit = 'a' * 40
+        targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
+        diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+        for code in (10, 23, 124):
+            with self.subTest(code=code):
+                receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+                receipt.unlink(missing_ok=True)
+                def pack(*_args):
+                    path = self.dir / 'temporary.pack'
+                    path.write_text('fixture')
+                    return {'pack_file': str(path)}
+                with mock.patch.object(eden_test, '_go_sh', return_value=0), \
+                        mock.patch.object(eden_test, '_go_target_ssh',
+                                          return_value=(0, json.dumps({'commit': commit, 'cached': False}), '')), \
+                        mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
+                        mock.patch.object(eden_test, '_go_target_rsync',
+                                          return_value=(eden_test._ExitCode(code, timed_out=code == 124), None)) as transfer, \
+                        mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                    with self.assertRaises(SystemExit) as error:
+                        eden_test._go_remote_with_mux(
+                            self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
+                transfer.assert_called_once()
+                self.assertEqual(diag.call_count, int(code in (10, 124)))
+                self.assertEqual('ssh diag named' in str(error.exception), code in (10, 124))
+                self.assertEqual(receipt.exists(), code in (10, 124))
+                if code == 124:
+                    self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
+
+    def test_target_staging_ssh_transport_is_diagnosed_without_replay(self):
+        commit = 'a' * 40
+        targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
+        diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+        for code in (255, 1):
+            with self.subTest(code=code):
+                receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+                receipt.unlink(missing_ok=True)
+                responses = [subprocess.CompletedProcess([], 0, json.dumps({'commit': commit, 'cached': True}), ''),
+                             subprocess.CompletedProcess([], code, '', 'failed')]
+                with mock.patch.object(eden_test, '_go_sh', return_value=0), \
+                        mock.patch.object(eden_test.subprocess, 'run', side_effect=responses) as ssh, \
+                        mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag, \
+                        redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        eden_test._go_remote_with_mux(
+                            self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
+                self.assertEqual(ssh.call_count, 2)
+                self.assertEqual(diag.call_count, int(code == 255))
+                self.assertEqual('ssh diag named' in str(error.exception), code == 255)
+                self.assertEqual(receipt.exists(), code == 255)
+
+    def test_remote_go_dead_master_refuses_even_with_mapped_application_exit(self):
+        class DeadMux(FakeMux):
+            def _control(self, operation):
+                return subprocess.CompletedProcess([], 255, '', 'master dead')
+        calls = []
+        def sh(command):
+            calls.append(command[0])
+            return 1 if command[0] == 'ssh' else 0
+        diagnosis = {'line': 'ssh diag named', 'phase': 'unknown', 'transient': False}
+        with mock.patch.object(eden_test, '_go_sh', side_effect=sh), \
+                mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag:
+            with self.assertRaisesRegex(SystemExit, 'remote go may be running') as error:
+                eden_test._go_remote_with_mux(
+                    self.remote_args(), None, 'fake-host', DeadMux('fake-host'), [], self.dir)
+        self.assertEqual(calls.count('ssh'), 1)
+        self.assertNotIn('scp', calls)
+        diag.assert_called_once()
+        self.assertIn('ssh diag named', str(error.exception))
+        self.assertTrue((eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md').is_file())
+
     def test_target_ssh_quotes_each_remote_argument_for_powershell(self):
         response = subprocess.CompletedProcess(['ssh'], 0, 'ok\n', '')
         args = ['/usr/bin/python3', '/tmp/a b/file.py', "a'b", '--probe']
@@ -2634,6 +2774,19 @@ class EdenTestTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[command.index('host') + 1:],
                          ['/usr/bin/python3', "'/tmp/a b/file.py'", "'a''b'", '--probe'])
+
+    def test_target_ssh_timeout_is_diagnosed_once(self):
+        mux = FakeMux('fake-host')
+        mux.receipt_dir = self.dir / 'receipts'
+        diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+        with mock.patch.object(eden_test.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 10)) as run, \
+                mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag:
+            with self.assertRaisesRegex(SystemExit, 'target staging SSH failed:.*ssh diag named'):
+                eden_test._go_target_ssh('fake-host', mux, ['probe'], 10)
+        run.assert_called_once()
+        diag.assert_called_once()
+        self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
+        self.assertEqual(len((mux.receipt_dir / 'ssh-diag.md').read_text().splitlines()), 1)
 
     def test_go_remote_missing_commit_stops_before_mux_or_remote_command(self):
         repo = self.dir / 'source'
