@@ -5272,6 +5272,227 @@ class WirelessRoomListTests(unittest.TestCase):
         self.assertEqual(stop['unread_presses'], warning)
 
 
+class DashboardRouteTests(unittest.TestCase):
+    class IO(WirelessRoomTests.IO):
+        def __init__(self):
+            super().__init__()
+            self.dashboard = 'closed'
+            self.dashboard_index = 0
+            self.local_index = 2
+            self.stuck_down = False
+            self.close_after_down = False
+            self.missing_main_ready = False
+            self.missing_dashboard_ready = False
+            self.room_ready = 'yes'
+            self.room_ready_after = None
+            self.form_ready = 'yes'
+
+        def read(self, provider, cap):
+            sample = super().read(provider, cap)
+            if provider == 'ssbu.ui':
+                values = sample.values
+                if self.phase == 'main':
+                    values.update({'dialog': 'none', 'focus': 'top', 'screen.layer': 'main'})
+                    if self.dashboard is not None:
+                        values['main.dashboard'] = self.dashboard
+                    if not self.missing_main_ready:
+                        values['input.ready'] = 'no' if self.ready_no_phase == 'main' else 'yes'
+                    if self.dashboard == 'open':
+                        if self.missing_dashboard_ready:
+                            values.pop('input.ready', None)
+                        values['focus.id'] = ('dashboard.local_wireless' if self.dashboard_index == self.local_index
+                                              else f'dashboard.item{self.dashboard_index}')
+                        values['focus.index'] = str(self.dashboard_index)
+                elif self.phase == 'rooms':
+                    if self.room_ready_after is not None and self.clock() >= self.room_ready_after:
+                        self.room_ready = 'yes'
+                    if self.room_ready is None:
+                        values.pop('input.ready', None)
+                    else:
+                        values['input.ready'] = self.room_ready
+                elif self.phase in ('form', 'confirm_form'):
+                    if self.form_ready is None:
+                        values.pop('input.ready', None)
+                    else:
+                        values['input.ready'] = self.form_ready
+                self.events[-1] = ('read', provider, dict(values))
+            return sample
+
+        def send(self, macro):
+            if self.phase == 'main' and macro in ('tap-zr1', 'main-menu-down', 'lobby-a'):
+                self.events.append(('send', macro))
+                self.actions.append(macro)
+                self.pending = macro
+                if macro == 'tap-zr1':
+                    self.dashboard = 'open'
+                elif macro == 'main-menu-down':
+                    if self.close_after_down:
+                        self.close_after_down = False
+                        self.dashboard = 'closed'
+                    elif not self.stuck_down:
+                        self.dashboard_index += 1
+                elif self.dashboard_index == self.local_index and self.dashboard == 'open':
+                    self.phase = 'rooms'
+                else:
+                    raise AssertionError('A sent away from Local Wireless')
+                return
+            return super().send(macro)
+
+    setUp = WirelessRoomTests.setUp
+    call = WirelessRoomTests.call
+
+    def run_route(self, guest=True):
+        self.io.clock = lambda: self.now
+        with mock.patch.object(routes, 'BridgePickerIO', return_value=self.io), \
+                mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
+                mock.patch.object(routes.time, 'sleep', side_effect=lambda delay: setattr(self, 'now', self.now + delay)):
+            if guest:
+                return routes.wireless_room_list(self.ctx, ready_cap=3)
+            return routes.wireless_room(self.ctx, ready_cap=3, unpublished_create='allow')
+
+    def test_each_of_the_four_presses_follows_its_own_read(self):
+        result = self.run_route()
+        self.assertEqual(self.io.actions, ['tap-zr1', 'main-menu-down', 'main-menu-down', 'lobby-a'])
+        last_send = -1
+        for i, event in enumerate(self.io.events):
+            if event[0] == 'send':
+                previous = next(e for e in reversed(self.io.events[last_send + 1:i]) if e[0] == 'read')
+                self.assertEqual(previous[1], 'ssbu.ui')
+                self.assertEqual(previous[2]['input.ready'], 'yes')
+                if event[1] == 'tap-zr1':
+                    self.assertEqual(previous[2]['main.dashboard'], 'closed')
+                else:
+                    self.assertEqual(previous[2]['main.dashboard'], 'open')
+                last_send = i
+        self.assertTrue(result['on_list'])
+        self.assertTrue(result['list_ready'])
+
+    def test_a_bridge_without_the_dashboard_key_gets_no_zr(self):
+        self.io.dashboard = None
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_route()
+        self.assertEqual(caught.exception.step, 'open-dashboard')
+        self.assertEqual(self.io.actions, [])
+        stop = json.loads((self.row / 'routes-wireless-room-list-stop.json').read_text())
+        self.assertEqual(stop['unsupported_reader'], 'main.dashboard')
+
+    def test_main_dashboard_unknown_gets_no_zr(self):
+        self.io.dashboard = 'unknown'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_route()
+        self.assertEqual(caught.exception.step, 'open-dashboard')
+        self.assertEqual(self.io.actions, [])
+
+    def test_the_cursor_is_steered_by_read_back_not_by_count(self):
+        for start, target, downs in ((0, 3, 3), (2, 2, 0)):
+            with self.subTest(start=start, target=target):
+                self.io = self.IO()
+                self.io.dashboard, self.io.dashboard_index, self.io.local_index = 'open', start, target
+                self.now = 0
+                self.run_route()
+                self.assertEqual(self.io.actions, ['main-menu-down'] * downs + ['lobby-a'])
+
+    def test_a_down_that_does_not_move_is_resent_on_the_same_item_then_stops(self):
+        self.io.dashboard = 'open'
+        self.io.stuck_down = True
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_route()
+        self.assertEqual(caught.exception.step, 'dashboard-down-0')
+        self.assertEqual(self.io.actions, ['main-menu-down'] * 3)
+
+    def test_a_is_sent_only_on_the_local_wireless_item(self):
+        self.run_route()
+        i = self.io.events.index(('send', 'lobby-a'))
+        sample = next(e[2] for e in reversed(self.io.events[:i]) if e[:2] == ('read', 'ssbu.ui'))
+        self.assertEqual(sample['focus.id'], 'dashboard.local_wireless')
+        self.assertEqual(sample['input.ready'], 'yes')
+
+    def test_a_dashboard_that_closed_by_itself_is_reopened_from_the_main_menu_read(self):
+        self.io.close_after_down = True
+        result = self.run_route()
+        self.assertEqual(self.io.actions.count('tap-zr1'), 2)
+        self.assertTrue(result['list_ready'])
+
+    def test_entry_with_the_dashboard_open_resumes_at_its_focus(self):
+        self.io.dashboard, self.io.dashboard_index = 'open', 1
+        result = self.run_route()
+        self.assertEqual(result['entered_at'], 'dashboard-down-1')
+        self.assertEqual(self.io.actions, ['main-menu-down', 'lobby-a'])
+
+    def test_no_route_block_uses_the_four_key_macro(self):
+        self.run_route()
+        self.assertNotIn('lobby-open-room-list', self.io.actions)
+        self.io = self.IO()
+        self.now = 0
+        self.run_route(guest=False)
+        self.assertNotIn('lobby-open-room-list', self.io.actions)
+        self.assertNotIn('lobby-open-room-list', Path(routes.__file__).read_text())
+
+    def test_main_requires_published_positive_readiness_for_both_routes(self):
+        for guest in (False, True):
+            for absent in (False, True):
+                with self.subTest(guest=guest, absent=absent):
+                    self.io = self.IO()
+                    self.now = 0
+                    self.io.missing_main_ready = absent
+                    self.io.ready_no_phase = None if absent else 'main'
+                    with self.assertRaises(routes.closed_loop.RouteStopped):
+                        self.run_route(guest)
+                    self.assertEqual(self.io.actions, [])
+
+    def test_a_room_list_without_ready_cannot_authorize_create_or_guest_pass(self):
+        for guest in (False, True):
+            for ready in (None, 'no'):
+                with self.subTest(guest=guest, ready=ready):
+                    self.io = self.IO()
+                    self.io.phase, self.io.room_ready = 'rooms', ready
+                    self.now = 0
+                    with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                        self.run_route(guest)
+                    self.assertEqual(caught.exception.step, 'room-list-ready' if guest else 'open-create')
+                    self.assertEqual(self.io.actions, [])
+
+    def test_an_initially_unready_room_list_can_become_ready_without_input(self):
+        self.io.phase, self.io.room_ready, self.io.room_ready_after = 'rooms', 'no', 2
+        result = self.run_route()
+        self.assertEqual(self.io.actions, [])
+        self.assertTrue(result['on_list'])
+        self.assertTrue(result['list_ready'])
+        self.assertGreaterEqual(self.now, 2)
+
+    def test_dashboard_requires_published_positive_readiness(self):
+        for absent in (False, True):
+            with self.subTest(absent=absent):
+                self.io = self.IO()
+                self.io.dashboard = 'open'
+                self.io.missing_dashboard_ready = absent
+                self.io.ready_no_phase = None if absent else 'main'
+                self.now = 0
+                with self.assertRaises(routes.closed_loop.RouteStopped):
+                    self.run_route()
+                self.assertEqual(self.io.actions, [])
+
+    def test_create_form_requires_published_positive_readiness(self):
+        for ready in (None, 'no'):
+            with self.subTest(ready=ready):
+                self.io = self.IO()
+                self.io.phase, self.io.form_ready, self.io.form_screen = 'form', ready, 'ldn.create'
+                self.now = 0
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_route(guest=False)
+                self.assertEqual(caught.exception.step, 'confirm-create')
+                self.assertNotIn('tap-plus1', self.io.actions)
+
+    def test_picker_without_the_ready_key_still_uses_its_tile_gate(self):
+        self.io.phase = 'stage'
+        result = self.run_route(guest=False)
+        self.assertEqual(result['result'], 'PASS')
+        stages = [e[2] for e in self.io.events if e[:2] == ('read', 'ssbu.ui') and e[2].get('screen') == 'stage_select']
+        self.assertTrue(stages)
+        self.assertNotIn('input.ready', stages[0])
+        self.assertEqual(self.io.stage_count, 1)
+
+
 class OnlineTests(unittest.TestCase):
     A1 = ('[auto] broker started title=01006A800016E000 lan=192.168.0.222 local_only=false\n'
           '[coord] leading epoch=137 tcp=192.168.0.222:35095\n'

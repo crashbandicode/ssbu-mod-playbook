@@ -1445,6 +1445,41 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(eden.calls.count('macro.play'), 1)
         self.assertEqual(getattr(run, 'row_macro_waits', []), [])
 
+    def test_idle_recovery_is_refused_when_the_segments_start_gate_fails(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['segments']['to-red']['start_gate'] = 'paused'
+        names = []
+
+        def check(on, name, **options):
+            names.append(name)
+            raise RuntimeError('not ' + name)
+
+        with mock.patch.object(run, 'check_gate', side_effect=check):
+            with self.assertRaisesRegex(RuntimeError, r'to-red.*paused'):
+                run.gate('a', 'red')
+        self.assertEqual(names, ['red', 'paused'])
+        self.assertNotIn('macro.play', eden.calls)
+
+    def test_idle_recovery_checks_the_start_gate_before_its_one_press(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['segments']['to-red']['start_gate'] = 'paused'
+        names = []
+
+        def check(on, name, **options):
+            names.append(name)
+            if names == ['red']:
+                raise RuntimeError('not red')
+            return True
+
+        with mock.patch.object(run, 'check_gate', side_effect=check):
+            run.gate('a', 'red')
+        self.assertEqual(names, ['red', 'paused', 'red'])
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+
     def test_a_rejected_dispatch_after_requalification_is_recorded_as_rejected(self):
         run, eden, _ = self.waiting_run()
         run.plan['segments']['to-red']['start_gate'] = 'red'
