@@ -1406,10 +1406,10 @@ def results_md(run, config):
              f'- Plugins: ' + ', '.join(f'{Path(p["path"]).name} {p["sha256"][:8]}' for p in config['instances'][0].get('plugins', [])),
              f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun{stall_suffix}; {retained} earlier failed attempts retained '
              f'(receipts in `out/`); final rows.json {rows_note}; {len(manifests)} runner manifests in `out/manifests/`']
-    if stalled:
-        for row, result, _, _, stalls in reported:
-            if result == 'PASS':
-                lines.append(f'  - {shown_result(result, stalls)} {row["id"]}')
+    for row, result, stalls in stalled[:6]:
+        lines.append(f'  - {shown_result(result, stalls)} {row["id"]}')
+    if len(stalled) > 6:
+        lines.append(f'  - and {len(stalled) - 6} more rows passed with stalls (see REPORT.md)')
     for row, error in failed[:6]:
         lines.append(f'  - FAILED {row}: {one_line(error)}')
     if unrun:
@@ -1640,12 +1640,13 @@ def report_rows_with_stalls(run):
 
 
 def _stall_totals(rows):
-    passed = sum(result == 'PASS' and bool(stalls) for _, result, _, _, stalls in rows)
-    total = sum(len(stalls) for _, _, _, _, stalls in rows)
-    if not total:
+    passed_stalls = [stalls for _, result, _, _, stalls in rows if result == 'PASS' and stalls]
+    if not passed_stalls:
         return ''
+    passed = len(passed_stalls)
+    total = sum(len(stalls) for stalls in passed_stalls)
     return (f' ({passed} {"row" if passed == 1 else "rows"} passed with stalls, '
-            f'{total} {"stall" if total == 1 else "stalls"} in all)')
+            f'{total} {"stall" if total == 1 else "stalls"} in those rows)')
 
 
 def _stall_text(event):

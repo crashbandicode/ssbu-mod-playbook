@@ -3164,6 +3164,7 @@ class ReportStallTests(unittest.TestCase):
         canonical = lambda item: json.dumps({key: val for key, val in item.items() if key != 'block'},
                                             sort_keys=True, default=str)
         self.assertEqual(canonical(event), canonical(line))
+        self.assertEqual(line, {**event, 'block': block})
         receipt = self.write_receipt(value, journal=journal)
         self.assertEqual(len(eden_test.row_stalls(self.run, 'r1', receipt)), 1)
 
