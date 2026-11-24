@@ -1427,7 +1427,7 @@ class Runner:
             return None
         try:
             job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip,
-                                        self.plan.get('known_issues'))
+                                        self.plan.get('known_issues'), self.still_records)
             proc = judge_queue.start_worker(job, self.out / 'judge' / 'workers.log')
         except Exception as error:  # noqa: BLE001 - a job that can't start leaves the row RAN-UNVERIFIED
             judge_queue.merge_receipt(receipt_path, lambda r: r.update(
@@ -1581,8 +1581,12 @@ class Runner:
                           if isinstance(status, dict) else None)
             except Exception:  # noqa: BLE001 - a missing status does not invalidate a screenshot
                 status = None
+            record = self.still_records.get(str(path))
+            fresh = ({key: value for key, value in record.items()
+                      if isinstance(value, (str, int, float, bool, type(None)))}
+                     if isinstance(record, dict) else None)
             self.captures.append({'name': name, 'file': path.name, 'sha256': digest(path), 'utc': utc,
-                                  'status': status})
+                                  'status': status, 'fresh': fresh})
         if self._arm_frames:
             try:
                 data = path.read_bytes()
@@ -3379,7 +3383,8 @@ def record_read(manifest, out, row_id, reader, verdict, text, still, capture=Non
                 if (isinstance(item, dict) and all(key in item for key in ('name', 'file', 'sha256', 'utc', 'status'))
                         and isinstance(item['file'], str) and item['file'] and Path(item['file']).name == item['file']):
                     captures.append({'row': candidate.stem, **{key: item[key]
-                                                              for key in ('name', 'file', 'sha256', 'utc', 'status')}})
+                                                              for key in ('name', 'file', 'sha256', 'utc', 'status')},
+                                     **({'fresh': item['fresh']} if 'fresh' in item else {})})
         own = [item for item in captures if item['row'] == row_id and still.parent == row_dir
                and item['file'] == still.name]
         if own:
@@ -3405,6 +3410,9 @@ def record_read(manifest, out, row_id, reader, verdict, text, still, capture=Non
                 labels = ', '.join(f"{item['row']}/{item['file']}" for item in matches)
                 raise ValueError(f'the still matches {len(matches)} captures ({labels}); name one with --capture <row>:<file>')
             selected = matches[0]
+        if not still_fresh.usable(selected.get('fresh')):
+            raise ValueError(f"the capture {selected['row']}/{selected['file']} is not usable evidence: "
+                             f"{still_fresh.evidence_issue(selected.get('fresh'))}")
         read['capture'] = selected
         previous = receipt.get('visual_read')
         history = list(receipt.get('visual_reads') or [])

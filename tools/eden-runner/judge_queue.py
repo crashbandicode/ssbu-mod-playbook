@@ -25,6 +25,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import still_fresh  # noqa: E402
 
 
 def effect_evidence(value):
@@ -225,15 +228,49 @@ def known_issue(known, verdict):
     return {'ids': ids, 'titles': [known[k]['title'] for k in ids], 'judge_reason': reason}
 
 
-def apply_verdict(receipt, check, verdict, frames, known=None):
+def evidence_blockers(shots, verdict, all_shots=None):
+    row_shots = [shot for shot in shots or [] if isinstance(shot, dict)
+                 and shot.get('phase') in ('before', 'step', 'after')]
+    shots = [shot for shot in row_shots if shot.get('path')]
+    if not any('fresh' in shot for shot in shots):
+        return []
+    available = [shot for shot in (all_shots or shots) if isinstance(shot, dict) and shot.get('path')]
+    citations = (verdict or {}).get('shots_cited')
+    citations = citations if isinstance(citations, list) else []
+    matched = [shot for shot in shots if any(citation == shot.get('path') or citation == shot.get('label')
+                                               for citation in citations)]
+    unresolved = any(not any(citation == shot.get('path') or citation == shot.get('label')
+                             for shot in available) for citation in citations)
+    if not citations or unresolved:
+        expected = [shot for shot in row_shots if shot.get('phase') == 'after'] or \
+            [shot for shot in row_shots if shot.get('phase') == 'step']
+        before = next((shot for shot in shots if shot.get('phase') == 'before'), None)
+        for shot in ([before] if before else []) + (expected[-1:] if expected and expected[-1].get('path') else []):
+            if shot not in matched:
+                matched.append(shot)
+    return [{'kind': 'evidence', 'source': shot.get('label') or shot.get('name') or Path(shot['path']).name,
+             'text': f"still {shot['path']} is not usable evidence: {still_fresh.unusable_reason(shot.get('fresh'))}"}
+            for shot in matched if not still_fresh.usable(shot.get('fresh'))]
+
+
+def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_shots=None):
     status, reason, review = final_status(receipt.get('gates_status', receipt.get('status')),
                                           receipt.get('effects_passed') or [], check, verdict)
-    issue = known_issue(known, verdict) if status == 'FAILED' and (check or {}).get('ok', True) else None
+    evidence = (evidence_blockers(shots, verdict, all_shots)
+                if (verdict or {}).get('verdict') in ('PASS', 'FAIL') else [])
+    issue = known_issue(known, verdict) if not evidence and status == 'FAILED' and (check or {}).get('ok', True) else None
     if issue:  # not chased, not counted by the consecutive-failure stop; listed apart in FAILING.md
         status, reason, review = 'KNOWN-PRODUCT-ISSUE', f'known issue {",".join(issue["ids"])}: {issue["judge_reason"]}', False
         receipt['known_issue'] = issue
     landed = time.time()
     receipt['judge'] = {'state': 'done', **(verdict or {}), 'frames': frames, 'landed': landed}
+    if evidence:
+        blockers = list(receipt.get('blockers') or [])
+        blockers.extend(item for item in evidence if item not in blockers)
+        receipt['blockers'] = blockers
+        receipt.pop('known_issue', None)
+        status, reason, review = 'RAN-UNVERIFIED', blockers[0]['text'], True
+        receipt['review_kind'] = 'unverified'
     if status == 'PASS' and 'blockers' in receipt:
         blockers = receipt['blockers'] or []
         visual = [blocker for blocker in blockers if blocker.get('kind') == 'visual']
@@ -320,13 +357,14 @@ def work(job_path):
         check = {'ok': True, 'error': repr(error)[:300]}
         verdict = {'verdict': 'UNSURE', 'reason': f'judge worker error: {error!r}'[:300], 'shots_cited': [],
                    'model': None}
-    merge_receipt(job['receipt'], lambda r: apply_verdict(r, check, verdict, frames, job.get('known_issues')))
+    merge_receipt(job['receipt'], lambda r: apply_verdict(
+        r, check, verdict, frames, job.get('known_issues'), job['shots'], job['judge_shots']))
     (folder / 'done.json').write_text(json.dumps({'verdict': verdict, 'clip_check': check}, indent=2) + '\n')
     return verdict
 
 
 # ---- the runner side -----------------------------------------------------------------------------------------------
-def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip, known=None):
+def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip, known=None, still_records=None):
     """The job file of one row: what the judge sees (expected line, labelled full-size shots, clip frames to come)."""
     receipt = json.loads(Path(receipt_path).read_text())
     folder = Path(out) / 'judge' / row['id']
@@ -337,7 +375,13 @@ def write_job(out, row, receipt_path, plan_dir, judge_cfg, clip, known=None):
     for spec in row.get('shots') or []:
         path = next((p for p in taken if p not in used and Path(p).stem.endswith('-' + spec['name'])), None)
         used.add(path)
-        shots.append({**spec, 'path': path})
+        shot = {**spec, 'path': path}
+        if path and still_records is not None:
+            record = still_records.get(str(path))
+            shot['fresh'] = ({key: value for key, value in record.items()
+                              if isinstance(value, (str, int, float, bool, type(None)))}
+                             if isinstance(record, dict) else None)
+        shots.append(shot)
     job = {'row': row['id'], 'name': row.get('name'), 'expected': row.get('expected'),
            'verdict_hint': row.get('verdict_hint'), 'covers': row.get('covers', []), 'shots': shots,
            'clip': clip, 'frames_wanted': list(FRAME_NAMES), 'receipt': str(receipt_path), 'dir': str(folder),
