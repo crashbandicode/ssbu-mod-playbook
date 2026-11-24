@@ -227,6 +227,8 @@ from a constant.
 ### Fresh stills
 
 `stills.jsonl` records each capture's file, hash, size, Eden reply and same-boot bridge frame and wall time.
+Gate checks never wait past their own cap for another check's evidence publication.
+A record written by a superseded check is retracted by a later line; journal readers skip the retracted record.
 The frame and boot are read incrementally from the instance's bridge log from its start; a replaced log starts
 again without the old boot.
 An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`

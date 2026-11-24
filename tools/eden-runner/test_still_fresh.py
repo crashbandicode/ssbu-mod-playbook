@@ -293,8 +293,9 @@ class StillFreshTests(unittest.TestCase):
         reply = {'backend': 'window', 'uniform': False, 'warning': 'sample warning'}
         one = self.record(self.frame(1000), reply=reply)
         two = self.record(self.frame(1200))
-        rows = [json.loads(line) for line in (self.root / 'stills.jsonl').read_text().splitlines()]
+        rows = self.fresh.load(self.root / 'stills.jsonl')
         self.assertEqual(rows, [one, two])
+        self.assertEqual(len((self.root / 'stills.jsonl').read_text().splitlines()), 2)
         self.assertEqual(one['sha256'], hashlib.sha256(b'picture').hexdigest())
         self.assertEqual((one['bytes'], one['backend'], one['uniform'], one['warning']),
                          (7, 'window', False, 'sample warning'))

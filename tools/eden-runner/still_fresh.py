@@ -125,6 +125,17 @@ class Ledger:
             stream.write(json.dumps(record) + '\n')
 
 
+def load(path):
+    rows = [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines()]
+    retracted, records = set(), []
+    for row in reversed(rows):
+        if 'retract' in row:
+            retracted.add((row['retract'], row['sha256']))
+        elif (row.get('file'), row.get('sha256')) not in retracted:
+            records.append(row)
+    return list(reversed(records))
+
+
 def refused(record):
     return isinstance(record, dict) and record.get('status') == 'refused'
 

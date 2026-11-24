@@ -1512,8 +1512,9 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(old.is_alive())
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
-            rows = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
+            rows = runner.still_fresh.load(run.out / 'stills.jsonl')
             self.assertEqual(len(rows), 1)
+            self.assertEqual(len((run.out / 'stills.jsonl').read_text().splitlines()), 1)
             self.assertEqual(set(run.still_records), {rows[0]['path']})
         finally:
             release.set()
@@ -1560,8 +1561,9 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(old.is_alive())
             self.assertFalse(successor.is_alive())
             self.assertTrue(waited_for_append)
-            rows = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
+            rows = runner.still_fresh.load(run.out / 'stills.jsonl')
             self.assertEqual([row['path'] for row in rows], [paths['old'], paths['successor']])
+            self.assertEqual(len((run.out / 'stills.jsonl').read_text().splitlines()), 2)
             self.assertEqual(set(run.still_records), set(paths.values()))
             self.assertTrue(all(isinstance(error, routes.closed_loop.DispatchRejected) for error in errors))
         finally:
@@ -1632,6 +1634,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(run.still_records, {})
             self.assertEqual(run.stills.runs['a'], previous)
             self.assertEqual(run.captures, [])
+            self.assertEqual(run.last_gate_outcome['gate'], 'status')
+            self.assertTrue(run.last_gate_outcome['timed_out'])
+            actions = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
+            self.assertFalse(any(action.get('gate') == 'status' and action.get('pass') is True for action in actions))
         finally:
             release.set()
             if timer.is_alive():
@@ -1818,6 +1824,52 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(recorded['sha256'], sha(result))
         self.assertTrue(recorded['acquired'])
         self.assertEqual(run.plan['gates']['capped']['sha256'], recorded['sha256'])
+
+    def test_acquisition_receipt_publication_cannot_outlive_the_gate_cap(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        run = self.make(eden)
+        run.acquired = []
+        run.plan['gates']['capped'] = {'kind': 'image', 'reference': 'refs/blocked.png', 'acquire': True,
+                                       'roi': [0, 0, 64, 36], 'cap': .25, 'interval': .03}
+        original_manifest = self.manifest.read_bytes()
+        entered, release = threading.Event(), threading.Event()
+        chmod = runner.os.chmod
+
+        def holder():
+            with run._gate_lock:
+                entered.set()
+                release.wait(1)
+
+        worker = threading.Thread(target=holder)
+        timer = threading.Timer(.4, release.set)
+
+        def stage(path, mode):
+            chmod(path, mode)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            timer.start()
+
+        try:
+            started = time.monotonic()
+            with mock.patch.object(runner.os, 'chmod', side_effect=stage):
+                with self.assertRaisesRegex(RuntimeError, 'gate capped on a did not pass within 0.25 s: '
+                                            'gate evidence was still being written'):
+                    run.check_gate('a', 'capped')
+            self.assertLessEqual(time.monotonic() - started, .3)
+            self.assertTrue(run.last_gate_outcome['timed_out'])
+            self.assertEqual(run.acquired, [])
+            self.assertFalse((self.dir / 'refs' / 'blocked.png').exists())
+            self.assertEqual(self.manifest.read_bytes(), original_manifest)
+        finally:
+            release.set()
+            if timer.is_alive():
+                timer.join(1)
+            if worker.ident is not None:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
 
     def test_action_log_publication_and_gate_supersession_are_serialized(self):
         eden = FakeEden({})
