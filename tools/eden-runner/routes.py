@@ -37,6 +37,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -964,6 +965,13 @@ def _udp_holder_text(holder):
             if holder['comm'] is not None and holder['pid'] is not None else 'an unknown process')
 
 
+class RoomPortDisproved(RuntimeError):
+    def __init__(self, message, bound_ports, holder):
+        super().__init__(message)
+        self.bound_ports = bound_ports
+        self.holder = holder
+
+
 def _owned_room_port(ctx, port):
     listeners = udp_listeners()
     if listeners is None:
@@ -979,8 +987,22 @@ def _owned_room_port(ctx, port):
                               int(port))
         if foreign:
             message += f'; UDP {port} is held by {_udp_holder_text(foreign)}'
-        raise RuntimeError(message)
+        holder = {key: foreign[key] for key in ('comm', 'pid')} if foreign else None
+        raise RoomPortDisproved(message, bound_ports, holder)
     return bound_ports
+
+
+def _write_room_handoff(path, value):
+    fd, name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(json.dumps(value, indent=1) + '\n')
+        os.replace(name, path)
+    finally:
+        try:
+            Path(name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _frontend_host_wait(ctx, match, cap, port, members=None, confirmation=None, room_name=None):
@@ -1150,13 +1172,50 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     def saved_join_port():
         saved_port = saved.get('port')
         if saved_port is not None and saved.get('port_verified') is not True:
+            disproved = saved.get('disproved')
+            if saved.get('port_verified') is False and isinstance(disproved, dict) and disproved.get('utc'):
+                raise RuntimeError(f'frontend_room: join refuses the saved room port {saved_port}: '
+                                   f"the host route found this Eden no longer listening on it at {disproved['utc']}")
             raise RuntimeError(f'frontend_room: join refuses the saved room port {saved_port}: '
                                'frontend-room.json does not say it was verified')
         return saved_port
 
+    def same_saved_port(port):
+        return (saved.get('instance') == ctx.on and saved.get('port') is not None
+                and str(saved['port']) == str(port))
+
+    def saved_history():
+        history = saved.get('history')
+        history = list(history) if isinstance(history, list) else []
+        if isinstance(saved.get('disproved'), dict):
+            history.append(saved['disproved'])
+        return history[-5:]
+
     def publish_host_port(port, room_name):
-        room_file.write_text(json.dumps({'port': port, 'port_verified': True,
-                                         'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
+        handoff = {'port': port, 'port_verified': True, 'room_name': room_name, 'instance': ctx.on}
+        history = saved_history() if same_saved_port(port) else []
+        if history:
+            handoff['history'] = history
+        _write_room_handoff(room_file, handoff)
+
+    def verify_host_port(port):
+        try:
+            return _owned_room_port(ctx, port)
+        except RoomPortDisproved as error:
+            if same_saved_port(port):
+                invalid = {**saved, 'port_verified': False,
+                           'disproved': {'utc': datetime.now(timezone.utc).isoformat(),
+                                         'bound_ports': error.bound_ports, 'holder': error.holder,
+                                         'reason': str(error)}}
+                history = saved_history()
+                if history:
+                    invalid['history'] = history
+                try:
+                    _write_room_handoff(room_file, invalid)
+                except OSError as write_error:
+                    message = f'{error}; the saved handoff could not be invalidated: {write_error}'
+                    raise RoomPortDisproved(message, error.bound_ports, error.holder) from error
+            raise
 
     def reuse(connected, dismissed):
         widget, title, count = connected
@@ -1177,7 +1236,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         port = requested_port if requested_port is not None else saved_port
         bound_ports, verified = None, None
         if role == 'host' and port is not None:
-            bound_ports = _owned_room_port(ctx, port)
+            bound_ports = verify_host_port(port)
             verified = True
             publish_host_port(port, expected_name)
         result = {
@@ -1305,7 +1364,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     if role == 'host':
         if port is None:
             raise RuntimeError("frontend_room: cannot determine this Eden's room port; room port is not verified")
-        bound_ports = _owned_room_port(ctx, port)
+        bound_ports = verify_host_port(port)
         port_verified = True
         if room_name is not None:
             publish_host_port(port, room_name)

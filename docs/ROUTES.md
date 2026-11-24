@@ -93,6 +93,11 @@ instance identity stops as unverified; a different owned port stops with any
 known foreign holder. A saved port that differs from a reuse request stops
 without acting on the dialog. Join refuses a saved port unless its handoff
 records `port_verified: true`; a row-given port remains usable.
+When listener evidence disproves this instance's saved port, the host marks
+the handoff unverified with the observed ports, holder and time, and a saved-port
+join refuses it. A later successful host check on that port makes it valid
+again and retains the disproof in the handoff's history (up to five).
+Missing listener or identity data does not disprove an earlier handoff.
 An explicitly occupied port stops before Host. A rejected edited flag stops
 a nondefault port, and a room-creation failure names the requested or
 default-port holder when known. The port-field cause and the new behavior
