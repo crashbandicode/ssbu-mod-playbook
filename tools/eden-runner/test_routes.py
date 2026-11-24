@@ -4215,6 +4215,7 @@ class WirelessRoomTests(unittest.TestCase):
             self.confirm_form_only_first = False
             self.confirm_reads = 0
             self.confirm_sent_at = None
+            self.confirm_send_times = []
             self.confirm_read_delay_after_cap = 0
             self.stage_context_unknown_reads = 0
             self.unpublished_confirms = 0
@@ -4255,6 +4256,7 @@ class WirelessRoomTests(unittest.TestCase):
             self.stage_tile_error_done = False
             self.ready_no_phase = None
             self.read_caps = []
+            self.read_windows = []
             self.stage_tile_after_send = None
             self.fail_stage_dispatch = False
             self.busy_macro = None
@@ -4285,6 +4287,7 @@ class WirelessRoomTests(unittest.TestCase):
 
         def read(self, provider, cap):
             self.read_caps.append((provider, cap))
+            self.read_windows.append((provider, cap, self.clock(), self.phase, self.stage_count))
             self.revision += 1
             if provider == 'tile.cursor':
                 if self.phase in ('stage', 'stage_reacting'):
@@ -4468,6 +4471,7 @@ class WirelessRoomTests(unittest.TestCase):
                     self.phase = 'form'
             elif macro == 'tap-plus1' and self.phase in ('form', 'confirm_form', 'unpublished', 'wrong'):
                 self.confirm_count += 1
+                self.confirm_send_times.append(self.clock())
                 if self.confirm_count == 1:
                     self.confirm_sent_at = self.clock()
                 if self.wrong_confirm_screen:
@@ -4867,6 +4871,22 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(result['confirm_presses'], 2)
         self.assertEqual(self.io.actions.count('tap-plus1'), 2)
         self.assertEqual(self.io.actions.count('lobby-ready'), 1)
+
+    def test_confirm_retry_revalidates_after_twenty_seconds_within_its_cap(self):
+        self.io.unpublished_confirms = 1
+        self.run_room(unpublished_create='allow')
+        first, second = self.io.confirm_send_times
+        self.assertGreaterEqual(second - first, 20)
+        self.assertLess(second - first, 24.5)
+        sends = [i for i, event in enumerate(self.io.events) if event == ('send', 'tap-plus1')]
+        witness = next(event for event in reversed(self.io.events[sends[0] + 1:sends[1]])
+                       if event[:2] == ('read', 'ssbu.ui'))
+        self.assertEqual(witness[2]['screen'], 'unknown')
+        self.assertEqual(witness[2]['input.ready'], 'yes')
+        reads = [(cap, start) for _, cap, start, phase, _ in self.io.read_windows
+                 if phase == 'unpublished' and first <= start < second]
+        self.assertTrue(reads)
+        self.assertTrue(all(cap <= first + 24.5 - start + 1e-9 for cap, start in reads), reads)
 
     def test_confirm_read_errors_never_authorize_a_second_press(self):
         self.io.unpublished_confirms = 1
@@ -5559,14 +5579,43 @@ class WirelessRoomTests(unittest.TestCase):
                 self.assertEqual(stop['press_gate'], 'input.ready' if phase in ('main', 'rooms', 'form')
                                  else 'input.ready + tile.cursor')
 
-    def test_the_last_read_of_a_wait_is_never_given_less_than_two_seconds(self):
+    def test_wireless_reads_respect_the_remaining_step_budget(self):
         for slow in (False, True):
             with self.subTest(slow=slow):
                 self.io = self.IO()
                 self.io.stage_load_seconds = 40 if slow else 0
                 self.run_room(unpublished_create='allow')
                 self.assertTrue(self.io.read_caps)
-                self.assertTrue(all(cap >= 2.0 for _, cap in self.io.read_caps), self.io.read_caps)
+                self.assertTrue(all(0.05 <= cap <= 2.0 for _, cap in self.io.read_caps), self.io.read_caps)
+                deadline = self.io.stage_send_times[0] + 60
+                stage_reads = [(provider, cap, start) for provider, cap, start, phase, count in self.io.read_windows
+                               if count and phase in ('stage', 'loading', 'stage_reacting')]
+                if slow:
+                    self.assertTrue(stage_reads)
+                self.assertTrue(all(cap <= deadline - start + 1e-9 for _, cap, start in stage_reads), stage_reads)
+
+    def test_wireless_observation_skips_reads_without_the_minimum_time(self):
+        self.io.phase = 'stage'
+        self.io.clock = lambda: self.now
+        state = {'ui_clock': {}, 'ready_published': False, 'last_error': None, 'last_read_was_error': False,
+                 'last_ui': {}, 'ui_answered': False, 'last_tile': None, 'last_answered_tile': None}
+        observe = routes._wireless_observer(self.ctx, self.io, [], state)
+        original = self.io.read
+
+        def read(provider, cap):
+            sample = original(provider, cap)
+            if provider == 'ssbu.ui':
+                self.now += 1.98
+            return sample
+
+        self.io.read = read
+        with mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now):
+            self.assertIs(observe(cap=0.049), routes.closed_loop.NO_READ)
+            self.assertEqual(self.io.read_caps, [])
+            sample = observe(cap=2.0)
+        self.assertEqual(sample['tile'], {'error': 'no time left for tile.cursor'})
+        self.assertEqual(state['last_tile'], sample['tile'])
+        self.assertEqual(self.io.read_caps, [('ssbu.ui', 2.0)])
 
     def test_a_missing_reply_at_the_deadline_does_not_skip_the_retry(self):
         self.io.lost_stage_sends = 1

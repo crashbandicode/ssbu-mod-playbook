@@ -160,11 +160,13 @@ finish it and resend, up to three sends total (some steps allow fewer). A contin
 confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
 A bridge continuity, boot or fence error is never retried: the route stops on the current step with the receipt and leaves the input unconfirmed.
 If observations stay unreadable or in flight until the cap, stop on the named step without confirming or pressing again.
-Every wireless bridge read gets at least 2 seconds. An unanswered read preserves the last answered read and the
-source timer, but cannot authorise input; at the deadline one grace read may witness completion or a qualified retry.
+Each wireless bridge read gets at most 2 seconds and no more than the observation's remaining time; a read with
+under 0.05 seconds remaining is not started. An unanswered read preserves the last answered read and the source
+timer, but cannot authorise input; no new read begins at or after the deadline.
 Training settle reads also have a 2-second floor and may finish up to 2 seconds after their settle cap.
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
+Create confirmation waits 20 seconds before retrying; its 24.5-second cap reserves time for bounded revalidation reads.
 
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
 Training phases re-locate after each phase; a failed phase retries only after two consecutive fresh reads of a

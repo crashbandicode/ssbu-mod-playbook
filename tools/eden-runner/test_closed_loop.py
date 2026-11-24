@@ -90,6 +90,24 @@ class ClosedLoopTests(unittest.TestCase):
                         clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
                 self.assertLessEqual(now[0], 3.01)
 
+    def test_retry_revalidation_cannot_start_a_read_at_the_deadline(self):
+        now, sends, reads = [0.0], [], []
+
+        def observe(*, cap=None):
+            reads.append((now[0], cap))
+            if sends and len(reads) == 3:
+                now[0] += cap
+            return 'source'
+
+        item = Step('bounded', lambda obs: True, lambda obs: False,
+                    'a', cap=3, lost_after=0)
+        with self.assertRaises(RouteStopped):
+            run('fixture', [item], observe, sends.append, lambda: None,
+                clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds), poll=1)
+        self.assertEqual(sends, ['a'])
+        self.assertEqual(reads, [(0.0, 20.0), (1.0, 2.0), (1.0, 2.0)])
+        self.assertEqual(now[0], 3.0)
+
     def test_a_latched_step_never_jumps_or_sends_after_its_send(self):
         fake = Script(lambda f: 'other' if f.sends else 'source')
         latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
@@ -1008,7 +1026,7 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['steps'][0]['unanswered'], 2)
         self.assertEqual(fake.sends, [])
 
-    def test_a_grace_location_witness_is_not_evaluated_twice(self):
+    def test_location_does_not_read_a_witness_at_the_deadline(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         deadline_reads, done_reads = [], []
 
@@ -1026,10 +1044,12 @@ class ClosedLoopTests(unittest.TestCase):
 
         fake = Script(observe)
         item = Step('press', lambda value: value == 'source', done, 'press', cap=5)
-        result = fake.run([item], locate_cap=1)
-        self.assertEqual(result['entered_at'], 'done')
-        self.assertEqual(len(done_reads), 1)
-        self.assertEqual(result['steps'][0]['unanswered'], 2)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item], locate_cap=1)
+        self.assertEqual(caught.exception.step, 'locate')
+        self.assertIn('1 unanswered reads', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
+        self.assertEqual(done_reads, [])
         self.assertEqual(fake.sends, [])
 
     def test_a_grace_location_source_does_not_authorize_a_first_send(self):
@@ -1047,9 +1067,10 @@ class ClosedLoopTests(unittest.TestCase):
             fake.run([step('press', 'source', 'done')], locate_cap=1)
         self.assertEqual(caught.exception.step, 'locate')
         self.assertIn('last answered read', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
         self.assertEqual(fake.sends, [])
 
-    def test_a_reply_just_after_the_deadline_is_used(self):
+    def test_a_reply_at_or_after_the_deadline_is_not_read(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         grace = []
 
@@ -1062,11 +1083,12 @@ class ClosedLoopTests(unittest.TestCase):
             return no_read
 
         fake = Script(observe)
-        result = fake.run([step('press', 'source', 'done', cap=4)])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=4)])
         self.assertEqual(len(fake.sends), 1)
-        self.assertEqual(fake.finishes, 1)
-        self.assertEqual(result['steps'][0]['unanswered'], 4)
-        self.assertEqual(len(grace), 2)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 3)
+        self.assertEqual(grace, [])
 
     def test_only_unanswered_reads_until_the_cap_stop_with_the_last_answered_read(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
@@ -1075,7 +1097,7 @@ class ClosedLoopTests(unittest.TestCase):
             fake.run([step('press', 'source', 'done', cap=4)])
         self.assertIn("last answered read 'source'", caught.exception.reason)
         self.assertIn('unanswered reads', caught.exception.reason)
-        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 5)
+        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 3)
         self.assertEqual(len(fake.sends), 1)
         self.assertEqual(fake.finishes, 0)
 
@@ -1120,10 +1142,11 @@ class ClosedLoopTests(unittest.TestCase):
                       step('second', 'second', 'done', ready_cap=2)])
         self.assertEqual(caught.exception.step, 'second')
         self.assertIn('last answered read', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
         self.assertEqual(fake.sends, [('first', 0)])
         self.assertEqual(fake.finishes, 1)
 
-    def test_a_grace_source_can_authorize_the_retry_only_if_the_lost_timer_was_satisfied(self):
+    def test_a_source_at_the_deadline_cannot_authorize_a_retry(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         reads_at_three = []
 
@@ -1137,11 +1160,12 @@ class ClosedLoopTests(unittest.TestCase):
             return 'source'
 
         fake = Script(observe)
-        result = fake.run([step('press', 'source', 'done', cap=3, lost_after=2)])
-        self.assertEqual(len(fake.sends), 2)
-        self.assertEqual(result['steps'][0]['unanswered'], 1)
-        self.assertEqual(len(result['stalls']), 1)
-        self.assertEqual(fake.finishes, 2)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=3, lost_after=2)])
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(reads_at_three, [])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
 
     def test_a_grace_source_without_a_satisfied_lost_timer_does_not_resend(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
@@ -1160,6 +1184,7 @@ class ClosedLoopTests(unittest.TestCase):
         with self.assertRaises(RouteStopped) as caught:
             fake.run([step('press', 'source', 'done', cap=4, lost_after=3)])
         self.assertIn('last answered read', caught.exception.reason)
+        self.assertEqual(deadline_reads, [])
         self.assertEqual(len(fake.sends), 1)
         self.assertEqual(fake.finishes, 0)
 

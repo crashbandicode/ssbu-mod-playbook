@@ -1504,8 +1504,10 @@ def _wireless_observer(ctx, io, screens, state):
     def observe(cap=None):
         try:
             deadline = time.monotonic() + cap if cap is not None else None
-            ui = _wireless_read(ctx, io, 'ssbu.ui', min(2.0, cap) if cap is not None else 2.0,
-                                screens, on_sample=remember_ui)
+            ui_cap = min(2.0, deadline - time.monotonic()) if deadline is not None else 2.0
+            if ui_cap < 0.05:
+                return closed_loop.NO_READ
+            ui = _wireless_read(ctx, io, 'ssbu.ui', ui_cap, screens, on_sample=remember_ui)
             if 'error' in ui:
                 state['last_error'] = ui['error']
                 state['last_read_was_error'] = True
@@ -1517,9 +1519,8 @@ def _wireless_observer(ctx, io, screens, state):
             if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
                     and ui.get('observation.active') == 'yes'):
                 tile_cap = min(2.0, deadline - time.monotonic()) if deadline is not None else 2.0
-                if tile_cap <= 0:
-                    return closed_loop.NO_READ
-                tile = _wireless_read(ctx, io, 'tile.cursor', tile_cap, screens)
+                tile = ({'error': 'no time left for tile.cursor'} if tile_cap < 0.05
+                        else _wireless_read(ctx, io, 'tile.cursor', tile_cap, screens))
                 state['last_tile'] = tile
                 if 'error' not in tile:
                     state['last_answered_tile'] = tile
@@ -1733,6 +1734,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
     if not isinstance(idle_cap, (int, float)) or not math.isfinite(idle_cap) or idle_cap <= 0:
         raise RuntimeError(f'wireless_room: idle_cap must be positive, got {idle_cap!r}')
     started, screens = time.monotonic(), []
+    confirm_retry_wait, revalidate_cap = 20.0, 4.5
     io = BridgePickerIO(ctx)
     state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
              'last_error': None, 'last_read_was_error': False,
@@ -1813,7 +1815,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             form = screen == 'ldn.create' or (screen == 'unknown' and state['form_ready']
                                               and state['current'] == 'confirm-create')
         return (available() and form and _wireless_ready(ui)
-                and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= 20))
+                and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= confirm_retry_wait))
 
     def confirm_done(obs):
         ui = obs['ui']
@@ -1875,7 +1877,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
                          target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index')),
                          screen=lambda o: active(o, 'ldn.room_list')),
         closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
-                         cap=20, lost_after=0, sends=2, before_send=begin_confirm,
+                         cap=confirm_retry_wait + revalidate_cap, lost_after=0, sends=2, before_send=begin_confirm,
                          screen=lambda o: active(o, 'ldn.create')),
         closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
                          cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at'),
@@ -1929,7 +1931,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
                                    clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
                                    idle=lambda remaining: _eden_macro_busy(
                                        ctx, remaining, note=lambda text: state.__setitem__('last_macro_error', text)),
-                                   idle_cap=idle_cap, revalidate_cap=4.5)
+                                   idle_cap=idle_cap, revalidate_cap=revalidate_cap)
         finally:
             if previous is missing:
                 del ctx.runner.closed_loop_owns_idle

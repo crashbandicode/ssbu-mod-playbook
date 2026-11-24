@@ -53,6 +53,8 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
     entered_at = 'done'
     stalls = []
     last_answered, last_answered_at, locate_unanswered = None, None, 0
+    last_was_unanswered = False
+    expired, next_read = object(), object()
     idle_budget = None
     idle_with_cap = True
     if idle is not None:
@@ -64,6 +66,12 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 idle_with_cap = False
         except (TypeError, ValueError):
             pass
+    try:
+        inspect.signature(observe).bind(cap=1.0)
+    except (TypeError, ValueError):
+        observe_with_cap = False
+    else:
+        observe_with_cap = True
 
     def receipt():
         flush_idle_budget()
@@ -85,15 +93,26 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         return next((i for i in range(len(steps) - 1, -1, -1)
                      if i != excluding and steps[i].source and steps[i].source(obs)), None)
 
-    def read(index=None):
-        nonlocal last_answered, last_answered_at, locate_unanswered
+    def read(index=None, deadline=None):
+        nonlocal last_answered, last_answered_at, locate_unanswered, last_was_unanswered
+        remaining = None if deadline is None else deadline - clock()
+        if remaining is not None and remaining <= 0:
+            return expired
         if idle_budget is not None:
             check_idle_budget()
             if idle_cap - (clock() - idle_budget['started']) < revalidate_cap:
                 stop_idle_budget(f'not enough of the bound left to re-read the screen (needs {revalidate_cap:g} s); '
                                  'nothing was sent')
+        remaining = None if deadline is None else deadline - clock()
+        if remaining is not None and remaining <= 0:
+            return expired
+        if idle_budget is not None:
+            idle_remaining = idle_cap - (clock() - idle_budget['started'])
+            remaining = idle_remaining if remaining is None else min(remaining, idle_remaining)
+            if remaining <= 0:
+                return expired
         try:
-            value = observe()
+            value = observe(cap=remaining) if observe_with_cap and remaining is not None else observe()
         except RuntimeError as error:
             reason = f'bridge continuity lost, nothing was sent after it: {error}'
             if index is None:
@@ -103,17 +122,19 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 records[index]['ms'] += round((clock() - active_started) * 1000)
             stop(steps[index].name, reason)
         if value is NO_READ:
+            last_was_unanswered = True
             if index is None:
                 locate_unanswered += 1
             else:
                 records[index]['unanswered'] += 1
         else:
+            last_was_unanswered = False
             last_answered, last_answered_at = value, clock()
         return value
 
     def wait(deadline, index=None):
         sleep(min(poll, max(0.0, deadline - clock())))
-        return read(index)
+        return read(index, deadline)
 
     def unreadable_reason(count):
         return (f'no transition within cap; last answered read {last_answered!r}; '
@@ -269,23 +290,25 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
     if not steps:
         return receipt()
     deadline = clock() + locate_cap
-    obs = read()
+    obs = read(deadline=deadline)
     while True:
-        grace = False
+        if obs is expired:
+            reason = (unreadable_reason(locate_unanswered) if last_was_unanswered
+                      else f'no matching step; last read {last_answered!r}')
+            stop('locate', reason)
         if obs is NO_READ:
             if clock() >= deadline:
-                grace = True
-                obs = read()
-                if obs is NO_READ:
-                    stop('locate', unreadable_reason(locate_unanswered))
+                stop('locate', unreadable_reason(locate_unanswered))
             else:
                 obs = wait(deadline)
                 continue
+        if clock() > deadline:
+            stop('locate', f'no matching step; last read {last_answered!r}')
         if done(steps[-1], obs) or (locate_done is not None and locate_done(obs)):
             records[-1]['unanswered'] += locate_unanswered
             return receipt()
-        if grace:
-            stop('locate', unreadable_reason(locate_unanswered))
+        if clock() >= deadline:
+            stop('locate', f'no matching step; last read {obs!r}')
         index = matching(obs)
         if index is None:
             index = next((i for i in range(len(steps) - 1, -1, -1)
@@ -306,34 +329,40 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         retry = None
         visit_sends = 0
         active_index, active_started = index, started
+        ready_deadline = started + step.ready_cap
+        if obs is next_read:
+            obs = read(index, ready_deadline)
         if on_step:
             on_step(step.name)
-        ready_deadline = started + step.ready_cap
-        ready_grace = False
         while True:
+            if obs is expired:
+                record['ms'] += round((clock() - started) * 1000)
+                if last_was_unanswered:
+                    stop(step.name, unreadable_reason(record['unanswered']))
+                reason = (f'no transition within cap; last read {last_answered!r}' if retry is not None
+                          else f'not ready: last read {last_answered!r}')
+                record['skipped'] = False
+                stop(step.name, reason)
             check_idle_budget()
             if obs is NO_READ:
                 if retry is not None and retry['pause_at'] is None:
                     retry['pause_at'] = last_answered_at
                 unreadable_deadline = min(ready_deadline, retry['deadline']) if retry is not None else ready_deadline
                 if clock() >= unreadable_deadline:
-                    if ready_grace or (retry is not None and retry['grace_used']):
-                        record['ms'] += round((clock() - started) * 1000)
-                        stop(step.name, unreadable_reason(record['unanswered']))
-                    ready_grace = True
-                    if retry is not None:
-                        retry['grace_used'] = True
-                    obs = read(index)
-                    if obs is NO_READ:
-                        record['ms'] += round((clock() - started) * 1000)
-                        stop(step.name, unreadable_reason(record['unanswered']))
-                else:
-                    obs = wait(unreadable_deadline, index)
-                    continue
+                    record['ms'] += round((clock() - started) * 1000)
+                    stop(step.name, unreadable_reason(record['unanswered']))
+                obs = wait(unreadable_deadline, index)
+                continue
             if retry is not None and retry['pause_at'] is not None:
                 if retry['changed_since'] is not None:
                     retry['changed_since'] += clock() - retry['pause_at']
                 retry['pause_at'] = None
+            if clock() > ready_deadline or (retry is not None and clock() > retry['deadline']):
+                record['ms'] += round((clock() - started) * 1000)
+                reason = (f'no transition within cap; last read {obs!r}' if retry is not None
+                          else f'not ready: last read {obs!r}')
+                record['skipped'] = False
+                stop(step.name, reason)
             # A prepared retry retains its target even if its first dispatch was rejected as busy.
             if done(step, obs):
                 if retry is not None and not retry.get('finished'):
@@ -342,21 +371,21 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 index += 1
                 if index < len(steps):
                     transfer_idle_budget(index)
-                    obs = read(index)
+                    obs = next_read
                 break
             if done(steps[-1], obs):
                 if retry is not None and not retry.get('finished'):
                     finish()
                 record['ms'] += round((clock() - started) * 1000)
                 return receipt()
+            if clock() >= ready_deadline or (retry is not None and clock() >= retry['deadline']):
+                record['ms'] += round((clock() - started) * 1000)
+                record['skipped'] = False
+                reason = (f'no transition within cap; last read {obs!r}' if retry is not None
+                          else f'not ready: last read {obs!r}')
+                stop(step.name, reason)
             at = step_at(step, obs)
             other = matching(obs, index)
-            if ready_grace and retry is not None and (not at or target(step, obs) != retry['witness']):
-                record['ms'] += round((clock() - started) * 1000)
-                stop(step.name, unreadable_reason(record['unanswered']))
-            if ready_grace and retry is None:
-                record['ms'] += round((clock() - started) * 1000)
-                stop(step.name, unreadable_reason(record['unanswered']))
             if retry is not None and source(step, obs) and target(step, obs) != retry['witness']:
                 current_target = target(step, obs)
                 if retry['changed_since'] is None:
@@ -367,7 +396,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 if clock() >= ready_deadline:
                     record['ms'] += round((clock() - started) * 1000)
                     stop(step.name, f'not ready: last read {obs!r}')
-                obs = wait(ready_deadline, index)
+                obs = wait(min(ready_deadline, retry['deadline']), index)
                 continue
             if not at and other is not None:
                 if retry is not None and not retry.get('finished'):
@@ -388,13 +417,14 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         if clock() >= ready_deadline:
                             record['ms'] += round((clock() - started) * 1000)
                             stop(step.name, f'not ready: last read {obs!r}')
-                        obs = wait(ready_deadline, index)
+                        obs = wait(min(ready_deadline, retry['deadline']), index)
                         continue
                 if record['sends'] >= step.sends:
                     record['ms'] += round((clock() - started) * 1000)
                     stop(step.name, f'no transition after {record["sends"]} sends')
                 if wait_idle(step, record, obs):
-                    obs = read(index)
+                    obs = read(index, min(ready_deadline, retry['deadline'])
+                               if retry is not None else ready_deadline)
                     continue
                 rollback = None
                 if step.before_send:
@@ -439,7 +469,8 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         record['ms'] += round((clock() - started) * 1000)
                         stop(step.name, 'dispatch rejected as busy twice; nothing was delivered')
                     wait_idle(step, record, obs, rejected=True, rejection_reason=str(error))
-                    obs = read(index)
+                    obs = read(index, min(ready_deadline, retry['deadline'])
+                               if retry is not None else ready_deadline)
                     continue
                 except Exception as error:
                     if visit_sends == 0 and record['sends'] > 1:
@@ -461,29 +492,23 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     stop(step.name, f'no transition within cap; last read {obs!r}')
                 lost_since = changed_since = None
                 pause_at = None
-                grace_used = False
                 while True:
                     obs = wait(deadline, index)
-                    if step.latch and clock() > deadline:
+                    if obs is expired:
                         record['ms'] += round((clock() - started) * 1000)
-                        stop(step.name, f'no transition within cap; last read {obs!r}')
-                    if step.latch and obs is NO_READ and clock() >= deadline:
+                        reason = (unreadable_reason(record['unanswered']) if last_was_unanswered
+                                  else f'no transition within cap; last read {last_answered!r}')
+                        stop(step.name, reason)
+                    if clock() > deadline:
                         record['ms'] += round((clock() - started) * 1000)
-                        stop(step.name, unreadable_reason(record['unanswered']))
-                    grace = False
+                        stop(step.name, f'no transition within cap; last read {last_answered!r}')
                     if obs is NO_READ:
                         if pause_at is None:
                             pause_at = last_answered_at
-                        if clock() < deadline:
-                            continue
-                        if grace_used:
+                        if clock() >= deadline:
                             record['ms'] += round((clock() - started) * 1000)
                             stop(step.name, unreadable_reason(record['unanswered']))
-                        grace_used = grace = True
-                        obs = read(index)
-                        if obs is NO_READ:
-                            record['ms'] += round((clock() - started) * 1000)
-                            stop(step.name, unreadable_reason(record['unanswered']))
+                        continue
                     if pause_at is not None:
                         paused = clock() - pause_at
                         if lost_since is not None:
@@ -496,29 +521,25 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         record['ms'] += round((clock() - started) * 1000)
                         index += 1
                         if index < len(steps):
-                            obs = read(index)
+                            obs = next_read
                         break
                     if done(steps[-1], obs):
                         finish()
                         record['ms'] += round((clock() - started) * 1000)
                         return receipt()
+                    if clock() >= deadline:
+                        record['ms'] += round((clock() - started) * 1000)
+                        stop(step.name, f'no transition within cap; last read {obs!r}')
                     if step.latch:
-                        if clock() >= deadline:
-                            record['ms'] += round((clock() - started) * 1000)
-                            stop(step.name, f'no transition within cap; last read {obs!r}')
                         continue
                     other = matching(obs, index)
                     at_source = source(step, obs)
                     current_target = target(step, obs) if at_source else None
-                    if grace and not (at_source and current_target == witness and lost_since is not None
-                                      and clock() - lost_since >= step.lost_after):
-                        record['ms'] += round((clock() - started) * 1000)
-                        stop(step.name, unreadable_reason(record['unanswered']))
                     if other is not None and not (at_source and current_target != witness):
                         finish()
                         record['ms'] += round((clock() - started) * 1000)
                         index = other
-                        obs = read(index)
+                        obs = next_read
                         break
                     if at_source and current_target != witness:
                         lost_since = None
@@ -539,44 +560,33 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                                 finish()
                                 record['ms'] += round((clock() - started) * 1000)
                                 stop(step.name, f'no transition after {record["sends"]} sends')
-                            preflight_started = clock()
-                            fresh = read(index)
+                            fresh = read(index, deadline)
+                            if fresh is expired:
+                                record['ms'] += round((clock() - started) * 1000)
+                                reason = (unreadable_reason(record['unanswered']) if last_was_unanswered
+                                          else f'no transition within cap; last read {last_answered!r}')
+                                stop(step.name, reason)
                             if fresh is NO_READ:
                                 pause_at = last_answered_at
                                 if clock() < deadline:
                                     continue
-                                if grace_used:
-                                    record['ms'] += round((clock() - started) * 1000)
-                                    stop(step.name, unreadable_reason(record['unanswered']))
-                                grace_used = True
-                                fresh = read(index)
-                                if fresh is NO_READ:
-                                    record['ms'] += round((clock() - started) * 1000)
-                                    stop(step.name, unreadable_reason(record['unanswered']))
-                                paused = clock() - pause_at
-                                lost_since += paused
-                                if changed_since is not None:
-                                    changed_since += paused
-                                pause_at = None
-                                grace = True
-                            if preflight_started < deadline and clock() > deadline:
-                                if not grace:
-                                    record['ms'] += round((clock() - started) * 1000)
-                                    stop(step.name, f'no transition within cap; last read {fresh!r}')
-                            fresh_done = done(step, fresh)
-                            fresh_final_done = False if fresh_done else done(steps[-1], fresh)
-                            if (grace and not fresh_done and not fresh_final_done
-                                    and not (step_at(step, fresh) and target(step, fresh) == witness)):
                                 record['ms'] += round((clock() - started) * 1000)
                                 stop(step.name, unreadable_reason(record['unanswered']))
+                            if clock() > deadline:
+                                record['ms'] += round((clock() - started) * 1000)
+                                stop(step.name, f'no transition within cap; last read {fresh!r}')
+                            fresh_done = done(step, fresh)
+                            fresh_final_done = False if fresh_done else done(steps[-1], fresh)
+                            if clock() >= deadline and not fresh_done and not fresh_final_done:
+                                record['ms'] += round((clock() - started) * 1000)
+                                stop(step.name, f'no transition within cap; last read {fresh!r}')
                             if (not fresh_done and not fresh_final_done
                                     and matching(fresh, index) is None and step_at(step, fresh)
                                     and target(step, fresh) == witness):
                                 retry = {'witness': witness, 'event': event, 'changed_since': None,
-                                         'deadline': deadline, 'grace_used': grace_used, 'pause_at': None}
-                                obs = read(index)
-                                ready_deadline = clock() + step.ready_cap
-                                ready_grace = False
+                                         'deadline': deadline, 'pause_at': None}
+                                ready_deadline = min(clock() + step.ready_cap, deadline)
+                                obs = read(index, ready_deadline)
                                 break
                             obs = fresh
                             lost_since = None
@@ -586,7 +596,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                                 record['ms'] += round((clock() - started) * 1000)
                                 index += 1
                                 if index < len(steps):
-                                    obs = read(index)
+                                    obs = next_read
                                 break
                             if fresh_final_done:
                                 finish()
@@ -597,7 +607,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                                 finish()
                                 record['ms'] += round((clock() - started) * 1000)
                                 index = other
-                                obs = read(index)
+                                obs = next_read
                                 break
                     else:
                         lost_since = changed_since = None
@@ -613,5 +623,6 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 stop(step.name, f'not ready: last read {obs!r}')
             if retry is not None:
                 retry['changed_since'] = None
-            obs = wait(ready_deadline, index)
+            obs = wait(min(ready_deadline, retry['deadline'])
+                       if retry is not None else ready_deadline, index)
     return receipt()
