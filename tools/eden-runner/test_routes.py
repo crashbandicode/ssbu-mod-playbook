@@ -40,7 +40,7 @@ class LogCursorTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == 'nt', 'Windows uses the unheld cursor; a held handle blocks the rename')
     def test_rotation_drains_old_file_then_reads_new(self):
-        cursor = routes.LogCursor(self.path)
+        cursor = routes.LogCursor(self.path, rotates=True)
         with self.path.open('a') as f:
             f.write('before rename\n')
         os.replace(self.path, self.dir / 'practice-diagnostics.previous.log')
@@ -54,7 +54,7 @@ class LogCursorTests(unittest.TestCase):
         self.assertEqual(cursor.read(), ['second of new'])
 
     def test_unheld_mode_for_windows(self):
-        cursor = routes.LogCursor(self.path, hold=False)
+        cursor = routes.LogCursor(self.path, hold=False, rotates=True)
         self.assertIsNone(cursor.handle)
         with self.path.open('a') as f:
             f.write('a\n')
@@ -67,7 +67,7 @@ class LogCursorTests(unittest.TestCase):
         self.assertEqual(cursor.read(), ['t'])
 
     def test_truncation_reads_from_start(self):
-        cursor = routes.LogCursor(self.path)
+        cursor = routes.LogCursor(self.path, rotates=True)
         self.path.write_text('x\n')
         self.assertEqual(cursor.read(), ['x'])
 
@@ -192,35 +192,120 @@ class LogCursorTests(unittest.TestCase):
                 self.assertEqual(cursor.rotations, 1)
                 cursor.close()
 
-    def test_a_rewrite_in_place_with_other_lines_is_read_from_its_start(self):
+    STAGE_READY = ('[Bridge] ui screen=stage_select ctx=local_wireless ready=yes gen=4 owner=native dialog=none '
+                   'picker=4.2.0 raw=0:4,0,0:4:2:0 ev=692 frame=1013')
+    CSS_READY = ('[Bridge] ui screen=css.smash ctx=local_wireless ready=yes gen=5 owner=native dialog=none '
+                 'picker=2.2.0 raw=0:2,0,0:2:2:0 ev=2600 frame=1967')
+
+    def _boot_log(self):
+        """A log like the A1 trace boot's up to its first CSS line: Stage Select ready early, then many frames."""
+        frames = [f'[Bridge] ui screen=stage_select ctx=local_wireless ready=yes gen=4 owner=native dialog=none '
+                  f'picker=4.{n}.0 raw=0:4,0,0:4:{n}:0 ev={692 + 2 * n} frame={1013 + n}' for n in range(1, 120)]
+        text = '\n'.join([self.STAGE_READY] + frames + [self.CSS_READY]) + '\n'
+        self.assertGreater(len(text), 2 * 4096)
+        return text
+
+    def test_wait_rejects_an_old_ready_line_in_a_replaced_log_it_cannot_place(self):
+        # rv-fusion-g4, 2026-11-24 02:58Z: the replacement holds an old Stage Select ready line and a later CSS line,
+        # but not the last text the cursor read. Its age is unknown, so it must not satisfy a wait or a read.
+        wanted = r'screen=stage_select .*ready=yes'
+        for hold in self.MODES:
+            for in_place in (False, True):
+                with self.subTest(hold=hold, in_place=in_place):
+                    self.path.write_text(self._boot_log())
+                    cursor = routes.LogCursor(self.path, hold=hold)
+                    cursor.mark()
+                    stale = self.STAGE_READY + '\n' + self.CSS_READY + '\n'
+                    if in_place:
+                        self.path.write_text(stale)  # the same file, cut short and written again
+                    else:
+                        self._replace_with(stale)
+                    self.assertEqual(cursor.read(), [])  # what the trace tap does
+                    with self.assertRaises(RuntimeError) as raised:
+                        cursor.wait(wanted, 0.3)
+                    self.assertIn('2 lines of a replaced file were not accepted', str(raised.exception))
+                    self.assertEqual((cursor.rotations, cursor.unqualified, cursor.backlog), (1, 2, []))
+                    # The positive control: a ready line written after the replacement is new.
+                    later = self.STAGE_READY.replace('ev=692 frame=1013', 'ev=9000 frame=5000')
+                    with self.path.open('a') as f:
+                        f.write(later + '\n')
+                    self.assertEqual(cursor.wait(wanted, 1).string, later)
+                    self.assertEqual((cursor.rotations, cursor.unqualified), (1, 2))
+                    cursor.close()
+
+    def test_a_line_cut_off_in_text_of_unknown_age_is_not_returned_when_it_is_finished(self):
         for hold in self.MODES:
             with self.subTest(hold=hold):
-                self.path.write_text('old 1\nold 2\n')
+                self.path.write_text(self._boot_log())
                 cursor = routes.LogCursor(self.path, hold=hold)
-                inode = os.stat(self.path).st_ino
-                with self.path.open('r+') as f:  # the same file, emptied and written again: not smaller than before
-                    f.truncate(0)
-                    f.write('fresh 1\nfresh 2 is longer than the old file\n')
-                self.assertEqual(os.stat(self.path).st_ino, inode)
-                self.assertEqual(cursor.read(), ['fresh 1', 'fresh 2 is longer than the old file'])
-                self.assertEqual(cursor.rotations, 1)
+                self._replace_with(self.CSS_READY + '\n[Bridge] ui screen=stage_select ctx=local_wireless ready=y')
+                self.assertEqual(cursor.read(), [])
                 with self.path.open('a') as f:
-                    f.write('fresh 3\n')
-                self.assertEqual(cursor.read(), ['fresh 3'])
-                self.assertEqual(cursor.rotations, 1)
+                    f.write('es gen=4\nwritten after\n')
+                self.assertEqual(cursor.read(), ['written after'])
+                self.assertEqual(cursor.unqualified, 2)
                 cursor.close()
+
+    def test_a_cursor_started_at_the_end_does_not_return_a_line_already_begun(self):
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('old 1\nscreen=stage_select ready=y')
+                cursor = routes.LogCursor(self.path, hold=hold)
+                with self.path.open('a') as f:
+                    f.write('es frame=1013\nnew 1\n')
+                self.assertEqual(cursor.read(), ['new 1'])
+                cursor.mark()
+                with self.path.open('a') as f:
+                    f.write('new 2\n')
+                self.assertEqual(cursor.read(), ['new 2'])
+                cursor.close()
+
+    def test_a_log_emptied_and_then_written_gives_the_new_lines(self):
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text(self._boot_log())
+                cursor = routes.LogCursor(self.path, hold=hold)
+                with self.path.open('r+') as f:
+                    f.truncate(0)
+                self.assertEqual(cursor.read(), [])
+                with self.path.open('a') as f:
+                    f.write('first after the cut\n')
+                self.assertEqual(cursor.read(), ['first after the cut'])
+                self.assertEqual((cursor.rotations, cursor.unqualified), (1, 0))
+                cursor.close()
+
+    def test_a_rewrite_in_place_with_other_lines(self):
+        for hold in self.MODES:
+            for rotates in (False, True):
+                with self.subTest(hold=hold, rotates=rotates):
+                    self.path.write_text('old 1\nold 2\n')
+                    cursor = routes.LogCursor(self.path, hold=hold, rotates=rotates)
+                    inode = os.stat(self.path).st_ino
+                    with self.path.open('r+') as f:  # the same file, emptied and written again: not smaller than before
+                        f.truncate(0)
+                        f.write('fresh 1\nfresh 2 is longer than the old file\n')
+                    self.assertEqual(os.stat(self.path).st_ino, inode)
+                    fresh = ['fresh 1', 'fresh 2 is longer than the old file']
+                    self.assertEqual(cursor.read(), fresh if rotates else [])
+                    self.assertEqual((cursor.rotations, cursor.unqualified), (1, 0 if rotates else 2))
+                    with self.path.open('a') as f:
+                        f.write('fresh 3\n')
+                    self.assertEqual(cursor.read(), ['fresh 3'])
+                    self.assertEqual(cursor.rotations, 1)
+                    cursor.close()
 
     def test_a_partial_line_of_a_replaced_log_is_not_joined_to_the_new_file(self):
         for hold in self.MODES:
-            with self.subTest(hold=hold):
-                self.path.write_text('old 1\n')
-                cursor = routes.LogCursor(self.path, hold=hold)
-                with self.path.open('a') as f:
-                    f.write('cut off')
-                self.assertEqual(cursor.read(), [])
-                self._replace_with('other file\n')
-                self.assertEqual(cursor.read(), ['cut off', 'other file'])
-                cursor.close()
+            for rotates in (False, True):
+                with self.subTest(hold=hold, rotates=rotates):
+                    self.path.write_text('old 1\n')
+                    cursor = routes.LogCursor(self.path, hold=hold, rotates=rotates)
+                    with self.path.open('a') as f:
+                        f.write('cut off')
+                    self.assertEqual(cursor.read(), [])
+                    self._replace_with('other file\n')
+                    self.assertEqual(cursor.read(), ['cut off', 'other file'] if rotates else ['cut off'])
+                    cursor.close()
 
     def test_a_short_log_cut_back_to_lines_already_read_gives_nothing(self):
         for hold in self.MODES:
@@ -234,22 +319,22 @@ class LogCursorTests(unittest.TestCase):
                         with self.path.open('r+') as f:
                             f.truncate(len('old 1\n'))
                     self.assertEqual(cursor.read(), [])
-                    self.assertEqual(cursor.rotations, 1)
+                    self.assertEqual((cursor.rotations, cursor.unqualified), (1, 0))
                     with self.path.open('a') as f:
                         f.write('new 1\n')
                     self.assertEqual(cursor.read(), ['new 1'])
                     cursor.close()
 
-    def test_a_long_log_cut_back_before_the_cursors_last_lines_is_read_from_its_start(self):
-        # The limit of the check: the cursor keeps the last 4096 bytes it read, not the whole file.
-        lines = [f'[Bridge] ui screen=stage_select ready=yes ev={n} frame={1000 + n}' for n in range(400)]
+    def test_a_rotating_log_cursor_reads_a_new_file_that_repeats_old_lines(self):
+        # The limit of rotates=True: the cursor keeps the last 4096 bytes it read, not the whole file.
+        lines = self._boot_log().splitlines()
         for hold in self.MODES:
             with self.subTest(hold=hold):
                 self.path.write_text('\n'.join(lines) + '\n')
-                cursor = routes.LogCursor(self.path, hold=hold)
+                cursor = routes.LogCursor(self.path, hold=hold, rotates=True)
                 self._replace_with('\n'.join(lines[:3]) + '\n')
                 self.assertEqual(cursor.read(), lines[:3])
-                self.assertEqual(cursor.rotations, 1)
+                self.assertEqual((cursor.rotations, cursor.unqualified), (1, 0))
                 cursor.close()
 
 
