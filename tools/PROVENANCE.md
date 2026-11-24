@@ -210,3 +210,9 @@ TrainingRooms `71158421` `src/model/bridge_events.rs` lines 23–26, 45 and 132.
 `dispatch-pack-v2/xps/bridge_watch_steps.py`, field parsing from `f16_judge.py` and effective partner readback
 from `f15_room_steps.py`, using canonical native state, log cursor and bridge request helpers. The fighter
 lines in `test_fixtures.py` are modelled, not recorded. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/runner.py` separates visual and deterministic blockers, binds visual reads to
+runner captures, and ties producer receipts to packet and canonical runner inputs. Offline fake-client
+regressions model the reviewer and F10 missing-delivery controls; host tests only, no runtime acceptance.
+Named GIF outputs are excluded from the input identity, including nested and recovery steps; collisions
+with packet inputs are refused and do not gain that exclusion.

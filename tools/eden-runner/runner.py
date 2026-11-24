@@ -1319,6 +1319,7 @@ class Runner:
         self.recovered_to = None
         self.current_on = self.default
         self.current_row = None
+        self.captures = None
         if client_factory is None:
             client_factory = default_client_factory()
         self.clients = {key: client_factory(inst['socket']) for key, inst in instances.items()}
@@ -1369,27 +1370,29 @@ class Runner:
             return receipt['status']
         if self.judge_config() and skipped_pending:
             receipt['judge'] = {'state': 'skipped'}
+        blockers = []
         if row.get('outcome') == 'visual':
-            receipt.update(status='RAN-UNVERIFIED', review=True, review_kind='visual',
-                           status_reason='visual read pending', visual_read={'state': 'pending'})
-            return receipt['status']
-        if self.unverified_hooks:
-            spec, marker = self.unverified_hooks[0]
-            receipt.update(status='RAN-UNVERIFIED', review=True, review_kind='visual',
-                           status_reason=f'hook {spec}: {marker}')
-            return receipt['status']
+            blockers.append({'kind': 'visual', 'source': 'row', 'text': 'visual read pending'})
+        blockers.extend({'kind': kind, 'source': spec, 'text': f'hook {spec}: {marker}'}
+                        for spec, kind, marker in self.unverified_hooks)
         required = bool(self.plan.get('require_effect')) or (is_test and 'target' in self.plan)
-        if is_test and required and self.empty_effect_hooks:
-            spec, reason = self.empty_effect_hooks[0]
-            receipt.update(status='RAN-UNVERIFIED', review=True,
-                           status_reason=f'effect hook {spec} returned {reason}')
-            return receipt['status']
-        status, reason = judge_queue.gates_only_status(self.effects_passed, required)
-        receipt['status'] = status
-        if reason:
-            receipt['status_reason'] = reason
-            receipt['review'] = True
-        return status
+        if is_test and self.empty_effect_hooks:
+            blockers.extend({'kind': 'effect', 'source': spec, 'text': f'effect hook {spec} returned {reason}'}
+                            for spec, reason in self.empty_effect_hooks)
+        if required and not self.effects_passed and row.get('outcome') != 'visual':
+            _, reason = judge_queue.gates_only_status(self.effects_passed, required)
+            blockers.append({'kind': 'effect', 'source': 'row', 'text': reason})
+        receipt['blockers'] = blockers
+        if not blockers:
+            receipt['status'] = 'PASS'
+            return 'PASS'
+        nonvisual = next((blocker for blocker in blockers if blocker['kind'] != 'visual'), None)
+        receipt.update(status='RAN-UNVERIFIED', review=True,
+                       review_kind='unverified' if nonvisual else 'visual',
+                       status_reason=(nonvisual or blockers[0])['text'])
+        if any(blocker['kind'] == 'visual' for blocker in blockers):
+            receipt['visual_read'] = {'state': 'pending'}
+        return receipt['status']
 
     def queue_judge(self, row_id, clip=None):
         """Write the row's judge job and start its worker; never blocks the console. Only rows whose deterministic
@@ -1535,6 +1538,17 @@ class Runner:
             target = next((n['id'] for n in tree if n.get('class') == 'GRenderWindow'), 'all')
         path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
         self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
+        if self.captures is not None:
+            utc = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            try:
+                status = self.call(on, 'status', {})
+                status = ({key: value for key, value in status.items()
+                           if isinstance(value, (str, int, float, bool, type(None)))}
+                          if isinstance(status, dict) else None)
+            except Exception:  # noqa: BLE001 - a missing status does not invalidate a screenshot
+                status = None
+            self.captures.append({'name': name, 'file': path.name, 'sha256': digest(path), 'utc': utc,
+                                  'status': status})
         if self._arm_frames:
             try:
                 data = path.read_bytes()
@@ -2372,17 +2386,16 @@ class Runner:
     def _step_run(self, on, step):
         hook = load_step(self.base, step['run'])
         value = hook(StepContext(self, on), **step.get('args', {}))
-        marker = None
+        markers = []
         if isinstance(value, dict):
             unverified = value.get('unverified')
             if isinstance(unverified, str) and unverified:
-                marker = unverified
-            elif value.get('grade') == 'NEEDS VISUAL READ':
-                marker = value['grade']
-            elif value.get('visual_verdict') == 'pending':
-                marker = value['visual_verdict']
-        if marker:
-            self.unverified_hooks.append((step['run'], marker))
+                markers.append(('unverified', unverified))
+            if value.get('grade') == 'NEEDS VISUAL READ':
+                markers.append(('visual', value['grade']))
+            if value.get('visual_verdict') == 'pending':
+                markers.append(('visual', value['visual_verdict']))
+        self.unverified_hooks.extend((step['run'], kind, text) for kind, text in markers)
         if step.get('effect'):
             if judge_queue.effect_evidence(value):
                 self.effects_passed.append(f'run:{step["run"]}')
@@ -2393,7 +2406,8 @@ class Runner:
                         reason = f'verdict {value["verdict"]}'
                     elif 'pass' in value and value['pass'] is not True:
                         reason = f'pass={value["pass"]}'
-                self.empty_effect_hooks.append((step['run'], reason))
+                if not markers or reason != 'no evidence':
+                    self.empty_effect_hooks.append((step['run'], reason))
         if not isinstance(value, (str, int, float, bool, list, dict, type(None))):
             value = repr(value)
         try:
@@ -3010,15 +3024,18 @@ class Runner:
             self.last_gate_outcome = None
             self.effects_passed = []
             self.unverified_hooks, self.empty_effect_hooks = [], []
+            self.captures = []
             receipt = {'id': row['id'], 'start': row['start'], 'end': row['end'], 'evidence': row.get('evidence', []),
                        'role': row_role(row), 'role_source': 'explicit' if 'role' in row else 'default',
                        'manifest_sha256': self.snapshot_manifest(),
                        'plan_identity': plan_identity(self.plan), 'instances_sha256': self.instances_sha256,
-                       'started': time.time(), 'results': []}
+                       'inputs_identity': packet_gate.inputs_identity(self.base, self.plan),
+                       'started': time.time(), 'results': [], 'captures': self.captures}
             try:
                 self.session_start()
                 start_mark = self.session_mark('row-start', row['id'])
             except StopRun as error:  # never run a row unrecorded: stopped before any of its input
+                self.captures = None
                 receipt.update(status='FAILED', error=repr(error), ended=time.time(), not_executed=True)
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
@@ -3038,9 +3055,10 @@ class Runner:
                         if pending_recovery and pending_recovery[0] == row['id']:
                             pending_recovery = None
                         raise UnmetRecovery(f'NOT RUN (setup): needs "{token}" from row {source}, which did not pass')
-                    if (source_receipt.get('plan_identity') != receipt['plan_identity'] or
-                            (self.instances_sha256 is not None and
-                             source_receipt.get('instances_sha256') != self.instances_sha256)):
+                    if (source_receipt.get('plan_identity') != receipt['plan_identity']
+                            or 'instances_sha256' not in source_receipt
+                            or source_receipt['instances_sha256'] != receipt['instances_sha256']
+                            or source_receipt.get('inputs_identity') != receipt['inputs_identity']):
                         if pending_recovery and pending_recovery[0] == row['id']:
                             pending_recovery = None
                         raise UnmetRecovery(f'NOT RUN (setup): needs "{token}" from row {source}, '
@@ -3151,6 +3169,7 @@ class Runner:
                     receipt['acquired_references'] = self.acquired
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
+                self.captures = None
                 for key in self.clients:
                     try:
                         self.call(key, 'input.reset')
@@ -3251,15 +3270,57 @@ def record_read(manifest, out, row_id, reader, verdict, text, still):
             'still_sha256': digest(still), 'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
 
     def update(receipt):
-        if (receipt.get('gates_status') != 'PASS' or receipt.get('status') != 'RAN-UNVERIFIED'
-                or receipt.get('review_kind') != 'visual'):
+        if receipt.get('gates_status') != 'PASS' or receipt.get('status') != 'RAN-UNVERIFIED':
             raise ValueError('the receipt is not a pending visual read with passing gates')
+        blockers = receipt.get('blockers') or []
+        visual = [blocker for blocker in blockers if blocker.get('kind') == 'visual']
+        if not visual:
+            kinds = ', '.join(blocker.get('kind', '?') for blocker in blockers) or 'none'
+            raise ValueError(f'the row has no pending visual read (blockers: {kinds})')
+        names = {row.get('id') for row in plan.get('rows', [])}
+        capture = None
+        for candidate in sorted(out.glob('*.json')):
+            if candidate.stem not in names:
+                continue
+            try:
+                source = json.loads(candidate.read_text())
+            except (OSError, ValueError):
+                continue
+            if (not isinstance(source, dict) or source.get('id') != candidate.stem
+                    or not isinstance(receipt.get('plan_identity'), str)
+                    or source.get('plan_identity') != receipt['plan_identity']
+                    or 'instances_sha256' not in receipt or 'instances_sha256' not in source
+                    or source['instances_sha256'] != receipt['instances_sha256']):
+                continue
+            for item in source.get('captures') or []:
+                if (isinstance(item, dict) and item.get('sha256') == read['still_sha256']
+                        and all(key in item for key in ('name', 'file', 'utc', 'status'))):
+                    capture = {'row': candidate.stem, **{key: item[key]
+                                                        for key in ('name', 'file', 'sha256', 'utc', 'status')}}
+                    break
+            if capture is not None:
+                break
+        if capture is None:
+            raise ValueError('the still is not a capture recorded by the runner in this run')
+        read['capture'] = capture
         previous = receipt.get('visual_read')
         history = list(receipt.get('visual_reads') or [])
         if previous is not None:
             history.append(previous)
-        receipt.update(visual_read=read, visual_reads=history, status='PASS' if verdict == 'PASS' else 'FAILED',
-                       status_reason=f'visual read by {reader}: {text}', review=False)
+        receipt.update(visual_read=read, visual_reads=history)
+        if verdict == 'FAIL':
+            receipt.update(status='FAILED', status_reason=f'visual read by {reader}: {text}', review=False)
+            return
+        receipt['cleared'] = list(receipt.get('cleared') or []) + [
+            {**blocker, 'reader': reader, 'utc': read['utc']} for blocker in visual]
+        remaining = [blocker for blocker in blockers if blocker.get('kind') != 'visual']
+        receipt['blockers'] = remaining
+        if remaining:
+            receipt.update(status='RAN-UNVERIFIED', review=True, review_kind='unverified',
+                           status_reason=remaining[0]['text'])
+        else:
+            receipt.update(status='PASS', status_reason=f'visual read by {reader}: {text}', review=False)
+            receipt.pop('review_kind', None)
 
     return judge_queue.merge_receipt(path, update)
 

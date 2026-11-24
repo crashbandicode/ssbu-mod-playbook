@@ -430,7 +430,7 @@ and shared `fixtures:` hooks are not asked for cases.
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
 A passing source receipt must also match the dependent row's plan identity and
-instances file hash; otherwise it is not played and its receipt says
+instances file hash and inputs identity; otherwise it is not played and its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, whose receipt is from another packet or another Up`.
 Rerun the producer with the dependent using
 `eden_test.py run <run> --rows <producer>,<dependent>`.
@@ -438,7 +438,11 @@ The identity hashes the library-expanded plan, excluding segment `sha256` and
 `recorded` and gate `sha256` and `acquired` written during a run. It includes
 the segment file and start gate changed by `record-stop`; changing those names
 a different plan. The instances hash does not detect a game reload inside the
-same Up.
+same Up. The inputs identity hashes the rows folder and canonical runner Python,
+excluding `rows.json`, `out/`, caches and `packet-gate.json`, recorded or missing
+segment files, acquired or acquirable gate references, and a GIF step's named
+`out` file, including nested steps and recovery; G4 refuses an `out` that names
+a packet input (including any `.py` or `.json`), and it is not excluded as a GIF.
 The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
 an exact `key` with a `reason`. Play calls with computed names or unknown
@@ -458,13 +462,21 @@ is not evidence. A dictionary with `verdict` is evidence only for PASS
 (case-insensitive); one with `pass` is evidence only when that value is true.
 A hook's `unverified` text, `NEEDS VISUAL READ` grade or
 pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
+A receipt records separate visual, unverified and effect blockers. A visual
+read can clear only visual blockers, never a missing deterministic observation
+or effect; remaining blockers keep the row RAN-UNVERIFIED.
 A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
 resuming without naming it does not promote it. A setup row's PASS still means
 its steps did not raise.
 
 Record a visual read with
 `runner.py record-read rows.json --out out --rows <id> --reader <who> --verdict PASS|FAIL --text "<what the still shows>" --still <out/id/still>`.
-The still must be inside the row folder and its hash is stored with the read.
+The still must be inside the row folder and match a runner capture from the same
+plan and instances file, including a capture copied from another row. The read
+stores the capture's name, hash, UTC time and scalar status snapshot. The runner
+records every still taken inside a row, including image-gate polling stills, as a
+capture with one `status` call after each. It does not yet check still freshness
+against the game frame.
 A judge, when configured, decides those rows instead.
 
 #### Fixtures

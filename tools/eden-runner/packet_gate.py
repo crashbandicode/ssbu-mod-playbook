@@ -38,6 +38,126 @@ def packet_digest(base):
     return digest.hexdigest()
 
 
+def _plan_steps(plan):
+    rows = plan.get('rows') if isinstance(plan.get('rows'), list) else []
+    first = next((row.get('id', '?') for row in rows if isinstance(row, dict)), '<plan>')
+    for step in _steps(plan.get('recover')):
+        yield first, step
+    for row in rows:
+        if isinstance(row, dict):
+            for name in ('steps', 'recover'):
+                for step in _steps(row.get(name)):
+                    yield row.get('id', '?'), step
+    classes = plan.get('screen_classes') if isinstance(plan.get('screen_classes'), list) else []
+    for screen in classes:
+        if isinstance(screen, dict):
+            for step in _steps(screen.get('reach')):
+                yield first, step
+
+
+def _packet_inputs(base, plan):
+    from runner import SHARED_HOOKS, _HERE
+
+    paths = {(base / 'rows.json').resolve()}
+
+    def add(value):
+        if isinstance(value, str) and value:
+            paths.add((base / value).resolve())
+
+    def hook(spec):
+        if isinstance(spec, dict):
+            spec = spec.get('run')
+        if isinstance(spec, str):
+            name, separator, _ = spec.partition(':')
+            if separator and name:
+                add(str(_HERE / f'{name}.py') if name in SHARED_HOOKS else name)
+
+    segments = plan.get('segments') if isinstance(plan.get('segments'), dict) else {}
+    for segment in segments.values():
+        if isinstance(segment, dict):
+            add(segment.get('file'))
+    gates = plan.get('gates') if isinstance(plan.get('gates'), dict) else {}
+    for gate in gates.values():
+        if isinstance(gate, dict):
+            add(gate.get('reference'))
+            if gate.get('kind') == 'hook':
+                add(gate.get('module'))
+    hook(plan.get('on_failure_hook'))
+    rows = plan.get('rows') if isinstance(plan.get('rows'), list) else []
+    for row in rows:
+        if isinstance(row, dict):
+            hook(row.get('on_failure_hook'))
+    for _, step in _plan_steps(plan):
+        hook(step.get('run'))
+    return paths
+
+
+def _gif_destinations(base, plan):
+    from runner import gif_dest_path, project_root
+
+    try:
+        root = Path(plan['root']) if plan.get('root') else project_root(base)
+    except (OSError, TypeError, ValueError):
+        return
+    for row_id, step in _plan_steps(plan):
+        gif = step.get('gif')
+        if not isinstance(gif, dict) or not gif.get('out'):
+            continue
+        try:
+            yield row_id, gif['out'], gif_dest_path(root, base, gif)
+        except (OSError, ValueError):
+            pass
+
+
+def _gif_names_input(path, inputs):
+    return path in inputs or path.suffix in ('.py', '.json')
+
+
+def inputs_identity(base, plan):
+    base = Path(base)
+    excluded = set()
+    segments = plan.get('segments') if isinstance(plan.get('segments'), dict) else {}
+    for segment in segments.values():
+        if not isinstance(segment, dict):
+            continue
+        name = segment.get('file')
+        if isinstance(name, str):
+            path = base / name
+            if segment.get('recorded') or not path.exists():
+                excluded.add(path.resolve())
+    gates = plan.get('gates') if isinstance(plan.get('gates'), dict) else {}
+    for gate in gates.values():
+        if not isinstance(gate, dict):
+            continue
+        name = gate.get('reference')
+        if isinstance(name, str) and (gate.get('acquire') or gate.get('acquired')):
+            excluded.add((base / name).resolve())
+    inputs = _packet_inputs(base, plan)
+    destinations = [path for _, _, path in _gif_destinations(base, plan)]
+    gif_outputs = {path for path in destinations if not _gif_names_input(path, inputs)}
+    protected = {path for path in destinations if _gif_names_input(path, inputs)}
+    excluded.update(gif_outputs)
+    files = []
+    for path in base.rglob('*'):
+        rel = path.relative_to(base)
+        if not path.is_file() or path.is_symlink():
+            continue
+        resolved = path.resolve()
+        if resolved in excluded:
+            continue
+        if (resolved not in protected and (rel == Path('rows.json') or 'out' in rel.parts
+                or '__pycache__' in rel.parts or path.suffix == '.pyc' or path.name == 'packet-gate.json')):
+            continue
+        files.append((rel.as_posix(), path))
+    for path in Path(__file__).resolve().parent.glob('*.py'):
+        if path.is_file() and not path.is_symlink() and not path.name.startswith('test_'):
+            files.append((f'runner:{path.name}', path))
+    result = hashlib.sha256()
+    for name, path in sorted(files):
+        result.update(f'{name}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n'.encode())
+    return result.hexdigest()
+
+
 def _git(tree, *args):
     return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, timeout=20, check=True)
 
@@ -650,7 +770,12 @@ def check(plan, base, raw):
     base = Path(base)
     report = {'errors': [], 'warnings': [], 'result': 'NO TARGET', 'packet_sha256': packet_digest(base),
               'gate_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              'inputs_identity': inputs_identity(base, plan),
               'target': plan.get('target'), 'emitted': {}, 'rows': {}, 'cases': {}}
+    inputs = _packet_inputs(base, plan)
+    for row_id, name, path in _gif_destinations(base, plan):
+        if _gif_names_input(path, inputs):
+            report['errors'].append(f'G4 row {row_id}: gif out {name} names a packet input')
     if 'target' not in plan:
         report['cases'] = _cases(plan, base, report['errors'], report['warnings'])
         if report['errors']:
