@@ -1506,6 +1506,8 @@ class Runner:
 
     # --- control -------------------------------------------------------------------------------------------------
     def log(self, record):
+        if macro_gate.abandoned():
+            return
         record['time'] = time.time()
         with (self.out / 'actions.jsonl').open('a') as f:
             f.write(json.dumps(record) + '\n')
@@ -1524,7 +1526,11 @@ class Runner:
         if method not in ('macro.stop', 'input.reset', 'recording.session_mark', 'recording.session_split',
                           'recording.session_ensure', 'recording.session_stop'):
             self.check_stop()  # cleanup and bookkeeping calls still go through after a STOP
+        if macro_gate.abandoned():
+            raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
         reply = self.clients[on].request(method, params or {})
+        if macro_gate.abandoned():
+            raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
         self.log({'on': on, 'method': method, 'params': params, 'ok': reply.get('ok')})
         if not reply.get('ok'):
             raise RuntimeError(f'{method} on {on}: {reply}')
@@ -1532,7 +1538,11 @@ class Runner:
         if isinstance(value, dict) and value.get('accepted') and value.get('job'):
             until = time.monotonic() + job_cap
             while True:
+                if macro_gate.abandoned():
+                    raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
                 job = self.clients[on].request('jobs.get', {'job': value['job']})
+                if macro_gate.abandoned():
+                    raise closed_loop.DispatchRejected(f'{method} on {on}: request was abandoned')
                 state = (job.get('result') or {}).get('state')
                 if state in ('done', 'completed', 'finished'):
                     break
@@ -1549,6 +1559,8 @@ class Runner:
     def shot(self, on, name):
         # "screenshot_target" in instances.json overrides the window lookup: the Ally needs "screen" (a per-window
         # grab is black under Vulkan there). Image gates are per host resolution; log gates are portable.
+        if macro_gate.abandoned():
+            raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
         self.__dict__.setdefault('row_still_errors', [])
         target = self.instances[on].get('screenshot_target')
         if not target:
@@ -1560,13 +1572,19 @@ class Runner:
             if on not in self._frame_sources:
                 self._frame_sources[on] = still_fresh.FrameSource(self.instances[on].get('bridge_log'))
             frame = self._frame_sources[on].read()
+            if macro_gate.abandoned():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
             record = self.stills.record(on, path, reply, frame)
+            if macro_gate.abandoned():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
             self.still_records[str(path)] = record
             if still_fresh.refused(record):
                 item = {'file': record['file'], 'reason': record['reason']}
                 self.row_stills_refused.append(item)
                 self.log({'still_refused': item})
         except Exception as error:  # noqa: BLE001 - freshness must not break a screenshot
+            if macro_gate.abandoned():
+                raise
             reason = f'freshness check failed: {error!r}'[:200]
             self.still_records[str(path)] = {
                 'file': path.name, 'path': str(path), 'on': on, 'status': 'error', 'reason': reason,
@@ -1582,14 +1600,21 @@ class Runner:
                            if isinstance(value, (str, int, float, bool, type(None)))}
                           if isinstance(status, dict) else None)
             except Exception:  # noqa: BLE001 - a missing status does not invalidate a screenshot
+                if macro_gate.abandoned():
+                    raise
                 status = None
-            self.captures.append({'name': name, 'file': path.name, 'sha256': digest(path), 'utc': utc,
+            sha256 = digest(path)
+            if macro_gate.abandoned():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
+            self.captures.append({'name': name, 'file': path.name, 'sha256': sha256, 'utc': utc,
                                   'status': status})
         if self._arm_frames:
             try:
                 data = path.read_bytes()
             except OSError:
                 data = None
+            if macro_gate.abandoned():
+                raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
             if data is not None:
                 if self._gate_baseline is None:
                     self._gate_baseline = data
@@ -1961,6 +1986,8 @@ class Runner:
         try:
             result = self.check_gate_spec(on, gate, name)
         except RuntimeError as error:
+            if macro_gate.abandoned():
+                raise
             timed_out = 'did not pass within' in str(error) or 'never settled' in str(error)
             if timed_out:
                 self.last_gate_outcome = harness.timeout_facts(
@@ -1971,6 +1998,8 @@ class Runner:
                                           'missing_evidence': missing, 'screen_reached': self.screen_reached}
             raise
         else:
+            if macro_gate.abandoned():
+                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
             if harness.assertion_role(gate) == 'screen':
                 self.screen_reached = True
             self.last_gate_outcome = {'gate': name, 'passed': True, 'role': harness.assertion_role(gate),
@@ -2098,6 +2127,10 @@ class Runner:
             while time.monotonic() < until:
                 self.check_stop()
                 status = self.call(on, 'status') or {}
+                if macro_gate.abandoned():
+                    raise RuntimeError(f'gate {name} requalification was abandoned')
+                if time.monotonic() >= until:
+                    break
                 fresh = ('max_frame_age_ms' not in gate or
                          (isinstance(status.get('last_frame_age_ms'), (int, float))
                           and status['last_frame_age_ms'] < gate['max_frame_age_ms']))
@@ -2181,8 +2214,12 @@ class Runner:
 
     def failure_evidence(self, on, name):
         """Best effort: the widget tree (with every dialog's text) and a screenshot, into the row folder."""
+        if macro_gate.abandoned():
+            return
         try:
             tree = self.clients[on].request('ui.tree', {})
+            if macro_gate.abandoned():
+                return
             (self.row_dir / f'{on}-GATE-FAILED-{name}-tree.json').write_text(json.dumps(tree.get('result'), indent=1))
             dialogs = [{'class': n.get('class'), 'name': n.get('name'), 'title': node_text(n, 'title'),
                         'text': node_text(n, 'text')} for n in tree.get('result') or []
@@ -2191,6 +2228,8 @@ class Runner:
             self.log({'gate': name, 'on': on, 'pass': False, 'visible_dialog_widgets': dialogs[:20]})
         except Exception as error:  # noqa: BLE001 - evidence is best effort; the gate failure is the result
             self.log({'gate': name, 'on': on, 'failure_evidence_error': repr(error)})
+        if macro_gate.abandoned():
+            return
         try:
             self.shot(on, 'GATE-FAILED-' + name)
         except Exception as error:  # noqa: BLE001

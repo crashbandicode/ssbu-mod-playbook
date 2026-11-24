@@ -7,6 +7,13 @@ import closed_loop
 
 IDLE_CAP = 15.0
 BLIND = object()
+_worker = threading.local()
+
+
+def abandoned():
+    flag = getattr(_worker, 'abandoned', None)
+    deadline = getattr(_worker, 'deadline', None)
+    return flag is not None and (flag.is_set() or time.monotonic() >= deadline)
 
 
 def stop(error, check=None):
@@ -21,29 +28,45 @@ def stop(error, check=None):
     return False
 
 
-def bounded_call(call, method, cap, check=None):
+def bounded_call(call, method, cap, check=None, until=None, with_completion=False):
     result = []
+    cancelled = threading.Event()
+    deadline = time.monotonic() + cap
+    if until is not None:
+        deadline = min(deadline, until)
+    if deadline <= time.monotonic():
+        return (False, None, None) if with_completion else (False, None)
 
     def invoke():
+        _worker.abandoned = cancelled
+        _worker.deadline = deadline
         try:
-            result.append((True, call(method)))
+            value = call(method)
         except BaseException as error:
-            result.append((False, error))
+            result.append((False, error, time.monotonic()))
+        else:
+            result.append((True, value, time.monotonic()))
 
     worker = threading.Thread(target=invoke, daemon=True)
     worker.start()
-    if check is None:
-        worker.join(cap)
-    else:
-        deadline = time.monotonic() + cap
-        while worker.is_alive():
+    try:
+        if check is None:
+            worker.join(max(0, deadline - time.monotonic()))
+        else:
+            while worker.is_alive():
+                check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                worker.join(min(.1, remaining))
             check()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            worker.join(min(.1, remaining))
-        check()
-    return result[0] if not worker.is_alive() else (False, None)
+        if not worker.is_alive():
+            return result[0] if with_completion else result[0][:2]
+        cancelled.set()
+        return (False, None, None) if with_completion else (False, None)
+    finally:
+        if worker.is_alive():
+            cancelled.set()
 
 
 def busy(call, remaining, note=None, check=None, is_stop=None):
@@ -137,14 +160,21 @@ def dispatch(call, path, *, name, requalify=None, until=None, on_event=None, not
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 reject('not sent: the bound passed during requalification')
-            try:
-                needed = requalify(remaining)
-            except Exception as error:
+            answered, needed, completed = bounded_call(
+                requalify, remaining, remaining, check=check, until=deadline, with_completion=True)
+            if not answered:
+                if needed is None:
+                    reject('not sent: requalification did not answer within the bound')
+                error = needed
+                if completed >= deadline:
+                    reject('not sent: the bound passed during requalification')
+                if not isinstance(error, Exception):
+                    raise error
                 if stop(error, check) or is_stop is not None and is_stop(error):
-                    raise
+                    raise error
                 check_cancelled()
                 emit(f'not sent: {error}')
-                raise
+                raise error
             if time.monotonic() >= deadline:
                 reject('not sent: the bound passed during requalification')
             if not needed:

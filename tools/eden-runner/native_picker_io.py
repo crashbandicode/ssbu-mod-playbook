@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import re
+import threading
 import time
 
 import closed_loop
@@ -71,6 +72,8 @@ class BridgePickerIO:
         self.revisions = {}
         self.witness = {}
         self.in_flight = False
+        self._send_generation = 0
+        self._send_lock = threading.Lock()
         self.stage_window = None
         self.pending = getattr(ctx.runner, 'native_ui_pending', {})
         ctx.runner.native_ui_pending = self.pending
@@ -102,9 +105,14 @@ class BridgePickerIO:
         return False
 
     def _request(self, requests, cap, consume, *, until=None, connection=None):
+        if self.routes.macro_gate.abandoned():
+            raise closed_loop.DispatchRejected('bridge requalification was abandoned')
         # Discard observations logged before this command, but keep connection
         # changes. The in-band reply fence excludes unsolicited/replayed state.
-        for line in self._receive():
+        lines = self._receive()
+        if self.routes.macro_gate.abandoned():
+            raise closed_loop.DispatchRejected('bridge requalification was abandoned')
+        for line in lines:
             self._boundary(line)
         if connection is not None and self.connection != connection:
             raise RuntimeError('bridge connection or replay continuity changed during native UI read')
@@ -112,6 +120,8 @@ class BridgePickerIO:
             until = time.monotonic() + cap
         if time.monotonic() < until:
             self.routes.bridge_v2(self.ctx, *requests)
+            if self.routes.macro_gate.abandoned():
+                raise closed_loop.DispatchRejected('bridge requalification was abandoned')
             self.request_count += len(requests)
             metrics = getattr(self.ctx.runner, 'setup_metrics', None)
             if metrics is not None:
@@ -119,7 +129,10 @@ class BridgePickerIO:
         while time.monotonic() < until:
             self.ctx.check_stop()
             answer = None
-            for line in self._receive():
+            lines = self._receive()
+            if self.routes.macro_gate.abandoned():
+                raise closed_loop.DispatchRejected('bridge requalification was abandoned')
+            for line in lines:
                 boundary = self._boundary(line)
                 candidate = consume(line, boundary)
                 if candidate is not None:
@@ -249,6 +262,8 @@ class BridgePickerIO:
             catalog_generation = fence_generation = None
 
     def _record(self, state):
+        if self.routes.macro_gate.abandoned():
+            raise closed_loop.DispatchRejected('bridge requalification was abandoned')
         provider, rev = state.block['name'], state.block['rev']
         self.witness[provider] = state
         self.revisions.setdefault(provider, [rev, rev])[1] = rev
@@ -320,7 +335,11 @@ class BridgePickerIO:
 
     def send(self, segment, until=None):
         # Process any boundary written after the query, before the one input.
-        self.in_flight = True
+        with self._send_lock:
+            self.in_flight = True
+            self._send_generation += 1
+            generation = self._send_generation
+            old_receive = self.__dict__.get('_receive')
         lines = self._receive()
         if self.stage_window is not None:
             for line in lines:
@@ -330,19 +349,21 @@ class BridgePickerIO:
 
         def requalify(remaining):
             deadline = time.monotonic() + remaining
-            self.in_flight = False
-            old_receive = self.__dict__.get('_receive')
-            receive = self._receive
+            with self._send_lock:
+                if self._send_generation != generation or self.routes.macro_gate.abandoned():
+                    raise closed_loop.DispatchRejected('bridge requalification was abandoned')
+                self.in_flight = False
+                receive = self._receive
 
-            def observe_receive():
-                fresh = receive()
+                def observe_receive():
+                    fresh = receive()
+                    if self.stage_window is not None:
+                        for line in fresh:
+                            self.stage_window.observe_before_press(line)
+                    return fresh
+
                 if self.stage_window is not None:
-                    for line in fresh:
-                        self.stage_window.observe_before_press(line)
-                return fresh
-
-            if self.stage_window is not None:
-                self._receive = observe_receive
+                    self._receive = observe_receive
             try:
                 for provider, previous in witness.items():
                     cap = min(2.0, deadline - time.monotonic())
@@ -376,11 +397,13 @@ class BridgePickerIO:
                             + ', '.join(dict.fromkeys(changed)))
                 return True
             finally:
-                if old_receive is None:
-                    self.__dict__.pop('_receive', None)
-                else:
-                    self._receive = old_receive
-                self.in_flight = True
+                with self._send_lock:
+                    if self._send_generation == generation:
+                        if old_receive is None:
+                            self.__dict__.pop('_receive', None)
+                        else:
+                            self._receive = old_receive
+                        self.in_flight = True
 
         try:
             if getattr(self.ctx.runner, 'closed_loop_owns_idle', False):
@@ -390,8 +413,14 @@ class BridgePickerIO:
         except Exception as error:
             if (isinstance(error, closed_loop.DispatchRejected)
                     or self.routes.macro_gate.stop(error, getattr(self.ctx, 'check_stop', None))):
-                self.pending.pop(self.ctx.on, None)
-                self.in_flight = False
+                with self._send_lock:
+                    self._send_generation += 1
+                    if old_receive is None:
+                        self.__dict__.pop('_receive', None)
+                    else:
+                        self._receive = old_receive
+                    self.pending.pop(self.ctx.on, None)
+                    self.in_flight = False
             raise
         self.witness.clear()
         self.input_count += 1

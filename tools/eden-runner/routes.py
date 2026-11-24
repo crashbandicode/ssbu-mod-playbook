@@ -1156,6 +1156,7 @@ def _wireless_placed(tile):
 DASHBOARD_KEY = 'dashboard'
 DASHBOARD_FOCUS = 'dashboard.'
 DASHBOARD_LOCAL_WIRELESS = 'dashboard.local_wireless'
+DASHBOARD_OWNERS = ('native',)
 
 
 def _wireless_ready(ui):
@@ -1208,6 +1209,11 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
     def dashboard(obs):
         return active(obs, 'main_menu') and obs['ui'].get(DASHBOARD_KEY) == 'open'
 
+    def dashboard_ready(obs):
+        ui = obs['ui']
+        return (dashboard(obs) and _wireless_ready(ui)
+                and ui.get('input.owner') in DASHBOARD_OWNERS and ui.get('dialog') == 'none')
+
     def open_at(obs):
         ui = obs['ui']
         if not (available() and active(obs, 'main_menu') and ui.get('screen.layer') == 'top'
@@ -1233,7 +1239,7 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
         def down_at(obs, index=i):
             ui = obs['ui']
             name = ui.get('focus.id')
-            return (available() and dashboard(obs) and _wireless_ready(ui)
+            return (available() and dashboard_ready(obs)
                     and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
                     and name != DASHBOARD_LOCAL_WIRELESS and ui.get('focus.index') == str(index))
 
@@ -1243,9 +1249,9 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
         steps.append(closed_loop.Step(f'dashboard-down-{i}', down_at, down_done, 'main-menu-down',
                                       cap=25, lost_after=6, target=focus))
     steps.append(closed_loop.Step(
-        'dashboard-a', lambda o: (available() and dashboard(o) and _wireless_ready(o['ui'])
+        'dashboard-a', lambda o: (available() and dashboard_ready(o)
                                   and o['ui'].get('focus.id') == DASHBOARD_LOCAL_WIRELESS),
-        lambda o: active(o, 'ldn.room_list'), 'lobby-a', cap=25, lost_after=6, target=focus))
+        lambda o: active(o, 'ldn.room_list'), 'lobby-a', cap=25, lost_after=26, sends=1, target=focus))
     return steps
 
 

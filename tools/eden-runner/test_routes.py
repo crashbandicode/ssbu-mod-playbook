@@ -4728,6 +4728,24 @@ class WirelessRoomTests(unittest.TestCase):
         stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
         self.assertEqual(stop['unsupported_reader'], 'ldn.room_list focus')
 
+    def test_a_bounce_to_the_room_list_reports_repeated_host_steps(self):
+        self.io.stage_return_rooms_after_send = True
+        original = self.io.send
+
+        def send(macro):
+            was_stage = self.io.phase == 'stage'
+            original(macro)
+            if was_stage and macro == 'lobby-a':
+                self.io.stage_return_rooms_after_send = False
+
+        self.io.send = send
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(result['result'], 'PASS with 3 stalls')
+        self.assertEqual([(event['kind'], event['step'], event['send']) for event in result['stalls']],
+                         [('repeat', 'open-create', 2), ('repeat', 'confirm-create', 2),
+                          ('repeat', 'stage-a', 2)])
+        self.assertEqual(result['waiting']['ldn.role'], 'host')
+
     def test_a_press_on_the_first_stage_select_read_is_refused_while_not_ready(self):
         self.io.phase = 'stage'
         self.io.stage_ready_after = 3
@@ -5464,6 +5482,7 @@ class DashboardRouteTests(unittest.TestCase):
         result = self.run_route()
         self.assertEqual(self.io.actions.count('tap-zr1'), 2)
         self.assertTrue(result['list_ready'])
+        self.assertEqual(result['result'], 'PASS with 2 stalls')
 
     def test_dashboard_a_is_one_shot_when_the_source_never_changes(self):
         for guest in (False, True):
@@ -5485,7 +5504,9 @@ class DashboardRouteTests(unittest.TestCase):
                 self.now = 0
                 self.io.dashboard, self.io.dashboard_index, self.io.a_delay = 'open', 2, 10
                 result = self.run_route(guest)
-                self.assertEqual(self.io.actions.count('lobby-a'), 1 if guest else 3)
+                dashboard_actions = (self.io.actions if guest
+                                     else self.io.actions[:self.io.actions.index('tap-a1')])
+                self.assertEqual(dashboard_actions, ['lobby-a'])
                 self.assertEqual(next(step for step in result['steps'] if step['name'] == 'dashboard-a')['sends'], 1)
                 self.assertGreaterEqual(self.now, 10)
 

@@ -131,9 +131,11 @@ class MacroGateTests(unittest.TestCase):
                 self.assertLessEqual(self.now, .4)
 
         entered, release = threading.Event(), threading.Event()
+        workers = []
         self.now, self.polls, self.sent, self.events = 0.0, [], [], []
 
         def blocked_status():
+            workers.append(threading.current_thread())
             entered.set()
             release.wait()
             return {'state': 'idle'}
@@ -150,6 +152,8 @@ class MacroGateTests(unittest.TestCase):
             self.assertEqual(self.events, [])
         finally:
             release.set()
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
 
     def test_a_one_shot_stop_from_the_check_is_not_mistaken_for_a_status_or_witness_failure(self):
         class Cancelled(RuntimeError):
@@ -250,6 +254,38 @@ class MacroGateTests(unittest.TestCase):
                 self.assertEqual(len(self.events), 1)
                 self.assertEqual(self.events[0]['outcome'], 'not sent: the bound passed during requalification')
 
+    def test_a_stop_raised_after_the_requalification_bound_is_discarded(self):
+        class StopRun(Exception):
+            pass
+
+        def witness(remaining):
+            self.now += remaining + .1
+            raise StopRun('late STOP')
+
+        with self.assertRaises(closed_loop.DispatchRejected):
+            self.dispatch(requalify=witness)
+        self.assertEqual(self.sent, [])
+        self.assertEqual([event['outcome'] for event in self.events],
+                         ['not sent: the bound passed during requalification'])
+
+    def test_an_exception_raised_in_time_propagates_even_if_the_waiter_is_delayed(self):
+        def witness(remaining):
+            raise RuntimeError('witness failed in time')
+
+        bounded_call = macro_gate.bounded_call
+
+        def delayed(*args, **kwargs):
+            result = bounded_call(*args, **kwargs)
+            if kwargs.get('with_completion'):
+                self.now = 16
+            return result
+
+        with mock.patch.object(macro_gate, 'bounded_call', side_effect=delayed):
+            with self.assertRaisesRegex(RuntimeError, 'witness failed in time'):
+                self.dispatch(requalify=witness)
+        self.assertEqual(self.sent, [])
+        self.assertEqual([event['outcome'] for event in self.events], ['not sent: witness failed in time'])
+
     def test_rejected_dispatch_after_requalification_is_recorded_as_rejected(self):
         original = self.call
 
@@ -311,10 +347,10 @@ class MacroGateTests(unittest.TestCase):
 
 class RealTimeRequalificationTests(unittest.TestCase):
     def test_blocked_requalification_is_abandoned_with_one_event(self):
-        for raises in (False, True):
-            with self.subTest(raises=raises):
+        for outcome in ('true', 'false', 'error'):
+            with self.subTest(outcome=outcome):
                 entered, release, exited = threading.Event(), threading.Event(), threading.Event()
-                events, sent, polls = [], [], []
+                events, sent, polls, workers = [], [], [], []
 
                 def call(method, params=None):
                     if method == 'macro.status':
@@ -323,12 +359,13 @@ class RealTimeRequalificationTests(unittest.TestCase):
                     sent.append(params)
 
                 def witness(remaining):
+                    workers.append(threading.current_thread())
                     entered.set()
                     try:
                         release.wait(.8)
-                        if raises:
+                        if outcome == 'error':
                             raise RuntimeError('late error')
-                        return True
+                        return outcome == 'true'
                     finally:
                         exited.set()
 
@@ -347,6 +384,8 @@ class RealTimeRequalificationTests(unittest.TestCase):
                 finally:
                     release.set()
                     self.assertTrue(exited.wait(1))
+                    workers[0].join(1)
+                    self.assertFalse(workers[0].is_alive())
                 self.assertEqual(sent, [])
                 self.assertEqual(len(events), 1)
 
@@ -359,8 +398,52 @@ class RealTimeRequalificationTests(unittest.TestCase):
                 return {'state': 'playing' if calls.count(method) == 1 else 'idle'}
             return {}
 
-        with mock.patch.object(macro_gate, 'IDLE_CAP', .5):
+        def witness(remaining):
+            time.sleep(.35)
+            return True
+
+        with mock.patch.object(macro_gate, 'IDLE_CAP', .7):
             self.assertTrue(macro_gate.dispatch(call, Path('/macro'), name='test',
-                                                requalify=lambda remaining: True, on_event=events.append))
+                                                requalify=witness, on_event=events.append))
         self.assertEqual(calls.count('macro.play'), 1)
         self.assertEqual([event['outcome'] for event in events], ['requalified, accepted'])
+        self.assertGreaterEqual(events[0]['seconds'], .5)
+
+    def test_stop_during_a_blocked_requalification_propagates_without_an_event(self):
+        class StopRun(Exception):
+            pass
+
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        workers, events, calls = [], [], []
+
+        def call(method, params=None):
+            calls.append(method)
+            if method == 'macro.status':
+                return {'state': 'playing' if calls.count(method) == 1 else 'idle'}
+
+        def witness(remaining):
+            workers.append(threading.current_thread())
+            entered.set()
+            try:
+                release.wait(1)
+                return True
+            finally:
+                exited.set()
+
+        def check():
+            if entered.is_set():
+                raise StopRun('STOP-INPUT')
+
+        started = time.monotonic()
+        try:
+            with self.assertRaises(StopRun):
+                macro_gate.dispatch(call, Path('/macro'), name='test', requalify=witness,
+                                    check=check, on_event=events.append)
+            self.assertLess(time.monotonic() - started, .7)
+            self.assertNotIn('macro.play', calls)
+            self.assertEqual(events, [])
+        finally:
+            release.set()
+            self.assertTrue(exited.wait(1))
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())

@@ -59,6 +59,30 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual([name for name, _ in fake.sends], ['a', 'b'])
         self.assertEqual(result['stalls'], [])
 
+    def test_a_busy_rejection_before_a_repeated_step_does_not_duplicate_the_repeat(self):
+        fake = Script(lambda f: ('a', 'b', 'a', 'done')[min(len(f.sends), 3)])
+        send = fake.send
+        rejected, payloads = [], []
+
+        def sometimes_busy(name):
+            if name == 'a' and len(fake.sends) == 2 and not rejected:
+                rejected.append(True)
+                raise closed_loop.DispatchRejected('busy')
+            send(name)
+
+        def on_stall(event, obs):
+            payloads.append(dict(event))
+            return event
+
+        fake.send = sometimes_busy
+        result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')],
+                          idle=lambda remaining: None, on_stall=on_stall)
+        self.assertEqual([name for name, _ in fake.sends], ['a', 'b', 'a'])
+        self.assertEqual([event.get('kind') for event in result['stalls']], ['busy-rejected', 'repeat'])
+        repeat = next(event for event in payloads if event.get('kind') == 'repeat')
+        self.assertTrue(repeat['_skip_diagnostic'])
+        self.assertEqual(repeat['send'], 2)
+
     def test_a_locate_predicate_can_stop_with_a_complete_step_receipt(self):
         fake = Script(lambda f: 'unsupported')
 
@@ -1278,6 +1302,7 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['entered_at'], 'second')
         self.assertEqual([s[0] for s in fake.sends], ['second', 'first', 'second'])
         self.assertEqual(fake.finishes, 3)
+        self.assertEqual(result['stalls'], [{'kind': 'repeat', 'step': 'second', 'send': 2, 'target': 'None'}])
 
     def test_not_ready_within_ready_cap_stops_with_zero_sends(self):
         fake = Script(lambda f: 'arrived' if not f.events else 'waiting')
@@ -1334,6 +1359,7 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(result['entered_at'], 'second')
         self.assertEqual([macro for macro, _ in fake.sends], ['second', 'first'])
         self.assertEqual(fake.finishes, 2)
+        self.assertEqual(result['stalls'], [])
 
     def test_a_destination_reached_while_waiting_is_skipped(self):
         def observe(f):
@@ -1356,6 +1382,7 @@ class ClosedLoopTests(unittest.TestCase):
         result = fake.run([step('first', 'one', 'arrived'), step('second', 'two', 'done')])
         self.assertEqual(result['entered_at'], 'first')
         self.assertEqual([macro for macro, _ in fake.sends], ['first', 'first', 'second'])
+        self.assertEqual(result['stalls'], [{'kind': 'repeat', 'step': 'first', 'send': 2, 'target': 'None'}])
 
     def test_final_witness_completes_without_an_extra_read(self):
         def observe(f):

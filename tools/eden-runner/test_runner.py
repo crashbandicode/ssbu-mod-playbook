@@ -1372,8 +1372,17 @@ class RunnerTests(unittest.TestCase):
         run.plan['segments']['to-red']['start_gate'] = 'red'
         run.plan['gates']['red'] = {'kind': 'status', 'cap': 40, 'expect': {'running': True}}
         entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        gate_done, logs = threading.Event(), []
         original = eden.request
-        status_calls = []
+        check_spec = run.check_gate_spec
+        status_calls, workers = [], []
+
+        def checked(on, gate, name):
+            try:
+                return check_spec(on, gate, name)
+            finally:
+                if entered.is_set():
+                    gate_done.set()
 
         def request(method, params):
             if method == 'macro.status':
@@ -1382,12 +1391,14 @@ class RunnerTests(unittest.TestCase):
             if method == 'status':
                 status_calls.append(method)
                 if len(status_calls) == 2:
+                    workers.append(threading.current_thread())
                     entered.set()
                     try:
                         release.wait(.8)
                         now[0] += 4
                     finally:
                         exited.set()
+                    return {'ok': True, 'result': {'accepted': True, 'job': 'late'}}
                 return {'ok': True, 'result': {'running': True}}
             return original(method, params)
 
@@ -1396,6 +1407,8 @@ class RunnerTests(unittest.TestCase):
                 now[0] = 15
 
         eden.request = request
+        run.check_gate_spec = checked
+        run.log = logs.append
         timer = threading.Thread(target=expire)
         timer.start()
         try:
@@ -1407,12 +1420,19 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn('macro.play', eden.calls)
             self.assertEqual([event['outcome'] for event in run.row_macro_waits],
                              ['not sent: requalification did not answer within the bound'])
+            last_gate_outcome = copy.deepcopy(run.last_gate_outcome)
         finally:
             release.set()
             timer.join(1)
             self.assertTrue(exited.wait(1))
+            self.assertTrue(gate_done.wait(1))
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
         self.assertFalse(timer.is_alive())
         self.assertNotIn('macro.play', eden.calls)
+        self.assertNotIn('jobs.get', eden.calls)
+        self.assertEqual(len([entry for entry in logs if entry.get('gate') == 'red']), 1)
+        self.assertEqual(run.last_gate_outcome, last_gate_outcome)
 
     def test_gate_recovery_after_a_wait_needs_the_segments_own_start_gate(self):
         run, eden, _ = self.waiting_run()

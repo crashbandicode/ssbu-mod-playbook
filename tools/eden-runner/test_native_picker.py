@@ -2,6 +2,7 @@
 
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -120,6 +121,85 @@ class IORequalificationTests(unittest.TestCase):
         self.assertNotIn('a', self.io.pending)
         self.assertFalse(self.io.in_flight)
         self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
+
+    def test_abandoned_requalification_cannot_restore_in_flight_after_rejection(self):
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        workers = []
+        self.io.stage_window = native_picker_io._StageWindow(self.before.block['boot'], 0, 0, 0, 0)
+
+        def read(provider, cap):
+            workers.append(threading.current_thread())
+            entered.set()
+            try:
+                release.wait(.8)
+                return self.io._record(self.after)
+            finally:
+                exited.set()
+
+        def expire():
+            if entered.wait(1):
+                self.now = 15
+
+        self.read = read
+        timer = threading.Thread(target=expire)
+        timer.start()
+        try:
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                self.send()
+            self.assertFalse(self.io.in_flight)
+            self.assertNotIn('a', self.io.pending)
+            self.assertNotIn('_receive', self.io.__dict__)
+        finally:
+            release.set()
+            timer.join(1)
+            self.assertTrue(exited.wait(1))
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
+        self.assertFalse(self.io.in_flight)
+        self.assertNotIn('a', self.io.pending)
+        self.assertNotIn('_receive', self.io.__dict__)
+        self.assertEqual(self.sent, [])
+        self.assertIs(self.io.witness['ssbu.ui'], self.before)
+        self.assertEqual(self.io.revisions['ssbu.ui'], [1, 1])
+
+    def test_a_late_requalification_cannot_clobber_a_newer_pending_send(self):
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        workers = []
+        self.io.stage_window = native_picker_io._StageWindow(self.before.block['boot'], 0, 0, 0, 0)
+
+        def read(provider, cap):
+            workers.append(threading.current_thread())
+            entered.set()
+            try:
+                release.wait(.8)
+                return self.io._record(self.after)
+            finally:
+                exited.set()
+
+        def expire():
+            if entered.wait(1):
+                self.now = 15
+
+        self.read = read
+        timer = threading.Thread(target=expire)
+        timer.start()
+        try:
+            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                self.send()
+            self.send()
+            pending = self.io.pending['a']
+            self.assertTrue(self.io.in_flight)
+            self.assertEqual(len(self.sent), 1)
+        finally:
+            release.set()
+            timer.join(1)
+            self.assertTrue(exited.wait(1))
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
+        self.assertTrue(self.io.in_flight)
+        self.assertEqual(self.io.pending['a'], pending)
+        self.assertEqual(self.io.witness, {})
+        self.assertNotIn('_receive', self.io.__dict__)
 
     def test_a_channel_that_frees_after_the_callers_deadline_gets_no_press(self):
         self.free_at = 10.2

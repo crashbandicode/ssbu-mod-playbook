@@ -302,6 +302,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         record = records[index]
         started = clock()
         retry = None
+        visit_sends = 0
         active_index, active_started = index, started
         if on_step:
             on_step(step.name)
@@ -439,10 +440,17 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     obs = read(index)
                     continue
                 except Exception as error:
+                    if visit_sends == 0 and record['sends'] > 1:
+                        stall({'kind': 'repeat', 'step': step.name, 'send': record['sends'],
+                               'target': repr(witness)}, obs, skip_diagnostic=idle_budget is not None)
                     record['dispatch'] = 'unknown'
                     record['ms'] += round((clock() - started) * 1000)
                     flush_idle_budget(dispatch_started)
                     stop(step.name, f'dispatch failed, delivery unknown: {error}')
+                if visit_sends == 0 and record['sends'] > 1:
+                    stall({'kind': 'repeat', 'step': step.name, 'send': record['sends'],
+                           'target': repr(witness)}, obs, skip_diagnostic=idle_budget is not None)
+                visit_sends += 1
                 flush_idle_budget(dispatch_started)
                 retry = None
                 deadline = clock() + step.cap
