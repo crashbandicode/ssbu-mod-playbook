@@ -4199,7 +4199,7 @@ def _bridge_on_stub_title(ctx, hello, start):
     last = None
     not_yet = []
     identities = set()
-    state = {'boot': boot, 'sent': False, 'prompt': None, 'opening_seen': False}
+    state = {'boot': boot, 'sent': False, 'prompt': None, 'opening_seen': False, 'fresh_non_opening': False}
     asked = []
 
     def timeout():
@@ -4250,7 +4250,11 @@ def _bridge_on_stub_title(ctx, hello, start):
                 raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
                                    f"{values.get('screen')}/{values.get('focus')}, not the Title")
             native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
-            state['opening_seen'] = is_opening
+            if is_opening:
+                state['opening_seen'] = True
+                state['fresh_non_opening'] = False
+            elif any(index >= mark for mark in asked):
+                state['fresh_non_opening'] = True
             last = {'rev': block['rev'], 'frame': block['frame'],
                     **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
             identity = (last['screen'], last['screen.context'], last['focus'])
@@ -4305,7 +4309,7 @@ def _bridge_on_stub_title(ctx, hello, start):
                     'matched': 'prompt', 'not_yet': not_yet, 'waited_s': round(time.monotonic() - started, 3),
                     'skip': skip}
         time.sleep(min(.05, max(0, until - time.monotonic())))
-    if state['opening_seen']:
+    if state['opening_seen'] and not state['fresh_non_opening']:
         raise RuntimeError('bridge_on (stub on): the opening was seen but no fresh ssbu.ui reply confirmed it; '
                            'nothing was sent')
     if last is not None:

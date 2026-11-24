@@ -471,6 +471,18 @@ class BridgeOnTests(unittest.TestCase):
         self.assertRegex(str(stopped), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
         self.assertFalse((self.row / 'routes-bridge-on.json').exists())
 
+    def test_bridge_on_stub_on_stale_opening_and_stale_passive_title_have_no_fresh_reply(self):
+        self.recorded_opening(prompt_after_skip=False)
+        passive = self.sample(boot=RUN1_BOOT, fields={
+            'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
+            'focus.index': 'unknown', 'focus.label': 'unknown',
+            'input.owner': 'unknown', 'dialog': 'unknown'})
+        self.stub_preamble = RUN1_PREAMBLE + RUN1_OPENING + passive
+        self.stub_default = ''
+        with self.assertRaisesRegex(RuntimeError, 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent'):
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+
     def test_bridge_on_stub_on_fresh_opening_reply_sends_once(self):
         self.recorded_opening()
         self.stub_samples, self.stub_default = [RUN1_OPENING, RUN1_LAST_OPENING], ''
