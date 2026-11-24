@@ -304,8 +304,93 @@ class LogCursorTests(unittest.TestCase):
                         f.write('cut off')
                     self.assertEqual(cursor.read(), [])
                     self._replace_with('other file\n')
-                    self.assertEqual(cursor.read(), ['cut off', 'other file'] if rotates else ['cut off'])
+                    self.assertEqual(cursor.read(), ['cut off', 'other file'] if rotates else [])
+                    self.assertEqual(cursor.unqualified, 0 if rotates else 2)
+                    with self.path.open('a') as f:
+                        f.write('appended\n')
+                    self.assertEqual(cursor.read(), ['appended'])
                     cursor.close()
+
+    def test_lines_drained_from_a_file_that_was_replaced_are_not_returned(self):
+        # rv-fusion-g4, 2026-11-24 03:10Z: a ready line appended to the old file between polls, then another file
+        # at the path that the cursor cannot place. The old file's line belongs to a generation that ended.
+        wanted = r'screen=stage_select .*ready=yes'
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text(self._boot_log())
+                cursor = routes.LogCursor(self.path, hold=hold)
+                with self.path.open('a') as f:
+                    f.write(self.STAGE_READY.replace('ev=692', 'ev=3000') + '\n')
+                self._replace_with(self.CSS_READY + '\n')
+                self.assertEqual(cursor.read(), [])
+                self.assertEqual(cursor.rotations, 1)
+                self.assertEqual(cursor.unqualified, 2 if hold else 1)  # the unheld cursor never saw the old line
+                with self.assertRaises(RuntimeError):
+                    cursor.wait(wanted, 0.3)
+                later = self.STAGE_READY.replace('ev=692 frame=1013', 'ev=9000 frame=5000')
+                with self.path.open('a') as f:
+                    f.write(later + '\n')
+                self.assertEqual(cursor.wait(wanted, 1).string, later)
+                cursor.close()
+
+    def test_a_partial_line_read_before_a_replacement_is_not_joined_to_what_follows(self):
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text(self._boot_log())
+                cursor = routes.LogCursor(self.path, hold=hold)
+                with self.path.open('a') as f:
+                    f.write('[Bridge] ui screen=stage_select ctx=local_wireless ready=y')
+                self.assertEqual(cursor.read(), [])
+                self._replace_with(self.CSS_READY + '\n')
+                self.assertEqual(cursor.read(), [])
+                with self.path.open('a') as f:
+                    f.write('es gen=4 appended\n')
+                self.assertEqual(cursor.read(), ['es gen=4 appended'])
+                cursor.close()
+
+    def _ctx(self, **files):
+        return FakeCtx(FakeRunner({key: str(value) for key, value in files.items()}, None), self.dir)
+
+    def test_only_a_plugins_own_log_is_read_as_a_rotating_log(self):
+        other = self.dir / 'tile-cursor.log'
+        other.write_text('tile\n')
+        eden = self._ctx(diag_log=self.path, tile_log=other, bridge_log=self.dir / 'bridge.log')
+        self.assertTrue(routes._log_cursor(eden, 'diag_log').rotates)
+        self.assertTrue(routes._log_cursor(eden, 'diag').rotates)
+        self.assertTrue(routes._log_cursor(eden, 'tile_log').rotates)
+        self.assertFalse(routes._log_cursor(eden, 'bridge_log').rotates)
+        # A Switch instance names the bridge capture's log as its diag log (switch_hw: diag_log = bridge_log).
+        switch = self._ctx(diag_log=self.path, bridge_log=self.path, console_log=other, tile_log=other)
+        self.assertFalse(routes._log_cursor(switch, 'diag_log').rotates)
+        self.assertFalse(routes._log_cursor(switch, 'bridge_log').rotates)
+        self.assertFalse(routes._log_cursor(switch, 'tile_log').rotates)  # the same file as its console log
+        with self.assertRaises(KeyError):
+            routes._log_cursor(self._ctx(bridge_log=self.path), 'diag_log')
+
+    def test_a_chord_on_a_switch_does_not_accept_an_old_line_of_a_replaced_bridge_log(self):
+        saved = '[TrainingRooms] state saved slot=1 entry=1 (file queued) frame=900'
+        ctx = self._ctx(diag_log=self.path, bridge_log=self.path)
+        for name, options, old in (('tr-save', {}, saved),
+                                   ('tr-save', {'source': 'bridge_log', 'expect': r'screen=stage_select .*ready=yes'},
+                                    self.STAGE_READY)):
+            with self.subTest(options=options):
+                self.path.write_text(self._boot_log() + old + '\n')
+
+                def replaces(_ctx, _name):  # the chord is played; the log is replaced and gains nothing
+                    self._replace_with(old + '\n' + self.CSS_READY + '\n')
+                    return 'sha'
+
+                with mock.patch.object(routes, 'play', replaces), self.assertRaises(RuntimeError):
+                    routes.chord(ctx, name, cap=0.3, **options)
+                new = old.replace('frame=', 'frame=77')
+
+                def answers(_ctx, _name):
+                    with self.path.open('a') as f:
+                        f.write(new + '\n')
+                    return 'sha'
+
+                with mock.patch.object(routes, 'play', answers):
+                    self.assertIn(routes.chord(ctx, name, cap=1, **options)['line'], new)
 
     def test_a_short_log_cut_back_to_lines_already_read_gives_nothing(self):
         for hold in self.MODES:
