@@ -1994,13 +1994,12 @@ def cmd_go(args):
                 f'ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
                 'nothing was started')
         else:
-            # A machine with no shared base and no route (a test folder, a first set-up): the base decides.
-            base = Path(args.from_config) if args.from_config else shared
-            try:
-                config = json.loads(base.read_text()) if base.is_file() else None
-                remote = not isinstance(config, dict) or config.get('host') != args.host
-            except (OSError, ValueError) as error:
-                raise SystemExit(f'the base {base} cannot be read: {error}; nothing was started') from error
+            # No shared base and no route: nothing says this machine is the host, and a file the go names is no
+            # evidence of it. A host is set up by giving it its shared base.
+            raise SystemExit(
+                f'this machine has no shared base {shared}, so it is not known to be host {args.host!r}, and it has '
+                f'no ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'a base named with --from does not say which machine this is; nothing was started')
         if remote:
             _go_trace(args)
             lineup = _go_card_lineup(args)

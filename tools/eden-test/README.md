@@ -42,8 +42,9 @@ pins another Eden AppImage than its shared base does, and starts nothing. A base
 is only read. Which machine a go runs on comes from that machine's own shared base: when it names the `--host`,
 the go runs there with any local `--from`; when it names another host, the go is sent over ssh (`--ssh` or
 `hosts.json`) and a local file given as `--from` is neither opened nor copied. With no ssh name, or with a
-`hosts.json` or shared base that cannot be read, go stops and starts nothing. A local copy of a host's base never
-makes a machine that host.
+`hosts.json` or shared base that cannot be read, go stops and starts nothing. A machine without a shared base is
+not a host: there go needs an ssh name, whatever `--from` names. A local copy of a host's base never makes a
+machine that host.
 The repository does not ship a `base.json` template; it is maintained on
 each host. Add `"notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md",
 "to": "tr-primary-2"}` to that base, without an `ssh` key. Notifications
