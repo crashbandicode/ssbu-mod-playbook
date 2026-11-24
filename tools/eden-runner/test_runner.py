@@ -1678,7 +1678,7 @@ class RunnerTests(unittest.TestCase):
             worker.join(1)
             self.assertFalse(worker.is_alive())
 
-    def test_a_latched_dashboard_macro_finishes_without_an_input_reset(self):
+    def test_a_latched_dashboard_macro_releases_before_waiting(self):
         path, _, _ = routes.macro_file('lobby-a')
         release = json.loads(path.read_text())['events'][-1]
         self.assertEqual(release['buttons'], 0)
@@ -1693,14 +1693,14 @@ class RunnerTests(unittest.TestCase):
         ctx = runner.StepContext(run, 'a')
         picker = routes.BridgePickerIO(ctx)
 
-        picker.send('lobby-a', reset=False)
-        self.assertEqual(eden.calls, ['macro.play', 'macro.status'])
+        picker.send('lobby-a')
+        self.assertEqual(eden.calls, ['macro.play', 'macro.status', 'input.reset'])
         self.assertTrue(picker.in_flight)
         self.assertIn('a', picker.pending)
 
         picker.finish()
         picker.send('main-menu-down')
-        self.assertEqual(eden.calls[2:], ['macro.play', 'macro.status', 'input.reset'])
+        self.assertEqual(eden.calls[3:], ['macro.play', 'macro.status', 'input.reset'])
 
     def test_runner_play_waits_for_idle_and_rechecks_the_start_gate(self):
         run, eden, now = self.waiting_run()

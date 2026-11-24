@@ -333,7 +333,7 @@ class BridgePickerIO:
             time.sleep(min(.05, max(0, until - time.monotonic())))
         raise RuntimeError('no fresh gameplay stage event after Training launch')
 
-    def send(self, segment, until=None, *, reset=True):
+    def send(self, segment, until=None):
         # Process any boundary written after the query, before the one input.
         with self._send_lock:
             self.in_flight = True
@@ -406,11 +406,10 @@ class BridgePickerIO:
                         self.in_flight = True
 
         try:
-            options = {} if reset else {'reset': False}
             if getattr(self.ctx.runner, 'closed_loop_owns_idle', False):
-                self.routes.play(self.ctx, segment, **options)
+                self.routes.play(self.ctx, segment)
             else:
-                self.routes.play(self.ctx, segment, requalify=requalify if witness else None, until=until, **options)
+                self.routes.play(self.ctx, segment, requalify=requalify if witness else None, until=until)
         except Exception as error:
             if (isinstance(error, closed_loop.DispatchRejected)
                     or self.routes.macro_gate.stop(error, getattr(self.ctx, 'check_stop', None))):

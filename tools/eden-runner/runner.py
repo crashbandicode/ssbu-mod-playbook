@@ -1659,15 +1659,14 @@ class Runner:
         return path
 
     # --- steps ---------------------------------------------------------------------------------------------------
-    def wait_macro(self, on, cap, *, reset=True):
+    def wait_macro(self, on, cap):
         until = time.monotonic() + cap
         while time.monotonic() < until:
             status = self.call(on, 'macro.status') or {}
             if status.get('error'):
                 raise RuntimeError(f'macro error on {on}: {status}')
             if status.get('state') == 'finished':
-                if reset:
-                    self.call(on, 'input.reset')
+                self.call(on, 'input.reset')
                 return
             time.sleep(.2)
         raise RuntimeError(f'macro on {on} not finished within {cap} s')

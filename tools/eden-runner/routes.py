@@ -727,7 +727,7 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
-def play(ctx, name, *, requalify=None, until=None, reset=True):
+def play(ctx, name, *, requalify=None, until=None):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
     path, sha, cap = macro_file(name)
     def on_event(event):
@@ -754,10 +754,7 @@ def play(ctx, name, *, requalify=None, until=None, reset=True):
                                  check=getattr(ctx, 'check_stop', None)):
         return None
     try:
-        if reset:
-            ctx.runner.wait_macro(ctx.on, cap)
-        else:
-            ctx.runner.wait_macro(ctx.on, cap, reset=False)
+        ctx.runner.wait_macro(ctx.on, cap)
     except RuntimeError as error:
         raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
     ctx.log({'route_macro': name, 'sha256': sha})
@@ -1291,7 +1288,7 @@ def wireless_room_list(ctx, ready_cap=60):
     io = BridgePickerIO(ctx)
     state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
              'last_error': None, 'last_read_was_error': False, 'ui_clock': {}, 'ready_published': False,
-             'last_macro_error': None, 'current': None}
+             'last_macro_error': None}
     observe = _wireless_observer(ctx, io, screens, state)
 
     def active(obs, screen):
@@ -1316,21 +1313,14 @@ def wireless_room_list(ctx, ready_cap=60):
     def on_stall(event, obs):
         return _wireless_stall(ctx, state, 'wireless_room_list', event, obs)
 
-    def send(macro):
-        if state['current'] == 'dashboard-a':
-            io.send(macro, reset=False)
-        else:
-            io.send(macro)
-
     missing = object()
     previous = getattr(ctx.runner, 'closed_loop_owns_idle', missing)
     ctx.runner.closed_loop_owns_idle = True
     try:
         try:
             outcome = closed_loop.run(
-                'wireless_room_list', steps, observe, send, io.finish,
+                'wireless_room_list', steps, observe, io.send, io.finish,
                 clock=time.monotonic, sleep=time.sleep, on_stall=on_stall,
-                on_step=lambda name: state.__setitem__('current', name),
                 idle=lambda remaining: _eden_macro_busy(
                     ctx, remaining, note=lambda text: state.__setitem__('last_macro_error', text)),
                 idle_cap=15.0, revalidate_cap=4.5, locate_done=lambda obs: active(obs, 'ldn.room_list'))
@@ -1581,10 +1571,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
     ]
 
     def send(macro):
-        if state['current'] == 'dashboard-a':
-            io.send(macro, reset=False)
-        else:
-            io.send(macro)
+        io.send(macro)
         if state['current'] == 'confirm-create':
             state['confirm_presses'] += 1
         elif state['current'] == 'stage-a':

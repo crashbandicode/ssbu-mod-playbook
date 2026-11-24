@@ -3693,7 +3693,7 @@ class WirelessRoomTests(unittest.TestCase):
             self.events.append(('read', provider, dict(values)))
             return types.SimpleNamespace(block=block, values=values, connection=1)
 
-        def send(self, macro, *, reset=True):
+        def send(self, macro):
             self.events.append(('send', macro))
             self.actions.append(macro)
             self.pending = macro
@@ -3850,9 +3850,9 @@ class WirelessRoomTests(unittest.TestCase):
                         self.ctx.runner.closed_loop_owns_idle = previous
                     original, observed = self.io.send, []
 
-                    def send(macro, **kwargs):
+                    def send(macro):
                         observed.append(self.ctx.runner.closed_loop_owns_idle)
-                        return original(macro, **kwargs)
+                        return original(macro)
 
                     self.io.send = send
                     if stuck:
@@ -4570,13 +4570,13 @@ class WirelessRoomTests(unittest.TestCase):
                 return {}
             return {}
 
-        def send(macro, **kwargs):
+        def send(macro):
             if macro == 'lobby-a' and self.io.phase == 'stage':
                 self.io.events.append(('send', macro))
                 self.io.actions.append(macro)
                 self.io.pending = macro
                 return routes.play(self.ctx, macro)
-            return original_send(macro, **kwargs)
+            return original_send(macro)
 
         self.ctx.call = call
         self.io.send = send
@@ -4734,9 +4734,9 @@ class WirelessRoomTests(unittest.TestCase):
         self.io.stage_return_rooms_after_send = True
         original = self.io.send
 
-        def send(macro, **kwargs):
+        def send(macro):
             was_stage = self.io.phase == 'stage'
-            original(macro, **kwargs)
+            original(macro)
             if was_stage and macro == 'lobby-a':
                 self.io.stage_return_rooms_after_send = False
 
@@ -5265,9 +5265,9 @@ class WirelessRoomListTests(unittest.TestCase):
                 self.io.ready_no_phase = 'main' if stop else None
                 original, flags = self.io.send, []
 
-                def send(macro, **kwargs):
+                def send(macro):
                     flags.append(self.ctx.runner.closed_loop_owns_idle)
-                    return original(macro, **kwargs)
+                    return original(macro)
 
                 self.io.send = send
                 if stop:
@@ -5331,7 +5331,6 @@ class DashboardRouteTests(unittest.TestCase):
             self.a_sent_at = None
             self.close_after_a = False
             self.focus_after_a = False
-            self.reset_flags = []
 
         def read(self, provider, cap):
             if (self.phase == 'main' and self.a_sent_at is not None and self.a_delay is not None
@@ -5376,9 +5375,8 @@ class DashboardRouteTests(unittest.TestCase):
                 self.events[-1] = ('read', provider, dict(values))
             return sample
 
-        def send(self, macro, *, reset=True):
+        def send(self, macro):
             if self.phase == 'main' and macro in ('tap-zr1', 'main-menu-down', 'lobby-a'):
-                self.reset_flags.append((macro, reset))
                 self.events.append(('send', macro))
                 self.actions.append(macro)
                 self.pending = macro
@@ -5407,7 +5405,7 @@ class DashboardRouteTests(unittest.TestCase):
                 else:
                     raise AssertionError('A sent away from Local Wireless')
                 return
-            return super().send(macro, reset=reset)
+            return super().send(macro)
 
     setUp = WirelessRoomTests.setUp
     call = WirelessRoomTests.call
@@ -5509,7 +5507,6 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(caught.exception.step, 'dashboard-a')
                 self.assertIn('no transition within cap', caught.exception.reason)
                 self.assertEqual(self.io.actions, ['lobby-a'])
-                self.assertEqual(self.io.reset_flags, [('lobby-a', False)])
                 self.assertEqual(self.io.pending, 'lobby-a')
 
     def test_dashboard_a_waits_for_a_slow_list_without_repeating(self):
