@@ -38,13 +38,13 @@ def flatten_steps(steps):
 
 
 def harvest(manifest, out, label, library, replace=False, dry=False):
-    plan = runner.expand_library(json.loads(manifest.read_text()))
+    plan = runner.expand_library(json.loads(runner.published_path(manifest).read_text()))
     base = manifest.parent
     index_path = library / 'index.json'
     index = json.loads(index_path.read_text()) if index_path.is_file() else {'segments': {}, 'gates': {}}
     added = {'segments': [], 'gates': [], 'skipped': []}
     for row in plan['rows']:
-        receipt = out / f'{row["id"]}.json'
+        receipt = runner.published_path(out / f'{row["id"]}.json')
         if not receipt.is_file() or json.loads(receipt.read_text()).get('status') != 'PASS':
             continue
         last_gate = {}
@@ -68,6 +68,7 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                 for field, folder in (('reference', 'refs'), ('module', 'checks')):
                     if field in gate:
                         src = Path(gate[field]) if Path(gate[field]).is_absolute() else base / gate[field]
+                        runner.published_path(src)
                         image = field == 'reference' and gate.get('kind') == 'image'
                         contents = src.read_bytes() if image else None
                         if (image and (hashlib.sha256(contents).hexdigest() != gate.get('sha256')
@@ -110,6 +111,7 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                     added['skipped'].append(name)
                 continue
             src = Path(seg['file']) if Path(seg['file']).is_absolute() else base / seg['file']
+            runner.published_path(src)
             if digest(src) != seg.get('sha256'):
                 raise RuntimeError(f'segment {name}: file changed since the run recorded it')
             end_gate = next((s['gate'] for s in steps[i + 1:] if 'gate' in s and s.get('on', '*') == on), None)

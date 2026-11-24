@@ -240,6 +240,12 @@ def gate_candidate(path):
     return path.name.startswith(GATE_CANDIDATE_PREFIX) or path.resolve().name.startswith(GATE_CANDIDATE_PREFIX)
 
 
+def published_path(path):
+    if gate_candidate(path):
+        raise ValueError(f'reserved gate candidate is not a published input: {path.name}')
+    return path
+
+
 def reference_approved(base, gate, manifest=None, name=None):
     reference = Path(base) / gate['reference']
     intent = acquisition_intent(reference)
@@ -247,7 +253,7 @@ def reference_approved(base, gate, manifest=None, name=None):
         if gate_candidate(reference) or intent.exists() or not reference.is_file() or not gate.get('sha256'):
             return False
         if manifest is not None and name is not None and (gate.get('acquire') or gate.get('acquired')):
-            raw = json.loads(Path(manifest).read_text())
+            raw = json.loads(published_path(Path(manifest)).read_text())
             recorded = expand_library(raw).get('gates', {}).get(name)
             if (not recorded or (Path(base) / recorded['reference']).resolve() != reference.resolve()
                     or recorded.get('sha256') != gate['sha256']):
@@ -271,7 +277,8 @@ def row_role(row):
 
 
 def load_hook(base, gate):
-    spec = importlib.util.spec_from_file_location('gate_hook_' + Path(gate['module']).stem, base / gate['module'])
+    path = published_path(base / gate['module'])
+    spec = importlib.util.spec_from_file_location('gate_hook_' + path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return getattr(module, gate['function'])
@@ -892,7 +899,7 @@ def review_class(plan, base, raw_plan=None):
 def dry_run(manifest_path):
     """Offline only. Raises on a broken manifest; returns the report (missing segments are not an error)."""
     base = manifest_path.parent
-    raw = json.loads(manifest_path.read_text())
+    raw = json.loads(published_path(manifest_path).read_text())
     roles_defaulted = [row.get('id') for row in raw.get('rows', []) if 'role' not in row]
     try:
         plan = expand_library(copy.deepcopy(raw))
@@ -904,6 +911,9 @@ def dry_run(manifest_path):
     errors, missing, available, to_acquire = [], [], [], []
     for name, seg in plan.get('segments', {}).items():
         path = base / seg['file']
+        if gate_candidate(path):
+            errors.append(f'segment {name}: reserved gate candidate is not a published input')
+            continue
         if path.is_file():
             if not seg.get('sha256'):
                 errors.append(f'segment {name}: no sha256')
@@ -1452,7 +1462,7 @@ class Runner:
                  instances_sha256=None):
         self.manifest_path = manifest_path
         self.base = manifest_path.parent
-        self.plan = expand_library(json.loads(manifest_path.read_text()))
+        self.plan = expand_library(json.loads(published_path(manifest_path).read_text()))
         self.instances = instances
         self.instances_sha256 = instances_sha256
         self.default = next(iter(instances))
@@ -1914,6 +1924,8 @@ class Runner:
     def _commit_evidence(self, ticket):
         candidates = ticket.candidates
         deadline = min(gate['deadline'] for gate in candidates)
+        if ticket.deadline is not None:
+            deadline = min(deadline, ticket.deadline)
         if not self._gate_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
             ticket.revoke('lock_timeout')
             ticket.discard_later()
@@ -1931,6 +1943,10 @@ class Runner:
                 ticket.revoke('cancel')
                 ticket.discard()
                 raise
+            if (time.monotonic() >= deadline and any(gate['passed'] or gate['receipts'] for gate in candidates)):
+                ticket.revoke('timeout')
+                ticket.discard()
+                raise closed_loop.DispatchRejected('gate evidence deadline passed before commit')
             if self._gate_owner is not ticket or not ticket.commit():
                 ticket.revoke()
                 return False
@@ -2396,14 +2412,14 @@ class Runner:
         inst = self.instances[on]
         for name in (key, key + '_log', key[:-4] if key.endswith('_log') else None):
             if name and name in inst:
-                return Path(inst[name])
-        return Path(key)
+                return published_path(Path(inst[name]))
+        return published_path(Path(key))
 
     def trace_source(self, on):
         inst = self.instances[on]
         path = inst.get('trace_jsonl') or inst.get('trace')
         if isinstance(path, (str, Path)) and path:
-            return Path(path)
+            return published_path(Path(path))
         if path:
             raise RuntimeError(f'instance {on} is tracing but has no trace_jsonl file path')
         raise RuntimeError(f'instance {on}: run is not tracing (no trace_jsonl)')

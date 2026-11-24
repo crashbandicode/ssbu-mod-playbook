@@ -117,12 +117,10 @@ class CtxSshTests(unittest.TestCase):
         self.helper_patch = mock.patch.object(runner, '_SSH_LIFECYCLE', self.life, create=True)
         self.helper_patch.start()
         self.addCleanup(self.helper_patch.stop)
-        self.tool = runner.Runner.__new__(runner.Runner)
-        self.tool.instances = {'a': {'socket': 'fake'}}
-        self.tool.out = self.tool.row_dir = self.root
-        self.tool.pace = {'first_row_done': True}
-        self.tool.pace_seconds = 900
-        self.tool.replaying = False
+        manifest = self.root / 'rows.json'
+        manifest.write_text('{"rows": []}')
+        self.tool = runner.Runner(manifest, {'a': {'socket': 'fake'}}, self.root, 15,
+                                  client_factory=lambda _: FakeEden({}))
         self.ctx = runner.StepContext(self.tool, 'a')
         self.diag = {'line': 'ssh diag named', 'phase': 'auth', 'cause': 'packet loss',
                      'evidence': '/tmp/ctx-diagnostic', 'transient': False}

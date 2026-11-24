@@ -236,6 +236,8 @@ Gate workers prepare temporary candidates only; one deciding-thread commit publi
 the publication lock, with the acquired-reference approval last.
 Each ticket moves from `PENDING` to `COMMITTED` or `REVOKED`; timeout, cancellation and supersession revoke before
 reporting, and a late candidate is discarded.
+Direct checks and bounded rechecks both check STOP at the commit decision. A second gate cannot use a staged
+reference before that decision. Reserved candidate names are not valid manifest or reference inputs.
 A deciding thread blocked in a local commit may report late, but a failed caller cannot be followed by a late approval.
 The deciding thread appends still records at commit, while journal readers continue to skip old retractions.
 The reserved `.gate-candidate-` names are excluded from packet digests, row reports and GIF frame lists.
