@@ -1061,6 +1061,10 @@ class TileTakeRouteTests(unittest.TestCase):
             self.assertEqual(normal['args'], {'holding': 'p1'})
 
     def test_expect_fighters_needs_roster_and_body_to_agree(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.log = Path(temp.name) / 'bridge.log'
+        self.ctx.instance = {'bridge_log': str(self.log)}
         io = recorded.Replay(native_blocks=[recorded.l8w_native(1)])
         ui = recorded.native(1, screen='training', **{'screen.context': 'training'})
         state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
@@ -1175,19 +1179,21 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.row = Path(temp.name)
         runner = SimpleNamespace(routes_expect={'stage_id': 3}, native_ui_pending={})
-        self.log = self.row / 'bridge.log'
-        self.ctx = SimpleNamespace(runner=runner, on='s', row_dir=self.row,
-                                   instance={'bridge_log': str(self.log)}, check_stop=lambda: None)
+        self.log = self.row / 'effect-capture.log'
+        self.ctx = SimpleNamespace(runner=runner, on='s', row_dir=self.row, check_stop=lambda: None)
         self.io = ReachTrainingPhaseReplay(self.ctx)
         self.state = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
 
     def invoke(self, *, set_fighter=None, picker_factory=None, **kwargs):
+        capture = routes._effect_capture_start
+        capture_ctx = SimpleNamespace(instance={'bridge_log': str(self.log)})
         with ExitStack() as stack:
             stack.enter_context(patch.object(routes, 'BridgePickerIO', **(
                 {'side_effect': picker_factory} if picker_factory else {'return_value': self.io})))
             stack.enter_context(patch.object(routes.time, 'monotonic', side_effect=lambda: self.io.now))
             stack.enter_context(patch.object(routes.time, 'sleep', side_effect=self.sleep))
             stack.enter_context(patch.object(routes, 'native_state', side_effect=logged_native(self.log, self.state)))
+            stack.enter_context(patch.object(routes, '_effect_capture_start', side_effect=lambda _: capture(capture_ctx)))
             stack.enter_context(patch.object(routes, 'library_topology', return_value={'path': 'modelled'}))
             for name in ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
                          'pick_fighters', 'enter_training'):
