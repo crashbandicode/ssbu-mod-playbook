@@ -486,10 +486,20 @@ in the functions the plan reaches. The gate resolves a play name when it is:
   `routes.play(ctx, name, among=NAMES)` with `NAMES` a module constant. Every
   declared name is checked like a written one.
 
+The gate knows the step context as the first parameter of every function the
+manifest names, as any parameter that is given the context at a call the plan
+reaches (by place or by keyword), as a local set once to it, and by the name
+`ctx` or an attribute `.ctx`. Imports are followed where they stand, at module
+level or inside a function, also `from helper import *`.
+
 Any other play warns: a name built at run time, a parameter of a method, of a
-nested function or of a function handed on as a value, arguments passed with
-`*`, a `.play(ctx, ...)` on something that is not `routes`, and a play on
-`ctx.runner` directly. A packet does not fly with a warning; declare the set.
+nested function or of a function handed on as a value, and arguments passed
+with `*`. In code the plan reaches, a `.play(` on anything the gate cannot
+place warns too: a context kept under another attribute, passed with `*` or
+handed on through a callback, and a play on `ctx.runner` directly. A packet
+does not fly with a warning; declare the set, or call `ctx.play` on a context
+the gate can follow. Code reached only through a dynamic import or `getattr`
+is not read; a `ctx.play` in it stops at run time.
 
 At run time `ctx.play` refuses a name the gate did not check for this plan,
 before anything is sent, and a name outside its `among=` set. So a call the
