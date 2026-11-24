@@ -40,6 +40,33 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_a_continuity_error_from_a_read_stops_with_a_receipt_and_never_sends_again(self):
+        message = 'bridge connection or replay continuity changed while input was unconfirmed'
+        for before_send in (False, True):
+            with self.subTest(before_send=before_send):
+                reads = []
+
+                def observe(fake):
+                    reads.append(fake.now)
+                    if before_send or fake.sends:
+                        raise RuntimeError(message)
+                    return 'source'
+
+                fake = Script(observe)
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([step('press', 'source', 'done')])
+                error = caught.exception
+                self.assertEqual(error.step, 'locate' if before_send else 'press')
+                self.assertEqual(error.reason, f'bridge continuity lost, nothing was sent after it: {message}')
+                self.assertEqual(len(fake.sends), 0 if before_send else 1)
+                self.assertEqual(len(reads), 1 if before_send else 2)
+                self.assertEqual(fake.finishes, 0)
+                if before_send:
+                    self.assertEqual(error.receipt['continuity'], 'lost')
+                else:
+                    self.assertEqual(error.receipt['steps'][0]['continuity'], 'lost')
+                    self.assertEqual(error.receipt['steps'][0]['sends'], 1)
+
     def test_an_unanswered_read_keeps_the_lost_timer_and_the_retry_runs(self):
         no_read = getattr(closed_loop, 'NO_READ', object())
         fake = Script(lambda f: 'done' if len(f.sends) >= 2 else

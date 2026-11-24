@@ -2887,6 +2887,10 @@ class WirelessRoomTests(unittest.TestCase):
             self.stage_send_times = []
             self.stage_retry_error_at = None
             self.stage_retry_error_done = False
+            self.ui_fatal_after_stage = None
+            self.ui_fatal_before_send = None
+            self.fatal_after_stage_tile_error = False
+            self.stage_tile_error_done = False
             self.ready_no_phase = None
             self.read_caps = []
             self.stage_tile_after_send = None
@@ -2920,6 +2924,11 @@ class WirelessRoomTests(unittest.TestCase):
             self.revision += 1
             if provider == 'tile.cursor':
                 if self.phase in ('stage', 'stage_reacting'):
+                    if (self.fatal_after_stage_tile_error and self.stage_count
+                            and not self.stage_tile_error_done):
+                        self.stage_tile_error_done = True
+                        self.events.append(('read_error', provider, 'no fenced bridge reply for state tile.cursor'))
+                        raise RuntimeError('no fenced bridge reply for state tile.cursor')
                     if self.stage_since is not None and self.clock() - self.stage_since < self.stage_tile_delay:
                         if self.stage_tile_delay_kind == 'error':
                             self.events.append(('read_error', provider, 'tile not published'))
@@ -2948,8 +2957,15 @@ class WirelessRoomTests(unittest.TestCase):
                     self.tile.update(self.tile_script.pop(0))
                 values = dict(self.tile)
             else:
+                if self.ui_fatal_before_send and not self.actions:
+                    self.events.append(('read_error', provider, self.ui_fatal_before_send))
+                    raise RuntimeError(self.ui_fatal_before_send)
                 if self.phase == 'stage' and self.stage_since is None:
                     self.stage_since = self.clock()
+                if (self.phase == 'stage' and self.stage_count and self.ui_fatal_after_stage
+                        and (not self.fatal_after_stage_tile_error or self.stage_tile_error_done)):
+                    self.events.append(('read_error', provider, self.ui_fatal_after_stage))
+                    raise RuntimeError(self.ui_fatal_after_stage)
                 if (self.phase == 'stage' and self.stage_count == 1 and self.stage_retry_error_at is not None
                         and not self.stage_retry_error_done and self.clock() - self.stage_send_times[0] >= 5):
                     self.stage_retry_error_done = True
@@ -3697,6 +3713,64 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(stop['last_ui']['screen'], 'stage_select')
         self.assertEqual((stop['last_tile']['screen'], stop['last_tile']['at']), ('sss', '0'))
         self.assertEqual(stop['result'], 'STOPPED')
+
+    def test_a_bridge_continuity_error_writes_the_stop_receipt(self):
+        messages = ('bridge connection or replay continuity changed while input was unconfirmed',
+                    'native picker bridge boot changed',
+                    'ssbu.ui: malformed explicit state reply',
+                    'ssbu.ui: overlapping explicit state reply',
+                    'native picker bridge log rotated or truncated')
+        for message in messages:
+            with self.subTest(message=message):
+                self.io = self.IO()
+                self.io.lost_stage_sends = 1
+                self.io.ui_fatal_after_stage = message
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_room(unpublished_create='allow')
+                self.assertEqual(caught.exception.step, 'stage-a')
+                self.assertTrue(caught.exception.reason.startswith(
+                    f'bridge continuity lost, nothing was sent after it: {message}'))
+                self.assertEqual(self.io.actions.count('lobby-a'), 1)
+                self.assertEqual(self.io.pending, 'lobby-a')
+                press = self.io.events.index(('send', 'lobby-a'))
+                self.assertEqual(self.io.events[press + 1:], [('read_error', 'ssbu.ui', message)])
+                stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+                self.assertEqual(stop['continuity'], 'lost')
+                self.assertEqual(stop['last_error'], message)
+                self.assertEqual(stop['last_ui']['screen'], 'stage_select')
+                self.assertEqual((stop['last_tile']['screen'], stop['last_tile']['at']), ('sss', '0'))
+                self.assertEqual(next(step for step in stop['steps'] if step['name'] == 'stage-a')['continuity'],
+                                 'lost')
+
+    def test_a_continuity_error_before_the_first_read_writes_a_locate_stop(self):
+        message = 'bridge connection or replay continuity changed during native UI read'
+        self.io.ui_fatal_before_send = message
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'locate')
+        self.assertEqual(self.io.actions, [])
+        self.assertEqual(self.io.events, [('read_error', 'ssbu.ui', message)])
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['continuity'], 'lost')
+        self.assertEqual(stop['last_error'], message)
+        self.assertIsNone(stop['last_ui'])
+        self.assertIsNone(stop['last_tile'])
+
+    def test_a_continuity_stop_retains_the_last_answered_tile_after_a_tile_timeout(self):
+        message = 'bridge connection or replay continuity changed while input was unconfirmed'
+        self.io.lost_stage_sends = 1
+        self.io.ui_fatal_after_stage = message
+        self.io.fatal_after_stage_tile_error = True
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertEqual(self.io.pending, 'lobby-a')
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['continuity'], 'lost')
+        self.assertEqual(stop['last_error'], message)
+        self.assertEqual((stop['last_tile']['screen'], stop['last_tile']['at']), ('sss', '0'))
+        press = self.io.events.index(('send', 'lobby-a'))
+        self.assertFalse(any(event[0] == 'finish' for event in self.io.events[press + 1:]))
 
     def test_a_resend_is_reported_as_pass_with_one_stall(self):
         log = self.row / 'bridge.log'

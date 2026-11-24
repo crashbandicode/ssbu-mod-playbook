@@ -978,7 +978,8 @@ def _wireless_read(ctx, io, provider, cap, screens, *, on_sample=None):
     try:
         sample = io.read(provider, cap)
     except RuntimeError as error:
-        if any(word in str(error).lower() for word in ('continuity', 'boot changed', 'malformed', 'overlapping')):
+        if any(word in str(error).lower() for word in
+               ('continuity', 'boot changed', 'malformed', 'overlapping', 'rotated', 'truncated')):
             raise
         return {'error': str(error)}
     block = sample.block
@@ -1008,7 +1009,8 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
     started, screens = time.monotonic(), []
     io = BridgePickerIO(ctx)
-    state = {'last_ui': {}, 'last_tile': None, 'last_error': None, 'last_read_was_error': False,
+    state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
+             'last_error': None, 'last_read_was_error': False,
              'form_pending': False, 'form_ready': False, 'form_settling': False, 'ready_published': False,
              'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
              'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
@@ -1019,19 +1021,27 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         state['ready_published'] |= 'input.ready' in sample.block['values']
 
     def observe():
-        ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens, on_sample=remember_ui)
-        if 'error' in ui:
-            state['last_error'] = ui['error']
+        try:
+            ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens, on_sample=remember_ui)
+            if 'error' in ui:
+                state['last_error'] = ui['error']
+                state['last_read_was_error'] = True
+                return closed_loop.NO_READ
+            state['last_read_was_error'] = False
+            state['last_ui'] = ui
+            state['ui_answered'] = True
+            tile = None
+            if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
+                    and ui.get('observation.active') == 'yes'):
+                tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+                state['last_tile'] = tile
+                if 'error' not in tile:
+                    state['last_answered_tile'] = tile
+            return {'ui': ui, 'tile': tile}
+        except RuntimeError as error:
+            state['last_error'] = str(error)
             state['last_read_was_error'] = True
-            return closed_loop.NO_READ
-        state['last_read_was_error'] = False
-        state['last_ui'] = ui
-        tile = None
-        if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
-                and ui.get('observation.active') == 'yes'):
-            tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
-            state['last_tile'] = tile
-        return {'ui': ui, 'tile': tile}
+            raise
 
     def active(obs, screen):
         ui = obs['ui']
@@ -1218,7 +1228,11 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
                                   clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall)
     except closed_loop.RouteStopped as error:
         reason = error.reason
-        if (error.step == 'confirm-create' and state['confirm_presses'] == 1
+        continuity = (error.receipt.get('continuity') == 'lost'
+                      or any(entry.get('continuity') == 'lost' for entry in error.receipt['steps']))
+        if continuity:
+            pass
+        elif (error.step == 'confirm-create' and state['confirm_presses'] == 1
                 and (state['last_read_was_error'] or state['last_ui'].get('screen') is None)):
             seen = state['last_error'] if state['last_read_was_error'] else f'screen missing from {state["last_ui"]}'
             reason = ('no ssbu.ui reply after the Create confirm, so a second press would '
@@ -1264,6 +1278,10 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
             'stalls': error.receipt['stalls'], 'result': _stall_result(False, error.receipt['stalls']),
             'last_error': state['last_error'], 'press_gate': press_gate(),
         }
+        if continuity:
+            stop_receipt['continuity'] = 'lost'
+            stop_receipt['last_ui'] = state['last_ui'] if state['ui_answered'] else None
+            stop_receipt['last_tile'] = state['last_answered_tile']
         dispatch = next((entry.get('dispatch') for entry in error.receipt['steps'] if entry['name'] == error.step),
                         None)
         if dispatch is not None:

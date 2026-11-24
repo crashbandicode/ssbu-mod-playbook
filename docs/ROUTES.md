@@ -94,6 +94,7 @@ key; never press on the screen name alone.
 After a send, wait for the transition. A continuously observed source with the same target counts as a lost input:
 finish it and resend, up to three sends total (some steps allow fewer). A continuously changed target stops without
 confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
+A bridge continuity, boot or fence error is never retried: the route stops on the current step with the receipt and leaves the input unconfirmed.
 If observations stay unreadable or in flight until the cap, stop on the named step without confirming or pressing again.
 Every wireless bridge read gets at least 2 seconds. An unanswered read preserves the last answered read and the
 source timer, but cannot authorise input; at the deadline one grace read may witness completion or a qualified retry.

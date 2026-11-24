@@ -40,9 +40,11 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         return {'entered_at': entered_at, 'steps': [dict(record) for record in records],
                 'stalls': list(stalls)}
 
-    def stop(name, reason):
+    def stop(name, reason, *, continuity=False):
         data = receipt()
         data.update(step=name, reason=reason)
+        if continuity:
+            data['continuity'] = 'lost'
         raise RouteStopped(route, name, reason, data)
 
     def matching(obs, excluding=None):
@@ -51,7 +53,16 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
 
     def read(index=None):
         nonlocal last_answered, last_answered_at, locate_unanswered
-        value = observe()
+        try:
+            value = observe()
+        except RuntimeError as error:
+            reason = f'bridge continuity lost, nothing was sent after it: {error}'
+            if index is None:
+                stop('locate', reason, continuity=True)
+            records[index]['continuity'] = 'lost'
+            if active_index == index and active_started is not None:
+                records[index]['ms'] += round((clock() - active_started) * 1000)
+            stop(steps[index].name, reason)
         if value is NO_READ:
             if index is None:
                 locate_unanswered += 1
