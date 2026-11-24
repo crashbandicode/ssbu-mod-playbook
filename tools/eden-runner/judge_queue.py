@@ -174,17 +174,34 @@ def sample_dense(clip, folder, positions_ms):
 def clip_check(job, frames):
     """Deterministic: the expected-result shot exists, and the row changed something on screen."""
     shots = job.get('shots') or []
-    taken = [s for s in shots if s.get('path') and Path(s['path']).is_file()]
+    taken = [s for s in shots if s.get('phase') in ('before', 'step', 'after')
+             and s.get('path') and Path(s['path']).is_file()]
+    excluded = [{'path': s['path'],
+                 **({'label': s['label']} if s.get('label') else
+                    {'name': s.get('name') or Path(s['path']).name}),
+                 'reason': still_fresh.unusable_reason(s.get('fresh'))}
+                for s in taken if not still_fresh.usable(s.get('fresh'))]
+    comparable = [s for s in taken if still_fresh.usable(s.get('fresh'))]
+
+    def result(values):
+        return {**values, **({'excluded': excluded} if excluded else {})}
+
+    def unmeasured(note):
+        if excluded:
+            return result({'ok': True, 'unmeasured': True,
+                           'note': f'change not measured: {len(excluded)} unusable still(s) excluded'})
+        return {'ok': True, 'note': note}
+
     expected = [s for s in shots if s.get('phase') == 'after'] or [s for s in shots if s.get('phase') == 'step']
     if expected and not Path(expected[-1].get('path') or '').is_file():
-        return {'ok': False, 'reason': f'expected-result shot missing: {expected[-1]["name"]}'}
-    before = next((s['path'] for s in taken if s.get('phase') == 'before'), None) or frames.get('start')
+        return result({'ok': False, 'reason': f'expected-result shot missing: {expected[-1]["name"]}'})
+    before = next((s['path'] for s in comparable if s.get('phase') == 'before'), None) or frames.get('start')
     if not before:
-        return {'ok': True, 'note': 'no before-shot and no clip start frame: change not measured'}
+        return unmeasured('no before-shot and no clip start frame: change not measured')
     later = [frames[k] for k in ('mid', 'end') if frames.get(k)] + \
-        [s['path'] for s in taken if s.get('phase') in ('step', 'after')]
+        [s['path'] for s in comparable if s.get('phase') in ('step', 'after')]
     if not later:
-        return {'ok': True, 'note': 'nothing to compare with the before frame'}
+        return unmeasured('nothing to compare with the before frame')
     diffs, unreadable = {}, []
     for p in later:
         try:
@@ -192,11 +209,13 @@ def clip_check(job, frames):
         except Exception:  # noqa: BLE001 - an unreadable still is listed, not a verdict
             unreadable.append(str(p))
     if not diffs:
+        if excluded:
+            return unmeasured('no readable frame pair: change not measured')
         return {'ok': True, 'note': 'no readable frame pair: change not measured', 'unreadable': unreadable}
     best = max(diffs.values())
     if best <= NO_EFFECT_DIFF:
-        return {'ok': False, 'reason': 'no-visible-effect', 'max_diff': best, 'diffs': diffs, 'before': before}
-    return {'ok': True, 'max_diff': best, 'before': before}
+        return result({'ok': False, 'reason': 'no-visible-effect', 'max_diff': best, 'diffs': diffs, 'before': before})
+    return result({'ok': True, 'max_diff': best, 'before': before})
 
 
 # ---- receipt merge -------------------------------------------------------------------------------------------------
@@ -228,12 +247,16 @@ def known_issue(known, verdict):
     return {'ids': ids, 'titles': [known[k]['title'] for k in ids], 'judge_reason': reason}
 
 
+def _shot_blockers(shots):
+    return [{'kind': 'evidence', 'source': shot.get('label') or shot.get('name') or Path(shot['path']).name,
+             'text': f"still {shot['path']} is not usable evidence: {still_fresh.unusable_reason(shot.get('fresh'))}"}
+            for shot in shots if not still_fresh.usable(shot.get('fresh'))]
+
+
 def evidence_blockers(shots, verdict, all_shots=None):
     row_shots = [shot for shot in shots or [] if isinstance(shot, dict)
                  and shot.get('phase') in ('before', 'step', 'after')]
     shots = [shot for shot in row_shots if shot.get('path')]
-    if not any('fresh' in shot for shot in shots):
-        return []
     available = [shot for shot in (all_shots or shots) if isinstance(shot, dict) and shot.get('path')]
     citations = (verdict or {}).get('shots_cited')
     citations = citations if isinstance(citations, list) else []
@@ -248,17 +271,31 @@ def evidence_blockers(shots, verdict, all_shots=None):
         for shot in ([before] if before else []) + (expected[-1:] if expected and expected[-1].get('path') else []):
             if shot not in matched:
                 matched.append(shot)
-    return [{'kind': 'evidence', 'source': shot.get('label') or shot.get('name') or Path(shot['path']).name,
-             'text': f"still {shot['path']} is not usable evidence: {still_fresh.unusable_reason(shot.get('fresh'))}"}
-            for shot in matched if not still_fresh.usable(shot.get('fresh'))]
+    return _shot_blockers(matched)
 
 
 def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_shots=None):
-    status, reason, review = final_status(receipt.get('gates_status', receipt.get('status')),
-                                          receipt.get('effects_passed') or [], check, verdict)
-    evidence = (evidence_blockers(shots, verdict, all_shots)
-                if (verdict or {}).get('verdict') in ('PASS', 'FAIL') else [])
-    issue = known_issue(known, verdict) if not evidence and status == 'FAILED' and (check or {}).get('ok', True) else None
+    gates_status = receipt.get('gates_status', receipt.get('status'))
+    status, reason, review = final_status(gates_status, receipt.get('effects_passed') or [], check, verdict)
+    if gates_status != 'PASS':
+        evidence = evidence_blockers(shots, verdict, all_shots)
+    elif check and not check.get('ok', True):
+        compared = check.get('diffs') or {}
+        evidence = _shot_blockers([shot for shot in shots or [] if isinstance(shot, dict)
+                                   and shot.get('phase') in ('before', 'step', 'after') and shot.get('path')
+                                   and (shot['path'] == check.get('before') or shot['path'] in compared)])
+    else:
+        evidence = (evidence_blockers(shots, verdict, all_shots)
+                    if (verdict or {}).get('verdict') in ('PASS', 'FAIL') else [])
+        if (verdict or {}).get('verdict') in ('PASS', 'FAIL') and (check or {}).get('unmeasured'):
+            for shot in check.get('excluded') or []:
+                item = {'kind': 'evidence', 'source': shot.get('label') or shot.get('name') or Path(shot['path']).name,
+                        'text': f"still {shot['path']} is not usable evidence: {shot['reason']}"}
+                if item not in evidence:
+                    evidence.append(item)
+    issue = (known_issue(known, verdict)
+             if gates_status == 'PASS' and not evidence and status == 'FAILED' and (check or {}).get('ok', True)
+             else None)
     if issue:  # not chased, not counted by the consecutive-failure stop; listed apart in FAILING.md
         status, reason, review = 'KNOWN-PRODUCT-ISSUE', f'known issue {",".join(issue["ids"])}: {issue["judge_reason"]}', False
         receipt['known_issue'] = issue
@@ -268,9 +305,10 @@ def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_s
         blockers = list(receipt.get('blockers') or [])
         blockers.extend(item for item in evidence if item not in blockers)
         receipt['blockers'] = blockers
-        receipt.pop('known_issue', None)
-        status, reason, review = 'RAN-UNVERIFIED', blockers[0]['text'], True
-        receipt['review_kind'] = 'unverified'
+        if gates_status == 'PASS':
+            receipt.pop('known_issue', None)
+            status, reason, review = 'RAN-UNVERIFIED', blockers[0]['text'], True
+            receipt['review_kind'] = 'unverified'
     if status == 'PASS' and 'blockers' in receipt:
         blockers = receipt['blockers'] or []
         visual = [blocker for blocker in blockers if blocker.get('kind') == 'visual']

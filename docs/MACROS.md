@@ -496,8 +496,13 @@ The read stores the capture's name, hash, UTC time, scalar status snapshot and
 freshness record. Both PASS and FAIL reads require a usable capture; a judge's
 PASS or FAIL requires usable stills on which the verdict rests. Refused or
 errored stills cannot establish either result; a judged verdict that rests on
-them leaves evidence blockers. The runner records every still taken inside a
-row, including image-gate polling stills, as a
+them leaves evidence blockers. A job written without freshness records also
+leaves the verdict unverified when it rests on row stills. A failed
+deterministic gate stays FAILED regardless of the stills. A failed clip check
+stays FAILED unless a row still it compared is unusable. The clip check compares
+only usable row stills, lists exclusions, and leaves an evidence blocker when
+nothing usable can be compared. The runner records
+every still taken inside a row, including image-gate polling stills, as a
 capture with one `status` call after each. Without a game-frame source the
 freshness is `unverified` and remains usable; that is not frame-freshness proof.
 The still's own recorded path selects its capture; otherwise use
