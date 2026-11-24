@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1045,6 +1046,241 @@ class TileTakeRouteTests(unittest.TestCase):
             result = routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
         self.assertEqual(result['verified']['bodies'][1], 7)
         self.assertEqual(io.actions, [])
+
+
+class ReachTrainingPhaseReplay:
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.pending = ctx.runner.native_ui_pending
+        self.in_flight = False
+        self.screen = 'stage_select'
+        self.revision = 0
+        self.now = 0.0
+        self.events = []
+        self.calls = []
+        self.failures = {}
+        self.failure_message = 'phase transition deadline'
+        self.failure_exception = None
+        self.after_failure = None
+        self.read_fault = False
+        self.good_reads_before_fault = 0
+        self.read_script = []
+        self.phase_duration = 0.0
+
+    def read(self, provider, cap):
+        self.events.append(('read', self.screen, self.ctx.on in self.pending))
+        if self.read_fault:
+            if self.good_reads_before_fault:
+                self.good_reads_before_fault -= 1
+            else:
+                raise RuntimeError('no fenced bridge reply')
+        self.revision += 1
+        if self.read_script:
+            screen = self.read_script.pop(0)
+            if screen == 'unknown':
+                return recorded.loading(self.revision)
+        else:
+            screen = self.screen
+        if screen == 'main_menu':
+            fields = {'screen': 'main_menu', 'screen.context': 'unknown', 'screen.layer': 'submenu',
+                      'screen.tab': 'games_and_more', 'focus.source': 'native', 'focus.id': 'classic_mode',
+                      'focus': 'main_menu.submenu.classic_mode'}
+        else:
+            fields = {'screen': screen, 'screen.context': 'training',
+                      'focus': screen,
+                      'focus.source': 'tile.cursor' if screen in ('stage_select', 'css.training') else 'native'}
+        return recorded.native(self.revision, **fields)
+
+    def finish(self):
+        self.events.append(('finish', self.screen, self.ctx.on in self.pending))
+        self.pending.pop(self.ctx.on, None)
+        self.in_flight = False
+
+    def phase(self, name):
+        self.calls.append(name)
+        self.events.append(('phase', name, self.ctx.on in self.pending))
+        self.now += self.phase_duration
+        if self.failures.get(name, 0):
+            self.failures[name] -= 1
+            self.pending[self.ctx.on] = ('macro-' + name, str(self.ctx.row_dir))
+            if self.after_failure:
+                self.after_failure(self, name)
+            if self.failure_exception:
+                raise self.failure_exception
+            raise RuntimeError(self.failure_message)
+        if name in ('to_main', 'back_to_main'):
+            self.screen = 'main_menu'
+        elif name == 'main_to_stage':
+            self.screen = 'stage_select'
+        elif name in ('pick_stage', 'quit_training'):
+            self.screen = 'css.training'
+        elif name == 'enter_training':
+            self.screen = 'training'
+        return {'phase': name}
+
+
+class ReachTrainingClosedLoopTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.row = Path(temp.name)
+        runner = SimpleNamespace(routes_expect={'stage_id': 3}, native_ui_pending={})
+        self.ctx = SimpleNamespace(runner=runner, on='s', row_dir=self.row, check_stop=lambda: None)
+        self.io = ReachTrainingPhaseReplay(self.ctx)
+        self.state = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
+
+    def invoke(self, **kwargs):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(routes, 'BridgePickerIO', return_value=self.io))
+            stack.enter_context(patch.object(routes.time, 'monotonic', side_effect=lambda: self.io.now))
+            stack.enter_context(patch.object(routes.time, 'sleep', side_effect=self.sleep))
+            stack.enter_context(patch.object(routes, 'native_state', return_value=self.state))
+            stack.enter_context(patch.object(routes, 'library_topology', return_value={'path': 'modelled'}))
+            for name in ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
+                         'pick_fighters', 'enter_training'):
+                stack.enter_context(patch.object(routes, name, side_effect=lambda *a, _name=name, **k:
+                                                 self.io.phase(_name)))
+            stack.enter_context(patch.object(routes, '_set_fighter', side_effect=lambda *a, **k:
+                                             self.io.phase('set_cpu')))
+            return routes.reach_training(self.ctx, 'Mario', cpu='Fox', **kwargs)
+
+    def sleep(self, seconds):
+        self.io.now += seconds
+
+    def stop_receipt(self):
+        return json.loads((self.row / 'routes-reach-training-stop.json').read_text())
+
+    def test_a_phase_that_fails_once_on_the_same_screen_runs_again(self):
+        self.io.failures['pick_stage'] = 1
+        result = self.invoke()
+        self.assertEqual(self.io.calls.count('pick_stage'), 2)
+        self.assertEqual(result['starts']['pick_stage'], 2)
+        self.assertEqual(result['retries'], {'pick_stage': 1})
+        self.assertEqual(result['recovered'], [])
+
+    def test_a_phase_whose_transition_happened_anyway_is_not_run_again(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.after_failure = lambda io, name: setattr(io, 'screen', 'css.training')
+        result = self.invoke()
+        self.assertEqual(self.io.calls.count('pick_stage'), 1)
+        self.assertEqual(result['recovered'], ['pick_stage'])
+        self.assertEqual(self.io.calls, ['pick_stage', 'pick_fighters', 'enter_training'])
+
+    def test_three_failures_of_one_phase_stop_on_that_phase(self):
+        self.io.failures['pick_stage'] = 3
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.step, 'pick_stage')
+        self.assertEqual(self.io.calls.count('pick_stage'), 3)
+        stop = self.stop_receipt()
+        self.assertEqual(stop['starts']['pick_stage'], 3)
+        self.assertIn('phase transition deadline', stop['reason'])
+        self.assertEqual(stop['last_ui']['screen'], 'stage_select')
+
+    def test_a_bounce_does_not_restart_a_phase_budget(self):
+        self.io.failures['pick_fighters'] = 3
+
+        def bounce(io, name):
+            if name == 'pick_fighters' and io.failures[name]:
+                io.screen = 'stage_select'
+        self.io.after_failure = bounce
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.step, 'pick_fighters')
+        self.assertEqual(self.io.calls.count('pick_fighters'), 3)
+        self.assertEqual(self.io.calls.count('pick_stage'), 3)
+        self.assertEqual(self.stop_receipt()['starts']['pick_fighters'], 3)
+
+    def test_a_continuity_error_is_never_retried(self):
+        for message in ('bridge connection or replay continuity changed',
+                        'native picker bridge boot changed', 'bridge log rotated or truncated'):
+            with self.subTest(message=message):
+                self.io = ReachTrainingPhaseReplay(self.ctx)
+                self.io.pending.clear()
+                self.io.failures['pick_stage'] = 1
+                self.io.failure_message = message
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.invoke()
+                self.assertEqual(caught.exception.step, 'pick_stage')
+                self.assertIn(message, caught.exception.reason)
+                self.assertEqual(self.io.calls.count('pick_stage'), 1)
+                self.assertEqual(self.stop_receipt()['pending'], 'macro-pick_stage')
+
+    def test_unreadable_state_after_a_failure_stops_and_keeps_the_input_unconfirmed(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.after_failure = lambda io, name: setattr(io, 'read_fault', True)
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.step, 'pick_stage')
+        self.assertIn('phase transition deadline', caught.exception.reason)
+        self.assertIn(self.ctx.on, self.io.pending)
+        self.assertEqual(self.stop_receipt()['pending'], 'macro-pick_stage')
+        self.assertFalse(any(event[0] == 'finish' for event in self.io.events))
+
+    def test_an_inner_route_stopped_is_not_retried(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.failure_exception = routes.closed_loop.RouteStopped('inner', 'tile', 'unsafe', {})
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.step, 'pick_stage')
+        self.assertIn("inner: stopped on step 'tile': unsafe", caught.exception.reason)
+        self.assertEqual(self.io.calls, ['pick_stage'])
+        self.assertIn(self.ctx.on, self.io.pending)
+
+    def test_a_single_qualified_read_is_not_enough_to_continue(self):
+        self.io.failures['pick_stage'] = 1
+
+        def unreadable_after_one(io, name):
+            io.read_fault = True
+            io.good_reads_before_fault = 1
+        self.io.after_failure = unreadable_after_one
+        with self.assertRaises(routes.closed_loop.RouteStopped):
+            self.invoke()
+        self.assertIn(self.ctx.on, self.io.pending)
+        self.assertEqual(self.io.calls, ['pick_stage'])
+        self.assertFalse(any(event[0] == 'finish' for event in self.io.events))
+
+    def test_unknown_between_good_reads_requires_another_qualified_pair(self):
+        self.io.failures['pick_stage'] = 1
+        self.io.after_failure = lambda io, name: setattr(
+            io, 'read_script', ['stage_select', 'unknown', 'stage_select', 'stage_select'])
+        self.invoke()
+        first_finish = next(i for i, event in enumerate(self.io.events) if event[0] == 'finish')
+        pending_reads = [event for event in self.io.events[:first_finish] if event[0] == 'read' and event[2]]
+        self.assertGreaterEqual(len(pending_reads), 4)
+
+    def test_the_unconfirmed_mark_is_cleared_only_after_the_qualified_pair(self):
+        self.io.failures['pick_stage'] = 1
+        result = self.invoke()
+        first_finish = next(i for i, event in enumerate(self.io.events) if event[0] == 'finish')
+        preceding = self.io.events[:first_finish]
+        pending_reads = [event for event in preceding if event[0] == 'read' and event[2]]
+        self.assertGreaterEqual(len(pending_reads), 2)
+        second_start = [event for event in self.io.events if event[:2] == ('phase', 'pick_stage')][1]
+        self.assertFalse(second_start[2])
+        self.assertEqual(result['starts']['pick_stage'], 2)
+
+    def test_the_overall_deadline_stops_with_the_deadline_step(self):
+        self.io.phase_duration = 2
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.invoke(cap=1)
+        self.assertEqual(caught.exception.step, 'deadline')
+        self.assertEqual(self.io.calls, ['pick_stage'])
+        self.assertEqual(self.stop_receipt()['step'], 'deadline')
+
+    def test_the_plain_path_receipt_has_empty_retries_and_recovered(self):
+        result = self.invoke()
+        self.assertEqual(self.io.calls, ['pick_stage', 'pick_fighters', 'enter_training'])
+        self.assertEqual(result['retries'], {})
+        self.assertEqual(result['recovered'], [])
+        self.assertEqual(result['starts'], {'pick_stage': 1, 'pick_fighters': 1, 'enter_training': 1})
+
+    def test_a_games_and_more_submenu_checkpoint_continues_to_stage(self):
+        self.io.screen = 'main_menu'
+        result = self.invoke()
+        self.assertEqual(self.io.calls[0], 'main_to_stage')
+        self.assertNotIn('back_to_main', self.io.calls)
+        self.assertEqual(result['starts']['main_to_stage'], 1)
 
 
 if __name__ == '__main__':
