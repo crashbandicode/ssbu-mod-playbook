@@ -205,3 +205,8 @@ checked against a run profile. `tap-zr1` and `recording-popup-chord` reproduce t
 `install2/flight-prep/dispatch-pack-v2/yoga/segments/i2-play-p1-chord.edenmacro.json`, SHA-256
 `437b038c2da32690c3ee43c923ca3c9d9e0fe97a70eb69bfdb75eeb523e66cb3`. The event extractor tests model
 TrainingRooms `71158421` `src/model/bridge_events.rs` lines 23–26, 45 and 132. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/fixtures.py` ports finite watch qualification from
+`dispatch-pack-v2/xps/bridge_watch_steps.py`, field parsing from `f16_judge.py` and effective partner readback
+from `f15_room_steps.py`, using canonical native state, log cursor and bridge request helpers. The fighter
+lines in `test_fixtures.py` are modelled, not recorded. Host tests only; no runtime acceptance.

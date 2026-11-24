@@ -1,11 +1,13 @@
 """Shared setup fixtures."""
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import time
 
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
@@ -21,10 +23,155 @@ GIVES = {
                                      else [f'practice.ready={args["game"]}']),
     'seeded_room': lambda args: ['lobby.practice=on', f'partner.behavior={args["behavior"]}',
                                  f'lobby.stage={args["stage"]}'],
+    'cpu_standing': lambda args: ['cpu.standing'],
+    'partner_effective': lambda args: [f'partner.effective={args["eb"]}'],
 }
 
 ROOM_MARK = 'fixture-room-mark'
 STAGE_LINE = re.compile(r'\[Bridge\] stage id=(-?\d+)\s.*\bframe=(\d+)\s')
+WATCH_ACK = re.compile(r'\[Bridge\] req fighters_watch result=ok entries=(0x[\da-f]+) frames=(\d+)')
+WATCH_DONE = re.compile(r'\[Bridge\] fighters_watch done entries=(0x[\da-f]+)')
+WATCH_FIGHTER = re.compile(r'\[Bridge\] fighter entry=(\d+) .*\bcbt=\S+ .*\bframe=(\d+)(?:\s|$)')
+FIGHTER_ENTRY = re.compile(r'\[Bridge\] fighter entry=(\d+)(?: |$)')
+FRAME = re.compile(r'\bframe=(\d+)\b')
+WORDS = re.compile(r'([a-z_][\w.]*)=([^ ]+)')
+
+
+def watch_window(lines, entries, frames, min_frame):
+    mask = hex(sum(1 << entry for entry in entries))
+    starts = []
+    for index, line in enumerate(lines):
+        ack, stamp = WATCH_ACK.search(line), FRAME.search(line)
+        if ack and stamp and ack.groups() == (mask, str(frames)) and int(stamp[1]) >= min_frame:
+            starts.append((index, int(stamp[1])))
+    if not starts:
+        return [], False
+    first_frame = starts[0][1]
+    start = next(index for index, frame in reversed(starts) if frame == first_frame)
+    for index in range(start + 1, len(lines)):
+        done, stamp = WATCH_DONE.search(lines[index]), FRAME.search(lines[index])
+        if done and stamp and done[1] == mask and int(stamp[1]) == first_frame + frames:
+            return lines[start:index + 1], True
+    return lines[start:], False
+
+
+def check_watch(window_lines, entries, frames):
+    mask = hex(sum(1 << entry for entry in entries))
+    acknowledgements = [m for line in window_lines if (m := WATCH_ACK.search(line))]
+    completions = [m for line in window_lines if (m := WATCH_DONE.search(line))]
+    sequence = [(int(m[1]), int(m[2])) for line in window_lines if (m := WATCH_FIGHTER.search(line))]
+    by_entry = {entry: [frame for actual, frame in sequence if actual == entry] for entry in entries}
+    problems = []
+    if len(acknowledgements) != 1 or acknowledgements[0].groups() != (mask, str(frames)):
+        problems.append('the expected watch acknowledgement did not arrive exactly once')
+    if len(completions) != 1 or completions[0][1] != mask:
+        problems.append('the expected watch completion did not arrive exactly once')
+    if len(sequence) != len(entries) * frames:
+        problems.append(f'expected {len(entries) * frames} samples, observed {len(sequence)}')
+    for entry, values in by_entry.items():
+        if len(values) != frames or (values and values != list(range(values[0], values[0] + frames))):
+            problems.append(f'entry {entry} did not have {frames} consecutive bridge frames')
+    if len({tuple(values) for values in by_entry.values()}) != 1:
+        problems.append('the watched entries did not share the same bridge frames')
+    return problems
+
+
+def samples(window_lines, entry):
+    found = []
+    for line in window_lines:
+        match = FIGHTER_ENTRY.search(line)
+        if match and int(match[1]) == entry:
+            fields = dict(WORDS.findall(line.strip()))
+            if 'frame' in fields:
+                found.append((int(fields['frame']), fields))
+    return found
+
+
+def standing(readings):
+    if not readings:
+        return False, 'no fighter samples'
+    start, initial = readings[0]
+    x, y = initial.get('x'), initial.get('y')
+    if x is None or y is None:
+        return False, f'frame {start}: x={x} y={y}'
+    for frame, fields in readings:
+        if (fields.get('status'), fields.get('situation'), fields.get('x'), fields.get('y')) != ('0', '0', x, y):
+            return False, (f'frame {frame}: status={fields.get("status")} situation={fields.get("situation")} '
+                           f'x={fields.get("x")} y={fields.get("y")}')
+    return True, ''
+
+
+def fresh_watch(ctx, entries, frames, name='fixture-watch'):
+    if (not entries or len(set(entries)) != len(entries) or
+            any(type(entry) is not int or entry < 0 for entry in entries) or type(frames) is not int or frames < 1):
+        raise ValueError('entries must be distinct non-negative integers and frames must be positive')
+    baseline = routes.native_state(ctx, fresh=('roster',), roster_entries=(entries[0],))
+    min_frame = baseline.get('frame')
+    if type(min_frame) is not int or entries[0] not in baseline.get('roster', {}):
+        raise RuntimeError(f'SETUP: fresh_watch: no fresh baseline for entry {entries[0]}: {baseline!r}')
+    cursor = routes.LogCursor(routes.instance_path(ctx, 'bridge_log'))
+    lines, window, complete = [], [], False
+    try:
+        routes.bridge_v2(ctx, f'fighters watch {",".join(map(str, entries))} {frames}')
+        deadline = time.monotonic() + max(12, frames / 15)
+        while time.monotonic() < deadline:
+            ctx.check_stop()
+            lines.extend(cursor.read())
+            window, complete = watch_window(lines, entries, frames, min_frame)
+            if complete:
+                break
+            time.sleep(.05)
+    finally:
+        cursor.close()
+    problems = check_watch(window, entries, frames)
+    if not complete:
+        problems.append('watch incomplete')
+    data = ('\n'.join(window) + ('\n' if window else '')).encode()
+    number = 1
+    while True:
+        suffix = '' if number == 1 else f'-{number}'
+        raw = Path(ctx.row_dir) / f'{name}{suffix}.log'
+        try:
+            with raw.open('xb') as stream:
+                stream.write(data)
+            break
+        except FileExistsError:
+            number += 1
+    readings = samples(window, entries[0])
+    receipt = {'entries': list(entries), 'frames': frames, 'first_frame': readings[0][0] if readings else None,
+               'last_frame': readings[-1][0] if readings else None, 'min_frame': min_frame,
+               'raw_file': raw.name, 'sha256': hashlib.sha256(data).hexdigest(), 'problems': problems}
+    routes._save_block(ctx, name, receipt)
+    if problems:
+        raise RuntimeError(f'SETUP: fresh_watch: {problems}')
+    return {**receipt, 'lines': window}
+
+
+def cpu_standing(ctx, entry=1, frames=120):
+    watch = fresh_watch(ctx, [entry], frames, 'fixture-cpu-standing-watch')
+    readings = samples(watch['lines'], entry)
+    okay, reason = standing(readings)
+    if not okay:
+        raise RuntimeError(f'SETUP: cpu_standing: entry {entry} {reason}')
+    return routes._save(ctx, 'fixture-cpu-standing', {
+        'entry': entry, 'frames': frames, 'first_frame': readings[0][0], 'last_frame': readings[-1][0],
+        'x': readings[0][1]['x'], 'y': readings[0][1]['y']})
+
+
+def partner_effective(ctx, eb, ab=None, entry=4, frames=120, kind=None):
+    watch = fresh_watch(ctx, [entry], frames, 'fixture-partner-effective-watch')
+    readings = samples(watch['lines'], entry)
+    expected_ab = str(eb if ab is None else ab)
+    for frame, fields in readings:
+        if (fields.get('eb') != str(eb) or fields.get('ab') != expected_ab or
+                (kind is not None and fields.get('kind') != str(kind))):
+            raise RuntimeError(f'SETUP: partner_effective: entry {entry} frame {frame}: '
+                               f'eb={fields.get("eb")} ab={fields.get("ab")} kind={fields.get("kind")}, '
+                               f'expected eb={eb} ab={expected_ab} kind={kind if kind is not None else "any"}')
+    return routes._save(ctx, 'fixture-partner-effective', {
+        'entry': entry, 'frames': frames, 'first_frame': readings[0][0], 'last_frame': readings[-1][0],
+        'eb': str(eb), 'ab': expected_ab, 'kind': kind,
+        'cpu': sorted({fields['cpu'] for _, fields in readings if 'cpu' in fields})})
 
 
 def _read(ctx, provider, predicate, baseline=None, ack=False, boot=None):
@@ -319,34 +466,6 @@ def window_from_wait(samples, entry, frames):
             if len(window) == frames:
                 return window
     raise RuntimeError(f'grounded Wait window has {len(window)} of {frames} frames')
-
-
-def watch_window(lines, entries, frames, min_frame):
-    return [], False
-
-
-def check_watch(window_lines, entries, frames):
-    return []
-
-
-def samples(window_lines, entry):
-    return []
-
-
-def standing(readings):
-    return False, "not implemented"
-
-
-def fresh_watch(ctx, entries, frames, name="fixture-watch"):
-    return {}
-
-
-def cpu_standing(ctx, entry=1, frames=120):
-    return {}
-
-
-def partner_effective(ctx, eb, ab=None, entry=4, frames=120, kind=None):
-    return {}
 
 
 def main(argv=None):

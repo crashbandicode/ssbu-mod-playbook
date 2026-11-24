@@ -1380,8 +1380,9 @@ class Runner:
             return receipt['status']
         required = bool(self.plan.get('require_effect')) or (is_test and 'target' in self.plan)
         if is_test and required and self.empty_effect_hooks:
+            spec, reason = self.empty_effect_hooks[0]
             receipt.update(status='RAN-UNVERIFIED', review=True,
-                           status_reason=f'effect hook {self.empty_effect_hooks[0]} returned no evidence')
+                           status_reason=f'effect hook {spec} returned {reason}')
             return receipt['status']
         status, reason = judge_queue.gates_only_status(self.effects_passed, required)
         receipt['status'] = status
@@ -2383,13 +2384,16 @@ class Runner:
         if marker:
             self.unverified_hooks.append((step['run'], marker))
         if step.get('effect'):
-            evidence = (isinstance(value, dict) and bool(value) and not marker
-                        or isinstance(value, str) and bool(value)
-                        or isinstance(value, (int, float)) and not isinstance(value, bool))
-            if evidence:
+            if judge_queue.effect_evidence(value):
                 self.effects_passed.append(f'run:{step["run"]}')
             else:
-                self.empty_effect_hooks.append(step['run'])
+                reason = 'no evidence'
+                if isinstance(value, dict):
+                    if 'verdict' in value and str(value['verdict']).upper() != 'PASS':
+                        reason = f'verdict {value["verdict"]}'
+                    elif 'pass' in value and value['pass'] is not True:
+                        reason = f'pass={value["pass"]}'
+                self.empty_effect_hooks.append((step['run'], reason))
         if not isinstance(value, (str, int, float, bool, list, dict, type(None))):
             value = repr(value)
         try:

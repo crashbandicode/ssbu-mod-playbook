@@ -494,15 +494,167 @@ def _effects(plan, errors):
         errors.append(message)
 
 
-CASE_LOADER = ""
+CASE_LOADER = r'''
+import importlib.util, json, pathlib, sys
+judge_path = pathlib.Path(sys.argv[2])
+sys.path.insert(0, str(judge_path.parent))
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location(judge_path.stem, judge_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+judge = getattr(module, sys.argv[3])
+from judge_queue import effect_evidence
+result = {}
+directory = pathlib.Path(sys.argv[4])
+for path in sorted(directory.rglob("*.json"), key=lambda p: p.relative_to(directory).as_posix()):
+    case = json.loads(path.read_text())
+    args = dict(case.get("args", {}))
+    for key, name in case.get("files", {}).items():
+        args[key] = (path.parent / name).read_text().splitlines()
+    try:
+        value = judge(**args)
+        outcome = "accept" if effect_evidence(value) else "reject"
+        text = repr(value)
+    except Exception as error:
+        outcome, text = "reject", str(error)
+    result[path.relative_to(directory).as_posix()] = {"outcome": outcome, "text": text[:300]}
+print(json.dumps(result))
+'''
+
+
+def _cases(plan, base, errors, warnings):
+    from runner import row_role
+
+    root = base.resolve()
+    result, cache = {}, {}
+    for row in plan.get('rows', []):
+        row_id = row.get('id', '?')
+        is_test = (('role' in row or ('start' in row and 'end' in row)) and row_role(row) == 'test')
+        for step in _steps(row.get('steps')):
+            spec = step.get('run')
+            if not isinstance(spec, str) or not step.get('effect') or spec.startswith('fixtures:'):
+                continue
+            if 'cases' not in step:
+                if is_test:
+                    message = f'G9 row {row_id}: effect hook {spec} has no judge cases; its evidence is trusted'
+                    if plan.get('require_cases'):
+                        errors.append(message + ' (require_cases)')
+                    else:
+                        warnings.append(message)
+                continue
+            cases = step['cases']
+            if not isinstance(cases, dict) or not isinstance(cases.get('judge'), str) or not isinstance(cases.get('dir'), str):
+                errors.append(f'G9 row {row_id}: cases: needs judge and dir')
+                continue
+            judge_spec, directory = cases['judge'], (base / cases['dir']).resolve()
+            judge_file, separator, function = judge_spec.partition(':')
+            path = (base / judge_file).resolve()
+            if (not separator or not judge_file or not function or not path.is_relative_to(root)):
+                errors.append(f'G9 row {row_id}: cases: invalid judge {judge_spec!r}')
+                continue
+            if not directory.is_relative_to(root) or not directory.is_dir():
+                errors.append(f'G9 row {row_id}: cases: directory {cases["dir"]!r} is not a folder inside the rows folder')
+                continue
+            files = sorted(directory.rglob('*.json'), key=lambda p: p.relative_to(directory).as_posix())
+            parsed, malformed = {}, False
+            for case_path in files:
+                case_name = case_path.relative_to(directory).as_posix()
+                try:
+                    if not case_path.resolve().is_relative_to(root):
+                        raise ValueError(f'{case_name}: case leaves the rows folder')
+                    case = json.loads(case_path.read_text())
+                    if not isinstance(case, dict) or case.get('expect') not in ('accept', 'reject'):
+                        raise ValueError(f'{case_name}: expect must be accept or reject')
+                    args, inputs = case.get('args', {}), case.get('files', {})
+                    if not isinstance(args, dict) or not isinstance(inputs, dict):
+                        raise ValueError(f'{case_name}: args and files must be objects')
+                    if 'contains' in case and not isinstance(case['contains'], str):
+                        raise ValueError(f'{case_name}: contains must be a string')
+                    for key, name in inputs.items():
+                        if not isinstance(key, str) or not isinstance(name, str) or key in args:
+                            raise ValueError(f'{case_name}: invalid file argument {key!r}')
+                        source = (case_path.parent / name).resolve()
+                        if not source.is_relative_to(root) or not source.is_file():
+                            raise ValueError(f'{case_name}: file {name!r} leaves the rows folder or is missing')
+                    parsed[case_name] = case
+                except (OSError, ValueError, TypeError) as error:
+                    errors.append(f'G9 row {row_id}: cases: {error}')
+                    malformed = True
+            if malformed:
+                continue
+            accepts = sum(case['expect'] == 'accept' for case in parsed.values())
+            rejects = sum(case['expect'] == 'reject' for case in parsed.values())
+            if not accepts or not rejects:
+                errors.append(f'G9 row {row_id}: cases need at least one accept and one reject '
+                              f'(found {accepts} accept, {rejects} reject)')
+            hook_file = (base / spec.partition(':')[0]).resolve()
+            if hook_file != path:
+                try:
+                    tree = ast.parse(hook_file.read_text())
+                    imported = any(
+                        (isinstance(node, ast.Import) and any(alias.name == path.stem for alias in node.names))
+                        or (isinstance(node, ast.ImportFrom) and node.module == path.stem)
+                        for node in ast.walk(tree))
+                except (OSError, SyntaxError, UnicodeError):
+                    imported = False
+                if not imported:
+                    errors.append(f'G9 row {row_id}: {spec.partition(":")[0]} does not import {judge_file}')
+            key = (str(path), function, str(directory))
+            if key not in cache:
+                runner_dir = Path(__file__).resolve().parent
+                try:
+                    proc = subprocess.run([sys.executable, '-I', '-B', '-c', CASE_LOADER, str(runner_dir),
+                                           str(path), function, str(directory)],
+                                          timeout=120, capture_output=True, text=True, errors='replace')
+                    lines = [line for line in proc.stderr.splitlines() if line.strip()]
+                    if proc.returncode:
+                        raise RuntimeError(lines[-1][:200] if lines else f'exit {proc.returncode}')
+                    try:
+                        output = json.loads(proc.stdout)
+                        if not isinstance(output, dict) or set(output) != set(parsed) or any(
+                                not isinstance(value, dict) or value.get('outcome') not in ('accept', 'reject')
+                                or not isinstance(value.get('text'), str) for value in output.values()):
+                            raise ValueError('invalid case output')
+                    except (ValueError, TypeError):
+                        raise RuntimeError(lines[-1][:200] if lines else 'non-JSON or invalid case output') from None
+                    cache[key] = output, None
+                except subprocess.TimeoutExpired as error:
+                    stderr = error.stderr or ''
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode(errors='replace')
+                    lines = [line for line in stderr.splitlines() if line.strip()]
+                    cache[key] = None, lines[-1][:200] if lines else 'timed out after 120 seconds'
+                except (OSError, RuntimeError) as error:
+                    cache[key] = None, str(error)[:200]
+            output, failure = cache[key]
+            if failure is not None:
+                errors.append(f'G9 row {row_id}: {judge_spec} could not run its cases: {failure}')
+                continue
+            agreed = {'accept': 0, 'reject': 0}
+            for name, case in parsed.items():
+                actual = output[name]
+                text = actual['text'][:300]
+                if case['expect'] == 'reject' and actual['outcome'] == 'accept':
+                    errors.append(f'G9 row {row_id}: case {name}: expected reject, the judge accepted')
+                elif case['expect'] == 'accept' and actual['outcome'] == 'reject':
+                    errors.append(f'G9 row {row_id}: case {name}: expected accept, the judge refused: {text}')
+                elif case['expect'] == 'reject' and case.get('contains') not in (None, '') and case['contains'] not in text:
+                    errors.append(f'G9 row {row_id}: case {name}: refused, but not with "{case["contains"]}": {text}')
+                else:
+                    agreed[case['expect']] += 1
+            result.setdefault(row_id, {})[judge_spec] = agreed
+    return result
 
 
 def check(plan, base, raw):
     base = Path(base)
     report = {'errors': [], 'warnings': [], 'result': 'NO TARGET', 'packet_sha256': packet_digest(base),
               'gate_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-              'target': plan.get('target'), 'emitted': {}, 'rows': {}}
+              'target': plan.get('target'), 'emitted': {}, 'rows': {}, 'cases': {}}
     if 'target' not in plan:
+        report['cases'] = _cases(plan, base, report['errors'], report['warnings'])
+        if report['errors']:
+            report['result'] = 'BROKEN'
         return report
     errors = report['errors']
     repos, settings = _target(plan, base, errors)
@@ -514,5 +666,6 @@ def check(plan, base, raw):
     _paths(plan, base, raw, modules, errors)
     report['rows'] = _needs(plan, errors)
     _effects(plan, errors)
+    report['cases'] = _cases(plan, base, errors, report['warnings'])
     report['result'] = 'BROKEN' if errors else 'OK'
     return report

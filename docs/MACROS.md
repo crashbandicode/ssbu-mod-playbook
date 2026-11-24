@@ -414,6 +414,18 @@ the exact `path` and a `reason`. Packet-gate errors name their check:
 - **G5:** a test row has no checked effect, judged expectation, or visual outcome.
 - **G6:** a need has no matching earlier giver.
 - **G8:** `ctx.play` names no plan segment, or `routes.play` names no library macro.
+- **G9:** an effect hook's judge cases are malformed, disagree, or are not
+  connected to that hook.
+
+An effect hook can declare `"cases": {"judge": "judge.py:judge", "dir":
+"cases/name"}`. Each JSON case supplies `args`, `files` (argument names to
+relative line-file paths), `expect` (`accept` or `reject`), and optionally
+`contains` for a rejection. Cases are discovered recursively; the directory
+must hold only case JSON files, with data files in other formats or outside it.
+The judge returns evidence for accept; a reject
+raises or returns a non-evidence value. A test effect hook with no cases warns,
+or refuses when the plan sets `require_cases: true`. Setup rows, effect gates
+and shared `fixtures:` hooks are not asked for cases.
 
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
@@ -442,7 +454,9 @@ With a target or `require_effect`, a test row without a judge reaches PASS only
 with a checked effect. A gate can declare `effect: true`; a `run` step can
 declare `effect: true` and return evidence (a non-empty dict or string, or a
 number other than a boolean). A boolean, empty value or unverified hook result
-is not evidence. A hook's `unverified` text, `NEEDS VISUAL READ` grade or
+is not evidence. A dictionary with `verdict` is evidence only for PASS
+(case-insensitive); one with `pass` is evidence only when that value is true.
+A hook's `unverified` text, `NEEDS VISUAL READ` grade or
 pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
 A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
 resuming without naming it does not promote it. A setup row's PASS still means
@@ -468,6 +482,18 @@ waiting battle, and checks the last stage line after that mark. It gives
 partner's effective Behavior.
 By default it uses the mark in this row; `mark_row` names an earlier row under
 `out/`. Fixture gives apply to later rows.
+
+`fixtures:fresh_watch` captures a finite bridge fighter window after a fresh
+native roster baseline; `fixtures:cpu_standing` requires a still grounded Wait
+fighter and gives `cpu.standing`. `fixtures:partner_effective` checks every
+sample's `eb` and `ab`, records (but does not gate) the `cpu` flag, and gives
+`partner.effective=<eb>`. Stored Behavior 1 (Stop) has `eb=1 ab=1`, and stored
+Behavior 7 (Attack) has `eb=34 ab=34`; no other mapping is established.
+
+To install a saved take before load, pin a reviewed TrainingRooms library root
+through the run config's `files` using the existing setup `via: fixture`
+mechanism, and give `"take:<name>"` in that setup item's `gives`. No hook records
+a take yet.
 
 Before game load, the offline seed command writes a new settings file without
 changing its base:

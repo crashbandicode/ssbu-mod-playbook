@@ -25,6 +25,19 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def effect_evidence(value):
+    if isinstance(value, dict):
+        marker = value.get('unverified')
+        return (bool(value) and not (isinstance(marker, str) and marker)
+                and value.get('grade') != 'NEEDS VISUAL READ' and value.get('visual_verdict') != 'pending'
+                and ('verdict' not in value or str(value['verdict']).upper() == 'PASS')
+                and ('pass' not in value or value['pass'] is True))
+    return ((isinstance(value, str) and bool(value))
+            or (isinstance(value, (int, float)) and not isinstance(value, bool)))
+
+
 NO_EFFECT_DIFF = 3.0      # mean abs RGB diff (0-255, 320x180) below which two frames are "the same picture"
 JUDGE_TIMEOUT_S = 600
 FRAME_NAMES = ('start', 'mid', 'end')
