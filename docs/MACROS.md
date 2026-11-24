@@ -473,8 +473,8 @@ its steps did not raise.
 Record a visual read with
 `runner.py record-read rows.json --out out --rows <id> --reader <who> --verdict PASS|FAIL --text "<what the still shows>" --still <out/id/still>`.
 The still must be inside the row folder and match a runner capture from the same
-plan and instances file, including a capture copied from another row. The read
-stores the capture's name, hash, UTC time and scalar status snapshot. The runner
+plan and instances file; a copied capture also needs the same inputs identity.
+The read stores the capture's name, hash, UTC time and scalar status snapshot. The runner
 records every still taken inside a row, including image-gate polling stills, as a
 capture with one `status` call after each. It does not yet check still freshness
 against the game frame.

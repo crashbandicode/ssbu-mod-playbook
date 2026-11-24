@@ -3302,6 +3302,10 @@ def record_read(manifest, out, row_id, reader, verdict, text, still, capture=Non
                     or 'instances_sha256' not in receipt or 'instances_sha256' not in source
                     or source['instances_sha256'] != receipt['instances_sha256']):
                 continue
+            if (candidate.stem != row_id
+                    and ('inputs_identity' not in receipt or 'inputs_identity' not in source
+                         or source['inputs_identity'] != receipt['inputs_identity'])):
+                continue
             for item in source.get('captures') or []:
                 if (isinstance(item, dict) and all(key in item for key in ('name', 'file', 'sha256', 'utc', 'status'))
                         and isinstance(item['file'], str) and item['file'] and Path(item['file']).name == item['file']):
