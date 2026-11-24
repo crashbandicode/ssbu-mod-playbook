@@ -158,6 +158,8 @@ again without the old boot.
 An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`
 in the plan to change that threshold. Image gates cannot pass on a refused still. A genuinely static screen is
 refused too: use a state source instead. Without a bridge log or boot identity, stills are `unverified`.
+Marks require usable stills, and change gates check both pictures. If the freshness record cannot be written, the
+still remains as a diagnostic but cannot pass a gate; the row lists it under `still_errors`.
 This check follows seven identical stills over 24 seconds in `rc15-a1-trace-2ddba1f-xps-2` (2026-11-24).
 
 ### The CPU's coin: not proven

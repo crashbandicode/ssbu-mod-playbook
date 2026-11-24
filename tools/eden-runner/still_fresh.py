@@ -120,3 +120,18 @@ class Ledger:
 
 def refused(record):
     return isinstance(record, dict) and record.get('status') == 'refused'
+
+
+def usable(record):
+    return isinstance(record, dict) and record.get('status') in ('fresh', 'same', 'unverified')
+
+
+def unusable_reason(record):
+    if not isinstance(record, dict) or 'status' not in record:
+        return 'no freshness record'
+    return record.get('reason') or f'invalid freshness status: {record["status"]!r}'
+
+
+def evidence_issue(record):
+    prefix = 'still refused as evidence' if refused(record) else 'still not usable as evidence'
+    return f'{prefix}: {unusable_reason(record)}'

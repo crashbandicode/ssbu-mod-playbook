@@ -1463,6 +1463,7 @@ class Runner:
     def shot(self, on, name):
         # "screenshot_target" in instances.json overrides the window lookup: the Ally needs "screen" (a per-window
         # grab is black under Vulkan there). Image gates are per host resolution; log gates are portable.
+        self.__dict__.setdefault('row_still_errors', [])
         target = self.instances[on].get('screenshot_target')
         if not target:
             tree = self.call(on, 'ui.tree', {'brief': True, 'visible_only': True}) or []
@@ -1480,7 +1481,13 @@ class Runner:
                 self.row_stills_refused.append(item)
                 self.log({'still_refused': item})
         except Exception as error:  # noqa: BLE001 - freshness must not break a screenshot
-            self.log({'still_freshness_error': repr(error)[:200]})
+            reason = f'freshness check failed: {error!r}'[:200]
+            self.still_records[str(path)] = {
+                'file': path.name, 'path': str(path), 'on': on, 'status': 'error', 'reason': reason,
+            }
+            item = {'file': path.name, 'reason': reason}
+            self.row_still_errors.append(item)
+            self.log({'still_error': item})
         if self._arm_frames:
             try:
                 data = path.read_bytes()
@@ -1883,13 +1890,18 @@ class Runner:
             before = self.marks.get((on, gate['mark']))
             if before is None:
                 raise RuntimeError(f'gate {name}: no mark {gate["mark"]!r} taken on {on} earlier in this row')
+            baseline = self.still_records.get(str(before))
+            if not still_fresh.usable(baseline):
+                raise RuntimeError(f'gate {name}: baseline mark {gate["mark"]} is not valid evidence: '
+                                   f'{still_fresh.unusable_reason(baseline)}')
             previous = None
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
                 still = self.still_records.get(str(path))
-                if still_fresh.refused(still):
-                    last_refused = still['reason']
-                    path.unlink(missing_ok=True)
+                if not still_fresh.usable(still):
+                    last_refused = still_fresh.evidence_issue(still)
+                    if still_fresh.refused(still):
+                        path.unlink(missing_ok=True)
                     time.sleep(gate.get('interval', .5))
                     continue
                 last_refused = None
@@ -1953,9 +1965,10 @@ class Runner:
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
                 still = self.still_records.get(str(path))
-                if still_fresh.refused(still):
-                    last_refused = still['reason']
-                    path.unlink(missing_ok=True)
+                if not still_fresh.usable(still):
+                    last_refused = still_fresh.evidence_issue(still)
+                    if still_fresh.refused(still):
+                        path.unlink(missing_ok=True)
                     time.sleep(gate.get('interval', 1))
                     continue
                 last_refused = None
@@ -1991,7 +2004,7 @@ class Runner:
                 path.unlink(missing_ok=True)  # keep only the passing shot and the final failing one
                 time.sleep(gate.get('interval', 1))
             self.shot(on, 'GATE-FAILED-' + name)
-            detail = f'; still refused as evidence: {last_refused}' if last_refused else ''
+            detail = f'; {last_refused}' if last_refused else ''
             raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{detail}')
         # Non-image gates save what the game showed when they gave up, so a
         # failure can be told apart afterwards: wrong gate, or a real error dialog (pkg4's guest join, 2026-11-03).
@@ -1999,7 +2012,7 @@ class Runner:
         missing_trace = f'; trace file not found: {source}' if kind == 'text' and not source.is_file() else ''
         unreadable = (f'; newest sample unreadable (sequence {record["sequence"]}: {record["why"]})'
                       if kind == 'text' and record and not record['known'] else '')
-        detail = f'; still refused as evidence: {last_refused}' if last_refused else ''
+        detail = f'; {last_refused}' if last_refused else ''
         raise RuntimeError(f'gate {name} on {on} did not pass within {gate["cap"]} s{missing_trace}{unreadable}{detail}')
 
     def failure_evidence(self, on, name):
@@ -2026,9 +2039,10 @@ class Runner:
         while time.monotonic() < until:
             path = self.shot(on, 'acquire-' + name)
             still = self.still_records.get(str(path))
-            if still_fresh.refused(still):
-                last_refused = still['reason']
-                path.unlink(missing_ok=True)
+            if not still_fresh.usable(still):
+                last_refused = still_fresh.evidence_issue(still)
+                if still_fresh.refused(still):
+                    path.unlink(missing_ok=True)
                 time.sleep(gate.get('interval', .5))
                 continue
             last_refused = None
@@ -2046,7 +2060,7 @@ class Runner:
                 previous.unlink(missing_ok=True)
             previous = path
             time.sleep(gate.get('interval', .5))
-        detail = f'; still refused as evidence: {last_refused}' if last_refused else ''
+        detail = f'; {last_refused}' if last_refused else ''
         raise RuntimeError(f'gate {name} on {on}: screen never settled within {gate["cap"]} s to acquire a reference'
                            f'{detail}')
 
@@ -2324,7 +2338,12 @@ class Runner:
             return {'bridge_error': repr(error)[:160]}
 
     def _step_mark(self, on, step):
-        self.marks[(on, step['mark'])] = self.shot(on, 'mark-' + step['mark'])
+        self.marks.pop((on, step['mark']), None)
+        path = self.shot(on, 'mark-' + step['mark'])
+        record = self.still_records.get(str(path))
+        if not still_fresh.usable(record):
+            raise RuntimeError(f'mark {step["mark"]} on {on}: {still_fresh.evidence_issue(record)}')
+        self.marks[(on, step['mark'])] = path
         return {'mark': step['mark'], 'on': on}
 
     def _step_copy(self, on, step):
@@ -2951,7 +2970,7 @@ class Runner:
             self.row_dir.mkdir(exist_ok=True)
             self.row_offsets = self.log_offsets()
             self.marks, self.copies, self.acquired = {}, {}, []
-            self.row_stills_refused = []
+            self.row_stills_refused, self.row_still_errors = [], []
             self.scales_used, self.gate_saw_evidence = [], []
             self.last_image_scale = None
             self.last_hook_evidence = None
@@ -3078,6 +3097,8 @@ class Runner:
                     receipt['acquired_references'] = self.acquired
                 if self.row_stills_refused:
                     receipt['stills_refused'] = list(self.row_stills_refused)
+                if self.row_still_errors:
+                    receipt['still_errors'] = list(self.row_still_errors)
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
                 for key in self.clients:
@@ -3088,6 +3109,7 @@ class Runner:
                 print(json.dumps({'row': row['id'], 'status': receipt['status'],
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
                                   **({'stills_refused': len(self.row_stills_refused)} if self.row_stills_refused else {}),
+                                  **({'still_errors': len(self.row_still_errors)} if self.row_still_errors else {}),
                                   'receipt': str(receipt_path)}), flush=True)
                 if not (self.session_config() or {}).get('per_row_files') or self.session is None:
                     self.queue_judge(row['id'])  # no per-row clip file: judge the shots now
