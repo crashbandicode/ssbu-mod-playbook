@@ -162,6 +162,23 @@ class ClosedLoopTests(unittest.TestCase):
             if event[0] == 'send':
                 self.assertEqual(fake.events[index - 1], ('read', 'source'))
 
+    def test_a_different_overlapping_step_after_send_jumps_back(self):
+        fake = Script(lambda f: 'shared' if len(f.sends) < 2 else 'done')
+        result = fake.run([step('first', 'shared', 'middle'), step('second', 'shared', 'done')])
+        self.assertEqual(result['entered_at'], 'second')
+        self.assertEqual([macro for macro, _ in fake.sends], ['second', 'first'])
+        self.assertEqual(fake.finishes, 2)
+
+    def test_a_destination_reached_while_waiting_is_skipped(self):
+        def observe(f):
+            if not f.sends:
+                return 'first'
+            return 'arrived' if f.now < 2 else 'done'
+        fake = Script(observe)
+        result = fake.run([step('first', 'first', 'arrived'), step('second', 'second', 'done')])
+        self.assertEqual([macro for macro, _ in fake.sends], ['first'])
+        self.assertTrue(result['steps'][1]['skipped'])
+
     def test_a_jump_back_during_ready_wait_is_observed_before_retry(self):
         def observe(f):
             if not f.sends:

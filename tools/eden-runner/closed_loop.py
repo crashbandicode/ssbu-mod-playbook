@@ -38,9 +38,9 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         data.update(step=name, reason=reason)
         raise RouteStopped(route, name, reason, data)
 
-    def matching(obs):
+    def matching(obs, excluding=None):
         return next((i for i in range(len(steps) - 1, -1, -1)
-                     if steps[i].at(obs)), None)
+                     if i != excluding and steps[i].at(obs)), None)
 
     def wait(deadline):
         sleep(min(poll, max(0.0, deadline - clock())))
@@ -89,13 +89,13 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
             if done(steps[-1], obs):
                 record['ms'] += round((clock() - started) * 1000)
                 return receipt()
-            other = matching(obs)
-            if other is not None and other != index:
+            at = step.at(obs)
+            other = matching(obs, index)
+            if not at and other is not None:
                 record['ms'] += round((clock() - started) * 1000)
                 index = other
                 break
-            record['skipped'] = False
-            if step.at(obs):
+            if at:
                 if record['sends'] >= step.sends:
                     record['ms'] += round((clock() - started) * 1000)
                     stop(step.name, f'no transition after {record["sends"]} sends')
@@ -104,6 +104,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 macro = step.macro(obs) if callable(step.macro) else step.macro
                 send(macro)
                 record['sends'] += 1
+                record['skipped'] = False
                 deadline = clock() + step.cap
                 lost_since = None
                 while True:
@@ -119,8 +120,8 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         finish()
                         record['ms'] += round((clock() - started) * 1000)
                         return receipt()
-                    other = matching(obs)
-                    if other is not None and other != index:
+                    other = matching(obs, index)
+                    if other is not None:
                         finish()
                         record['ms'] += round((clock() - started) * 1000)
                         index = other
@@ -147,6 +148,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 continue
             if clock() >= ready_deadline:
                 record['ms'] += round((clock() - started) * 1000)
+                record['skipped'] = False
                 stop(step.name, f'not ready: last read {obs!r}')
             obs = wait(ready_deadline)
     return receipt()
