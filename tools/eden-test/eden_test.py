@@ -733,6 +733,20 @@ def check_run(run, skip_setup_plan=False, allow_volatile_pins=False):
             problems.append(f'volatile pins: {paths}; shared inputs belong in {run.parent}/_<name>/ '
                             'because the host janitor keeps only those '
                             '(configs that pin inputs-* folders: move them to _<name>/ or pass --allow-volatile-pins)')
+    target = (spec.get('target') or {}).get('plugin') or {}
+    sha256, commit = target.get('nro_sha256'), target.get('commit', '')
+    if sha256:
+        matches = [pin for instance in config.get('instances', []) for pin in instance.get('plugins', [])
+                   if pin.get('sha256') == sha256]
+        if not matches:
+            problems.append(f'target NRO {sha256[:12]}… is not staged in this run')
+        for pin in matches:
+            path = Path(pin['path'])
+            try:
+                if commit[:8].encode('ascii') not in path.read_bytes():
+                    problems.append(f'target NRO {path.name} does not carry commit {commit[:8]}')
+            except (OSError, UnicodeError) as error:
+                problems.append(f'target NRO {path.name} cannot be read: {error}')
     return problems
 
 

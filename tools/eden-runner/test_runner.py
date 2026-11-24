@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1143,6 +1144,17 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report['errors'], [])
         self.assertEqual(report['packet_gate']['result'], 'NO TARGET')
 
+    def test_dry_run_writes_the_packet_receipt_and_run_requires_a_target(self):
+        out = self.dir / 'out'
+        self.assertEqual(runner.main(['dry-run', str(self.manifest), '--out', str(out)]), 0)
+        receipt = json.loads((out / 'packet-gate.json').read_text())
+        self.assertEqual(receipt['result'], 'NO TARGET')
+        self.assertEqual(receipt['packet_sha256'], runner.packet_gate.packet_digest(self.dir))
+        self.assertEqual(receipt['manifest_sha256'], sha(self.manifest))
+        self.assertEqual(receipt['runner_sha256'], sha(Path(runner.__file__)))
+        self.assertEqual(runner.main(['run', str(self.manifest), '--out', str(out)]), 1)
+        self.assertEqual(json.loads((out / 'dry-run.json').read_text())['result'], 'BROKEN')
+
     def test_state_gate_poll_s_validation(self):
         state = {'kind': 'state', 'provider': 'tr.menu', 'where': {'phase': 'flight'}, 'cap': 1}
         self.plan['gates']['timed'] = state
@@ -1842,6 +1854,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_a_dependent_row_is_not_played_after_its_source_failed(self):
         self._continue_plan()
+        self._third_row_recovers_to_red()
         self.plan['rows'][0]['gives'] = ['drill:a']
         self.plan['rows'][1]['needs'] = ['drill:a']
         self.plan['rows'][1]['steps'] = [{'call': 'settings.get'}]
@@ -1850,7 +1863,7 @@ class RunnerTests(unittest.TestCase):
         out.mkdir()
         (out / 'packet-gate.json').write_text(json.dumps(
             {'rows': {'r2': {'needs': ['drill:a'], 'provided_by': {'drill:a': 'r1'}}}}))
-        eden = FakeEden({'to-red': RED}, log_path=self.log)
+        eden = FakeEden({'to-red': RED, 'to-fix': RED}, log_path=self.log)
         self.assertEqual(self.make(eden).run(), 'FAILED')
         receipt = json.loads((out / 'r2.json').read_text())
         self.assertEqual(receipt['status'], 'FAILED')
@@ -1869,6 +1882,25 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.make(eden).run(), 'DONE')
         self.assertEqual(json.loads((out / 'r2.json').read_text())['status'], 'PASS')
         self.assertIn('settings.get', eden.calls)
+        for gates_status, should_run in (('PASS', True), (None, False), ('FAIL', False)):
+            with self.subTest(gates_status=gates_status):
+                shutil.rmtree(out)
+                out.mkdir()
+                (out / 'packet-gate.json').write_text(json.dumps(
+                    {'rows': {'r2': {'needs': ['drill:a'], 'provided_by': {'drill:a': 'r1'}}}}))
+                source = {'status': 'RAN-UNVERIFIED'}
+                if gates_status is not None:
+                    source['gates_status'] = gates_status
+                (out / 'r1.json').write_text(json.dumps(source))
+                eden = FakeEden({'to-fix': RED}, log_path=self.log)
+                self.assertEqual(self.make(eden).run(only={'r2'}), 'DONE' if should_run else 'FAILED')
+                receipt = json.loads((out / 'r2.json').read_text())
+                self.assertEqual(receipt['status'], 'PASS' if should_run else 'FAILED')
+                self.assertEqual('settings.get' in eden.calls, should_run)
+                if not should_run:
+                    self.assertTrue(receipt['not_executed'])
+                    self.assertEqual(receipt['error'],
+                                     'NOT RUN (setup): needs "drill:a" from row r1, which did not pass')
 
     def _third_row_recovers_to_red(self):
         original = self.dir / 'segments/to-red.edenmacro.json'
@@ -1995,6 +2027,17 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.make(eden).run()
         (self.dir / 'out' / 'STOP-INPUT').unlink()
+        tree = Path(tempfile.mkdtemp(prefix='eden-target-'))
+        self.addCleanup(shutil.rmtree, tree)
+        subprocess.run(['git', '-C', str(tree), 'init', '-q'], check=True)
+        (tree / 'source').write_text('target')
+        subprocess.run(['git', '-C', str(tree), 'add', 'source'], check=True)
+        subprocess.run(['git', '-C', str(tree), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '-qm', 'fixture'], check=True)
+        commit = subprocess.run(['git', '-C', str(tree), 'rev-parse', 'HEAD'], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        self.plan['target'] = {'plugin': {'tree': str(tree), 'commit': commit, 'nro_sha256': 'a' * 64}}
+        self.manifest.write_text(json.dumps(self.plan))
         instances = self.dir / 'instances.json'
         instances.write_text(json.dumps(self.instances))
         fixed = FakeEden({'to-red': RED, 'to-blue': BLUE}, log_path=self.log)

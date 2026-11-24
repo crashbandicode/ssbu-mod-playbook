@@ -1455,7 +1455,8 @@ class Lifecycle:
         spec = importlib.util.spec_from_file_location('_lifecycle_shared_runner', runner['path'])
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.dry_run(Path(self.c['rows']['path']))
+        check = module.up_check if hasattr(module, 'up_check') else module.dry_run
+        return check(Path(self.c['rows']['path']))
 
     def record(self, kind, value):
         with (self.directory / 'actions.jsonl').open('a', encoding='utf-8') as stream:

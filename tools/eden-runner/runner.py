@@ -144,6 +144,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import packet_gate  # noqa: E402
 import trace_text  # noqa: E402
 import subprocess  # noqa: E402
 
@@ -1049,13 +1050,23 @@ def dry_run(manifest_path):
             if recover_steps_of(plan, nxt) is None:
                 errors.append(f'row {row["id"]}: on_failure continue needs a recover list on {nxt["id"]} or the plan')
         state = row['end']
+    packet = packet_gate.check(plan, base, raw)
+    errors.extend(packet['errors'])
     effects = effect_report(plan, base, errors)
     report = {'manifest': str(manifest_path), 'manifest_sha256': digest(manifest_path), 'rows': len(plan['rows']),
               'available_segments': available, 'missing_segments': missing, 'references_to_acquire': to_acquire,
               'gates': len(plan.get('gates', {})), 'errors': errors, 'review': review_class(plan, base, raw),
-              'roles_defaulted': roles_defaulted,
+              'roles_defaulted': roles_defaulted, 'packet_gate': packet,
               'result': 'BROKEN' if errors else ('READY_TO_RECORD' if missing or to_acquire else 'READY')}
     report.update(effects)
+    return report
+
+
+def up_check(manifest_path):
+    report = dry_run(manifest_path)
+    if 'target' not in json.loads(manifest_path.read_text()):
+        report['errors'].append('packet gate: rows.json has no "target" (the build the rows were checked against)')
+        report['result'] = 'BROKEN'
     return report
 
 
@@ -2873,6 +2884,8 @@ class Runner:
         pending_recovery = None
         rows = self.plan['rows']
         review = None
+        packet = self.out / 'packet-gate.json'
+        dependencies = json.loads(packet.read_text()).get('rows', {}) if packet.is_file() else {}
         for index, row in enumerate(rows):
             self.current_row = row
             receipt_path = self.out / f'{row["id"]}.json'
@@ -2930,6 +2943,17 @@ class Runner:
                                   'receipt': str(receipt_path)}), flush=True)
                 raise
             try:
+                for token, source in dependencies.get(row['id'], {}).get('provided_by', {}).items():
+                    if source == 'setup':
+                        continue
+                    source_path = self.out / f'{source}.json'
+                    source_receipt = json.loads(source_path.read_text()) if source_path.is_file() else {}
+                    if not (source_receipt.get('status') == 'PASS' or
+                            (source_receipt.get('status') == 'RAN-UNVERIFIED'
+                             and source_receipt.get('gates_status') == 'PASS')):
+                        if pending_recovery and pending_recovery[0] == row['id']:
+                            pending_recovery = None
+                        raise UnmetRecovery(f'NOT RUN (setup): needs "{token}" from row {source}, which did not pass')
                 if pending_recovery and pending_recovery[0] == row['id']:
                     recovered = pending_recovery[1]
                     pending_recovery = None
@@ -2969,8 +2993,10 @@ class Runner:
             except Exception as error:
                 prerequisite = isinstance(error, UnmetRecovery)
                 if prerequisite:
+                    reason = str(error.failure)
                     receipt.update(status='FAILED', not_executed=True,
-                                   error=f'not run: recovery to its start failed: {error.failure!r}')
+                                   error=reason if reason.startswith('NOT RUN (setup):') else
+                                   f'not run: recovery to its start failed: {error.failure!r}')
                 else:
                     receipt.update(status='FAILED', error=repr(error))
                 if isinstance(error, GifRefused):
@@ -3142,10 +3168,14 @@ def main(argv=None):
                                         args.segment, args.on, args.start_gate)))
         return 0
     manifest = args.manifest.resolve()
-    report = dry_run(manifest)
+    report = up_check(manifest) if args.mode in ('run', 'self-test', 'capture-fixture') else dry_run(manifest)
     out = (args.out or manifest.parent / 'out').resolve()
     out.mkdir(parents=True, exist_ok=True)
     (out / 'dry-run.json').write_text(json.dumps(report, indent=2) + '\n')
+    receipt = {**report.get('packet_gate', {}), 'manifest': str(manifest),
+               'manifest_sha256': report.get('manifest_sha256'), 'runner_sha256': digest(Path(__file__)),
+               'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    (out / 'packet-gate.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if args.mode == 'replay':
         if report['errors']:
             print(json.dumps(report, indent=2))

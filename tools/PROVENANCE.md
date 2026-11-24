@@ -185,3 +185,8 @@ Retired practice-mode and hitbox slots are handled from `practice_games.rs` and 
 
 2026-11-22: `library/routes/tr-setting-widths.json` records the product row widths from TrainingRooms
 `7d962416` `src/model/factory.rs` DEFS, cross-checked against its product-written settings fixture.
+
+2026-11-24: `tools/eden-runner/packet_gate.py` and its tests use throw-away Git repositories shaped like
+TrainingRooms `71158421` `src/model/bridge_state.rs` and `src/model/practice_state.rs`. The button table maps the
+plugin's logical order in `src/model/chords.rs` at `71158421` to `recipe_macro.BITS`. The optional witness test
+compares the extractor with a recorded `tr.menu` snapshot when supplied. Host tests only; no runtime acceptance.

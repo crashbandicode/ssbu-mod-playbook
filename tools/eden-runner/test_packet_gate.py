@@ -76,6 +76,16 @@ writeln!(out, "wizard.x={x}\nwizard.y={y}");
         self.plan.pop('allow_paths')
         self.assertEqual(self.errors(), [])
 
+    def test_state_focus_paths_are_not_missing_files(self):
+        (self.base / 'steps.py').write_text('def ok(ctx, focus):\n    return True\n')
+        self.plan['gates']['focus'] = {'kind': 'state', 'provider': 'tr.menu', 'where': {'focus': '/-/0/row'}}
+        self.plan['rows'][0]['steps'] = [
+            {'gate': 'focus'}, {'run': 'steps.py:ok', 'args': {'focus': '/0/1/row'}}]
+        self.assertEqual(self.errors(), [])
+        path = '/home/intpa/does-not-exist/x.json'
+        self.plan['rows'][0]['steps'][1]['args']['focus'] = path
+        self.assertEqual(self.errors(), [f'G4 rows.json: missing file {path}'])
+
     def test_a_recipe_that_presses_the_cpu_chord_for_player_play_is_refused(self):
         seg = {'file': 'play.json', 'binding': 'play_player', 'recipe': [{'buttons': 'zr+up'}]}
         self.plan['segments']['play-p1'] = seg
@@ -149,6 +159,39 @@ writeln!(out, "wizard.x={x}\nwizard.y={y}");
         self.assertEqual(len(errors), 1, errors)
         self.assertIn('G1 row r1:', errors[0])
         self.assertIn('view', errors[0])
+
+    def test_step_recovery_and_failure_hooks_bind_context_and_arguments(self):
+        (self.base / 'steps.py').write_text(
+            'def step(ctx, scene):\n    return scene\n'
+            'def failed(ctx, scene):\n    return scene\n')
+        row = self.plan['rows'][0]
+        row['steps'] = [{'gif': {'steps': [{'run': 'steps.py:step', 'args': {'scene': 'lobby'}}]}}]
+        row['recover'] = [{'run': 'steps.py:step', 'args': {'scene': 'lobby'}}]
+        row['on_failure_hook'] = {'run': 'steps.py:failed', 'args': {'scene': 'lobby'}}
+        self.assertEqual(self.errors(), [])
+        row['recover'][0]['args'] = {'scenes': 'lobby'}
+        row['on_failure_hook']['args'] = {'scenes': 'lobby'}
+        errors = self.errors()
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(all(error.startswith('G1 row r1:') for error in errors), errors)
+        self.assertTrue(any('steps.py:step' in error for error in errors), errors)
+        self.assertTrue(any('steps.py:failed' in error for error in errors), errors)
+        row['recover'][0]['args'] = {'scene': 'lobby'}
+        row['on_failure_hook']['args'] = {'scene': 'lobby'}
+        self.plan['recover'] = [{'run': 'steps.py:step', 'args': {'scenes': 'lobby'}}]
+        self.plan['on_failure_hook'] = {'run': 'steps.py:failed', 'args': {'scenes': 'lobby'}}
+        errors = self.errors()
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any('steps.py:step' in error for error in errors), errors)
+        self.assertTrue(any('steps.py:failed' in error for error in errors), errors)
+
+    def test_a_bridge_provider_needs_a_valid_bridge_target(self):
+        self.plan['target'].pop('bridge')
+        self.plan['target']['providers'] = {'ssbu.ui': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:screen']
+        self.assertIn('G2 row r1: provider ssbu.ui needs target.bridge', self.errors())
+        self.plan['target']['providers'] = []
+        self.assertIn('G2 target: providers must be an object', self.errors())
 
     def test_the_packet_digest_changes_with_any_file_and_ignores_out(self):
         initial = packet_gate.packet_digest(self.base)

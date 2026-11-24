@@ -384,6 +384,39 @@ The rules:
     hit during playback, and no difference between SDI on and off. The
     coordinator's frame review caught it.)
 
+#### Packet gate
+
+`rows.json` names the build it was checked against in `target`: `plugin.tree`,
+`plugin.commit`, and `plugin.nro_sha256`, with optional `bridge.tree` and
+`bridge.commit`, `settings`, and `providers`. The trees are absolute Git
+directories and the commits are full commit IDs. Provider source files are read
+from the named commit, never from the working tree; the settings fixture is
+read from the rows folder.
+
+The lifecycle's Up check and `runner.py run`, `self-test`, and
+`capture-fixture` refuse a plan without a target. `dry-run` and `replay` report
+`NO TARGET` instead. Each checked runner command writes `out/packet-gate.json`
+at the start. `eden_test.py check` also refuses a target NRO that is not staged
+or does not contain the plugin commit's first eight characters.
+
+Rows can declare `needs`, `gives`, and `reads` (`"<provider>:<key>"`); setup
+items can declare `gives`. A segment can name its persisted input `binding`.
+The plan can allow a path into another run with `allow_paths`, an entry with
+the exact `path` and a `reason`. Packet-gate errors name their check:
+
+- **G1:** a hook's call shape does not accept its declared arguments.
+- **G2:** a declared read is not written by the target.
+- **G3:** the recipe, compiled macro, and persisted binding differ.
+- **G4:** a path points into another run, or a local file is missing.
+- **G6:** a need has no matching earlier giver.
+
+A dependent row whose source row did not pass is not played. Its receipt says
+`NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
+Only declared reads are checked. The built-in providers are `tr.menu` and
+`tr.practice`; a dotted string literal in a provider's source file is
+accepted as a key. The packet gate has host tests; it has not been proven
+in a runtime acceptance.
+
 #### The shared runner: a helper, extended per project
 
 `tools/eden-runner/runner.py` runs the rows; `tools/eden-lifecycle` does
