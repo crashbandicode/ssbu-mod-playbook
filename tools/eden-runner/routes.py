@@ -37,9 +37,11 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -47,6 +49,7 @@ try:
 except ImportError:
     fcntl = None
 
+import closed_loop
 import native_picker
 import state_gate
 import trace_attempts
@@ -70,6 +73,74 @@ def _sha256(path):
 def _save(ctx, name, value):
     (Path(ctx.row_dir) / f'{name}.json').write_text(json.dumps(value, indent=1, default=str) + '\n')
     return value
+
+
+def _bridge_tail(ctx):
+    try:
+        with instance_path(ctx, 'bridge_log').open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            position, tail = stream.tell(), b''
+            while position:
+                size = min(position, 8192)
+                position -= size
+                stream.seek(position)
+                tail = stream.read(size) + tail
+                lines = tail.split(b'\n')
+                for line in reversed(lines if position == 0 else lines[1:]):
+                    if line.strip():
+                        return line.decode('utf-8', errors='replace').rstrip('\r')
+    except (AttributeError, KeyError, OSError):
+        return None
+    return None
+
+
+def _bounded_call(ctx, method, cap):
+    result = []
+
+    def call():
+        try:
+            result.append((True, ctx.call(method)))
+        except BaseException as error:
+            result.append((False, error))
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(cap)
+    return result[0] if not worker.is_alive() else (False, None)
+
+
+def _eden_macro_busy(ctx, remaining):
+    try:
+        answered, status = _bounded_call(ctx, 'macro.status', remaining)
+        if not answered:
+            if status is None:
+                return f'macro.status not answered within {remaining:g} s'
+            return f'macro.status not understood: {repr(status)[:160]}'
+        if isinstance(status, dict):
+            state, error = status.get('state'), status.get('error')
+            if error in (None, ''):
+                if state in ('idle', 'finished'):
+                    return None
+                if state in ('countdown', 'recording', 'playing', 'branch_playing'):
+                    return f'macro {state}'
+        return f'macro.status not understood: {repr(status)[:160]}'
+    except Exception as error:
+        return f'macro.status not understood: {repr(error)[:160]}'
+
+
+def _stall_result(ok, stalls):
+    result = 'PASS' if ok else 'STOPPED'
+    count = len(stalls)
+    return f'{result} with {count} {"stall" if count == 1 else "stalls"}' if count else result
+
+
+def _append_stall(ctx, block, event):
+    with (Path(ctx.row_dir) / 'stall-events.jsonl').open('a', encoding='utf-8') as stream:
+        stream.write(json.dumps({**event, 'block': block}, default=str) + '\n')
+
+
+def _stall_utc():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def routes_index():
@@ -681,8 +752,17 @@ def macro_file(name):
 def play(ctx, name):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
     path, sha, cap = macro_file(name)
-    ctx.call('macro.play', {'path': str(path)})
-    ctx.runner.wait_macro(ctx.on, cap)
+    try:
+        ctx.call('macro.play', {'path': str(path)})
+    except RuntimeError as error:
+        message = str(error).lower()
+        if 'input_busy' in message or 'macro.play busy' in message:
+            raise closed_loop.DispatchRejected(str(error)) from error
+        raise
+    try:
+        ctx.runner.wait_macro(ctx.on, cap)
+    except RuntimeError as error:
+        raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
     ctx.log({'route_macro': name, 'sha256': sha})
     return sha
 
@@ -1051,18 +1131,21 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                                'room_matched': True if room_name is not None else None})
 
 
-def _wireless_read(ctx, io, provider, cap, screens):
+def _wireless_read(ctx, io, provider, cap, screens, *, on_sample=None):
     ctx.check_stop()
     try:
         sample = io.read(provider, cap)
     except RuntimeError as error:
-        if any(word in str(error).lower() for word in ('continuity', 'boot changed', 'malformed', 'overlapping')):
+        if any(word in str(error).lower() for word in
+               ('continuity', 'boot changed', 'malformed', 'overlapping', 'rotated', 'truncated')):
             raise
         return {'error': str(error)}
     block = sample.block
     if (block.get('name') != provider or block.get('schema') != provider + '/1'
             or block.get('filtered') or block.get('rev', 0) <= 0):
         raise RuntimeError(f'{provider}: incomplete bridge state: {block}')
+    if on_sample:
+        on_sample(sample)
     values = dict(block['values'])
     if provider == 'ssbu.ui':
         screen = values.get('screen', 'unknown')
@@ -1071,187 +1154,351 @@ def _wireless_read(ctx, io, provider, cap, screens):
     return values
 
 
-def _wireless_wait(ctx, io, provider, cap, accept, screens):
-    until = time.monotonic() + cap
-    last = {}
-    while True:
-        remaining = max(0, until - time.monotonic())
-        last = _wireless_read(ctx, io, provider, min(2, max(.001, remaining)), screens)
-        if accept(last):
-            return True, last
-        remaining = until - time.monotonic()
-        if remaining <= 0:
-            return False, last
-        time.sleep(min(.3, remaining))
-
-
 def _wireless_placed(tile):
     return tile.get('screen') == 'css' and (tile.get('p1.token') == 'placed'
                                              or tile.get('local.token') == 'placed')
 
 
-def wireless_room(ctx, ready_cap=60):
-    """Create a Local Wireless room from the main menu and reach its waiting room as host (one member)."""
+def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0):
+    """Reach the Local Wireless waiting room as host from an observed route screen."""
+    if unpublished_create not in ('refuse', 'allow'):
+        raise RuntimeError(f'wireless_room: invalid unpublished_create {unpublished_create!r}')
     if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
         raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
+    if not isinstance(idle_cap, (int, float)) or not math.isfinite(idle_cap) or idle_cap <= 0:
+        raise RuntimeError(f'wireless_room: idle_cap must be positive, got {idle_cap!r}')
     started, screens = time.monotonic(), []
     io = BridgePickerIO(ctx)
+    state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
+             'last_error': None, 'last_read_was_error': False,
+             'form_pending': False, 'form_ready': False, 'form_settling': False, 'ready_published': False,
+             'form_away': 0, 'form_left_list': False, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
+             'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
+             'prefinished': False, 'current': None, 'ui_clock': {}}
 
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 20,
-                              lambda v: v.get('screen') == 'main_menu' and v.get('observation.active') == 'yes'
-                              and v.get('input.owner') == 'native', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected main_menu with input.owner native; saw {last}')
-    io.send('lobby-open-room-list')
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 25,
-                              lambda v: v.get('screen') == 'ldn.room_list'
-                              and v.get('observation.active') == 'yes', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected ldn.room_list; saw {last}')
-    io.finish()
-    io.send('tap-a1')
+    def remember_ui(sample):
+        state['ui_clock'] = {key: sample.block.get(key) for key in ('frame', 'wall', 'rev')}
+        state['ready_published'] |= 'input.ready' in sample.block['values']
 
-    away, until = 0, time.monotonic() + 15
-    while away < 3:
-        remaining = max(.001, until - time.monotonic())
-        last = _wireless_read(ctx, io, 'ssbu.ui', min(2, remaining), screens)
-        screen = last.get('screen')
-        away = away + 1 if screen is not None and screen != 'ldn.room_list' else 0
-        if away < 3:
-            remaining = until - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f'wireless_room: expected ssbu.ui to leave ldn.room_list; saw {last}')
-            time.sleep(min(.3, remaining))
-    io.finish()
-    time.sleep(1.5)
-    last = _wireless_read(ctx, io, 'ssbu.ui', 2, screens)
-    if last.get('screen') not in ('unknown', 'ldn.create'):
-        seen = f'read error: {last["error"]}' if 'error' in last else str(last)
-        raise RuntimeError(f'wireless_room: expected the Create form (ldn.create, or unpublished) after A; saw {seen}')
-    create_form = 'ldn.create' if last['screen'] == 'ldn.create' else 'unpublished'
+    def observe():
+        try:
+            ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens, on_sample=remember_ui)
+            if 'error' in ui:
+                state['last_error'] = ui['error']
+                state['last_read_was_error'] = True
+                return closed_loop.NO_READ
+            state['last_read_was_error'] = False
+            state['last_ui'] = ui
+            state['ui_answered'] = True
+            tile = None
+            if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
+                    and ui.get('observation.active') == 'yes'):
+                tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+                state['last_tile'] = tile
+                if 'error' not in tile:
+                    state['last_answered_tile'] = tile
+            return {'ui': ui, 'tile': tile}
+        except RuntimeError as error:
+            state['last_error'] = str(error)
+            state['last_read_was_error'] = True
+            raise
 
-    confirm_presses, room = 0, None
-    for attempt in range(2):
-        io.send('tap-plus1')
-        confirm_presses += 1
-        ok, last = _wireless_wait(
-            ctx, io, 'ssbu.ui', 20,
-            lambda v: (v.get('screen') in ('stage_select', 'css.smash')
-                       and v.get('screen.context') == 'local_wireless' and v.get('observation.active') == 'yes')
-            or v.get('screen') not in (None, 'unknown', 'ldn.create', 'stage_select', 'css.smash'), screens)
-        if (ok and last.get('screen') in ('stage_select', 'css.smash')
-                and last.get('screen.context') == 'local_wireless' and last.get('observation.active') == 'yes'):
-            io.finish()
-            room = last
-            break
-        if not ok and attempt == 0 and last.get('screen') is None:
-            seen = last.get('error', f'screen missing from {last}')
-            raise RuntimeError('wireless_room: no ssbu.ui reply after the Create confirm, so a second press would '
-                               f'have no screen witness; last read: {seen}')
-        if ok or last.get('screen') not in (None, 'unknown', 'ldn.create') or attempt == 1:
-            raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless after '
-                               f'{confirm_presses} confirm press(es); saw {last}, screens {screens}')
-        io.finish()
-    stage_presses = 0
-    if room['screen'] == 'stage_select':
-        for attempt in range(2):
-            ok, last = _wireless_wait(
-                ctx, io, 'ssbu.ui', 5,
-                lambda v: v.get('screen') in ('stage_select', 'css.smash')
-                and v.get('observation.active') == 'yes' and v.get('screen.context') == 'local_wireless', screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless; saw {last}')
-            if last['screen'] == 'css.smash':
-                break
-            io.send('lobby-a')
-            stage_presses += 1
-            ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 15,
-                                      lambda v: v.get('screen') == 'css.smash'
-                                      and v.get('observation.active') == 'yes'
-                                      and v.get('screen.context') == 'local_wireless', screens)
-            if ok:
-                io.finish()
-                break
-            if (attempt == 1 or last.get('screen') != 'stage_select'
-                    or last.get('observation.active') != 'yes' or last.get('screen.context') != 'local_wireless'):
-                raise RuntimeError(f'wireless_room: expected css.smash in local_wireless; saw {last}, screens {screens}')
-            io.finish()
+    def active(obs, screen):
+        ui = obs['ui']
+        return ui.get('screen') == screen and ui.get('observation.active') == 'yes'
 
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                              lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
-                              and v.get('screen.context') == 'local_wireless', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before tile-up; saw {last}')
-    ok, tile = _wireless_wait(
-        ctx, io, 'tile.cursor', 8,
-        lambda v: v.get('screen') == 'css' and (_wireless_placed(v)
-                                                 or v.get('p1.token') == 'held'),
-        screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected tile.cursor screen css with p1.token held before the chord; '
-                           f'saw {tile}')
-    placed_by, chord_sent, chord_fence = 'already placed', False, None
-    if not _wireless_placed(tile):
+    def accepting(ui):
+        return 'input.ready' not in ui or ui['input.ready'] == 'yes'
+
+    def press_gate():
+        return ('input.ready + tile.cursor' if state['ready_published']
+                else 'tile.cursor (no input.ready published)')
+
+    def local(obs, screen):
+        return active(obs, screen) and obs['ui'].get('screen.context') == 'local_wireless'
+
+    def available():
+        return not state['form_pending']
+
+    def hovered(tile):
         at = tile.get('at')
-        if not (isinstance(at, str) and at.isdigit() and tile.get('hovered') == at):
-            chord_fence = {key: tile.get(key) for key in ('screen', 'p1.token', 'local.token', 'at', 'hovered')}
-            io.send('lobby-first-tile')
-            chord_sent = True
-            ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 5,
-                                      lambda v: v.get('screen') == 'css' and isinstance(v.get('at'), str)
-                                      and v['at'].isdigit() and v.get('hovered') == v['at'], screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
-            io.finish()
-        ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                                  lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
-                                  and v.get('screen.context') == 'local_wireless', screens)
-        if not ok:
-            raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before placement; saw {last}')
-        tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
-        if _wireless_placed(tile) and chord_sent:
-            placed_by = 'chord'
-        if not _wireless_placed(tile):
-            at = tile.get('at')
-            if not (tile.get('screen') == 'css' and isinstance(at, str) and at.isdigit()
-                    and tile.get('hovered') == at):
-                raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
-            io.send('lobby-a')
-            placed_by = 'chord + A' if chord_sent else 'A'
-            ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, _wireless_placed, screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected p1.token or local.token placed; saw {tile}')
+        return isinstance(at, str) and at.isdigit() and tile.get('hovered') == at
+
+    def begin_create(_obs):
+        previous = {key: state[key] for key in ('form_pending', 'form_ready', 'form_settling', 'form_away')}
+        state['form_pending'] = True
+        state['form_ready'] = False
+        state['form_settling'] = False
+        state['form_away'] = 0
+        return lambda: state.update(previous)
+
+    def create_done(obs):
+        if not state['form_pending']:
+            return False
+        screen = obs['ui'].get('screen')
+        if state['form_settling']:
+            if screen not in ('unknown', 'ldn.create'):
+                raise closed_loop.RouteStopped('wireless_room', 'open-create',
+                                              f'expected the Create form (ldn.create, or unpublished) after A; '
+                                              f'saw {obs["ui"]}', {})
+            state['create_form'] = 'ldn.create' if screen == 'ldn.create' else 'unpublished'
+            state['form_ready'] = True
+            state['form_pending'] = False
+            state['form_settling'] = False
+            return True
+        if screen is not None and screen != 'ldn.room_list':
+            state['form_left_list'] = True
+        if unpublished_create == 'refuse':
+            if not active(obs, 'ldn.create'):
+                return False
+            state['create_form'] = 'ldn.create'
+            state['form_ready'] = True
+            state['form_pending'] = False
+            return True
+        state['form_away'] = state['form_away'] + 1 if screen is not None and screen != 'ldn.room_list' else 0
+        if state['form_away'] < 3:
+            return False
+        io.finish()
+        state['prefinished'] = True
+        time.sleep(1.5)
+        state['form_settling'] = True
+        return False
+
+    def confirm_ready(obs):
+        ui = obs['ui']
+        screen = ui.get('screen')
+        if unpublished_create == 'refuse':
+            form = active(obs, 'ldn.create')
+        else:
+            form = screen == 'ldn.create' or (screen == 'unknown' and state['form_ready']
+                                              and state['current'] == 'confirm-create')
+        return (available() and form and accepting(ui)
+                and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= 20))
+
+    def confirm_done(obs):
+        ui = obs['ui']
+        if local(obs, 'stage_select') or local(obs, 'css.smash'):
+            return True
+        if state['confirm_at'] is not None and ui.get('screen') not in (
+                None, 'unknown', 'ldn.create', 'stage_select', 'css.smash'):
+            raise closed_loop.RouteStopped('wireless_room', 'confirm-create',
+                                          f'expected stage_select or css.smash in local_wireless after '
+                                          f'{state["confirm_presses"]} confirm press(es); saw {ui}, screens {screens}',
+                                          {})
+        return False
+
+    def begin_confirm(_obs):
+        previous = state['confirm_at']
+        state['confirm_at'] = time.monotonic()
+        return lambda: state.__setitem__('confirm_at', previous)
+
+    def fence_chord(obs):
+        previous = state['chord_fence']
+        state['chord_fence'] = {key: obs['tile'].get(key)
+                                for key in ('screen', 'p1.token', 'local.token', 'at', 'hovered')}
+        return lambda: state.__setitem__('chord_fence', previous)
+
+    def css(obs):
+        return available() and local(obs, 'css.smash')
+
+    def stage_at(obs):
+        tile = obs['tile'] or {}
+        return (available() and local(obs, 'stage_select') and tile.get('screen') == 'sss'
+                and accepting(obs['ui']) and tile.get('settled') == '1'
+                and tile.get('p1.token') == 'held' and tile.get('local.token') == 'held' and hovered(tile))
+
+    def hand_at(obs):
+        tile = obs['tile'] or {}
+        return (css(obs) and accepting(obs['ui']) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
+                and not hovered(tile) and not _wireless_placed(tile))
+
+    def place_at(obs):
+        tile = obs['tile'] or {}
+        return (css(obs) and accepting(obs['ui']) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
+                and hovered(tile) and not _wireless_placed(tile))
+
+    def placed(obs):
+        return css(obs) and _wireless_placed(obs['tile'] or {})
+
+    def waiting(obs):
+        return (active(obs, 'ldn.waiting') and obs['ui'].get('ldn.role') == 'host')
+
+    ready_wait_cap = max(ready_cap + 10, 45)
+    steps = [
+        closed_loop.Step('open-room-list',
+                         lambda o: (available() and active(o, 'main_menu') and accepting(o['ui'])
+                                    and o['ui'].get('input.owner') == 'native'),
+                         lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6,
+                         target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer'))),
+        closed_loop.Step('open-create', lambda o: (not state['form_settling'] and active(o, 'ldn.room_list')
+                                                   and accepting(o['ui'])
+                                                   and o['ui'].get('focus.id') == 'ldn.create_room'
+                                                   and o['ui'].get('focus.index') == '0'), create_done, 'tap-a1',
+                         cap=15, lost_after=5, before_send=begin_create,
+                         source=lambda o: active(o, 'ldn.room_list'),
+                         target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index'))),
+        closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
+                         cap=20, lost_after=0, sends=2, before_send=begin_confirm),
+        closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
+                         cap=60, ready_cap=20, lost_after=6, target=lambda o: (o['tile'] or {}).get('at')),
+        closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
+                         cap=5, ready_cap=30, lost_after=3, before_send=fence_chord,
+                         target=lambda o: ((o['tile'] or {}).get('at'), (o['tile'] or {}).get('hovered'))),
+        closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4,
+                         target=lambda o: (o['tile'] or {}).get('at')),
+        closed_loop.Step('ready', lambda o: placed(o) and accepting(o['ui']), waiting, 'lobby-ready', cap=ready_wait_cap,
+                         lost_after=ready_wait_cap + 1, sends=1,
+                         target=lambda o: ((o['tile'] or {}).get('p1.placed.at'),
+                                           (o['tile'] or {}).get('local.placed.at'))),
+    ]
+
+    def send(macro):
+        io.send(macro)
+        if state['current'] == 'confirm-create':
+            state['confirm_presses'] += 1
+        elif state['current'] == 'stage-a':
+            state['stage_presses'] += 1
+        elif state['current'] == 'css-hand':
+            state['chord_sent'] = True
+        elif state['current'] == 'place':
+            state['place_presses'] += 1
+
+    def finish():
+        if state['prefinished']:
+            state['prefinished'] = False
+        else:
             io.finish()
 
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                              lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
-                              and v.get('screen.context') == 'local_wireless', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before Ready; saw {last}')
-    tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
-    if not _wireless_placed(tile):
-        raise RuntimeError(f'wireless_room: expected p1.token or local.token placed before Ready; saw {tile}')
-    io.send('lobby-ready')
-    ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', ready_cap,
-                                 lambda v: v.get('screen') == 'ldn.waiting'
-                                 and v.get('observation.active') == 'yes', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected ldn.waiting; screens seen {screens}, last {waiting}')
-    if waiting.get('ldn.role') != 'host':
-        ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', 10,
-                                     lambda v: v.get('screen') == 'ldn.waiting'
-                                     and v.get('observation.active') == 'yes' and v.get('ldn.role') == 'host',
-                                     screens)
-        if not ok:
-            raise RuntimeError(f'wireless_room: expected ldn.role host; screens seen {screens}, last {waiting}')
-    io.finish()
+    def on_step(name):
+        if state['current'] == 'confirm-create' and name != 'confirm-create':
+            state['form_ready'] = False
+            state['confirm_at'] = None
+        state['current'] = name
+        if name == 'confirm-create' and state['create_form'] is None:
+            state['create_form'] = 'ldn.create'
+
+    def on_stall(event, obs):
+        skip = event.get('_skip_diagnostic') or event.get('kind') in ('idle-wait', 'busy-rejected')
+        event = {key: value for key, value in event.items() if key != '_skip_diagnostic'}
+        result = {
+            **event, 'kind': event.get('kind', 'resend'), 'screen': obs['ui'].get('screen'), **state['ui_clock'],
+            'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_fps': None, 'eden_frame_ms': None,
+            'utc': _stall_utc(),
+        }
+        if not skip:
+            answered, status = _bounded_call(ctx, 'status', 1.0)
+            status = status if answered else {}
+            fps = status.get('game_fps') if isinstance(status, dict) else None
+            if isinstance(fps, (int, float)) and math.isfinite(fps) and fps > 0:
+                result['eden_fps'] = fps
+                result['eden_frame_ms'] = 1000 / fps
+        _append_stall(ctx, 'wireless_room', result)
+        return result
+
+    try:
+        outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
+                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
+                                  idle=lambda remaining: _eden_macro_busy(ctx, remaining), idle_cap=idle_cap,
+                                  revalidate_cap=4.5)
+    except closed_loop.RouteStopped as error:
+        reason = error.reason
+        continuity = (error.receipt.get('continuity') == 'lost'
+                      or any(entry.get('continuity') == 'lost' for entry in error.receipt['steps']))
+        if continuity:
+            pass
+        elif (error.step == 'confirm-create' and state['confirm_presses'] == 1
+                and (state['last_read_was_error'] or state['last_ui'].get('screen') is None)):
+            seen = state['last_error'] if state['last_read_was_error'] else f'screen missing from {state["last_ui"]}'
+            reason = ('no ssbu.ui reply after the Create confirm, so a second press would '
+                      f'have no screen witness; last read: {seen}; {reason}')
+        elif error.step == 'confirm-create' and reason.startswith('no transition'):
+            reason = (f'expected stage_select or css.smash in local_wireless after '
+                      f'{state["confirm_presses"]} confirm press(es); saw {state["last_ui"]}, screens {screens}; '
+                      f'{reason}')
+        elif error.step == 'locate':
+            reason += '; expected main_menu with native input or a later route screen'
+        elif error.step == 'open-room-list':
+            reason += f'; expected ldn.room_list; saw {state["last_ui"]}'
+        elif error.step == 'open-create':
+            if state['form_settling'] and state['last_read_was_error']:
+                reason = f'expected the Create form after A; last read error: {state["last_error"]}; {reason}'
+            elif (reason.startswith('not ready') and state['last_ui'].get('screen') == 'ldn.room_list'
+                  and (state['last_ui'].get('focus.id') != 'ldn.create_room'
+                       or state['last_ui'].get('focus.index') != '0')):
+                reason += (f'; the Create row is not focused (focus.id={state["last_ui"].get("focus.id")}, '
+                           f'focus.index={state["last_ui"].get("focus.index")})')
+            elif (unpublished_create == 'refuse' and state['form_left_list']
+                    and reason.startswith('no transition within cap')):
+                reason = ('unsupported reader: the Create form is not published as ldn.create; '
+                          f'last read {state["last_ui"]}; {reason}')
+            else:
+                reason += f'; expected ssbu.ui to leave ldn.room_list; saw {state["last_ui"]}'
+        elif error.step == 'stage-a':
+            reason += f'; expected css.smash in local_wireless; saw {state["last_ui"]}'
+        elif error.step == 'css-hand':
+            if state['chord_sent']:
+                reason += f'; expected the hand on a tile before placement; saw {state["last_tile"]}'
+            else:
+                reason += ('; expected css.smash before tile-up; expected tile.cursor screen css with '
+                           f'p1.token held before the chord; saw {state["last_tile"]}')
+        elif error.step == 'place':
+            reason += (f'; expected p1.token or local.token placed; saw {state["last_tile"]}; '
+                       'expected css.smash before Ready')
+        elif error.step == 'ready':
+            reason += f'; expected ldn.waiting; expected ldn.role host; saw {state["last_ui"]}'
+        error.reason = reason
+        error.receipt['reason'] = reason
+        error.args = (f'wireless_room: stopped on step {error.step!r}: {reason}',)
+        sends = next((entry['sends'] for entry in error.receipt['steps'] if entry['name'] == error.step), 0)
+        stop_receipt = {
+            'block': 'wireless_room', 'ok': False, 'step': error.step, 'reason': reason, 'sends': sends,
+            'screens': screens, 'last_ui': state['last_ui'], 'last_tile': state['last_tile'],
+            'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
+            'stalls': error.receipt['stalls'], 'result': _stall_result(False, error.receipt['stalls']),
+            'last_error': state['last_error'], 'press_gate': press_gate(),
+        }
+        if continuity:
+            stop_receipt['continuity'] = 'lost'
+            stop_receipt['last_ui'] = state['last_ui'] if state['ui_answered'] else None
+            stop_receipt['last_tile'] = state['last_answered_tile']
+        dispatch = next((entry.get('dispatch') for entry in error.receipt['steps'] if entry['name'] == error.step),
+                        None)
+        input_channel = next((entry.get('input_channel') for entry in error.receipt['steps']
+                              if entry['name'] == error.step), None)
+        if input_channel is not None:
+            stop_receipt['input_channel'] = error.receipt['input_channel'] = input_channel
+        if dispatch is not None:
+            stop_receipt['dispatch'] = error.receipt['dispatch'] = dispatch
+        if reason.startswith('unsupported reader: the Create form is not published as ldn.create'):
+            stop_receipt['unsupported_reader'] = 'ldn.create'
+        elif (error.step == 'open-create' and reason.startswith('not ready')
+              and state['last_ui'].get('screen') == 'ldn.room_list'
+              and (state['last_ui'].get('focus.id') in (None, 'unknown')
+                   or state['last_ui'].get('focus.index') in (None, 'unknown'))):
+            stop_receipt['unsupported_reader'] = 'ldn.room_list focus'
+        _save(ctx, 'routes-wireless-room-stop', stop_receipt)
+        raise
+
+    tile, waiting_ui = state['last_tile'], state['last_ui']
+    if state['place_presses']:
+        placed_by = 'chord + A' if state['chord_sent'] else 'A'
+    elif state['chord_sent']:
+        placed_by = 'chord'
+    else:
+        placed_by = 'already placed'
     return _save(ctx, 'routes-wireless-room', {
-        'block': 'wireless_room', 'screens': screens, 'create_form': create_form, 'confirm_presses': confirm_presses,
-        'stage_presses': stage_presses, 'tile': tile, 'placed_by': placed_by, 'chord_sent': chord_sent,
-        'chord_fence': chord_fence,
-        'waiting': {key: waiting.get(key, 'unknown')
+        'block': 'wireless_room', 'screens': screens, 'create_form': state['create_form'],
+        'create_witness': {'unpublished': 'none: unpublished Create form allowed by the caller',
+                           None: 'not observed: the route entered after the Create form'}.get(
+                               state['create_form'], 'ldn.create'),
+        'confirm_presses': state['confirm_presses'], 'stage_presses': state['stage_presses'], 'tile': tile,
+        'placed_by': placed_by, 'chord_sent': state['chord_sent'], 'chord_fence': state['chord_fence'],
+        'waiting': {key: waiting_ui.get(key, 'unknown')
                     for key in ('screen', 'ldn.role', 'ldn.members', 'observation.active')},
-        'ldn.members': waiting.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),
+        'ldn.members': waiting_ui.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),
+        'entered_at': outcome['entered_at'], 'steps': outcome['steps'],
+        'stalls': outcome['stalls'], 'result': _stall_result(True, outcome['stalls']),
+        'press_gate': press_gate(),
     })
 
 
@@ -1768,6 +2015,10 @@ def _merge_setup_metrics(destination, source):
         destination['bridge_boot'] = source['bridge_boot']
     for provider, revisions in source['revisions'].items():
         destination['revisions'].setdefault(provider, list(revisions))[1] = revisions[1]
+    if 'retries' in source:
+        destination['retries'] = destination.get('retries', 0) + source['retries']
+    if source.get('stalls'):
+        destination.setdefault('stalls', []).extend(source['stalls'])
 
 
 # --- Training: game state ---------------------------------------------------------------------------------------------
@@ -3353,10 +3604,17 @@ INPUT_LAG_S = 3.0
 
 def _send_with_retry(io, macro, until, wait):
     io.send(macro)
+    started = time.monotonic()
     result = wait(min(until, time.monotonic() + INPUT_LAG_S))
     if result is None and time.monotonic() < until:
-        io.send(macro)
+        event = {'kind': 'resend', 'block': 'tr_input', 'step': macro, 'send': 2,
+                 'seconds_on_source': time.monotonic() - started,
+                 'last_bridge_line': _bridge_tail(io.ctx), 'utc': _stall_utc()}
         metrics = getattr(io.ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics.setdefault('stalls', []).append(event)
+        _append_stall(io.ctx, 'tr_input', event)
+        io.send(macro)
         if metrics is not None:
             metrics['retries'] = metrics.get('retries', 0) + 1
         result = wait(until)
@@ -3446,7 +3704,7 @@ def _live_body(ctx, seat, kind, cap):
 
 
 def _with_setup_metrics(ctx, action):
-    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}, 'retries': 0, 'stalls': []}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     try:
@@ -3472,7 +3730,7 @@ def _remember(io, state):
 def _block(ctx, block, name, args, action):
     started = time.monotonic()
     metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {},
-               'retries': 0, 'last_seen': {}}
+               'retries': 0, 'stalls': [], 'last_seen': {}}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     try:
@@ -3480,6 +3738,8 @@ def _block(ctx, block, name, args, action):
             receipt = action(metrics)
             receipt.pop('observed', None)
             receipt['ok'] = True
+            receipt['retries'] = metrics['retries']
+            receipt['stalls'] = list(metrics['stalls'])
         except RuntimeError as error:
             last = dict(metrics['last_seen'])
             seen = ' '.join(f'{key}={value}' for key, value in last.items()) or 'none'
@@ -5047,97 +5307,306 @@ def setup_state(ctx):
     })
 
 
-def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', cap=180):
+def _reach_training_screen(ui):
+    values = ui.values
+    if (values.get('observation.active') != 'yes' or values.get('input.owner') != 'native'
+            or values.get('dialog') != 'none'):
+        return None
+    screen = values.get('screen')
+    if screen == 'main_menu':
+        return screen
+    if screen in ('stage_select', 'css.training', 'training') and values.get('screen.context') == 'training':
+        return screen
+    return None
+
+
+def _reach_training_main_checkpoint(ui):
+    if _main_top(ui):
+        return True
+    values = ui.values
+    focus = values.get('focus.id')
+    return focus in ('classic_mode', 'mob_smash', 'training') and _fields_match(ui, {
+        'screen': 'main_menu', 'screen.tab': 'games_and_more', 'screen.layer': 'submenu',
+        'input.owner': 'native', 'dialog': 'none', 'focus.source': 'native', 'focus.id': focus,
+        'focus': f'main_menu.submenu.{focus}',
+    })
+
+
+def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', cap=240):
     started = time.monotonic()
     until = started + cap
     wanted_stage = stage_entry(stage)['id']
     wanted_p1 = fighter_entry(p1)['kind']
     wanted_cpu = fighter_entry(cpu)['kind'] if cpu is not None else None
-    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}, 'retries': 0, 'stalls': []}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     phases = ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
               'pick_fighters', 'enter_training', 'set_cpu')
     skipped, timings, receipts = list(phases), {}, {}
+    starts, recovered, errors = {}, [], {}
+    stalls, retry_evidence, phase_elapsed = [], {}, {}
+    io, ui, last_ui = None, None, None
+    known_stage = expected(ctx).get('stage_id')
+    css_picked, pending_recoveries = False, {}
 
-    def run(name, function, *args, **kwargs):
+    def all_stalls():
+        return list(stalls) + list(metrics['stalls'])
+
+    def phase_retries():
+        return {key: count - 1 for key, count in starts.items() if count > 1}
+
+    def metric_fields():
+        return {'inputs': metrics['inputs'], 'bridge_requests': metrics['bridge_requests'],
+                'bridge_boot': metrics['bridge_boot'], 'revisions': metrics['revisions'],
+                'input_retries': metrics['retries']}
+
+    def pending():
+        entries = getattr(io, 'pending', None) if io is not None else None
+        if entries is None:
+            entries = getattr(ctx.runner, 'native_ui_pending', {})
+        value = entries.get(ctx.on)
+        return value[0] if isinstance(value, tuple) else value
+
+    def stop(step, reason):
+        combined_stalls = all_stalls()
+        receipt = {
+            'block': 'reach_training', 'ok': False, 'step': step, 'reason': reason,
+            'starts': dict(starts), 'recovered': list(recovered), 'last_ui': last_ui,
+            'phases': dict(receipts), 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)},
+            'pending': pending(), **metric_fields(), 'retries': phase_retries(),
+            'stalls': combined_stalls, 'result': _stall_result(False, combined_stalls),
+        }
+        _save(ctx, 'routes-reach-training-stop', receipt)
+        raise closed_loop.RouteStopped('reach_training', step, reason, receipt)
+
+    def deadline(reason):
         if time.monotonic() >= until:
-            raise RuntimeError(f'reach_training deadline expired before {name}')
+            stop('deadline', reason)
+
+    def phase_stall(kind, name, evidence):
+        event = {'kind': kind, 'step': name, **evidence,
+                 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
+        _append_stall(ctx, 'reach_training', event)
+        stalls.append(event)
+
+    def phase(name):
+        nonlocal css_picked, known_stage
+        deadline(f'deadline expired before {name}')
+        if starts.get(name, 0) >= 3:
+            stop(name, f'no transition after 3 starts; last error: {errors.get(name, "none")}')
+        if name in retry_evidence:
+            phase_stall('phase-retry', name, retry_evidence.pop(name))
+        recovered[:] = [item for item in recovered if item != name]
+        starts[name] = starts.get(name, 0) + 1
         begin = time.monotonic()
-        value = function(*args, **kwargs)
-        timings[name] = round((time.monotonic() - begin) * 1000)
+        try:
+            if name == 'to_main':
+                value = to_main(ctx)
+            elif name == 'back_to_main':
+                value = back_to_main(ctx)
+            elif name == 'main_to_stage':
+                value = main_to_stage(ctx)
+            elif name == 'pick_stage':
+                value = pick_stage(ctx, stage, topology=library_topology('sss-training'), form=form)
+            elif name == 'quit_training':
+                value = quit_training(ctx, cap=max(.01, until - time.monotonic()))
+            elif name == 'pick_fighters':
+                value = pick_fighters(ctx, p1, topology=library_topology('css-training'), take_back=True)
+            elif name == 'enter_training':
+                value = enter_training(ctx, cap=max(.01, until - time.monotonic()),
+                                       stage_ids={wanted_stage}, fighters={'p1': p1, 'cpu': None})
+            else:
+                value = _set_fighter(ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
+        finally:
+            phase_elapsed[name] = time.monotonic() - begin
+            timings[name] = timings.get(name, 0) + round(phase_elapsed[name] * 1000)
         receipts[name] = value
         if name in skipped:
             skipped.remove(name)
-        return value
+        if name == 'pick_fighters':
+            css_picked = True
+        elif name == 'pick_stage':
+            known_stage = expected(ctx).get('stage_id')
+
+    def fatal(error):
+        return isinstance(error, closed_loop.RouteStopped) or any(
+            word in str(error).lower() for word in
+            ('boot changed', 'connection', 'continuity', 'rotated', 'truncated', 'malformed', 'overlapping'))
+
+    def settle(name, original, before):
+        nonlocal ui, last_ui
+        settle_until = min(until, time.monotonic() + 30)
+        previous, matching, count = ui, None, 0
+        if pending() is not None and hasattr(io, 'in_flight'):
+            io.in_flight = True
+        while True:
+            deadline(f'deadline expired; settle after {name} was cut short: {original}')
+            if time.monotonic() >= settle_until:
+                stop(name, f'{original}; no two consecutive qualified screens within settle cap')
+            try:
+                sample = native_picker.check_sample(
+                    io.read(native_picker.UI, 2.0),
+                    native_picker.UI, loading_ui=True)
+                deadline(f'deadline expired; settle after {name} was cut short: {original}')
+                if time.monotonic() > settle_until:
+                    stop(name, f'{original}; no two consecutive qualified screens within settle cap')
+                if previous is not None:
+                    native_picker.same_epoch(previous, sample, in_flight=True)
+                    _, revision, observation = sample.clock
+                    _, old_revision, old_observation = previous.clock
+                    if revision < old_revision or observation < old_observation:
+                        raise RuntimeError('bridge observation continuity changed during settle')
+                    if revision == old_revision and sample.values != previous.values:
+                        raise RuntimeError('malformed contradictory bridge observation during settle')
+                    fresh = revision > old_revision and observation > old_observation
+                else:
+                    fresh = True
+                if fresh:
+                    previous = sample
+                last_ui = dict(sample.values)
+                current = _reach_training_screen(sample) if fresh else None
+                if current is None:
+                    matching, count = None, 0
+                elif current == matching:
+                    count += 1
+                else:
+                    matching, count = current, 1
+                if count == 2:
+                    deadline(f'deadline expired; settle after {name} was cut short: {original}')
+                    ui = sample
+                    io.finish()
+                    return current
+            except RuntimeError as error:
+                if isinstance(error, closed_loop.RouteStopped):
+                    raise
+                if fatal(error):
+                    stop(name, f'{original}; settle failed: {error}')
+                matching, count = None, 0
+            ctx.check_stop()
+            time.sleep(min(.5, max(0, settle_until - time.monotonic())))
+
+    def later(name, before, after):
+        if after == before:
+            return False
+        if name in ('to_main', 'back_to_main'):
+            return after == 'main_menu'
+        if name == 'quit_training':
+            return after == 'css.training'
+        rank = {'main_menu': 0, 'stage_select': 1, 'css.training': 2, 'training': 3}
+        target = {'main_to_stage': 1, 'pick_stage': 2, 'pick_fighters': 3, 'enter_training': 3}
+        return name in target and rank.get(after, -1) >= target[name]
 
     try:
-        io = BridgePickerIO(ctx)
-        ui = native_picker.wait_sample(io, native_picker.UI, until)
-        known_stage = expected(ctx).get('stage_id')
-        if not _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
-            if not _main_top(ui):
-                run('to_main', to_main, ctx)
-            screen = 'main'
-        else:
-            screen = ui.values.get('screen')
-        if screen == 'training':
-            if ui.values.get('input.owner') != 'native':
-                raise RuntimeError('reach_training needs native Training input ownership')
-            state = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
-                                 roster_entries=(0, 1))
-            known_stage = state.get('stage')
-            roster = state.get('roster', {})
-            stage_matches = state.get('stage') == wanted_stage
-            p1_matches = roster.get(0, {}).get('kind') == wanted_p1 and 1 in roster
-            if stage_matches and p1_matches:
-                final = state
-                screen = 'done'
-            elif stage_matches:
-                run('quit_training', quit_training, ctx, cap=max(.01, until - time.monotonic()))
-                screen = 'css.training'
+        try:
+            io = BridgePickerIO(ctx)
+        except RuntimeError as error:
+            stop('locate', str(error))
+        next_phase = 'locate'
+        while True:
+            deadline(f'deadline expired before {next_phase}')
+            try:
+                ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+                last_ui = dict(ui.values)
+            except RuntimeError as error:
+                if time.monotonic() >= until:
+                    stop('deadline', f'deadline expired before {next_phase}: {error}')
+                stop('locate', str(error))
+            screen = _reach_training_screen(ui)
+            if screen != 'css.training':
+                css_picked = False
+            if screen == 'main_menu':
+                name = 'main_to_stage' if _reach_training_main_checkpoint(ui) else 'back_to_main'
+            elif _fields_match(ui, {'screen.context': 'training', 'dialog': 'none'}):
+                raw_screen = ui.values.get('screen')
+                if raw_screen == 'training':
+                    if ui.values.get('input.owner') != 'native':
+                        stop('locate', 'reach_training needs native Training input ownership')
+                    try:
+                        final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
+                                             roster_entries=(0, 1))
+                    except RuntimeError as error:
+                        stop('locate', str(error))
+                    known_stage = final.get('stage')
+                    roster = final.get('roster', {})
+                    if known_stage != wanted_stage:
+                        name = 'back_to_main'
+                    elif roster.get(0, {}).get('kind') != wanted_p1 or 1 not in roster:
+                        name = 'quit_training'
+                    elif wanted_cpu is not None and roster[1].get('kind') != wanted_cpu:
+                        name = 'set_cpu'
+                    else:
+                        name = None
+                elif raw_screen == 'css.training':
+                    name = ('back_to_main' if known_stage != wanted_stage else
+                            'enter_training' if css_picked else 'pick_fighters')
+                elif raw_screen == 'stage_select':
+                    name = 'pick_stage'
+                else:
+                    name = 'back_to_main'
             else:
-                run('back_to_main', back_to_main, ctx)
-                screen = 'main'
-        if screen == 'css.training':
-            if known_stage != wanted_stage:
-                run('back_to_main', back_to_main, ctx)
-                screen = 'main'
-        if screen not in ('done', 'main', 'stage_select', 'css.training'):
-            run('back_to_main', back_to_main, ctx)
-            screen = 'main'
-        if screen == 'main':
-            run('main_to_stage', main_to_stage, ctx)
-            screen = 'stage_select'
-        if screen == 'stage_select':
-            run('pick_stage', pick_stage, ctx, stage, topology=library_topology('sss-training'), form=form)
-            screen = 'css.training'
-        if screen == 'css.training':
-            run('pick_fighters', pick_fighters, ctx, p1, topology=library_topology('css-training'),
-                take_back=True)
-            run('enter_training', enter_training, ctx, cap=max(.01, until - time.monotonic()),
-                stage_ids={wanted_stage}, fighters={'p1': p1, 'cpu': None})
-            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
-                                 roster_entries=(0, 1))
-        if wanted_cpu is not None and final.get('roster', {}).get(1, {}).get('kind') != wanted_cpu:
-            run('set_cpu', _set_fighter, ctx, cpu, 1, max(.01, until - time.monotonic()), metrics)
-            final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
-                                 roster_entries=(0, 1))
-        final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
-        if not _fields_match(final_ui, TRAINING_SCREEN):
-            raise RuntimeError('final Training screen is not owned by native input')
-        roster = final.get('roster', {})
-        if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
-                or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
-            raise RuntimeError(f'live Training state does not match the requested setup: {final}')
+                name = 'to_main'
+            for failed in tuple(pending_recoveries):
+                if name == failed:
+                    pending_recoveries.pop(failed)
+                elif name is None:
+                    recovered.append(failed)
+                    phase_stall('phase-recovered', failed, retry_evidence[failed])
+                    pending_recoveries.pop(failed)
+            if name is None:
+                deadline('deadline expired before final verification')
+                try:
+                    final_ui = native_picker.wait_sample(io, native_picker.UI, until, ui, in_flight=True)
+                    last_ui = dict(final_ui.values)
+                except RuntimeError as error:
+                    stop('locate', str(error))
+                if not _fields_match(final_ui, TRAINING_SCREEN):
+                    stop('locate', 'final Training screen is not owned by native input')
+                roster = final.get('roster', {})
+                if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
+                        or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
+                    stop('locate', f'live Training state does not match the requested setup: {final}')
+                break
+            next_phase = name
+            try:
+                phase(name)
+            except closed_loop.RouteStopped as error:
+                if error.route == 'reach_training' and error.receipt.get('block') == 'reach_training':
+                    raise
+                errors[name] = str(error)
+                stop(name, str(error))
+            except RuntimeError as error:
+                errors[name] = str(error)
+                if fatal(error):
+                    stop(name, str(error))
+                after = settle(name, str(error), screen)
+                block = getattr(ui, 'block', {})
+                retry_evidence[name] = {
+                    'start': starts[name], 'error': str(error), 'screen': after, 'seconds': phase_elapsed[name],
+                    **{key: block.get(key) for key in ('frame', 'wall', 'rev')},
+                }
+                if later(name, screen, after):
+                    recovered.append(name)
+                    phase_stall('phase-recovered', name, retry_evidence[name])
+                elif after == screen:
+                    pending_recoveries[name] = None
+                if after != 'css.training':
+                    css_picked = False
+            next_phase = {'to_main': 'main_to_stage', 'back_to_main': 'main_to_stage',
+                          'main_to_stage': 'pick_stage', 'pick_stage': 'pick_fighters',
+                          'quit_training': 'pick_fighters', 'pick_fighters': 'enter_training',
+                          'enter_training': 'set_cpu', 'set_cpu': 'final verification'}[name]
     finally:
         ctx.runner.setup_metrics = previous
         if previous is not None:
             _merge_setup_metrics(previous, metrics)
+    combined_stalls = all_stalls()
     return _save(ctx, 'routes-reach-training', {
         'block': 'reach_training', 'args': {'p1': p1, 'cpu': cpu, 'stage': stage, 'form': form},
-        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metrics,
+        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metric_fields(),
         'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
+        'starts': starts, 'recovered': recovered, 'retries': phase_retries(),
+        'stalls': combined_stalls, 'result': _stall_result(True, combined_stalls),
     })
 
 
