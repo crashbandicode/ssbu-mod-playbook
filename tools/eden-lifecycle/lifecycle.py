@@ -3273,10 +3273,11 @@ class SshMux:
     _sequence = 0
 
     def __init__(self, host, run=subprocess.run, ssh_options=(), ssh_bin='ssh', windows=False,
-                 evidence_dir=None, popen=None):
+                 evidence_dir=None, popen=None, allow_master_retry=True):
         require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
         self.host, self.run, self.options, self.ssh_bin = host, run, tuple(ssh_options), ssh_bin
         self.windows, self.evidence_dir, self.popen = windows, evidence_dir, popen or subprocess.Popen
+        self.allow_master_retry = allow_master_retry
         self.root = Path(os.environ.get('XDG_RUNTIME_DIR') or tempfile.gettempdir()) / f'eden-ssh-{os.getpid()}'
         self.key = None
         self.entered = False
@@ -3447,11 +3448,12 @@ class SshMux:
                             pass
                 diagnosis = ssh_diagnosis(self.host, run=self.run, evidence_dir=self.evidence_dir,
                                           ssh_options=self.options, attempt_log=log, mux_dir=self.root,
-                                          ssh_bin=self.ssh_bin, windows=self.windows, allow_retry=attempt == 0,
+                                          ssh_bin=self.ssh_bin, windows=self.windows,
+                                          allow_retry=self.allow_master_retry and attempt == 0,
                                           attempt_timed_out=attempt_timed_out, attempt_killed=attempt_killed)
                 ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'master'}, self.evidence_dir)
                 diagnoses.append(diagnosis)
-                if attempt or not diagnosis['transient']:
+                if attempt or not self.allow_master_retry or not diagnosis['transient']:
                     raise LedgerTransport(diagnoses, 'SSH master failed')
 
     def __exit__(self, exc_type, exc, traceback):

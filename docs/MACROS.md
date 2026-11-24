@@ -671,10 +671,35 @@ Python in the plugin's repo, `eden/steps.py`.
 
 - **Hooks are the flexible part.** A step `{"run": "eden/steps.py:open_defaults",
   "args": {...}}` gets the runner's tools: `call`, `press`, `stick`, `play`,
-  `gate`, `ui`, `shot`, `wait_log` and `log`. Write the plugin's own menu
+  `gate`, `ui`, `shot`, `wait_log`, `ssh` and `log`. Write the plugin's own menu
   navigation and checks there, freely. They still run inside the row, so
   stop files, the pace cap and `actions.jsonl` apply. Add `"check": true`
   when the hook verifies the screen it leaves.
+- **Remote commands:** `ctx.ssh(host, command, timeout=60, input=None)` opens
+  a bounded shared SSH master and sends the command once. `host` is an SSH
+  alias or `user@host` made of letters, digits, `_`, `.`, `@` and `-`, starting
+  with a letter, digit or `_`. `command` is a non-empty command-line string
+  or list of strings; `timeout` is greater than 0 and at most 900 seconds.
+  It returns `{"returncode": int, "stdout": str, "stderr": str, "seconds": float}`
+  for a completed remote command, including a non-zero application result.
+  Transport failure instead raises a named stop and records a diagnosis in
+  `ssh-diag.md` and `actions.jsonl`. A timed-out command may still be running
+  on the host; inspect it before sending another. The command is never replayed.
+  Because an arbitrary alias does not identify its target OS before login,
+  this call does not retry a failed master on any target.
+  Write it for the host's login shell: Yoga uses PowerShell and XPS uses bash.
+  PowerShell login shells map non-zero results to 1, so do not rely on a
+  particular non-zero exit code there. The action log records the argv, not
+  command output or stdin. Fixture replay refuses this live-only call.
+  Do not spawn `ssh`, `scp` or `rsync` yourself: dry-run refuses it (G10).
+  For example, instead of a direct subprocess in a join hook:
+
+  ```python
+  result = ctx.ssh('tr-yoga', ['Get-Content', '/path/to/room.json'], timeout=30)
+  if result['returncode'] != 0:
+      raise RuntimeError('could not read the room handoff')
+  room = result['stdout']
+  ```
 - **Bring only generic needs to the shared tool**: something any plugin's
   test would want (a new gate kind, a frontend operation). Add it with a
   test in `test_runner.py`. Don't copy or fork `runner.py`.
