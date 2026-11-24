@@ -303,6 +303,14 @@ class StillFreshTests(unittest.TestCase):
         self.assertEqual((first_a['status'], first_b['status'], refused_a['status']), ('fresh', 'fresh', 'refused'))
         self.assertEqual(refused_a['first_identical'], first_a['file'])
 
+    def test_a_still_without_any_record_is_not_usable(self):
+        for status in ('fresh', 'same', 'unverified'):
+            with self.subTest(status=status):
+                self.assertTrue(self.fresh.usable({'status': status}))
+        for record in (None, {}, {'status': 'refused'}, {'status': 'error'}, {'status': 'unknown'}, 'fresh'):
+            with self.subTest(record=record):
+                self.assertFalse(self.fresh.usable(record))
+
     def test_an_unknown_boot_does_not_authorise_a_refusal(self):
         first = self.record(self.frame(1000, boot=None))
         second = self.record(self.frame(1300, boot=None))
