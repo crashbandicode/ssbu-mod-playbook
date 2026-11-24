@@ -548,6 +548,12 @@ write!(out, "[Bridge] [Nested] other hidden={}");
 write!(out, "[Bridge] fighters_watch done entries={mask:#x}");
 write!(out, "[Bridge] req fighters_watch result=ok entries={mask:#x} frames={frames}");
 ''')
+        write('src/runtime.rs', r'''
+let _ = write!(out, " ev={seq}");
+write!(out, "[Bridge] state begin name={name} schema={schema} rev={rev} boot={boot} lines={lines} filtered={filtered}");
+write!(out, "[Bridge] state end name={name} rev={rev} crc={crc}");
+write!(out, "[Bridge] provider name={name} schema_id={schema_id} version={version} rev={rev} dropped={dropped} toggle_gen={toggle_gen}");
+''')
         git('init', '-q')
         git('add', 'src')
         git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'partial')
@@ -590,7 +596,20 @@ write!(out, "[Bridge] req fighters_watch result=ok entries={mask:#x} frames={fra
             with self.subTest(key=key):
                 self.plan['rows'][0]['reads'] = [f'bridge:{key}']
                 self.assertEqual(self.errors(), [f'G2 row r1: bridge:{key} is not written by bridge '
-                                                 f'{commit[:8]} (src/proto2.rs, src/hooks.rs, src/model.rs)'])
+                                                 f'{commit[:8]} (src/proto2.rs, src/hooks.rs, src/model.rs, '
+                                                 'src/runtime.rs)'])
+
+    def test_builtin_bridge_provider_includes_runtime_stamps_and_events(self):
+        tree, _, _, commit = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = ['bridge:ev', 'bridge:state name', 'bridge:state crc',
+                                         'bridge:provider schema_id']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertTrue({'ev', 'state name', 'state crc', 'provider schema_id'} <= set(report['emitted']['bridge']))
+        self.plan['rows'][0]['reads'] = ['bridge:state colour']
+        self.assertEqual(self.errors(), [f'G2 row r1: bridge:state colour is not written by bridge '
+                                         f'{commit[:8]} (src/proto2.rs, src/hooks.rs, src/model.rs, src/runtime.rs)'])
 
     def test_builtins_require_the_bridge_target(self):
         self.plan['target'].pop('bridge')
