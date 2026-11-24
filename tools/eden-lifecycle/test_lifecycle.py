@@ -1470,8 +1470,53 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('remote message', run.call_args.kwargs['input'])
         remote.down()
 
+    def test_ruled_notify_validation_and_local_file_creation(self):
+        ruled = {'file': '/home/intpa/eden-run-notify/NOTIFY.md', 'to': 'tr-primary-2'}
+        config = deepcopy(self.config)
+        config['notify'] = ruled
+        self.assertEqual(life.validate(config)['notify'], ruled)
+        target = self.base / 'new-notify' / 'nested' / 'NOTIFY.md'
+        self.config['notify'] = {'file': str(target), 'to': 'tr-primary-2'}
+        c = self.controller()
+        c.up()
+        c.pending_receipt('existing receipt')
+        with patch.object(life.subprocess, 'run') as run:
+            c.notify('one message')
+        run.assert_not_called()
+        first = target.read_text()
+        self.assertRegex(first, r'^\n## \d\d:\d\d:\d\dZ eden-lifecycle test-01 → tr-primary-2 \| one message\n$')
+        self.assertTrue(target.parent.is_dir())
+        self.assertNotIn('notify not configured', (c.directory / 'RELEASE-PENDING.md').read_text())
+        c.notify('second message')
+        self.assertTrue(target.read_text().startswith(first))
+        self.assertRegex(target.read_text()[len(first):],
+                         r'^\n## \d\d:\d\d:\d\dZ eden-lifecycle test-01 → tr-primary-2 \| second message\n$')
+        c.down()
+
+    def test_pending_down_notifies_local_file_and_receipt(self):
+        target = self.base / 'new-notify' / 'nested' / 'NOTIFY.md'
+        self.config['notify'] = {'file': str(target), 'to': 'tr-primary-2'}
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport('ssh diag fake: release unavailable')), \
+                patch.object(life.subprocess, 'run') as run:
+            result = c.down()
+        run.assert_not_called()
+        self.assertEqual(result['phase'], 'down')
+        self.assertTrue(result['release_pending'])
+        receipt = (c.directory / 'RELEASE-PENDING.md').read_text()
+        line = next(line for line in receipt.splitlines() if line.startswith('release pending since '))
+        self.assertIn('ssh diag fake: release unavailable', line)
+        self.assertNotIn('notify not configured', receipt)
+        self.assertRegex(target.read_text(), r'^\n## \d\d:\d\d:\d\dZ eden-lifecycle test-01 → tr-primary-2 \| '
+                         + re.escape(line) + r'\n$')
+        self.assertNotIn('notify_errors', json.loads(c.journal.read_text()))
+        c.down()
+
     def test_failing_notify_does_not_fail_down(self):
-        self.config['notify'] = {'file': str(self.base / 'missing' / 'notifications.md')}
+        occupied = self.base / 'occupied'
+        occupied.write_text('not a directory')
+        self.config['notify'] = {'file': str(occupied / 'missing' / 'notifications.md')}
         c = self.controller()
         c.up()
         with patch.object(self.ledger, 'inspect', side_effect=transport()):
@@ -1486,6 +1531,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_notify_validation_rejects_unsafe_fields(self):
         for spec in ({'file': 'relative'}, {'file': '/tmp/file;touch'}, {'file': '/tmp/../file'},
+                     {'file': r'C:\Users\intpa\eden-run-notify\NOTIFY.md'},
                      {'file': '/tmp/file', 'ssh': 'host;bad'}, {'file': '/tmp/file', 'from': 'bad\nname'}):
             with self.subTest(spec=spec):
                 config = deepcopy(self.config)
@@ -3768,6 +3814,25 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(self.host.started_settles, [])
         self.assertTrue(c.down()['released'])
 
+    def test_ally_notify_accepts_windows_only_and_writes_through_local_path(self):
+        value = r'C:\Users\intpa\eden-run-notify\NOTIFY.md'
+        self.config['notify'] = {'file': value, 'to': 'tr-primary-2'}
+        self.assertEqual(life.validate(self.config)['notify']['file'], value)
+        for invalid in ('/home/intpa/eden-run-notify/NOTIFY.md', r'C:\Users\intpa\..\NOTIFY.md',
+                        r'C:Users\intpa\NOTIFY.md', r'\\server\share\NOTIFY.md',
+                        r'C:\Users\intpa\bad;name.md'):
+            with self.subTest(path=invalid):
+                config = deepcopy(self.config)
+                config['notify']['file'] = invalid
+                with self.assertRaisesRegex(life.Refused, 'notify file must be an absolute safe path'):
+                    life.validate(config)
+        target = self.base / 'windows-profile' / 'eden-run-notify' / 'NOTIFY.md'
+        c = self.controller()
+        with patch.object(life, 'safe_absolute', return_value=target) as resolve:
+            c.notify('pending')
+        resolve.assert_called_once_with(value)
+        self.assertRegex(target.read_text(), r'^\n## \d\d:\d\d:\d\dZ eden-lifecycle test-01 → tr-primary-2 \| pending\n$')
+
     def test_windows_bridge_preserves_ledger_transport_classification(self):
         token = 'a' * 32
         def dispatch(*args):
@@ -4012,6 +4077,8 @@ class WindowsTests(unittest.TestCase):
         self.assertIsNone(packet['observed_after_go_utc'])
         self.assertTrue(packet['not_for_execution'])
         self.assertTrue(draft['lifecycle_only'])
+        self.assertEqual(draft['notify'],
+                         {'file': r'C:\Users\intpa\eden-run-notify\NOTIFY.md', 'to': 'tr-primary-2'})
         self.assertFalse(draft['defer_load'])
         self.assertFalse(draft['allow_inbound_block'])
         self.assertEqual(len(draft['instances']), 1)
