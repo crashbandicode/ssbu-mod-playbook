@@ -3584,6 +3584,103 @@ class SshMuxTests(unittest.TestCase):
                         self.assertEqual(len(receipt.read_text().splitlines()), 1)
                         self.assertIn(expected_cause, stderr.getvalue())
                         self.assertIn(f'ssh-diag receipt: {receipt}', stderr.getvalue())
+                        self.assertEqual(stderr.getvalue().count(
+                            f'ssh retried once: {expected_cause}; ssh-diag receipt: {receipt}'), 1)
+
+    def _retry_caller(self, operation, action):
+        _, facts, ping, _, expected_cause = next(case for case in health_path_cases() if case[0] == 'healthy-loss')
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
+            root = Path(temporary)
+            receipt = root / 'ssh-diag.md'
+            starts, riders = [], []
+            base_run = target_fixture_run(facts, [], ping)
+            class Process:
+                pid = 123456
+                def __init__(self, status):
+                    self.status = status
+                def wait(self, timeout=None):
+                    return self.status
+                def poll(self):
+                    return self.status
+            def popen(argv, **_kwargs):
+                if starts:
+                    self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                starts.append(argv)
+                Path(argv[argv.index('-E') + 1]).write_text(
+                    'Connecting to fake-host\nConnection established\nRemote protocol version 2.0\n'
+                    'SSH2_MSG_KEXINIT sent\nConnection to fake-host port 22 timed out\n')
+                return Process(0 if len(starts) > 1 else 255)
+            def run(argv, **kwargs):
+                if 'input' in kwargs:
+                    riders.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({'owned_claim': True}), '')
+                return base_run(argv, **kwargs)
+            def diagnose(host, **kwargs):
+                return real_ssh_diagnosis(host, **kwargs, tcp=lambda *_: True)
+            def mux(host, **kwargs):
+                return real_ssh_mux(host, popen=popen, **kwargs)
+            captured = io.StringIO()
+            with patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
+                    patch.object(life, 'SshMux', side_effect=mux), \
+                    patch.object(life, 'ssh_diagnosis', side_effect=diagnose), \
+                    patch('sys.stderr', captured):
+                if action == 'executor':
+                    result = life.forward('fake-host', 'status', {'host': 'xps', 'state_dir': temporary},
+                                          False, run=run)
+                else:
+                    controller = life.Lifecycle.__new__(life.Lifecycle)
+                    controller.c = {'ledger': '/tmp/fake-ledger', 'host': 'xps', 'owner': 'test',
+                                    'label': 'fixture', 'ledger_ssh': 'fake-host'}
+                    controller.state = {'token': 'a' * 32}
+                    controller.directory = root
+                    controller.injected_ledger = None
+                    forward = life.ledger_forward
+                    with patch.object(life, 'ledger_forward',
+                                      side_effect=lambda host, op, config: forward(host, op, config, run=run)):
+                        result = controller.ledger().operate(operation)
+                    controller.record(action, result)
+            self.assertEqual(len(starts), 2)
+            self.assertEqual(len(riders), 1)
+            self.assertEqual(len(receipt.read_text().splitlines()), 1)
+            retry = {'phase': 'kex', 'cause': expected_cause, 'receipt': str(receipt)}
+            compact = f'ssh retried once: {expected_cause}; ssh-diag receipt: {receipt}'
+            self.assertEqual(captured.getvalue().count(compact), 1)
+            if action != 'executor':
+                self.assertEqual(result['ssh_retry'], retry)
+                entry = json.loads((root / 'actions.jsonl').read_text())
+                self.assertEqual((entry['kind'], entry['ssh_retry']), (action, retry))
+            else:
+                self.assertEqual(result, {'owned_claim': True})
+
+    def test_retry_metadata_reaches_ledger_action_journal(self):
+        for operation, action in (('claim', 'claim'), ('release', 'release'), ('reserve', 'reserve'),
+                                  ('read', 'read'), ('read', 'claim-readback'), ('read', 'settle-readback')):
+            with self.subTest(operation=operation, action=action):
+                self._retry_caller(operation, action)
+
+    def test_executor_reports_one_master_retry_without_replaying_rider(self):
+        self._retry_caller(None, 'executor')
+
+    def test_remote_claim_readback_and_exclusive_reserve_record_retry_metadata(self):
+        retry = {'phase': 'kex', 'cause': 'packet loss', 'receipt': '/tmp/receipt'}
+        controller = life.Lifecycle.__new__(life.Lifecycle)
+        controller.c = {'ledger': '/tmp/fake-ledger', 'host': 'xps', 'owner': 'test',
+                        'ledger_ssh': 'fake-host', 'hostname': 'fake-host', 'exclusive_host': True,
+                        'work_root': '/tmp', 'label': 'fixture'}
+        controller.directory = Path('/tmp')
+        controller.injected_ledger = None
+        controller.record = unittest.mock.Mock()
+        controller.host = unittest.mock.Mock()
+        controller.host.name.return_value = 'fake-host'
+        controller.host.resources.return_value = {'foreign_processes': []}
+        remote = unittest.mock.Mock()
+        remote.inspect.return_value = {'open': ['claimed'], 'ssh_retry': retry}
+        remote.operate.return_value = {'reserved': True, 'ssh_retry': retry}
+        with patch.object(life, 'Ledger', return_value=remote):
+            self.assertEqual(controller.ledger_text(), 'claimed')
+            self.assertEqual(controller.reserve_exclusive('test'), remote.operate.return_value)
+        self.assertEqual(controller.record.call_args_list, [
+            call('claim-readback', remote.inspect.return_value), call('reserve', remote.operate.return_value)])
 
     def test_control_path_length_guard_precedes_all_ssh(self):
         calls = unittest.mock.Mock()
@@ -4746,6 +4843,7 @@ class WindowsTests(unittest.TestCase):
 
     def test_windows_transport_keeps_authoritative_ledger_on_controller(self):
         token = 'b' * 32
+        retry = {'phase': 'kex', 'cause': 'packet loss', 'receipt': '/tmp/fixture-ssh-diag.md'}
         request = {'ledger_request': {'operation': 'claim', 'token': token,
                    'admission': {'foreign_processes': []}, 'stale_claim_hours': None}}
         class Input(io.StringIO):
@@ -4770,7 +4868,7 @@ class WindowsTests(unittest.TestCase):
                 ledgers.append(args)
             def operate(self, operation, stale, admission):
                 self.test = operation
-                return {'line': 'FAKE claim'}
+                return {'line': 'FAKE claim', 'ssh_retry': retry}
         self.config['ledger_ssh'] = 'yoga'
         value = life.forward_windows('intpa@dreamland-ally', 'up', self.config, True, popen, Ledger)
         self.assertEqual(value['phase'], 'up')
@@ -4778,7 +4876,8 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(commands[0][-1].startswith('"C:\\Program Files\\PowerShell\\7\\pwsh.exe"'))
         packet = json.loads(process.stdin.saved.splitlines()[0])
         self.assertTrue(packet['ledger_bridge'])
-        self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]), {'result': {'line': 'FAKE claim'}})
+        self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]),
+                         {'result': {'line': 'FAKE claim', 'ssh_retry': retry}})
 
     def test_windows_controller_serializes_transport_in_the_existing_error_reply(self):
         request = {'ledger_request': {'operation': 'read', 'token': 'a' * 32,

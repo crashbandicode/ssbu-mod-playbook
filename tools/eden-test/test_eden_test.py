@@ -2962,6 +2962,49 @@ class EdenTestTests(unittest.TestCase):
         pack_path = Path(rsync.call_args.args[0][-2])
         self.assertFalse(pack_path.exists())
 
+    def test_go_remote_reports_a_master_retry_once(self):
+        life = eden_test._lifecycle_module
+        starts = []
+        diagnosis = {'line': 'ssh diag fake: packet loss', 'phase': 'kex', 'cause': 'packet loss',
+                     'evidence': 'fixture', 'transient': True}
+        class Process:
+            pid = 123456
+            def __init__(self, status):
+                self.status = status
+            def wait(self, timeout=None):
+                return self.status
+            def poll(self):
+                return self.status
+        def popen(argv, **_kwargs):
+            starts.append(argv)
+            return Process(0 if len(starts) > 1 else 255)
+        def run(argv, **_kwargs):
+            if '-G' in argv:
+                template = next(option for option in argv if option.startswith('ControlPath='))
+                return subprocess.CompletedProcess(argv, 0, 'controlpath ' +
+                                                   template.removeprefix('ControlPath=').replace('%C', 'fixture') +
+                                                   '\n', '')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        def mux(host, **kwargs):
+            return life.SshMux(host, run=run, popen=popen, **kwargs)
+        captured = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as runtime, \
+                mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': runtime}), \
+                mock.patch.object(eden_test, '_go_route', return_value='fake-host'), \
+                mock.patch.object(eden_test, '_go_remote_base', return_value=None), \
+                mock.patch.object(eden_test, '_go_targets', return_value=[]), \
+                mock.patch.object(eden_test, 'SshMux', side_effect=mux), \
+                mock.patch.object(life, 'ssh_diagnosis', return_value=diagnosis), \
+                mock.patch.object(eden_test, '_go_remote_with_mux', return_value=0) as operation, \
+                redirect_stderr(captured):
+            self.assertEqual(eden_test._go_remote(self.remote_args(), None), 0)
+        receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(receipt.read_text().splitlines()), 1)
+        self.assertEqual(captured.getvalue().count(
+            f'ssh retried once: packet loss; ssh-diag receipt: {receipt}'), 1)
+        operation.assert_called_once()
+
     def test_go_remote_uses_host_map_and_file_rows(self):
         hosts = eden_test.RUNS / '_eden-test/hosts.json'
         hosts.parent.mkdir(parents=True, exist_ok=True)

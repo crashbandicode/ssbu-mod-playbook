@@ -1559,6 +1559,14 @@ class IdleWatchdog:
         return value
 
 
+def record_action(directory, kind, value):
+    entry = {'utc': stamp(), 'kind': kind, 'value': value}
+    if isinstance(value, dict) and value.get('ssh_retry'):
+        entry['ssh_retry'] = value['ssh_retry']
+    with (Path(directory) / 'actions.jsonl').open('a', encoding='utf-8') as stream:
+        stream.write(json.dumps(entry) + '\n')
+
+
 class Lifecycle:
     def __init__(self, config, host=None, ledger=None, plan_check=None):
         self.c = validate(config)
@@ -1585,8 +1593,7 @@ class Lifecycle:
         return module.up_check(Path(self.c['rows']['path']), self.c)
 
     def record(self, kind, value):
-        with (self.directory / 'actions.jsonl').open('a', encoding='utf-8') as stream:
-            stream.write(json.dumps({'utc': stamp(), 'kind': kind, 'value': value}) + '\n')
+        record_action(self.directory, kind, value)
 
     def pending_receipt(self, text):
         with (self.directory / 'RELEASE-PENDING.md').open('a', encoding='utf-8') as stream:
@@ -1676,7 +1683,10 @@ class Lifecycle:
         require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname')
         # Process scan is on the executor. The authoritative ledger checks open claims under the append lock.
         admission = self.host.resources(Path(Path(self.c['work_root']).anchor))
-        return self.ledger(uuid.uuid4().hex).operate('reserve', admission=admission, approver=approver)
+        result = self.ledger(uuid.uuid4().hex).operate('reserve', admission=admission, approver=approver)
+        if result.get('ssh_retry'):
+            self.record('reserve', result)
+        return result
 
     @contextmanager
     def lock(self):
@@ -1810,6 +1820,8 @@ class Lifecycle:
         if self.c.get('ledger_ssh'):
             info = Ledger(self.c['ledger'], self.c['host'], self.c['owner'], '0' * 32,
                           self.c.get('ledger_ssh'), state_dir=self.directory).inspect()
+            if info.get('ssh_retry'):
+                self.record('claim-readback', info)
             return '\n'.join(info.get('open') or [])
         path = safe_absolute(self.c['ledger'])
         require(path.is_file(), 'Authoritative ledger must already exist')
@@ -3531,7 +3543,10 @@ class SshMux:
                 diagnoses.append(diagnosis)
                 if attempt or not self.allow_master_retry or not diagnosis.get('transient', False):
                     raise LedgerTransport(diagnoses, 'SSH master failed')
+                diagnosis['retried'] = True
                 print(diagnosis['reported_line'], file=sys.stderr, flush=True)
+                print(f"ssh retried once: {diagnosis.get('cause', 'unknown')}; "
+                      f"ssh-diag receipt: {diagnosis['receipt']}", file=sys.stderr, flush=True)
 
     def __exit__(self, exc_type, exc, traceback):
         with self._lock:
@@ -3554,6 +3569,14 @@ class SshMux:
             if not self._directories[root]:
                 self._directories.pop(root)
                 shutil.rmtree(self.root, ignore_errors=True)
+
+
+def ssh_retry_info(mux):
+    for diagnosis in reversed(getattr(mux, 'diagnoses', ())):
+        if diagnosis.get('retried'):
+            return {'phase': diagnosis.get('phase', 'unknown'), 'cause': diagnosis.get('cause', 'unknown'),
+                    'receipt': diagnosis.get('receipt')}
+    return None
 
 
 def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=None, watchdog_pause=None,
@@ -3633,6 +3656,9 @@ def ledger_forward(host, operation, config, run=subprocess.run):
             result = json.loads(done.stdout)
             if not isinstance(result, dict):
                 raise ValueError('ledger reply is not an object')
+            retry = ssh_retry_info(mux)
+            if retry:
+                result['ssh_retry'] = retry
             return result
         except (ValueError, TypeError) as error:
             raise Refused(f'SSH lifecycle failed: invalid ledger reply: {error}') from error
@@ -3861,6 +3887,8 @@ def main(argv=None):
                                 config.get('ledger_ssh') or args.ssh, label=config['label'],
                                 state_dir=config.get('state_dir'))
                 receipt = ledger.operate('reserve', approver=args.approver)
+                if receipt.get('ssh_retry'):
+                    record_action(config['state_dir'], 'reserve', receipt)
             print(json.dumps(receipt, indent=2))
             return 0
         options = {'keep_state': args.keep_state, 'evidence_dir': args.evidence_dir}
