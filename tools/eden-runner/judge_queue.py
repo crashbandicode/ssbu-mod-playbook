@@ -20,10 +20,17 @@ import hashlib
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -172,7 +179,176 @@ def sample_dense(clip, folder, positions_ms):
         pipe.close()
 
 
-def shot_issue(shot):
+def _png_decodes(path):
+    with open(path, 'rb') as stream:
+        if stream.read(8) != b'\x89PNG\r\n\x1a\n':
+            return False
+        header = None
+        inflater = None
+        seen_end = False
+        seen_palette = False
+        palette_entries = 0
+        seen_metadata = set()
+        idat_closed = False
+        passes = []
+        remaining_rows = row_bytes = offset = 0
+
+        def consume(data):
+            nonlocal remaining_rows, row_bytes, offset
+            position = 0
+            while position < len(data):
+                if not remaining_rows:
+                    if not passes:
+                        return False
+                    remaining_rows, row_bytes = passes.pop(0)
+                    offset = 0
+                if offset == 0 and data[position] > 4:
+                    return False
+                take = min(len(data) - position, row_bytes - offset)
+                offset += take
+                position += take
+                if offset == row_bytes:
+                    remaining_rows -= 1
+                    offset = 0
+            return True
+
+        while True:
+            prefix = stream.read(8)
+            if len(prefix) != 8:
+                return False
+            length, kind = struct.unpack('>I4s', prefix)
+            if length >= 2 ** 31 or any(not (65 <= c <= 90 or 97 <= c <= 122) for c in kind) or kind[2] & 32:
+                return False
+            if header is None and (kind != b'IHDR' or length != 13):
+                return False
+            if kind == b'IHDR' and header is not None:
+                return False
+            if kind[0] & 32:
+                lengths = {b'gAMA': 4, b'cHRM': 32, b'sRGB': 1, b'pHYs': 9, b'tIME': 7}
+                if kind not in (*lengths, b'tRNS', b'tEXt'):
+                    return False
+                if kind != b'tEXt' and kind in seen_metadata:
+                    return False
+                if (kind in lengths and length != lengths[kind]) or (kind == b'tEXt' and length > 1024 * 1024):
+                    return False
+                if kind in (b'gAMA', b'cHRM', b'sRGB') and seen_palette:
+                    return False
+                if kind not in (b'tEXt', b'tIME') and inflater is not None:
+                    return False
+                if kind == b'tRNS':
+                    colour = header[3]
+                    if ((colour == 0 and length != 2) or (colour == 2 and length != 6)
+                            or (colour == 3 and not (seen_palette and 1 <= length <= palette_entries))
+                            or colour in (4, 6)):
+                        return False
+                seen_metadata.add(kind)
+            if kind == b'IDAT':
+                if idat_closed or (header[3] == 3 and not seen_palette):
+                    return False
+                if inflater is None:
+                    inflater = zlib.decompressobj()
+            elif inflater is not None:
+                idat_closed = True
+            crc = zlib.crc32(kind)
+            value = b''
+            left = length
+            while left:
+                block = stream.read(min(left, 65536))
+                if not block:
+                    return False
+                left -= len(block)
+                crc = zlib.crc32(block, crc)
+                if kind == b'IHDR' or kind[0] & 32:
+                    value += block
+                if kind == b'IDAT':
+                    while block:
+                        decoded = inflater.decompress(block, 65536)
+                        if not consume(decoded) or inflater.unused_data:
+                            return False
+                        block = inflater.unconsumed_tail
+            checksum = stream.read(4)
+            if len(checksum) != 4 or struct.unpack('>I', checksum)[0] != crc:
+                return False
+            if kind == b'IHDR':
+                width, height, depth, colour, compression, filtering, interlace = struct.unpack('>IIBBBBB', value)
+                modes = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8),
+                         4: (8, 16), 6: (8, 16)}
+                if (not 0 < width < 2 ** 31 or not 0 < height < 2 ** 31
+                        or colour not in modes or depth not in modes[colour]
+                        or compression or filtering or interlace not in (0, 1)):
+                    return False
+                header = (width, height, depth, colour)
+                bits = depth * {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colour]
+                grids = ((0, 0, 1, 1),) if not interlace else (
+                    (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+                    (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+                for x, y, dx, dy in grids:
+                    w = max(0, (width - x + dx - 1) // dx)
+                    h = max(0, (height - y + dy - 1) // dy)
+                    if w and h:
+                        passes.append((h, 1 + (w * bits + 7) // 8))
+            elif kind == b'PLTE':
+                if (seen_palette or inflater is not None or not length or length > 768 or length % 3
+                        or header[3] in (0, 4) or (header[3] == 3 and length // 3 > 2 ** header[2])):
+                    return False
+                seen_palette = True
+                palette_entries = length // 3
+            elif kind == b'IEND':
+                if inflater is not None:
+                    while decoded := inflater.decompress(b'', 65536):
+                        if not consume(decoded):
+                            return False
+                seen_end = length == 0 and inflater is not None and inflater.eof
+                break
+            elif kind == b'gAMA' and struct.unpack('>I', value)[0] == 0:
+                return False
+            elif kind == b'sRGB' and value[0] > 3:
+                return False
+            elif kind == b'pHYs' and value[-1] > 1:
+                return False
+            elif kind == b'tRNS' and header[3] in (0, 2):
+                if any(sample >= 2 ** header[2] for sample in struct.unpack('>' + 'H' * (length // 2), value)):
+                    return False
+            elif kind == b'tEXt':
+                keyword, separator, text = value.partition(b'\x00')
+                if (not separator or not 1 <= len(keyword) <= 79 or b'\x00' in text
+                        or keyword.startswith(b' ') or keyword.endswith(b' ') or b'  ' in keyword
+                        or any(not (32 <= c <= 126 or 161 <= c <= 255) for c in keyword)):
+                    return False
+            elif kind == b'tIME':
+                _, month, day, hour, minute, second = struct.unpack('>H5B', value)
+                if not (1 <= month <= 12 and 1 <= day <= 31 and hour <= 23 and minute <= 59 and second <= 60):
+                    return False
+            elif kind not in (b'IDAT',) and not (kind[0] & 32):
+                return False
+        return seen_end and not remaining_rows and not offset and not passes and not stream.read(1)
+
+
+def image_issue(path, *, previews=None):
+    try:
+        if Image is None:
+            return None if _png_decodes(path) else 'not a decodable image'
+        with Image.open(path) as image:
+            image.load()
+            if previews is not None:
+                previews[str(Path(path))] = image.convert('RGB').resize((320, 180), Image.Resampling.BOX)
+        return None
+    except Exception:  # noqa: BLE001 - any unreadable or unsupported image is excluded
+        return 'not a decodable image'
+
+
+def _cached_image_issue(path, cache):
+    if cache is None:
+        return image_issue(path)
+    key = str(Path(path))
+    if key not in cache:
+        preview = {}
+        issue = image_issue(path, previews=preview)
+        cache[key] = (issue, preview.get(key))
+    return cache[key][0]
+
+
+def shot_issue(shot, image_cache=None):
     path = shot.get('path')
     if not path:
         return 'still was not taken'
@@ -186,6 +362,8 @@ def shot_issue(shot):
                 digest.update(block)
     except (OSError, TypeError, ValueError):
         return 'still file is missing or unreadable'
+    if _cached_image_issue(path, image_cache):
+        return 'still file is not a decodable image'
     record = shot.get('fresh')
     if not still_fresh.usable(record):
         return still_fresh.unusable_reason(record)
@@ -195,11 +373,16 @@ def shot_issue(shot):
     return None
 
 
-def clip_check(job, frames):
+def clip_check(job, frames, image_cache=None):
     """Deterministic: the expected-result shot exists, and the row changed something on screen."""
+    if image_cache is None:
+        image_cache = {}
+    for path in frames.values():
+        if isinstance(path, (str, Path)) and path:
+            _cached_image_issue(path, image_cache)
     shots = job.get('shots') or []
     taken = [s for s in shots if s.get('phase') in ('before', 'step', 'after') and s.get('path')]
-    checked = [(s, shot_issue(s)) for s in taken]
+    checked = [(s, shot_issue(s, image_cache)) for s in taken]
     excluded = [{'path': s['path'],
                  **({'label': s['label']} if s.get('label') else
                     {'name': s.get('name') or Path(s['path']).name}),
@@ -226,9 +409,16 @@ def clip_check(job, frames):
     if not later:
         return unmeasured('nothing to compare with the before frame')
     diffs, unreadable = {}, []
+    def preview(path):
+        if not isinstance(path, (str, Path)):
+            return path
+        cached = image_cache.get(str(Path(path)))
+        if cached and cached[0]:
+            raise ValueError(cached[0])
+        return cached[1] if cached and cached[1] is not None else path
     for p in later:
         try:
-            diffs[str(p)] = round(frame_diff(before, p), 2)
+            diffs[str(p)] = round(frame_diff(preview(before), preview(p)), 2)
         except Exception:  # noqa: BLE001 - an unreadable still is listed, not a verdict
             unreadable.append(str(p))
     if not diffs:
@@ -270,10 +460,10 @@ def known_issue(known, verdict):
     return {'ids': ids, 'titles': [known[k]['title'] for k in ids], 'judge_reason': reason}
 
 
-def _shot_blockers(shots):
+def _shot_blockers(shots, image_cache=None):
     result = []
     for shot in shots:
-        issue = shot_issue(shot)
+        issue = shot_issue(shot, image_cache)
         if issue:
             path = shot.get('path')
             source = shot.get('label') or shot.get('name') or (Path(path).name if path else 'still')
@@ -282,7 +472,7 @@ def _shot_blockers(shots):
     return result
 
 
-def evidence_blockers(shots, verdict, all_shots=None):
+def evidence_blockers(shots, verdict, all_shots=None, image_cache=None):
     row_shots = [shot for shot in shots or [] if isinstance(shot, dict)
                  and shot.get('phase') in ('before', 'step', 'after')]
     available = [shot for shot in (all_shots or row_shots) if isinstance(shot, dict) and shot.get('path')]
@@ -300,21 +490,33 @@ def evidence_blockers(shots, verdict, all_shots=None):
         for shot in ([before] if before else []) + expected[-1:]:
             if shot not in matched:
                 matched.append(shot)
-    return _shot_blockers(matched)
+    return _shot_blockers(matched, image_cache)
 
 
-def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_shots=None):
+def retire_evidence(receipt, attempt=None):
+    blockers = receipt.get('blockers') or []
+    removed = [item for item in blockers if item.get('kind') == 'evidence']
+    if removed:
+        previous = attempt if isinstance(attempt, dict) else receipt.get('judge')
+        previous = previous if isinstance(previous, dict) else {}
+        receipt['blockers'] = [item for item in blockers if item.get('kind') != 'evidence']
+        receipt.setdefault('evidence_attempts', []).append(
+            {'verdict': previous.get('verdict'), 'landed': previous.get('landed'), 'blockers': removed})
+
+
+def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_shots=None, image_cache=None):
+    retire_evidence(receipt)
     gates_status = receipt.get('gates_status', receipt.get('status'))
     status, reason, review = final_status(gates_status, receipt.get('effects_passed') or [], check, verdict)
     if gates_status != 'PASS':
-        evidence = evidence_blockers(shots, verdict, all_shots)
+        evidence = evidence_blockers(shots, verdict, all_shots, image_cache)
     elif check and not check.get('ok', True):
         compared = check.get('diffs') or {}
         evidence = _shot_blockers([shot for shot in shots or [] if isinstance(shot, dict)
                                    and shot.get('phase') in ('before', 'step', 'after') and shot.get('path')
-                                   and (shot['path'] == check.get('before') or shot['path'] in compared)])
+                                   and (shot['path'] == check.get('before') or shot['path'] in compared)], image_cache)
     else:
-        evidence = (evidence_blockers(shots, verdict, all_shots)
+        evidence = (evidence_blockers(shots, verdict, all_shots, image_cache)
                     if (verdict or {}).get('verdict') in ('PASS', 'FAIL') else [])
         if (verdict or {}).get('verdict') in ('PASS', 'FAIL') and (check or {}).get('unmeasured'):
             for shot in check.get('excluded') or []:
@@ -354,6 +556,8 @@ def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_s
     receipt['clip_check'] = check
     receipt['status'] = status
     receipt['status_reason'] = reason
+    if status == 'PASS':
+        receipt.pop('review_kind', None)
     if review:
         receipt['review'] = True
     else:
@@ -384,6 +588,7 @@ def mark_retry(receipt_path):
         previous = receipt.get('judge')
         if not isinstance(previous, dict) or previous.get('state') != 'done':
             return
+        retire_evidence(receipt, previous)
         receipt['judge'] = {'state': 'pending', 'retry': True,
                             'previous': {'verdict': previous.get('verdict'), 'landed': previous.get('landed')}}
         if receipt.get('gates_status') == 'PASS':
@@ -427,6 +632,7 @@ def work(job_path):
     initial_shots = job.get('shots') or []
     job['shots'], job['judge_shots'], job['excluded_shots'] = [], [], []
     frames = {}
+    image_cache = {}
     try:
         try:
             mark_retry(job['receipt'])
@@ -467,7 +673,7 @@ def work(job_path):
                 name = s['name'][len(job['row']) + 1:] if s['name'].startswith(job['row'] + '-') else s['name']
                 return f'shot-{i}' if re.search(r'FAIL|PASS', name) else f'{s.get("phase", "step")}:{name}'
             job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(row_shots, 1)]
-            checked = [(s, shot_issue(s)) for s in job['shots']]
+            checked = [(s, shot_issue(s, image_cache)) for s in job['shots']]
             job['excluded_shots'] = [
                 {'label': s['label'], 'name': s.get('name'), 'phase': s.get('phase'), 'path': s.get('path'),
                  'reason': issue} for s, issue in checked if issue]
@@ -476,14 +682,16 @@ def work(job_path):
                   **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)] + \
                 [{'label': f'dense {ms / 1000:.1f}s', 'path': p, 'phase': 'clip', 'clip_ms': ms}
                  for ms, p in sorted(dense.items())]
-            checked_clip = [(shot, Path(shot['path']).is_file()) for shot in clip_shots]
-            for shot, present in checked_clip:
-                if not present:
+            checked_clip = [(shot, 'clip frame file is missing' if not Path(shot['path']).is_file()
+                             else 'clip frame is not a decodable image'
+                             if _cached_image_issue(shot['path'], image_cache) else None) for shot in clip_shots]
+            for shot, issue in checked_clip:
+                if issue:
                     job['excluded_shots'].append({'label': shot['label'], 'name': None, 'phase': 'clip',
-                                                  'path': shot['path'], 'reason': 'clip frame file is missing'})
+                                                  'path': shot['path'], 'reason': issue})
             job['judge_shots'] = [s for s, issue in checked if not issue] + \
-                [s for s, present in checked_clip if present]
-            available_clip_labels = {s['label'] for s, present in checked_clip if present}
+                [s for s, issue in checked_clip if not issue]
+            available_clip_labels = {s['label'] for s, issue in checked_clip if not issue}
             frames = {k: p for k, p in frames.items() if f'clip {k}' in available_clip_labels}
             job['frames_by_name'] = frames
             job['frames_at_ms'] = frames_at  # where each clip frame was cut (clip time, ms): the judge times them from this
@@ -491,7 +699,8 @@ def work(job_path):
             if frame_error:
                 job['frame_error'] = frame_error
             job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
-            check = clip_check(job, frames)
+            check = clip_check(job, frames, image_cache)
+            image_cache = {path: (issue, None) for path, (issue, _) in image_cache.items()}
             if not check.get('ok', True):
                 verdict = {'verdict': 'FAIL', 'reason': f'clip check: {check["reason"]}', 'shots_cited': [],
                            'model': 'clip-check'}
@@ -505,11 +714,13 @@ def work(job_path):
             else:
                 verdict = run_judge(job_path, job)
     except Exception as error:  # noqa: BLE001 - a worker error is UNSURE (RAN-UNVERIFIED), never a PASS
+        image_cache = {path: (issue, None) for path, (issue, _) in image_cache.items()}
         check = {'ok': True, 'error': repr(error)[:300]}
         verdict = {'verdict': 'UNSURE', 'reason': f'judge worker error: {error!r}'[:300], 'shots_cited': [],
                    'model': None}
     def update(receipt):
-        apply_verdict(receipt, check, verdict, frames, job.get('known_issues'), job['shots'], job['judge_shots'])
+        apply_verdict(receipt, check, verdict, frames, job.get('known_issues'), job['shots'], job['judge_shots'],
+                      image_cache)
         if job['excluded_shots']:
             receipt['judge']['excluded_shots'] = job['excluded_shots']
 
