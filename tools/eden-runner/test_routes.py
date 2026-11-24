@@ -3621,6 +3621,15 @@ class WirelessRoomTests(unittest.TestCase):
         rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
         self.assertEqual(rows, [{**event, 'block': 'wireless_room'}])
 
+    def test_a_recording_macro_also_blocks_the_step_until_idle(self):
+        self.io.phase = 'stage'
+        self.status_script = lambda: {'state': 'recording' if self.now - self.io.stage_since < 1.2 else 'finished'}
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertGreaterEqual(self.io.stage_send_times[0] - self.io.stage_since, 1.2)
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        self.assertEqual(result['stalls'][0]['why'], 'macro recording')
+
     def test_a_macro_that_never_finishes_stops_on_the_step_with_the_receipt(self):
         self.io.phase = 'stage'
         self.status_script = lambda: {'state': 'playing'}
@@ -3648,8 +3657,18 @@ class WirelessRoomTests(unittest.TestCase):
                 stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
                 self.assertIn('macro.status unavailable:', stop['input_channel'])
 
+    def test_a_macro_status_error_is_not_an_idle_channel(self):
+        self.io.phase = 'stage'
+        self.status_script = lambda: {'state': 'finished', 'error': 'decoder fault'}
+        with self.assertRaises(routes.closed_loop.RouteStopped):
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.actions, [])
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['input_channel'], 'macro.status unavailable: decoder fault')
+
     def test_a_busy_macro_play_reply_is_not_a_blind_resend(self):
         self.io.phase = 'stage'
+        self.io.place_on_chord = True
         self.io.busy_macro, self.io.busy_left = 'lobby-a', 1
         result = self.run_room(unpublished_create='allow')
         self.assertEqual(self.io.actions.count('lobby-a'), 2)
@@ -3671,6 +3690,43 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertLess(self.io.confirm_sent_at, 2)
         self.assertEqual(result['confirm_presses'], 1)
         record = next(item for item in result['steps'] if item['name'] == 'confirm-create')
+        self.assertEqual((record['sends'], record['busy_rejections']), (1, 1))
+
+    def test_a_busy_rejection_followed_by_a_long_wait_reports_both_stalls(self):
+        self.io.phase = 'stage'
+        self.io.busy_macro, self.io.busy_left = 'lobby-a', 1
+        self.status_script = lambda: {'state': 'playing' if not self.io.busy_left
+                                      and not self.io.stage_count and self.now < 2.1 else 'finished'}
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertEqual(result['result'], 'PASS with 2 stalls')
+        self.assertEqual([event['kind'] for event in result['stalls']], ['busy-rejected', 'idle-wait'])
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{**event, 'block': 'wireless_room'} for event in result['stalls']])
+
+    def test_two_busy_dispatches_stop_with_both_stalls_in_the_receipt(self):
+        self.io.phase = 'stage'
+        self.io.busy_macro, self.io.busy_left = 'lobby-a', 2
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'stage-a')
+        self.assertEqual(self.io.actions, ['lobby-a', 'lobby-a'])
+        self.assertEqual(self.io.stage_count, 0)
+        self.assertIsNone(self.io.pending)
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual((stop['sends'], stop['input_channel'], stop['result']),
+                         (0, 'macro.play busy', 'STOPPED with 2 stalls'))
+        self.assertEqual([event['kind'] for event in stop['stalls']], ['busy-rejected', 'busy-rejected'])
+        rows = [json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()]
+        self.assertEqual(rows, [{**event, 'block': 'wireless_room'} for event in stop['stalls']])
+
+    def test_a_busy_create_press_is_rechecked_before_it_opens_the_form(self):
+        self.io.phase = 'rooms'
+        self.io.busy_macro, self.io.busy_left = 'tap-a1', 1
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.actions.count('tap-a1'), 2)
+        self.assertEqual(result['create_witness'], 'none: unpublished Create form allowed by the caller')
+        record = next(item for item in result['steps'] if item['name'] == 'open-create')
         self.assertEqual((record['sends'], record['busy_rejections']), (1, 1))
 
     def test_open_create_presses_only_on_the_create_row(self):

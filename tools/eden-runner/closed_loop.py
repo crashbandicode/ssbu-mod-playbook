@@ -15,6 +15,8 @@ class RouteStopped(RuntimeError):
 
 
 class Step:
+    """A before_send hook may return a rollback for a known busy rejection."""
+
     def __init__(self, name, at, done, macro, *, cap, ready_cap=20.0, lost_after=4.0, sends=3,
                  before_send=None, target=None, source=None):
         self.name = name
@@ -31,7 +33,7 @@ class Step:
 
 
 def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time.sleep, poll=0.3,
-        locate_cap=20.0, on_step=None, on_stall=None):
+        locate_cap=20.0, on_step=None, on_stall=None, idle=None, idle_cap=15.0):
     records = [{'name': step.name, 'sends': 0, 'skipped': True, 'ms': 0, 'unanswered': 0} for step in steps]
     entered_at = 'done'
     stalls = []
@@ -107,6 +109,41 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         enriched = on_stall(event, obs) if on_stall else None
         stalls.append(event if enriched is None else enriched)
 
+    def wait_idle(step, record, obs, *, rejected=False, rejection_reason=None):
+        if idle is None:
+            if rejected:
+                started_wait = clock()
+                sleep(poll)
+                elapsed = clock() - started_wait
+                record['idle_waits'] = record.get('idle_waits', 0) + 1
+                record['idle_wait_ms'] = record.get('idle_wait_ms', 0) + round(elapsed * 1000)
+                if elapsed > 1.0:
+                    stall({'kind': 'idle-wait', 'step': step.name, 'seconds': elapsed,
+                           'why': rejection_reason}, obs)
+                return True
+            return False
+        started_wait = clock()
+        why = idle()
+        if why is None:
+            return False
+        record['idle_waits'] = record.get('idle_waits', 0) + 1
+        deadline = started_wait + idle_cap
+        current = why
+        while current is not None and clock() < deadline:
+            sleep(min(poll, max(0.0, deadline - clock())))
+            current = idle()
+            if current is not None:
+                why = current
+        elapsed = clock() - started_wait
+        record['idle_wait_ms'] = record.get('idle_wait_ms', 0) + round(elapsed * 1000)
+        if elapsed > 1.0:
+            stall({'kind': 'idle-wait', 'step': step.name, 'seconds': elapsed, 'why': why}, obs)
+        if current is not None or clock() > deadline:
+            record['input_channel'] = why
+            record['ms'] += round((clock() - active_started) * 1000)
+            stop(step.name, f'input channel busy for {elapsed:g} s: {why}; nothing was sent')
+        return True
+
     active_index, active_started = None, None
     if not steps:
         return receipt()
@@ -171,10 +208,9 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 if retry['changed_since'] is not None:
                     retry['changed_since'] += clock() - retry['pause_at']
                 retry['pause_at'] = None
-            # While a retry is prepared the earlier send is still unconfirmed: it is confirmed only by a
-            # transition seen here, or just before the resend on the same target.
+            # A prepared retry retains its target even if its first dispatch was rejected as busy.
             if done(step, obs):
-                if retry is not None:
+                if retry is not None and not retry.get('finished'):
                     finish()
                 record['ms'] += round((clock() - started) * 1000)
                 index += 1
@@ -182,7 +218,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     obs = read(index)
                 break
             if done(steps[-1], obs):
-                if retry is not None:
+                if retry is not None and not retry.get('finished'):
                     finish()
                 record['ms'] += round((clock() - started) * 1000)
                 return receipt()
@@ -207,7 +243,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 obs = wait(ready_deadline, index)
                 continue
             if not at and other is not None:
-                if retry is not None:
+                if retry is not None and not retry.get('finished'):
                     finish()
                 record['ms'] += round((clock() - started) * 1000)
                 index = other
@@ -226,24 +262,47 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                             stop(step.name, f'not ready: last read {obs!r}')
                         obs = wait(ready_deadline, index)
                         continue
-                    finish()
-                    stall(retry['event'], obs)
-                    retry = None
                 if record['sends'] >= step.sends:
                     record['ms'] += round((clock() - started) * 1000)
                     stop(step.name, f'no transition after {record["sends"]} sends')
+                if wait_idle(step, record, obs):
+                    obs = read(index)
+                    continue
+                if retry is not None and not retry.get('finished'):
+                    finish()
+                    stall(retry['event'], obs)
+                    retry['finished'] = True
+                rollback = None
                 if step.before_send:
-                    step.before_send(obs)
+                    rollback = step.before_send(obs)
                 macro = step.macro(obs) if callable(step.macro) else step.macro
                 witness = target(step, obs)
                 record['sends'] += 1
                 record['skipped'] = False
+                dispatch_started = clock()
                 try:
                     send(macro)
                 except RuntimeError as error:
+                    if 'busy' in str(error).lower():
+                        record['sends'] -= 1
+                        finish()
+                        if callable(rollback):
+                            rollback()
+                        count = record.get('busy_rejections', 0) + 1
+                        record['busy_rejections'] = count
+                        stall({'kind': 'busy-rejected', 'step': step.name, 'seconds': clock() - dispatch_started,
+                               'why': str(error)}, obs)
+                        if count >= 2:
+                            record['input_channel'] = str(error)
+                            record['ms'] += round((clock() - started) * 1000)
+                            stop(step.name, 'dispatch rejected as busy twice; nothing was delivered')
+                        wait_idle(step, record, obs, rejected=True, rejection_reason=str(error))
+                        obs = read(index)
+                        continue
                     record['dispatch'] = 'unknown'
                     record['ms'] += round((clock() - started) * 1000)
                     stop(step.name, f'dispatch failed, delivery unknown: {error}')
+                retry = None
                 deadline = clock() + step.cap
                 lost_since = changed_since = None
                 pause_at = None

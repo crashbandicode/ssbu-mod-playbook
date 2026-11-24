@@ -93,6 +93,20 @@ def _bridge_tail(ctx):
     return None
 
 
+def _eden_macro_busy(ctx):
+    try:
+        status = ctx.call('macro.status')
+        if not isinstance(status, dict):
+            return 'macro.status unavailable: non-dict reply'
+        if status.get('error'):
+            return f'macro.status unavailable: {status["error"]}'
+        if status.get('state') in ('playing', 'recording'):
+            return f'macro {status["state"]}'
+        return None
+    except Exception as error:
+        return f'macro.status unavailable: {error}'
+
+
 def _stall_result(ok, stalls):
     result = 'PASS' if ok else 'STOPPED'
     count = len(stalls)
@@ -1065,10 +1079,12 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         return isinstance(at, str) and at.isdigit() and tile.get('hovered') == at
 
     def begin_create(_obs):
+        previous = {key: state[key] for key in ('form_pending', 'form_ready', 'form_settling', 'form_away')}
         state['form_pending'] = True
         state['form_ready'] = False
         state['form_settling'] = False
         state['form_away'] = 0
+        return lambda: state.update(previous)
 
     def create_done(obs):
         if not state['form_pending']:
@@ -1126,11 +1142,15 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         return False
 
     def begin_confirm(_obs):
+        previous = state['confirm_at']
         state['confirm_at'] = time.monotonic()
+        return lambda: state.__setitem__('confirm_at', previous)
 
     def fence_chord(obs):
+        previous = state['chord_fence']
         state['chord_fence'] = {key: obs['tile'].get(key)
                                 for key in ('screen', 'p1.token', 'local.token', 'at', 'hovered')}
+        return lambda: state.__setitem__('chord_fence', previous)
 
     def css(obs):
         return available() and local(obs, 'css.smash')
@@ -1213,7 +1233,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
 
     def on_stall(event, obs):
         result = {
-            **event, 'kind': 'resend', 'screen': obs['ui'].get('screen'), **state['ui_clock'],
+            **event, 'kind': event.get('kind', 'resend'), 'screen': obs['ui'].get('screen'), **state['ui_clock'],
             'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_frame_ms': None, 'utc': _stall_utc(),
         }
         try:
@@ -1229,7 +1249,8 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
 
     try:
         outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
-                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall)
+                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
+                                  idle=lambda: _eden_macro_busy(ctx))
     except closed_loop.RouteStopped as error:
         reason = error.reason
         continuity = (error.receipt.get('continuity') == 'lost'
@@ -1293,6 +1314,10 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
             stop_receipt['last_tile'] = state['last_answered_tile']
         dispatch = next((entry.get('dispatch') for entry in error.receipt['steps'] if entry['name'] == error.step),
                         None)
+        input_channel = next((entry.get('input_channel') for entry in error.receipt['steps']
+                              if entry['name'] == error.step), None)
+        if input_channel is not None:
+            stop_receipt['input_channel'] = error.receipt['input_channel'] = input_channel
         if dispatch is not None:
             stop_receipt['dispatch'] = error.receipt['dispatch'] = dispatch
         if reason.startswith('unsupported reader: the Create form is not published as ldn.create'):

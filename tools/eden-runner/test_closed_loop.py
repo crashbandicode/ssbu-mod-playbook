@@ -54,7 +54,8 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(fake.sends, [('press', 3)])
         self.assertEqual([value for _, value in polls[:4]], ['macro playing'] * 3 + [None])
         sent = fake.events.index(('send', 'press'))
-        self.assertEqual(fake.events[sent - 1], ('read', 'source'))
+        first_idle = fake.events.index(('idle', None))
+        self.assertIn(('read', 'source'), fake.events[first_idle + 1:sent])
         self.assertEqual(result['steps'][0]['idle_waits'], 1)
         self.assertEqual(result['steps'][0]['idle_wait_ms'], 3000)
         self.assertEqual(result['stalls'][0]['kind'], 'idle-wait')
@@ -141,6 +142,94 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertNotIn(('finish',), fake.events[first_idle:next_idle])
         self.assertEqual(result['steps'][0]['idle_waits'], 1)
         self.assertIn('idle-wait', [event.get('kind') for event in result['stalls']])
+
+    def test_a_rejected_resend_never_acts_on_a_new_target(self):
+        attempts = []
+        fake = Script(lambda f: ('source', 'tile-1' if len(attempts) >= 2 else 'tile-0'))
+        send = fake.send
+
+        def dispatch(macro):
+            attempts.append(macro)
+            if len(attempts) == 2:
+                raise RuntimeError('macro.play busy')
+            send(macro)
+
+        fake.send = dispatch
+        item = Step('press', lambda value: value[0] == 'source', lambda value: value[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda value: value[1])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item], idle=lambda: None)
+        self.assertEqual(attempts, ['press', 'press'])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 2)
+        self.assertIn('source target changed', caught.exception.reason)
+
+    def test_a_transition_after_a_rejected_resend_does_not_finish_twice(self):
+        attempts = []
+        fake = Script(lambda f: 'done' if len(attempts) >= 2 else 'source')
+        send = fake.send
+
+        def dispatch(macro):
+            attempts.append(macro)
+            if len(attempts) == 2:
+                raise RuntimeError('macro.play busy')
+            send(macro)
+
+        fake.send = dispatch
+        result = fake.run([step('press', 'source', 'done', lost_after=2)], idle=lambda: None)
+        self.assertEqual(attempts, ['press', 'press'])
+        self.assertEqual(fake.finishes, 2)
+        self.assertEqual(result['steps'][0]['sends'], 1)
+        self.assertEqual([event.get('kind', 'resend') for event in result['stalls']],
+                         ['resend', 'busy-rejected'])
+
+    def test_a_rejection_without_an_idle_callback_waits_and_reads_again(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        attempts, send = [], fake.send
+
+        def dispatch(macro):
+            attempts.append(fake.now)
+            if len(attempts) == 1:
+                raise RuntimeError('input_busy')
+            send(macro)
+
+        fake.send = dispatch
+        result = fake.run([step('press', 'source', 'done')])
+        self.assertEqual(attempts, [0, 1])
+        self.assertEqual(result['steps'][0]['sends'], 1)
+        self.assertEqual(result['steps'][0]['busy_rejections'], 1)
+        self.assertEqual(result['steps'][0]['idle_waits'], 1)
+        self.assertEqual(result['steps'][0]['idle_wait_ms'], 1000)
+        self.assertEqual(result['stalls'][0]['kind'], 'busy-rejected')
+
+    def test_a_target_changed_while_waiting_to_resend_stays_unconfirmed(self):
+        fake = Script(lambda f: ('source', 'tile-1' if f.now >= 6 else 'tile-0'))
+        item = Step('press', lambda value: value[0] == 'source', lambda value: value[0] == 'done',
+                    'press', cap=20, lost_after=2, target=lambda value: value[1])
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item], idle=lambda: 'macro playing' if fake.sends and 3 <= fake.now < 6 else None)
+        self.assertIn('source target changed', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+
+    def test_a_busy_timeout_before_a_resend_keeps_the_input_unconfirmed(self):
+        fake = Script(lambda f: 'source')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', lost_after=2)], idle_cap=2,
+                     idle=lambda: 'macro playing' if fake.sends else None)
+        self.assertIn('input channel busy for 2 s', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual(caught.exception.receipt['steps'][0]['sends'], 1)
+        self.assertEqual(caught.exception.receipt['stalls'][0]['kind'], 'idle-wait')
+
+    def test_a_one_second_idle_wait_is_counted_but_not_a_stall(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        result = fake.run([step('press', 'source', 'done')],
+                          idle=lambda: 'macro recording' if fake.now < 1 else None)
+        self.assertEqual(result['steps'][0]['idle_waits'], 1)
+        self.assertEqual(result['steps'][0]['idle_wait_ms'], 1000)
+        self.assertEqual(result['stalls'], [])
 
     def test_a_changed_source_target_never_confirms_a_prepared_retry(self):
         for change_on in (2, 3):
