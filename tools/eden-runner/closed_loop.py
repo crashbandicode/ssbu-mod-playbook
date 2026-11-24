@@ -1,4 +1,6 @@
 """Closed-loop steps for routes that can observe their current state."""
+import inspect
+import math
 import time
 
 
@@ -41,12 +43,24 @@ class Step:
 
 
 def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time.sleep, poll=0.3,
-        locate_cap=20.0, on_step=None, on_stall=None, idle=None, idle_cap=15.0):
+        locate_cap=20.0, on_step=None, on_stall=None, idle=None, idle_cap=15.0, revalidate_cap=0.0):
+    if not isinstance(revalidate_cap, (int, float)) or not math.isfinite(revalidate_cap) or revalidate_cap < 0:
+        raise ValueError(f'revalidate_cap must be finite and non-negative, got {revalidate_cap!r}')
     records = [{'name': step.name, 'sends': 0, 'skipped': True, 'ms': 0, 'unanswered': 0} for step in steps]
     entered_at = 'done'
     stalls = []
     last_answered, last_answered_at, locate_unanswered = None, None, 0
     idle_budget = None
+    idle_with_cap = True
+    if idle is not None:
+        try:
+            signature = inspect.signature(idle)
+            try:
+                signature.bind(1.0)
+            except TypeError:
+                idle_with_cap = False
+        except (TypeError, ValueError):
+            pass
 
     def receipt():
         flush_idle_budget()
@@ -70,6 +84,11 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
 
     def read(index=None):
         nonlocal last_answered, last_answered_at, locate_unanswered
+        if idle_budget is not None:
+            check_idle_budget()
+            if idle_cap - (clock() - idle_budget['started']) < revalidate_cap:
+                stop_idle_budget(f'not enough of the bound left to re-read the screen (needs {revalidate_cap:g} s); '
+                                 'nothing was sent')
         try:
             value = observe()
         except RuntimeError as error:
@@ -115,8 +134,11 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         return (f'source target changed after the send: {witness!r} -> {current!r}; '
                 'the input is neither confirmed nor repeatable')
 
-    def stall(event, obs):
-        enriched = on_stall(event, obs) if on_stall else None
+    def stall(event, obs, *, skip_diagnostic=False):
+        payload = {**event, '_skip_diagnostic': True} if skip_diagnostic else event
+        enriched = on_stall(payload, obs) if on_stall else None
+        if enriched is not None and skip_diagnostic:
+            enriched = {key: value for key, value in enriched.items() if key != '_skip_diagnostic'}
         stalls.append(event if enriched is None else enriched)
 
     def flush_idle_budget(ended=None):
@@ -168,19 +190,24 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         if total_ms:
             record['idle_wait_ms'] = total_ms
 
-    def check_idle_budget():
+    def stop_idle_budget(tail):
+        elapsed = clock() - idle_budget['started']
+        record = records[idle_budget['index']]
+        record['input_channel'] = idle_budget['why']
+        if active_index == idle_budget['index']:
+            record['ms'] += round((clock() - active_started) * 1000)
+        stop(steps[idle_budget['index']].name,
+             f'input channel busy for {elapsed:g} s over {idle_budget["waits"]} waits: '
+             f'{idle_budget["why"]}; {tail}')
+
+    def check_idle_budget(*, min_remaining=0.0):
         if idle_budget is not None:
             elapsed = clock() - idle_budget['started']
-            if elapsed >= idle_cap:
-                record = records[idle_budget['index']]
-                record['input_channel'] = idle_budget['why']
-                record['ms'] += round((clock() - active_started) * 1000)
-                stop(steps[idle_budget['index']].name,
-                     f'input channel busy for {elapsed:g} s over {idle_budget["waits"]} waits: '
-                     f'{idle_budget["why"]}; nothing was sent')
+            if elapsed >= idle_cap or idle_cap - elapsed < min_remaining:
+                stop_idle_budget('nothing was sent')
 
     def wait_idle(step, record, obs, *, rejected=False, rejection_reason=None):
-        check_idle_budget()
+        check_idle_budget(min_remaining=0.05 if idle is not None else 0.0)
         if idle is None:
             if rejected:
                 begin_idle_budget(active_index, clock(), rejection_reason)
@@ -192,10 +219,13 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 return True
             return False
         started_wait = clock()
-        why = idle()
+        remaining = idle_cap if idle_budget is None else idle_cap - (clock() - idle_budget['started'])
+        if idle_budget is not None and remaining < 0.05:
+            stop_idle_budget('nothing was sent')
+        why = idle(remaining) if idle_with_cap else idle()
         duration = clock() - started_wait
         if idle_budget is None and (why is not None or duration > 1.0):
-            begin_idle_budget(active_index, started_wait if duration > 1.0 else clock(),
+            begin_idle_budget(active_index, started_wait,
                               why if why is not None else 'macro.status slow', measure_started=started_wait)
         if why is None:
             if duration > 1.0:
@@ -210,7 +240,11 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
             sleep(min(poll, max(0.0, deadline - clock())))
             if clock() >= deadline:
                 break
-            current = idle()
+            remaining = deadline - clock()
+            if remaining < 0.05:
+                note_idle_wait(why)
+                stop_idle_budget('nothing was sent')
+            current = idle(remaining) if idle_with_cap else idle()
             if current is not None:
                 why = current
         note_idle_wait(why)
@@ -354,7 +388,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     check_idle_budget()
                 if retry is not None and not retry.get('finished'):
                     if not retry.get('stall_reported'):
-                        stall(retry['event'], obs)
+                        stall(retry['event'], obs, skip_diagnostic=idle_budget is not None)
                         retry['stall_reported'] = True
                     if idle_budget is not None and clock() - idle_budget['started'] >= idle_cap:
                         if callable(rollback):
@@ -462,7 +496,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                             event = {'step': step.name, 'send': record['sends'],
                                      'seconds_on_source': clock() - lost_since, 'target': repr(witness)}
                             if record['sends'] >= step.sends:
-                                stall(event, obs)
+                                stall(event, obs, skip_diagnostic=True)
                                 finish()
                                 record['ms'] += round((clock() - started) * 1000)
                                 stop(step.name, f'no transition after {record["sends"]} sends')

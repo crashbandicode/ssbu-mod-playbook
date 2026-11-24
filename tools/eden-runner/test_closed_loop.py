@@ -40,6 +40,140 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_an_invalid_revalidation_cap_is_rejected_before_any_read(self):
+        for value in (-1, float('nan'), float('inf'), None, '4'):
+            with self.subTest(value=value):
+                fake = Script(lambda f: 'source')
+                with self.assertRaisesRegex(ValueError, 'revalidate_cap must be finite and non-negative'):
+                    fake.run([step('press', 'source', 'done')], revalidate_cap=value)
+                self.assertEqual(fake.events, [])
+
+    def test_idle_at_fourteen_seconds_stops_instead_of_starting_a_read_that_would_overrun(self):
+        reads = []
+
+        def observe(fake):
+            reads.append(fake.now)
+            if fake.now:
+                fake.now += 4
+            return 'source'
+
+        fake = Script(observe)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')], idle=lambda _: 'macro playing' if fake.now < 14 else None,
+                     idle_cap=15, revalidate_cap=4)
+        self.assertLessEqual(fake.now, 16.25)
+        self.assertEqual(reads, [0])
+        self.assertEqual(fake.sends, [])
+        self.assertIn('not enough of the bound left to re-read the screen (needs 4 s); nothing was sent',
+                      caught.exception.reason)
+
+    def test_an_idle_answer_with_enough_budget_left_revalidates_and_sends(self):
+        reads = []
+
+        def observe(fake):
+            reads.append(fake.now)
+            if fake.sends:
+                return 'done'
+            if fake.now:
+                fake.now += 4
+            return 'source'
+
+        fake = Script(observe)
+        result = fake.run([step('press', 'source', 'done')],
+                          idle=lambda _: 'macro playing' if fake.now < 3 else None,
+                          idle_cap=15, revalidate_cap=4)
+        self.assertEqual(reads[:2], [0, 3])
+        self.assertEqual(fake.sends, [('press', 7)])
+        self.assertEqual(result['steps'][0]['sends'], 1)
+
+    def test_an_exact_revalidation_reserve_is_allowed_but_not_a_late_send(self):
+        reads = []
+
+        def observe(fake):
+            reads.append(fake.now)
+            if fake.now:
+                fake.now += 4
+            return 'source'
+
+        fake = Script(observe)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')],
+                     idle=lambda _: 'macro playing' if fake.now < 11 else None,
+                     idle_cap=15, revalidate_cap=4)
+        self.assertEqual(reads, [0, 11])
+        self.assertEqual(fake.now, 15)
+        self.assertEqual(fake.sends, [])
+        self.assertIn('input channel busy for 15 s', caught.exception.reason)
+
+    def test_an_insufficient_read_reserve_keeps_a_lost_input_unconfirmed(self):
+        fake = Script(lambda f: 'source')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', lost_after=2)],
+                     idle=lambda _: 'macro playing' if fake.sends and fake.now < 16 else None,
+                     idle_cap=15, revalidate_cap=4)
+        self.assertIn('not enough of the bound left to re-read', caught.exception.reason)
+        self.assertEqual(fake.sends, [('press', 0)])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_a_poll_is_not_started_with_less_than_fifty_milliseconds_left(self):
+        fake = Script(lambda f: 'source')
+        calls = []
+
+        def idle(remaining):
+            calls.append(remaining)
+            fake.now += 14.96
+            return 'macro playing'
+
+        with self.assertRaises(RouteStopped):
+            run('fixture', [step('press', 'source', 'done')], fake.observe, fake.send, fake.finish,
+                clock=lambda: fake.now, sleep=fake.sleep, poll=.01, idle=idle, idle_cap=15)
+        self.assertEqual(calls, [15])
+        self.assertLessEqual(fake.now, 15)
+        self.assertEqual(fake.sends, [])
+
+    def test_a_rejected_dispatch_does_not_read_without_the_revalidation_reserve(self):
+        fake = Script(lambda f: 'source')
+        attempts, statuses = [], []
+
+        def send(macro):
+            attempts.append(macro)
+            raise closed_loop.DispatchRejected('input_busy')
+
+        def idle(remaining):
+            statuses.append(remaining)
+            if len(statuses) == 2:
+                fake.now += 2.5
+            return None
+
+        fake.send = send
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=3, revalidate_cap=1)
+        self.assertEqual(fake.events.count(('read', 'source')), 1)
+        self.assertEqual(attempts, ['press'])
+        self.assertEqual(fake.finishes, 1)
+        self.assertIn('not enough of the bound left to re-read', caught.exception.reason)
+
+    def test_an_unanswered_revalidation_preserves_the_read_reserve(self):
+        reads = []
+
+        def observe(fake):
+            reads.append(fake.now)
+            if len(reads) > 1:
+                fake.now += 4
+                return closed_loop.NO_READ
+            return 'source'
+
+        fake = Script(observe)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')],
+                     idle=lambda _: 'macro playing' if fake.now < 3 else None,
+                     idle_cap=10, revalidate_cap=4)
+        self.assertEqual(reads, [0, 3])
+        self.assertEqual(fake.now, 8)
+        self.assertEqual(fake.sends, [])
+        self.assertEqual(caught.exception.receipt['steps'][0]['unanswered'], 1)
+        self.assertIn('not enough of the bound left to re-read', caught.exception.reason)
+
     def test_each_idle_poll_gets_only_the_remaining_budget(self):
         fake = Script(lambda f: 'done' if f.sends else 'source')
         calls = []

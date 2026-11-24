@@ -37,6 +37,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -93,9 +94,28 @@ def _bridge_tail(ctx):
     return None
 
 
-def _eden_macro_busy(ctx):
+def _bounded_call(ctx, method, cap):
+    result = []
+
+    def call():
+        try:
+            result.append((True, ctx.call(method)))
+        except BaseException as error:
+            result.append((False, error))
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(cap)
+    return result[0] if not worker.is_alive() else (False, None)
+
+
+def _eden_macro_busy(ctx, remaining):
     try:
-        status = ctx.call('macro.status')
+        answered, status = _bounded_call(ctx, 'macro.status', remaining)
+        if not answered:
+            if status is None:
+                return f'macro.status not answered within {remaining:g} s'
+            return f'macro.status not understood: {repr(status)[:160]}'
         if isinstance(status, dict):
             state, error = status.get('state'), status.get('error')
             if error in (None, ''):
@@ -1025,12 +1045,14 @@ def _wireless_placed(tile):
                                              or tile.get('local.token') == 'placed')
 
 
-def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
+def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0):
     """Reach the Local Wireless waiting room as host from an observed route screen."""
     if unpublished_create not in ('refuse', 'allow'):
         raise RuntimeError(f'wireless_room: invalid unpublished_create {unpublished_create!r}')
     if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
         raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
+    if not isinstance(idle_cap, (int, float)) or not math.isfinite(idle_cap) or idle_cap <= 0:
+        raise RuntimeError(f'wireless_room: idle_cap must be positive, got {idle_cap!r}')
     started, screens = time.monotonic(), []
     io = BridgePickerIO(ctx)
     state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
@@ -1242,25 +1264,28 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
             state['create_form'] = 'ldn.create'
 
     def on_stall(event, obs):
+        skip = event.get('_skip_diagnostic') or event.get('kind') in ('idle-wait', 'busy-rejected')
+        event = {key: value for key, value in event.items() if key != '_skip_diagnostic'}
         result = {
             **event, 'kind': event.get('kind', 'resend'), 'screen': obs['ui'].get('screen'), **state['ui_clock'],
-            'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_frame_ms': None, 'utc': _stall_utc(),
+            'tile': obs['tile'], 'last_bridge_line': _bridge_tail(ctx), 'eden_fps': None, 'eden_frame_ms': None,
+            'utc': _stall_utc(),
         }
-        try:
-            status = ctx.call('status') or {}
+        if not skip:
+            answered, status = _bounded_call(ctx, 'status', 1.0)
+            status = status if answered else {}
             fps = status.get('game_fps') if isinstance(status, dict) else None
             if isinstance(fps, (int, float)) and math.isfinite(fps) and fps > 0:
                 result['eden_fps'] = fps
                 result['eden_frame_ms'] = 1000 / fps
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-            pass
         _append_stall(ctx, 'wireless_room', result)
         return result
 
     try:
         outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
                                   clock=time.monotonic, sleep=time.sleep, on_step=on_step, on_stall=on_stall,
-                                  idle=lambda: _eden_macro_busy(ctx))
+                                  idle=lambda remaining: _eden_macro_busy(ctx, remaining), idle_cap=idle_cap,
+                                  revalidate_cap=4.5)
     except closed_loop.RouteStopped as error:
         reason = error.reason
         continuity = (error.receipt.get('continuity') == 'lost'

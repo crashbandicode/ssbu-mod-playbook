@@ -27,8 +27,10 @@ import test_native_picker as picker_fixtures  # noqa: E402
 class BoundedControlTests(unittest.TestCase):
     def blocked_call(self):
         release, entered, finished = threading.Event(), threading.Event(), threading.Event()
+        threads = []
 
         def call(method):
+            threads.append(threading.current_thread())
             entered.set()
             try:
                 release.wait(5)
@@ -40,6 +42,9 @@ class BoundedControlTests(unittest.TestCase):
             release.set()
             if entered.is_set():
                 self.assertTrue(finished.wait(1), 'control-call thread did not exit')
+                for thread in threads:
+                    thread.join(1)
+                    self.assertFalse(thread.is_alive(), 'control-call thread remains alive')
 
         self.addCleanup(cleanup)
         return types.SimpleNamespace(call=call)
@@ -47,9 +52,22 @@ class BoundedControlTests(unittest.TestCase):
     def test_bounded_call_returns_within_its_cap_when_the_control_call_hangs(self):
         ctx = self.blocked_call()
         started = time.monotonic()
-        answered, _ = routes._bounded_call(ctx, 'macro.status', 0.3)
+        answered, value = routes._bounded_call(ctx, 'macro.status', 0.3)
         self.assertFalse(answered)
+        self.assertIsNone(value)
         self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_bounded_call_returns_answers_and_exceptions(self):
+        self.assertEqual(routes._bounded_call(types.SimpleNamespace(call=lambda method: {'state': 'idle'}),
+                                              'macro.status', .3), (True, {'state': 'idle'}))
+        error = RuntimeError('control offline')
+
+        def fail(method):
+            raise error
+
+        answered, value = routes._bounded_call(types.SimpleNamespace(call=fail), 'macro.status', .3)
+        self.assertFalse(answered)
+        self.assertIs(value, error)
 
     def test_eden_macro_busy_reports_an_unanswered_status_as_busy(self):
         ctx = self.blocked_call()
@@ -3253,11 +3271,12 @@ class WirelessRoomTests(unittest.TestCase):
 
     def blocked_control(self, blocked_method):
         release, entered, finished = threading.Event(), threading.Event(), threading.Event()
-        calls = []
+        calls, threads = [], []
 
         def call(method):
             calls.append(method)
             if method == blocked_method:
+                threads.append(threading.current_thread())
                 entered.set()
                 try:
                     release.wait(5)
@@ -3270,6 +3289,9 @@ class WirelessRoomTests(unittest.TestCase):
             release.set()
             if entered.is_set():
                 self.assertTrue(finished.wait(1), 'control-call thread did not exit')
+                for thread in threads:
+                    thread.join(1)
+                    self.assertFalse(thread.is_alive(), 'control-call thread remains alive')
 
         self.addCleanup(cleanup)
         return call, calls
@@ -3302,6 +3324,60 @@ class WirelessRoomTests(unittest.TestCase):
         stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
         self.assertEqual(stop['stalls'][0]['kind'], 'idle-wait')
         self.assertIsNone(stop['stalls'][0]['eden_frame_ms'])
+        self.assertIsNone(stop['stalls'][0]['eden_fps'])
+
+    def test_the_route_declares_its_revalidation_cost(self):
+        self.io.phase = 'stage'
+        with mock.patch.object(routes.closed_loop, 'run', wraps=routes.closed_loop.run) as engine:
+            self.run_room(unpublished_create='allow')
+        ui_caps = [cap for provider, cap in self.io.read_caps if provider == 'ssbu.ui']
+        tile_caps = [cap for provider, cap in self.io.read_caps if provider == 'tile.cursor']
+        self.assertTrue(ui_caps and tile_caps)
+        self.assertGreaterEqual(engine.call_args.kwargs['revalidate_cap'], max(ui_caps) + max(tile_caps))
+
+    def test_a_resend_stop_does_not_request_diagnostic_status(self):
+        self.io.phase = 'stage'
+        self.io.stuck_stage = True
+        blocking, _ = self.blocked_control('status')
+        status_counts = []
+
+        def call(method):
+            if method == 'macro.status':
+                return {'state': 'finished'}
+            if method == 'status':
+                status_counts.append(self.io.stage_count)
+                if self.io.stage_count >= 3:
+                    return blocking(method)
+                return {'game_fps': 50}
+            return {}
+
+        self.ctx.call = call
+        started = time.perf_counter()
+        with self.assertRaises(routes.closed_loop.RouteStopped):
+            self.run_room(unpublished_create='allow')
+        self.assertLess(time.perf_counter() - started, .6)
+        self.assertEqual(self.io.stage_count, 3)
+        self.assertEqual(status_counts, [1, 2])
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertIsNone(stop['stalls'][-1]['eden_frame_ms'])
+        self.assertNotIn('_skip_diagnostic', stop['stalls'][-1])
+
+    def test_a_successful_resend_bounds_the_diagnostic_status_call(self):
+        self.io.phase = 'stage'
+        self.io.lost_stage_sends = 1
+        blocking, calls = self.blocked_control('status')
+
+        def call(method):
+            return {'state': 'finished'} if method == 'macro.status' else blocking(method)
+
+        self.ctx.call = call
+        started = time.perf_counter()
+        result = self.run_room(unpublished_create='allow')
+        self.assertLess(time.perf_counter() - started, 1.6)
+        self.assertEqual(calls, ['status'])
+        self.assertEqual(result['result'], 'PASS with 1 stall')
+        self.assertIsNone(result['stalls'][0]['eden_fps'])
+        self.assertIsNone(result['stalls'][0]['eden_frame_ms'])
 
     def test_an_unpublished_create_form_is_refused_by_default(self):
         with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
@@ -3863,8 +3939,9 @@ class WirelessRoomTests(unittest.TestCase):
         with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
             self.run_room(unpublished_create='allow')
         self.assertEqual(caught.exception.step, 'stage-a')
-        self.assertGreaterEqual(self.now, 15)
-        self.assertLessEqual(self.now, 15.3)
+        self.assertGreaterEqual(self.now, 10.5)
+        self.assertLessEqual(self.now, 10.81)
+        self.assertIn('not enough of the bound left to re-read', caught.exception.reason)
         self.assertEqual(self.io.actions, [])
         stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
         self.assertEqual(stop['input_channel'], 'macro playing')
