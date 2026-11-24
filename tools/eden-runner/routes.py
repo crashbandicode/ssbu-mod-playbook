@@ -47,6 +47,7 @@ try:
 except ImportError:
     fcntl = None
 
+import closed_loop
 import native_picker
 import state_gate
 import trace_attempts
@@ -977,167 +978,214 @@ def _wireless_placed(tile):
 
 
 def wireless_room(ctx, ready_cap=60):
-    """Create a Local Wireless room from the main menu and reach its waiting room as host (one member)."""
+    """Reach the Local Wireless waiting room as host from an observed route screen."""
     if not isinstance(ready_cap, (int, float)) or not math.isfinite(ready_cap) or ready_cap <= 0:
         raise RuntimeError(f'wireless_room: ready_cap must be positive, got {ready_cap!r}')
     started, screens = time.monotonic(), []
     io = BridgePickerIO(ctx)
+    state = {'last_ui': {}, 'last_tile': None, 'form_pending': False, 'form_ready': False,
+             'form_away': 0, 'create_form': None, 'confirm_at': None, 'confirm_presses': 0,
+             'stage_presses': 0, 'place_presses': 0, 'chord_sent': False, 'chord_fence': None,
+             'prefinished': False, 'current': None}
 
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 20,
-                              lambda v: v.get('screen') == 'main_menu' and v.get('observation.active') == 'yes'
-                              and v.get('input.owner') == 'native', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected main_menu with input.owner native; saw {last}')
-    io.send('lobby-open-room-list')
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 25,
-                              lambda v: v.get('screen') == 'ldn.room_list'
-                              and v.get('observation.active') == 'yes', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected ldn.room_list; saw {last}')
-    io.finish()
-    io.send('tap-a1')
+    def observe():
+        ui = _wireless_read(ctx, io, 'ssbu.ui', 2, screens)
+        state['last_ui'] = ui
+        tile = None
+        if (ui.get('screen') in ('stage_select', 'css.smash') and ui.get('screen.context') == 'local_wireless'
+                and ui.get('observation.active') == 'yes'):
+            tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
+            state['last_tile'] = tile
+        return {'ui': ui, 'tile': tile}
 
-    away, until = 0, time.monotonic() + 15
-    while away < 3:
-        remaining = max(.001, until - time.monotonic())
-        last = _wireless_read(ctx, io, 'ssbu.ui', min(2, remaining), screens)
-        screen = last.get('screen')
-        away = away + 1 if screen is not None and screen != 'ldn.room_list' else 0
-        if away < 3:
-            remaining = until - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f'wireless_room: expected ssbu.ui to leave ldn.room_list; saw {last}')
-            time.sleep(min(.3, remaining))
-    io.finish()
-    time.sleep(1.5)
-    last = _wireless_read(ctx, io, 'ssbu.ui', 2, screens)
-    if last.get('screen') not in ('unknown', 'ldn.create'):
-        seen = f'read error: {last["error"]}' if 'error' in last else str(last)
-        raise RuntimeError(f'wireless_room: expected the Create form (ldn.create, or unpublished) after A; saw {seen}')
-    create_form = 'ldn.create' if last['screen'] == 'ldn.create' else 'unpublished'
+    def active(obs, screen):
+        ui = obs['ui']
+        return ui.get('screen') == screen and ui.get('observation.active') == 'yes'
 
-    confirm_presses, room = 0, None
-    for attempt in range(2):
-        io.send('tap-plus1')
-        confirm_presses += 1
-        ok, last = _wireless_wait(
-            ctx, io, 'ssbu.ui', 20,
-            lambda v: (v.get('screen') in ('stage_select', 'css.smash')
-                       and v.get('screen.context') == 'local_wireless' and v.get('observation.active') == 'yes')
-            or v.get('screen') not in (None, 'unknown', 'ldn.create', 'stage_select', 'css.smash'), screens)
-        if (ok and last.get('screen') in ('stage_select', 'css.smash')
-                and last.get('screen.context') == 'local_wireless' and last.get('observation.active') == 'yes'):
-            io.finish()
-            room = last
-            break
-        if not ok and attempt == 0 and last.get('screen') is None:
-            seen = last.get('error', f'screen missing from {last}')
-            raise RuntimeError('wireless_room: no ssbu.ui reply after the Create confirm, so a second press would '
-                               f'have no screen witness; last read: {seen}')
-        if ok or last.get('screen') not in (None, 'unknown', 'ldn.create') or attempt == 1:
-            raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless after '
-                               f'{confirm_presses} confirm press(es); saw {last}, screens {screens}')
-        io.finish()
-    stage_presses = 0
-    if room['screen'] == 'stage_select':
-        for attempt in range(2):
-            ok, last = _wireless_wait(
-                ctx, io, 'ssbu.ui', 5,
-                lambda v: v.get('screen') in ('stage_select', 'css.smash')
-                and v.get('observation.active') == 'yes' and v.get('screen.context') == 'local_wireless', screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected stage_select or css.smash in local_wireless; saw {last}')
-            if last['screen'] == 'css.smash':
-                break
-            io.send('lobby-a')
-            stage_presses += 1
-            ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 15,
-                                      lambda v: v.get('screen') == 'css.smash'
-                                      and v.get('observation.active') == 'yes'
-                                      and v.get('screen.context') == 'local_wireless', screens)
-            if ok:
-                io.finish()
-                break
-            if (attempt == 1 or last.get('screen') != 'stage_select'
-                    or last.get('observation.active') != 'yes' or last.get('screen.context') != 'local_wireless'):
-                raise RuntimeError(f'wireless_room: expected css.smash in local_wireless; saw {last}, screens {screens}')
-            io.finish()
+    def local(obs, screen):
+        return active(obs, screen) and obs['ui'].get('screen.context') == 'local_wireless'
 
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                              lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
-                              and v.get('screen.context') == 'local_wireless', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before tile-up; saw {last}')
-    ok, tile = _wireless_wait(
-        ctx, io, 'tile.cursor', 8,
-        lambda v: v.get('screen') == 'css' and (_wireless_placed(v)
-                                                 or v.get('p1.token') == 'held'),
-        screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected tile.cursor screen css with p1.token held before the chord; '
-                           f'saw {tile}')
-    placed_by, chord_sent, chord_fence = 'already placed', False, None
-    if not _wireless_placed(tile):
+    def available():
+        return not state['form_pending']
+
+    def hovered(tile):
         at = tile.get('at')
-        if not (isinstance(at, str) and at.isdigit() and tile.get('hovered') == at):
-            chord_fence = {key: tile.get(key) for key in ('screen', 'p1.token', 'local.token', 'at', 'hovered')}
-            io.send('lobby-first-tile')
-            chord_sent = True
-            ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 5,
-                                      lambda v: v.get('screen') == 'css' and isinstance(v.get('at'), str)
-                                      and v['at'].isdigit() and v.get('hovered') == v['at'], screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
-            io.finish()
-        ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                                  lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
-                                  and v.get('screen.context') == 'local_wireless', screens)
-        if not ok:
-            raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before placement; saw {last}')
-        tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
-        if _wireless_placed(tile) and chord_sent:
-            placed_by = 'chord'
-        if not _wireless_placed(tile):
-            at = tile.get('at')
-            if not (tile.get('screen') == 'css' and isinstance(at, str) and at.isdigit()
-                    and tile.get('hovered') == at):
-                raise RuntimeError(f'wireless_room: expected the hand on a tile; saw {tile}')
-            io.send('lobby-a')
-            placed_by = 'chord + A' if chord_sent else 'A'
-            ok, tile = _wireless_wait(ctx, io, 'tile.cursor', 8, _wireless_placed, screens)
-            if not ok:
-                raise RuntimeError(f'wireless_room: expected p1.token or local.token placed; saw {tile}')
+        return isinstance(at, str) and at.isdigit() and tile.get('hovered') == at
+
+    def begin_create(_obs):
+        state['form_pending'] = True
+        state['form_ready'] = False
+        state['form_away'] = 0
+
+    def create_done(obs):
+        if not state['form_pending']:
+            return False
+        screen = obs['ui'].get('screen')
+        state['form_away'] = state['form_away'] + 1 if screen is not None and screen != 'ldn.room_list' else 0
+        if state['form_away'] < 3:
+            return False
+        io.finish()
+        state['prefinished'] = True
+        time.sleep(1.5)
+        settled = observe()['ui']
+        if settled.get('screen') not in ('unknown', 'ldn.create'):
+            seen = f'read error: {settled["error"]}' if 'error' in settled else str(settled)
+            raise closed_loop.RouteStopped('wireless_room', 'open-create',
+                                          f'expected the Create form (ldn.create, or unpublished) after A; saw {seen}',
+                                          {})
+        state['create_form'] = 'ldn.create' if settled['screen'] == 'ldn.create' else 'unpublished'
+        state['form_ready'] = True
+        state['form_pending'] = False
+        return True
+
+    def confirm_ready(obs):
+        ui = obs['ui']
+        screen = ui.get('screen')
+        form = screen == 'ldn.create' or (screen == 'unknown' and state['form_ready']
+                                          and state['current'] == 'confirm-create')
+        return available() and form and (state['confirm_at'] is None or time.monotonic() - state['confirm_at'] >= 20)
+
+    def confirm_done(obs):
+        ui = obs['ui']
+        if local(obs, 'stage_select') or local(obs, 'css.smash'):
+            return True
+        if state['confirm_at'] is not None and ui.get('screen') not in (
+                None, 'unknown', 'ldn.create', 'stage_select', 'css.smash'):
+            raise closed_loop.RouteStopped('wireless_room', 'confirm-create',
+                                          f'expected stage_select or css.smash in local_wireless after '
+                                          f'{state["confirm_presses"]} confirm press(es); saw {ui}, screens {screens}',
+                                          {})
+        return False
+
+    def begin_confirm(_obs):
+        state['confirm_at'] = time.monotonic()
+
+    def fence_chord(obs):
+        state['chord_fence'] = {key: obs['tile'].get(key)
+                                for key in ('screen', 'p1.token', 'local.token', 'at', 'hovered')}
+
+    def css(obs):
+        return available() and local(obs, 'css.smash')
+
+    def stage_at(obs):
+        tile = obs['tile'] or {}
+        return (available() and local(obs, 'stage_select') and tile.get('screen') == 'sss'
+                and tile.get('settled') == '1' and hovered(tile))
+
+    def hand_at(obs):
+        tile = obs['tile'] or {}
+        return (css(obs) and tile.get('screen') == 'css' and tile.get('p1.token') == 'held'
+                and not hovered(tile) and not _wireless_placed(tile))
+
+    def place_at(obs):
+        tile = obs['tile'] or {}
+        return css(obs) and tile.get('screen') == 'css' and hovered(tile) and not _wireless_placed(tile)
+
+    def placed(obs):
+        return css(obs) and _wireless_placed(obs['tile'] or {})
+
+    def waiting(obs):
+        return (active(obs, 'ldn.waiting') and obs['ui'].get('ldn.role') == 'host')
+
+    steps = [
+        closed_loop.Step('open-room-list',
+                         lambda o: available() and active(o, 'main_menu') and o['ui'].get('input.owner') == 'native',
+                         lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6),
+        closed_loop.Step('open-create', lambda o: active(o, 'ldn.room_list'), create_done, 'tap-a1',
+                         cap=15, lost_after=5, before_send=begin_create),
+        closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
+                         cap=20, lost_after=0, sends=2, before_send=begin_confirm),
+        closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
+                         cap=60, ready_cap=20, lost_after=4),
+        closed_loop.Step('css-hand', hand_at, lambda o: placed(o) or place_at(o), 'lobby-first-tile',
+                         cap=5, ready_cap=30, lost_after=3, before_send=fence_chord),
+        closed_loop.Step('place', place_at, placed, 'lobby-a', cap=8, lost_after=4),
+        closed_loop.Step('ready', placed, waiting, 'lobby-ready', cap=ready_cap + 10, lost_after=20, sends=2),
+    ]
+
+    def send(macro):
+        io.send(macro)
+        if state['current'] == 'confirm-create':
+            state['confirm_presses'] += 1
+        elif state['current'] == 'stage-a':
+            state['stage_presses'] += 1
+        elif state['current'] == 'css-hand':
+            state['chord_sent'] = True
+        elif state['current'] == 'place':
+            state['place_presses'] += 1
+
+    def finish():
+        if state['prefinished']:
+            state['prefinished'] = False
+        else:
             io.finish()
 
-    ok, last = _wireless_wait(ctx, io, 'ssbu.ui', 5,
-                              lambda v: v.get('screen') == 'css.smash' and v.get('observation.active') == 'yes'
-                              and v.get('screen.context') == 'local_wireless', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected css.smash in local_wireless before Ready; saw {last}')
-    tile = _wireless_read(ctx, io, 'tile.cursor', 2, screens)
-    if not _wireless_placed(tile):
-        raise RuntimeError(f'wireless_room: expected p1.token or local.token placed before Ready; saw {tile}')
-    io.send('lobby-ready')
-    ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', ready_cap,
-                                 lambda v: v.get('screen') == 'ldn.waiting'
-                                 and v.get('observation.active') == 'yes', screens)
-    if not ok:
-        raise RuntimeError(f'wireless_room: expected ldn.waiting; screens seen {screens}, last {waiting}')
-    if waiting.get('ldn.role') != 'host':
-        ok, waiting = _wireless_wait(ctx, io, 'ssbu.ui', 10,
-                                     lambda v: v.get('screen') == 'ldn.waiting'
-                                     and v.get('observation.active') == 'yes' and v.get('ldn.role') == 'host',
-                                     screens)
-        if not ok:
-            raise RuntimeError(f'wireless_room: expected ldn.role host; screens seen {screens}, last {waiting}')
-    io.finish()
+    def on_step(name):
+        if state['current'] == 'confirm-create' and name != 'confirm-create':
+            state['form_ready'] = False
+            state['confirm_at'] = None
+        state['current'] = name
+        if name == 'confirm-create' and state['create_form'] is None:
+            state['create_form'] = 'ldn.create'
+
+    try:
+        outcome = closed_loop.run('wireless_room', steps, observe, send, finish,
+                                  clock=time.monotonic, sleep=time.sleep, on_step=on_step)
+    except closed_loop.RouteStopped as error:
+        reason = error.reason
+        if (error.step == 'confirm-create' and state['confirm_presses'] == 1
+                and state['last_ui'].get('screen') is None):
+            seen = state['last_ui'].get('error', f'screen missing from {state["last_ui"]}')
+            reason = ('no ssbu.ui reply after the Create confirm, so a second press would '
+                      f'have no screen witness; last read: {seen}')
+        elif error.step == 'confirm-create' and reason.startswith('no transition'):
+            reason = (f'expected stage_select or css.smash in local_wireless after '
+                      f'{state["confirm_presses"]} confirm press(es); saw {state["last_ui"]}, screens {screens}')
+        elif error.step == 'locate':
+            reason += '; expected main_menu with native input or a later route screen'
+        elif error.step == 'open-room-list':
+            reason += f'; expected ldn.room_list; saw {state["last_ui"]}'
+        elif error.step == 'open-create':
+            reason += f'; expected ssbu.ui to leave ldn.room_list; saw {state["last_ui"]}'
+        elif error.step == 'stage-a':
+            reason += f'; expected css.smash in local_wireless; saw {state["last_ui"]}'
+        elif error.step == 'css-hand':
+            if state['chord_sent']:
+                reason += f'; expected the hand on a tile before placement; saw {state["last_tile"]}'
+            else:
+                reason += ('; expected css.smash before tile-up; expected tile.cursor screen css with '
+                           f'p1.token held before the chord; saw {state["last_tile"]}')
+        elif error.step == 'place':
+            reason += (f'; expected p1.token or local.token placed; saw {state["last_tile"]}; '
+                       'expected css.smash before Ready')
+        elif error.step == 'ready':
+            reason += f'; expected ldn.waiting; expected ldn.role host; saw {state["last_ui"]}'
+        error.reason = reason
+        error.receipt['reason'] = reason
+        error.args = (f'wireless_room: stopped on step {error.step!r}: {reason}',)
+        sends = next((entry['sends'] for entry in error.receipt['steps'] if entry['name'] == error.step), 0)
+        _save(ctx, 'routes-wireless-room-stop', {
+            'block': 'wireless_room', 'ok': False, 'step': error.step, 'reason': reason, 'sends': sends,
+            'screens': screens, 'last_ui': state['last_ui'], 'last_tile': state['last_tile'],
+            'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
+        })
+        raise
+
+    tile, waiting_ui = state['last_tile'], state['last_ui']
+    if state['place_presses']:
+        placed_by = 'chord + A' if state['chord_sent'] else 'A'
+    elif state['chord_sent']:
+        placed_by = 'chord'
+    else:
+        placed_by = 'already placed'
     return _save(ctx, 'routes-wireless-room', {
-        'block': 'wireless_room', 'screens': screens, 'create_form': create_form, 'confirm_presses': confirm_presses,
-        'stage_presses': stage_presses, 'tile': tile, 'placed_by': placed_by, 'chord_sent': chord_sent,
-        'chord_fence': chord_fence,
-        'waiting': {key: waiting.get(key, 'unknown')
+        'block': 'wireless_room', 'screens': screens, 'create_form': state['create_form'],
+        'confirm_presses': state['confirm_presses'], 'stage_presses': state['stage_presses'], 'tile': tile,
+        'placed_by': placed_by, 'chord_sent': state['chord_sent'], 'chord_fence': state['chord_fence'],
+        'waiting': {key: waiting_ui.get(key, 'unknown')
                     for key in ('screen', 'ldn.role', 'ldn.members', 'observation.active')},
-        'ldn.members': waiting.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),
+        'ldn.members': waiting_ui.get('ldn.members', 'unknown'), 'ms': round((time.monotonic() - started) * 1000),
+        'entered_at': outcome['entered_at'], 'steps': outcome['steps'],
     })
 
 

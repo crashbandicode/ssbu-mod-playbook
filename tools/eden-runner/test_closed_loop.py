@@ -133,14 +133,57 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(fake.finishes, 3)
 
     def test_not_ready_within_ready_cap_stops_with_zero_sends(self):
-        fake = Script(lambda f: 'first' if not f.sends else 'arrived')
+        fake = Script(lambda f: 'arrived' if not f.events else 'waiting')
         with self.assertRaises(RouteStopped) as caught:
-            fake.run([step('first', 'first', 'arrived', cap=3),
+            fake.run([step('first', 'arrived', 'arrived', cap=3),
                       step('second', 'second', 'done', ready_cap=2)])
         self.assertEqual(caught.exception.step, 'second')
         self.assertIn('not ready', caught.exception.reason)
         self.assertEqual(caught.exception.receipt['steps'][-1]['sends'], 0)
-        self.assertEqual(len(fake.sends), 1)
+        self.assertFalse(caught.exception.receipt['steps'][-1]['skipped'])
+        self.assertEqual(fake.sends, [])
+
+    def test_the_last_matching_step_wins_at_location(self):
+        fake = Script(lambda f: 'shared' if not f.sends else 'done')
+        result = fake.run([step('first', 'shared', 'middle'), step('second', 'shared', 'done')])
+        self.assertEqual(result['entered_at'], 'second')
+        self.assertEqual([macro for macro, _ in fake.sends], ['second'])
+
+    def test_a_callable_macro_and_hook_use_the_fresh_retry_witness(self):
+        fake = Script(lambda f: 'done' if len(f.sends) >= 2 else 'source')
+        witnesses = []
+        item = Step('press', lambda value: value == 'source', lambda value: value == 'done',
+                    lambda value: 'send-' + value, cap=20, lost_after=2,
+                    before_send=lambda value: witnesses.append(value))
+        fake.run([item])
+        self.assertEqual(witnesses, ['source', 'source'])
+        self.assertEqual([macro for macro, _ in fake.sends], ['send-source', 'send-source'])
+        for index, event in enumerate(fake.events):
+            if event[0] == 'send':
+                self.assertEqual(fake.events[index - 1], ('read', 'source'))
+
+    def test_a_jump_back_during_ready_wait_is_observed_before_retry(self):
+        def observe(f):
+            if not f.sends:
+                return 'one'
+            if len(f.sends) == 1:
+                return 'arrived' if f.now < 2 else 'one'
+            return 'two' if len(f.sends) == 2 else 'done'
+        fake = Script(observe)
+        result = fake.run([step('first', 'one', 'arrived'), step('second', 'two', 'done')])
+        self.assertEqual(result['entered_at'], 'first')
+        self.assertEqual([macro for macro, _ in fake.sends], ['first', 'first', 'second'])
+
+    def test_final_witness_completes_without_an_extra_read(self):
+        def observe(f):
+            if not f.sends:
+                return 'source'
+            if ('read', 'done') in f.events:
+                raise AssertionError('read after completion')
+            return 'done'
+        fake = Script(observe)
+        fake.run([step('press', 'source', 'done')])
+        self.assertEqual(fake.finishes, 1)
 
 
 if __name__ == '__main__':

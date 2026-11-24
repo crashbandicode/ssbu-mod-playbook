@@ -3106,13 +3106,13 @@ class WirelessRoomTests(unittest.TestCase):
         self.io.room_list_missing = True
         with self.assertRaisesRegex(RuntimeError, 'ldn.room_list.*main_menu'):
             self.run_room()
-        self.assertEqual(self.io.actions, ['lobby-open-room-list'])
+        self.assertEqual(self.io.actions, ['lobby-open-room-list'] * 3)
 
     def test_create_form_never_leaves_list_sends_no_confirm(self):
         self.io.stuck_in_list = True
         with self.assertRaisesRegex(RuntimeError, 'leave.*ldn.room_list'):
             self.run_room()
-        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1'])
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-a1', 'tap-a1'])
 
     def test_form_requires_three_consecutive_samples_away_from_list(self):
         self.io.form_script = ['unknown', 'unknown', 'ldn.room_list', 'unknown', 'unknown', 'unknown']
@@ -3257,12 +3257,13 @@ class WirelessRoomTests(unittest.TestCase):
             self.run_room()
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1'])
 
-    def test_stage_still_selected_after_a_retries_once(self):
+    def test_stage_still_selected_after_a_retries_twice(self):
         self.io.stuck_stage = True
-        with self.assertRaisesRegex(RuntimeError, 'css.smash.*stage_select'):
+        with self.assertRaisesRegex(RuntimeError, 'stage-a.*3 sends'):
             self.run_room()
-        self.assertEqual(self.io.stage_count, 2)
-        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a', 'lobby-a'])
+        self.assertEqual(self.io.stage_count, 3)
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
+                                           'lobby-a', 'lobby-a', 'lobby-a'])
 
     def test_css_entry_waits_for_held_token_immediately_before_chord(self):
         unknown = {key: 'unknown' for key in self.io.tile}
@@ -3311,13 +3312,12 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
         self.assertFalse((self.row / 'routes-wireless-room.json').exists())
 
-    def test_local_held_without_p1_held_on_tile_never_authorizes_placement(self):
+    def test_local_held_without_p1_held_on_tile_can_place(self):
         self.io.tile.update({'p1.token': 'unknown', 'local.token': 'held', 'at': '42', 'hovered': '42'})
-        with self.assertRaisesRegex(RuntimeError,
-                                    r'expected tile.cursor screen css with p1.token held before the chord'):
-            self.run_room()
-        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a'])
-        self.assertFalse((self.row / 'routes-wireless-room.json').exists())
+        result = self.run_room()
+        self.assertEqual(result['placed_by'], 'A')
+        self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
+                                           'lobby-a', 'lobby-a', 'lobby-ready'])
 
     def test_local_held_waits_until_p1_held_before_chord(self):
         self.io.tile_script = [
@@ -3365,7 +3365,7 @@ class WirelessRoomTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'expected the hand on a tile'):
             self.run_room()
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1', 'lobby-a',
-                                           'lobby-first-tile'])
+                                           'lobby-first-tile', 'lobby-first-tile', 'lobby-first-tile'])
 
     def test_existing_p1_or_local_placement_needs_no_placement_input(self):
         for field in ('p1.token', 'local.token'):
@@ -3382,7 +3382,7 @@ class WirelessRoomTests(unittest.TestCase):
         self.io.stuck_placement = True
         with self.assertRaisesRegex(RuntimeError, 'placed.*66'):
             self.run_room()
-        self.assertEqual(self.io.actions[-2:], ['lobby-first-tile', 'lobby-a'])
+        self.assertEqual(self.io.actions[-4:], ['lobby-first-tile', 'lobby-a', 'lobby-a', 'lobby-a'])
         self.assertEqual(self.io.actions.count('tap-plus1'), 1)
 
     def test_token_placed_after_chord_without_a_does_not_claim_already_placed(self):
@@ -3488,6 +3488,9 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertGreaterEqual(self.now - self.io.css_since, 20)
         self.assertEqual(result['placed_by'], 'chord + A')
         chord = self.io.events.index(('send', 'lobby-first-tile'))
+        css_entry = next(i for i, event in enumerate(self.io.events)
+                         if event[:2] == ('read', 'ssbu.ui') and event[2]['screen'] == 'css.smash')
+        self.assertFalse(any(e[0] == 'send' for e in self.io.events[css_entry:chord]))
         self.assertTrue(any(e[:2] == ('read_error', 'tile.cursor') for e in self.io.events[:chord]))
         last_tile = [e for e in self.io.events[:chord] if e[:2] == ('read', 'tile.cursor')][-1]
         self.assertEqual((last_tile[2]['screen'], last_tile[2]['p1.token']), ('css', 'held'))
@@ -3505,6 +3508,14 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(result['entered_at'], 'stage-a')
         self.assertEqual(self.io.actions, ['lobby-a', 'lobby-first-tile', 'lobby-a', 'lobby-ready'])
 
+    def test_entry_from_the_published_create_form(self):
+        self.io.phase = 'form'
+        self.io.form_screen = 'ldn.create'
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'confirm-create')
+        self.assertEqual(result['create_form'], 'ldn.create')
+        self.assertEqual(self.io.actions, ['tap-plus1', 'lobby-a', 'lobby-first-tile', 'lobby-a', 'lobby-ready'])
+
     def test_entry_from_css_with_the_token_held(self):
         self.io.phase = 'css'
         result = self.run_room()
@@ -3518,6 +3529,14 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(result['entered_at'], 'ready')
         self.assertEqual(self.io.actions, ['lobby-ready'])
         self.assertEqual(result['placed_by'], 'already placed')
+
+    def test_entry_from_css_with_the_token_hovering(self):
+        self.io.phase = 'css'
+        self.io.tile.update({'at': '42', 'hovered': '42'})
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'place')
+        self.assertEqual(self.io.actions, ['lobby-a', 'lobby-ready'])
+        self.assertEqual(result['placed_by'], 'A')
 
     def test_entry_from_the_waiting_room_sends_nothing(self):
         self.io.phase = 'waiting'
