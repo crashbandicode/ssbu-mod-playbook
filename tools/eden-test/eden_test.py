@@ -1382,6 +1382,10 @@ def time_split(run):
 
 def results_md(run, config):
     passed, failed, unrun, retained = row_accounting(run)
+    reported = report_rows_with_stalls(run)
+    stalled = [(row, result, stalls) for row, result, _, _, stalls in reported
+               if result == 'PASS' and stalls]
+    stall_suffix = _stall_totals(reported)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
     timing = json.loads((run / 'timing.json').read_text())
     runs = [(start, end) for start, end in timing.get('runs', []) if end]
@@ -1400,8 +1404,12 @@ def results_md(run, config):
     lines = [f'# {config["label"]} — {time.strftime("%Y-%m-%d", time.gmtime())}',
              f'- Eden: {"; ".join(apps)}',
              f'- Plugins: ' + ', '.join(f'{Path(p["path"]).name} {p["sha256"][:8]}' for p in config['instances'][0].get('plugins', [])),
-             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun; {retained} earlier failed attempts retained '
+             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun{stall_suffix}; {retained} earlier failed attempts retained '
              f'(receipts in `out/`); final rows.json {rows_note}; {len(manifests)} runner manifests in `out/manifests/`']
+    for row, result, stalls in stalled[:6]:
+        lines.append(f'  - {shown_result(result, stalls)} {row["id"]}')
+    if len(stalled) > 6:
+        lines.append(f'  - and {len(stalled) - 6} more rows passed with stalls (see REPORT.md)')
     for row, error in failed[:6]:
         lines.append(f'  - FAILED {row}: {one_line(error)}')
     if unrun:
@@ -1420,8 +1428,8 @@ def results_md(run, config):
               + (' (incomplete timing)' if split['incomplete'] else '')
               + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
-    (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
-    print('\n'.join(lines[:20]))
+    (run / 'RESULTS.md').write_text('\n'.join(lines) + '\n')
+    print('\n'.join(lines))
 
 
 PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'  # lifecycle.py PLUGINS
@@ -1560,6 +1568,93 @@ def row_report(run, row, history):
     return result, reason, proof + [f'out/{name}' for name in asides]
 
 
+class _RowStalls(list):
+    def __init__(self):
+        super().__init__()
+        self.unreadable = 0
+
+
+def row_stalls(run, row_id, receipt) -> list[dict]:
+    stalls = _RowStalls()
+    seen = {}
+
+    def add(event):
+        if not isinstance(event, dict):
+            return
+        identity = json.dumps({key: value for key, value in event.items() if key != 'block'},
+                              sort_keys=True, default=str)
+        if identity not in seen:
+            seen[identity] = len(stalls)
+            stalls.append(dict(event))
+        elif 'block' in event:
+            stalls[seen[identity]].setdefault('block', event['block'])
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == 'stalls' and isinstance(child, list):
+                    for event in child:
+                        add(event)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for step in receipt.get('results', []):
+        if isinstance(step, dict):
+            walk(step.get('value'))
+    path = Path(run) / 'out' / row_id / 'stall-events.jsonl'
+    if path.exists():
+        try:
+            with path.open(encoding='utf-8', errors='replace') as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        stalls.unreadable += 1
+                        continue
+                    if isinstance(event, dict):
+                        add(event)
+                    else:
+                        stalls.unreadable += 1
+        except OSError:
+            stalls.unreadable += 1
+    return stalls
+
+
+def shown_result(result, stalls):
+    if result != 'PASS' or not stalls:
+        return result
+    count = len(stalls)
+    return f'PASS with {count} {"stall" if count == 1 else "stalls"}'
+
+
+def report_rows_with_stalls(run):
+    run = Path(run)
+    rows = []
+    for row, result, reason, proof in report_rows(run):
+        path = run / 'out' / f'{row["id"]}.json'
+        receipt = json.loads(path.read_text()) if path.exists() else {}
+        rows.append((row, result, reason, proof, row_stalls(run, row['id'], receipt)))
+    return rows
+
+
+def _stall_totals(rows):
+    passed_stalls = [stalls for _, result, _, _, stalls in rows if result == 'PASS' and stalls]
+    if not passed_stalls:
+        return ''
+    passed = len(passed_stalls)
+    total = sum(len(stalls) for stalls in passed_stalls)
+    return (f' ({passed} {"row" if passed == 1 else "rows"} passed with stalls, '
+            f'{total} {"stall" if total == 1 else "stalls"} in those rows)')
+
+
+def _stall_text(event):
+    fields = ('block', 'kind', 'step', 'screen', 'send')
+    parts = [f'{key}={event[key]}' for key in fields if key in event]
+    return ', '.join(parts) if parts else json.dumps(event, sort_keys=True, default=str)
+
+
 def report_rows(run):
     run = Path(run)
     spec = json.loads((run / 'rows' / 'rows.json').read_text())
@@ -1587,7 +1682,7 @@ def report_md(run):
     from the run folder alone. Works while Eden is still up and again after Down."""
     run = Path(run)
     config = json.loads((run / 'config.json').read_text())
-    rows = report_rows(run)
+    rows = report_rows_with_stalls(run)
     timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
 
     def utc(key):
@@ -1604,10 +1699,18 @@ def report_md(run):
     else:
         state = f'no Up recorded on {host}'
     table, counts = [], {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}
-    for row, result, reason, proof in rows:
+    for row, result, reason, proof, stalls in rows:
         counts[result] += 1
         blocks = ', '.join(str(step.get('run', next(iter(step), '?'))).split(':')[-1] for step in row.get('steps', []))
-        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {result} | {cell(reason, 420)} | {"<br>".join(proof)} |')
+        details = []
+        if stalls:
+            text = f'stalls: {len(stalls)}: ' + '; '.join(_stall_text(event) for event in stalls)
+            details.append(cell(text, len(text)))
+        if stalls.unreadable:
+            details.append(f'unreadable stall-event lines: {stalls.unreadable}')
+        details.append(cell(reason, 420))
+        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {shown_result(result, stalls)} | '
+                     f'{"; ".join(details)} | {"<br>".join(proof)} |')
     split = time_split(run)
     ends = []  # how each runner call ended: its last status line that is not a row's
     runner_log = run / 'runner.log'
@@ -1624,8 +1727,8 @@ def report_md(run):
              f'- Runner: {len(ends)} call(s) ended: ' + ('; '.join(ends) if ends else 'no end line in runner.log'),
              card_lineup_report(config),
              '- NROs:', *nro_lines(run, config),
-             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)} '
-             f'(proof paths are relative to `{run}`)',
+             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)}'
+             f'{_stall_totals(rows)} (proof paths are relative to `{run}`)',
              '', '| Row | Steps | Result | Reason | Proof |', '| --- | --- | --- | --- | --- |', *table, '',
              f'- Times: Up {utc("up_start")} to {utc("up_done")}; rows {utc("run_start")} to {utc("run_end")} over '
              f'{len(timing.get("runs", [])) or 1} runner call(s); setup rows {split["setup"]:.0f} s, test rows '
@@ -1717,10 +1820,111 @@ def _go_target_rsync(command):
     return result.returncode, int(match.group(1).replace(',', '')) if match else None
 
 
+_GO_BASE_NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*\.json'
+
+
+def _go_this_host():
+    """The host this machine is, by its shared base, or None when it has no shared base. A local copy of another
+    host's base never answers this. A shared base that cannot say is a stop, not a guess."""
+    shared = RUNS / '_eden-test' / 'base.json'
+    if not shared.exists():
+        return None
+    try:
+        config = json.loads(shared.read_text())
+        host = config.get('host') if isinstance(config, dict) else None
+        if not isinstance(host, str) or not host:
+            raise ValueError('it names no host')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'this machine\'s shared base {shared} cannot say which host this is: {error}; '
+                         'nothing was started') from error
+    return host
+
+
+def _go_route(args):
+    """The ssh name this machine reaches args.host by: --ssh, else its hosts.json entry, else None. A hosts.json
+    that exists and cannot be read is a stop: it must not look like a machine with no route."""
+    if args.ssh:
+        return args.ssh
+    hosts = RUNS / '_eden-test' / 'hosts.json'
+    if not hosts.exists():
+        return None
+    try:
+        mapping = json.loads(hosts.read_text())
+        if not isinstance(mapping, dict):
+            raise ValueError('it is not an object of host names')
+        route = mapping.get(args.host)
+        if route is not None and (not isinstance(route, str) or not route):
+            raise ValueError(f'its entry for {args.host!r} is not an ssh name')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot find the ssh name for host {args.host!r}: {hosts} cannot be used: {error}; '
+                         'nothing was started') from error
+    return route
+
+
+def _go_remote_base(args):
+    """The --from of a go that is sent to another host: a path on that host, in this run's own stage folder. It is
+    forwarded as given; a local file is never copied there."""
+    value = getattr(args, 'from_config', None)
+    if not value:
+        return None
+    stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
+    name = value[len(stage) + 1:] if value.startswith(stage + '/') else ''
+    if not re.fullmatch(_GO_BASE_NAME, name):
+        raise SystemExit(
+            f'--from {value!r}: a go sent to another host takes a base that is on the host, a .json file directly in '
+            f'this run\'s own stage folder {stage}/ (a plain name of letters, digits, "_", "-" and "."). '
+            'A local file is not copied there, and it does not make this machine the host')
+    return value
+
+
+def _go_received_base(args):
+    """Check the base of a go a controller sent to this host (it carries --token). Such a go runs here or not at
+    all: a missing or foreign base is refused here and is never sent on. --from must be a file in this run's own
+    stage folder, reached without a symlink, for this host, and it must pin the Eden AppImage this host's shared
+    base pins (go_new then checks that file's hash). The shared base is only read."""
+    shared = RUNS / '_eden-test' / 'base.json'
+
+    def load(path, what):
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f'{what} {path} is missing on this host or is not a plain file; nothing was started')
+        try:
+            config = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise SystemExit(f'{what} {path} cannot be read: {error}; nothing was started') from error
+        host = config.get('host') if isinstance(config, dict) else None
+        if host != args.host or not isinstance(config.get('instances'), list):
+            raise SystemExit(f'{what} {path} is for host {host!r}, not {args.host!r}; nothing was started')
+        return config
+
+    if not args.from_config:
+        load(shared, 'the base')
+        return
+    stage = RUNS / '_eden-test' / 'stage' / args.label
+    try:
+        _target_label(args.label)
+        name = args.from_config[len(str(stage)) + 1:] if args.from_config.startswith(f'{stage}/') else ''
+        if not re.fullmatch(_GO_BASE_NAME, name):
+            raise ValueError('not a .json file directly in that folder')
+        if _owned_target_directory(RUNS, ('_eden-test', 'stage', args.label)) is None:
+            raise ValueError('that folder does not exist')
+    except ValueError as error:
+        raise SystemExit(f'--from {args.from_config!r}: {error}; a go sent to a host takes its base from the run\'s '
+                         f'own stage folder {stage}/; nothing was started') from error
+    config = load(stage / name, '--from')
+    released = {(item.get('app', {}).get('path'), item.get('app', {}).get('sha256'))
+                for item in load(shared, "this host's shared base")['instances'] if isinstance(item, dict)}
+    for item in config['instances']:
+        app = item.get('app', {}) if isinstance(item, dict) else {}
+        if (app.get('path'), app.get('sha256')) not in released:
+            pinned = ', '.join(sorted(f'{path} ({str(digest)[:12]}…)' for path, digest in released))
+            raise SystemExit(f'--from {stage / name}: it pins Eden AppImage {app.get("path")} '
+                             f'({str(app.get("sha256"))[:12]}…), not the released AppImage this host\'s shared base '
+                             f'{shared} pins: {pinned}; nothing was started')
+
+
 def _go_remote(args, lineup):
     hosts = RUNS / '_eden-test' / 'hosts.json'
-    mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
-    host = args.ssh or mapping.get(args.host)
+    host = _go_route(args)
     if not host:
         raise SystemExit(f'no SSH host for {args.host!r}; use --ssh or add it to {hosts}')
     if host.startswith('-'):
@@ -1729,6 +1933,7 @@ def _go_remote(args, lineup):
         _target_label(args.label)
     except ValueError as error:
         raise SystemExit(str(error)) from error
+    _go_remote_base(args)
     targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
     with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
@@ -1736,6 +1941,7 @@ def _go_remote(args, lineup):
 
 
 def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
+    base = _go_remote_base(args)
     if targets is None:
         try:
             _target_label(args.label)
@@ -1819,6 +2025,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                 print(f'target {label} {commit[:12]}: cache {result["cache"]}, '
                       f'{sent if sent is not None else "unknown"} bytes shipped in {time.monotonic() - started:.1f} s')
     remote = ['/usr/bin/python3', '-I', '-B', script, 'go', '--host', args.host, '--label', args.label]
+    if base:
+        remote.extend(('--from', base))
     for nro in args.nro:
         remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
     remote.extend(('--rows', f'{stage}/rows'))
@@ -1872,11 +2080,33 @@ def cmd_go(args):
     if not re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', args.owner):
         raise SystemExit('--owner must be "<Engine> <session>/<stream>" (OpenCode|Codex|Claude|Cursor), '
                          f'e.g. "Claude devin-<lane>/<label>"; got: {args.owner!r}')
-    base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
-    if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
-        _go_trace(args)
-        lineup = _go_card_lineup(args)
-        return _go_remote(args, lineup)
+    if args.token:  # a controller sent this go here: it runs on this machine or not at all
+        _go_received_base(args)
+    else:
+        # Which machine this is comes from its own shared base, never from the base the go names: a local copy of
+        # the host's base does not make this machine the host.
+        shared = RUNS / '_eden-test' / 'base.json'
+        this_host = _go_this_host()
+        if this_host == args.host:
+            remote = False  # this is the host: any local --from, as before; an ssh name is not needed
+        elif _go_route(args):
+            remote = True  # the host is elsewhere: --from is a path there, and a local file is not opened
+        elif this_host is not None:
+            raise SystemExit(
+                f'this machine is host {this_host!r} by its shared base {shared}, not {args.host!r}, and it has no '
+                f'ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'nothing was started')
+        else:
+            # No shared base and no route: nothing says this machine is the host, and a file the go names is no
+            # evidence of it. A host is set up by giving it its shared base.
+            raise SystemExit(
+                f'this machine has no shared base {shared}, so it is not known to be host {args.host!r}, and it has '
+                f'no ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'a base named with --from does not say which machine this is; nothing was started')
+        if remote:
+            _go_trace(args)
+            lineup = _go_card_lineup(args)
+            return _go_remote(args, lineup)
     run = go_new(args)
     config = json.loads((run / 'config.json').read_text())
     for key, entries in config['staged_plugins'].items():

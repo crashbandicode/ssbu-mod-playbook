@@ -34,6 +34,17 @@ no longer needs its target trees, run this on that host, replacing `LABEL`
 with the run label; it removes the run's trees but retains the cache:
 `/usr/bin/python3 -I -B /home/intpa/eden-runs/_eden-test/stage/LABEL/tools/eden-test/eden_test.py unstage-targets --label LABEL`.
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
+A remote go uses that shared base unless `--from` names another one. `--from` is then a path on the host, a `.json`
+file directly in the run's own stage folder `/home/intpa/eden-runs/_eden-test/stage/<label>/`; it is forwarded, and a
+local file is never copied there. The host refuses a base that is missing, is for another host, is a symlink, or
+pins another Eden AppImage than its shared base does, and starts nothing. A base without a `trace` section needs no
+`--elf` and no trace points: use one for a stub-on run on a host whose shared base is a trace base. The shared base
+is only read. Which machine a go runs on comes from that machine's own shared base: when it names the `--host`,
+the go runs there with any local `--from`; when it names another host, the go is sent over ssh (`--ssh` or
+`hosts.json`) and a local file given as `--from` is neither opened nor copied. With no ssh name, or with a
+`hosts.json` or shared base that cannot be read, go stops and starts nothing. A machine without a shared base is
+not a host: there go needs an ssh name, whatever `--from` names. A local copy of a host's base never makes a
+machine that host.
 The repository does not ship a `base.json` template; it is maintained on
 each host. Add `"notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md",
 "to": "tr-primary-2"}` to that base, without an `ssh` key. Notifications
@@ -60,6 +71,10 @@ What it does:
 6. Leaves Eden up after Up succeeds, whether the rows pass or fail.
 
 Read the printed `REPORT.md` for PASS, FAIL and NOT RUN.
+`PASS with N stalls` means the row passed after N inputs or steps had to be recovered.
+Machine counts still count the row as PASS.
+Each stall event is counted once, including copies in nested receipts and the JSONL log.
+Stall totals count passed rows only.
 `go` exits 0 only when every row passed, and 3 otherwise.
 Rows continue after a failure; a row whose recovery fails is FAILED without running.
 Rerun one row: `eden_test.py run /home/intpa/eden-runs/my-run --rows r02a`.
