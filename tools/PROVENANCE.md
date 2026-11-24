@@ -298,3 +298,12 @@ Host tests only; no runtime acceptance.
 
 2026-11-24: `eden-runner/packet_gate.py` G9 checks fixture effect hooks in
 test rows under the shared-hook case rules. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/slow_clock.py` finds host tests that depend on real time: it runs one test module
+plainly and again with every `time.monotonic`, `time.time` and `time.perf_counter` read a fixed delay later
+than the one before, clocks bound as default arguments included, and lists the tests that pass only plainly.
+`eden-runner/fake_clock.py` is the clock those tests use instead: it moves only when the code under test
+sleeps or a fixture spends time. `test_native_picker.py` and `test_trace_attempts.py` use it; at 0.3 s per
+read 55 and 60 of their tests failed before and none after. Caps and expected outcomes are unchanged. Not
+covered by the harness: real sleeps, and a clock stored before the slow run starts. Host tests only; no
+runtime acceptance.

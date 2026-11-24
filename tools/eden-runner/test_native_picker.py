@@ -6,7 +6,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fake_clock
 import native_picker as picker
+import native_picker_io
+import routes
+import trace_attempts
 
 
 def snapshot(provider, rev, fields, epoch=1):
@@ -223,6 +227,9 @@ def l8w_native(rev):
 
 
 class PickerTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
+
     def run_takeback(self, tiles, *, natives=None):
         io = Replay(tiles, natives or [l8w_native(rev) for rev in (1841, 1844, 1850)])
         return io, picker.acquire_local_token(io, L8W_RICHTER, L8W_TOPOLOGY, cap=.2, expected_context='training')
@@ -446,10 +453,18 @@ class PickerTests(unittest.TestCase):
         pending = recorded_training_tile(809)
 
         class RepeatPending(Replay):
+            def __init__(self, clock):
+                super().__init__()
+                self.clock = clock
+                self.seen = False
+
             def read(self, provider, cap):
+                if self.seen:
+                    self.clock.spend(cap)
+                self.seen = True
                 return pending
 
-        replay = RepeatPending()
+        replay = RepeatPending(self.clock)
         with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
             picker.move(replay, 'css', recorded_before(809), recorded_native(1), '78', 'up', '67',
                         picker.Target('68', 'Richter', 'default'), .005, expected_context='training')
@@ -469,16 +484,18 @@ class PickerTests(unittest.TestCase):
         older.values.update({'rev': '808', 'observation': '4784'})
 
         class RepeatOlder(Replay):
-            def __init__(self):
+            def __init__(self, clock):
                 super().__init__([pending, older])
+                self.clock = clock
 
             def read(self, provider, cap):
                 try:
                     return super().read(provider, cap)
                 except RuntimeError:
+                    self.clock.spend(cap)
                     return older
 
-        replay = RepeatOlder()
+        replay = RepeatOlder(self.clock)
         with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
             picker.move(replay, 'css', recorded_before(809), recorded_native(1), '78', 'up', '67',
                         picker.Target('68', 'Richter', 'default'), .005, expected_context='training')
@@ -486,19 +503,21 @@ class PickerTests(unittest.TestCase):
 
     def test_unsettled_or_older_sample_never_completes_the_step(self):
         class RepeatingReplay(Replay):
-            def __init__(self, samples):
+            def __init__(self, samples, clock):
                 super().__init__(samples)
                 self.last = samples[-1]
+                self.clock = clock
 
             def read(self, provider, cap):
                 try:
                     return super().read(provider, cap)
                 except RuntimeError:
+                    self.clock.spend(cap)
                     return self.last
 
         for samples in ([self.training_step(548)], [self.training_step(548), self.training_step(543)]):
             with self.subTest(revisions=[sample.block['rev'] for sample in samples]):
-                replay = RepeatingReplay(samples)
+                replay = RepeatingReplay(samples, self.clock)
                 with self.assertRaisesRegex(RuntimeError, 'tile.cursor: no newer active observation'):
                     self.training_move(replay)
                 self.assertEqual(replay.actions, ['tile-up'])
@@ -827,8 +846,6 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(replay.actions, ['tap-a1'])
 
     def test_stage_to_training_css_waits_through_passive_stage_owner(self):
-        import time
-
         # Native provider rev 2971 after the single stage-confirm A kept the
         # exact Training Stage Select identity but withdrew input ownership.
         source = {'screen': 'stage_select', 'focus': 'stage_select', 'screen.context': 'training',
@@ -840,7 +857,7 @@ class PickerTests(unittest.TestCase):
         replay = Replay(native_blocks=[native(2971, **passive), native(2972, **passive), observed])
 
         self.assertEqual(
-            picker.wait_scene_transition(replay, before, time.monotonic() + 1, source, target, label='stage'),
+            picker.wait_scene_transition(replay, before, self.clock.monotonic() + 1, source, target, label='stage'),
             observed,
         )
         self.assertEqual(replay.actions, [])
@@ -850,7 +867,7 @@ class PickerTests(unittest.TestCase):
                 replay = Replay(native_blocks=[native(2971, **{**passive, **bad}), observed])
                 with self.assertRaisesRegex(RuntimeError, 'unexpected stage focus'):
                     picker.wait_scene_transition(
-                        replay, before, time.monotonic() + 1, source, target, label='stage',
+                        replay, before, self.clock.monotonic() + 1, source, target, label='stage',
                     )
                 self.assertEqual(replay.actions, [])
 
@@ -1244,6 +1261,9 @@ class BridgeFramingTests(unittest.TestCase):
 class TrainingStageProofTests(unittest.TestCase):
     boot = '0x0000000000000001'
 
+    def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
+
     def run_training(self, replay, finish, *, expected=0, before_press='',
                      refreshed_context='training', after_owner='native', after_dialog='none',
                      scene_loading=False, press=True):
@@ -1388,6 +1408,9 @@ class TrainingStageProofTests(unittest.TestCase):
                               self.ending(42))
 
 class NativeScreenGateTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
+
     def run_gate(self, socket, name, samples, *, cap=1):
         import json
         import zlib
@@ -1431,7 +1454,19 @@ class NativeScreenGateTests(unittest.TestCase):
                     else:
                         dest.write(wire(sample))
 
-            with (patch.object(routes, 'bridge_v2', side_effect=respond),
+            original_read = native_picker_io.BridgePickerIO.read
+            previous = None
+
+            def read(io, provider, cap):
+                nonlocal previous
+                state = original_read(io, provider, cap)
+                if previous is not None and (state.clock[1] <= previous.clock[1] or state.clock[2] <= previous.clock[2]):
+                    self.clock.spend(cap)
+                previous = state
+                return state
+
+            with (patch.object(native_picker_io.BridgePickerIO, 'read', new=read),
+                  patch.object(routes, 'bridge_v2', side_effect=respond),
                   patch.object(routes, 'frame', side_effect=AssertionError('still')),
                   patch.object(routes, 'play', side_effect=AssertionError('controller input'))):
                 result = routes.gate(ctx, name, cap=cap)
@@ -1487,6 +1522,7 @@ class MainMenuStepTests(unittest.TestCase):
 
         import routes
 
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
         self.ctx = SimpleNamespace()
         self.io = Mock(connection=1, boot=self.top(1, 'smash').clock[0])
         test_io = patch.object(routes, 'BridgePickerIO', return_value=self.io)
@@ -1599,6 +1635,9 @@ class MainMenuStepTests(unittest.TestCase):
 class TrainingSubmenuRouteTests(unittest.TestCase):
     chain = ('games_and_more', 'classic_mode', 'mob_smash', 'training', 'stage_select')
     actions = ('tap-a1', 'main-menu-down', 'main-menu-left', 'tap-a1')
+
+    def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
 
     @staticmethod
     def checkpoint(rev, focus):
@@ -1924,6 +1963,7 @@ class NativeQuitTrainingTests(unittest.TestCase):
 
         import routes
 
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
         self.ctx = SimpleNamespace()
         self.io = Mock(connection=1, boot=self.state(1, 'training').clock[0])
         adapter = patch.object(routes, 'BridgePickerIO', return_value=self.io)
@@ -2012,11 +2052,12 @@ class TrainingSceneTransitionTests(unittest.TestCase):
               'input.owner': 'native', 'dialog': 'none', 'focus': 'css.training'}
     target = {'screen': 'training', 'screen.context': 'training', 'input.owner': 'native', 'dialog': 'none'}
 
-    def run_wait(self, *frames):
-        import time
+    def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker, native_picker_io, trace_attempts)
 
+    def run_wait(self, *frames):
         replay = Replay(native_blocks=frames)
-        return picker.wait_scene_transition(replay, native(2, **self.source), time.monotonic() + .1,
+        return picker.wait_scene_transition(replay, native(2, **self.source), self.clock.monotonic() + .1,
                                             self.source, self.target, label='native')
 
     def test_wrong_active_screen_or_modal_stops_even_with_ready_frame_available(self):
