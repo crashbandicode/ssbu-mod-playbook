@@ -77,7 +77,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release after the fence when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, game, perfect, allow_stopped, count}` | named practice game with an armed attempt tracepoint | matching markers, CPU kinds, sequence/frame bounds, and running state |
-| `bridge_on` `{port, cap}` | title-screen trace or bridge already on | own listening event before detached capture, greeting and backup reply; backup refusal is recorded, not a block failure |
+| `bridge_on` `{port, cap}` | title-screen trace, stub-on no-input boot, or bridge already on | own listening event before detached capture, greeting and backup reply; stub-on also checks listener ownership and the first active Title prompt when it sends the chord; backup refusal is recorded, not a block failure |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
 | `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded; cap defaults to 240 seconds |
@@ -121,6 +121,7 @@ source timer, but cannot authorise input; at the deadline one grace read may wit
 Training settle reads also have a 2-second floor and may finish up to 2 seconds after their settle cap.
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
+
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
 Training phases re-locate after each phase; a failed phase retries only after two consecutive fresh reads of a
 recognised native-owned screen, with at most three starts per phase per call. Continuity errors and unreadable
@@ -149,6 +150,19 @@ misreading of the early press: both lengths are lost when sent before the picker
 late did reach the fighter select (proof-lobby-17060a5e-3). 9 frames is kept only because it is the length flown in
 every later successful transition; it is not evidence against the 4-frame tap.
 
+`bridge_on` accepts a trace witness or, on Linux Eden hosts with the stub on, checks boot-default chord readiness,
+running and loading status, no input since `game.load`, and listener ownership before capture. With the stub on, the
+Title prompt is named by the bridge only after it is On. Before the chord the
+evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
+the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.
+Opening playback is not the prompt and can extend the readiness wait to 180 seconds.
+With the stub on, the greeting, the install line and the Title read come from the latest complete connection in the capture log; a connection change after that greeting stops the step.
+If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event,
+the same port and the same boot: a stub-on receipt with its pre-On evidence and its Title prompt read, or a trace
+receipt with its stock opening witness.
+A chord that brings no toggle stops the step; it is not retried.
+The first stub-on receipt in a row is `routes-bridge-on.json`; repeats are `routes-bridge-on-2.json` and so on.
+
 `to_main` defaults to a 54-second navigation cap. If it observes native `title.opening_playback` with no dialog
 within that initial wait, it allows one passive opening-readiness period, capped at 180 seconds from route entry.
 The unchanged navigation cap starts when the next qualified prompt or Main appears. The opening grants no input.
@@ -158,6 +172,18 @@ skip remains a separate single-shot recovery within the navigation deadline.
 `pick_stage` and `pick_fighters` step the tile cursor ([TILE-CURSOR](TILE-CURSOR.md)) with the `tile-*` macros,
 never a plain D-pad. Each step must log `step … to=N`, then `settled … at=N`. Row widths come from the log, not
 from a constant.
+
+### Fresh stills
+
+`stills.jsonl` records each capture's file, hash, size, Eden reply and same-boot bridge frame and wall time.
+The frame and boot are read incrementally from the instance's bridge log from its start; a replaced log starts
+again without the old boot.
+An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`
+in the plan to change that threshold. Image gates cannot pass on a refused still. A genuinely static screen is
+refused too: use a state source instead. Without a bridge log or boot identity, stills are `unverified`.
+Marks require usable stills, and change gates check both pictures. If the freshness record cannot be written, the
+still remains as a diagnostic but cannot pass a gate; the row lists it under `still_errors`.
+This check follows seven identical stills over 24 seconds in `rc15-a1-trace-2ddba1f-xps-2` (2026-11-24).
 
 ### The CPU's coin: not proven
 

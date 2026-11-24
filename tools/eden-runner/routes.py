@@ -3400,6 +3400,16 @@ def _bridge_on_events(ctx):
     return path.read_text().splitlines() if path.is_file() else []
 
 
+def _bridge_on_listener_owner(port):
+    """Read Linux Eden listener ownership; ss must be available on the Eden host."""
+    try:
+        return subprocess.check_output(['ss', '-ltnp', f'sport = :{port}'], text=True, timeout=4)
+    except FileNotFoundError:
+        raise RuntimeError('bridge_on (stub on): ss is not available') from None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f'bridge_on (stub on): ss failed: {exc}') from exc
+
+
 class BridgeOnChordHoldError(RuntimeError):
     pass
 
@@ -3498,6 +3508,11 @@ def _bridge_on_cold_enable(ctx, trace):
     if witness is None:
         raise RuntimeError("No live stock opening owner and boot-default chord readiness")
     _bridge_on_chord(ctx)
+    event = _bridge_on_fresh_transition(ctx, before)
+    return _save(ctx, "cold-opening-chord", {"stock": witness, "event": event})
+
+
+def _bridge_on_fresh_transition(ctx, before):
     until = time.monotonic() + 10
     while time.monotonic() < until:
         ctx.check_stop()
@@ -3508,9 +3523,251 @@ def _bridge_on_cold_enable(ctx, trace):
         if transitions:
             if len(transitions) != 1 or not re.search(r"phase=on gen=1 .*\bsource=pad_chord\b", transitions[0]):
                 raise RuntimeError(f"Unexpected cold chord transition: {transitions!r}")
-            return _save(ctx, "cold-opening-chord", {"stock": witness, "event": transitions[0]})
+            return transitions[0]
         time.sleep(0.05)
     raise RuntimeError("No fresh pad-chord On event within 10 seconds")
+
+
+def _bridge_on_control_journal(ctx):
+    message = "bridge_on (stub on): no control journal with this boot's game.load: cannot show the game has had no input"
+    try:
+        path = instance_path(ctx, 'control_log')
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        if any(not isinstance(row, dict) or (row.get('event') == 'request'
+               and not isinstance(row.get('method'), str)) for row in rows):
+            raise ValueError('invalid control journal row')
+        requests = [row for row in rows if row.get('event') == 'request']
+        loads = [i for i, row in enumerate(requests) if row.get('method') == 'game.load']
+        if not loads:
+            raise ValueError('no game.load')
+    except (KeyError, OSError, UnicodeError, ValueError):
+        raise RuntimeError(message) from None
+    load = requests[loads[-1]]
+    after = requests[loads[-1] + 1:]
+    for row in after:
+        method = row['method']
+        if method == 'macro.play' or (method.startswith('input.') and method not in ('input.schema', 'input.reset')):
+            raise RuntimeError(f"bridge_on (stub on): input was sent since game.load ({method} at {row.get('time')}): "
+                               "the game may have left the opening, Title and attract screens")
+    return {'path': str(path), 'game_load_time': load.get('time'),
+            'requests_after_load': len(after), 'inputs_after_load': 0}
+
+
+def _bridge_on_receipt_qualifies(receipt, event, port):
+    try:
+        chord = receipt['chord']
+        hello = receipt['hello']
+        if (not isinstance(chord, dict) or chord.get('event') != event
+                or receipt['capture']['port'] != port or not isinstance(hello, str)):
+            return None
+        match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
+        if match is None:
+            return None
+        boot = match[1]
+        if receipt['witness'] == 'trace':
+            stock = chord.get('stock')
+            return boot if isinstance(stock, dict) and stock and chord.get('chord') != 'already on' else None
+        if receipt['witness'] != 'stub-on' or chord.get('chord') != 'pad':
+            return None
+        pre = chord['pre_chord']
+        title = receipt['title']
+        if not isinstance(pre, dict) or not isinstance(title, dict):
+            return None
+        install = pre.get('install')
+        ready = pre.get('chord_ready')
+        status = pre.get('status')
+        journal = pre.get('journal')
+        if not (isinstance(install, str) and 'toggle=off reason=boot_default' in install
+                and isinstance(ready, str) and re.fullmatch(r'\d+ \[Bridge\] chord ready', ready)
+                and isinstance(status, dict) and status.get('running') is True
+                and status.get('loading_complete') is True
+                and isinstance(journal, dict) and type(journal.get('inputs_after_load')) is int
+                and journal['inputs_after_load'] == 0 and journal.get('game_load_time')):
+            return None
+        if not (title.get('matched') == 'prompt' and title.get('screen') == 'title'
+                and title.get('focus') == 'title.press_any' and title.get('observation.active') == 'yes'
+                and all(type(title.get(key)) is int for key in ('rev', 'frame', 'wall'))
+                and title.get('boot') == boot):
+            return None
+        return boot
+    except (KeyError, TypeError):
+        return None
+
+
+def _bridge_on_qualified_receipt(ctx, event, port):
+    candidates = []
+    for path in Path(ctx.row_dir).parent.glob('*/routes-bridge-on*.json'):
+        try:
+            candidates.append((path.stat().st_mtime_ns, str(path), path))
+        except OSError:
+            continue
+    for _, _, path in sorted(candidates, reverse=True):
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            continue
+        boot = _bridge_on_receipt_qualifies(receipt, event, port)
+        if boot is None:
+            continue
+        witness = receipt['witness']
+        title = receipt.get('title') if witness == 'stub-on' else None
+        return {'chord': 'already on', 'event': event,
+                'qualified_by': {'receipt': str(path), 'witness': witness, 'title': title, 'boot': boot}}
+    raise RuntimeError(f'bridge_on (stub on): the bridge is already On ({event}) but this run has no qualified '
+                       'bridge_on receipt for that On event: cannot show how it was enabled')
+
+
+def _bridge_on_stub_enable(ctx, port):
+    before = _bridge_on_events(ctx)
+    existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
+    if existing is not None:
+        return _bridge_on_qualified_receipt(ctx, existing, port)
+    until = time.monotonic() + 54
+    missing = []
+    while time.monotonic() < until:
+        ctx.check_stop()
+        before = _bridge_on_events(ctx)
+        existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
+        if existing is not None:
+            return _bridge_on_qualified_receipt(ctx, existing, port)
+        _bridge_on_control_journal(ctx)
+        install = next((line for line in reversed(before) if 'toggle=off reason=boot_default' in line), None)
+        ready = next((line for line in reversed(before) if re.fullmatch(r'\d+ \[Bridge\] chord ready', line)), None)
+        status = ctx.call('status') or {}
+        if not isinstance(status, dict):
+            status = {}
+        status = {key: status.get(key) for key in ('running', 'loading_complete')}
+        journal = _bridge_on_control_journal(ctx)
+        missing = [name for name, good in (
+            ('install', install is not None), ('chord_ready', ready is not None),
+            ('running', status['running'] is True), ('loading_complete', status['loading_complete'] is True),
+        ) if not good]
+        if not missing:
+            break
+        time.sleep(min(.1, max(0, until - time.monotonic())))
+    else:
+        raise RuntimeError(f"bridge_on (stub on): not ready for the chord: {', '.join(missing)}")
+    _bridge_on_chord(ctx)
+    event = _bridge_on_fresh_transition(ctx, before)
+    return {'chord': 'pad', 'witness': 'stub-on',
+            'pre_chord': {'install': install, 'chord_ready': ready, 'status': status, 'journal': journal},
+            'event': event}
+
+
+def _bridge_on_owned_listener(ctx, port):
+    try:
+        path = instance_path(ctx, 'control_log').parent / 'run.json'
+        pid = json.loads(path.read_text())['owned_pids'][0]['pid']
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError('invalid owned pid')
+    except (KeyError, IndexError, TypeError, ValueError, OSError, UnicodeError) as exc:
+        raise RuntimeError(f'bridge_on (stub on): cannot read owned Eden pid from run.json: {exc}') from exc
+    listener = _bridge_on_listener_owner(port)
+    if f'pid={pid},' not in listener:
+        raise RuntimeError(f"bridge_on (stub on): port {port} is not bound by the owned Eden (pid {pid}): "
+                           f"{listener.strip() or 'no listener'}")
+    return listener
+
+
+def _bridge_on_latest_connection(text):
+    hello = install = None
+    start = None
+    for index, line in enumerate(text.splitlines()):
+        if state_gate.BOUNDARY.search(line):
+            hello = line if '[Bridge] hello ' in line else None
+            install = None
+            start = index if hello is not None else None
+        elif hello is not None and install is None and 'plugin=ssbu-hw-bridge/' in line and 'result=' in line:
+            install = line
+    return (hello, install, start) if hello is not None and install is not None else None
+
+
+def _bridge_on_connection_changed(line):
+    return RuntimeError(f"bridge_on (stub on): the bridge connection changed after the greeting "
+                        f"({line[:120]}): the Title cannot be read from an earlier connection")
+
+
+def _bridge_on_ui_blocks_since_hello(text, hello, start):
+    lines = text.splitlines()
+    if start >= len(lines) or lines[start] != hello:
+        raise RuntimeError('bridge_on (stub on): bridge greeting disappeared from capture log')
+    for line in lines[start + 1:]:
+        if state_gate.BOUNDARY.search(line):
+            raise _bridge_on_connection_changed(line)
+    segment = []
+    for line in lines[start + 1:]:
+        if state_gate.BEGIN.search(line):
+            segment = [line]
+        elif segment:
+            segment.append(line)
+            if state_gate.END.search(line):
+                blocks = state_gate.blocks('\n'.join(segment), native_picker.UI)
+                if blocks:
+                    clock = re.search(r' frame=(\d+) wall=(\d+)$', segment[0])
+                    if clock is None:
+                        raise RuntimeError('bridge_on (stub on): state begin lacks frame or wall')
+                    blocks[0].update(frame=int(clock[1]), wall=int(clock[2]))
+                    yield blocks[0]
+                segment = []
+
+
+def _bridge_on_stub_title(ctx, hello, start):
+    match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
+    if match is None:
+        raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
+    boot = match[1]
+    log = instance_path(ctx, 'bridge_log')
+    started = time.monotonic()
+    until = started + 10
+    allowed = 10
+    next_request = 0
+    seen = 0
+    last = None
+    opening = False
+    not_yet = []
+    identities = set()
+    timeout = 'bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting'
+    while (remaining := until - time.monotonic()) > 0:
+        ctx.check_stop()
+        now = time.monotonic()
+        if now >= next_request:
+            bridge_v2(ctx, 'providers', 'state ssbu.ui')
+            next_request = now + .1
+        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello, start))
+        if len(blocks) < seen:
+            raise RuntimeError('bridge_on (stub on): bridge observation history changed')
+        for block in blocks[seen:]:
+            seen += 1
+            values = block['values']
+            if block['boot'] != boot or values.get('observation.active') != 'yes':
+                continue
+            sample = native_picker.Sample(block, 0)
+            if _fields_match(sample, TITLE_PROMPT):
+                native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+                return {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'], 'boot': block['boot'],
+                        **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
+                        'matched': 'prompt', 'not_yet': not_yet, 'waited_s': round(time.monotonic() - started, 3)}
+            is_opening = _fields_match(sample, TITLE_OPENING)
+            if not is_opening and not _fields_match(sample, _TITLE_WITHOUT_PROMPT):
+                raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
+                                   f"{values.get('screen')}/{values.get('focus')}, not the Title")
+            native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+            last = {'rev': block['rev'], 'frame': block['frame'],
+                    **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
+            identity = (last['screen'], last['screen.context'], last['focus'])
+            if identity not in identities:
+                identities.add(identity)
+                not_yet.append(last)
+            if is_opening:
+                until, allowed = started + TITLE_OPENING_READY_S, TITLE_OPENING_READY_S
+            elif opening:
+                until, allowed = now + 10, 10
+            opening = is_opening
+        time.sleep(min(.05, max(0, until - time.monotonic())))
+    if last is not None:
+        raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within {allowed} s of the greeting; "
+                           f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
+    raise RuntimeError(timeout)
 
 
 def free_port(first=6980, last=7079, host='0.0.0.0'):
@@ -3537,19 +3794,22 @@ def free_udp_port(first=24872, last=24971):
 
 def bridge_on(ctx, port=None, cap=60):
     """Turn the bridge on at the title screen and start its detached playbook capture."""
-    try:
-        if not ctx.instance.get('trace_jsonl'):
-            raise KeyError('trace_jsonl')
-        trace = instance_path(ctx, 'trace_jsonl')
-    except KeyError:
-        raise RuntimeError('bridge_on needs a trace run: the title-screen witness is a trace point '
-                           '(start Eden with a trace config and the GDB stub off)') from None
+    trace = None
+    if ctx.instance.get('trace_jsonl'):
+        try:
+            trace = instance_path(ctx, 'trace_jsonl')
+        except KeyError:
+            raise RuntimeError('bridge_on needs a trace run: the title-screen witness is a trace point '
+                               '(start Eden with a trace config and the GDB stub off)') from None
+    elif str((ctx.call('settings.get', {'key': 'core.use_gdbstub'}) or {}).get('value')).lower() != 'true':
+        raise RuntimeError('bridge_on needs a trace run (GDB stub off) or a stub-on run '
+                           '(core.use_gdbstub true); this instance is neither')
     if port is None:
         try:
             port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())
         except (KeyError, OSError, ValueError):
             raise RuntimeError('bridge_on needs a port argument or an integer in profile port.txt') from None
-    chord = _bridge_on_cold_enable(ctx, trace)
+    chord = _bridge_on_cold_enable(ctx, trace) if trace is not None else _bridge_on_stub_enable(ctx, port)
     until = time.monotonic() + 5
     listening = last_listen = None
     pattern = re.compile(r'\[Bridge\] listening port=' + re.escape(str(port)) + r'\b')
@@ -3566,6 +3826,7 @@ def bridge_on(ctx, port=None, cap=60):
                            f'expected "[Bridge] listening port={port}" in its own events log, '
                            f'saw: {last_listen or "no listen line"}. Another process holds the port: '
                            'give the run its own free port (port.txt) and boot again. No capture was started.')
+    listener = _bridge_on_owned_listener(ctx, port) if trace is None else None
     run = Path(ctx.row_dir).parent / 'bridge-run'
     (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
     log = run / 'bridge.log'
@@ -3596,13 +3857,23 @@ def bridge_on(ctx, port=None, cap=60):
     ctx.runner.instances.setdefault(ctx.on, {})['bridge_log'] = str(log)
     text = ''
     until = time.monotonic() + cap
-    while 'plugin=ssbu-hw-bridge/' not in text or 'tr_export=' not in text:
-        if time.monotonic() > until:
-            raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
-        time.sleep(0.2)
-        text = log.read_text(errors='replace')
-    hello = next(l for l in text.splitlines() if '[Bridge] hello' in l)
-    install = next(l for l in text.splitlines() if 'plugin=ssbu-hw-bridge/' in l and 'result=' in l)
+    if trace is None:
+        connection = None
+        while connection is None:
+            if time.monotonic() > until:
+                raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
+            time.sleep(0.2)
+            text = log.read_text(errors='replace')
+            connection = _bridge_on_latest_connection(text)
+        hello, install, start = connection
+    else:
+        while 'plugin=ssbu-hw-bridge/' not in text or 'tr_export=' not in text:
+            if time.monotonic() > until:
+                raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
+            time.sleep(0.2)
+            text = log.read_text(errors='replace')
+        hello = next(l for l in text.splitlines() if '[Bridge] hello' in l)
+        install = next(l for l in text.splitlines() if 'plugin=ssbu-hw-bridge/' in l and 'result=' in l)
     guard = next((field for field in install.split() if field.startswith('guards=')), '')
     if not guard or int(guard.split('=', 1)[1], 16) & 0x3fffff != 0x3fffff:
         raise RuntimeError(f'bridge core guards incomplete: {install}')
@@ -3614,6 +3885,20 @@ def bridge_on(ctx, port=None, cap=60):
             raise RuntimeError(f'bridge install line lacks {want}: {install}')
     if not re.search(r'\btoggle_gen=[1-9][0-9]*\b', hello):
         raise RuntimeError(f'bridge greeting lacks a positive On generation: {hello}')
+    title = None
+    if trace is None:
+        if chord['chord'] == 'already on':
+            match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
+            if match is None:
+                raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
+            qualified = chord['qualified_by']
+            if match[1] != qualified['boot']:
+                raise RuntimeError(f"bridge_on (stub on): the bridge is already On, but the qualified receipt "
+                                   f"{qualified['receipt']} is from boot {qualified['boot']} and this greeting "
+                                   f"is boot {match[1]}: cannot show how this boot's bridge was enabled")
+            title = {'checked': False, 'reason': 'bridge already On before this call', 'qualified_by': qualified}
+        else:
+            title = _bridge_on_stub_title(ctx, hello, start)
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:
@@ -3623,11 +3908,29 @@ def bridge_on(ctx, port=None, cap=60):
         if backup is not None:
             break
         time.sleep(0.1)
-    return _save(ctx, 'routes-bridge-on', {
+    receipt = {
         'block': 'bridge_on', 'chord': chord, 'listening': listening, 'hello': hello, 'install': install, 'backup': backup,
         'backup_open': bool(backup and re.search(r'\[Bridge\] req backup result=ok(?: |$)', backup)),
         'capture': {'pid': pid, 'port': port, 'bridge_log': str(log)}, 'reused': reused,
-    })
+        'witness': 'stub-on' if trace is None else 'trace',
+    }
+    if trace is None:
+        receipt.update(listener=listener, title=title)
+    name = 'routes-bridge-on'
+    if trace is None:
+        suffix = 2
+        while (Path(ctx.row_dir) / f'{name}.json').exists():
+            name = f'routes-bridge-on-{suffix}'
+            suffix += 1
+        text = log.read_text(errors='replace')
+        connection = _bridge_on_latest_connection(text)
+        if connection is None or connection[0] != hello or connection[2] != start:
+            lines = text.splitlines()
+            boundary = next((line for line in lines[start + 1:] if state_gate.BOUNDARY.search(line)), None)
+            if boundary is None:
+                boundary = lines[start] if start < len(lines) else 'greeting disappeared'
+            raise _bridge_on_connection_changed(boundary)
+    return _save(ctx, name, receipt)
 
 
 def _apply_settings(ctx, data, cap=30):

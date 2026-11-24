@@ -389,7 +389,13 @@ The rules:
 
 `rows.json` names the build it was checked against in `target`: `plugin.tree`,
 `plugin.commit`, and `plugin.nro_sha256`, with optional `bridge.tree` and
-`bridge.commit`, `settings`, and `providers`. The trees are absolute Git
+`bridge.commit`, `settings`, and `providers`. `target.repos` can name additional
+repositories as `{"name": {"tree": "/absolute/path", "commit": "<40 hex>"}}`;
+`plugin` and `bridge` are reserved names. `target.providers` may use these
+names in its `repo` field, but may not redefine a built-in provider. A legacy
+entry with the same repository and files (in any order), and matching optional
+extraction settings, is ignored with a warning and uses the built-in instead.
+The trees are absolute Git
 directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is
 read from the rows folder.
@@ -447,10 +453,22 @@ The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
 an exact `key` with a `reason`. Play calls with computed names or unknown
 callees are warned about, not checked. The built-in providers are `tr.menu`,
-`tr.practice` and `tr.event`;
-event reads use names such as `tr.event:fed run.p1`. A dotted
-string literal in a provider's source file is accepted as a key. The packet
-gate has host tests; it has not been proven in a runtime acceptance.
+`tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need
+`target.bridge`. Example reads include `tr.event:fed run.p1`,
+`ssbu.ui:input.ready`, `bridge:fighter status`, `bridge:input lx` and `bridge:ev`.
+The `bridge` provider reads `src/proto2.rs`, `src/hooks.rs`, `src/model.rs` and
+`src/runtime.rs` at the named commit.
+An event can follow one leading bracket tag, as in `[Bridge] fighter entry=...`;
+continuation literals without their own event contribute bare keys only.
+A provider may set `block` to a schema name to take keys only from functions
+writing that schema, and `helpers` to list optional files included when declared
+with `mod` in a main file and present at the commit. Block keys start a literal
+or follow `\n`, or are string arguments to helpers called with `out`; tagged
+diagnostic literals and whole dotted values are not keys. `ssbu.ui` reads its
+block writer and the pause helper when available; values of `screen` and
+`focus.source` are not keys. Without `block`, dotted string literals are keys
+unless a provider sets `whole_literals: false`, as the `bridge` provider does.
+The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means
 

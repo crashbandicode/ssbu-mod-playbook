@@ -14,6 +14,10 @@ PROVIDERS = {
     'tr.menu': {'repo': 'plugin', 'files': ['src/model/bridge_state.rs', 'src/model/record_place.rs']},
     'tr.practice': {'repo': 'plugin', 'files': ['src/model/practice_state.rs']},
     'tr.event': {'repo': 'plugin', 'files': ['src/model/bridge_events.rs']},
+    'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs'], 'block': 'ssbu.ui',
+                'helpers': ['src/native_ui/pause_focus.rs']},
+    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs', 'src/runtime.rs'],
+               'whole_literals': False},
 }
 BUTTONS = (
     ('A', 1), ('B', 2), ('X', 4), ('Y', 8), ('L', 64), ('R', 128), ('ZL', 256), ('ZR', 512),
@@ -162,21 +166,213 @@ def _git(tree, *args):
     return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, timeout=20, check=True)
 
 
-def emitted_keys(tree, commit, files):
+def emitted_keys(tree, commit, files, whole_literals=True):
     keys = set()
     for path in files:
-        text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
+            raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
         text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
         for literal in re.findall(r'"((?:\\.|[^"\\])*)"', text):
             found = re.findall(r'(?:^|\\n| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal)
             keys.update(found)
-            event = re.match(r'^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
+            event = re.match(r'^(?:\[[A-Za-z]+\] )?([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
             if event:
                 keys.update(f'{event.group(1)} {key}' for key in found)
-            if re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
+            if whole_literals and re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
                 keys.add(literal)
         keys.update(re.findall(r'\bpush_str\s*\(\s*out\s*,\s*"((?:\\.|[^"\\])*)"', text))
     keys.discard('schema')
+    return keys
+
+
+def _rust_lex(text):
+    code = list(text)
+    literals = []
+    i = 0
+    while i < len(text):
+        start = i
+        if text.startswith('//', i):
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end
+        elif text.startswith('/*', i):
+            i += 2
+            depth = 1
+            while i < len(text) and depth:
+                if text.startswith('/*', i):
+                    depth += 1
+                    i += 2
+                elif text.startswith('*/', i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                raise ValueError('could not be scanned')
+        else:
+            raw = re.match(r'(?:b)?r(#+)?"', text[i:])
+            if raw:
+                hashes = raw.group(1) or ''
+                content = i + raw.end()
+                end = text.find('"' + hashes, content)
+                if end < 0:
+                    raise ValueError('could not be scanned')
+                i = end + 1 + len(hashes)
+                literals.append((start, i, text[content:end], True))
+            elif text[i] == '"' or text.startswith('b"', i):
+                quote = i + (text[i] == 'b')
+                i = quote + 1
+                while i < len(text) and text[i] != '"':
+                    i += 2 if text[i] == '\\' else 1
+                if i >= len(text):
+                    raise ValueError('could not be scanned')
+                literals.append((start, i + 1, text[quote + 1:i], False))
+                i += 1
+            elif text[i] == "'":
+                char = re.match(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'", text[i:])
+                if char:
+                    i += char.end()
+                else:
+                    i += 1
+                    continue
+            else:
+                i += 1
+                continue
+        code[start:i] = ['\n' if ch == '\n' else ' ' for ch in text[start:i]]
+    return ''.join(code), literals
+
+
+def _rust_function_bodies(text):
+    code, _ = _rust_lex(text)
+    depth = 0
+    for char in code:
+        depth += (char == '{') - (char == '}')
+        if depth < 0:
+            raise ValueError('could not be scanned')
+    if depth:
+        raise ValueError('could not be scanned')
+    for match in re.finditer(r'\bfn\s+[A-Za-z_][A-Za-z0-9_]*', code):
+        paren = bracket = angle = 0
+        pos = match.end()
+        while pos < len(code):
+            char = code[pos]
+            if char == '(':
+                paren += 1
+            elif char == ')':
+                paren -= 1
+            elif char == '[':
+                bracket += 1
+            elif char == ']':
+                bracket -= 1
+            elif char == '<':
+                angle += 1
+            elif char == '>' and angle:
+                angle -= 1
+            elif char == ';' and not (paren or bracket or angle):
+                break
+            elif char == '{' and not (paren or bracket or angle):
+                start = pos
+                depth = 1
+                pos += 1
+                while pos < len(code) and depth:
+                    depth += (code[pos] == '{') - (code[pos] == '}')
+                    pos += 1
+                if depth:
+                    raise ValueError('could not be scanned')
+                yield start, pos
+                break
+            pos += 1
+
+
+def _block_keys(text):
+    code, literals = _rust_lex(text)
+    keys = set()
+    key_pattern = r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*'
+    for _, _, literal, raw in literals:
+        if re.match(r'^\[[^\]\r\n]+\] ', literal):
+            continue
+        keys.update(re.findall((r'^(' if raw else r'(?:^|\\n)(') + key_pattern + r')=', literal))
+    calls = re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*'
+                        r'(?:::\s*<[^(){};]*>)?\s*\(\s*(?:out|&\s*mut\s+out)\s*,', code)
+    for call in calls:
+        arg_start = call.end()
+        stack = []
+        for pos in range(arg_start, len(code)):
+            char = code[pos]
+            if char in '([{':
+                stack.append(char)
+                continue
+            if char in ')]}':
+                if stack:
+                    stack.pop()
+                    continue
+                if char != ')':
+                    break
+            elif char != ',' or stack:
+                continue
+            argument = next((literal for start, end, literal, _ in literals
+                             if arg_start <= start and end <= pos
+                             and not code[arg_start:start].strip() and not code[end:pos].strip()), None)
+            if argument is not None:
+                if re.fullmatch(key_pattern, argument):
+                    keys.add(argument)
+                break
+            if char == ')':
+                break
+            arg_start = pos + 1
+    return keys
+
+
+def _provider_keys(tree, commit, source, partial=False):
+    files = source['files']
+    block = source.get('block')
+    if not block:
+        if not partial:
+            return emitted_keys(tree, commit, files, source.get('whole_literals') is not False)
+        keys = set()
+        for path in files:
+            try:
+                keys.update(emitted_keys(tree, commit, [path], source.get('whole_literals') is not False))
+            except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
+                continue
+        return keys
+    texts = []
+    for path in files:
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError as error:
+            if partial:
+                continue
+            detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
+            raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
+        texts.append(re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0])
+    keys = set()
+    found = False
+    for text in texts:
+        try:
+            bodies = list(_rust_function_bodies(text))
+            _, literals = _rust_lex(text)
+        except ValueError as error:
+            raise ValueError(f'{error} at {commit[:8]}') from error
+        for start, end in bodies:
+            if any(start < pos < end and f'schema={block}/' in value for pos, _, value, _ in literals):
+                found = True
+                keys.update(_block_keys(text[start:end]))
+    if not found:
+        raise ValueError(f'no function writes schema={block}/ in {", ".join(files)} at {commit[:8]}')
+    declarations = '\n'.join(_rust_lex(text)[0] for text in texts)
+    for path in source.get('helpers', []):
+        stem = Path(path).stem
+        if not re.search(r'\bmod\s+' + re.escape(stem) + r'\s*;', declarations):
+            continue
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError:
+            continue
+        list(_rust_function_bodies(text))
+        keys.update(_block_keys(text))
     return keys
 
 
@@ -186,24 +382,35 @@ def _target(plan, base, errors):
         errors.append('G2 target: target must be an object')
         return {}, None
     repos = {}
-    for name in ('plugin', 'bridge'):
-        if name == 'bridge' and name not in target:
-            continue
-        spec = target.get(name)
+    extra = target.get('repos', {})
+    if not isinstance(extra, dict):
+        errors.append('G2 target: repos must be an object')
+        extra = {}
+    specs = [('plugin', target.get('plugin'), 'plugin')]
+    if 'bridge' in target:
+        specs.append(('bridge', target['bridge'], 'bridge'))
+    for name, spec in extra.items():
+        if name in ('plugin', 'bridge'):
+            errors.append(f'G2 target: repos.{name} is reserved')
+        elif not isinstance(name, str) or not name:
+            errors.append(f'G2 target: invalid repository name {name!r}')
+        else:
+            specs.append((name, spec, f'repos.{name}'))
+    for name, spec, label in specs:
         if not isinstance(spec, dict):
-            errors.append(f'G2 target: {name} must be an object')
+            errors.append(f'G2 target: {label} must be an object')
             continue
         tree, commit = spec.get('tree'), spec.get('commit')
         if not isinstance(tree, str) or not Path(tree).is_absolute() or not Path(tree).is_dir():
-            errors.append(f'G2 target: {name}.tree must be an existing absolute directory')
+            errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
             continue
         if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
-            errors.append(f'G2 target: {name}.commit must be 40 lower-case hex characters')
+            errors.append(f'G2 target: {label}.commit must be 40 lower-case hex characters')
             continue
         try:
             _git(tree, 'cat-file', '-e', f'{commit}^{{commit}}')
         except (OSError, subprocess.SubprocessError):
-            errors.append(f'G2 target: {name}.commit {commit} is not a commit in {tree}')
+            errors.append(f'G2 target: {label}.commit {commit} is not a commit in {tree}')
             continue
         repos[name] = spec
         if name == 'plugin' and not re.fullmatch(r'[0-9a-fA-F]{64}', str(spec.get('nro_sha256', ''))):
@@ -323,12 +530,42 @@ def _hooks(plan, base, errors):
     return modules
 
 
-def _reads(plan, repos, errors):
+def _providers(plan, errors, warnings):
     declared = plan['target'].get('providers', {})
     if not isinstance(declared, dict):
         errors.append('G2 target: providers must be an object')
         declared = {}
-    providers = {**PROVIDERS, **declared}
+    providers = dict(PROVIDERS)
+    for name, source in declared.items():
+        if name not in PROVIDERS:
+            providers[name] = source
+            continue
+        builtin = PROVIDERS[name]
+        differences = []
+        if not isinstance(source, dict) or source.get('repo') != builtin['repo']:
+            differences.append('repo')
+        files = source.get('files') if isinstance(source, dict) else None
+        if (not isinstance(files, list) or not all(isinstance(path, str) for path in files)
+                or sorted(files) != sorted(builtin['files'])):
+            differences.append('files')
+        for field in ('block', 'helpers', 'whole_literals'):
+            if isinstance(source, dict) and field in source:
+                expected = builtin.get(field)
+                if type(source[field]) is not type(expected) or source[field] != expected:
+                    differences.append(field)
+        if differences:
+            errors.append(f'G2 target: providers.{name} redefines a built-in provider '
+                          f'({", ".join(differences)}); remove the entry or give the provider another name')
+        else:
+            warnings.append(f'G2 target: providers.{name} repeats a built-in provider; '
+                            'the built-in extraction is used (remove the entry)')
+    return providers
+
+
+def _reads(plan, repos, errors, providers):
+    extra = plan['target'].get('repos', {})
+    repo_names = {'plugin', 'bridge'} | ({name for name in extra if isinstance(name, str)}
+                                         if isinstance(extra, dict) else set())
     emitted = {}
     failed = set()
     for row in plan.get('rows', []):
@@ -339,17 +576,20 @@ def _reads(plan, repos, errors):
                 continue
             provider, key = read.split(':', 1)
             source = providers.get(provider)
-            if not isinstance(source, dict) or source.get('repo') not in ('plugin', 'bridge'):
+            if (not isinstance(source, dict) or not isinstance(source.get('repo'), str)
+                    or source['repo'] not in repo_names):
                 errors.append(f'G2 row {row_id}: no extractor for provider {provider} (add target.providers)')
                 continue
             repo = repos.get(source['repo'])
             if repo is None:
-                errors.append(f'G2 row {row_id}: provider {provider} needs target.{source["repo"]}')
+                name = source['repo']
+                label = name if name in ('plugin', 'bridge') else f'repos.{name}'
+                errors.append(f'G2 row {row_id}: provider {provider} needs target.{label}')
                 continue
             if provider not in emitted and provider not in failed:
                 try:
-                    emitted[provider] = emitted_keys(repo['tree'], repo['commit'], source['files'])
-                except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
+                    emitted[provider] = _provider_keys(repo['tree'], repo['commit'], source)
+                except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError) as error:
                     errors.append(f'G2 row {row_id}: extractor {provider}: {error}')
                     failed.add(provider)
             if provider in emitted and key not in emitted[provider]:
@@ -466,7 +706,7 @@ def _paths(plan, base, raw, modules, errors):
                 check_path(node.value, module, False)
 
 
-def _hook_checks(plan, base, modules, repos, errors, warnings):
+def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
     import routes
 
     segment_names = set(plan.get('segments', {}))
@@ -483,22 +723,19 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
             continue
     if not sources:
         return
-    declared = plan['target'].get('providers', {})
-    providers = {**PROVIDERS, **(declared if isinstance(declared, dict) else {})}
     written = set()
     for source in providers.values():
-        if not isinstance(source, dict) or source.get('repo') not in repos:
+        if not isinstance(source, dict) or not isinstance(source.get('repo'), str) or source['repo'] not in repos:
             continue
         repo = repos[source['repo']]
         files = source.get('files')
         if not isinstance(files, list):
             continue
-        for file in files:
-            try:
-                written.update(emitted_keys(repo['tree'], repo['commit'], [file]))
-            except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError):
-                continue
-    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key}
+        try:
+            written.update(_provider_keys(repo['tree'], repo['commit'], source, partial=True))
+        except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
+            continue
+    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key and '.' in key}
     ignored = {item['key'] for item in plan.get('reads_ignore', [])
                if isinstance(item, dict) and isinstance(item.get('key'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
@@ -785,9 +1022,10 @@ def check(plan, base, raw):
     repos, settings = _target(plan, base, errors)
     modules = _hooks(plan, base, errors)
     if isinstance(plan['target'], dict):
-        report['emitted'] = _reads(plan, repos, errors)
+        providers = _providers(plan, errors, report['warnings'])
+        report['emitted'] = _reads(plan, repos, errors, providers)
         _bindings(plan, base, settings, errors, report['warnings'])
-        _hook_checks(plan, base, modules, repos, errors, report['warnings'])
+        _hook_checks(plan, base, modules, repos, errors, report['warnings'], providers)
     _paths(plan, base, raw, modules, errors)
     report['rows'] = _needs(plan, errors)
     _effects(plan, errors)

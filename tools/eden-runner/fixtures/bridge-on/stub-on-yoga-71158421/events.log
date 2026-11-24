@@ -1,0 +1,4 @@
+474066032 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=installed indicator=hooked native_ui=installed chord=deferred toggle=off reason=boot_default fixture=closed deluxe=registered heap_register=43 guards=0x7ffffff tr_export=available server=started result=installed heap_allocations=51 heap_install=51
+474148389 [Bridge] chord ready
+474261175 [Bridge] listening port=6980 rebinds=0
+474261178 [Bridge] toggle phase=on gen=1 reason=pad_chord source=pad_chord fixture=closed indicator=on
