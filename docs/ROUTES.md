@@ -153,6 +153,8 @@ from a constant.
 ### Fresh stills
 
 `stills.jsonl` records each capture's file, hash, size, Eden reply and same-boot bridge frame and wall time.
+The frame and boot are read incrementally from the instance's bridge log from its start; a replaced log starts
+again without the old boot.
 An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`
 in the plan to change that threshold. Image gates cannot pass on a refused still. A genuinely static screen is
 refused too: use a state source instead. Without a bridge log or boot identity, stills are `unverified`.

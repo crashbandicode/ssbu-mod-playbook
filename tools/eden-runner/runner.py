@@ -1261,6 +1261,7 @@ class Runner:
         self.out = out
         self.out.mkdir(parents=True, exist_ok=True)
         self.stills = still_fresh.Ledger(self.out, frames=(self.plan.get('still_freshness') or {}).get('frames', 180))
+        self._frame_sources = {}
         self.still_records = {}
         self.row_stills_refused = []
         capture_path = self.out / 'bridge-run' / 'capture.json'
@@ -1469,7 +1470,9 @@ class Runner:
         path = self.row_dir / f'{on}-{time.strftime("%H%M%S", time.gmtime())}Z-{time.time_ns() % 10**6:06d}-{name}.png'
         reply = self.call(on, 'ui.screenshot', {'target': target, 'path': str(path)})
         try:
-            frame = still_fresh.game_frame(self.instances[on].get('bridge_log'))
+            if on not in self._frame_sources:
+                self._frame_sources[on] = still_fresh.FrameSource(self.instances[on].get('bridge_log'))
+            frame = self._frame_sources[on].read()
             record = self.stills.record(on, path, reply, frame)
             self.still_records[str(path)] = record
             if still_fresh.refused(record):

@@ -1,6 +1,7 @@
 """Record screenshot provenance and detect images frozen across game frames."""
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,30 +9,63 @@ from pathlib import Path
 
 _BOOT = re.compile(rb'\bboot=(0x[0-9a-fA-F]+)\b')
 _FRAME = re.compile(rb' frame=(\d+) wall=(\d+)$')
-_TAIL_BYTES = 64 * 1024
+_READ_BYTES = 1024 * 1024
 
 
-def game_frame(bridge_log):
-    if bridge_log is None:
-        return None
-    try:
-        with Path(bridge_log).open('rb') as stream:
-            stream.seek(0, 2)
-            size = stream.tell()
-            start = max(0, size - _TAIL_BYTES)
-            stream.seek(start)
-            lines = stream.read().splitlines()
-    except (OSError, TypeError, ValueError):
-        return None
-    boot, frame = None, None
-    for line in lines:
+class FrameSource:
+    def __init__(self, path):
+        self.path = Path(path) if path is not None else None
+        self._reset()
+
+    def _reset(self):
+        self.identity = None
+        self.offset = 0
+        self.partial = b''
+        self.boot = self.frame = self.wall = None
+
+    def _line(self, line):
         for value in _BOOT.findall(line):
             boot = value.decode('ascii')
-        if match := _FRAME.search(line):
-            frame = (int(match[1]), int(match[2]))
-    if frame is None:
+            if boot != self.boot:
+                self.boot = boot
+                self.frame = self.wall = None
+        if match := _FRAME.search(line.rstrip(b'\r')):
+            self.frame, self.wall = int(match[1]), int(match[2])
+
+    def read(self):
+        if self.path is None:
+            self._reset()
+            return None
+        for _ in range(2):
+            try:
+                with self.path.open('rb') as stream:
+                    stat = os.fstat(stream.fileno())
+                    identity = (stat.st_dev, stat.st_ino)
+                    if identity != self.identity or stat.st_size < self.offset:
+                        self._reset()
+                        self.identity = identity
+                    stream.seek(self.offset)
+                    while self.offset < stat.st_size:
+                        data = stream.read(min(_READ_BYTES, stat.st_size - self.offset))
+                        if not data:
+                            break
+                        self.offset += len(data)
+                        lines = (self.partial + data).split(b'\n')
+                        self.partial = lines.pop()
+                        for line in lines:
+                            self._line(line)
+                    current = self.path.stat()
+                    if (self.offset < stat.st_size or (current.st_dev, current.st_ino) != identity
+                            or current.st_size < self.offset):
+                        self._reset()
+                        continue
+            except (OSError, TypeError, ValueError):
+                self._reset()
+                return None
+            if self.frame is None:
+                return None
+            return {'boot': self.boot, 'frame': self.frame, 'wall': self.wall}
         return None
-    return {'boot': boot, 'frame': frame[0], 'wall': frame[1]}
 
 
 class Ledger:

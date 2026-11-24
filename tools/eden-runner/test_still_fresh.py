@@ -7,6 +7,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 class StillFreshTests(unittest.TestCase):
@@ -89,11 +90,30 @@ class StillFreshTests(unittest.TestCase):
         source = self.fresh.FrameSource(path)
         self.assertEqual(source.read()['boot'], '0xabc')
         replacement = self.root / 'new.log'
-        replacement.write_bytes(b'[Bridge] state frame=300 wall=3000\n')
+        replacement.write_bytes(b'[Bridge] padding=' + b'x' * 200 + b' frame=300 wall=3000\n')
         replacement.replace(path)
         frame = source.read()
         self.assertEqual(frame, {'boot': None, 'frame': 300, 'wall': 3000})
         self.assertEqual(self.record(frame)['status'], 'unverified')
+
+    def test_a_log_replaced_during_a_read_is_reopened_without_the_old_boot(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=100 wall=1000\n')
+        replacement = self.root / 'new.log'
+        replacement.write_bytes(b'[Bridge] frame=300 wall=3000\n')
+        original_stat = Path.stat
+        replaced = []
+
+        def replace_before_stat(target, *args, **kwargs):
+            if target == path and not replaced:
+                replacement.replace(path)
+                replaced.append(True)
+            return original_stat(target, *args, **kwargs)
+
+        with mock.patch.object(Path, 'stat', autospec=True, side_effect=replace_before_stat):
+            frame = self.fresh.FrameSource(path).read()
+        self.assertTrue(replaced)
+        self.assertEqual(frame, {'boot': None, 'frame': 300, 'wall': 3000})
 
     def test_a_truncated_log_restarts_from_its_start(self):
         path = self.root / 'bridge.log'
@@ -115,6 +135,15 @@ class StillFreshTests(unittest.TestCase):
             stream.write(b'[Bridge] frame=2 wall=20\n')
         self.assertEqual(source.read(), {'boot': '0xdef', 'frame': 2, 'wall': 20})
 
+    def test_a_repeated_boot_token_preserves_the_latest_frame(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=100 wall=1000\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read(), {'boot': '0xabc', 'frame': 100, 'wall': 1000})
+        with path.open('ab') as stream:
+            stream.write(b'[Bridge] boot=0xabc\n')
+        self.assertEqual(source.read(), {'boot': '0xabc', 'frame': 100, 'wall': 1000})
+
     def test_an_incomplete_last_line_is_completed_by_the_next_read(self):
         path = self.root / 'bridge.log'
         path.write_bytes(b'[Bridge] boot=0xabc frame=12 wall=')
@@ -134,8 +163,43 @@ class StillFreshTests(unittest.TestCase):
         self.assertEqual(source.offset, len(initial))
         with path.open('ab') as stream:
             stream.write(appended)
-        self.assertEqual(source.read()['frame'], 2)
+        original_open = Path.open
+        observed = []
+
+        class CountedStream:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def read(self, size=-1):
+                data = self.stream.read(size)
+                observed.append(data)
+                return data
+
+        def tracked_open(path, *args, **kwargs):
+            return CountedStream(original_open(path, *args, **kwargs))
+
+        with mock.patch.object(Path, 'open', autospec=True, side_effect=tracked_open):
+            self.assertEqual(source.read()['frame'], 2)
+        self.assertEqual(b''.join(observed), appended)
         self.assertEqual(source.offset, len(initial) + len(appended))
+
+    def test_a_large_first_read_spans_multiple_chunks(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc\n' + b'x' * (1024 * 1024 + 5) +
+                         b'\n[Bridge] frame=100 wall=1000\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read(), {'boot': '0xabc', 'frame': 100, 'wall': 1000})
+        self.assertEqual(source.offset, path.stat().st_size)
 
     def test_missing_log_clears_a_previously_observed_boot(self):
         path = self.root / 'bridge.log'
@@ -145,6 +209,16 @@ class StillFreshTests(unittest.TestCase):
         path.unlink()
         self.assertIsNone(source.read())
         path.write_bytes(b'[Bridge] frame=200 wall=2000\n')
+        self.assertEqual(source.read(), {'boot': None, 'frame': 200, 'wall': 2000})
+
+    def test_unreadable_log_clears_a_previously_observed_boot(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc frame=1 wall=10\n')
+        source = self.fresh.FrameSource(path)
+        self.assertEqual(source.read()['boot'], '0xabc')
+        with mock.patch.object(Path, 'open', side_effect=PermissionError('denied')):
+            self.assertIsNone(source.read())
+        path.write_bytes(b'[Bridge] padding=xxxxxxxxxxxxxxxx frame=200 wall=2000\n')
         self.assertEqual(source.read(), {'boot': None, 'frame': 200, 'wall': 2000})
 
     def test_a_changed_picture_is_fresh(self):

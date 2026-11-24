@@ -1150,6 +1150,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((first['status'], second['status']), ('fresh', 'refused'))
         self.assertEqual((second['boot'], second['frame'], second['unchanged_frames']), ('0xabc', 1200, 200))
 
+    def test_shot_does_not_inherit_boot_from_a_replaced_log(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        bridge.write_bytes(b'[Bridge] boot=0xabc frame=1000 wall=17000\n')
+        run = self.make(FakeEden({}))
+        run.shot('a', 'first')
+        replacement = self.dir / 'replacement.log'
+        replacement.write_bytes(b'[Bridge] padding=' + b'x' * 200 + b' frame=1200 wall=20400\n')
+        replacement.replace(bridge)
+        second = run.still_records[str(run.shot('a', 'second'))]
+        self.assertEqual((second['boot'], second['frame'], second['status']), (None, 1200, 'unverified'))
+
     def test_a_frozen_still_is_listed_in_the_row_receipt(self):
         bridge = self.dir / 'bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)
