@@ -485,7 +485,8 @@ class RunnerEffects(unittest.TestCase):
                 self.assertEqual(receipt(folder, 'a'), before)
 
     def test_a_copied_capture_needs_the_same_packet_and_up(self):
-        for changed in (None, 'plan_identity', 'instances_sha256'):
+        for changed in (None, 'plan_identity', 'instances_sha256', 'inputs_identity',
+                        'source_missing', 'reader_missing', 'both_missing'):
             with self.subTest(changed=changed):
                 tmp = tempfile.TemporaryDirectory()
                 self.addCleanup(tmp.cleanup)
@@ -506,9 +507,19 @@ class RunnerEffects(unittest.TestCase):
                 self.assertEqual(engine.run(), 'DONE')
                 a = receipt(folder, 'a')
                 self.assertTrue(a.get('captures'))
-                if changed:
+                b = receipt(folder, 'b')
+                self.assertEqual(a['inputs_identity'], b['inputs_identity'])
+                if changed in ('plan_identity', 'instances_sha256', 'inputs_identity'):
                     a[changed] = 'another'
+                elif changed in ('source_missing', 'both_missing'):
+                    a.pop('inputs_identity')
+                if changed in ('reader_missing', 'both_missing'):
+                    b.pop('inputs_identity')
+                    (folder / 'out/b.json').write_text(json.dumps(b))
+                if changed:
                     (folder / 'out/a.json').write_text(json.dumps(a))
+                else:
+                    (folder / 'hooks/copy.py').write_text('def check(ctx): return "changed since capture"\n')
                 still = folder / 'out/b/copy.png'
                 before = receipt(folder, 'b')
                 result = self.record_read(folder, still, row='b')
@@ -516,6 +527,13 @@ class RunnerEffects(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn('the still is not a capture recorded by the runner in this run', result.stderr)
                     self.assertEqual(receipt(folder, 'b'), before)
+                    if changed in ('inputs_identity', 'source_missing', 'reader_missing', 'both_missing'):
+                        capture = f"a:{a['captures'][0]['file']}"
+                        declared = self.record_read(folder, still, row='b', capture=capture)
+                        self.assertNotEqual(declared.returncode, 0)
+                        self.assertIn(f'--capture {capture} is not a capture of this run with these bytes',
+                                      declared.stderr)
+                        self.assertEqual(receipt(folder, 'b'), before)
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(receipt(folder, 'b')['visual_read']['capture']['row'], 'a')
@@ -543,6 +561,38 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual(receipt(folder, 'a')['captures'][0]['status']['frame'], 100)
         self.assertEqual(receipt(folder, 'b')['captures'][0]['status']['frame'], 700)
         return folder, a, b
+
+    def test_declared_capture_rejects_a_different_inputs_identity(self):
+        folder, a, _ = self.identical_captures()
+        copy = folder / 'out/c/copied.png'
+        copy.write_bytes(a.read_bytes())
+        source = receipt(folder, 'a')
+        source['inputs_identity'] = 'another'
+        (folder / 'out/a.json').write_text(json.dumps(source))
+        before = receipt(folder, 'c')
+        capture = f'a:{a.name}'
+        result = self.record_read(folder, copy, row='c', capture=capture)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f'--capture {capture} is not a capture of this run with these bytes', result.stderr)
+        self.assertEqual(receipt(folder, 'c'), before)
+
+    def test_own_capture_without_inputs_identity_works_in_all_resolution_modes(self):
+        for mode in ('path', 'declared', 'unique'):
+            with self.subTest(mode=mode):
+                folder, _ = self.hook_run({'frames': 300}, target=True, effect=True, outcome='visual', capture=True)
+                original = self.captured(folder)
+                current = receipt(folder, 'a')
+                current.pop('inputs_identity')
+                (folder / 'out/a.json').write_text(json.dumps(current))
+                still = original
+                if mode != 'path':
+                    still = folder / 'out/a/copied.png'
+                    still.write_bytes(original.read_bytes())
+                declared = f'a:{original.name}' if mode == 'declared' else None
+                result = self.record_read(folder, still, capture=declared)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                selected = receipt(folder, 'a')['visual_read']['capture']
+                self.assertEqual((selected['row'], selected['file']), ('a', original.name))
 
     def test_identical_stills_are_credited_to_their_own_paths(self):
         folder, a, b = self.identical_captures()
