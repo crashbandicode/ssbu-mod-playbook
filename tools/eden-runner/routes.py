@@ -3481,6 +3481,47 @@ def _bridge_on_control_journal(ctx):
             'requests_after_load': len(after), 'inputs_after_load': 0}
 
 
+def _bridge_on_receipt_qualifies(receipt, event, port):
+    try:
+        chord = receipt['chord']
+        hello = receipt['hello']
+        if (not isinstance(chord, dict) or chord.get('event') != event
+                or receipt['capture']['port'] != port or not isinstance(hello, str)):
+            return None
+        match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
+        if match is None:
+            return None
+        boot = match[1]
+        if receipt['witness'] == 'trace':
+            stock = chord.get('stock')
+            return boot if isinstance(stock, dict) and stock and chord.get('chord') != 'already on' else None
+        if receipt['witness'] != 'stub-on' or chord.get('chord') != 'pad':
+            return None
+        pre = chord['pre_chord']
+        title = receipt['title']
+        if not isinstance(pre, dict) or not isinstance(title, dict):
+            return None
+        install = pre.get('install')
+        ready = pre.get('chord_ready')
+        status = pre.get('status')
+        journal = pre.get('journal')
+        if not (isinstance(install, str) and 'toggle=off reason=boot_default' in install
+                and isinstance(ready, str) and re.fullmatch(r'\d+ \[Bridge\] chord ready', ready)
+                and isinstance(status, dict) and status.get('running') is True
+                and status.get('loading_complete') is True
+                and isinstance(journal, dict) and type(journal.get('inputs_after_load')) is int
+                and journal['inputs_after_load'] == 0 and journal.get('game_load_time')):
+            return None
+        if not (title.get('matched') == 'prompt' and title.get('screen') == 'title'
+                and title.get('focus') == 'title.press_any' and title.get('observation.active') == 'yes'
+                and all(type(title.get(key)) is int for key in ('rev', 'frame', 'wall'))
+                and title.get('boot') == boot):
+            return None
+        return boot
+    except (KeyError, TypeError):
+        return None
+
+
 def _bridge_on_qualified_receipt(ctx, event, port):
     candidates = []
     for path in Path(ctx.row_dir).parent.glob('*/routes-bridge-on*.json'):
@@ -3491,24 +3532,15 @@ def _bridge_on_qualified_receipt(ctx, event, port):
     for _, _, path in sorted(candidates, reverse=True):
         try:
             receipt = json.loads(path.read_text())
-            chord = receipt['chord']
-            witness = receipt['witness']
-            if (not isinstance(chord, dict) or chord.get('event') != event
-                    or receipt['capture']['port'] != port):
-                continue
-            title = receipt.get('title')
-            if witness == 'trace':
-                if not isinstance(chord.get('stock'), dict) or chord.get('chord') == 'already on':
-                    continue
-                title = None
-            elif not (witness == 'stub-on' and chord.get('chord') == 'pad'
-                      and isinstance(chord.get('pre_chord'), dict)
-                      and isinstance(title, dict) and title.get('matched') == 'prompt'):
-                continue
         except (OSError, UnicodeError, ValueError, TypeError, KeyError):
             continue
+        boot = _bridge_on_receipt_qualifies(receipt, event, port)
+        if boot is None:
+            continue
+        witness = receipt['witness']
+        title = receipt.get('title') if witness == 'stub-on' else None
         return {'chord': 'already on', 'event': event,
-                'qualified_by': {'receipt': str(path), 'witness': witness, 'title': title}}
+                'qualified_by': {'receipt': str(path), 'witness': witness, 'title': title, 'boot': boot}}
     raise RuntimeError(f'bridge_on (stub on): the bridge is already On ({event}) but this run has no qualified '
                        'bridge_on receipt for that On event: cannot show how it was enabled')
 
@@ -3756,10 +3788,18 @@ def bridge_on(ctx, port=None, cap=60):
         raise RuntimeError(f'bridge greeting lacks a positive On generation: {hello}')
     title = None
     if trace is None:
-        title = ({'checked': False, 'reason': 'bridge already On before this call'}
-                 if chord['chord'] == 'already on' else _bridge_on_stub_title(ctx, hello))
         if chord['chord'] == 'already on':
-            title['qualified_by'] = chord['qualified_by']
+            match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
+            if match is None:
+                raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
+            qualified = chord['qualified_by']
+            if match[1] != qualified['boot']:
+                raise RuntimeError(f"bridge_on (stub on): the bridge is already On, but the qualified receipt "
+                                   f"{qualified['receipt']} is from boot {qualified['boot']} and this greeting "
+                                   f"is boot {match[1]}: cannot show how this boot's bridge was enabled")
+            title = {'checked': False, 'reason': 'bridge already On before this call', 'qualified_by': qualified}
+        else:
+            title = _bridge_on_stub_title(ctx, hello)
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:
