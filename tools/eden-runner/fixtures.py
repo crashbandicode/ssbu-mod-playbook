@@ -321,6 +321,34 @@ def window_from_wait(samples, entry, frames):
     raise RuntimeError(f'grounded Wait window has {len(window)} of {frames} frames')
 
 
+def watch_window(lines, entries, frames, min_frame):
+    return [], False
+
+
+def check_watch(window_lines, entries, frames):
+    return []
+
+
+def samples(window_lines, entry):
+    return []
+
+
+def standing(readings):
+    return False, "not implemented"
+
+
+def fresh_watch(ctx, entries, frames, name="fixture-watch"):
+    return {}
+
+
+def cpu_standing(ctx, entry=1, frames=120):
+    return {}
+
+
+def partner_effective(ctx, eb, ab=None, entry=4, frames=120, kind=None):
+    return {}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Write an offline waiting-room settings seed.')
     commands = parser.add_subparsers(dest='command', required=True)

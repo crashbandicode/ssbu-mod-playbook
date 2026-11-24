@@ -413,6 +413,200 @@ write!(text, "clip ctx={} total={} in={} out={}");
         self.assertEqual(result['errors'], [])
         self.assertEqual(result['rows']['consumer']['provided_by'], {'guard.ready': 'wizard'})
 
+    def test_watch_fixtures_give_standing_and_specific_effective_behavior(self):
+        self.plan['rows'] = [
+            {'id': 'watch', 'steps': [{'run': 'fixtures:cpu_standing'},
+                                      {'run': 'fixtures:partner_effective', 'args': {'eb': 1}}]},
+            {'id': 'consumer', 'needs': ['cpu.standing', 'partner.effective=1'], 'steps': []},
+        ]
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['rows']['consumer']['provided_by'], {
+            'cpu.standing': 'watch', 'partner.effective=1': 'watch'})
+        self.plan['rows'][1]['needs'] = ['partner.effective=34']
+        self.assertEqual(self.errors(), [
+            'G6 row consumer: needs "partner.effective=34" but partner.effective is "1" (set by watch)'])
+
+    def case_setup(self):
+        (self.base / 'judge.py').write_text(
+            'def judge(lines):\n'
+            '    if any("walking" in line for line in lines): raise RuntimeError("walking frame 2")\n'
+            '    return {"frames": len(lines)}\n')
+        (self.base / 'steps.py').write_text(
+            'import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parent))\n'
+            'import judge\ndef ok(ctx): return {"frames": 3}\n')
+        directory = self.base / 'cases'
+        directory.mkdir()
+        (directory / 'standing.log').write_text('still\nstill\nstill\n')
+        (directory / 'walking.log').write_text('still\nwalking\nstill\n')
+        accept = {'args': {}, 'files': {'lines': 'standing.log'}, 'expect': 'accept'}
+        reject = {'args': {}, 'files': {'lines': 'walking.log'}, 'expect': 'reject', 'contains': 'walking'}
+        (directory / 'a.json').write_text(json.dumps(accept))
+        (directory / 'b.json').write_text(json.dumps(reject))
+        self.plan['rows'] = [{'id': 'trial', 'role': 'test',
+                              'steps': [{'run': 'steps.py:ok', 'effect': True,
+                                         'cases': {'judge': 'judge.py:judge', 'dir': 'cases'}}]}]
+        return directory, accept, reject
+
+    def test_judge_cases_accept_standing_and_reject_walking(self):
+        self.case_setup()
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result.get('cases', {}).get('trial', {}).get('judge.py:judge'),
+                         {'accept': 1, 'reject': 1})
+
+    def nested_verdict_cases(self):
+        directory, _, _ = self.case_setup()
+        (directory / 'a.json').unlink()
+        (directory / 'b.json').unlink()
+        (self.base / 'judge.py').write_text(
+            'def judge(lines): return {"verdict": "PASS" if lines[0] == "standing" else "FAIL"}\n')
+        for folder, content, expect in (('good', 'standing', 'accept'), ('bad', 'walking', 'reject')):
+            case_dir = directory / folder
+            case_dir.mkdir()
+            (case_dir / 'bridge.log').write_text(content + '\n')
+            (case_dir / 'case.json').write_text(json.dumps({
+                'args': {}, 'files': {'lines': 'bridge.log'}, 'expect': expect}))
+        return directory
+
+    def test_nested_cases_use_relative_files_and_verdict_evidence(self):
+        self.nested_verdict_cases()
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result.get('cases', {}).get('trial', {}).get('judge.py:judge'),
+                         {'accept': 1, 'reject': 1})
+
+    def test_nested_cases_with_the_same_basename_are_reported_separately(self):
+        directory = self.nested_verdict_cases()
+        (directory / 'good' / 'bridge.log').write_text('walking\n')
+        (directory / 'bad' / 'bridge.log').write_text('standing\n')
+        errors = self.errors()
+        self.assertIn('G9 row trial: case bad/case.json: expected reject, the judge accepted', errors)
+        self.assertTrue(any(error.startswith('G9 row trial: case good/case.json: expected accept, '
+                                             'the judge refused:') for error in errors))
+
+    def test_non_case_json_in_a_nested_case_directory_is_malformed(self):
+        directory = self.nested_verdict_cases()
+        (directory / 'good' / 'data.json').write_text('{}')
+        self.assertTrue(any('good/data.json: expect must be accept or reject' in error for error in self.errors()))
+
+    def test_a_reject_case_fed_standing_lines_is_refused(self):
+        directory, _, reject = self.case_setup()
+        reject['files']['lines'] = 'standing.log'
+        (directory / 'b.json').write_text(json.dumps(reject))
+        self.assertIn('G9 row trial: case b.json: expected reject, the judge accepted', self.errors())
+
+    def test_cases_need_both_accept_and_reject(self):
+        directory, _, _ = self.case_setup()
+        (directory / 'b.json').unlink()
+        self.assertIn('G9 row trial: cases need at least one accept and one reject (found 1 accept, 0 reject)',
+                      self.errors())
+
+    def test_a_judge_with_a_missing_import_cannot_run_cases(self):
+        self.case_setup()
+        (self.base / 'judge.py').write_text('import missing_sibling\ndef judge(lines): return {"frames": 1}\n')
+        self.assertTrue(any('G9 row trial: judge.py:judge could not run its cases:' in error
+                            and 'missing_sibling' in error for error in self.errors()))
+
+    def test_non_json_judge_output_is_reported_as_a_case_failure(self):
+        self.case_setup()
+        (self.base / 'judge.py').write_text(
+            'import os\ndef judge(lines):\n    os.write(1, b"\\xff")\n    return {"frames": len(lines)}\n')
+        self.assertTrue(any(error.startswith('G9 row trial: judge.py:judge could not run its cases:')
+                            and 'output' in error for error in self.errors()))
+
+    def test_case_file_inputs_cannot_leave_the_rows_folder(self):
+        directory, _, reject = self.case_setup()
+        reject['files']['lines'] = '../../outside.log'
+        (directory / 'b.json').write_text(json.dumps(reject))
+        self.assertTrue(any(error.startswith('G9 row trial: cases:') and 'leaves the rows folder' in error
+                            for error in self.errors()))
+
+    def test_invalid_json_missing_expect_and_missing_file_are_malformed(self):
+        directory, _, reject = self.case_setup()
+        for text in ('not json', json.dumps({'args': {}}),
+                     json.dumps({**reject, 'files': {'lines': 'missing.log'}})):
+            with self.subTest(text=text):
+                (directory / 'b.json').write_text(text)
+                self.assertTrue(any(error.startswith('G9 row trial: cases:') for error in self.errors()))
+
+    def test_judge_refusing_an_accept_case_is_an_error(self):
+        directory, accept, _ = self.case_setup()
+        accept['files']['lines'] = 'walking.log'
+        (directory / 'a.json').write_text(json.dumps(accept))
+        self.assertIn('G9 row trial: case a.json: expected accept, the judge refused: walking frame 2',
+                      self.errors())
+
+    def test_a_boolean_return_is_not_evidence(self):
+        directory, _, reject = self.case_setup()
+        reject['contains'] = 'True'
+        (directory / 'b.json').write_text(json.dumps(reject))
+        (self.base / 'judge.py').write_text('def judge(lines): return True\n')
+        self.assertIn('G9 row trial: case a.json: expected accept, the judge refused: True', self.errors())
+
+    def test_a_judge_directory_pair_uses_one_subprocess_for_multiple_rows(self):
+        self.case_setup()
+        self.plan['rows'].append({'id': 'again', 'role': 'test', 'steps': self.plan['rows'][0]['steps']})
+        original = subprocess.run
+        with mock.patch.object(packet_gate.subprocess, 'run', wraps=original) as calls:
+            result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        loaders = [call for call in calls.call_args_list if packet_gate.CASE_LOADER in call.args[0]]
+        self.assertEqual(len(loaders), 1)
+        self.assertEqual(result.get('cases', {}).get('again', {}).get('judge.py:judge'),
+                         {'accept': 1, 'reject': 1})
+
+    def test_reject_contains_must_match_the_reason(self):
+        directory, _, reject = self.case_setup()
+        reject['contains'] = 'different reason'
+        (directory / 'b.json').write_text(json.dumps(reject))
+        self.assertIn('G9 row trial: case b.json: refused, but not with "different reason": walking frame 2',
+                      self.errors())
+
+    def test_case_judge_must_be_imported_by_the_hook(self):
+        self.case_setup()
+        (self.base / 'steps.py').write_text('def ok(ctx): return {"frames": 3}\n')
+        self.assertIn('G9 row trial: steps.py does not import judge.py', self.errors())
+        (self.base / 'steps.py').write_text(
+            'import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parent))\n'
+            'from judge import judge\ndef ok(ctx): return {"frames": 3}\n')
+        self.assertEqual(self.errors(), [])
+
+    def test_missing_hook_cases_warn_or_refuse_but_shared_fixtures_are_exempt(self):
+        self.plan['rows'] = [{'id': 'trial', 'role': 'test', 'steps': [{'run': 'steps.py:ok', 'effect': True}]}]
+        message = 'G9 row trial: effect hook steps.py:ok has no judge cases; its evidence is trusted'
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertIn(message, result['warnings'])
+        self.plan['require_cases'] = True
+        self.assertIn(message + ' (require_cases)', self.errors())
+        self.plan['rows'][0]['steps'] = [{'run': 'fixtures:cpu_standing', 'effect': True}]
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertFalse(any(message.startswith('G9 ') for message in result['errors'] + result['warnings']))
+
+    def test_require_cases_is_checked_without_a_target_too(self):
+        self.plan.pop('target')
+        self.plan['rows'] = [{'id': 'trial', 'role': 'test', 'steps': [{'run': 'steps.py:ok', 'effect': True}]}]
+        message = 'G9 row trial: effect hook steps.py:ok has no judge cases; its evidence is trusted'
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['result'], 'NO TARGET')
+        self.assertIn(message, result['warnings'])
+        self.plan['require_cases'] = True
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['result'], 'BROKEN')
+        self.assertIn(message + ' (require_cases)', result['errors'])
+
+    def test_case_rejects_empty_or_unverified_evidence(self):
+        directory, _, reject = self.case_setup()
+        reject['contains'] = 'unverified'
+        (directory / 'b.json').write_text(json.dumps(reject))
+        (self.base / 'judge.py').write_text(
+            'def judge(lines):\n'
+            '    return {"unverified": "walking"} if "walking" in lines else {"frames": len(lines)}\n')
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result.get('cases', {}).get('trial', {}).get('judge.py:judge'),
+                         {'accept': 1, 'reject': 1})
+
     def test_a_hook_that_plays_a_macro_nobody_defines_is_refused(self):
         (self.base / 'steps.py').write_text('def ok(ctx):\n    ctx.play("missing")\n')
         self.assertEqual(self.errors(),

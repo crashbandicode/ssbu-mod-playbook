@@ -199,6 +199,35 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual((r['status'], r['effects_passed']), ('RAN-UNVERIFIED', []))
         self.assertEqual(r['status_reason'], 'hook hooks/result.py:check: read this')
 
+    def test_effect_hook_verdict_and_pass_values_are_checked(self):
+        cases = (
+            ({'verdict': 'FAIL', 'reason': 'x'}, 'RAN-UNVERIFIED', 'verdict FAIL'),
+            ({'verdict': 'UNVERIFIED'}, 'RAN-UNVERIFIED', 'verdict UNVERIFIED'),
+            ({'pass': False, 'samples': 3}, 'RAN-UNVERIFIED', 'pass=False'),
+            ({'pass': 1, 'samples': 3}, 'RAN-UNVERIFIED', 'pass=1'),
+            ({'verdict': 'PASS', 'frames': 300}, 'PASS', None),
+            ({'verdict': 'pass', 'frames': 300}, 'PASS', None),
+            ({'pass': True, 'samples': 300}, 'PASS', None),
+        )
+        for value, status, reason in cases:
+            with self.subTest(value=value):
+                folder, _ = self.hook_run(value, target=True, effect=True)
+                result = receipt(folder, 'a')
+                self.assertEqual(result['status'], status)
+                self.assertEqual(result['effects_passed'], [] if reason else ['run:hooks/result.py:check'])
+                if reason:
+                    self.assertEqual(result['status_reason'], f'effect hook hooks/result.py:check returned {reason}')
+                    self.assertNotEqual(result.get('review_kind'), 'visual')
+
+    def test_failed_verdict_receipt_cannot_be_promoted_by_record_read(self):
+        folder, _ = self.hook_run({'verdict': 'FAIL', 'reason': 'x'}, target=True, effect=True)
+        still = folder / 'out/a/still.png'
+        still.write_bytes(b'fixture image')
+        before = receipt(folder, 'a')
+        self.assertEqual(before['status'], 'RAN-UNVERIFIED')
+        self.assertNotEqual(self.record_read(folder, still).returncode, 0)
+        self.assertEqual(receipt(folder, 'a'), before)
+
     def test_a_skipped_judge_cannot_promote_an_unverified_hook(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

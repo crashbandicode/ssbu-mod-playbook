@@ -440,3 +440,125 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual([[e['frame'], e['buttons'], e['sticks']] for e in macro['events']],
                          [[0, 0, [0, 0, 0, 0]], [20, 4, [0, 0, 0, 0]], [24, 0, [0, 0, 0, 0]]])
         self.assertEqual(macro['duration_frames'], 64)
+
+
+class WatchFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        self.log = self.directory / 'bridge.log'
+        self.log.write_text('old data\n')
+        self.ctx = FakeCtx(FakeRunner({'bridge_log': str(self.log)}, None), self.directory)
+
+    @staticmethod
+    def lines(entries=(1,), frames=3, start=100, changes=None):
+        changes = changes or {}
+        mask = hex(sum(1 << entry for entry in entries))
+        lines = [f'[Bridge] req fighters_watch result=ok entries={mask} frames={frames} frame={start} wall=1']
+        for frame in range(start + 1, start + frames + 1):
+            for entry in entries:
+                fields = {'kind': '67', 'x': '1.00', 'y': '2.00', 'status': '0', 'situation': '0',
+                          'eb': '1', 'ab': '1', 'cpu': '-1'}
+                fields.update(changes.get((entry, frame), {}))
+                body = ' '.join(f'{key}={value}' for key, value in fields.items())
+                lines.append(f'[Bridge] fighter entry={entry} {body} cbt=0 frame={frame} wall=1')
+        lines.append(f'[Bridge] fighters_watch done entries={mask} frame={start + frames} wall=1')
+        return lines
+
+    def standin(self, lines, baseline=99):
+        def send(_ctx, request):
+            with self.log.open('a') as stream:
+                stream.write('\n'.join(lines) + '\n')
+            return request
+        return (mock.patch.object(routes, 'native_state', return_value={'frame': baseline, 'roster': {1: {}, 4: {}}}),
+                mock.patch.object(routes, 'bridge_v2', side_effect=send))
+
+    def test_a_replayed_acknowledgement_is_not_a_second_watch(self):
+        lines = self.lines()
+        window, complete = fixtures.watch_window(lines[:2] + lines, [1], 3, 99)
+        self.assertTrue(complete)
+        self.assertEqual(window, lines)
+        self.assertEqual(fixtures.check_watch(window, [1], 3), [])
+
+    def test_a_stale_acknowledgement_before_the_baseline_is_ignored(self):
+        old = self.lines(start=20)
+        current = self.lines(start=100)
+        window, complete = fixtures.watch_window(old + current, [1], 3, 99)
+        self.assertTrue(complete)
+        self.assertEqual(window, current)
+
+    def test_a_missing_frame_is_a_problem(self):
+        lines = self.lines()
+        del lines[2]
+        problems = fixtures.check_watch(lines, [1], 3)
+        self.assertTrue(any('consecutive' in problem for problem in problems))
+
+    def test_two_entries_on_different_frames_are_a_problem(self):
+        lines = self.lines((0, 1))
+        lines[2] = lines[2].replace('frame=101', 'frame=102')
+        lines[4] = lines[4].replace('frame=102', 'frame=103')
+        lines[6] = lines[6].replace('frame=103', 'frame=104')
+        problems = fixtures.check_watch(lines, [0, 1], 3)
+        self.assertTrue(any('same bridge frames' in problem for problem in problems))
+
+    def test_no_done_line_is_incomplete(self):
+        window, complete = fixtures.watch_window(self.lines()[:-1], [1], 3, 99)
+        self.assertFalse(complete)
+        self.assertTrue(window)
+
+    def test_a_walking_fighter_is_not_standing(self):
+        readings = fixtures.samples(self.lines(changes={(1, 102): {'x': '1.01'}}), 1)
+        self.assertEqual(len(readings), 3)
+        okay, reason = fixtures.standing(readings)
+        self.assertFalse(okay)
+        self.assertIn('frame 102', reason)
+        self.assertIn('x=1.01', reason)
+
+    def test_a_fighter_in_another_status_is_not_standing(self):
+        readings = fixtures.samples(self.lines(changes={(1, 103): {'status': '24'}}), 1)
+        self.assertEqual(len(readings), 3)
+        okay, reason = fixtures.standing(readings)
+        self.assertFalse(okay)
+        self.assertIn('frame 103', reason)
+        self.assertIn('status=24', reason)
+        okay, _ = fixtures.standing(fixtures.samples(self.lines(), 1))
+        self.assertTrue(okay)
+
+    def test_cpu_standing_saves_a_fresh_raw_watch_and_refuses_jumping(self):
+        baseline, bridge = self.standin(self.lines())
+        with baseline as fresh, bridge as send:
+            result = fixtures.cpu_standing(self.ctx, frames=3)
+        self.assertEqual((result.get('first_frame'), result.get('last_frame')), (101, 103))
+        fresh.assert_called_once_with(self.ctx, fresh=('roster',), roster_entries=(1,))
+        send.assert_called_once_with(self.ctx, 'fighters watch 1 3')
+        receipt_path = self.directory / 'fixture-cpu-standing-watch.json'
+        self.assertTrue(receipt_path.is_file())
+        receipt = json.loads(receipt_path.read_text())
+        raw = self.directory / receipt.get('raw_file', 'missing')
+        self.assertTrue(raw.is_file())
+        self.assertEqual(fixtures.hashlib.sha256(raw.read_bytes()).hexdigest(), receipt.get('sha256'))
+        baseline, bridge = self.standin(self.lines(changes={(1, 102): {'status': '24'}}))
+        with baseline, bridge, self.assertRaisesRegex(RuntimeError, 'SETUP: cpu_standing: entry 1 frame 102'):
+            fixtures.cpu_standing(self.ctx, frames=3)
+
+    def test_partner_effective_accepts_stop_attack_and_observes_cpu_flag(self):
+        for eb in (1, 34):
+            changes = {(4, frame): {'eb': str(eb), 'ab': str(eb), 'cpu': '-1'} for frame in (101, 102, 103)}
+            baseline, bridge = self.standin(self.lines((4,), changes=changes))
+            with baseline, bridge:
+                result = fixtures.partner_effective(self.ctx, eb, frames=3, kind=67)
+            self.assertEqual(result.get('eb'), str(eb))
+            self.assertEqual(result.get('cpu'), ['-1'])
+
+    def test_partner_effective_names_the_first_mismatching_frame(self):
+        baseline, bridge = self.standin(self.lines((4,), changes={(4, 102): {'eb': '34'}}))
+        with baseline, bridge, self.assertRaisesRegex(RuntimeError, 'SETUP: partner_effective: entry 4 frame 102: eb=34'):
+            fixtures.partner_effective(self.ctx, 1, frames=3)
+
+    def test_partner_cpu_is_observed_not_required(self):
+        lines = [line.replace(' cpu=-1', '') for line in self.lines((4,))]
+        baseline, bridge = self.standin(lines)
+        with baseline, bridge:
+            result = fixtures.partner_effective(self.ctx, 1, frames=3)
+        self.assertEqual(result.get('cpu'), [])

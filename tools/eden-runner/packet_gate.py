@@ -494,6 +494,9 @@ def _effects(plan, errors):
         errors.append(message)
 
 
+CASE_LOADER = ""
+
+
 def check(plan, base, raw):
     base = Path(base)
     report = {'errors': [], 'warnings': [], 'result': 'NO TARGET', 'packet_sha256': packet_digest(base),
