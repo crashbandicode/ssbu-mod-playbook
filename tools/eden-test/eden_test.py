@@ -1762,12 +1762,12 @@ def _go_diagnosis(mux, kind, code, what, *, timed_out=False):
     diagnosis = _lifecycle_module.ssh_transport_failure(
         mux, kind, code, getattr(code, 'stderr', ''), timed_out=timed_out)
     if diagnosis:
-        _lifecycle_module.ssh_receipt({**diagnosis, 'kind': kind, 'what': what}, getattr(mux, 'receipt_dir', None))
+        diagnosis = _lifecycle_module.ssh_record(diagnosis, kind, what, getattr(mux, 'receipt_dir', None))
     return diagnosis
 
 
 def _go_suffix(diagnosis):
-    return '; ' + diagnosis['line'] if diagnosis else ''
+    return '; ' + _lifecycle_module.ssh_diagnosis_with_receipt(diagnosis) if diagnosis else ''
 
 
 def _pwsh_arg(value):
@@ -1963,7 +1963,8 @@ def _go_remote(args, lineup):
     targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
     receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
-    with SshMux(host, ssh_options=options, windows=args.host == 'ally', evidence_dir=receipt_dir) as mux:
+    with SshMux(host, ssh_options=options, windows=args.host == 'ally', evidence_dir=receipt_dir,
+                receipt_dir=receipt_dir) as mux:
         return _go_remote_with_mux(args, lineup, host, mux, targets)
 
 

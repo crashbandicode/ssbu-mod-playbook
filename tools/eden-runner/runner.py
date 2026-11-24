@@ -1194,30 +1194,37 @@ class StepContext:
         opened = False
 
         def stop(diagnosis, prefix=''):
-            self.log({'ssh': host, 'argv': argv, 'transport_failure': True, 'phase': diagnosis['phase'],
-                      'cause': diagnosis['cause'], 'evidence': diagnosis['evidence']})
-            raise RuntimeError(f'ctx.ssh {host}: {prefix}{diagnosis["line"]}')
+            detail = life.ssh_diagnosis_with_receipt(diagnosis)
+            self.log({'ssh': host, 'argv': argv, 'transport_failure': True,
+                      'phase': diagnosis.get('phase', 'unknown'), 'cause': diagnosis.get('cause', 'unknown'),
+                      'evidence': diagnosis.get('evidence', 'unavailable'), 'diagnosis': detail})
+            raise RuntimeError(f'ctx.ssh {host}: {prefix}{detail}')
 
         try:
             with life.SshMux(host, ssh_options=options or (), evidence_dir=self.runner.out,
-                             allow_master_retry=False) as mux:
+                             receipt_dir=self.runner.out, allow_master_retry=False) as mux:
                 opened = True
                 argv = ['ssh', '-T', *mux.rider_args, host, *remote]
+                try:
+                    self.check_stop()
+                except StopRun as error:
+                    self.log({'ssh': host, 'argv': argv, 'stopped': True, 'reason': str(error)})
+                    raise
                 started = time.monotonic()
                 try:
                     done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input)
                 except subprocess.TimeoutExpired:
                     diagnosis = life.ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
-                    life.ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'ctx.ssh'}, self.runner.out)
+                    diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh', self.runner.out)
                     stop(diagnosis, f'remote command exceeded {timeout} s; it may still be running on the host; ')
                 except OSError as error:
                     diagnosis = life.ssh_transport_failure(mux, 'ssh', 255, str(error))
-                    life.ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'ctx.ssh'}, self.runner.out)
+                    diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh', self.runner.out)
                     stop(diagnosis)
                 elapsed = time.monotonic() - started
                 diagnosis = life.ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
                 if diagnosis:
-                    life.ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'ctx.ssh'}, self.runner.out)
+                    diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh', self.runner.out)
                     stop(diagnosis)
                 self.log({'ssh': host, 'argv': argv, 'returncode': done.returncode, 'seconds': elapsed})
                 return {'returncode': done.returncode, 'stdout': done.stdout, 'stderr': done.stderr,
@@ -1228,8 +1235,9 @@ class StepContext:
             if opened:
                 raise
             diagnosis = {'line': f'ssh mux failed: {error}; attempt phase unknown; cause: local mux failure; retry: no',
-                         'phase': 'unknown', 'cause': 'local mux failure', 'evidence': ''}
-            life.ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'ctx.ssh master'}, self.runner.out)
+                         'transient': False, 'phase': 'unknown', 'cause': 'local mux failure',
+                         'evidence': 'unavailable'}
+            diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh master', self.runner.out)
             stop(diagnosis)
 
     def shot(self, name):

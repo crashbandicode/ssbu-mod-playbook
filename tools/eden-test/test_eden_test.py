@@ -2648,7 +2648,8 @@ class EdenTestTests(unittest.TestCase):
                 self.assertIn('target plugin cache probe failed: connection reset', str(error.exception))
                 if code == 255:
                     self.assertEqual(str(error.exception),
-                                     'target plugin cache probe failed: connection reset; ssh diag named')
+                                     'target plugin cache probe failed: connection reset; ssh diag named; '
+                                     f'ssh-diag receipt: {receipt}')
                 self.assertEqual('ssh diag named' in str(error.exception), code == 255)
                 self.assertEqual(probe.call_count, 1)
                 self.assertEqual(diag.call_count, int(code == 255))
@@ -2657,6 +2658,23 @@ class EdenTestTests(unittest.TestCase):
                     self.assertEqual(len(receipt.read_text().splitlines()), 1)
                     self.assertIn(' ssh target probe : ssh diag named', receipt.read_text())
                     self.assertFalse(diag.call_args.kwargs['allow_retry'])
+
+    def test_target_does_not_duplicate_master_failure_receipt(self):
+        receipt = self.dir / 'ssh-diag.md'
+        diagnosis = {'line': 'ssh diag master failed', 'phase': 'auth', 'cause': 'not established',
+                     'evidence': 'fixture', 'transient': False}
+        life = eden_test._lifecycle_module
+        class FailedMux(FakeMux):
+            def ensure(self):
+                recorded = life.ssh_record(diagnosis, 'ssh', 'master', self_dir)
+                raise life.LedgerTransport([recorded], 'SSH master failed')
+        self_dir = self.dir
+        with mock.patch.object(eden_test.subprocess, 'run') as run:
+            with self.assertRaises(life.LedgerTransport) as error:
+                eden_test._go_target_ssh('fake-host', FailedMux('fake-host'), ['probe'], 10)
+        run.assert_not_called()
+        self.assertIn(f'ssh-diag receipt: {receipt}', str(error.exception))
+        self.assertEqual(len(receipt.read_text().splitlines()), 1)
 
     def test_go_rider_transfers_and_remote_go_distinguish_transport_from_application(self):
         diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
@@ -2699,7 +2717,8 @@ class EdenTestTests(unittest.TestCase):
                             'report': f'copying remote report failed ({255 if transport else 1})',
                             'go': 'remote go failed (ssh exit 255); the remote go may be running; '
                                   'check the host before starting another'}[stage]
-                self.assertEqual(str(error.exception), original + ('; ssh diag named' if transport else ''))
+                self.assertEqual(str(error.exception), original +
+                                 (f'; ssh diag named; ssh-diag receipt: {receipt}' if transport else ''))
                 if transport:
                     self.assertEqual(len(receipt.read_text().splitlines()), 1)
                 if stage == 'go':
@@ -2735,7 +2754,8 @@ class EdenTestTests(unittest.TestCase):
                 self.assertEqual(receipt.exists(), code in (10, 124))
                 if code != 124:
                     original = f'target plugin pack rsync failed ({code}): {shlex.join(transfer.call_args.args[0])}'
-                    self.assertEqual(str(error.exception), original + ('; ssh diag named' if code == 10 else ''))
+                    self.assertEqual(str(error.exception), original +
+                                     (f'; ssh diag named; ssh-diag receipt: {receipt}' if code == 10 else ''))
                 if code == 124:
                     self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
 
@@ -2761,7 +2781,7 @@ class EdenTestTests(unittest.TestCase):
                 self.assertEqual('ssh diag named' in str(error.exception), code == 255)
                 self.assertEqual(receipt.exists(), code == 255)
                 self.assertEqual(str(error.exception), f'target plugin staging failed ({code})' +
-                                 ('; ssh diag named' if code == 255 else ''))
+                                 (f'; ssh diag named; ssh-diag receipt: {receipt}' if code == 255 else ''))
 
     def test_target_pack_rsync_timeout_preserves_original_detail_and_diagnosis(self):
         commit = 'a' * 40
@@ -2786,10 +2806,10 @@ class EdenTestTests(unittest.TestCase):
                     self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
         self.assertEqual(len(calls), 1)
         previous = f'target pack rsync failed: {subprocess.TimeoutExpired(calls[0][0], 3600)}'
-        self.assertEqual(str(error.exception), previous + '; ssh diag named')
+        receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+        self.assertEqual(str(error.exception), previous + f'; ssh diag named; ssh-diag receipt: {receipt}')
         diag.assert_called_once()
         self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
-        receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
         self.assertEqual(len(receipt.read_text().splitlines()), 1)
 
     def test_remote_go_dead_master_refuses_even_with_mapped_application_exit(self):

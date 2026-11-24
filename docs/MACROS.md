@@ -691,7 +691,8 @@ Python in the plugin's repo, `eden/steps.py`.
   PowerShell login shells map non-zero results to 1, so do not rely on a
   particular non-zero exit code there. The action log records the argv, not
   command output or stdin. Fixture replay refuses this live-only call.
-  Do not spawn `ssh`, `scp` or `rsync` yourself: dry-run refuses it (G10).
+  Do not spawn `ssh`, `scp` or `rsync` yourself: dry-run will refuse it
+  once G10 is merged from its separate branch.
   For example, instead of a direct subprocess in a join hook:
 
   ```python

@@ -202,8 +202,9 @@ class CtxSshTests(unittest.TestCase):
         with mock.patch.object(self.life, 'SshMux', self.Mux), \
                 mock.patch.object(runner.subprocess, 'run', return_value=result) as run, \
                 mock.patch.object(self.life, 'ssh_diagnosis', return_value=self.diag) as diagnosis:
-            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: ssh diag named$'):
+            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: ssh diag named; ssh-diag receipt:') as error:
                 self.ctx.ssh('fake-host', ['work'])
+        self.assertIn(str(self.root / 'ssh-diag.md'), str(error.exception))
         self.assertEqual(len(self.masters), 1)
         run.assert_called_once()
         diagnosis.assert_called_once()
@@ -220,7 +221,7 @@ class CtxSshTests(unittest.TestCase):
                 mock.patch.object(runner.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 7)) as run, \
                 mock.patch.object(self.life, 'ssh_diagnosis', return_value=self.diag) as diagnosis:
             with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: remote command exceeded 7 s; '
-                                                    r'.*may still be running.*; ssh diag named$'):
+                                                    r'.*may still be running.*; ssh diag named; ssh-diag receipt:'):
                 self.ctx.ssh('fake-host', ['work'], timeout=7)
         run.assert_called_once()
         diagnosis.assert_called_once()
@@ -232,11 +233,11 @@ class CtxSshTests(unittest.TestCase):
         outer = self
         class FailedMux(self.Mux):
             def __enter__(self):
-                outer.life.ssh_receipt({**outer.diag, 'kind': 'ssh', 'what': 'master'}, outer.root)
-                raise outer.life.LedgerTransport([outer.diag], 'SSH master failed')
+                diagnosis = outer.life.ssh_record(outer.diag, 'ssh', 'master', outer.root)
+                raise outer.life.LedgerTransport([diagnosis], 'SSH master failed')
         with mock.patch.object(self.life, 'SshMux', FailedMux), \
                 mock.patch.object(runner.subprocess, 'run') as run:
-            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: ssh diag named$'):
+            with self.assertRaisesRegex(RuntimeError, r'^ctx\.ssh fake-host: ssh diag named; ssh-diag receipt:'):
                 self.ctx.ssh('fake-host', ['work'])
         self.assertEqual(len(self.masters), 1)
         run.assert_not_called()
@@ -260,6 +261,50 @@ class CtxSshTests(unittest.TestCase):
         self.assertEqual(len(self.receipt()), 1)
         self.assertEqual(len(self.entries()), 1)
         self.assertEqual(self.entries()[0]['cause'], 'local mux failure')
+
+    def test_stop_created_during_master_acquisition_prevents_rider(self):
+        outer = self
+        closed = []
+        class StopMux(self.Mux):
+            def __enter__(self):
+                (outer.root / 'STOP').write_text('stop during master')
+                return self
+            def __exit__(self, *_args):
+                closed.append(True)
+                return False
+        with mock.patch.object(self.life, 'SshMux', StopMux), \
+                mock.patch.object(runner.subprocess, 'run') as run:
+            with self.assertRaisesRegex(runner.StopRun, 'STOP present'):
+                self.ctx.ssh('fake-host', ['work'])
+        run.assert_not_called()
+        self.assertEqual(closed, [True])
+        self.assertEqual(len(self.entries()), 1)
+        self.assertTrue(self.entries()[0]['stopped'])
+
+    def test_rider_diagnosis_failure_still_records_named_stop(self):
+        outer = self
+        class LoggedMux(self.Mux):
+            def __init__(self, host, **kwargs):
+                super().__init__(host, **kwargs)
+                self.master_log = outer.root / 'master.log'
+                self.master_log.write_text('SSH2_MSG_NEWKEYS received\n')
+        result = subprocess.CompletedProcess([], 255, '', 'connection reset')
+        with mock.patch.object(self.life, 'SshMux', LoggedMux), \
+                mock.patch.object(runner.subprocess, 'run', return_value=result) as run, \
+                mock.patch.object(self.life, 'ssh_diagnosis', side_effect=OSError('diagnostic denied')) as diag:
+            with self.assertRaises(RuntimeError) as error:
+                self.ctx.ssh('fake-host', ['work'])
+        run.assert_called_once()
+        diag.assert_called_once()
+        self.assertIn('attempt phase auth', str(error.exception))
+        self.assertIn('diagnosis failed: diagnostic denied', str(error.exception))
+        self.assertIn('evidence unavailable', str(error.exception))
+        self.assertIn(f'ssh-diag receipt: {self.root / "ssh-diag.md"}', str(error.exception))
+        self.assertEqual(len(self.receipt()), 1)
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(self.entries()[0]['phase'], 'auth')
+        self.assertEqual(self.entries()[0]['cause'], 'diagnosis failed: diagnostic denied')
+        self.assertEqual(self.entries()[0]['evidence'], 'unavailable')
 
     def test_windows_shaped_host_with_loss_does_not_reopen_master(self):
         starts, allow_retry = [], []
