@@ -89,6 +89,9 @@ def health_path_cases():
     loss = '20% packet loss\nrtt min/avg/max/mdev = 1.000/2.000/3.000/0.100 ms\n'
     spike = '0% packet loss\nrtt min/avg/max/mdev = 2.000/5.000/140.000/0.100 ms\n'
     quiet = '0% packet loss\nrtt min/avg/max/mdev = 1.000/2.000/3.000/0.100 ms\n'
+    windows_busy = {'cpuLoadPct': 100, 'memAvailMiB': 4096, 'sshdProcesses': 3, 'sshdUnauth': None,
+                    'journal': 'unavailable on Windows'}
+    windows_idle = {**windows_busy, 'cpuLoadPct': 5, 'memAvailMiB': 8192}
     return (
         ('unavailable-loss', None, loss, 1, 'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
         ('missing-memory', {k: v for k, v in normal.items() if k != 'memAvailMiB'}, loss, 1,
@@ -104,6 +107,14 @@ def health_path_cases():
          'target overloaded (load 48 on 8 cores, 150 MiB available, 2 OOM kills)'),
         ('throttled-loss', {**normal, 'sshdUnauth': 10}, loss, 1,
          'sshd connection throttling on the target (MaxStartups)'),
+        ('windows-busy-loss', windows_busy, loss, 1,
+         'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('windows-idle-loss', windows_idle, loss, 1,
+         'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('windows-rtt', windows_idle, spike, 1,
+         'RTT spikes on the path to fake-host (max 140.000 ms); target health not confirmed, no retry'),
+        ('windows-timeout', windows_idle, quiet, 1,
+         'target health not confirmed, no retry'),
     )
 
 
@@ -2795,13 +2806,20 @@ class SshDiagnosisTests(unittest.TestCase):
                 self.assertFalse(life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '0%', facts, 'x',
                                                 attempt_timed_out=True)[1])
         self.assertFalse(life.target_healthy('failed, phase kex', normal))
-        windows = {'cpuLoadPct': 40, 'memAvailMiB': 1000, 'sshdUnauth': None,
-                   'journal': 'unavailable on Windows'}
-        self.assertTrue(life.target_healthy('ok in 0.5 s', windows))
-        self.assertTrue(life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '20%', windows, 'x')[1])
-        windows['cpuLoadPct'] = None
-        self.assertFalse(life.target_healthy('ok in 0.5 s', windows))
-        self.assertFalse(life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '20%', windows, 'x')[1])
+        for cpu, memory in ((100, 4096), (5, 8192), (None, 1000)):
+            windows = {'cpuLoadPct': cpu, 'memAvailMiB': memory, 'sshdUnauth': None,
+                       'journal': 'unavailable on Windows'}
+            self.assertFalse(life.target_healthy('ok in 0.5 s', windows))
+            for loss, low, high in (('20%', None, None), ('0%', '2', '140')):
+                cause, transient, _ = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', loss, windows, 'x', low, high)
+                self.assertFalse(transient)
+                self.assertTrue(cause.endswith('; target health not confirmed, no retry'))
+            cause, transient, _ = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '0%', windows, 'x',
+                                                  attempt_timed_out=True)
+            self.assertEqual(cause, 'not established (attempt stalled in kex; ok in 0.5 s); '
+                                    'target health not confirmed, no retry')
+            self.assertFalse(transient)
+        self.assertFalse(life.target_healthy('ok in 0.5 s', {**normal, 'cpuLoadPct': 5}))
 
     def test_i5_rtt_timeout_and_real_message_boundaries(self):
         normal = {'load1': 1, 'cores': 8, 'memAvailMiB': 1000, 'oomKills5m': 0,
@@ -2930,15 +2948,17 @@ class SshMuxTests(unittest.TestCase):
                     return result
                 with patch.object(life, 'ssh_diagnosis', side_effect=diagnose), patch('sys.stderr', new=io.StringIO()):
                     if expected_attempts == 2:
-                        with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp):
+                        with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp,
+                                          windows=label.startswith('windows-')):
                             pass
                     else:
                         with self.assertRaises(life.LedgerTransport):
-                            with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp):
+                            with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp,
+                                              windows=label.startswith('windows-')):
                                 self.fail('unexpected successful master')
                 self.assertEqual(len(attempts), expected_attempts)
                 self.assertEqual(len(diagnoses), 1)
-                self.assertEqual(diagnoses[0]['cause'], expected_cause)
+                self.assertIn(expected_cause, diagnoses[0]['cause'])
                 self.assertEqual(diagnoses[0]['transient'], expected_attempts == 2)
 
     def test_real_overloaded_target_stops_master_after_one_attempt(self):

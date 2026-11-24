@@ -2866,17 +2866,15 @@ def ssh_phase(text):
 def target_healthy(diag_login, target):
     if not diag_login.startswith('ok in ') or not isinstance(target, dict):
         return False
-    windows = target.get('journal') == 'unavailable on Windows'
-    keys = (('cpuLoadPct', 'memAvailMiB') if windows else
-            ('load1', 'cores', 'memAvailMiB', 'oomKills5m', 'maxStartupsLines', 'sshdUnauth'))
+    if 'cpuLoadPct' in target or target.get('journal') == 'unavailable on Windows':
+        return False
+    keys = ('load1', 'cores', 'memAvailMiB', 'oomKills5m', 'maxStartupsLines', 'sshdUnauth')
     try:
         if any(type(target.get(key)) not in (int, float) or not math.isfinite(target[key]) or target[key] < 0
                for key in keys):
             return False
     except OverflowError:
         return False
-    if windows:
-        return target['cpuLoadPct'] <= 100 and target['memAvailMiB'] >= 300
     maximum = re.match(r'^(?:default\s+)?(\d+)', str(target.get('maxStartups', '')))
     return bool(target['cores'] > 0 and maximum and target['maxStartupsLines'] == 0
                 and target['sshdUnauth'] < int(maximum.group(1)) and target['load1'] / target['cores'] < 4
@@ -2930,7 +2928,12 @@ def ssh_cause(text, phase, diag_login, tcp, loss, target=None, address='', rtt_m
             and target['cores'] > 0 and type(target.get('memAvailMiB')) in (int, float)):
         return (f"single {phase} timeout with TCP 22 answering and a healthy target "
                 f"(load {target['load1']} on {target['cores']} cores, {target['memAvailMiB']} MiB available)"), True, message
-    return f'not established (attempt stalled in {phase}; {diag_login})', False, message
+    cause = f'not established (attempt stalled in {phase}; {diag_login})'
+    if ((attempt_timed_out or re.search('timed out', text, re.I)) and phase in ('tcp', 'banner', 'kex')
+            and tcp == 'ok' and isinstance(target, dict)
+            and ('cpuLoadPct' in target or target.get('journal') == 'unavailable on Windows')):
+        cause += '; target health not confirmed, no retry'
+    return cause, False, message
 
 
 def _tcp_probe(hostname, port):

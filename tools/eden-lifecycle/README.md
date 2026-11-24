@@ -78,7 +78,8 @@ Transport failures are diagnosed before at most one retry, only for a named
 path cause with target facts that have been read and establish health. MaxStartups throttling and target
 overload stop without retry. A single TCP, banner or key-exchange timeout is
 retryable only when TCP answers and a successful diagnostic login provides
-healthy target evidence. Token-idempotent ledger mutations
+healthy target evidence. Windows target health cannot be confirmed, so failed
+SSH transport is never retried to the Ally. Token-idempotent ledger mutations
 make a retry safe. Down stops, restores and verifies locally before release. A transport outage
 leaves `release_pending` in the journal and a token record under
 `$XDG_STATE_HOME/eden-lifecycle/pending-release/` (or `~/.local/state`).
