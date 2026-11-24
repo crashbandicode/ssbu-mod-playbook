@@ -130,12 +130,29 @@ another state source for visibility, focus and positions.
 
 ## Logs that rotate
 
-`routes.LogCursor(path)` keeps the file it started on open:
-- **Rotation:** on a rename it drains the old file, then reads the new one from its start.
-- **Truncation:** when the file shrinks, it reads from 0.
+`routes.LogCursor(path)` keeps the file it started on open and returns each line once:
+- **Rotation:** on a rename it drains the old file, then reads the new one.
+- **Truncation or a rewrite in place:** it checks the file's own size and the bytes before its offset after each
+  read. A writer that appends during a read is not a truncation.
+- **A replaced file:** when the new file carries the text the cursor read last, the cursor continues after that
+  text.
+- **A replaced file the cursor cannot place** holds text of unknown age, which must not authorise an input. The
+  cursor returns none of it: it starts at that file's end and returns only what is appended afterwards. What the
+  old handle still had and a partial line read before are dropped with it. `unqualified` counts the lines left
+  out, and a `wait` that times out names the count.
+- **`rotations`** counts the replacements; a route that must not span one checks it.
 - **Waiting:** `wait(regex, cap)` returns the first new matching line and keeps later lines for the next wait.
+  `mark()` drops them and restarts at the file's end. A line already begun at that end is not returned.
+- **A file that did not exist** when the cursor started is read from its first byte.
 
-Use it for any plugin log a wait reads. TrainingRooms' `practice-diagnostics.log` rotates at 128 KiB.
+`routes.LogCursor(path, rotates=True)` is for a log whose writer starts new files itself. A file the cursor cannot
+continue is then new from its first byte, and a partial line of the old file is returned as its own line.
+TrainingRooms' `practice-diagnostics.log` rotates at 128 KiB. Its limit: the cursor remembers the last 4 KiB it
+read, so a new file that repeats older lines without them is read again.
+
+Open an instance's log with `routes._log_cursor(ctx, source)`. It reads `diag_log` and `tile_log` as rotating
+logs only when they are a plugin's own files. The bridge capture's log is always read strictly, also under a
+plugin log's name: a Switch instance has `diag_log` and `bridge_log` on one file.
 
 ## Online pairs (`routes_online`)
 
