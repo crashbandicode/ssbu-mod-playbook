@@ -47,25 +47,42 @@ class TicketTests(unittest.TestCase):
             self.assertIn(ticket.state, ('COMMITTED', 'REVOKED'))
 
 
-class ClaimTests(unittest.TestCase):
-    def test_claim_outside_a_bounded_call_succeeds(self):
-        self.assertTrue(macro_gate.claim())
+class BoundedTicketTests(unittest.TestCase):
+    def test_a_result_produced_after_the_deadline_is_not_an_answer(self):
+        for with_completion in (False, True):
+            with self.subTest(with_completion=with_completion):
+                entered, release = threading.Event(), threading.Event()
+                workers, tickets = [], []
+                now = [0.0]
+                join = threading.Thread.join
 
-    def test_a_claim_at_the_deadline_does_not_change_pending_state(self):
-        outcome = macro_gate._Outcome(10)
-        with mock.patch.object(macro_gate.time, 'monotonic', return_value=10):
-            self.assertFalse(outcome.claim())
-            self.assertEqual(outcome.state, 'pending')
-            self.assertTrue(outcome.abandon())
-            self.assertEqual(outcome.state, 'abandoned')
+                def work(_):
+                    workers.append(threading.current_thread())
+                    tickets.append(macro_gate.current_ticket())
+                    entered.set()
+                    release.wait(1)
+                    return 'late'
 
-    def test_a_nearer_gate_deadline_also_closes_the_claim(self):
-        outcome = macro_gate._Outcome(10)
-        with mock.patch.object(macro_gate.time, 'monotonic', return_value=2):
-            self.assertFalse(outcome.claim(limit=2))
-            self.assertEqual(outcome.state, 'pending')
+                def ordered_join(worker, timeout=None):
+                    self.assertTrue(entered.wait(1))
+                    self.assertIs(worker, workers[0])
+                    now[0] = 2.0
+                    release.set()
+                    join(worker, 1)
 
-    def test_an_unclaimed_worker_remains_abandoned_after_timeout(self):
+                try:
+                    with mock.patch.object(macro_gate.time, 'monotonic', side_effect=lambda: now[0]), \
+                            mock.patch.object(threading.Thread, 'join', new=ordered_join):
+                        result = macro_gate.bounded_call(work, 'gate', 1, with_completion=with_completion)
+                    self.assertEqual(result, (False, None, 2.0) if with_completion else (False, None))
+                    self.assertEqual(tickets[0].state, 'REVOKED')
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(1)
+                        self.assertFalse(worker.is_alive())
+
+    def test_a_worker_remains_revoked_after_timeout(self):
         entered, release = threading.Event(), threading.Event()
         workers, state = [], []
 
@@ -73,7 +90,7 @@ class ClaimTests(unittest.TestCase):
             workers.append(threading.current_thread())
             entered.set()
             release.wait(1)
-            state.append((macro_gate.abandoned(), macro_gate.claim()))
+            state.append((macro_gate.abandoned(), macro_gate.current_ticket().state))
 
         try:
             self.assertEqual(macro_gate.bounded_call(work, 'gate', .1), (False, None))
@@ -81,142 +98,41 @@ class ClaimTests(unittest.TestCase):
             release.set()
             workers[0].join(1)
             self.assertFalse(workers[0].is_alive())
-            self.assertEqual(state, [(True, False)])
+            self.assertEqual(state, [(True, 'REVOKED')])
         finally:
             release.set()
             for worker in workers:
                 worker.join(1)
                 self.assertFalse(worker.is_alive())
 
-    def test_claimed_worker_is_subject_to_the_safety_bound(self):
+    def test_a_stop_revokes_the_worker_before_the_caller_returns(self):
         entered, release = threading.Event(), threading.Event()
         workers, state = [], []
-
-        def work(_):
-            workers.append(threading.current_thread())
-            self.assertTrue(macro_gate.claim())
-            entered.set()
-            release.wait(1)
-            state.append(macro_gate.abandoned())
-            return 'done'
-
-        try:
-            with mock.patch.object(macro_gate, 'CLAIMED_WAIT_CAP', .05):
-                with self.assertRaisesRegex(RuntimeError, 'the acquisition commit was claimed but did not finish'):
-                    macro_gate.bounded_call(work, 'gate', .1)
-            self.assertTrue(entered.is_set())
-        finally:
-            release.set()
-            for worker in workers:
-                worker.join(1)
-                self.assertFalse(worker.is_alive())
-            self.assertEqual(state, [False])
-
-    def test_claimed_worker_is_not_abandoned_when_the_caller_deadline_passes(self):
-        entered, deadline, release = threading.Event(), threading.Event(), threading.Event()
-        workers, answers, state = [], [], []
-        abandon = macro_gate._Outcome.abandon
-
-        def work(_):
-            workers.append(threading.current_thread())
-            self.assertTrue(macro_gate.claim())
-            entered.set()
-            release.wait(1)
-            state.append(macro_gate.abandoned())
-            return 'done'
-
-        def mark_deadline(outcome):
-            result = abandon(outcome)
-            if not result:
-                deadline.set()
-            return result
-
-        caller = threading.Thread(target=lambda: answers.append(macro_gate.bounded_call(work, 'gate', .1)))
-        try:
-            with mock.patch.object(macro_gate._Outcome, 'abandon', new=mark_deadline):
-                caller.start()
-                self.assertTrue(entered.wait(1))
-                self.assertTrue(deadline.wait(1))
-                self.assertTrue(caller.is_alive())
-                release.set()
-                caller.join(1)
-                self.assertFalse(caller.is_alive())
-            self.assertEqual(answers, [(True, 'done')])
-            self.assertEqual(state, [False])
-        finally:
-            release.set()
-            caller.join(1)
-            for worker in workers:
-                worker.join(1)
-                self.assertFalse(worker.is_alive())
-
-    def test_a_stop_waits_for_a_claimed_commit_to_finish(self):
-        entered, stop_seen, release = threading.Event(), threading.Event(), threading.Event()
-        workers, errors = [], []
 
         class StopRun(Exception):
             pass
 
         def work(_):
             workers.append(threading.current_thread())
-            self.assertTrue(macro_gate.claim())
             entered.set()
             release.wait(1)
+            state.append((macro_gate.abandoned(), macro_gate.current_ticket().state))
             return 'done'
 
         def check():
-            if entered.is_set():
-                stop_seen.set()
+            if entered.wait(1):
                 raise StopRun('stop')
 
-        def call():
-            try:
+        try:
+            with self.assertRaises(StopRun):
                 macro_gate.bounded_call(work, 'gate', 1, check=check)
-            except BaseException as error:
-                errors.append(error)
-
-        caller = threading.Thread(target=call)
-        try:
-            caller.start()
-            self.assertTrue(stop_seen.wait(1))
-            self.assertTrue(caller.is_alive())
+            self.assertTrue(workers[0].is_alive())
             release.set()
-            caller.join(1)
-            self.assertFalse(caller.is_alive())
-            self.assertEqual(len(errors), 1)
-            self.assertIsInstance(errors[0], StopRun)
+            workers[0].join(1)
+            self.assertFalse(workers[0].is_alive())
+            self.assertEqual(state, [(True, 'REVOKED')])
         finally:
             release.set()
-            caller.join(1)
-            for worker in workers:
-                worker.join(1)
-                self.assertFalse(worker.is_alive())
-
-    def test_deferred_cleanup_runs_only_after_the_claimed_call_returns(self):
-        entered, release, cleaned = threading.Event(), threading.Event(), threading.Event()
-        workers, answers = [], []
-
-        def work(_):
-            workers.append(threading.current_thread())
-            self.assertTrue(macro_gate.defer_cleanup(cleaned.set))
-            self.assertTrue(macro_gate.claim())
-            entered.set()
-            release.wait(1)
-            return 'done'
-
-        caller = threading.Thread(target=lambda: answers.append(macro_gate.bounded_call(work, 'gate', .5)))
-        try:
-            caller.start()
-            self.assertTrue(entered.wait(1))
-            self.assertFalse(cleaned.is_set())
-            release.set()
-            caller.join(1)
-            self.assertFalse(caller.is_alive())
-            self.assertEqual(answers, [(True, 'done')])
-            self.assertTrue(cleaned.wait(1))
-        finally:
-            release.set()
-            caller.join(1)
             for worker in workers:
                 worker.join(1)
                 self.assertFalse(worker.is_alive())
@@ -400,12 +316,40 @@ class MacroGateTests(unittest.TestCase):
                 self.assertEqual(self.events, [])
 
     def test_a_slow_first_idle_poll_counts_as_a_wait(self):
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+        bounded_call = macro_gate.bounded_call
+
         def status():
-            self.now += 3
+            workers.append(threading.current_thread())
+            entered.set()
+            release.wait(1)
             return {'state': 'idle'}
 
+        def bounded(call, method, cap, **kwargs):
+            if method == 'macro.status':
+                join = threading.Thread.join
+
+                def ordered_join(worker, timeout=None):
+                    self.assertTrue(entered.wait(1))
+                    self.assertIs(worker, workers[0])
+                    self.now += 3
+                    release.set()
+                    join(worker, 1)
+
+                with mock.patch.object(threading.Thread, 'join', new=ordered_join):
+                    return bounded_call(call, method, cap, **kwargs)
+            return bounded_call(call, method, cap, **kwargs)
+
         self.status = status
-        self.assertTrue(self.dispatch(requalify=macro_gate.BLIND))
+        try:
+            with mock.patch.object(macro_gate, 'bounded_call', side_effect=bounded):
+                self.assertTrue(self.dispatch(requalify=macro_gate.BLIND))
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
         self.assertEqual(len(self.polls), 1)
         self.assertEqual(len(self.events), 1)
         self.assertEqual(self.events[0]['outcome'], 'the caller declared no witness, accepted')

@@ -1513,6 +1513,15 @@ fn elsewhere() { write!(out, "outside=1"); }
         (self.base / 'steps.py').write_text('def ok(ctx):\n    return False\n')
         self.assertNotEqual(packet_gate.packet_digest(self.base), initial)
 
+    def test_packet_digests_ignore_gate_candidates(self):
+        (self.base / 'refs').mkdir(exist_ok=True)
+        before_packet = packet_gate.packet_digest(self.base)
+        before_inputs = packet_gate.inputs_identity(self.base, self.plan)
+        (self.base / '.gate-candidate-manifest').write_bytes(b'partial manifest')
+        (self.base / 'refs' / '.gate-candidate-reference').write_bytes(b'partial reference')
+        self.assertEqual(packet_gate.packet_digest(self.base), before_packet)
+        self.assertEqual(packet_gate.inputs_identity(self.base, self.plan), before_inputs)
+
     def test_a_fixture_step_gives_what_a_later_row_needs(self):
         self.plan['rows'] = [
             {'id': 'switch', 'steps': [{'run': 'fixtures:recording_role', 'args': {'role': 'player'}}]},

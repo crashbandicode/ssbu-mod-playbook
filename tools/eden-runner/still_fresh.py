@@ -12,6 +12,12 @@ _FRAME = re.compile(rb' frame=(\d+) wall=(\d+)$')
 _READ_BYTES = 1024 * 1024
 
 
+class PreparedRecord(dict):
+    def __init__(self, record):
+        super().__init__(record)
+        self.encoded = json.dumps(record) + '\n'
+
+
 class FrameSource:
     def __init__(self, path):
         self.path = Path(path) if path is not None else None
@@ -121,8 +127,9 @@ class Ledger:
         return record
 
     def append(self, record):
+        encoded = record.encoded if isinstance(record, PreparedRecord) else json.dumps(record) + '\n'
         with (self.out_dir / 'stills.jsonl').open('a', encoding='utf-8') as stream:
-            stream.write(json.dumps(record) + '\n')
+            stream.write(encoded)
 
 
 def load(path):

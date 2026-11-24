@@ -1526,7 +1526,8 @@ def row_report(run, row, history):
     if not receipt_path.exists():
         folder = out / row_id
         recovery = folder / 'recovery'
-        files = sorted(path for path in folder.rglob('*') if path.is_file()) if folder.is_dir() else []
+        files = sorted(path for path in folder.rglob('*')
+                       if path.is_file() and not path.name.startswith('.gate-candidate-')) if folder.is_dir() else []
         wrote = [path for path in files if not path.is_relative_to(recovery)]
         note = f'no receipt out/{row_id}.json'
         if not wrote and any(path.is_relative_to(recovery) for path in files):
@@ -1561,7 +1562,8 @@ def row_report(run, row, history):
     files = [Path(path) for path in receipt.get('evidence_paths', [])]
     files = [out / str(path).split('/out/', 1)[1] if '/out/' in str(path) else path for path in files]
     if (out / row_id).is_dir():
-        files += [path for path in sorted((out / row_id).rglob('*')) if path.suffix.lower() in MEDIA]
+        files += [path for path in sorted((out / row_id).rglob('*'))
+                  if path.suffix.lower() in MEDIA and not path.name.startswith('.gate-candidate-')]
     for path in dict.fromkeys(files):
         shown = f'out/{path.relative_to(out)}' if path.is_relative_to(out) else str(path)
         proof.append(f'{shown} ({path.stat().st_size} bytes)' if path.is_file() else f'{shown} (missing here)')

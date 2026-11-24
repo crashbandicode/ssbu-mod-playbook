@@ -38,7 +38,8 @@ def packet_digest(base):
     files = []
     for path in base.rglob('*'):
         rel = path.relative_to(base)
-        if (not path.is_file() or path.is_symlink() or 'out' in rel.parts or '__pycache__' in rel.parts
+        if (not path.is_file() or path.is_symlink() or path.name.startswith('.gate-candidate-')
+                or 'out' in rel.parts or '__pycache__' in rel.parts
                 or path.suffix == '.pyc' or path.name == 'packet-gate.json'):
             continue
         files.append((rel.as_posix(), path))
@@ -150,7 +151,7 @@ def inputs_identity(base, plan):
     files = []
     for path in base.rglob('*'):
         rel = path.relative_to(base)
-        if not path.is_file() or path.is_symlink():
+        if not path.is_file() or path.is_symlink() or path.name.startswith('.gate-candidate-'):
             continue
         resolved = path.resolve()
         if resolved in excluded:

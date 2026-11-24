@@ -227,12 +227,15 @@ from a constant.
 ### Fresh stills
 
 `stills.jsonl` records each capture's file, hash, size, Eden reply and same-boot bridge frame and wall time.
-Gate checks never wait past their own cap for another check's evidence publication.
-A record written by a superseded check is retracted by a later line; journal readers skip the retracted record.
-An acquired reference is usable only after its hash and `acquired` marker are published and its acquisition intent
-is cleared; matching legacy hashes without a marker remain usable when no intent is present.
-Acquisition approval claims completion before the caller's deadline, so the caller and reference cannot disagree;
-a claimed commit is waited for while its final local write finishes, with a named error if it takes over two seconds.
+Gate workers prepare temporary candidates only; one deciding-thread commit publishes the complete gate evidence under
+the publication lock, with the acquired-reference approval last.
+Each ticket moves from `PENDING` to `COMMITTED` or `REVOKED`; timeout, cancellation and supersession revoke before
+reporting, and a late candidate is discarded.
+A deciding thread blocked in a local commit may report late, but a failed caller cannot be followed by a late approval.
+The deciding thread appends still records at commit, while journal readers continue to skip old retractions.
+The reserved `.gate-candidate-` names are excluded from packet digests, row reports and GIF frame lists.
+An acquired reference requires a matching hash and `acquired` marker, with no acquisition intent; matching legacy
+hashes without a marker remain usable, and an intent is retained when rollback cannot restore the previous state.
 The frame and boot are read incrementally from the instance's bridge log from its start; a replaced log starts
 again without the old boot.
 An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`

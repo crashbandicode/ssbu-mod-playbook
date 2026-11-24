@@ -6,85 +6,86 @@ import closed_loop
 
 
 IDLE_CAP = 15.0
-CLAIMED_WAIT_CAP = 2.0
 BLIND = object()
 _worker = threading.local()
 
 
-class ClaimedCommitTimeout(RuntimeError):
-    pass
-
-
-class _Outcome:
-    def __init__(self, deadline):
+class Ticket:
+    def __init__(self, deadline=None):
         self.deadline = deadline
-        self.state = 'pending'
-        self.claimed_at = None
+        self.state = 'PENDING'
         self.lock = threading.Lock()
+        self.publisher = None
+        self.candidates = []
+        self.discarded = False
+        self.reason = None
 
-    def claim(self, limit=None):
+    def commit(self):
         with self.lock:
-            if self.state == 'claimed':
-                return True
-            now = time.monotonic()
-            if self.state != 'pending' or now >= min(self.deadline, limit if limit is not None else self.deadline):
+            if self.state != 'PENDING':
                 return False
-            self.state = 'claimed'
-            self.claimed_at = now
+            self.state = 'COMMITTED'
             return True
 
-    def abandon(self):
+    def revoke(self, reason=None):
         with self.lock:
-            if self.state != 'pending':
+            if self.state != 'PENDING':
                 return False
-            self.state = 'abandoned'
+            self.state = 'REVOKED'
+            self.reason = reason
             return True
 
     def is_abandoned(self):
         with self.lock:
-            return self.state == 'abandoned' or (self.state == 'pending' and time.monotonic() >= self.deadline)
+            return (self.state == 'REVOKED' or
+                    (self.state == 'PENDING' and self.deadline is not None and time.monotonic() >= self.deadline))
 
-    def is_claimed(self):
+    def revoked_for(self, reason):
         with self.lock:
-            return self.state == 'claimed'
+            return self.state == 'REVOKED' and self.reason == reason
+
+    def is_revoked(self):
+        with self.lock:
+            return self.state == 'REVOKED'
+
+    def attach(self, owner, candidate):
+        with self.lock:
+            if self.state != 'PENDING':
+                return False
+            if self.publisher is not None and self.publisher is not owner:
+                raise RuntimeError('one bounded call cannot publish evidence for multiple runners')
+            self.publisher = owner
+            self.candidates.append(candidate)
+            return True
+
+    def finish(self):
+        if self.publisher is None:
+            return self.commit()
+        return self.publisher._commit_evidence(self)
+
+    def discard(self):
+        with self.lock:
+            if self.discarded or self.state != 'REVOKED':
+                return
+            self.discarded = True
+            owner, candidates = self.publisher, list(self.candidates)
+        if owner is not None:
+            owner._discard_evidence(candidates)
+
+    def discard_later(self):
+        with self.lock:
+            needed = self.state == 'REVOKED' and not self.discarded and self.publisher is not None
+        if needed:
+            threading.Thread(target=self.discard, daemon=True).start()
 
 
-def claim():
-    outcome = getattr(_worker, 'outcome', None)
-    return True if outcome is None else outcome.claim(getattr(_worker, 'claim_limit', None))
-
-
-def claimed():
-    outcome = getattr(_worker, 'outcome', None)
-    return outcome is not None and outcome.is_claimed()
-
-
-def set_claim_limit(deadline):
-    previous = getattr(_worker, 'claim_limit', None)
-    if getattr(_worker, 'outcome', None) is not None:
-        _worker.claim_limit = deadline
-    return previous
-
-
-def defer_cleanup(callback):
-    cleanups = getattr(_worker, 'cleanups', None)
-    if cleanups is None:
-        return False
-    ready = threading.Event()
-
-    def cleanup():
-        ready.wait()
-        callback()
-
-    cleaner = threading.Thread(target=cleanup, daemon=True)
-    cleaner.start()
-    cleanups.append(ready)
-    return True
+def current_ticket():
+    return getattr(_worker, 'ticket', None)
 
 
 def abandoned():
-    outcome = getattr(_worker, 'outcome', None)
-    return outcome is not None and outcome.is_abandoned()
+    ticket = current_ticket()
+    return ticket is not None and ticket.is_abandoned()
 
 
 def stop(error, check=None):
@@ -106,20 +107,18 @@ def bounded_call(call, method, cap, check=None, until=None, with_completion=Fals
         deadline = min(deadline, until)
     if deadline <= time.monotonic():
         return (False, None, None) if with_completion else (False, None)
-    outcome = _Outcome(deadline)
+    ticket = Ticket(deadline)
 
     def invoke():
-        _worker.outcome = outcome
-        _worker.cleanups = []
+        _worker.ticket = ticket
         try:
             value = call(method)
         except BaseException as error:
-            result.append((False, error, outcome.claimed_at if outcome.is_claimed() else time.monotonic()))
+            result.append((False, error, time.monotonic()))
         else:
-            result.append((True, value, outcome.claimed_at if outcome.is_claimed() else time.monotonic()))
+            result.append((True, value, time.monotonic()))
         finally:
-            for ready in _worker.cleanups:
-                ready.set()
+            ticket.discard()
 
     worker = threading.Thread(target=invoke, daemon=True)
     worker.start()
@@ -134,25 +133,28 @@ def bounded_call(call, method, cap, check=None, until=None, with_completion=Fals
                     break
                 worker.join(min(.1, remaining))
             check()
-        if not worker.is_alive():
+        if result:
+            if result[0][2] < deadline:
+                try:
+                    if ticket.is_revoked() and not result[0][0]:
+                        pass
+                    elif not ticket.finish():
+                        raise closed_loop.DispatchRejected('gate evidence publication was revoked')
+                except BaseException as error:
+                    return (False, error, time.monotonic()) if with_completion else (False, error)
+            else:
+                ticket.revoke('timeout')
+                ticket.discard_later()
+                return (False, None, result[0][2]) if with_completion else (False, None)
             return result[0] if with_completion else result[0][:2]
-        if outcome.abandon():
-            return (False, None, None) if with_completion else (False, None)
-        worker.join(CLAIMED_WAIT_CAP)
-        if worker.is_alive():
-            raise ClaimedCommitTimeout('the acquisition commit was claimed but did not finish')
-        return result[0] if with_completion else result[0][:2]
-    except ClaimedCommitTimeout:
-        raise
-    except BaseException:
-        if outcome.is_claimed():
-            worker.join(CLAIMED_WAIT_CAP)
-            if worker.is_alive():
-                raise ClaimedCommitTimeout('the acquisition commit was claimed but did not finish')
-        raise
+        ticket.revoke('timeout')
+        if not worker.is_alive():
+            ticket.discard_later()
+        return (False, None, None) if with_completion else (False, None)
     finally:
-        if worker.is_alive():
-            outcome.abandon()
+        ticket.revoke('cancel')
+        if not worker.is_alive():
+            ticket.discard_later()
 
 
 def busy(call, remaining, note=None, check=None, is_stop=None):
@@ -250,6 +252,8 @@ def dispatch(call, path, *, name, requalify=None, until=None, on_event=None, not
                 requalify, remaining, remaining, check=check, until=deadline, with_completion=True)
             if not answered:
                 if needed is None:
+                    if completed is not None:
+                        reject('not sent: the bound passed during requalification')
                     reject('not sent: requalification did not answer within the bound')
                 error = needed
                 if completed >= deadline:

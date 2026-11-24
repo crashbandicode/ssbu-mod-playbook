@@ -142,7 +142,10 @@ def gate_inputs_missing(runner, on, gate):
 
 
 def timeout_facts(runner, on, name, gate, missing, tolerance):
-    unchanged = frames_unchanged(getattr(runner, '_gate_baseline', None), getattr(runner, '_gate_latest', None), tolerance)
+    context = getattr(getattr(runner, '_gate_context', None), 'gate', None)
+    baseline = context['baseline'] if context is not None else getattr(runner, '_gate_baseline', None)
+    latest = context['latest'] if context is not None else getattr(runner, '_gate_latest', None)
+    unchanged = frames_unchanged(baseline, latest, tolerance)
     return {'gate': name, 'on': on, 'role': assertion_role(gate), 'timed_out': True,
             'screen_unchanged': unchanged, 'missing_evidence': bool(missing),
             'screen_reached': bool(getattr(runner, 'screen_reached', False))}

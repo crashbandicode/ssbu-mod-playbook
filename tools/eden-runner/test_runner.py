@@ -1573,7 +1573,7 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(old.is_alive())
             self.assertFalse(successor.is_alive())
 
-    def test_abandoned_append_cannot_extend_a_successor_gate_or_qualify_its_still(self):
+    def test_deciding_append_cannot_extend_a_successor_gate(self):
         eden = FakeEden({})
         eden.colour = RED
         original_request = eden.request
@@ -1603,16 +1603,12 @@ class RunnerTests(unittest.TestCase):
             old_result.append(runner.macro_gate.bounded_call(lambda _: run.check_gate('a', 'red'), 'gate', .2))
 
         old = threading.Thread(target=old_gate)
-        timer = threading.Timer(.55, release.set)
         try:
             with mock.patch.object(run.stills, 'append', side_effect=paused_append), \
                     mock.patch.object(runner.still_fresh, 'usable', return_value=True):
                 old.start()
                 self.assertTrue(entered.wait(1))
-                old.join(.4)
-                self.assertFalse(old.is_alive())
-                self.assertEqual(old_result, [(False, None)])
-                timer.start()
+                self.assertTrue(old.is_alive())
                 started = time.monotonic()
                 with self.assertRaisesRegex(RuntimeError,
                                             'gate status on a did not pass within 0.1 s: '
@@ -1621,27 +1617,22 @@ class RunnerTests(unittest.TestCase):
                 self.assertLessEqual(time.monotonic() - started, .15)
                 self.assertTrue(run.last_gate_outcome['timed_out'])
                 self.assertIn('gate evidence was still being written', run.last_gate_outcome['reason'])
-                timer.join(1)
+                release.set()
                 workers[0].join(1)
             self.assertFalse(workers[0].is_alive())
+            self.assertTrue(old_result[0][0])
             rows = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(rows[1]['retract'], rows[0]['file'])
-            self.assertEqual(rows[1]['sha256'], rows[0]['sha256'])
-            self.assertEqual(rows[1]['reason'], 'written by a superseded gate check')
-            self.assertTrue(rows[1]['utc'])
-            self.assertEqual(runner.still_fresh.load(run.out / 'stills.jsonl'), [])
-            self.assertEqual(run.still_records, {})
-            self.assertEqual(run.stills.runs['a'], previous)
-            self.assertEqual(run.captures, [])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(runner.still_fresh.load(run.out / 'stills.jsonl'), rows)
+            self.assertEqual(set(run.still_records), {rows[0]['path']})
+            self.assertEqual(run.stills.runs['a']['sha256'], rows[0]['sha256'])
+            self.assertEqual(len(run.captures), 1)
             self.assertEqual(run.last_gate_outcome['gate'], 'status')
             self.assertTrue(run.last_gate_outcome['timed_out'])
             actions = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
             self.assertFalse(any(action.get('gate') == 'status' and action.get('pass') is True for action in actions))
         finally:
             release.set()
-            if timer.is_alive():
-                timer.join(1)
             old.join(1)
             for worker in workers:
                 worker.join(1)
@@ -1658,7 +1649,7 @@ class RunnerTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, .1)
         self.assertTrue(run.last_gate_outcome['passed'])
 
-    def test_abandoned_append_is_retracted_without_advancing_identical_run(self):
+    def test_decided_append_advances_identical_run_once(self):
         eden = FakeEden({})
         eden.colour = RED
         run = self.make(eden)
@@ -1683,17 +1674,15 @@ class RunnerTests(unittest.TestCase):
                     mock.patch.object(runner.still_fresh, 'usable', return_value=True):
                 old.start()
                 self.assertTrue(entered.wait(1))
-                old.join(.3)
-                self.assertEqual(result, [(False, None)])
+                self.assertTrue(old.is_alive())
                 release.set()
                 workers[0].join(1)
             self.assertFalse(workers[0].is_alive())
+            self.assertTrue(result[0][0])
             rows = [json.loads(line) for line in (run.out / 'stills.jsonl').read_text().splitlines()]
-            self.assertEqual(len(rows), 2)
-            self.assertEqual(rows[1]['retract'], rows[0]['file'])
-            self.assertEqual(rows[1]['sha256'], rows[0]['sha256'])
-            self.assertEqual(run.still_records, {})
-            self.assertEqual(run.stills.runs['a'], previous)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(set(run.still_records), {rows[0]['path']})
+            self.assertEqual(run.stills.runs['a']['sha256'], rows[0]['sha256'])
         finally:
             release.set()
             old.join(1)
@@ -1855,8 +1844,12 @@ class RunnerTests(unittest.TestCase):
 
                 def paused_request(method, params):
                     if phase == 'screenshot' and method == 'ui.screenshot' and not entered.is_set():
-                        screenshot_paths.append(Path(params['path']))
-                        block()
+                        path = Path(params['path'])
+                        screenshot_paths.append(path)
+                        with path.open('wb') as stream:
+                            stream.write(b'partial still')
+                            stream.flush()
+                            block()
                     return request(method, params)
 
                 def paused_compare(*args):
@@ -1946,6 +1939,183 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(run.acquired), 1)
         self.assertEqual(json.loads(self.manifest.read_text())['gates'][name]['sha256'], sha(result))
 
+    def test_candidate_cleanup_failure_does_not_turn_approval_into_a_failed_call(self):
+        bridge = self.dir / 'cleanup-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        name = 'cleanup'
+        self.plan['gates'][name] = {'kind': 'image', 'reference': 'refs/cleanup.png', 'acquire': True,
+                                    'roi': [0, 0, 64, 36], 'cap': 1, 'interval': .01}
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(eden)
+        run.acquired = []
+        unlink = Path.unlink
+
+        def remove(path, *args, **kwargs):
+            if path.name.startswith('.gate-'):
+                raise OSError('candidate cleanup failed')
+            return unlink(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with mock.patch.object(Path, 'unlink', new=remove), mock.patch('sys.stderr', errors):
+            answered, result = runner.macro_gate.bounded_call(lambda _: run.check_gate('a', name), 'gate', 1)
+        self.assertTrue(answered)
+        self.assertNotIn(name, runner.dry_run(self.manifest)['references_to_acquire'])
+        self.assertEqual(len(run.acquired), 1)
+        self.assertEqual(json.loads(self.manifest.read_text())['gates'][name]['sha256'], sha(result))
+        self.assertIn('candidate cleanup failed', errors.getvalue())
+
+    def test_solo_encoder_ignores_uncommitted_gate_stills(self):
+        source = self.dir / 'encoder-input'
+        source.mkdir()
+        Image.new('RGB', (8, 8), RED).save(source / 'committed.png')
+        (source / '.gate-candidate-unfinished.png').write_bytes(b'partial image')
+        output = self.dir / 'encoded.gif'
+        script = Path(runner.__file__).parent.parent / 'eden-solo' / 'encode.py'
+        subprocess.run([sys.executable, '-B', str(script), str(source), str(output), '0,0,8,8'],
+                       check=True, capture_output=True, text=True, timeout=2)
+        self.assertTrue(output.is_file())
+
+    def test_complete_acquisition_candidate_cannot_publish_after_timeout(self):
+        bridge = self.dir / 'candidate-finished.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001, 1002, 1003])
+        eden.colour = RED
+        name = 'candidate-finished'
+        reference = self.dir / 'refs/candidate-finished.png'
+        Image.new('RGB', (64, 36), BLUE).save(reference)
+        old = reference.read_bytes()
+        self.plan['gates'][name] = {'kind': 'image', 'reference': 'refs/candidate-finished.png', 'acquire': True,
+                                    'sha256': '0' * 64, 'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.manifest.write_text(json.dumps(self.plan))
+        before = self.manifest.read_bytes()
+        run = self.make(eden)
+        run.acquired = []
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+        log = run.log
+
+        def pause(record):
+            log(record)
+            if record.get('acquisition_pending') and not entered.is_set():
+                workers.append(threading.current_thread())
+                entered.set()
+                release.wait(2)
+
+        def fresh_reader():
+            child = subprocess.run(
+                [sys.executable, '-B', '-c',
+                 'import json,sys; import runner; from pathlib import Path; '
+                 'print(json.dumps(runner.dry_run(Path(sys.argv[1]))["references_to_acquire"]))',
+                 str(self.manifest)],
+                cwd=Path(runner.__file__).parent, text=True, capture_output=True, timeout=2, check=True)
+            return json.loads(child.stdout)
+
+        try:
+            with mock.patch.object(run, 'log', side_effect=pause):
+                self.assertEqual(runner.macro_gate.bounded_call(
+                    lambda _: run.check_gate('a', name, cap=.22), 'gate', .22), (False, None))
+                self.assertTrue(entered.is_set())
+                self.assertIn(name, fresh_reader())
+                self.assertEqual(reference.read_bytes(), old)
+                self.assertEqual(self.manifest.read_bytes(), before)
+                self.assertEqual(run.acquired, [])
+                release.set()
+                workers[0].join(1)
+                self.assertFalse(workers[0].is_alive())
+            self.assertIn(name, fresh_reader())
+            self.assertEqual(reference.read_bytes(), old)
+            self.assertEqual(self.manifest.read_bytes(), before)
+            self.assertEqual(run.acquired, [])
+            self.assertEqual(run.still_records, {})
+            self.assertFalse((run.out / 'stills.jsonl').exists())
+            with mock.patch.object(run, 'compare_region',
+                                   side_effect=AssertionError('unapproved reference was used')):
+                run.check_gate('a', name)
+            self.assertEqual(len(run.acquired), 1)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+
+    def test_direct_acquisition_cannot_publish_a_candidate_staged_after_its_deadline(self):
+        for entry, phase in (('check_gate', 'manifest'), ('acquire', 'manifest'),
+                             ('check_gate', 'end'), ('acquire', 'end')):
+            with self.subTest(entry=entry, phase=phase):
+                bridge = self.dir / f'direct-{entry}-{phase}.log'
+                self.instances['a']['bridge_log'] = str(bridge)
+                eden = FreshEden(bridge, [1000, 1001])
+                eden.colour = RED
+                name = f'direct-{entry}-{phase}'
+                reference = self.dir / f'refs/{name}.png'
+                Image.new('RGB', (64, 36), BLUE).save(reference)
+                old = reference.read_bytes()
+                gate = {'kind': 'image', 'reference': f'refs/{name}.png', 'acquire': True,
+                        'sha256': '0' * 64, 'roi': [0, 0, 64, 36], 'cap': .12, 'interval': .01}
+                self.plan['gates'][name] = gate
+                self.manifest.write_text(json.dumps(self.plan))
+                before = self.manifest.read_bytes()
+                run = self.make(eden)
+                run.acquired = []
+                entered, release, elapsed = threading.Event(), threading.Event(), threading.Event()
+                answers, errors = [], []
+                stage = run._stage_gate_file
+                log = run.log
+
+                def staged(context, target, contents):
+                    stage(context, target, contents)
+                    if phase == 'manifest' and target == self.manifest:
+                        entered.set()
+                        release.wait(1)
+
+                def logged(record):
+                    log(record)
+                    if phase == 'end' and record.get('acquisition_pending'):
+                        entered.set()
+                        release.wait(1)
+
+                def invoke():
+                    try:
+                        if entry == 'check_gate':
+                            answers.append(run.check_gate('a', name))
+                        else:
+                            answers.append(run.acquire('a', name, run.plan['gates'][name],
+                                                       time.monotonic() + gate['cap']))
+                    except BaseException as error:
+                        errors.append(error)
+
+                caller = threading.Thread(target=invoke)
+                timer = threading.Timer(.15, elapsed.set)
+                try:
+                    with mock.patch.object(run, '_stage_gate_file', side_effect=staged), \
+                            mock.patch.object(run, 'log', side_effect=logged):
+                        caller.start()
+                        self.assertTrue(entered.wait(1))
+                        timer.start()
+                        self.assertTrue(elapsed.wait(1))
+                        self.assertIn(name, runner.dry_run(self.manifest)['references_to_acquire'])
+                        release.set()
+                        caller.join(1)
+                        self.assertFalse(caller.is_alive())
+                    self.assertEqual(answers, [])
+                    self.assertEqual(len(errors), 1)
+                    self.assertEqual(reference.read_bytes(), old)
+                    self.assertEqual(self.manifest.read_bytes(), before)
+                    self.assertEqual(run.acquired, [])
+                    self.assertIn(name, runner.dry_run(self.manifest)['references_to_acquire'])
+                    self.assertTrue(run.still_records)
+                    if entry == 'check_gate':
+                        self.assertTrue(run.last_gate_outcome['timed_out'])
+                finally:
+                    release.set()
+                    if timer.ident is not None:
+                        timer.join(1)
+                    if caller.ident is not None:
+                        caller.join(1)
+                        self.assertFalse(caller.is_alive())
+
     def test_bounded_image_gate_publishes_still_on_the_deciding_thread(self):
         eden = FakeEden({})
         eden.colour = RED
@@ -2007,8 +2177,8 @@ class RunnerTests(unittest.TestCase):
             worker.join(1)
             self.assertFalse(worker.is_alive())
 
-    def test_timed_out_acquisition_rolls_back_at_each_publication_stage(self):
-        for phase in ('reference', 'manifest', 'receipt'):
+    def test_deciding_thread_waits_for_each_acquisition_publication_stage(self):
+        for phase in ('reference', 'manifest', 'receipt', 'approval'):
             with self.subTest(phase=phase):
                 bridge = self.dir / f'{phase}-bridge.log'
                 self.instances['a']['bridge_log'] = str(bridge)
@@ -2019,15 +2189,15 @@ class RunnerTests(unittest.TestCase):
                         'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
                 self.plan['gates'][name] = gate
                 self.manifest.write_text(json.dumps(self.plan))
-                before = self.manifest.read_bytes()
                 run = self.make(eden)
                 entered, release = threading.Event(), threading.Event()
-                workers = []
                 reference = self.dir / gate['reference']
-                replace = Path.replace
+                intent = runner.acquisition_intent(reference)
+                replace, unlink = Path.replace, Path.unlink
+                answers, errors = [], []
+                now = [time.monotonic()]
 
                 def block():
-                    workers.append(threading.current_thread())
                     entered.set()
                     release.wait(1)
 
@@ -2037,48 +2207,48 @@ class RunnerTests(unittest.TestCase):
                         block()
                     return replace(path, target)
 
+                def remove(path, *args, **kwargs):
+                    if phase == 'approval' and path == intent and not entered.is_set():
+                        block()
+                    return unlink(path, *args, **kwargs)
+
                 class Receipts(list):
-                    def append(self, value):
+                    def extend(self, value):
                         if phase == 'receipt' and not entered.is_set():
                             block()
-                        super().append(value)
+                        super().extend(value)
+
+                def invoke():
+                    try:
+                        answers.append(runner.macro_gate.bounded_call(
+                            lambda _: run.check_gate('a', name), 'gate', .22))
+                    except BaseException as error:
+                        errors.append(error)
 
                 run.acquired = Receipts()
+                caller = threading.Thread(target=invoke)
                 try:
-                    with mock.patch.object(Path, 'replace', new=replacement):
-                        answered = runner.macro_gate.bounded_call(
-                            lambda _: run.check_gate('a', name), 'gate', .22)
-                        self.assertEqual(answered, (False, None))
-                        self.assertTrue(entered.is_set())
-                        report = runner.dry_run(self.manifest)
-                        self.assertIn(name, report['references_to_acquire'])
-                        probe = subprocess.run(
-                            [sys.executable, '-B', '-c',
-                             'import json,sys; import runner; '
-                             'print(json.dumps(runner.dry_run(__import__("pathlib").Path(sys.argv[1]))'
-                             '["references_to_acquire"]))', str(self.manifest)],
-                            cwd=Path(runner.__file__).parent, text=True, capture_output=True, timeout=2, check=True)
-                        self.assertIn(name, json.loads(probe.stdout))
+                    with mock.patch.object(Path, 'replace', new=replacement), \
+                            mock.patch.object(Path, 'unlink', new=remove), \
+                            mock.patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]):
+                        caller.start()
+                        self.assertTrue(entered.wait(1))
+                        now[0] += .3
+                        self.assertTrue(caller.is_alive())
                         release.set()
-                        workers[0].join(1)
-                        self.assertFalse(workers[0].is_alive())
-                    self.assertEqual(self.manifest.read_bytes(), before)
-                    self.assertFalse(reference.exists())
-                    self.assertEqual(run.acquired, [])
-                    self.assertNotIn('sha256', run.plan['gates'][name])
-                    self.assertNotIn('acquired', run.plan['gates'][name])
-                    with mock.patch.object(run, 'compare_region',
-                                           side_effect=AssertionError('unapproved reference was used')):
-                        result = run.check_gate('a', name)
+                        caller.join(1)
+                        self.assertFalse(caller.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertEqual(answers, [(True, str(reference))])
                     entry = json.loads(self.manifest.read_text())['gates'][name]
-                    self.assertEqual(entry['sha256'], sha(result))
+                    self.assertEqual(entry['sha256'], sha(reference))
                     self.assertTrue(entry['acquired'])
                     self.assertEqual(len(run.acquired), 1)
                 finally:
                     release.set()
-                    for worker in workers:
-                        worker.join(1)
-                        self.assertFalse(worker.is_alive())
+                    if caller.ident is not None:
+                        caller.join(1)
+                        self.assertFalse(caller.is_alive())
 
     def test_abandoned_replacement_restores_an_older_reference(self):
         bridge = self.dir / 'old-bridge.log'
@@ -2097,17 +2267,17 @@ class RunnerTests(unittest.TestCase):
         run.acquired = []
         entered, release = threading.Event(), threading.Event()
         workers = []
-        replace = Path.replace
+        read_bytes = Path.read_bytes
 
-        def replacement(path, target):
-            if Path(target) == reference:
+        def read(path):
+            if path == reference and not entered.is_set():
                 workers.append(threading.current_thread())
                 entered.set()
                 release.wait(1)
-            return replace(path, target)
+            return read_bytes(path)
 
         try:
-            with mock.patch.object(Path, 'replace', new=replacement):
+            with mock.patch.object(Path, 'read_bytes', new=read):
                 answered = runner.macro_gate.bounded_call(
                     lambda _: run.acquire('a', 'old', run.plan['gates']['old'], time.monotonic() + 2),
                     'gate', .22)
@@ -2221,7 +2391,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(json.loads(self.manifest.read_text())['gates']['legacy']['acquired'])
         self.assertEqual(len(run.acquired), 1)
 
-    def test_abandoned_caller_wins_before_acquisition_claim(self):
+    def test_abandoned_caller_revokes_before_candidate_finishes(self):
         bridge = self.dir / 'abandoned-claim-bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)
         eden = FreshEden(bridge, [1000, 1001])
@@ -2235,18 +2405,19 @@ class RunnerTests(unittest.TestCase):
         run = self.make(eden)
         run.acquired = []
         entered, release = threading.Event(), threading.Event()
-        workers, claims = [], []
-        claim = runner.macro_gate.claim
+        workers, states = [], []
+        stage = run._stage_gate_file
 
-        def delayed_claim():
-            workers.append(threading.current_thread())
-            entered.set()
-            release.wait(1)
-            claims.append(claim())
-            return claims[-1]
+        def delayed_stage(context, target, contents):
+            if target == self.dir / gate['reference'] and not entered.is_set():
+                workers.append(threading.current_thread())
+                entered.set()
+                release.wait(1)
+                states.append(runner.macro_gate.current_ticket().state)
+            return stage(context, target, contents)
 
         try:
-            with mock.patch.object(runner.macro_gate, 'claim', side_effect=delayed_claim):
+            with mock.patch.object(run, '_stage_gate_file', side_effect=delayed_stage):
                 answered = runner.macro_gate.bounded_call(lambda _: run.check_gate('a', name), 'gate', .22)
                 self.assertEqual(answered, (False, None))
                 self.assertTrue(entered.is_set())
@@ -2255,19 +2426,20 @@ class RunnerTests(unittest.TestCase):
                 release.set()
                 workers[0].join(1)
                 self.assertFalse(workers[0].is_alive())
-            self.assertEqual(claims, [False])
+            self.assertEqual(states, ['REVOKED'])
             self.assertEqual(self.manifest.read_bytes(), before)
             self.assertFalse((self.dir / gate['reference']).exists())
             self.assertEqual(run.acquired, [])
             actions = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
             self.assertFalse(any(action.get('acquired') for action in actions))
+            self.assertEqual(len([action for action in actions if 'late_candidate_discarded' in action]), 1)
         finally:
             release.set()
             for worker in workers:
                 worker.join(1)
                 self.assertFalse(worker.is_alive())
 
-    def test_claimed_acquisition_rolls_back_if_its_approving_write_fails(self):
+    def test_decided_acquisition_rolls_back_if_its_approving_write_fails(self):
         bridge = self.dir / 'claimed-error-bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)
         eden = FreshEden(bridge, [1000, 1001])
@@ -2299,7 +2471,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse((self.dir / gate['reference']).exists())
         self.assertEqual(run.acquired, [])
 
-    def test_claimed_acquisition_completes_even_if_the_caller_deadline_passes_at_unlock(self):
+    def test_decided_acquisition_completes_if_caller_is_delayed_at_unlock(self):
         bridge = self.dir / 'unlock-bridge.log'
         self.instances['a']['bridge_log'] = str(bridge)
         eden = FreshEden(bridge, [1000, 1001])
@@ -2311,9 +2483,11 @@ class RunnerTests(unittest.TestCase):
         self.manifest.write_text(json.dumps(self.plan))
         run = self.make(eden)
         run.acquired = []
-        entered, release, deadline = threading.Event(), threading.Event(), threading.Event()
-        workers, answers, errors = [], [], []
-        abandon = runner.macro_gate._Outcome.abandon
+        entered, release = threading.Event(), threading.Event()
+        answers, errors = [], []
+        now = [time.monotonic()]
+        reference = self.dir / gate['reference']
+        intent = runner.acquisition_intent(reference)
 
         class PausedLock:
             def __init__(self):
@@ -2324,17 +2498,10 @@ class RunnerTests(unittest.TestCase):
 
             def release(self):
                 self.lock.release()
-                context = getattr(run._gate_context, 'gate', None)
-                if context is not None and context.get('acquisition_completed') and not entered.is_set():
-                    workers.append(threading.current_thread())
+                if (threading.current_thread() is caller and reference.exists()
+                        and not intent.exists() and not entered.is_set()):
                     entered.set()
                     release.wait(1)
-
-        def abandon_at_deadline(outcome):
-            abandoned = abandon(outcome)
-            if not abandoned:
-                deadline.set()
-            return abandoned
 
         def call():
             try:
@@ -2345,10 +2512,10 @@ class RunnerTests(unittest.TestCase):
         run._gate_lock = PausedLock()
         caller = threading.Thread(target=call)
         try:
-            with mock.patch.object(runner.macro_gate._Outcome, 'abandon', new=abandon_at_deadline):
+            with mock.patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]):
                 caller.start()
                 self.assertTrue(entered.wait(1))
-                self.assertTrue(deadline.wait(1))
+                now[0] += .3
                 self.assertTrue(caller.is_alive())
                 self.assertNotIn(name, runner.dry_run(self.manifest)['references_to_acquire'])
                 release.set()
@@ -2361,9 +2528,6 @@ class RunnerTests(unittest.TestCase):
         finally:
             release.set()
             caller.join(1)
-            for worker in workers:
-                worker.join(1)
-                self.assertFalse(worker.is_alive())
 
     def test_acquisition_receipt_publication_cannot_outlive_the_gate_cap(self):
         bridge = self.dir / 'bridge.log'
@@ -2388,9 +2552,10 @@ class RunnerTests(unittest.TestCase):
 
         def stage(path, mode):
             chmod(path, mode)
-            worker.start()
-            self.assertTrue(entered.wait(1))
-            timer.start()
+            if worker.ident is None:
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                timer.start()
 
         try:
             started = time.monotonic()
@@ -2862,6 +3027,7 @@ class RunnerTests(unittest.TestCase):
         gate_done, logs = threading.Event(), []
         original = eden.request
         check_spec = run.check_gate_spec
+        bounded_call = runner.macro_gate.bounded_call
         status_calls, workers = [], []
 
         def checked(on, gate, name):
@@ -2882,25 +3048,33 @@ class RunnerTests(unittest.TestCase):
                     entered.set()
                     try:
                         release.wait(.8)
-                        now[0] += 4
                     finally:
                         exited.set()
                     return {'ok': True, 'result': {'accepted': True, 'job': 'late'}}
                 return {'ok': True, 'result': {'running': True}}
             return original(method, params)
 
-        def expire():
-            if entered.wait(1):
-                now[0] = 15
+        def bounded(call, method, cap, **kwargs):
+            if kwargs.get('with_completion'):
+                join = threading.Thread.join
+
+                def ordered_join(worker, timeout=None):
+                    self.assertTrue(entered.wait(1))
+                    self.assertIs(worker, workers[0])
+                    now[0] = 15
+                    join(worker, 0)
+
+                with mock.patch.object(threading.Thread, 'join', new=ordered_join):
+                    return bounded_call(call, method, cap, **kwargs)
+            return bounded_call(call, method, cap, **kwargs)
 
         eden.request = request
         run.check_gate_spec = checked
         run.log = logs.append
-        timer = threading.Thread(target=expire)
-        timer.start()
         try:
-            with self.assertRaises(routes.closed_loop.DispatchRejected):
-                run.play('a', 'to-red')
+            with mock.patch.object(runner.macro_gate, 'bounded_call', side_effect=bounded):
+                with self.assertRaises(routes.closed_loop.DispatchRejected):
+                    run.play('a', 'to-red')
             rejected_at = now[0]
             self.assertTrue(entered.is_set())
             self.assertLessEqual(rejected_at, 15.25)
@@ -2910,12 +3084,10 @@ class RunnerTests(unittest.TestCase):
             last_gate_outcome = copy.deepcopy(run.last_gate_outcome)
         finally:
             release.set()
-            timer.join(1)
             self.assertTrue(exited.wait(1))
             self.assertTrue(gate_done.wait(1))
             workers[0].join(1)
             self.assertFalse(workers[0].is_alive())
-        self.assertFalse(timer.is_alive())
         self.assertNotIn('macro.play', eden.calls)
         self.assertNotIn('jobs.get', eden.calls)
         self.assertEqual(len([entry for entry in logs if entry.get('gate') == 'red']), 1)
@@ -2951,17 +3123,44 @@ class RunnerTests(unittest.TestCase):
         run.plan['gates']['blue'] = {**run.plan['gates']['red'], 'recover': None}
         run.plan['segments']['to-red']['start_gate'] = 'blue'
         checks = []
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+        bounded_call = runner.macro_gate.bounded_call
 
         def check(on, name, **options):
             checks.append((name, options))
             if name == 'red' and sum(checked == 'red' for checked, _ in checks) < 3:
                 if sum(checked == 'red' for checked, _ in checks) == 2:
-                    now[0] += 2
+                    workers.append(threading.current_thread())
+                    entered.set()
+                    release.wait(1)
                 raise RuntimeError('not red')
             return True
 
-        with mock.patch.object(run, 'check_gate', side_effect=check):
-            run.gate('a', 'red')
+        def bounded(call, method, cap, **kwargs):
+            if kwargs.get('with_completion'):
+                join = threading.Thread.join
+
+                def ordered_join(worker, timeout=None):
+                    self.assertTrue(entered.wait(1))
+                    self.assertIs(worker, workers[0])
+                    now[0] += 2
+                    release.set()
+                    join(worker, 1)
+
+                with mock.patch.object(threading.Thread, 'join', new=ordered_join):
+                    return bounded_call(call, method, cap, **kwargs)
+            return bounded_call(call, method, cap, **kwargs)
+
+        try:
+            with mock.patch.object(run, 'check_gate', side_effect=check), \
+                    mock.patch.object(runner.macro_gate, 'bounded_call', side_effect=bounded):
+                run.gate('a', 'red')
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
         self.assertEqual([name for name, _ in checks], ['red', 'blue', 'red', 'blue', 'red'])
         self.assertAlmostEqual(checks[2][1]['cap'] - checks[3][1]['cap'], 2)
         self.assertEqual(eden.calls.count('macro.play'), 1)

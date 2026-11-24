@@ -3342,6 +3342,17 @@ class ReportStallTests(unittest.TestCase):
         self.assertIn('1 PASS, 0 FAIL, 0 NOT RUN of 1', eden_test.report_md(self.run))
         self.assertNotIn('stall', self.summary().lower())
 
+    def test_report_ignores_uncommitted_gate_candidates(self):
+        folder = self.run / 'out' / 'r1'
+        (folder / '.gate-candidate-unfinished.png').write_bytes(b'partial')
+        self.assertEqual(eden_test.row_report(self.run, self.row, {})[0], 'NOT RUN')
+        self.write_receipt({}, status='PASS')
+        result, _, proof = eden_test.row_report(self.run, self.row, {})
+        self.assertEqual(result, 'PASS')
+        self.assertFalse(any('.gate-candidate-' in entry for entry in proof))
+        (folder / 'committed.png').write_bytes(b'picture')
+        self.assertTrue(any('committed.png' in entry for entry in eden_test.row_report(self.run, self.row, {})[2]))
+
     def test_clean_results_match_base_byte_for_byte(self):
         value, journal = self.wireless_value(0)
         self.write_receipt(value, journal=journal)
