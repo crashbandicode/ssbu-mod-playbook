@@ -85,6 +85,31 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
 
+For a new `frontend_room` host, the route marks the port field edited before
+clicking Host. It publishes a port only after `ss` shows that this Eden's
+owned processes listen on it, including when reusing a connected room;
+without a known reuse port it publishes nothing. Missing listener data or
+instance identity stops as unverified; a different owned port stops with any
+known foreign holder. A saved port that differs from a reuse request stops
+without acting on the dialog. Join refuses a saved port unless its handoff
+records `port_verified: true`; a row-given port remains usable.
+When listener evidence disproves this instance's saved port, the host marks
+the handoff unverified with the observed ports, holder and time, and a saved-port
+join refuses it. A later successful host check on that port makes it valid
+again and retains the disproof in the handoff's history (up to five).
+Missing listener or identity data does not disprove an earlier handoff.
+Before a join uses a saved port, it also checks that the saved host instance
+in this run currently owns that UDP listener; missing host identity or listener
+data refuses the join, while a different owned port marks the handoff
+disproved on a best-effort basis. For a host on another machine (not an
+instance in the guest's run), give the port in the row instead.
+If a Direct Connect warning is already open, a saved-port join also requires
+one readable dialog port matching the saved port before confirming.
+An explicitly occupied port stops before Host. A rejected edited flag stops
+a nondefault port, and a room-creation failure names the requested or
+default-port holder when known. The port-field cause and the new behavior
+have not yet been confirmed in a live run.
+
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
