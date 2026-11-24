@@ -71,9 +71,12 @@ class BridgeOnTests(unittest.TestCase):
         self.stub_default = STUB_UI
         self.bridge_requests = []
         self.ready_at = None
+        self.chord_started = None
 
     def call(self, name, args=None):
         self.calls.append((name, args))
+        if name == 'input.button' and args['state'] == 'press' and self.chord_started is None:
+            self.chord_started = self.seconds
         if name == 'trace.arm':
             row = dict(STOCK, wall_time_ns=str(self.now_ns()))
             self.trace.write_text(json.dumps(row) + '\n')
@@ -93,7 +96,8 @@ class BridgeOnTests(unittest.TestCase):
             if STUB_EVENTS[1] not in self.events.read_text():
                 with self.events.open('a') as stream:
                     stream.write(STUB_EVENTS[1] + '\n')
-        if self.seconds >= 3.1 and len([c for c in self.calls if c[0] == 'input.button']) >= 4:
+        if (self.chord_started is not None and self.seconds - self.chord_started >= 3.1
+                and len([c for c in self.calls if c[0] == 'input.button']) >= 4):
             listening, on = STUB_EVENTS[2:] if self.stub else (LISTENING, ON)
             if on not in self.events.read_text():
                 with self.events.open('a') as stream:
