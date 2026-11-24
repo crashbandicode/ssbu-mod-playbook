@@ -119,6 +119,17 @@ def receipt(folder, row):
     return json.loads((folder / 'out' / f'{row}.json').read_text())
 
 
+def complete_file_samples(png):
+    bad_crc = png[:-1] + bytes([png[-1] ^ 1])
+    wrong_iend = struct.pack('>I', 1) + b'IEND' + b'\x00' + struct.pack('>I', zlib.crc32(b'IEND\x00'))
+    output = io.BytesIO()
+    Image.new('RGB', (1, 1)).save(output, format='JPEG')
+    jpeg = output.getvalue()
+    return {'valid.png': png, 'short-iend.png': png[:-1], 'bad-iend-crc.png': bad_crc,
+            'extra.png': png + b'\x00', 'long-iend.png': png[:-12] + wrong_iend,
+            'valid.jpg': jpeg, 'short-eoi.jpg': jpeg[:-1], 'extra.jpg': jpeg + b'\x00'}
+
+
 class WorkerJudgeInput(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -813,6 +824,53 @@ class ImageAndEvidenceAttempts(unittest.TestCase):
             'a', path, {}, {'boot': 'test', 'frame': 1, 'wall': 1})
         self.assertEqual((fresh['status'], fresh['sha256']), ('fresh', hashlib.sha256(path.read_bytes()).hexdigest()))
         return {'name': name, 'phase': 'before', 'path': str(path), 'fresh': fresh}
+
+    def test_worker_requires_complete_77_byte_png_and_jpeg_endings(self):
+        samples = complete_file_samples(self.integrity_inputs()['valid.png'])
+        for name, data in samples.items():
+            with self.subTest(name=name):
+                valid = name in ('valid.png', 'valid.jpg')
+                shot = self.integrity_shot(name, data)
+                self.assertEqual(jq.image_issue(shot['path']), None if valid else 'not a decodable image')
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                worker_receipt, done = self.fresh_worker()
+                self.assertEqual(done['verdict']['verdict'], 'PASS' if valid else 'UNSURE')
+                self.assertEqual(worker_receipt['status'], 'PASS' if valid else 'RAN-UNVERIFIED')
+                self.assertEqual(marker.exists(), valid)
+                if not valid:
+                    self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+
+    def test_stdlib_77_byte_png_requires_the_complete_iend(self):
+        png = self.integrity_inputs()['valid.png']
+        with mock.patch.object(jq, 'Image', None):
+            for name, data, expected in (('valid', png, None),
+                                         ('missing-final-byte', png[:-1], 'not a decodable image')):
+                with self.subTest(name=name):
+                    path = self.base / f'{name}.png'
+                    path.write_bytes(data)
+                    self.assertEqual(jq.image_issue(path), expected)
+
+    def test_file_ends_complete_formats_and_short_files(self):
+        helper = getattr(jq, '_file_ends_complete', None)
+        self.assertTrue(callable(helper))
+        samples = complete_file_samples(self.integrity_inputs()['valid.png'])
+        for name, image_format, expected in (('valid.png', 'PNG', True), ('short-iend.png', 'PNG', False),
+                                             ('bad-iend-crc.png', 'PNG', False), ('extra.png', 'PNG', False),
+                                             ('long-iend.png', 'PNG', False), ('valid.jpg', 'JPEG', True),
+                                             ('short-eoi.jpg', 'JPEG', False), ('extra.jpg', 'JPEG', False),
+                                             ('valid.jpg', 'MPO', True), ('short-eoi.jpg', 'MPO', False)):
+            with self.subTest(name=name, format=image_format):
+                path = self.base / name
+                path.write_bytes(samples[name])
+                self.assertEqual(helper(path, image_format), expected)
+        short = self.base / 'short'
+        short.write_bytes(b'\xff')
+        self.assertFalse(helper(short, 'PNG'))
+        self.assertFalse(helper(short, 'JPEG'))
+        self.assertFalse(helper(short, 'MPO'))
+        self.assertTrue(helper(short, 'GIF'))
 
     def test_pil_integrity_inputs_in_fresh_workers(self):
         inputs = self.integrity_inputs()
@@ -1698,6 +1756,24 @@ class RunnerEffects(unittest.TestCase):
                 self.assertEqual(current['visual_read']['capture']['fresh']['status'], 'fresh')
                 self.assertEqual(current['visual_read']['capture']['sha256'],
                                  hashlib.sha256(payloads[name]).hexdigest())
+
+    def test_record_read_requires_complete_77_byte_png_and_accepts_jpeg(self):
+        samples = complete_file_samples(self.visual_payloads()['png'])
+        for name in ('valid.png', 'short-iend.png', 'bad-iend-crc.png', 'valid.jpg'):
+            valid = name in ('valid.png', 'valid.jpg')
+            for verdict in (('PASS',) if valid else ('PASS', 'FAIL')):
+                with self.subTest(name=name, verdict=verdict):
+                    folder, original, still, row = self.visual_payload_run(samples[name])
+                    before = (folder / 'out' / f'{row}.json').read_bytes()
+                    result = self.record_read(folder, still, verdict=verdict, row=row)
+                    if valid:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(receipt(folder, row)['status'], 'PASS')
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f'the capture {row}/{original.name} is not usable evidence: '
+                                      'still file is not a decodable image', result.stderr)
+                        self.assertEqual((folder / 'out' / f'{row}.json').read_bytes(), before)
 
     def test_record_read_checks_identity_before_declared_non_image_copy(self):
         data = self.visual_payloads()['short-header']
