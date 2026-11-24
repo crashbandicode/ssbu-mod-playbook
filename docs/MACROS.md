@@ -389,7 +389,19 @@ The rules:
 
 `rows.json` names the build it was checked against in `target`: `plugin.tree`,
 `plugin.commit`, and `plugin.nro_sha256`, with optional `bridge.tree` and
-`bridge.commit`, `settings`, and `providers`. The trees are absolute Git
+`bridge.commit`, `settings`, and `providers`. `target.repos` can name additional
+repositories as `{"name": {"tree": "/absolute/path", "commit": "<40 hex>"}}`;
+`plugin` and `bridge` are reserved names. `target.providers` may use these
+names in its `repo` field, but may not redefine a built-in provider. A legacy
+entry with the same repository and files (in any order), and matching optional
+extraction settings, is ignored with a warning and uses the built-in instead.
+Remote `go` stages the exact named commits under
+`RUNS/_eden-test/stage/<label>/targets/<commit>` without rewriting rows.
+When that tree exists, G2 reads it instead of the producer path and requires
+HEAD to match the commit and the checkout to be clean, including untracked
+and ignored files. Without a staged tree, G2 keeps using the named producer
+tree and permits its working checkout to be dirty.
+The trees are absolute Git
 directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is
 read from the rows folder.
@@ -447,10 +459,55 @@ The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
 an exact `key` with a `reason`. Play calls with computed names or unknown
 callees are warned about, not checked. The built-in providers are `tr.menu`,
-`tr.practice` and `tr.event`;
-event reads use names such as `tr.event:fed run.p1`. A dotted
-string literal in a provider's source file is accepted as a key. The packet
-gate has host tests; it has not been proven in a runtime acceptance.
+`tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need
+`target.bridge`. Example reads include `tr.event:fed run.p1`,
+`ssbu.ui:input.ready`, `bridge:fighter status`, `bridge:input lx` and `bridge:ev`.
+The `bridge` provider reads `src/proto2.rs`, `src/hooks.rs`, `src/model.rs` and
+`src/runtime.rs` at the named commit.
+An event can follow one leading bracket tag, as in `[Bridge] fighter entry=...`;
+continuation literals without their own event contribute bare keys only.
+A provider may set `block` to a schema name to take keys only from functions
+writing that schema, and `helpers` to list optional files included when declared
+with `mod` in a main file and present at the commit. Block keys start a literal
+or follow `\n`, or are string arguments to helpers called with `out`; tagged
+diagnostic literals and whole dotted values are not keys. `ssbu.ui` reads its
+block writer and the pause helper when available; values of `screen` and
+`focus.source` are not keys. Without `block`, dotted string literals are keys
+unless a provider sets `whole_literals: false`, as the `bridge` provider does.
+
+Without `block`, a key the source builds in a format string, such as
+`writeln!(out, "cpu.{entry}.ai_thinks={count}")`, is accepted for the values the
+gate can read from the loop that binds each `{name}`:
+
+- a range, `for lane in 2..=3`;
+- a list written out in the loop header, `for (key, value) in [("step", a),
+  ("score", b)]`: the strings at that place;
+- the index of `.enumerate()`, after an optional `.skip(n)`, over such a list
+  or over an array the function declares with its length, `thinks: [u64;
+  CPU_ENTRIES]`.
+
+A number is one written out or the one integer `const` of that name in the
+file. So with `CPU_ENTRIES = 8` and `.skip(1)` the gate accepts `cpu.1.ai_thinks`
+to `cpu.7.ai_thinks` and refuses `cpu.0`, `cpu.8` and `cpu.04`. Placeholders
+bound by the same loop are taken together, pass by pass: a loop over
+`[("player", "left"), ("partner", "right")]` writing `{group}.{kind}` gives
+`player.left` and `partner.right` only. Placeholders of different loops combine.
+
+A template writes no key when the gate cannot show which values reach the
+write:
+
+- a placeholder bound any other way (a function parameter, a slice, another
+  iterator adapter);
+- a `mut` binding;
+- a loop with a `break`, `continue` or `return` in it;
+- the name used inside its loop before the key is written (a condition on it,
+  arithmetic, a new binding).
+
+The G2 error for a read of that shape names the template, its line and the
+reason. A `{name:…}` format or a positional `{}` in a key is not read as a
+template. The gate does not follow which branch runs otherwise: a key written
+under a condition on something else counts as written.
+The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means
 

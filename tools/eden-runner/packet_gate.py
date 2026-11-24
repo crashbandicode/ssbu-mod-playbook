@@ -14,6 +14,10 @@ PROVIDERS = {
     'tr.menu': {'repo': 'plugin', 'files': ['src/model/bridge_state.rs', 'src/model/record_place.rs']},
     'tr.practice': {'repo': 'plugin', 'files': ['src/model/practice_state.rs']},
     'tr.event': {'repo': 'plugin', 'files': ['src/model/bridge_events.rs']},
+    'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs'], 'block': 'ssbu.ui',
+                'helpers': ['src/native_ui/pause_focus.rs']},
+    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs', 'src/runtime.rs'],
+               'whole_literals': False},
 }
 BUTTONS = (
     ('A', 1), ('B', 2), ('X', 4), ('Y', 8), ('L', 64), ('R', 128), ('ZL', 256), ('ZR', 512),
@@ -158,25 +162,578 @@ def inputs_identity(base, plan):
     return result.hexdigest()
 
 
+_TEMPLATE_LIMIT = 512
+_TEMPLATE_KEY = r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*'
+_TEMPLATE_NAME = r'[A-Za-z_][A-Za-z0-9_]*'
+_TEMPLATE_INT = r'[iu](?:8|16|32|64|128|size)'
+_TEMPLATE_RAW = re.compile(r'b?r(#*)"')
+_TEMPLATE_CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'")
+_TEMPLATE_MACRO = re.compile(r'\b(write|writeln|format|format_args)!\s*$')
+_TEMPLATE_CHAIN = {'iter': 1, 'into_iter': 1, 'iter_mut': 1, 'copied': 2, 'cloned': 2, 'enumerate': 3, 'skip': 4}
+_TEMPLATE_SHAPE = 'its loop is not over a range, a written-out list or a named array'
+
+
+def _template_lex(text):
+    """Rust source with comments and the insides of string and char literals blanked, offsets kept, and the plain
+    string literals: the offset of the opening quote gives (the offset after the closing quote, the content)."""
+    code = list(text)
+    strings = {}
+    size = len(text)
+    pos = 0
+
+    def blank(start, end):
+        for index in range(start, min(end, size)):
+            if code[index] != '\n':
+                code[index] = ' '
+
+    while pos < size:
+        char = text[pos]
+        word = pos > 0 and (text[pos - 1].isalnum() or text[pos - 1] == '_')
+        raw = _TEMPLATE_RAW.match(text, pos) if char in 'br' and not word else None
+        if text.startswith('//', pos):
+            end = text.find('\n', pos)
+            end = size if end < 0 else end
+            blank(pos, end)
+            pos = end
+        elif text.startswith('/*', pos):
+            depth, end = 1, pos + 2
+            while end < size and depth:
+                if text.startswith('/*', end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith('*/', end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            blank(pos, end)
+            pos = end
+        elif raw:
+            end = text.find('"' + raw.group(1), raw.end())
+            end = size if end < 0 else end
+            blank(raw.end(), end)
+            pos = end + 1 + len(raw.group(1))
+        elif char == '"' or (char == 'b' and not word and text.startswith('b"', pos)):
+            quote = pos + (char == 'b')
+            end = quote + 1
+            while end < size and text[end] != '"':
+                end += 2 if text[end] == '\\' else 1
+            if end >= size:
+                blank(quote + 1, size)
+                break
+            if char == '"':
+                strings[quote] = (end + 1, text[quote + 1:end])
+            blank(quote + 1, end)
+            pos = end + 1
+        elif char == "'":
+            literal = _TEMPLATE_CHAR.match(text, pos)
+            if literal:
+                blank(pos + 1, literal.end() - 1)
+                pos = literal.end()
+            else:
+                pos += 1
+        else:
+            pos += 1
+    return ''.join(code), strings
+
+
+def _template_pairs(code):
+    """The offset of the closing bracket of every opening bracket."""
+    close, stack = {}, []
+    for pos, char in enumerate(code):
+        if char in '([{':
+            stack.append(pos)
+        elif char in ')]}' and stack:
+            close[stack.pop()] = pos
+    return close
+
+
+def _template_parts(code, start, end):
+    """The spans of the comma-separated parts of code[start:end], outside any bracket."""
+    parts, depth, last = [], 0, start
+    for pos in range(start, end):
+        char = code[pos]
+        if char in '([{':
+            depth += 1
+        elif char in ')]}':
+            depth -= 1
+        elif char == ',' and depth == 0:
+            parts.append((last, pos))
+            last = pos + 1
+    if code[last:end].strip():
+        parts.append((last, end))
+    return parts
+
+
+def _template_number(token, code):
+    """An integer written out, or the one integer constant of that name in this file; None otherwise."""
+    token = re.sub(r'\s+as\s+' + _TEMPLATE_INT + r'\s*$', '', token.strip())
+    if re.fullmatch(r'[0-9][0-9_]*(?:' + _TEMPLATE_INT + r')?', token):
+        return int(re.match(r'[0-9_]+', token).group(0).replace('_', ''))
+    if not re.fullmatch(_TEMPLATE_NAME, token):
+        return None
+    if len(re.findall(r'\b(?:const|static|let)\s+(?:mut\s+)?' + token + r'\b', code)) != 1:
+        return None
+    constant = re.search(r'\bconst\s+' + token + r'\s*:\s*' + _TEMPLATE_INT
+                         + r'\s*=\s*([0-9][0-9_]*)(?:' + _TEMPLATE_INT + r')?\s*;', code)
+    return int(constant.group(1).replace('_', '')) if constant else None
+
+
+def _template_loops(code, close):
+    """Every `for <pattern> in <expression> { body }` of the blanked code."""
+    loops = []
+    for match in re.finditer(r'\bfor\b', code):
+        pos = match.end()
+        word = None
+        while pos < len(code) and code[pos] not in '{;':
+            if code[pos] in '([' and pos in close:
+                pos = close[pos]
+            elif re.match(r'in\b', code[pos:pos + 3]) and not (code[pos - 1].isalnum() or code[pos - 1] == '_'):
+                word = pos
+                break
+            pos += 1
+        if word is None:
+            continue
+        pos = word + 2
+        while pos < len(code) and code[pos] not in '{;':
+            if code[pos] in '([' and pos in close:
+                pos = close[pos]
+            pos += 1
+        if pos < len(code) and code[pos] == '{' and pos in close:
+            loops.append({'start': match.start(), 'pattern': code[match.end():word], 'expr': (word + 2, pos),
+                          'open': pos, 'close': close[pos]})
+    return loops
+
+
+def _template_path(pattern, name):
+    """Where a loop pattern binds `name`: [] for the name itself, else (index, tuple size) per tuple level; None if
+    the pattern is not that name or a tuple of names holding it."""
+    pattern = pattern.strip()
+    plain = re.fullmatch(r'(?:&\s*)?(?:mut\s+)?(' + _TEMPLATE_NAME + r')', pattern)
+    if plain:
+        return [] if plain.group(1) == name else None
+    if pattern.startswith('(') and _template_pairs(pattern).get(0) == len(pattern) - 1:
+        parts = _template_parts(pattern, 1, len(pattern) - 1)
+        for index, (start, end) in enumerate(parts):
+            path = _template_path(pattern[start:end], name)
+            if path is not None:
+                return [(index, len(parts))] + path
+    return None
+
+
+def _template_string(code, close, strings, start, end, path):
+    """The string written out at `path` of the item code[start:end]; None when that is not a written-out string or
+    the item is not a tuple of the pattern's size."""
+    while start < end and code[start].isspace():
+        start += 1
+    while end > start and code[end - 1].isspace():
+        end -= 1
+    if not path:
+        return strings[start][1] if start in strings and strings[start][0] == end else None
+    if start >= end or code[start] != '(' or close.get(start) != end - 1:
+        return None
+    parts = _template_parts(code, start + 1, end - 1)
+    index, size = path[0]
+    if len(parts) != size:
+        return None
+    return _template_string(code, close, strings, *parts[index], path[1:])
+
+
+def _template_length(base, code, before):
+    """The length of the array `base` as the enclosing function declares it (`base: [T; LEN]`); None otherwise."""
+    start = max((match.start() for match in re.finditer(r'\bfn\b', code[:before])), default=None)
+    if start is None:
+        return None
+    span = code[start:before]
+    if len(re.findall(r'\b' + base + r'\s*:', span)) != 1 or re.search(r'\blet\s+(?:mut\s+)?' + base + r'\b', span):
+        return None
+    declared = re.search(r'\b' + base + r'\s*:\s*(?:&\s*(?:mut\s+)?)?\[[^\[\];]*;([^\[\];]*)\]', span)
+    return _template_number(declared.group(1), code) if declared else None
+
+
+def _template_loop_values(loop, path, name, code, close, strings):
+    """What the loop gives `name`: (values, how to say them) or (None, why they cannot be told)."""
+    start, end = loop['expr']
+    if not path:
+        span = re.fullmatch(r'\s*\(?\s*([A-Za-z0-9_ ]+?)\s*\.\.(=?)\s*([A-Za-z0-9_ ]+?)\s*\)?\s*', code[start:end])
+        if span:
+            low, high = _template_number(span.group(1), code), _template_number(span.group(3), code)
+            if low is None or high is None:
+                return None, 'a bound of its range is not a number or an integer constant of this file'
+            high += 1 if span.group(2) else 0
+            if high - low > _TEMPLATE_LIMIT:
+                return None, f'its range has more than {_TEMPLATE_LIMIT} values'
+            return [str(value) for value in range(low, high)], f'{name} = {low} to {high - 1}'
+    pos = start
+    while pos < end and code[pos].isspace():
+        pos += 1
+    items = base = None
+    if pos < end and code[pos] == '[' and close.get(pos, end) < end:
+        items = _template_parts(code, pos + 1, close[pos])
+        pos = close[pos] + 1
+    else:
+        word = re.compile(_TEMPLATE_NAME).match(code, pos, end)
+        if not word:
+            return None, _TEMPLATE_SHAPE
+        base, pos = word.group(0), word.end()
+    skip, enumerated, stage = 0, False, 0
+    while True:
+        call = re.compile(r'\s*\.\s*([a-z_]+)\s*\(').match(code, pos, end)
+        if not call:
+            break
+        opening = call.end() - 1
+        if close.get(opening, end) >= end:
+            return None, _TEMPLATE_SHAPE
+        method, argument = call.group(1), code[opening + 1:close[opening]]
+        pos = close[opening] + 1
+        order = _TEMPLATE_CHAIN.get(method)
+        if order is None or order <= stage or (method != 'skip' and argument.strip()):
+            return None, f'its loop goes through .{method}() where the gate does not follow it'
+        stage = order
+        if method == 'enumerate':
+            enumerated = True
+        elif method == 'skip':
+            skip = _template_number(argument, code)
+            if skip is None:
+                return None, 'its skip is not a number or an integer constant of this file'
+    if code[pos:end].strip():
+        return None, _TEMPLATE_SHAPE
+    if enumerated:
+        if not path or path[0][1] != 2:
+            return None, f'{name} is not the index or the item of its enumerate'
+        if path[0][0] == 0:
+            if len(path) != 1:
+                return None, f'{name} is not the index or the item of its enumerate'
+            count = len(items) if items is not None else _template_length(base, code, loop['start'])
+            if count is None:
+                return None, f'the length of {base} is not written as an array length in this function'
+            if count - skip > _TEMPLATE_LIMIT:
+                return None, f'its index has more than {_TEMPLATE_LIMIT} values'
+            return [str(value) for value in range(skip, count)], f'{name} = {skip} to {count - 1}'
+        path = path[1:]
+    if items is None:
+        return None, f'the items of {base} are not written out in the loop'
+    values = [_template_string(code, close, strings, *item, path) for item in items[skip:]]
+    if any(value is None for value in values):
+        return None, 'an item of its list is not a written-out string'
+    return values, f'{name} = one of ' + ', '.join(values[:6]) + (', …' if len(values) > 6 else '')
+
+
+def _template_values(name, at, arguments, code, close, strings, loops):
+    """What `name` can hold in a format string at `at`, one value per pass of the loop that binds it: (values, how
+    to say them, that loop) or (None, why they cannot be told, None). Anything that could make the written values
+    differ from the loop's own is refused: the gate does not follow arithmetic, conditions or early exits."""
+    if re.search(r'\b' + name + r'\s*=(?!=)', arguments):
+        return None, f'{name} is a named argument of the macro', None
+    for loop in sorted((loop for loop in loops if loop['open'] < at < loop['close']), key=lambda loop: -loop['open']):
+        if not re.search(r'\b' + name + r'\b', loop['pattern']):
+            continue
+        if re.search(r'\bmut\s+' + name + r'\b', loop['pattern']):
+            return None, f'{name} is a mutable binding', None
+        path = _template_path(loop['pattern'], name)
+        if path is None:
+            return None, f'the loop pattern that binds {name} is not a name or a tuple of names', None
+        if re.search(r'\b(?:break|continue|return)\b', code[loop['open']:loop['close']]):
+            return None, 'its loop can stop or skip a pass (break, continue or return)', None
+        if re.search(r'\b' + name + r'\b', code[loop['open']:at]):
+            return None, f'{name} is used inside its loop before the key is written', None
+        values, said = _template_loop_values(loop, path, name, code, close, strings)
+        return values, said, loop if values is not None else None
+    return None, f'no loop around the key binds {name}', None
+
+
+def _template_keys(text):
+    """Keys a source writes through a format string, such as `cpu.{entry}.ai_thinks`: the keys of every template
+    whose placeholders are bound by a loop the gate can read, and a note per template (the template, its line, what
+    its placeholders hold, or why that cannot be told). A placeholder the gate cannot follow writes no key."""
+    code, strings = _template_lex(text)
+    close = _template_pairs(code)
+    loops = _template_loops(code, close)
+    keys, notes = set(), []
+    for start, (end, content) in sorted(strings.items()):
+        if '{' not in content or '=' not in content:
+            continue
+        opening = max((pos for pos, closing in close.items() if pos < start < closing), default=None)
+        if opening is None or code[opening] != '(':
+            continue
+        macro = _TEMPLATE_MACRO.search(code, max(0, opening - 40), opening)
+        if not macro:
+            continue
+        # The literal must be the format string: the first argument, or the second of write! and writeln!.
+        before = _template_parts(code, opening + 1, start)
+        gap = code[before[-1][1] + 1:start] if before else code[opening + 1:start]
+        if len(before) != (1 if macro.group(1) in ('write', 'writeln') else 0) or gap.strip():
+            continue
+        arguments = code[end:close[opening]]
+        event = re.match(r'^(?:\[[A-Za-z]+\] )?(' + _TEMPLATE_KEY + r') ', content)
+        for match in re.finditer(r'(?:^|\\n| )((?:[a-z0-9_.]|\{' + _TEMPLATE_NAME + r'\})+)=', content):
+            template = match.group(1)
+            names = list(dict.fromkeys(re.findall(r'\{(' + _TEMPLATE_NAME + r')\}', template)))
+            if not names:
+                continue
+            bound, reason = {}, None
+            for name in names:
+                values, detail, loop = _template_values(name, start, arguments, code, close, strings, loops)
+                if values is None:
+                    reason = detail
+                    break
+                bound.setdefault(loop['open'], []).append((name, values, detail))
+            # Placeholders of one loop belong together, pass by pass; only different loops combine.
+            combos, said = [{}], []
+            for group in bound.values() if reason is None else ():
+                if len({len(values) for _, values, _ in group}) != 1:
+                    reason = 'placeholders of one loop give lists of different lengths'
+                    break
+                passes = [{name: values[index] for name, values, _ in group} for index in range(len(group[0][1]))]
+                if len(combos) * len(passes) > _TEMPLATE_LIMIT:
+                    reason = f'it would write more than {_TEMPLATE_LIMIT} keys'
+                    break
+                combos = [{**combo, **one} for combo in combos for one in passes]
+                details = ' and '.join(detail for _, _, detail in group)
+                said.append(details + (', pass by pass' if len(group) > 1 else ''))
+            notes.append((template, text.count('\n', 0, start) + 1, ', '.join(said), reason))
+            if reason is not None:
+                continue
+            for combo in combos:
+                key = re.sub(r'\{(' + _TEMPLATE_NAME + r')\}', lambda found: combo[found.group(1)], template)
+                if re.fullmatch(_TEMPLATE_KEY, key):
+                    keys.add(key)
+                    if event:
+                        keys.add(f'{event.group(1)} {key}')
+    return keys, notes
+
+
+def _template_hint(tree, commit, files, key):
+    """For a refused read: the format-string key it has the shape of, and what that template writes; '' if none."""
+    for path in files:
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            continue
+        text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
+        for template, line, said, reason in _template_keys(text)[1]:
+            pieces = re.split(r'(\{[^{}]*\})', template)
+            if not any(re.search(r'[a-z0-9_]', piece) for piece in pieces if not piece.startswith('{')):
+                continue
+            shape = ''.join(r'[^.=\s]+' if piece.startswith('{') else re.escape(piece) for piece in pieces)
+            if not re.fullmatch(shape, key):
+                continue
+            if reason is not None:
+                return f'; {path}:{line} writes {template}, but the gate cannot tell its values: {reason}'
+            return f'; {path}:{line} writes {template} with {said}'
+    return ''
+
+
 def _git(tree, *args):
     return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, timeout=20, check=True)
 
 
-def emitted_keys(tree, commit, files):
+def emitted_keys(tree, commit, files, whole_literals=True):
     keys = set()
     for path in files:
-        text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
+            raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
         text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
         for literal in re.findall(r'"((?:\\.|[^"\\])*)"', text):
             found = re.findall(r'(?:^|\\n| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal)
             keys.update(found)
-            event = re.match(r'^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
+            event = re.match(r'^(?:\[[A-Za-z]+\] )?([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
             if event:
                 keys.update(f'{event.group(1)} {key}' for key in found)
-            if re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
+            if whole_literals and re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
                 keys.add(literal)
         keys.update(re.findall(r'\bpush_str\s*\(\s*out\s*,\s*"((?:\\.|[^"\\])*)"', text))
+        keys.update(_template_keys(text)[0])
     keys.discard('schema')
+    return keys
+
+
+def _rust_lex(text):
+    code = list(text)
+    literals = []
+    i = 0
+    while i < len(text):
+        start = i
+        if text.startswith('//', i):
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end
+        elif text.startswith('/*', i):
+            i += 2
+            depth = 1
+            while i < len(text) and depth:
+                if text.startswith('/*', i):
+                    depth += 1
+                    i += 2
+                elif text.startswith('*/', i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                raise ValueError('could not be scanned')
+        else:
+            raw = re.match(r'(?:b)?r(#+)?"', text[i:])
+            if raw:
+                hashes = raw.group(1) or ''
+                content = i + raw.end()
+                end = text.find('"' + hashes, content)
+                if end < 0:
+                    raise ValueError('could not be scanned')
+                i = end + 1 + len(hashes)
+                literals.append((start, i, text[content:end], True))
+            elif text[i] == '"' or text.startswith('b"', i):
+                quote = i + (text[i] == 'b')
+                i = quote + 1
+                while i < len(text) and text[i] != '"':
+                    i += 2 if text[i] == '\\' else 1
+                if i >= len(text):
+                    raise ValueError('could not be scanned')
+                literals.append((start, i + 1, text[quote + 1:i], False))
+                i += 1
+            elif text[i] == "'":
+                char = re.match(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'", text[i:])
+                if char:
+                    i += char.end()
+                else:
+                    i += 1
+                    continue
+            else:
+                i += 1
+                continue
+        code[start:i] = ['\n' if ch == '\n' else ' ' for ch in text[start:i]]
+    return ''.join(code), literals
+
+
+def _rust_function_bodies(text):
+    code, _ = _rust_lex(text)
+    depth = 0
+    for char in code:
+        depth += (char == '{') - (char == '}')
+        if depth < 0:
+            raise ValueError('could not be scanned')
+    if depth:
+        raise ValueError('could not be scanned')
+    for match in re.finditer(r'\bfn\s+[A-Za-z_][A-Za-z0-9_]*', code):
+        paren = bracket = angle = 0
+        pos = match.end()
+        while pos < len(code):
+            char = code[pos]
+            if char == '(':
+                paren += 1
+            elif char == ')':
+                paren -= 1
+            elif char == '[':
+                bracket += 1
+            elif char == ']':
+                bracket -= 1
+            elif char == '<':
+                angle += 1
+            elif char == '>' and angle:
+                angle -= 1
+            elif char == ';' and not (paren or bracket or angle):
+                break
+            elif char == '{' and not (paren or bracket or angle):
+                start = pos
+                depth = 1
+                pos += 1
+                while pos < len(code) and depth:
+                    depth += (code[pos] == '{') - (code[pos] == '}')
+                    pos += 1
+                if depth:
+                    raise ValueError('could not be scanned')
+                yield start, pos
+                break
+            pos += 1
+
+
+def _block_keys(text):
+    code, literals = _rust_lex(text)
+    keys = set()
+    key_pattern = r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*'
+    for _, _, literal, raw in literals:
+        if re.match(r'^\[[^\]\r\n]+\] ', literal):
+            continue
+        keys.update(re.findall((r'^(' if raw else r'(?:^|\\n)(') + key_pattern + r')=', literal))
+    calls = re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*'
+                        r'(?:::\s*<[^(){};]*>)?\s*\(\s*(?:out|&\s*mut\s+out)\s*,', code)
+    for call in calls:
+        arg_start = call.end()
+        stack = []
+        for pos in range(arg_start, len(code)):
+            char = code[pos]
+            if char in '([{':
+                stack.append(char)
+                continue
+            if char in ')]}':
+                if stack:
+                    stack.pop()
+                    continue
+                if char != ')':
+                    break
+            elif char != ',' or stack:
+                continue
+            argument = next((literal for start, end, literal, _ in literals
+                             if arg_start <= start and end <= pos
+                             and not code[arg_start:start].strip() and not code[end:pos].strip()), None)
+            if argument is not None:
+                if re.fullmatch(key_pattern, argument):
+                    keys.add(argument)
+                break
+            if char == ')':
+                break
+            arg_start = pos + 1
+    return keys
+
+
+def _provider_keys(tree, commit, source, partial=False):
+    files = source['files']
+    block = source.get('block')
+    if not block:
+        if not partial:
+            return emitted_keys(tree, commit, files, source.get('whole_literals') is not False)
+        keys = set()
+        for path in files:
+            try:
+                keys.update(emitted_keys(tree, commit, [path], source.get('whole_literals') is not False))
+            except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
+                continue
+        return keys
+    texts = []
+    for path in files:
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError as error:
+            if partial:
+                continue
+            detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
+            raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
+        texts.append(re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0])
+    keys = set()
+    found = False
+    for text in texts:
+        try:
+            bodies = list(_rust_function_bodies(text))
+            _, literals = _rust_lex(text)
+        except ValueError as error:
+            raise ValueError(f'{error} at {commit[:8]}') from error
+        for start, end in bodies:
+            if any(start < pos < end and f'schema={block}/' in value for pos, _, value, _ in literals):
+                found = True
+                keys.update(_block_keys(text[start:end]))
+    if not found:
+        raise ValueError(f'no function writes schema={block}/ in {", ".join(files)} at {commit[:8]}')
+    declarations = '\n'.join(_rust_lex(text)[0] for text in texts)
+    for path in source.get('helpers', []):
+        stem = Path(path).stem
+        if not re.search(r'\bmod\s+' + re.escape(stem) + r'\s*;', declarations):
+            continue
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError:
+            continue
+        list(_rust_function_bodies(text))
+        keys.update(_block_keys(text))
     return keys
 
 
@@ -185,27 +742,99 @@ def _target(plan, base, errors):
     if not isinstance(target, dict):
         errors.append('G2 target: target must be an object')
         return {}, None
+    required = []
+    if base.name == 'rows':
+        config_path = base.parent / 'config.json'
+        try:
+            try:
+                config_path.lstat()
+            except FileNotFoundError:
+                config = {}
+            else:
+                config = json.loads(config_path.read_text(encoding='utf-8'))
+                if not isinstance(config, dict):
+                    raise ValueError('expected a JSON object')
+        except (OSError, UnicodeError, ValueError) as error:
+            errors.append(f'G2 target: run config {config_path} cannot be read: {error}')
+            return {}, None
+        if 'staged_targets' in config:
+            required = config['staged_targets']
+            if (not isinstance(required, list) or any(not isinstance(commit, str)
+                    or not re.fullmatch(r'[0-9a-f]{40}', commit) for commit in required)):
+                errors.append('G2 target: run config staged_targets is invalid')
+                return {}, None
     repos = {}
-    for name in ('plugin', 'bridge'):
-        if name == 'bridge' and name not in target:
-            continue
-        spec = target.get(name)
+    extra = target.get('repos', {})
+    if not isinstance(extra, dict):
+        errors.append('G2 target: repos must be an object')
+        extra = {}
+    specs = [('plugin', target.get('plugin'), 'plugin')]
+    if 'bridge' in target:
+        specs.append(('bridge', target['bridge'], 'bridge'))
+    for name, spec in extra.items():
+        if name in ('plugin', 'bridge'):
+            errors.append(f'G2 target: repos.{name} is reserved')
+        elif not isinstance(name, str) or not name:
+            errors.append(f'G2 target: invalid repository name {name!r}')
+        else:
+            specs.append((name, spec, f'repos.{name}'))
+    for name, spec, label in specs:
         if not isinstance(spec, dict):
-            errors.append(f'G2 target: {name} must be an object')
+            errors.append(f'G2 target: {label} must be an object')
             continue
         tree, commit = spec.get('tree'), spec.get('commit')
-        if not isinstance(tree, str) or not Path(tree).is_absolute() or not Path(tree).is_dir():
-            errors.append(f'G2 target: {name}.tree must be an existing absolute directory')
+        if not isinstance(tree, str) or not Path(tree).is_absolute():
+            errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
             continue
         if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
-            errors.append(f'G2 target: {name}.commit must be 40 lower-case hex characters')
+            errors.append(f'G2 target: {label}.commit must be 40 lower-case hex characters')
+            continue
+        staged = base.parent.parent / '_eden-test' / 'stage' / base.parent.name / 'targets' / commit
+        if required and commit not in required:
+            errors.append(f'G2 target: {label}.commit {commit} was not staged for this run')
+            continue
+        if commit in required and not staged.is_dir():
+            errors.append(f'G2 target: {label} staged tree {staged} is missing; this run gates staged targets only '
+                          f'(stage-target --commit {commit} --label {base.parent.name})')
+            continue
+        if base.name == 'rows' and (staged.exists() or staged.is_symlink()):
+            try:
+                paths = [base.parent.parent / '_eden-test',
+                         base.parent.parent / '_eden-test' / 'stage',
+                         base.parent.parent / '_eden-test' / 'stage' / base.parent.name,
+                         staged.parent, staged]
+                if any(path.is_symlink() for path in paths):
+                    raise ValueError('symlink in staged path')
+                if (staged.is_symlink() or not staged.is_dir() or not (staged / '.git').is_dir()
+                        or (staged / '.git').is_symlink()):
+                    raise ValueError('not a directory')
+                head = _git(staged, 'rev-parse', 'HEAD').stdout.decode('utf-8').strip()
+                if head != commit:
+                    errors.append(f'G2 target: {label} staged tree {staged} is at {head}, not {commit}')
+                    continue
+                status = _git(staged, '--no-optional-locks', 'status', '--porcelain',
+                              '--untracked-files=all', '--ignored').stdout.decode('utf-8', errors='replace')
+                if status.strip():
+                    errors.append(f'G2 target: {label} staged tree {staged} changed after staging: '
+                                  f'{status.splitlines()[0]}')
+                    continue
+            except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+                errors.append(f'G2 target: {label} staged tree {staged} cannot be read: {error}')
+                continue
+            tree = str(staged)
+        elif not Path(tree).is_dir():
+            if Path(tree).exists():
+                errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
+            else:
+                errors.append(f'G2 target: {label}.tree {tree} does not exist on this host and '
+                              f'the run has no staged tree for {commit}')
             continue
         try:
             _git(tree, 'cat-file', '-e', f'{commit}^{{commit}}')
         except (OSError, subprocess.SubprocessError):
-            errors.append(f'G2 target: {name}.commit {commit} is not a commit in {tree}')
+            errors.append(f'G2 target: {label}.commit {commit} is not a commit in {tree}')
             continue
-        repos[name] = spec
+        repos[name] = dict(spec, tree=tree)
         if name == 'plugin' and not re.fullmatch(r'[0-9a-fA-F]{64}', str(spec.get('nro_sha256', ''))):
             errors.append('G2 target: plugin.nro_sha256 must be 64 hex characters')
     settings = None
@@ -323,12 +952,42 @@ def _hooks(plan, base, errors):
     return modules
 
 
-def _reads(plan, repos, errors):
+def _providers(plan, errors, warnings):
     declared = plan['target'].get('providers', {})
     if not isinstance(declared, dict):
         errors.append('G2 target: providers must be an object')
         declared = {}
-    providers = {**PROVIDERS, **declared}
+    providers = dict(PROVIDERS)
+    for name, source in declared.items():
+        if name not in PROVIDERS:
+            providers[name] = source
+            continue
+        builtin = PROVIDERS[name]
+        differences = []
+        if not isinstance(source, dict) or source.get('repo') != builtin['repo']:
+            differences.append('repo')
+        files = source.get('files') if isinstance(source, dict) else None
+        if (not isinstance(files, list) or not all(isinstance(path, str) for path in files)
+                or sorted(files) != sorted(builtin['files'])):
+            differences.append('files')
+        for field in ('block', 'helpers', 'whole_literals'):
+            if isinstance(source, dict) and field in source:
+                expected = builtin.get(field)
+                if type(source[field]) is not type(expected) or source[field] != expected:
+                    differences.append(field)
+        if differences:
+            errors.append(f'G2 target: providers.{name} redefines a built-in provider '
+                          f'({", ".join(differences)}); remove the entry or give the provider another name')
+        else:
+            warnings.append(f'G2 target: providers.{name} repeats a built-in provider; '
+                            'the built-in extraction is used (remove the entry)')
+    return providers
+
+
+def _reads(plan, repos, errors, providers):
+    extra = plan['target'].get('repos', {})
+    repo_names = {'plugin', 'bridge'} | ({name for name in extra if isinstance(name, str)}
+                                         if isinstance(extra, dict) else set())
     emitted = {}
     failed = set()
     for row in plan.get('rows', []):
@@ -339,23 +998,27 @@ def _reads(plan, repos, errors):
                 continue
             provider, key = read.split(':', 1)
             source = providers.get(provider)
-            if not isinstance(source, dict) or source.get('repo') not in ('plugin', 'bridge'):
+            if (not isinstance(source, dict) or not isinstance(source.get('repo'), str)
+                    or source['repo'] not in repo_names):
                 errors.append(f'G2 row {row_id}: no extractor for provider {provider} (add target.providers)')
                 continue
             repo = repos.get(source['repo'])
             if repo is None:
-                errors.append(f'G2 row {row_id}: provider {provider} needs target.{source["repo"]}')
+                name = source['repo']
+                label = name if name in ('plugin', 'bridge') else f'repos.{name}'
+                errors.append(f'G2 row {row_id}: provider {provider} needs target.{label}')
                 continue
             if provider not in emitted and provider not in failed:
                 try:
-                    emitted[provider] = emitted_keys(repo['tree'], repo['commit'], source['files'])
-                except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
+                    emitted[provider] = _provider_keys(repo['tree'], repo['commit'], source)
+                except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError) as error:
                     errors.append(f'G2 row {row_id}: extractor {provider}: {error}')
                     failed.add(provider)
             if provider in emitted and key not in emitted[provider]:
                 files = ', '.join(source['files'])
+                hint = '' if source.get('block') else _template_hint(repo['tree'], repo['commit'], source['files'], key)
                 errors.append(f'G2 row {row_id}: {read} is not written by {source["repo"]} '
-                              f'{repo["commit"][:8]} ({files})')
+                              f'{repo["commit"][:8]} ({files}){hint}')
     return {provider: sorted(keys) for provider, keys in emitted.items()}
 
 
@@ -423,18 +1086,18 @@ def _bindings(plan, base, settings, errors, warnings):
                               'without a "binding"')
 
 
-def _strings(value):
+def _strings(value, location=()):
     if isinstance(value, str):
-        yield value
+        yield location, value
     elif isinstance(value, dict):
-        for child in value.values():
-            yield from _strings(child)
+        for key, child in value.items():
+            yield from _strings(child, (*location, key))
     elif isinstance(value, list):
-        for child in value:
-            yield from _strings(child)
+        for index, child in enumerate(value):
+            yield from _strings(child, (*location, index))
 
 
-def _paths(plan, base, raw, modules, errors):
+def _paths(plan, base, raw, modules, repos, errors):
     allowed = {item['path'] for item in plan.get('allow_paths', [])
                if isinstance(item, dict) and isinstance(item.get('path'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
@@ -451,7 +1114,17 @@ def _paths(plan, base, raw, modules, errors):
               and not re.search(r'\s|<', value) and not Path(value).exists()):
             errors.append(f'G4 rows.json: missing file {value}')
 
-    for value in _strings(raw):
+    for location, value in _strings(raw):
+        name = None
+        if len(location) == 3 and location[0] == 'target' and location[1] in ('plugin', 'bridge') \
+                and location[2] == 'tree':
+            name = location[1]
+        elif len(location) == 4 and location[:2] == ('target', 'repos') and location[3] == 'tree':
+            name = location[2]
+        if name in repos and base.name == 'rows':
+            staged = base.parent.parent / '_eden-test' / 'stage' / base.parent.name / 'targets' / repos[name]['commit']
+            if repos[name]['tree'] == str(staged):
+                continue
         check_path(value, 'rows.json', True)
     for module in sorted(modules):
         path = (base / module).resolve()
@@ -466,7 +1139,7 @@ def _paths(plan, base, raw, modules, errors):
                 check_path(node.value, module, False)
 
 
-def _hook_checks(plan, base, modules, repos, errors, warnings):
+def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
     import routes
 
     segment_names = set(plan.get('segments', {}))
@@ -483,22 +1156,19 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
             continue
     if not sources:
         return
-    declared = plan['target'].get('providers', {})
-    providers = {**PROVIDERS, **(declared if isinstance(declared, dict) else {})}
     written = set()
     for source in providers.values():
-        if not isinstance(source, dict) or source.get('repo') not in repos:
+        if not isinstance(source, dict) or not isinstance(source.get('repo'), str) or source['repo'] not in repos:
             continue
         repo = repos[source['repo']]
         files = source.get('files')
         if not isinstance(files, list):
             continue
-        for file in files:
-            try:
-                written.update(emitted_keys(repo['tree'], repo['commit'], [file]))
-            except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError):
-                continue
-    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key}
+        try:
+            written.update(_provider_keys(repo['tree'], repo['commit'], source, partial=True))
+        except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
+            continue
+    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key and '.' in key}
     ignored = {item['key'] for item in plan.get('reads_ignore', [])
                if isinstance(item, dict) and isinstance(item.get('key'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
@@ -785,10 +1455,11 @@ def check(plan, base, raw):
     repos, settings = _target(plan, base, errors)
     modules = _hooks(plan, base, errors)
     if isinstance(plan['target'], dict):
-        report['emitted'] = _reads(plan, repos, errors)
+        providers = _providers(plan, errors, report['warnings'])
+        report['emitted'] = _reads(plan, repos, errors, providers)
         _bindings(plan, base, settings, errors, report['warnings'])
-        _hook_checks(plan, base, modules, repos, errors, report['warnings'])
-    _paths(plan, base, raw, modules, errors)
+        _hook_checks(plan, base, modules, repos, errors, report['warnings'], providers)
+    _paths(plan, base, raw, modules, repos, errors)
     report['rows'] = _needs(plan, errors)
     _effects(plan, errors)
     report['cases'] = _cases(plan, base, errors, report['warnings'])

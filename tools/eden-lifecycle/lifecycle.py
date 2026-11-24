@@ -41,7 +41,7 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shlex
 import shutil
@@ -709,8 +709,13 @@ def validate(config):
         require(isinstance(notify, dict) and set(notify) <= {'file', 'ssh', 'from', 'to'},
                 'notify must be an object with file, ssh, from and to only')
         path = notify.get('file')
-        require(isinstance(path, str) and re.fullmatch(r'/[A-Za-z0-9_./@+ -]+', path)
-                and '..' not in Path(path).parts, 'notify file must be an absolute safe path')
+        if windows:
+            valid_path = (isinstance(path, str) and re.fullmatch(r'[A-Za-z]:\\[A-Za-z0-9_.@+ \\-]+', path)
+                          and PureWindowsPath(path).is_absolute() and '..' not in PureWindowsPath(path).parts)
+        else:
+            valid_path = (isinstance(path, str) and re.fullmatch(r'/[A-Za-z0-9_./@+ -]+', path)
+                          and '..' not in Path(path).parts)
+        require(valid_path, 'notify file must be an absolute safe path')
         if 'ssh' in notify:
             require(isinstance(notify['ssh'], str)
                     and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', notify['ssh']), 'Unsafe notify SSH host')
@@ -1595,7 +1600,9 @@ class Lifecycle:
                                           input=line, capture_output=True, text=True, timeout=10)
                 require(done.returncode == 0, 'notify SSH failed: ' + (done.stderr or '')[-500:])
             else:
-                with safe_absolute(spec['file']).open('a', encoding='utf-8') as stream:
+                path = safe_absolute(spec['file'])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open('a', encoding='utf-8') as stream:
                     stream.write(line)
         except Exception as error:
             try:
