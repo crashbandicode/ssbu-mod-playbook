@@ -55,8 +55,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | --- | --- | --- |
 | `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
-| `wireless_room_list` `{ready_cap}` | Main Menu or Local Wireless room list | reads before each dashboard press and reaches a positively ready room list; stops before ZR when the bridge does not publish `main.dashboard` |
-| `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; uses the same read-before-press dashboard steps, stops before ZR without `main.dashboard`, and otherwise resends a lost input at most 3 times or stops on a named step |
+| `wireless_room_list` `{ready_cap}` | Main Menu or Local Wireless room list | reads before each dashboard press and reaches a positively ready room list; stops before ZR when the bridge does not publish `dashboard` |
+| `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; uses the same read-before-press dashboard steps, stops before ZR without `dashboard`, and otherwise resends a lost input at most 3 times or stops on a named step |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
 | `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
@@ -92,8 +92,8 @@ Look for the current screen and start there; wait for the step's fresh ready obs
 A route starting on a recognised but unready screen waits in that screen's step and stops there, not on `locate`,
 if readiness never arrives; this was found by replaying `rc15-i2-71158421-xps-stop-1`.
 The wireless dashboard path reads before each press: ZR, Down, Down, A on the flown layout, or as many
-observed Down steps as needed. The proposed `main.dashboard`, `dashboard.*` focus and
-`dashboard.local_wireless` keys are unflown; without `main.dashboard` the route stops before ZR.
+observed Down steps as needed. The proposed `dashboard`, `dashboard.*` focus and
+`dashboard.local_wireless` keys are unflown; without `dashboard` the route stops before ZR.
 Main, dashboard, room list and Create form require `input.ready=yes`; only the tile-gated pickers accept
 an absent readiness key. The guest waits up to 20 seconds for a positively ready room list without input.
 The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,

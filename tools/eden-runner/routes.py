@@ -1153,7 +1153,7 @@ def _wireless_placed(tile):
                                              or tile.get('local.token') == 'placed')
 
 
-DASHBOARD_KEY = 'main.dashboard'
+DASHBOARD_KEY = 'dashboard'
 DASHBOARD_FOCUS = 'dashboard.'
 DASHBOARD_LOCAL_WIRELESS = 'dashboard.local_wireless'
 
@@ -1217,7 +1217,7 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
         if value in (None, 'unknown'):
             raise closed_loop.RouteStopped(
                 route, 'open-dashboard',
-                'unsupported reader: the bridge does not publish the dashboard (main.dashboard); '
+                'unsupported reader: the bridge does not publish the dashboard (key dashboard); '
                 'ZR is not sent blind', {})
         return value == 'closed'
 

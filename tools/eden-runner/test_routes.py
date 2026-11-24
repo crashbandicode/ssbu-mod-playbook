@@ -3672,7 +3672,7 @@ class WirelessRoomTests(unittest.TestCase):
                     values.update({'focus.id': self.room_focus_id, 'focus.index': self.room_focus_index})
                 if self.phase == 'main':
                     values.update({'focus': self.main_focus, 'screen.layer': 'top', 'dialog': 'none',
-                                   'main.dashboard': self.dashboard})
+                                   'dashboard': self.dashboard})
                     if self.dashboard == 'open':
                         values.update({'focus.id': ('dashboard.local_wireless' if self.dashboard_index == 2
                                                     else f'dashboard.item{self.dashboard_index}'),
@@ -5313,9 +5313,9 @@ class DashboardRouteTests(unittest.TestCase):
                 if self.phase == 'main':
                     values.update({'dialog': 'none', 'focus': 'top', 'screen.layer': 'top'})
                     if self.dashboard is not None:
-                        values['main.dashboard'] = self.dashboard
+                        values['dashboard'] = self.dashboard
                     else:
-                        values.pop('main.dashboard', None)
+                        values.pop('dashboard', None)
                     if not self.missing_main_ready:
                         values['input.ready'] = 'no' if self.ready_no_phase == 'main' else 'yes'
                     else:
@@ -5383,9 +5383,9 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(previous[1], 'ssbu.ui')
                 self.assertEqual(previous[2]['input.ready'], 'yes')
                 if event[1] == 'tap-zr1':
-                    self.assertEqual(previous[2]['main.dashboard'], 'closed')
+                    self.assertEqual(previous[2]['dashboard'], 'closed')
                 else:
-                    self.assertEqual(previous[2]['main.dashboard'], 'open')
+                    self.assertEqual(previous[2]['dashboard'], 'open')
                 last_send = i
         self.assertTrue(result['on_list'])
         self.assertTrue(result['list_ready'])
@@ -5403,9 +5403,9 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(self.io.actions, [])
                 name = 'routes-wireless-room-list-stop.json' if guest else 'routes-wireless-room-stop.json'
                 stop = json.loads((self.row / name).read_text())
-                self.assertEqual(stop['unsupported_reader'], 'main.dashboard')
+                self.assertEqual(stop['unsupported_reader'], 'dashboard')
                 self.assertEqual(stop['reason'],
-                                 'unsupported reader: the bridge does not publish the dashboard (main.dashboard); '
+                                 'unsupported reader: the bridge does not publish the dashboard (key dashboard); '
                                  'ZR is not sent blind')
 
     def test_main_dashboard_unknown_gets_no_zr(self):
