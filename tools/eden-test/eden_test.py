@@ -1820,10 +1820,111 @@ def _go_target_rsync(command):
     return result.returncode, int(match.group(1).replace(',', '')) if match else None
 
 
+_GO_BASE_NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*\.json'
+
+
+def _go_this_host():
+    """The host this machine is, by its shared base, or None when it has no shared base. A local copy of another
+    host's base never answers this. A shared base that cannot say is a stop, not a guess."""
+    shared = RUNS / '_eden-test' / 'base.json'
+    if not shared.exists():
+        return None
+    try:
+        config = json.loads(shared.read_text())
+        host = config.get('host') if isinstance(config, dict) else None
+        if not isinstance(host, str) or not host:
+            raise ValueError('it names no host')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'this machine\'s shared base {shared} cannot say which host this is: {error}; '
+                         'nothing was started') from error
+    return host
+
+
+def _go_route(args):
+    """The ssh name this machine reaches args.host by: --ssh, else its hosts.json entry, else None. A hosts.json
+    that exists and cannot be read is a stop: it must not look like a machine with no route."""
+    if args.ssh:
+        return args.ssh
+    hosts = RUNS / '_eden-test' / 'hosts.json'
+    if not hosts.exists():
+        return None
+    try:
+        mapping = json.loads(hosts.read_text())
+        if not isinstance(mapping, dict):
+            raise ValueError('it is not an object of host names')
+        route = mapping.get(args.host)
+        if route is not None and (not isinstance(route, str) or not route):
+            raise ValueError(f'its entry for {args.host!r} is not an ssh name')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot find the ssh name for host {args.host!r}: {hosts} cannot be used: {error}; '
+                         'nothing was started') from error
+    return route
+
+
+def _go_remote_base(args):
+    """The --from of a go that is sent to another host: a path on that host, in this run's own stage folder. It is
+    forwarded as given; a local file is never copied there."""
+    value = getattr(args, 'from_config', None)
+    if not value:
+        return None
+    stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
+    name = value[len(stage) + 1:] if value.startswith(stage + '/') else ''
+    if not re.fullmatch(_GO_BASE_NAME, name):
+        raise SystemExit(
+            f'--from {value!r}: a go sent to another host takes a base that is on the host, a .json file directly in '
+            f'this run\'s own stage folder {stage}/ (a plain name of letters, digits, "_", "-" and "."). '
+            'A local file is not copied there, and it does not make this machine the host')
+    return value
+
+
+def _go_received_base(args):
+    """Check the base of a go a controller sent to this host (it carries --token). Such a go runs here or not at
+    all: a missing or foreign base is refused here and is never sent on. --from must be a file in this run's own
+    stage folder, reached without a symlink, for this host, and it must pin the Eden AppImage this host's shared
+    base pins (go_new then checks that file's hash). The shared base is only read."""
+    shared = RUNS / '_eden-test' / 'base.json'
+
+    def load(path, what):
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f'{what} {path} is missing on this host or is not a plain file; nothing was started')
+        try:
+            config = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise SystemExit(f'{what} {path} cannot be read: {error}; nothing was started') from error
+        host = config.get('host') if isinstance(config, dict) else None
+        if host != args.host or not isinstance(config.get('instances'), list):
+            raise SystemExit(f'{what} {path} is for host {host!r}, not {args.host!r}; nothing was started')
+        return config
+
+    if not args.from_config:
+        load(shared, 'the base')
+        return
+    stage = RUNS / '_eden-test' / 'stage' / args.label
+    try:
+        _target_label(args.label)
+        name = args.from_config[len(str(stage)) + 1:] if args.from_config.startswith(f'{stage}/') else ''
+        if not re.fullmatch(_GO_BASE_NAME, name):
+            raise ValueError('not a .json file directly in that folder')
+        if _owned_target_directory(RUNS, ('_eden-test', 'stage', args.label)) is None:
+            raise ValueError('that folder does not exist')
+    except ValueError as error:
+        raise SystemExit(f'--from {args.from_config!r}: {error}; a go sent to a host takes its base from the run\'s '
+                         f'own stage folder {stage}/; nothing was started') from error
+    config = load(stage / name, '--from')
+    released = {(item.get('app', {}).get('path'), item.get('app', {}).get('sha256'))
+                for item in load(shared, "this host's shared base")['instances'] if isinstance(item, dict)}
+    for item in config['instances']:
+        app = item.get('app', {}) if isinstance(item, dict) else {}
+        if (app.get('path'), app.get('sha256')) not in released:
+            pinned = ', '.join(sorted(f'{path} ({str(digest)[:12]}…)' for path, digest in released))
+            raise SystemExit(f'--from {stage / name}: it pins Eden AppImage {app.get("path")} '
+                             f'({str(app.get("sha256"))[:12]}…), not the released AppImage this host\'s shared base '
+                             f'{shared} pins: {pinned}; nothing was started')
+
+
 def _go_remote(args, lineup):
     hosts = RUNS / '_eden-test' / 'hosts.json'
-    mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
-    host = args.ssh or mapping.get(args.host)
+    host = _go_route(args)
     if not host:
         raise SystemExit(f'no SSH host for {args.host!r}; use --ssh or add it to {hosts}')
     if host.startswith('-'):
@@ -1832,6 +1933,7 @@ def _go_remote(args, lineup):
         _target_label(args.label)
     except ValueError as error:
         raise SystemExit(str(error)) from error
+    _go_remote_base(args)
     targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
     with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
@@ -1839,6 +1941,7 @@ def _go_remote(args, lineup):
 
 
 def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
+    base = _go_remote_base(args)
     if targets is None:
         try:
             _target_label(args.label)
@@ -1922,6 +2025,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                 print(f'target {label} {commit[:12]}: cache {result["cache"]}, '
                       f'{sent if sent is not None else "unknown"} bytes shipped in {time.monotonic() - started:.1f} s')
     remote = ['/usr/bin/python3', '-I', '-B', script, 'go', '--host', args.host, '--label', args.label]
+    if base:
+        remote.extend(('--from', base))
     for nro in args.nro:
         remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
     remote.extend(('--rows', f'{stage}/rows'))
@@ -1975,11 +2080,33 @@ def cmd_go(args):
     if not re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', args.owner):
         raise SystemExit('--owner must be "<Engine> <session>/<stream>" (OpenCode|Codex|Claude|Cursor), '
                          f'e.g. "Claude devin-<lane>/<label>"; got: {args.owner!r}')
-    base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
-    if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
-        _go_trace(args)
-        lineup = _go_card_lineup(args)
-        return _go_remote(args, lineup)
+    if args.token:  # a controller sent this go here: it runs on this machine or not at all
+        _go_received_base(args)
+    else:
+        # Which machine this is comes from its own shared base, never from the base the go names: a local copy of
+        # the host's base does not make this machine the host.
+        shared = RUNS / '_eden-test' / 'base.json'
+        this_host = _go_this_host()
+        if this_host == args.host:
+            remote = False  # this is the host: any local --from, as before; an ssh name is not needed
+        elif _go_route(args):
+            remote = True  # the host is elsewhere: --from is a path there, and a local file is not opened
+        elif this_host is not None:
+            raise SystemExit(
+                f'this machine is host {this_host!r} by its shared base {shared}, not {args.host!r}, and it has no '
+                f'ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'nothing was started')
+        else:
+            # No shared base and no route: nothing says this machine is the host, and a file the go names is no
+            # evidence of it. A host is set up by giving it its shared base.
+            raise SystemExit(
+                f'this machine has no shared base {shared}, so it is not known to be host {args.host!r}, and it has '
+                f'no ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'a base named with --from does not say which machine this is; nothing was started')
+        if remote:
+            _go_trace(args)
+            lineup = _go_card_lineup(args)
+            return _go_remote(args, lineup)
     run = go_new(args)
     config = json.loads((run / 'config.json').read_text())
     for key, entries in config['staged_plugins'].items():
