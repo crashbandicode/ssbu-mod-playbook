@@ -9,6 +9,44 @@ import closed_loop
 import macro_gate
 
 
+class TicketTests(unittest.TestCase):
+    def test_ticket_commit_and_revoke_are_terminal(self):
+        committed = macro_gate.Ticket()
+        self.assertTrue(committed.commit())
+        self.assertFalse(committed.commit())
+        self.assertFalse(committed.revoke())
+        self.assertEqual(committed.state, 'COMMITTED')
+
+        revoked = macro_gate.Ticket()
+        self.assertTrue(revoked.revoke())
+        self.assertFalse(revoked.commit())
+        self.assertFalse(revoked.revoke())
+        self.assertEqual(revoked.state, 'REVOKED')
+
+    def test_commit_and_revoke_have_exactly_one_winner(self):
+        for _ in range(300):
+            ticket = macro_gate.Ticket()
+            start = threading.Barrier(3)
+            results = []
+
+            def attempt(action):
+                start.wait(timeout=1)
+                results.append(action())
+
+            workers = [threading.Thread(target=attempt, args=(ticket.commit,)),
+                       threading.Thread(target=attempt, args=(ticket.revoke,))]
+            try:
+                for worker in workers:
+                    worker.start()
+                start.wait(timeout=1)
+            finally:
+                for worker in workers:
+                    worker.join(1)
+                    self.assertFalse(worker.is_alive())
+            self.assertCountEqual(results, [True, False])
+            self.assertIn(ticket.state, ('COMMITTED', 'REVOKED'))
+
+
 class ClaimTests(unittest.TestCase):
     def test_claim_outside_a_bounded_call_succeeds(self):
         self.assertTrue(macro_gate.claim())

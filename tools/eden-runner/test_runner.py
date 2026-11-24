@@ -1825,6 +1825,188 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(recorded['acquired'])
         self.assertEqual(run.plan['gates']['capped']['sha256'], recorded['sha256'])
 
+    def test_timed_out_gate_discards_candidate_stills_and_reacquires(self):
+        for phase in ('candidate', 'screenshot'):
+            with self.subTest(phase=phase):
+                bridge = self.dir / f'ticket-{phase}.log'
+                self.instances['a']['bridge_log'] = str(bridge)
+                eden = FreshEden(bridge, [1000, 1001, 1002, 1003])
+                eden.colour = RED
+                name = f'ticket-{phase}'
+                reference = self.dir / f'refs/{name}.png'
+                Image.new('RGB', (64, 36), BLUE).save(reference)
+                old = reference.read_bytes()
+                gate = {'kind': 'image', 'reference': f'refs/{name}.png', 'acquire': True, 'sha256': '0' * 64,
+                        'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+                self.plan['gates'][name] = gate
+                self.manifest.write_text(json.dumps(self.plan))
+                before = self.manifest.read_bytes()
+                run = runner.Runner(self.manifest, self.instances, self.dir / f'out-{phase}', 15,
+                                    client_factory=lambda _: eden)
+                run.acquired, run.captures = [], []
+                entered, release = threading.Event(), threading.Event()
+                workers, screenshot_paths = [], []
+                request, roi_diff = eden.request, run.roi_diff
+
+                def block():
+                    workers.append(threading.current_thread())
+                    entered.set()
+                    release.wait(2)
+
+                def paused_request(method, params):
+                    if phase == 'screenshot' and method == 'ui.screenshot' and not entered.is_set():
+                        screenshot_paths.append(Path(params['path']))
+                        block()
+                    return request(method, params)
+
+                def paused_compare(*args):
+                    result = roi_diff(*args)
+                    if phase == 'candidate' and not entered.is_set():
+                        block()
+                    return result
+
+                eden.request = paused_request
+                try:
+                    with mock.patch.object(run, 'roi_diff', side_effect=paused_compare):
+                        started = time.monotonic()
+                        answered = runner.macro_gate.bounded_call(
+                            lambda _: run.check_gate('a', name, cap=.22), 'gate', .22)
+                        self.assertEqual(answered, (False, None))
+                        self.assertLess(time.monotonic() - started, .35)
+                        self.assertTrue(entered.is_set())
+                        self.assertEqual(reference.read_bytes(), old)
+                        self.assertEqual(self.manifest.read_bytes(), before)
+                        self.assertEqual(run.acquired, [])
+                        self.assertEqual(run.captures, [])
+                        self.assertEqual(run.still_records, {})
+                        self.assertEqual(run.stills.runs, {})
+                        self.assertFalse((run.out / 'stills.jsonl').exists())
+                        child = subprocess.run(
+                            [sys.executable, '-B', '-c',
+                             'import json,sys; import runner; from pathlib import Path; '
+                             'print(json.dumps(runner.dry_run(Path(sys.argv[1]))["references_to_acquire"]))',
+                             str(self.manifest)],
+                            cwd=Path(runner.__file__).parent, text=True, capture_output=True, timeout=2, check=True)
+                        self.assertIn(name, json.loads(child.stdout))
+                        release.set()
+                        workers[0].join(1)
+                        self.assertFalse(workers[0].is_alive())
+                    self.assertEqual(reference.read_bytes(), old)
+                    self.assertEqual(self.manifest.read_bytes(), before)
+                    self.assertEqual(run.acquired, [])
+                    self.assertEqual(run.still_records, {})
+                    self.assertFalse((run.out / 'stills.jsonl').exists())
+                    actions = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
+                    self.assertEqual(len([action for action in actions if 'late_candidate_discarded' in action]), 1)
+                    for path in screenshot_paths:
+                        self.assertFalse(path.exists())
+                    child = subprocess.run(
+                        [sys.executable, '-B', '-c',
+                         'import json,sys; import runner; from pathlib import Path; '
+                         'print(json.dumps(runner.dry_run(Path(sys.argv[1]))["references_to_acquire"]))',
+                         str(self.manifest)],
+                        cwd=Path(runner.__file__).parent, text=True, capture_output=True, timeout=2, check=True)
+                    self.assertIn(name, json.loads(child.stdout))
+                    with mock.patch.object(run, 'compare_region',
+                                           side_effect=AssertionError('unapproved reference was used')):
+                        result = run.check_gate('a', name)
+                    self.assertEqual(len(run.acquired), 1)
+                    self.assertEqual(json.loads(self.manifest.read_text())['gates'][name]['sha256'], sha(result))
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(1)
+                        self.assertFalse(worker.is_alive())
+
+    def test_bounded_acquisition_commits_on_the_deciding_thread(self):
+        bridge = self.dir / 'decision-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        name = 'decision'
+        reference = self.dir / 'refs/decision.png'
+        self.plan['gates'][name] = {'kind': 'image', 'reference': 'refs/decision.png', 'acquire': True,
+                                    'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(eden)
+        run.acquired = []
+        deciding_thread = threading.current_thread()
+        authors = []
+        replace = Path.replace
+
+        def record(path, target):
+            if Path(target) == reference:
+                authors.append(threading.current_thread())
+            return replace(path, target)
+
+        with mock.patch.object(Path, 'replace', new=record):
+            answered, result = runner.macro_gate.bounded_call(lambda _: run.check_gate('a', name), 'gate', 1)
+        self.assertTrue(answered)
+        self.assertEqual(authors, [deciding_thread])
+        self.assertEqual(len(run.acquired), 1)
+        self.assertEqual(json.loads(self.manifest.read_text())['gates'][name]['sha256'], sha(result))
+
+    def test_bounded_image_gate_publishes_still_on_the_deciding_thread(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        deciding_thread = threading.current_thread()
+        authors = []
+        append = run.stills.append
+
+        def record(value):
+            authors.append(threading.current_thread())
+            return append(value)
+
+        with mock.patch.object(run.stills, 'append', side_effect=record):
+            answered, _ = runner.macro_gate.bounded_call(lambda _: run.check_gate('a', 'red'), 'gate', 1)
+        self.assertTrue(answered)
+        self.assertEqual(authors, [deciding_thread])
+        self.assertEqual(len(run.still_records), 1)
+
+    def test_superseded_gate_discards_its_unpublished_screenshot(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        entered, release = threading.Event(), threading.Event()
+        old_paths, errors = [], []
+        request = eden.request
+
+        def blocked_request(method, params):
+            reply = request(method, params)
+            if method == 'ui.screenshot' and threading.current_thread() is worker:
+                old_paths.append(Path(params['path']))
+                entered.set()
+                release.wait(2)
+            return reply
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'red')
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = blocked_request
+        worker = threading.Thread(target=old_gate)
+        try:
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            run.check_gate('a', 'red')
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertFalse(old_paths[0].exists())
+            self.assertEqual(len(run.still_records), 1)
+            self.assertEqual(len(runner.still_fresh.load(run.out / 'stills.jsonl')), 1)
+            actions = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
+            self.assertEqual(len([action for action in actions if 'late_candidate_discarded' in action]), 1)
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
     def test_timed_out_acquisition_rolls_back_at_each_publication_stage(self):
         for phase in ('reference', 'manifest', 'receipt'):
             with self.subTest(phase=phase):
