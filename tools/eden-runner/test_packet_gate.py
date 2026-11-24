@@ -447,9 +447,9 @@ write!(text, "clip ctx={} total={} in={} out={}");
         row['reads'] = ['tr.menu:strip.aims', 'tr.menu:page', 'tr.menu:zone.left', 'tr.menu:rows',
                         'tr.practice:wizard.step', 'tr.practice:wizard.y', 'tr.practice:phase']
         self.assertEqual(self.errors(), [])
-        row['reads'] = ['ssbu.ui:screen']
-        self.assertIn('no extractor for provider ssbu.ui (add target.providers)', self.errors()[0])
-        self.plan['target']['providers'] = {'ssbu.ui': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        row['reads'] = ['user.ui:screen']
+        self.assertIn('no extractor for provider user.ui (add target.providers)', self.errors()[0])
+        self.plan['target']['providers'] = {'user.ui': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
         self.assertEqual(self.errors(), [])
         row['reads'] = ['tr.menu:test.only']
         self.assertIn('tr.menu:test.only is not written', self.errors()[0])
@@ -521,6 +521,149 @@ write!(text, "clip ctx={} total={} in={} out={}");
         self.assertIn('G2 row r1: provider ssbu.ui needs target.bridge', self.errors())
         self.plan['target']['providers'] = []
         self.assertIn('G2 target: providers must be an object', self.errors())
+
+    def bridge_fixture(self):
+        tree = Path(self.tmp.name) / 'bridge-source'
+        tree.mkdir()
+
+        def write(name, content):
+            path = tree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        old_ui = r'write!(out, "\nobservation={}\nobservation.active={}\nscreen={screen}\n");' + '\n'
+        write('src/native_ui/mod.rs', old_ui)
+        write('src/proto2.rs', r'''
+write!(out, "[Bridge] fighter entry={entry} kind={} x={} y={} status={} situation={} stock={} dead={} item={}");
+write!(out, " eb={} ab={} cpu={} cbt={}");
+write!(out, "[Bridge] input slot={slot} src={src} buttons={:#x} lx={} ly={} rx={} ry={}");
+write!(out, "x={} y={} at={} tr={}");
+write!(out, "[Bridge2] other hidden={}");
+write!(out, "[Bridge] [Nested] other hidden={}");
+''')
+        write('src/hooks.rs', r'''
+write!(out, "[Bridge] fighters_watch done entries={mask:#x}");
+write!(out, "[Bridge] req fighters_watch result=ok entries={mask:#x} frames={frames}");
+''')
+        git('init', '-q')
+        git('add', 'src')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'partial')
+        partial = git('rev-parse', 'HEAD').stdout.strip()
+        write('src/model.rs', 'write!(out, "[Bridge] stage id={stage}");\n')
+        git('add', 'src/model.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'old bridge')
+        old = git('rev-parse', 'HEAD').stdout.strip()
+        write('src/native_ui/mod.rs', old_ui +
+              r'write!(out, "\ninput.ready={}\nscreen.gen={}\nscreen.gap={}");' + '\n')
+        git('add', 'src/native_ui/mod.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'new bridge')
+        new = git('rev-parse', 'HEAD').stdout.strip()
+        return tree, partial, old, new
+
+    def test_builtin_ssbu_ui_provider_checks_the_selected_bridge_commit(self):
+        tree, _, old, new = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': new}
+        self.plan['rows'][0]['reads'] = ['ssbu.ui:screen', 'ssbu.ui:observation.active', 'ssbu.ui:input.ready']
+        self.assertEqual(self.errors(), [])
+        self.plan['target']['bridge']['commit'] = old
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn(f'ssbu.ui:input.ready is not written by bridge {old[:8]}', errors[0])
+
+    def test_builtin_bridge_provider_extracts_tagged_events_and_bare_continuations(self):
+        tree, _, _, commit = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = ['bridge:fighter status', 'bridge:fighter x', 'bridge:eb',
+                                         'bridge:input lx', 'bridge:stage id', 'bridge:fighters_watch entries',
+                                         'bridge:req result']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        emitted = set(report['emitted']['bridge'])
+        self.assertTrue({'fighter entry', 'fighter status', 'fighter x', 'eb', 'input lx',
+                         'stage id', 'fighters_watch entries', 'req result'} <= emitted)
+        self.assertNotIn('fighter eb', emitted)
+        self.assertNotIn('other hidden', emitted)
+        for key in ('fighter position', 'fighter eb'):
+            with self.subTest(key=key):
+                self.plan['rows'][0]['reads'] = [f'bridge:{key}']
+                self.assertEqual(self.errors(), [f'G2 row r1: bridge:{key} is not written by bridge '
+                                                 f'{commit[:8]} (src/proto2.rs, src/hooks.rs, src/model.rs)'])
+
+    def test_builtins_require_the_bridge_target(self):
+        self.plan['target'].pop('bridge')
+        for provider, key in (('ssbu.ui', 'screen'), ('bridge', 'fighter status')):
+            with self.subTest(provider=provider):
+                self.plan['rows'][0]['reads'] = [f'{provider}:{key}']
+                self.assertIn(f'G2 row r1: provider {provider} needs target.bridge', self.errors())
+
+    def test_missing_bridge_provider_file_names_its_commit(self):
+        tree, partial, _, _ = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': partial}
+        self.plan['rows'][0]['reads'] = ['bridge:fighter status']
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith('G2 row r1: extractor bridge:'), errors)
+        self.assertIn('src/model.rs', errors[0])
+        self.assertIn(partial, errors[0])
+
+    def test_declared_provider_can_use_a_third_repository(self):
+        tree = Path(self.tmp.name) / 'tile-source'
+        tree.mkdir()
+        (tree / 'cursor.rs').write_text(r'write!(out, "screen={}\np1.token={}\nsettled={}");' + '\n')
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        git('init', '-q')
+        git('add', 'cursor.rs')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'tile')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['repos'] = {'tile': {'tree': str(tree), 'commit': commit}}
+        self.plan['target']['providers'] = {'tile.cursor': {'repo': 'tile', 'files': ['cursor.rs']}}
+        self.plan['rows'][0]['reads'] = ['tile.cursor:p1.token']
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        self.assertIn('p1.token', report['emitted']['tile.cursor'])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("p1.unknown")\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "p1.unknown", which the target does not write'])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return True\n')
+        source = self.plan['target']['providers']['tile.cursor']
+        source['repo'] = 'unknown'
+        self.assertIn('G2 row r1: no extractor for provider tile.cursor (add target.providers)', self.errors())
+        source['repo'] = 'tile'
+        for name in ('plugin', 'bridge'):
+            with self.subTest(reserved=name):
+                self.plan['target']['repos'][name] = {'tree': str(tree), 'commit': commit}
+                self.assertIn(f'G2 target: repos.{name} is reserved', self.errors())
+                self.plan['target']['repos'].pop(name)
+        self.plan['target']['repos']['tile']['commit'] = '0' * 40
+        self.assertTrue(any('repos.tile.commit' in error and 'is not a commit' in error for error in self.errors()))
+        self.plan['target']['repos']['tile']['commit'] = 'not-a-commit'
+        self.assertIn('G2 target: repos.tile.commit must be 40 lower-case hex characters', self.errors())
+        self.plan['target']['repos']['tile']['commit'] = commit
+        self.plan['target']['repos']['tile']['tree'] = 'relative'
+        self.assertIn('G2 target: repos.tile.tree must be an existing absolute directory', self.errors())
+        self.plan['target']['repos']['tile']['tree'] = str(tree / 'missing')
+        self.assertIn('G2 target: repos.tile.tree must be an existing absolute directory', self.errors())
+        self.plan['target']['repos']['tile'] = 'bad'
+        self.assertIn('G2 target: repos.tile must be an object', self.errors())
+        self.plan['target']['repos'] = []
+        self.assertIn('G2 target: repos must be an object', self.errors())
+
+    def test_hook_read_prefixes_come_from_dotted_provider_keys_only(self):
+        tree, _, _, commit = self.bridge_fixture()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['target']['providers'] = {'probe': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        (self.base / 'steps.py').write_text(
+            'def ok(ctx):\n    return [values.get("x.position"), values.get("y.velocity"), '
+            'values.get("at.start"), values.get("tr.example")]\n')
+        self.assertEqual(self.errors(), [])
+        self.plan['target'].pop('providers')
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("screen.unknown")\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "screen.unknown", which the target does not write'])
 
     def test_the_packet_digest_changes_with_any_file_and_ignores_out(self):
         initial = packet_gate.packet_digest(self.base)
@@ -848,6 +991,21 @@ write!(text, "clip ctx={} total={} in={} out={}");
             payload = re.sub(r'(?: ev=\d+)? frame=\d+ wall=\d+$', '', payload)
             expected = {'fed ' + key for key in re.findall(r'(?:^| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', payload)}
             self.assertEqual(expected - keys, set())
+
+    @unittest.skipUnless(os.environ.get('PACKET_GATE_BRIDGE_TREE') and os.environ.get('PACKET_GATE_BRIDGE_COMMIT')
+                         and os.environ.get('PACKET_GATE_BRIDGE_LOG'), 'recorded bridge witness not supplied')
+    def test_recorded_bridge_fighter_witness(self):
+        keys = packet_gate.emitted_keys(Path(os.environ['PACKET_GATE_BRIDGE_TREE']),
+                                        os.environ['PACKET_GATE_BRIDGE_COMMIT'],
+                                        packet_gate.PROVIDERS['bridge']['files'])
+        lines = [line for line in Path(os.environ['PACKET_GATE_BRIDGE_LOG']).read_text().splitlines()
+                 if '[Bridge] fighter entry=' in line]
+        self.assertTrue(lines, 'bridge witness has no fighter entry lines')
+        words = {key for line in lines
+                 for key in re.findall(r'(?:^| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', line)}
+        missing = {key for key in words if key not in keys and f'fighter {key}' not in keys}
+        print('bridge witness keys the extractor lacks:', sorted(missing))
+        self.assertEqual(missing, set())
 
 
 if __name__ == '__main__':
