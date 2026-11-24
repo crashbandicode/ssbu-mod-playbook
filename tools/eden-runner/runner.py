@@ -220,11 +220,15 @@ def acquisition_intent(reference):
     return reference.with_name(reference.name + '.acquiring')
 
 
+def gate_candidate(path):
+    return path.name.startswith(GATE_CANDIDATE_PREFIX) or path.resolve().name.startswith(GATE_CANDIDATE_PREFIX)
+
+
 def reference_approved(base, gate, manifest=None, name=None):
     reference = Path(base) / gate['reference']
     intent = acquisition_intent(reference)
     try:
-        if intent.exists() or not reference.is_file() or not gate.get('sha256'):
+        if gate_candidate(reference) or intent.exists() or not reference.is_file() or not gate.get('sha256'):
             return False
         if manifest is not None and name is not None and (gate.get('acquire') or gate.get('acquired')):
             raw = json.loads(Path(manifest).read_text())
@@ -923,6 +927,9 @@ def dry_run(manifest_path):
                     errors.append(f'gate {name}: frame must be [width, height]')
                 elif gate.get('reference_is_roi') and scale == 'fit' and frame is None:
                     errors.append(f'gate {name}: an ROI reference with scale "fit" needs "frame": [width, height]')
+                if gate_candidate(base / gate['reference']):
+                    errors.append(f'gate {name}: reference uses a reserved candidate path')
+                    continue
                 approved = reference_approved(base, gate)
                 if not approved and gate.get('acquire'):
                     to_acquire.append(name)  # captured the first time the run reaches the screen
@@ -1753,10 +1760,11 @@ class Runner:
     def _gate_reference(self, gate, name):
         context = getattr(self._gate_context, 'gate', None)
         target = self.base / gate['reference']
-        if context is not None:
-            candidate = context['references'].get(str(target))
-            if candidate is not None and candidate[1] == gate.get('sha256'):
-                return candidate[0]
+        if gate_candidate(target):
+            raise RuntimeError(f'gate {name}: reference uses a reserved candidate path')
+        if context is not None and target.resolve() in context['references']:
+            context['ticket'].revoke('pending_reference')
+            raise closed_loop.DispatchRejected(f'gate {name}: reference acquisition has not committed')
         return target if reference_approved(self.base, gate, self.manifest_path, name) else None
 
     def _stage_gate_file(self, gate, target, contents):
@@ -1825,6 +1833,12 @@ class Runner:
         journal_error = None
         before = None
         try:
+            try:
+                self.check_stop()
+            except StopRun:
+                ticket.revoke('cancel')
+                ticket.discard()
+                raise
             if self._gate_owner is not ticket or not ticket.commit():
                 ticket.revoke()
                 return False
@@ -2474,7 +2488,7 @@ class Runner:
             'runs': copy.deepcopy(preceding['runs'] if preceding else self.stills.runs),
             'frame_sources': dict(preceding['frame_sources'] if preceding else self._frame_sources),
             'plan': copy.deepcopy(preceding['plan'] if preceding else self.plan),
-            'references': dict(preceding['references'] if preceding else {}),
+            'ticket': token, 'references': set(preceding['references'] if preceding else ()),
             'baseline': None, 'latest': None, 'outcome': None, 'evidence': True, 'passed': False,
             'role': harness.assertion_role(gate),
         }
@@ -2538,6 +2552,9 @@ class Runner:
             self._gate_result(result_slot, {'gate': name, 'passed': True, 'role': context['role'],
                                             'screen_reached': self.screen_reached})
             return context['paths'].get(result, result) if isinstance(result, str) else result
+        except StopRun:
+            token.revoke('cancel')
+            raise
         except GateEvidenceTimeout as error:
             self._gate_result(result_slot, {'gate': name, 'on': on, 'role': harness.assertion_role(gate),
                                             'timed_out': True, 'reason': str(error), 'screen_unchanged': None,
@@ -2868,6 +2885,8 @@ class Runner:
     def acquire(self, on, name, gate, until):
         """First visit of a screen with no reference yet: wait until the region stops changing, save that shot as the
         reference, write its sha256 into rows.json, and flag the row so the runner stops for a review after it."""
+        if gate_candidate(self.base / gate['reference']):
+            raise RuntimeError(f'gate {name}: reference uses a reserved candidate path')
         if getattr(self._gate_context, 'gate', None) is None:
             token = macro_gate.current_ticket()
             direct = token is None
@@ -2896,13 +2915,18 @@ class Runner:
                     raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
                 completed = True
                 return result
+            except StopRun:
+                token.revoke('cancel')
+                raise
             finally:
                 if not completed:
                     self._cancel_acquisition(context)
                 self._gate_context.token = previous
                 self._gate_context.gate = None
                 if direct and registered:
-                    if not token.finish():
+                    if token.is_revoked():
+                        token.discard()
+                    elif not token.finish():
                         token.revoke()
                         token.discard()
                         raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
@@ -2931,13 +2955,12 @@ class Runner:
                 context['acquisition_checkpoint'] = {
                     'files': len(context['files']), 'intents': len(context['intents']),
                     'receipts': len(context['receipts']), 'gate_updates': copy.deepcopy(context['gate_updates']),
-                    'references': dict(context['references']), 'name': name,
+                    'references': set(context['references']), 'name': name,
                     'previous': copy.deepcopy(plan['gates'].get(name)),
                 }
                 plan['gates'].setdefault(name, copy.deepcopy(gate)).update(sha256=sha256, acquired=acquired)
                 try:
                     self._stage_gate_file(context, reference, data)
-                    reference_candidate = context['files'][-1][0]
                     self._stage_gate_file(context, self.manifest_path, (json.dumps(plan, indent=2) + '\n').encode())
                     intent = acquisition_intent(reference)
                     with tempfile.NamedTemporaryFile(dir=intent.parent, prefix=f'{GATE_CANDIDATE_PREFIX}intent-',
@@ -2949,7 +2972,7 @@ class Runner:
                     self._cancel_acquisition(context)
                     raise
                 context['gate_updates'][name] = copy.deepcopy(plan['gates'][name])
-                context['references'][str(reference)] = (reference_candidate, sha256)
+                context['references'].add(reference.resolve())
                 context['receipts'].append({'gate': name, 'reference': str(reference),
                                             'shot': context['paths'][str(path)]})
                 self.log({'gate': name, 'on': on, 'acquisition_pending': str(reference), 'sha256': sha256})
