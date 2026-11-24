@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2645,6 +2646,9 @@ class EdenTestTests(unittest.TestCase):
                         eden_test._go_remote_with_mux(
                             self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
                 self.assertIn('target plugin cache probe failed: connection reset', str(error.exception))
+                if code == 255:
+                    self.assertEqual(str(error.exception),
+                                     'target plugin cache probe failed: connection reset; ssh diag named')
                 self.assertEqual('ssh diag named' in str(error.exception), code == 255)
                 self.assertEqual(probe.call_count, 1)
                 self.assertEqual(diag.call_count, int(code == 255))
@@ -2663,11 +2667,13 @@ class EdenTestTests(unittest.TestCase):
                 receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
                 receipt.unlink(missing_ok=True)
                 calls = []
+                commands = []
                 def sh(command):
                     kind = command[0]
                     what = ('result' if kind == 'scp' and command[-2].endswith('/go-result.json') else
                             'report' if kind == 'scp' else 'go' if kind == 'ssh' else 'rsync')
                     calls.append(what)
+                    commands.append(command)
                     if what == stage:
                         code = 255 if transport else 23 if what == 'rsync' else 1
                         return eden_test._ExitCode(code, 'Connection reset' if transport else 'application failure')
@@ -2687,6 +2693,13 @@ class EdenTestTests(unittest.TestCase):
                 self.assertEqual(diag.call_count, int(transport))
                 self.assertEqual('ssh diag named' in str(error.exception), transport)
                 self.assertEqual(receipt.exists(), transport)
+                original = {'rsync': f'go staging failed ({255 if transport else 23}): {shlex.join(commands[-1])}',
+                            'result': 'remote go produced no result for this call (ssh exit 0); '
+                                      'nothing was copied; see the output above',
+                            'report': f'copying remote report failed ({255 if transport else 1})',
+                            'go': 'remote go failed (ssh exit 255); the remote go may be running; '
+                                  'check the host before starting another'}[stage]
+                self.assertEqual(str(error.exception), original + ('; ssh diag named' if transport else ''))
                 if transport:
                     self.assertEqual(len(receipt.read_text().splitlines()), 1)
                 if stage == 'go':
@@ -2720,6 +2733,9 @@ class EdenTestTests(unittest.TestCase):
                 self.assertEqual(diag.call_count, int(code in (10, 124)))
                 self.assertEqual('ssh diag named' in str(error.exception), code in (10, 124))
                 self.assertEqual(receipt.exists(), code in (10, 124))
+                if code != 124:
+                    original = f'target plugin pack rsync failed ({code}): {shlex.join(transfer.call_args.args[0])}'
+                    self.assertEqual(str(error.exception), original + ('; ssh diag named' if code == 10 else ''))
                 if code == 124:
                     self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
 
@@ -2744,6 +2760,37 @@ class EdenTestTests(unittest.TestCase):
                 self.assertEqual(diag.call_count, int(code == 255))
                 self.assertEqual('ssh diag named' in str(error.exception), code == 255)
                 self.assertEqual(receipt.exists(), code == 255)
+                self.assertEqual(str(error.exception), f'target plugin staging failed ({code})' +
+                                 ('; ssh diag named' if code == 255 else ''))
+
+    def test_target_pack_rsync_timeout_preserves_original_detail_and_diagnosis(self):
+        commit = 'a' * 40
+        targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
+        diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+        calls = []
+        def pack(*_args):
+            path = self.dir / 'temporary.pack'
+            path.write_text('fixture')
+            return {'pack_file': str(path)}
+        def timeout(command, **kwargs):
+            calls.append((command, kwargs))
+            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+        with mock.patch.object(eden_test, '_go_sh', return_value=0), \
+                mock.patch.object(eden_test, '_go_target_ssh',
+                                  return_value=(0, json.dumps({'commit': commit, 'cached': False}), '')), \
+                mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
+                mock.patch.object(eden_test.subprocess, 'run', side_effect=timeout), \
+                mock.patch.object(eden_test._lifecycle_module, 'ssh_diagnosis', return_value=diagnosis) as diag:
+            with self.assertRaises(SystemExit) as error:
+                eden_test._go_remote_with_mux(
+                    self.remote_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
+        self.assertEqual(len(calls), 1)
+        previous = f'target pack rsync failed: {subprocess.TimeoutExpired(calls[0][0], 3600)}'
+        self.assertEqual(str(error.exception), previous + '; ssh diag named')
+        diag.assert_called_once()
+        self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
+        receipt = eden_test.RUNS / '_eden-test/ssh-diag/go-1/ssh-diag.md'
+        self.assertEqual(len(receipt.read_text().splitlines()), 1)
 
     def test_remote_go_dead_master_refuses_even_with_mapped_application_exit(self):
         class DeadMux(FakeMux):

@@ -2772,8 +2772,12 @@ class LedgerForwardTests(unittest.TestCase):
     def test_transient_transport_diagnoses_without_replaying(self):
         self.plan = [255, self.read()]
         self.diagnoses = [self.diag()]
-        with self.assertRaises(life.LedgerTransport):
+        with self.assertRaises(life.LedgerTransport) as error:
             self.request('read')
+        self.assertEqual(str(error.exception),
+                         'SSH lifecycle failed: synthetic SSH failure; ssh diag fake -> fake-yoga: synthetic')
+        forwarded = life.LedgerTransport(json.loads(json.dumps(error.exception.diagnoses)))
+        self.assertEqual(str(forwarded), str(error.exception))
         self.assertEqual([c[0] for c in self.calls], ['ledger-read'])
         self.diagnosis_mock.assert_called_once()
         self.assertFalse(self.diagnosis_mock.call_args.kwargs['allow_retry'])
@@ -2800,8 +2804,10 @@ class LedgerForwardTests(unittest.TestCase):
         self.calls.clear()
         self.plan = [subprocess.TimeoutExpired('ssh', 10), self.read()]
         self.diagnoses = [self.diag()]
-        with self.assertRaises(life.LedgerTransport):
+        with self.assertRaises(life.LedgerTransport) as error:
             self.request('read')
+        self.assertEqual(str(error.exception), 'SSH lifecycle failed: ' +
+                         str(subprocess.TimeoutExpired('ssh', 10)) + '; ssh diag fake -> fake-yoga: synthetic')
         self.assertEqual(len(self.calls), 1)
 
     def test_real_classifier_without_target_never_retries_fake_packet_loss(self):
@@ -3086,6 +3092,8 @@ class SshDiagnosisTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 1)
                 self.assertEqual(diag.call_count, int(code == 255))
                 self.assertEqual('ssh diag named' in str(error.exception), code == 255)
+                self.assertEqual(str(error.exception), 'SSH lifecycle failed: application errorapplication output' +
+                                 ('; ssh diag named' if code == 255 else ''))
                 receipt = Path(temporary) / 'ssh-diag.md'
                 self.assertEqual(receipt.is_file(), code == 255)
                 if receipt.exists():
@@ -3105,6 +3113,9 @@ class SshDiagnosisTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 1)
                 self.assertEqual(diag.call_count, int(code == 255))
                 self.assertEqual('ssh diag named' in controller.state['notify_errors'][0]['error'], code == 255)
+                self.assertIn('notify SSH failed: application error' +
+                              ('; ssh diag named' if code == 255 else ''),
+                              controller.state['notify_errors'][0]['error'])
                 self.assertEqual((notify_dir / 'ssh-diag.md').is_file(), code == 255)
 
     def test_receipt_write_failure_does_not_mask_forward_stop(self):
@@ -3121,6 +3132,25 @@ class SshDiagnosisTests(unittest.TestCase):
                     life.forward('fake-host', 'status', {'state_dir': temporary}, False,
                                  run=lambda *_args, **_kwargs: response)
             self.assertIn('SSH lifecycle failed: connection reset; ssh diag named', str(error.exception))
+
+    def test_notify_timeout_preserves_original_error_representation(self):
+        with tempfile.TemporaryDirectory(prefix='notify-timeout-') as temporary:
+            controller = life.Lifecycle.__new__(life.Lifecycle)
+            controller.c = {'notify': {'ssh': 'fake-host', 'file': '/fake/notice'},
+                            'label': 'fixture', 'owner': 'Codex test/owner'}
+            controller.directory, controller.state = Path(temporary), {}
+            controller.record = unittest.mock.Mock()
+            controller.write = unittest.mock.Mock()
+            timeout = subprocess.TimeoutExpired(['ssh', 'fixture'], 10)
+            diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+            with patch.object(life.subprocess, 'run', side_effect=timeout) as run, \
+                    patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                controller.notify('failure')
+            run.assert_called_once()
+            diag.assert_called_once()
+            expected = repr(life.Refused(f'{timeout!r}; ssh diag named'))
+            self.assertEqual(controller.state['notify_errors'][0]['error'], expected)
+            self.assertTrue((Path(temporary) / 'ssh-diag.md').is_file())
 
     def test_unwritable_diagnostic_directory_uses_temporary_evidence(self):
         with tempfile.TemporaryDirectory(prefix='unwritable-diag-') as temporary:
@@ -3157,7 +3187,27 @@ class SshDiagnosisTests(unittest.TestCase):
                 self.assertEqual(calls.call_count, 1)
                 self.assertEqual(diag.call_count, int(code == 255))
                 self.assertEqual('ssh diag named' in str(error.exception), code == 255)
+                self.assertEqual(str(error.exception), 'Windows SSH disconnected: remote failed' +
+                                 ('; ssh diag named' if code == 255 else ''))
                 self.assertEqual((Path(temporary) / 'ssh-diag.md').is_file(), code == 255)
+
+    def test_windows_wait_timeout_preserves_exception_text_and_diagnosis(self):
+        class Process:
+            def __init__(self):
+                self.stdin, self.stdout, self.stderr = io.StringIO(), io.StringIO(''), io.StringIO('')
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(['ssh', 'fixture'], timeout)
+            def poll(self):
+                return 255
+        with tempfile.TemporaryDirectory(prefix='windows-timeout-') as temporary:
+            diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+            with patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                with self.assertRaises(life.Refused) as error:
+                    life.forward_windows('fake-ally', 'status', {'state_dir': temporary}, False,
+                                         unittest.mock.Mock(return_value=Process()))
+            self.assertEqual(str(error.exception),
+                             str(subprocess.TimeoutExpired(['ssh', 'fixture'], 3)) + '; ssh diag named')
+            diag.assert_called_once()
 
     def test_inaccessible_or_disappearing_socket_does_not_mask_diagnosis(self):
         with tempfile.TemporaryDirectory(prefix='eden-socket-') as tmp:
@@ -3560,7 +3610,8 @@ class SshMuxTests(unittest.TestCase):
                         else:
                             with self.assertRaises(life.LedgerTransport) as error:
                                 life.ledger_forward('fake-host', 'read', config, run=run)
-                            self.assertEqual(error.exception.diagnoses, [diagnosis])
+                            self.assertEqual(error.exception.diagnoses,
+                                             [{**diagnosis, 'stop': 'SSH master failed'}])
                     self.assertEqual(len(masters), 2)
                     self.assertEqual(len(riders), 1 if restart_ok else 0)
                     if restart_ok:

@@ -96,13 +96,17 @@ class Refused(RuntimeError):
 
 
 class LedgerTransport(Refused):
-    def __init__(self, diagnoses):
+    def __init__(self, diagnoses, message=None):
         if isinstance(diagnoses, str):
             diagnoses = [{'line': diagnoses, 'cause': 'unknown', 'transient': False, 'phase': 'unknown',
                           'evidence': ''}]
+        if message:
+            diagnoses = [*diagnoses[:-1], {**diagnoses[-1], 'stop': message}]
+        else:
+            message = diagnoses[-1].get('stop')
         self.diagnoses = diagnoses
         self.transient = bool(diagnoses[-1]['transient'])
-        super().__init__('\n'.join(d['line'] for d in diagnoses))
+        super().__init__((message + '; ' if message else '') + '\n'.join(d['line'] for d in diagnoses))
 
 
 class SettleDeadline(Exception):
@@ -1604,7 +1608,7 @@ class Lifecycle:
                     except subprocess.TimeoutExpired as error:
                         diagnosis = ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
                         ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'notify'}, self.directory)
-                        raise Refused(f'notify SSH failed: {error}; {diagnosis["line"]}') from error
+                        raise Refused(f'{error!r}; {diagnosis["line"]}') from error
                     diagnosis = ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
                     if diagnosis:
                         ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'notify'}, self.directory)
@@ -3302,7 +3306,7 @@ class SshMux:
                                       ssh_options=self.options, ssh_bin=self.ssh_bin, windows=self.windows,
                                       allow_retry=False)
             ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'master configuration'}, self.evidence_dir)
-            raise LedgerTransport([diagnosis])
+            raise LedgerTransport([diagnosis], 'SSH master configuration failed')
         path = Path(match.group(1).strip())
         require(path.parent == self.root and path.name != '%C', 'Unsafe SSH control path')
         return str(path)
@@ -3448,7 +3452,7 @@ class SshMux:
                 ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'master'}, self.evidence_dir)
                 diagnoses.append(diagnosis)
                 if attempt or not diagnosis['transient']:
-                    raise LedgerTransport(diagnoses)
+                    raise LedgerTransport(diagnoses, 'SSH master failed')
 
     def __exit__(self, exc_type, exc, traceback):
         with self._lock:
@@ -3504,7 +3508,8 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
         diagnosis = ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
         if diagnosis:
             ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'lifecycle {mode}'}, config.get('state_dir'))
-            raise Refused('SSH lifecycle failed: ' + (done.stderr or '')[-2000:] + '; ' + diagnosis['line'])
+            raise Refused('SSH lifecycle failed: ' + (done.stderr or '')[-2000:] +
+                          (done.stdout or '')[-2000:] + '; ' + diagnosis['line'])
         require(done.returncode == 0, 'SSH lifecycle failed: ' + done.stderr[-2000:] + done.stdout[-2000:])
         return json.loads(done.stdout)
 
@@ -3536,13 +3541,14 @@ def ledger_forward(host, operation, config, run=subprocess.run):
         except subprocess.TimeoutExpired as error:
             diagnosis = ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
             ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'ledger {operation}'}, config.get('state_dir'))
-            raise LedgerTransport([diagnosis]) from error
+            raise LedgerTransport([diagnosis], f'SSH lifecycle failed: {error}') from error
         except OSError as error:
             raise Refused(f'SSH lifecycle failed: {error}') from error
         diagnosis = ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
         if diagnosis:
             ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': f'ledger {operation}'}, config.get('state_dir'))
-            raise LedgerTransport([diagnosis])
+            raise LedgerTransport([diagnosis], 'SSH lifecycle failed: ' +
+                                  (done.stderr or '')[-2000:] + (done.stdout or '')[-2000:])
         require(done.returncode == 0, 'SSH lifecycle failed: ' + (done.stderr or '')[-2000:] + (done.stdout or '')[-2000:])
         try:
             result = json.loads(done.stdout)
@@ -3679,7 +3685,7 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
                 try:
                     code = process.wait(timeout=3)
                 except subprocess.TimeoutExpired as cause:
-                    raise failed('Windows SSH disconnected: process did not exit', None, True) from cause
+                    raise failed(str(cause), None, True) from cause
                 error_thread.join(timeout=2)
                 raise failed('Windows SSH disconnected: ' + ''.join(errors)[-2000:], code)
             message = json.loads(line)
@@ -3712,7 +3718,7 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
                 try:
                     code = process.wait(timeout=15)
                 except subprocess.TimeoutExpired as cause:
-                    raise failed('Windows SSH failed after reply: process did not exit', None, True) from cause
+                    raise failed(str(cause), None, True) from cause
                 if code != 0:
                     error_thread.join(timeout=2)
                     raise failed('Windows SSH failed after reply', code)

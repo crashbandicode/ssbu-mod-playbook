@@ -2039,6 +2039,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                         if failure:
                             diagnosis = _go_diagnosis(mux, 'rsync', failure, f'target {label} pack',
                                                      timed_out=getattr(failure, 'timed_out', False))
+                            if getattr(failure, 'timed_out', False):
+                                raise SystemExit(f'target pack rsync failed: {failure.stderr}{_go_suffix(diagnosis)}')
                             raise SystemExit(f'target {label} pack rsync failed ({failure}): '
                                              f'{shlex.join(transfer)}{_go_suffix(diagnosis)}')
                         helper.extend(('--pack', incoming))
