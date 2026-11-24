@@ -1,0 +1,147 @@
+"""Offline closed-loop route tests with a scripted clock and observations."""
+import unittest
+
+from closed_loop import RouteStopped, Step, run
+
+
+class Script:
+    def __init__(self, observe):
+        self.now = 0.0
+        self.script = observe
+        self.sends = []
+        self.events = []
+        self.finishes = 0
+
+    def observe(self):
+        value = self.script(self)
+        self.events.append(('read', value))
+        return value
+
+    def send(self, macro):
+        self.sends.append((macro, self.now))
+        self.events.append(('send', macro))
+
+    def finish(self):
+        self.finishes += 1
+        self.events.append(('finish',))
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def run(self, steps, **kwargs):
+        return run('fixture', steps, self.observe, self.send, self.finish,
+                   clock=lambda: self.now, sleep=self.sleep, poll=1, **kwargs)
+
+
+def step(name, source, destination, **kwargs):
+    return Step(name, lambda value: value == source, lambda value: value == destination,
+                name, cap=kwargs.pop('cap', 60), **kwargs)
+
+
+class ClosedLoopTests(unittest.TestCase):
+    def test_every_step_runs_once_on_the_plain_path(self):
+        fake = Script(lambda f: ['one', 'two', 'done'][len(f.sends)])
+        result = fake.run([step('first', 'one', 'two'), step('second', 'two', 'done')])
+        self.assertEqual([s[0] for s in fake.sends], ['first', 'second'])
+        self.assertEqual(result['entered_at'], 'first')
+        self.assertEqual([(s['name'], s['sends'], s['skipped']) for s in result['steps']],
+                         [('first', 1, False), ('second', 1, False)])
+        self.assertEqual(fake.finishes, 2)
+        for index, event in enumerate(fake.events):
+            if event[0] == 'send':
+                self.assertEqual(fake.events[index - 1][0], 'read')
+
+    def test_a_lost_input_is_sent_again_and_then_passes(self):
+        fake = Script(lambda f: 'done' if len(f.sends) >= 2 else 'source')
+        result = fake.run([step('press', 'source', 'done', lost_after=4)])
+        self.assertEqual(len(fake.sends), 2)
+        self.assertGreaterEqual(fake.sends[1][1] - fake.sends[0][1], 4)
+        self.assertEqual(result['steps'][0]['sends'], 2)
+        self.assertEqual(fake.finishes, 2)
+        index = fake.events.index(('finish',))
+        self.assertEqual(fake.events[index + 1][0], 'read')
+
+    def test_a_slow_transition_is_waited_out_without_a_second_send(self):
+        fake = Script(lambda f: 'source' if not f.sends else
+                      ('done' if f.now - f.sends[-1][1] >= 40 else 'flight'))
+        result = fake.run([step('press', 'source', 'done', cap=60)])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertGreaterEqual(fake.now, 40)
+        self.assertEqual(result['steps'][0]['sends'], 1)
+
+    def test_a_flicker_back_to_the_source_resets_the_lost_timer(self):
+        def observe(f):
+            if not f.sends:
+                return 'source'
+            elapsed = f.now - f.sends[0][1]
+            return ('source' if elapsed < 2 else 'flight' if elapsed < 4 else
+                    'source' if elapsed < 6 else 'done')
+        fake = Script(observe)
+        fake.run([step('press', 'source', 'done', lost_after=4)])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 1)
+
+    def test_three_lost_inputs_stop_on_the_named_step(self):
+        fake = Script(lambda f: 'source')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', lost_after=4)])
+        error = caught.exception
+        self.assertEqual(error.step, 'press')
+        self.assertIn('no transition after 3 sends', error.reason)
+        self.assertEqual(len(fake.sends), 3)
+        self.assertEqual(fake.finishes, 3)
+        self.assertEqual(error.receipt['steps'][0]['sends'], 3)
+
+    def test_no_readable_state_until_the_cap_stops_without_finish_or_resend(self):
+        fake = Script(lambda f: 'source' if not f.sends else 'error')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done', cap=6)])
+        self.assertEqual(caught.exception.step, 'press')
+        self.assertIn('cap', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+
+    def test_the_route_starts_at_the_step_matching_the_first_read(self):
+        fake = Script(lambda f: 'two' if not f.sends else 'done')
+        result = fake.run([step('first', 'one', 'two'), step('second', 'two', 'done')])
+        self.assertEqual(result['entered_at'], 'second')
+        self.assertEqual([s[0] for s in fake.sends], ['second'])
+        self.assertTrue(result['steps'][0]['skipped'])
+
+    def test_an_already_finished_route_sends_nothing(self):
+        fake = Script(lambda f: 'done')
+        result = fake.run([step('first', 'one', 'two'), step('second', 'two', 'done')])
+        self.assertEqual(result['entered_at'], 'done')
+        self.assertEqual(fake.sends, [])
+        self.assertTrue(all(s['skipped'] for s in result['steps']))
+
+    def test_an_unknown_first_screen_stops_on_locate(self):
+        fake = Script(lambda f: 'unexpected')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('first', 'one', 'done')], locate_cap=3)
+        self.assertEqual(caught.exception.step, 'locate')
+        self.assertIn('unexpected', caught.exception.reason)
+        self.assertEqual(fake.sends, [])
+
+    def test_a_jump_back_to_an_earlier_screen_resumes_there(self):
+        def observe(f):
+            return ['two', 'one', 'two', 'done'][len(f.sends)]
+        fake = Script(observe)
+        result = fake.run([step('first', 'one', 'two'), step('second', 'two', 'done')])
+        self.assertEqual(result['entered_at'], 'second')
+        self.assertEqual([s[0] for s in fake.sends], ['second', 'first', 'second'])
+        self.assertEqual(fake.finishes, 3)
+
+    def test_not_ready_within_ready_cap_stops_with_zero_sends(self):
+        fake = Script(lambda f: 'first' if not f.sends else 'arrived')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('first', 'first', 'arrived', cap=3),
+                      step('second', 'second', 'done', ready_cap=2)])
+        self.assertEqual(caught.exception.step, 'second')
+        self.assertIn('not ready', caught.exception.reason)
+        self.assertEqual(caught.exception.receipt['steps'][-1]['sends'], 0)
+        self.assertEqual(len(fake.sends), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

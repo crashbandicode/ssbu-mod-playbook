@@ -2868,6 +2868,15 @@ class WirelessRoomTests(unittest.TestCase):
             self.wrong_confirm_screen = False
             self.direct_css = False
             self.stuck_stage = False
+            self.lost_stage_sends = 0
+            self.stage_load_seconds = 0
+            self.stage_load_until = None
+            self.stage_script = []
+            self.stage_errors_after_send = False
+            self.stage_tile_unsettled_reads = 0
+            self.css_tile_delay = 0
+            self.css_since = None
+            self.clock = lambda: 0
             self.stuck_tile = False
             self.place_on_chord = False
             self.stuck_placement = False
@@ -2887,8 +2896,18 @@ class WirelessRoomTests(unittest.TestCase):
         def read(self, provider, cap):
             self.revision += 1
             if provider == 'tile.cursor':
+                if self.phase == 'stage':
+                    settled = '0' if self.stage_tile_unsettled_reads else '1'
+                    self.stage_tile_unsettled_reads = max(0, self.stage_tile_unsettled_reads - 1)
+                    values = {'screen': 'sss', 'settled': settled, 'at': '0', 'hovered': '0',
+                              'local.token': 'held'}
+                    block = {'name': provider, 'schema': provider + '/1', 'filtered': False,
+                             'rev': self.revision, 'boot': '0xe54e9b821337ecd1', 'values': values}
+                    self.events.append(('read', provider, dict(values)))
+                    return types.SimpleNamespace(block=block, values=values, connection=1)
                 self.tile_reads += 1
-                if self.tile_read_error:
+                if (self.tile_read_error or
+                        (self.css_since is not None and self.clock() - self.css_since < self.css_tile_delay)):
                     error = 'no fenced bridge reply for state tile.cursor'
                     self.events.append(('read_error', provider, error))
                     raise RuntimeError(error)
@@ -2896,6 +2915,10 @@ class WirelessRoomTests(unittest.TestCase):
                     self.tile.update(self.tile_script.pop(0))
                 values = dict(self.tile)
             else:
+                if self.phase == 'loading' and self.clock() >= self.stage_load_until:
+                    self.phase = 'css'
+                if self.phase == 'css' and self.css_since is None:
+                    self.css_since = self.clock()
                 if self.phase == 'form':
                     self.form_reads += 1
                 if self.phase == 'unpublished' and self.confirm_count == 1:
@@ -2921,6 +2944,16 @@ class WirelessRoomTests(unittest.TestCase):
                     error = 'no fenced bridge reply for state ssbu.ui'
                     self.events.append(('read_error', provider, error))
                     raise RuntimeError(error)
+                scripted_stage = None
+                if self.phase == 'stage' and self.stage_count:
+                    if self.stage_errors_after_send:
+                        scripted_stage = 'error'
+                    elif self.stage_script:
+                        scripted_stage = self.stage_script.pop(0)
+                    if scripted_stage == 'error':
+                        error = 'no fenced bridge reply for state ssbu.ui'
+                        self.events.append(('read_error', provider, error))
+                        raise RuntimeError(error)
                 if self.phase == 'confirm_form':
                     if self.confirm_reads >= self.confirm_form_reads:
                         self.phase = 'css' if self.direct_css else 'stage'
@@ -2930,8 +2963,10 @@ class WirelessRoomTests(unittest.TestCase):
                     'main': self.main_screen, 'rooms': 'ldn.room_list', 'form': self.form_screen,
                     'confirm_form': 'ldn.create',
                     'unpublished': 'unknown', 'wrong': 'ldn.room_list', 'stage': 'stage_select',
-                    'css': 'css.smash', 'waiting': 'ldn.waiting', 'not_waiting': 'css.smash',
+                    'css': 'css.smash', 'waiting': 'ldn.waiting', 'not_waiting': 'css.smash', 'loading': 'unknown',
                 }[self.phase]
+                if scripted_stage is not None:
+                    screen = scripted_stage
                 if self.phase == 'form' and self.form_script:
                     screen = self.form_script.pop(0)
                 role = 'unknown'
@@ -2977,7 +3012,12 @@ class WirelessRoomTests(unittest.TestCase):
                     self.phase = 'css' if self.direct_css else 'stage'
             elif macro in ('tap-a1', 'lobby-a') and self.phase == 'stage':
                 self.stage_count += 1
-                if not self.stuck_stage:
+                if self.lost_stage_sends:
+                    self.lost_stage_sends -= 1
+                elif not self.stuck_stage and self.stage_load_seconds:
+                    self.phase = 'loading'
+                    self.stage_load_until = self.clock() + self.stage_load_seconds
+                elif not self.stuck_stage and not self.stage_errors_after_send:
                     self.phase = 'css'
             elif macro in ('tile-up', 'lobby-first-tile') and self.phase == 'css':
                 if not self.stuck_tile:
@@ -3010,6 +3050,7 @@ class WirelessRoomTests(unittest.TestCase):
         def sleep(seconds):
             self.now += seconds
 
+        self.io.clock = lambda: self.now
         with mock.patch.object(routes, 'BridgePickerIO', return_value=self.io), \
                 mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
                 mock.patch.object(routes.time, 'sleep', side_effect=sleep):
@@ -3380,6 +3421,115 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertNotIn('lobby-first-tile', self.io.actions)
         self.assertEqual(self.io.actions, ['lobby-open-room-list', 'tap-a1', 'tap-plus1',
                                            'lobby-a', 'lobby-a', 'lobby-ready'])
+
+    def test_a_lost_stage_a_is_sent_again(self):
+        self.io.lost_stage_sends = 1
+        result = self.run_room()
+        self.assertEqual(self.io.stage_count, 2)
+        self.assertEqual(result['stage_presses'], 2)
+        self.assertEqual(next(s for s in result['steps'] if s['name'] == 'stage-a')['sends'], 2)
+
+    def test_a_slow_stage_load_gets_one_press(self):
+        self.io.stage_load_seconds = 40
+        result = self.run_room()
+        self.assertGreaterEqual(self.now, 40)
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertEqual(result['stage_presses'], 1)
+        self.assertEqual(result['waiting']['ldn.role'], 'host')
+
+    def test_the_flown_stall_sequence_recovers(self):
+        self.io.lost_stage_sends = 1
+        self.io.stage_script = ['stage_select', 'unknown', 'error']
+        result = self.run_room()
+        self.assertEqual(self.io.stage_count, 2)
+        self.assertEqual(result['stage_presses'], 2)
+        self.assertIn('unknown', result['screens'])
+        self.assertTrue(any(e[:2] == ('read_error', 'ssbu.ui') for e in self.io.events))
+
+    def test_no_reply_until_the_stage_cap_never_presses_again(self):
+        self.io.stage_errors_after_send = True
+        with self.assertRaisesRegex(RuntimeError, "stage-a.*cap"):
+            self.run_room()
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertEqual(self.io.actions.count('lobby-a'), 1)
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual((stop['step'], stop['sends']), ('stage-a', 1))
+        self.assertIn('screens', stop)
+        self.assertIn('error', stop['last_ui'])
+        self.assertIn('last_tile', stop)
+
+    def test_three_lost_stage_presses_stop_on_stage_a(self):
+        self.io.stuck_stage = True
+        with self.assertRaisesRegex(RuntimeError, 'stage-a.*3 sends'):
+            self.run_room()
+        self.assertEqual(self.io.stage_count, 3)
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual((stop['step'], stop['sends']), ('stage-a', 3))
+
+    def test_stage_a_waits_for_the_settled_stage_tile(self):
+        self.io.stage_tile_unsettled_reads = 5
+        self.run_room()
+        press = self.io.events.index(('send', 'lobby-a'))
+        stage_tiles = [e[2] for e in self.io.events[:press] if e[:2] == ('read', 'tile.cursor')]
+        self.assertGreaterEqual(sum(tile['settled'] == '0' for tile in stage_tiles), 5)
+        self.assertEqual(stage_tiles[-1]['settled'], '1')
+        self.assertEqual(stage_tiles[-1]['at'], stage_tiles[-1]['hovered'])
+
+    def test_stage_a_never_settled_stops_with_no_press(self):
+        self.io.stage_tile_unsettled_reads = 1000
+        with self.assertRaisesRegex(RuntimeError, 'stage-a.*not ready'):
+            self.run_room()
+        self.assertEqual(self.io.stage_count, 0)
+        self.assertNotIn('lobby-a', self.io.actions)
+
+    def test_a_late_css_tile_cursor_is_waited_for(self):
+        self.io.css_tile_delay = 20
+        result = self.run_room()
+        self.assertGreaterEqual(self.now - self.io.css_since, 20)
+        self.assertEqual(result['placed_by'], 'chord + A')
+        chord = self.io.events.index(('send', 'lobby-first-tile'))
+        self.assertTrue(any(e[:2] == ('read_error', 'tile.cursor') for e in self.io.events[:chord]))
+        last_tile = [e for e in self.io.events[:chord] if e[:2] == ('read', 'tile.cursor')][-1]
+        self.assertEqual((last_tile[2]['screen'], last_tile[2]['p1.token']), ('css', 'held'))
+
+    def test_entry_from_the_room_list(self):
+        self.io.phase = 'rooms'
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'open-create')
+        self.assertEqual(self.io.actions, ['tap-a1', 'tap-plus1', 'lobby-a',
+                                           'lobby-first-tile', 'lobby-a', 'lobby-ready'])
+
+    def test_entry_from_stage_select(self):
+        self.io.phase = 'stage'
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'stage-a')
+        self.assertEqual(self.io.actions, ['lobby-a', 'lobby-first-tile', 'lobby-a', 'lobby-ready'])
+
+    def test_entry_from_css_with_the_token_held(self):
+        self.io.phase = 'css'
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'css-hand')
+        self.assertEqual(self.io.actions, ['lobby-first-tile', 'lobby-a', 'lobby-ready'])
+
+    def test_entry_from_css_with_the_token_placed(self):
+        self.io.phase = 'css'
+        self.io.tile['p1.token'] = 'placed'
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'ready')
+        self.assertEqual(self.io.actions, ['lobby-ready'])
+        self.assertEqual(result['placed_by'], 'already placed')
+
+    def test_entry_from_the_waiting_room_sends_nothing(self):
+        self.io.phase = 'waiting'
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'done')
+        self.assertEqual(self.io.actions, [])
+
+    def test_entry_from_an_unknown_screen_stops_on_locate(self):
+        self.io.main_screen = 'unknown'
+        with self.assertRaisesRegex(RuntimeError, 'wireless_room:.*locate.*unknown'):
+            self.run_room()
+        self.assertEqual(self.io.actions, [])
 
 
 class SwitchBootTests(unittest.TestCase):
