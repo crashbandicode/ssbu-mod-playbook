@@ -411,6 +411,40 @@ def retrying_menu(ctx, advance):
 
 
 class SetupCallsR2Tests(unittest.TestCase):
+    def test_a_macro_playing_before_a_training_input_is_waited_for_and_reported(self):
+        now, sent = [0.0], []
+        runner = SimpleNamespace(setup_metrics={'stalls': []}, wait_macro=lambda on, cap: None)
+        with tempfile.TemporaryDirectory() as folder:
+            def call(method, params=None):
+                if method == 'macro.status':
+                    return {'state': 'playing' if now[0] < 1.2 else 'idle'}
+                if method == 'macro.play':
+                    sent.append((now[0], params))
+                    return {}
+                raise AssertionError(method)
+
+            ctx = SimpleNamespace(runner=runner, on='s', instance={}, row_dir=folder,
+                                  call=call, log=lambda event: None)
+            menu = MenuReplay()
+            menu.ctx = ctx
+            before = menu.read('tr.menu', 2)
+            original = menu.send
+
+            def send(macro):
+                routes.play(ctx, macro)
+                original(macro)
+
+            menu.send = send
+            with patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)), \
+                    patch.object(routes.time, 'monotonic', side_effect=lambda: now[0]), \
+                    patch.object(routes.time, 'sleep', side_effect=lambda delay: now.__setitem__(0, now[0] + delay)):
+                result = routes._tr_input(menu, before, 'tap-a1', 10)
+            self.assertEqual(result.values['ack'], '1')
+            self.assertEqual(len(sent), 1)
+            self.assertGreaterEqual(sent[0][0], 1.2)
+            self.assertEqual(len(runner.setup_metrics['stalls']), 1)
+            self.assertEqual(runner.setup_metrics['stalls'][0]['step'], 'tap-a1')
+
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)

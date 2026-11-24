@@ -152,6 +152,19 @@ class RecordedRoomsTests(unittest.TestCase):
                 self.assertLess(facts['tiles'][-1], facts['working_a'])
                 self.assertLess(facts['working_a'], facts['css'])
 
+    def test_the_recorded_early_stage_select_window_gets_no_press(self):
+        for name, facts in RUNS.items():
+            with self.subTest(run=name):
+                replay, error, receipt = self.stopped(name, facts['stage_first'], facts['stage_wait_last'], [])
+                self.assertEqual(error.step, 'stage-a')
+                self.assertEqual(error.receipt['entered_at'], 'stage-a')
+                self.assertEqual(receipt['entered_at'], 'stage-a')
+                self.assertEqual(replay.sends, [])
+                self.assertEqual(receipt['step'], 'stage-a')
+                self.assertEqual(next(step for step in receipt['steps'] if step['name'] == 'stage-a')['sends'], 0)
+                self.assertEqual(receipt['press_gate'], 'tile.cursor (no input.ready published)')
+                self.assertEqual(receipt['stalls'], [])
+
     def test_the_recorded_qualifying_tile_read_gets_one_a_and_reaches_css(self):
         for name, facts in RUNS.items():
             with self.subTest(run=name):

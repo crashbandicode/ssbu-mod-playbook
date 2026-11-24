@@ -77,11 +77,24 @@ class BoundedControlTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.6)
 
 
+class MacroCall:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def __call__(self, method, *args):
+        if method == 'macro.status':
+            return {'state': 'idle', 'error': ''}
+        return self.wrapped(method, *args)
+
+    def assert_called_once_with(self, *args):
+        self.wrapped.assert_called_once_with(*args)
+
+
 class MacroDispatchTests(unittest.TestCase):
     def test_play_marks_a_refused_macro_play_as_rejected(self):
         for message in ('input_busy', 'macro.play busy'):
             with self.subTest(message=message):
-                ctx = types.SimpleNamespace(call=mock.Mock(side_effect=RuntimeError(message)),
+                ctx = types.SimpleNamespace(call=MacroCall(mock.Mock(side_effect=RuntimeError(message))),
                                             runner=types.SimpleNamespace(wait_macro=mock.Mock()), on='host',
                                             log=mock.Mock())
                 with mock.patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)):
@@ -91,7 +104,7 @@ class MacroDispatchTests(unittest.TestCase):
                 ctx.runner.wait_macro.assert_not_called()
 
     def test_play_marks_a_failure_after_acceptance_as_delivery_unknown(self):
-        ctx = types.SimpleNamespace(call=mock.Mock(return_value={}),
+        ctx = types.SimpleNamespace(call=MacroCall(mock.Mock(return_value={})),
                                     runner=types.SimpleNamespace(
                                         wait_macro=mock.Mock(side_effect=RuntimeError('input.reset input_busy'))),
                                     on='host', log=mock.Mock())
@@ -104,13 +117,96 @@ class MacroDispatchTests(unittest.TestCase):
 
     def test_an_unrelated_macro_play_error_is_not_a_dispatch_rejection(self):
         error = RuntimeError('macro.play timed out')
-        ctx = types.SimpleNamespace(call=mock.Mock(side_effect=error),
+        ctx = types.SimpleNamespace(call=MacroCall(mock.Mock(side_effect=error)),
                                     runner=types.SimpleNamespace(wait_macro=mock.Mock()), on='host', log=mock.Mock())
         with mock.patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)):
             with self.assertRaises(RuntimeError) as caught:
                 routes.play(ctx, 'lobby-a')
         self.assertIs(caught.exception, error)
         ctx.runner.wait_macro.assert_not_called()
+
+
+class PlayIdleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.row = Path(self.temp.name)
+        self.now, self.status_calls, self.sent, self.logs = 0.0, [], [], []
+        self.status = lambda: {'state': 'idle', 'error': ''}
+        self.runner = types.SimpleNamespace(wait_macro=mock.Mock(), setup_metrics={})
+        self.ctx = types.SimpleNamespace(runner=self.runner, on='a', row_dir=self.row, instance={},
+                                         call=self.call, log=self.logs.append)
+
+    def call(self, method, params=None):
+        if method == 'macro.status':
+            self.status_calls.append(self.now)
+            return self.status()
+        if method == 'macro.play':
+            self.sent.append((self.now, params))
+            return {}
+        raise AssertionError(method)
+
+    def play(self):
+        def sleep(seconds):
+            self.now += seconds
+
+        with mock.patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)), \
+                mock.patch.object(routes.time, 'monotonic', side_effect=lambda: self.now), \
+                mock.patch.object(routes.time, 'sleep', side_effect=sleep):
+            return routes.play(self.ctx, 'training-input')
+
+    def test_play_waits_while_a_macro_is_playing_then_sends_once(self):
+        self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
+        self.assertEqual(self.play(), 'sha')
+        self.assertEqual(len(self.sent), 1)
+        self.assertGreaterEqual(self.sent[0][0], .4)
+        self.assertGreater(len(self.status_calls), 1)
+        self.runner.wait_macro.assert_called_once_with('a', 3)
+
+    def test_play_gives_up_after_the_idle_budget_and_sends_nothing(self):
+        self.status = lambda: {'state': 'playing'}
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected,
+                                    'macro training-input not sent: input channel busy for .* waits: macro playing'):
+            self.play()
+        self.assertEqual(self.sent, [])
+        self.assertGreaterEqual(self.now, 15)
+        self.runner.wait_macro.assert_not_called()
+
+    def test_play_records_one_stall_event_for_a_wait_over_a_second(self):
+        self.status = lambda: {'state': 'recording'} if self.now < 1.2 else {'state': 'finished'}
+        self.play()
+        self.assertEqual(len(self.sent), 1)
+        stalls = self.runner.setup_metrics['stalls']
+        self.assertEqual(len(stalls), 1)
+        event = stalls[0]
+        self.assertEqual((event['kind'], event['block'], event['step'], event['why']),
+                         ('idle-wait', 'play', 'training-input', 'macro recording'))
+        self.assertGreater(event['seconds'], 1)
+        self.assertGreater(event['waits'], 1)
+        self.assertIn('utc', event)
+        self.assertIn('last_bridge_line', event)
+        self.assertEqual([json.loads(line) for line in (self.row / 'stall-events.jsonl').read_text().splitlines()],
+                         [event])
+
+    def test_play_on_an_idle_channel_sends_at_once_with_no_event(self):
+        self.play()
+        self.assertEqual([when for when, _ in self.sent], [0])
+        self.assertEqual(len(self.status_calls), 1)
+        self.assertFalse(self.runner.setup_metrics.get('stalls'))
+        self.assertFalse((self.row / 'stall-events.jsonl').exists())
+
+    def test_play_does_not_wait_when_the_engine_owns_the_idle_check(self):
+        self.runner.closed_loop_owns_idle = True
+        self.status = lambda: {'state': 'playing'}
+        self.play()
+        self.assertEqual(self.status_calls, [])
+        self.assertEqual([when for when, _ in self.sent], [0])
+
+    def test_play_sends_after_an_earlier_macro_error(self):
+        self.status = lambda: {'state': 'error', 'error': 'decoder fault'}
+        self.play()
+        self.assertEqual([when for when, _ in self.sent], [0])
+        self.assertEqual(sum(event.get('last_macro_error') == 'decoder fault' for event in self.logs), 1)
 
 
 class LogCursorTests(unittest.TestCase):
@@ -559,6 +655,8 @@ class FakeRunner:
         self.played = []
 
     def call(self, on, method, params=None, job_cap=15):
+        if method == 'macro.status':
+            return {'state': 'idle', 'error': ''}
         if method == 'macro.play':
             name = Path(params['path']).name.split('.')[0]
             self.played.append(name)
@@ -3579,7 +3677,8 @@ class WirelessRoomTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.row = Path(self.temp.name)
-        self.ctx = types.SimpleNamespace(row_dir=self.row, check_stop=lambda: None, call=self.call)
+        self.ctx = types.SimpleNamespace(row_dir=self.row, check_stop=lambda: None, call=self.call,
+                                         runner=types.SimpleNamespace())
         self.io = self.IO()
         self.now = 0.0
         self.status_script = None
@@ -3604,6 +3703,55 @@ class WirelessRoomTests(unittest.TestCase):
                 mock.patch.object(routes.time, 'sleep', side_effect=sleep):
             options = {} if unpublished_create is None else {'unpublished_create': unpublished_create}
             return routes.wireless_room(self.ctx, ready_cap=3, **options)
+
+    def test_entry_on_stage_select_before_the_tile_publishes_waits_in_stage_a(self):
+        self.io.phase = 'stage'
+        self.io.stage_tile_delay = 5
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'stage-a')
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertGreaterEqual(self.io.stage_send_times[0], 5)
+
+    def test_entry_on_css_before_the_tile_publishes_waits_in_css_hand(self):
+        self.io.phase = 'css'
+        self.io.css_tile_delay = 5
+        result = self.run_room()
+        self.assertEqual(result['entered_at'], 'css-hand')
+        self.assertEqual(self.io.actions[0], 'lobby-first-tile')
+
+    def test_a_stop_receipt_names_where_the_route_entered(self):
+        self.io.phase = 'stage'
+        self.io.stage_tile_unsettled_reads = 1000
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room()
+        self.assertEqual(caught.exception.step, 'stage-a')
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['entered_at'], 'stage-a')
+        self.assertEqual(stop['sends'], 0)
+
+    def test_wireless_room_restores_the_idle_owner_flag(self):
+        for stuck in (False, True):
+            with self.subTest(stuck=stuck):
+                self.io = self.IO()
+                self.io.phase = 'stage'
+                self.io.stuck_stage = stuck
+                self.now = 0
+                self.ctx.runner.closed_loop_owns_idle = False
+                original, observed = self.io.send, []
+
+                def send(macro):
+                    observed.append(self.ctx.runner.closed_loop_owns_idle)
+                    return original(macro)
+
+                self.io.send = send
+                if stuck:
+                    with self.assertRaises(routes.closed_loop.RouteStopped):
+                        self.run_room()
+                else:
+                    self.run_room()
+                self.assertTrue(observed)
+                self.assertTrue(all(value is True for value in observed))
+                self.assertFalse(self.ctx.runner.closed_loop_owns_idle)
 
     def blocked_control(self, blocked_method):
         release, entered, finished = threading.Event(), threading.Event(), threading.Event()
@@ -4237,16 +4385,23 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertIn('macro.status not understood:', stop['input_channel'])
         self.assertIn('late failure', stop['input_channel'])
 
-    def test_a_macro_error_state_is_not_an_idle_channel(self):
+    def test_an_error_state_releases_input_and_is_recorded(self):
         self.io.phase = 'stage'
-        self.status_script = lambda: {'state': 'error', 'error': ''}
-        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+        self.status_script = lambda: {'state': 'error', 'error': 'decoder fault'}
+        result = self.run_room(unpublished_create='allow')
+        self.assertEqual(self.io.stage_count, 1)
+        self.assertEqual(result['last_macro_error'], 'decoder fault')
+        self.assertEqual(json.loads((self.row / 'routes-wireless-room.json').read_text())['last_macro_error'],
+                         'decoder fault')
+
+    def test_an_error_state_is_recorded_in_a_stop_receipt(self):
+        self.io.phase = 'stage'
+        self.io.stuck_stage = True
+        self.status_script = lambda: {'state': 'error', 'error': 'decoder fault'}
+        with self.assertRaises(routes.closed_loop.RouteStopped):
             self.run_room(unpublished_create='allow')
-        self.assertEqual(caught.exception.step, 'stage-a')
-        self.assertEqual(self.io.actions, [])
-        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
-        self.assertIn('macro.status not understood:', stop['input_channel'])
-        self.assertIn("'error'", stop['input_channel'])
+        self.assertEqual(json.loads((self.row / 'routes-wireless-room-stop.json').read_text())['last_macro_error'],
+                         'decoder fault')
 
     def test_countdown_and_branch_playing_are_busy(self):
         for state in ('countdown', 'branch_playing'):

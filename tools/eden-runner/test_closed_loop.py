@@ -40,6 +40,62 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_locate_enters_a_recognised_screen_that_is_not_ready_and_waits_in_that_step(self):
+        fake = Script(lambda f: {'screen': 'stage', 'ready': False, 'done': False})
+        item = Step('stage', lambda obs: obs['ready'], lambda obs: obs['done'], 'a',
+                    cap=3, ready_cap=3, screen=lambda obs: obs['screen'] == 'stage')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertEqual(caught.exception.step, 'stage')
+        self.assertEqual(caught.exception.receipt['entered_at'], 'stage')
+        self.assertIn('not ready', caught.exception.reason)
+        self.assertEqual(fake.sends, [])
+
+    def test_a_recognised_screen_that_becomes_ready_sends_once(self):
+        fake = Script(lambda f: {'screen': 'stage', 'ready': f.now >= 2, 'done': bool(f.sends)})
+        item = Step('stage', lambda obs: obs['ready'], lambda obs: obs['done'], 'a',
+                    cap=3, ready_cap=5, screen=lambda obs: obs['screen'] == 'stage')
+        receipt = fake.run([item])
+        self.assertEqual(receipt['entered_at'], 'stage')
+        self.assertEqual(fake.sends, [('a', 2)])
+        self.assertEqual(fake.finishes, 1)
+
+    def test_screen_is_never_used_after_a_send(self):
+        fake = Script(lambda f: {'screen': 'other' if f.sends else 'stage', 'ready': not f.sends})
+        first = Step('stage', lambda obs: obs['screen'] == 'stage' and obs['ready'], lambda obs: False,
+                     'a', cap=3, lost_after=10, screen=lambda obs: obs['screen'] == 'stage')
+        second = Step('other', lambda obs: False, lambda obs: False, 'b',
+                      cap=3, screen=lambda obs: obs['screen'] == 'other')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([first, second])
+        self.assertEqual(caught.exception.step, 'stage')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_screen_is_never_used_for_a_jump_during_a_ready_wait(self):
+        fake = Script(lambda f: {'screen': 'stage' if f.now == 0 else 'other'})
+        first = Step('stage', lambda obs: False, lambda obs: False, 'a',
+                     cap=3, ready_cap=3, screen=lambda obs: obs['screen'] == 'stage')
+        second = Step('other', lambda obs: False, lambda obs: False, 'b',
+                      cap=3, ready_cap=3, screen=lambda obs: obs['screen'] == 'other')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([first, second])
+        self.assertEqual(caught.exception.step, 'stage')
+        self.assertIn('not ready', caught.exception.reason)
+        self.assertEqual(fake.sends, [])
+
+    def test_locate_selects_the_last_matching_screen(self):
+        fake = Script(lambda f: 'shared')
+        first = Step('first', lambda obs: False, lambda obs: False, 'a',
+                     cap=3, ready_cap=1, screen=lambda obs: obs == 'shared')
+        second = Step('second', lambda obs: False, lambda obs: False, 'b',
+                      cap=3, ready_cap=1, screen=lambda obs: obs == 'shared')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([first, second])
+        self.assertEqual((caught.exception.step, caught.exception.receipt['entered_at']), ('second', 'second'))
+        self.assertEqual(fake.sends, [])
+
     def test_an_invalid_revalidation_cap_is_rejected_before_any_read(self):
         for value in (-1, float('nan'), float('inf'), None, '4'):
             with self.subTest(value=value):
