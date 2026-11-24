@@ -28,6 +28,17 @@ class StillFreshTests(unittest.TestCase):
         path.write_bytes(data)
         return self.ledger.record(on, path, reply, frame)
 
+    def test_deferred_commit_does_not_publish_the_ledger_or_journal(self):
+        path = self.root / 'deferred.png'
+        path.write_bytes(b'deferred')
+        captured = []
+        record = self.ledger.record('a', path, None, self.frame(42),
+                                    commit=lambda result, run: captured.append((result, run)))
+        self.assertEqual(captured[0][0], record)
+        self.assertEqual(captured[0][1]['sha256'], hashlib.sha256(b'deferred').hexdigest())
+        self.assertEqual(self.ledger.runs, {})
+        self.assertFalse((self.root / 'stills.jsonl').exists())
+
     def test_frame_source_reads_the_last_frame_line_and_boot(self):
         path = self.root / 'bridge.log'
         path.write_text('[Bridge] boot=0xabc\n[Bridge] state.8 screen=one frame=618 wall=1513497634\n'

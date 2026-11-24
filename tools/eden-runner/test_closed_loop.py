@@ -75,6 +75,46 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(fake.finishes, 1)
         self.assertTrue(result['steps'][-1]['skipped'])
 
+    def test_a_latched_step_does_not_confirm_an_unanswered_or_late_read(self):
+        for late in (False, True):
+            with self.subTest(late=late):
+                def observe(fake):
+                    if not fake.sends:
+                        return 'source'
+                    if late:
+                        fake.now += 2
+                        return 'done'
+                    return closed_loop.NO_READ
+
+                fake = Script(observe)
+                item = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                            'a', cap=1, latch=True)
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([item])
+                self.assertEqual(caught.exception.step, 'latched')
+                self.assertIn('no transition within cap', caught.exception.reason)
+                self.assertEqual(len(fake.sends), 1)
+                self.assertEqual(fake.finishes, 0)
+
+    def test_a_latched_step_counts_dispatch_time_in_its_bound(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        send = fake.send
+
+        def slow_send(name):
+            send(name)
+            fake.now += 3
+
+        fake.send = slow_send
+        item = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                    'a', cap=2, latch=True)
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([item])
+        self.assertEqual(caught.exception.step, 'latched')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(fake.finishes, 0)
+        self.assertEqual([event for event in fake.events if event[0] == 'read'], [('read', 'source')])
+
     def test_a_step_repeated_after_the_route_went_back_is_a_stall(self):
         fake = Script(lambda f: ('a', 'b', 'a', 'done')[min(len(f.sends), 3)])
         result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')])

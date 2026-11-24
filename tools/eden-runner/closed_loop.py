@@ -28,7 +28,7 @@ class Step:
     """A before_send hook may return a rollback for a known busy rejection."""
 
     def __init__(self, name, at, done, macro, *, cap, ready_cap=20.0, lost_after=4.0, sends=3,
-                 before_send=None, target=None, source=None, screen=None):
+                 before_send=None, target=None, source=None, screen=None, latch=False):
         self.name = name
         self.at = at
         self.done = done
@@ -41,10 +41,12 @@ class Step:
         self.target = target
         self.source = source
         self.screen = screen
+        self.latch = latch
 
 
 def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time.sleep, poll=0.3,
-        locate_cap=20.0, on_step=None, on_stall=None, idle=None, idle_cap=15.0, revalidate_cap=0.0):
+        locate_cap=20.0, on_step=None, on_stall=None, idle=None, idle_cap=15.0, revalidate_cap=0.0,
+        locate_done=None):
     if not isinstance(revalidate_cap, (int, float)) or not math.isfinite(revalidate_cap) or revalidate_cap < 0:
         raise ValueError(f'revalidate_cap must be finite and non-negative, got {revalidate_cap!r}')
     records = [{'name': step.name, 'sends': 0, 'skipped': True, 'ms': 0, 'unanswered': 0} for step in steps]
@@ -279,7 +281,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
             else:
                 obs = wait(deadline)
                 continue
-        if done(steps[-1], obs):
+        if done(steps[-1], obs) or (locate_done is not None and locate_done(obs)):
             records[-1]['unanswered'] += locate_unanswered
             return receipt()
         if grace:
@@ -453,12 +455,21 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 visit_sends += 1
                 flush_idle_budget(dispatch_started)
                 retry = None
-                deadline = clock() + step.cap
+                deadline = (dispatch_started if step.latch else clock()) + step.cap
+                if step.latch and clock() >= deadline:
+                    record['ms'] += round((clock() - started) * 1000)
+                    stop(step.name, f'no transition within cap; last read {obs!r}')
                 lost_since = changed_since = None
                 pause_at = None
                 grace_used = False
                 while True:
                     obs = wait(deadline, index)
+                    if step.latch and clock() > deadline:
+                        record['ms'] += round((clock() - started) * 1000)
+                        stop(step.name, f'no transition within cap; last read {obs!r}')
+                    if step.latch and obs is NO_READ and clock() >= deadline:
+                        record['ms'] += round((clock() - started) * 1000)
+                        stop(step.name, unreadable_reason(record['unanswered']))
                     grace = False
                     if obs is NO_READ:
                         if pause_at is None:
@@ -491,6 +502,11 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         finish()
                         record['ms'] += round((clock() - started) * 1000)
                         return receipt()
+                    if step.latch:
+                        if clock() >= deadline:
+                            record['ms'] += round((clock() - started) * 1000)
+                            stop(step.name, f'no transition within cap; last read {obs!r}')
+                        continue
                     other = matching(obs, index)
                     at_source = source(step, obs)
                     current_target = target(step, obs) if at_source else None

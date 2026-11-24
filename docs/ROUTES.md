@@ -100,10 +100,13 @@ Dashboard Down and A also require what an open, input-taking dashboard publishes
 `dialog=dashboard` (`DASHBOARD_OWNERS`, `DASHBOARD_DIALOG`). The Main Menu's own `native` / `none` on an open
 dashboard is a contradiction and gets no press.
 Dashboard A is sent at most once per run, even if the route leaves and later returns to that step.
+After dashboard A, the route only observes until a ready room list appears or the step stops by name.
+The A macro includes its own release; no separate `input.reset` is sent while awaiting that list.
 A repeated step after a jump back is recorded as a stall; a retry within one visit is not counted twice.
 The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,
 with one 15-second budget or the caller's earlier deadline, including requalification.
 An unanswered requalification is abandoned in the background at the bound and its answer is discarded.
+Gate frame capture belongs to its gate invocation, not an abandoned or superseded recheck.
 After a wait, bridge IO re-reads the caller's observations and sends only if they are unchanged and its original
 deadline has not passed. A caller without a witness sends nothing after a wait unless it declares `BLIND`.
 After a wait, recovery requires both the failed gate to remain failed and the recovery segment's own start gate

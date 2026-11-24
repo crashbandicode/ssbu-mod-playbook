@@ -74,7 +74,7 @@ class Ledger:
         self.frames = frames
         self.runs = {}
 
-    def record(self, on, path, reply, frame_source):
+    def record(self, on, path, reply, frame_source, *, commit=None):
         path = Path(path)
         data = path.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
@@ -111,11 +111,18 @@ class Ledger:
                   'utc': datetime.now(timezone.utc).isoformat(), 'boot': boot, 'frame': frame, 'wall': wall,
                   'backend': reply.get('backend'), 'uniform': reply.get('uniform'), 'warning': reply.get('warning'),
                   'status': status, 'reason': reason, 'unchanged_frames': unchanged, 'first_identical': first_file}
+        run = {'sha256': digest, 'boot': boot, 'frame': frame,
+               'first_file': first_file, 'first_frame': first_frame}
+        if commit is None:
+            self.append(record)
+            self.runs[on] = run
+        else:
+            commit(record, run)
+        return record
+
+    def append(self, record):
         with (self.out_dir / 'stills.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(record) + '\n')
-        self.runs[on] = {'sha256': digest, 'boot': boot, 'frame': frame,
-                         'first_file': first_file, 'first_frame': first_frame}
-        return record
 
 
 def refused(record):

@@ -1244,7 +1244,7 @@ class RunnerTests(unittest.TestCase):
                 run.plan['gates']['status'] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
                 run.plan['segments']['to-red']['start_gate'] = 'status'
                 entered, release = threading.Event(), threading.Event()
-                workers, armed, status_count, poll_count = [], [], [], []
+                workers, armed, status_count, poll_count, screenshots = [], [], [], [], []
                 original = eden.request
 
                 def request(method, params):
@@ -1259,12 +1259,17 @@ class RunnerTests(unittest.TestCase):
                         poll_count.append(1)
                         return {'ok': True, 'result': {'state': 'playing' if len(poll_count) == 1 else 'idle'}}
                     if method == 'ui.screenshot':
+                        screenshots.append(params['path'])
+                        eden.colour = BLUE if len(screenshots) == 1 else RED
                         armed.append(run._arm_frames)
-                        if overlap and workers:
+                        if overlap and workers and not release.is_set():
+                            prior = (copy.deepcopy(run.last_gate_outcome), run.screen_reached,
+                                     list(run.gate_saw_evidence))
                             release.set()
                             workers[0].join(1)
                             self.assertFalse(workers[0].is_alive())
                             armed.append(run._arm_frames)
+                            self.assertEqual((run.last_gate_outcome, run.screen_reached, run.gate_saw_evidence), prior)
                     return original(method, params)
 
                 eden.request = request
@@ -1277,9 +1282,10 @@ class RunnerTests(unittest.TestCase):
                         self.assertNotIn('macro.play', eden.calls)
                     with mock.patch.object(runner.still_fresh, 'usable', return_value=True):
                         run.check_gate('a', 'red')
-                    self.assertTrue(all(armed))
-                    self.assertIsNotNone(run._gate_baseline)
-                    self.assertIsNotNone(run._gate_latest)
+                    self.assertEqual(armed, [True, True, True] if overlap else [True, True])
+                    self.assertEqual(len(screenshots), 2)
+                    self.assertEqual(Image.open(io.BytesIO(run._gate_baseline)).getpixel((0, 0)), BLUE)
+                    self.assertEqual(Image.open(io.BytesIO(run._gate_latest)).getpixel((0, 0)), RED)
                     self.assertEqual(run.last_gate_outcome['gate'], 'red')
                     self.assertTrue(run.last_gate_outcome['passed'])
                 finally:
@@ -1287,6 +1293,414 @@ class RunnerTests(unittest.TestCase):
                     for worker in workers:
                         worker.join(1)
                         self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_screenshot_cannot_publish_into_its_successor_gate(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        entered, release = threading.Event(), threading.Event()
+        original = eden.request
+        errors, armed, screenshots = [], [], []
+
+        def request(method, params):
+            if method == 'ui.screenshot':
+                screenshots.append(params['path'])
+                if threading.current_thread() is worker:
+                    entered.set()
+                    release.wait(2)
+                else:
+                    self.assertTrue(run._arm_frames)
+                    release.set()
+                    worker.join(1)
+                    self.assertFalse(worker.is_alive())
+                    armed.append(run._arm_frames)
+            return original(method, params)
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'red')
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = request
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'red')
+            self.assertEqual(armed, [True])
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertNotIn(screenshots[0], run.still_records)
+            self.assertTrue(run._gate_baseline)
+            self.assertTrue(run._gate_latest)
+            self.assertEqual(run.last_gate_outcome['gate'], 'red')
+            self.assertEqual(len(run.gate_saw_evidence), 1)
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_state_gate_cannot_consume_the_new_gate_state(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['native'] = {'kind': 'state', 'provider': 'ssbu.ui', 'cap': 2}
+        run.plan['gates']['status'] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
+        run.current_row = {'id': 'r1'}
+        key = ('r1', 'a', 'ssbu.ui')
+        run.state_marks = {key: {'boot': 'boot', 'rev': 1}}
+        run.state_pending = {('r1', 'a'): 'press'}
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+
+        def state_block(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            return {'boot': 'boot', 'rev': 2, 'values': {'focus': 'row'}}, 'confirmed'
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'native')
+            except Exception as error:
+                errors.append(error)
+
+        original = eden.request
+
+        def request(method, params):
+            if method == 'status':
+                return {'ok': True, 'result': {'running': True}}
+            return original(method, params)
+
+        eden.request = request
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(run, '_state_block', side_effect=state_block):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'status')
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertIn(key, run.state_marks)
+            self.assertEqual(run.state_pending[('r1', 'a')], 'press')
+            self.assertEqual(run.last_gate_outcome['gate'], 'status')
+            self.assertEqual(len(run.gate_saw_evidence), 1)
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_frame_read_cannot_change_the_successor_frame_source(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        source = runner.still_fresh.FrameSource(None)
+        source.frame = 5
+        run._frame_sources['a'] = source
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+
+        def read(frame_source):
+            if threading.current_thread() is worker:
+                frame_source.frame = 999
+                entered.set()
+                release.wait(2)
+            else:
+                self.assertEqual(source.frame, 5)
+                frame_source.frame = 100
+                release.set()
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+            return None
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'red')
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner.still_fresh.FrameSource, 'read', autospec=True, side_effect=read), \
+                    mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'red')
+            self.assertEqual(run._frame_sources['a'].frame, 100)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertEqual(len(run.still_records), 1)
+            self.assertEqual(len((run.out / 'stills.jsonl').read_text().splitlines()), 1)
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_freshness_record_cannot_update_the_ledger(self):
+        eden = FakeEden({})
+        eden.colour = RED
+        run = self.make(eden)
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        sha256 = runner.still_fresh.hashlib.sha256
+
+        def digest(data=b''):
+            if threading.current_thread() is worker:
+                entered.set()
+                release.wait(2)
+            elif entered.is_set() and not release.is_set():
+                release.set()
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+            return sha256(data)
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'red')
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner.still_fresh.hashlib, 'sha256', side_effect=digest), \
+                    mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'red')
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertEqual(len(run.still_records), 1)
+            self.assertEqual(len((run.out / 'stills.jsonl').read_text().splitlines()), 1)
+            latest = next(iter(run.still_records.values()))
+            self.assertEqual(run.stills.runs['a']['sha256'], latest['sha256'])
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_hook_cannot_change_gate_evidence(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['hook'] = {'kind': 'hook', 'cap': 2}
+        run.plan['gates']['status'] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        original = eden.request
+
+        def request(method, params):
+            if method == 'status':
+                return {'ok': True, 'result': {'running': True}}
+            return original(method, params)
+
+        def hook(path, gate):
+            entered.set()
+            release.wait(2)
+            return True
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'hook')
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = request
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner, 'load_hook', return_value=hook), \
+                    mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'status')
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertTrue(run._gate_evidence)
+            self.assertEqual(run.gate_saw_evidence, [True])
+            self.assertEqual(run.last_gate_outcome['gate'], 'status')
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_acquisition_cannot_publish_gate_or_receipt_state(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['acquire'] = {'kind': 'image', 'reference': 'refs/acquired.png',
+                                       'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01, 'acquire': True}
+        run.plan['gates']['status'] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
+        run.acquired = []
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        original = eden.request
+        digest = runner.digest
+
+        def request(method, params):
+            if method == 'status':
+                return {'ok': True, 'result': {'running': True}}
+            return original(method, params)
+
+        def delayed_digest(path):
+            if threading.current_thread() is worker:
+                entered.set()
+                release.wait(2)
+            return digest(path)
+
+        def old_gate():
+            try:
+                run.check_gate('a', 'acquire')
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = request
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner, 'digest', side_effect=delayed_digest), \
+                    mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.check_gate('a', 'status')
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertNotIn('sha256', run.plan['gates']['acquire'])
+            self.assertNotIn('acquired', run.plan['gates']['acquire'])
+            self.assertEqual(run.acquired, [])
+            self.assertEqual(run.last_gate_outcome['gate'], 'status')
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_gate_does_not_start_its_recovery(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['old'] = {'kind': 'status', 'expect': {'running': False},
+                                    'cap': 2, 'recover': 'to-red'}
+        run.plan['gates']['new'] = {'kind': 'status', 'expect': {'running': True}, 'cap': 2}
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        original = eden.request
+
+        def request(method, params):
+            if method == 'status':
+                if threading.current_thread() is worker:
+                    entered.set()
+                    release.wait(2)
+                return {'ok': True, 'result': {'running': True}}
+            return original(method, params)
+
+        def old_gate():
+            try:
+                run.gate('a', 'old')
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = request
+        worker = threading.Thread(target=old_gate)
+        try:
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            run.gate('a', 'new')
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertNotIn('macro.play', eden.calls)
+            self.assertEqual(run.last_gate_outcome['gate'], 'new')
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_superseded_recovery_recheck_cannot_requalify_or_play(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['old'] = {'kind': 'status', 'expect': {'running': False},
+                                    'cap': 2, 'recover': 'to-red'}
+        run.plan['gates']['start'] = {'kind': 'status', 'expect': {'running': True}, 'cap': 2}
+        run.plan['gates']['new'] = {'kind': 'status', 'expect': {'running': True}, 'cap': 2}
+        run.plan['segments']['to-red']['start_gate'] = 'start'
+        entered, release = threading.Event(), threading.Event()
+        errors, reads, polls = [], [], []
+        original_request, original_check = eden.request, run.check_gate
+
+        def request(method, params):
+            if method == 'macro.status':
+                polls.append(1)
+                return {'ok': True, 'result': {'state': 'playing' if len(polls) == 1 else 'idle'}}
+            if method == 'status':
+                if threading.current_thread() is not threading.main_thread():
+                    entered.set()
+                    release.wait(2)
+                return {'ok': True, 'result': {'running': True}}
+            return original_request(method, params)
+
+        def check(on, name, *, cap=None):
+            reads.append((name, cap))
+            if name == 'old' and cap is None:
+                raise RuntimeError('initial destination failure')
+            if name == 'start' and cap is None:
+                return True
+            return original_check(on, name, cap=cap)
+
+        def old_gate():
+            try:
+                run.gate('a', 'old')
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = request
+        run.check_gate = check
+        worker = threading.Thread(target=old_gate)
+        try:
+            with mock.patch.object(runner.macro_gate, 'IDLE_CAP', 2):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                run.gate('a', 'new')
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], routes.closed_loop.DispatchRejected)
+            self.assertEqual([name for name, cap in reads if name == 'start' and cap is not None], [])
+            self.assertNotIn('macro.play', eden.calls)
+            self.assertEqual(run.last_gate_outcome['gate'], 'new')
+        finally:
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+
+    def test_a_latched_dashboard_macro_finishes_without_an_input_reset(self):
+        path, _, _ = routes.macro_file('lobby-a')
+        release = json.loads(path.read_text())['events'][-1]
+        self.assertEqual(release['buttons'], 0)
+        self.assertEqual(release['sticks'], [0, 0, 0, 0])
+        self.assertEqual(release['triggers'], [0, 0])
+        bridge = self.dir / 'bridge.log'
+        bridge.write_text('')
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.closed_loop_owns_idle = True
+        ctx = runner.StepContext(run, 'a')
+        picker = routes.BridgePickerIO(ctx)
+
+        picker.send('lobby-a', reset=False)
+        self.assertEqual(eden.calls, ['macro.play', 'macro.status'])
+        self.assertTrue(picker.in_flight)
+        self.assertIn('a', picker.pending)
+
+        picker.finish()
+        picker.send('main-menu-down')
+        self.assertEqual(eden.calls[2:], ['macro.play', 'macro.status', 'input.reset'])
 
     def test_runner_play_waits_for_idle_and_rechecks_the_start_gate(self):
         run, eden, now = self.waiting_run()

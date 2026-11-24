@@ -727,7 +727,7 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
-def play(ctx, name, *, requalify=None, until=None):
+def play(ctx, name, *, requalify=None, until=None, reset=True):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
     path, sha, cap = macro_file(name)
     def on_event(event):
@@ -754,7 +754,10 @@ def play(ctx, name, *, requalify=None, until=None):
                                  check=getattr(ctx, 'check_stop', None)):
         return None
     try:
-        ctx.runner.wait_macro(ctx.on, cap)
+        if reset:
+            ctx.runner.wait_macro(ctx.on, cap)
+        else:
+            ctx.runner.wait_macro(ctx.on, cap, reset=False)
     except RuntimeError as error:
         raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
     ctx.log({'route_macro': name, 'sha256': sha})
@@ -1174,6 +1177,8 @@ def _wireless_observer(ctx, io, screens, state):
     def remember_ui(sample):
         state['ui_clock'] = {key: sample.block.get(key) for key in ('frame', 'wall', 'rev')}
         values = sample.block['values']
+        if values.get('screen') == 'ldn.room_list' and values.get('observation.active') == 'yes':
+            state['room_list_seen'] = True
         state['ready_published'] |= ('input.ready' in values
                                      and values.get('screen') in ('stage_select', 'css.smash'))
 
@@ -1254,7 +1259,8 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
     steps.append(closed_loop.Step(
         'dashboard-a', lambda o: (available() and dashboard_ready(o)
                                   and o['ui'].get('focus.id') == DASHBOARD_LOCAL_WIRELESS),
-        lambda o: active(o, 'ldn.room_list'), 'lobby-a', cap=25, lost_after=26, sends=1, target=focus))
+        lambda o: active(o, 'ldn.room_list') and _wireless_ready(o['ui']), 'lobby-a',
+        cap=45, lost_after=46, sends=1, target=focus, latch=True))
     return steps
 
 
@@ -1285,7 +1291,7 @@ def wireless_room_list(ctx, ready_cap=60):
     io = BridgePickerIO(ctx)
     state = {'last_ui': {}, 'last_tile': None, 'last_answered_tile': None, 'ui_answered': False,
              'last_error': None, 'last_read_was_error': False, 'ui_clock': {}, 'ready_published': False,
-             'last_macro_error': None}
+             'last_macro_error': None, 'current': None}
     observe = _wireless_observer(ctx, io, screens, state)
 
     def active(obs, screen):
@@ -1310,17 +1316,24 @@ def wireless_room_list(ctx, ready_cap=60):
     def on_stall(event, obs):
         return _wireless_stall(ctx, state, 'wireless_room_list', event, obs)
 
+    def send(macro):
+        if state['current'] == 'dashboard-a':
+            io.send(macro, reset=False)
+        else:
+            io.send(macro)
+
     missing = object()
     previous = getattr(ctx.runner, 'closed_loop_owns_idle', missing)
     ctx.runner.closed_loop_owns_idle = True
     try:
         try:
             outcome = closed_loop.run(
-                'wireless_room_list', steps, observe, io.send, io.finish,
+                'wireless_room_list', steps, observe, send, io.finish,
                 clock=time.monotonic, sleep=time.sleep, on_stall=on_stall,
+                on_step=lambda name: state.__setitem__('current', name),
                 idle=lambda remaining: _eden_macro_busy(
                     ctx, remaining, note=lambda text: state.__setitem__('last_macro_error', text)),
-                idle_cap=15.0, revalidate_cap=4.5)
+                idle_cap=15.0, revalidate_cap=4.5, locate_done=lambda obs: active(obs, 'ldn.room_list'))
             deadline = time.monotonic() + 20.0
             while not list_ready():
                 ctx.check_stop()
@@ -1352,7 +1365,11 @@ def wireless_room_list(ctx, ready_cap=60):
         except closed_loop.RouteStopped as error:
             reason = (error.reason if error.reason.startswith('unsupported reader: the bridge does not publish')
                       else f'{error.reason}; last screen {state["last_ui"].get("screen")!r}')
+            if error.step == 'dashboard-a' and error.reason.startswith('no transition within cap'):
+                reason += ('; the room list was reached but never read ready' if state.get('room_list_seen')
+                           else '; the room list did not appear')
             error.reason = error.receipt['reason'] = reason
+            error.receipt.update(on_list=on_list(), list_ready=list_ready())
             error.args = (f'wireless_room_list: stopped on step {error.step!r}: {reason}',)
             stalls = error.receipt['stalls']
             receipt = {
@@ -1564,7 +1581,10 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
     ]
 
     def send(macro):
-        io.send(macro)
+        if state['current'] == 'dashboard-a':
+            io.send(macro, reset=False)
+        else:
+            io.send(macro)
         if state['current'] == 'confirm-create':
             state['confirm_presses'] += 1
         elif state['current'] == 'stage-a':
@@ -1628,6 +1648,9 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             reason += '; expected main_menu with native input or a later route screen'
         elif error.step == 'open-dashboard' and not reason.startswith('unsupported reader:'):
             reason += f'; expected the dashboard; saw {state["last_ui"]}'
+        elif error.step == 'dashboard-a' and reason.startswith('no transition within cap'):
+            reason += ('; the room list was reached but never read ready' if state.get('room_list_seen')
+                       else '; the room list did not appear')
         elif error.step == 'open-create':
             if state['form_settling'] and state['last_read_was_error']:
                 reason = f'expected the Create form after A; last read error: {state["last_error"]}; {reason}'
@@ -1657,6 +1680,9 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             reason += f'; expected ldn.waiting; expected ldn.role host; saw {state["last_ui"]}'
         error.reason = reason
         error.receipt['reason'] = reason
+        on_list = active({'ui': state['last_ui']}, 'ldn.room_list')
+        list_ready = on_list and _wireless_ready(state['last_ui'])
+        error.receipt.update(on_list=on_list, list_ready=list_ready)
         error.args = (f'wireless_room: stopped on step {error.step!r}: {reason}',)
         sends = next((entry['sends'] for entry in error.receipt['steps'] if entry['name'] == error.step), 0)
         stop_receipt = {
@@ -1665,6 +1691,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
             'steps': error.receipt['steps'], 'ms': round((time.monotonic() - started) * 1000),
             'stalls': error.receipt['stalls'], 'result': _stall_result(False, error.receipt['stalls']),
             'last_error': state['last_error'], 'press_gate': press_gate(), 'entered_at': error.receipt['entered_at'],
+            'on_list': on_list, 'list_ready': list_ready,
         }
         if state['last_macro_error'] is not None:
             stop_receipt['last_macro_error'] = error.receipt['last_macro_error'] = state['last_macro_error']
