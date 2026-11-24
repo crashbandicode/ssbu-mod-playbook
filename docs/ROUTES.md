@@ -91,6 +91,8 @@ Look for the current screen and start there; wait for the step's fresh ready obs
 The Stage Select A gate requires a settled `tile.cursor` with numeric `at == hovered` and both `p1.token`
 and `local.token` held. Every wireless press also requires `input.ready=yes` whenever the bridge publishes that
 key; never press on the screen name alone.
+On the room list, A requires `focus.id=ldn.create_room` and `focus.index=0`: a room row or unknown focus stops;
+the route never moves that cursor.
 After a send, wait for the transition. A continuously observed source with the same target counts as a lost input:
 finish it and resend, up to three sends total (some steps allow fewer). A continuously changed target stops without
 confirming or repeating the input. A dispatch error stops with delivery unknown, without confirming or resending.
@@ -113,6 +115,8 @@ Wireless stall events record `step`, `send`, `seconds_on_source`, `target`, `scr
 record `kind`, `step`, `start`, `error`, `screen`, `seconds`, `frame`, `wall`, `rev`, `last_bridge_line` and `utc`.
 Receipts say `PASS`, `PASS with 1 stall`, or `PASS with N stalls` (and corresponding `STOPPED` forms on failure);
 the row folder also receives `stall-events.jsonl`. The flight owner copies that file into the root-cause folder.
+Inner Training input resends are stall events in every enclosing receipt and in `stall-events.jsonl`.
+After a phase fails, the route re-decides from live state and never repeats it when its postcondition already holds.
 This closed-loop route is host-tested only, not flown.
 
 **Why (2026-11-23/24):** the three stalled flights pressed A 5 to 12 frames after the first `stage_select` block,

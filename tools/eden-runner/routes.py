@@ -1165,8 +1165,12 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
                          lambda o: active(o, 'ldn.room_list'), 'lobby-open-room-list', cap=25, lost_after=6,
                          target=lambda o: (o['ui'].get('focus'), o['ui'].get('screen.layer'))),
         closed_loop.Step('open-create', lambda o: (not state['form_settling'] and active(o, 'ldn.room_list')
-                                                   and accepting(o['ui'])), create_done, 'tap-a1',
-                         cap=15, lost_after=5, before_send=begin_create),
+                                                   and accepting(o['ui'])
+                                                   and o['ui'].get('focus.id') == 'ldn.create_room'
+                                                   and o['ui'].get('focus.index') == '0'), create_done, 'tap-a1',
+                         cap=15, lost_after=5, before_send=begin_create,
+                         source=lambda o: active(o, 'ldn.room_list'),
+                         target=lambda o: (o['ui'].get('focus.id'), o['ui'].get('focus.index'))),
         closed_loop.Step('confirm-create', confirm_ready, confirm_done, 'tap-plus1',
                          cap=20, lost_after=0, sends=2, before_send=begin_confirm),
         closed_loop.Step('stage-a', stage_at, lambda o: local(o, 'css.smash'), 'lobby-a',
@@ -1248,6 +1252,11 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
         elif error.step == 'open-create':
             if state['form_settling'] and state['last_read_was_error']:
                 reason = f'expected the Create form after A; last read error: {state["last_error"]}; {reason}'
+            elif (reason.startswith('not ready') and state['last_ui'].get('screen') == 'ldn.room_list'
+                  and (state['last_ui'].get('focus.id') != 'ldn.create_room'
+                       or state['last_ui'].get('focus.index') != '0')):
+                reason += (f'; the Create row is not focused (focus.id={state["last_ui"].get("focus.id")}, '
+                           f'focus.index={state["last_ui"].get("focus.index")})')
             elif (unpublished_create == 'refuse' and state['form_left_list']
                     and reason.startswith('no transition within cap')):
                 reason = ('unsupported reader: the Create form is not published as ldn.create; '
@@ -1288,6 +1297,11 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse'):
             stop_receipt['dispatch'] = error.receipt['dispatch'] = dispatch
         if reason.startswith('unsupported reader: the Create form is not published as ldn.create'):
             stop_receipt['unsupported_reader'] = 'ldn.create'
+        elif (error.step == 'open-create' and reason.startswith('not ready')
+              and state['last_ui'].get('screen') == 'ldn.room_list'
+              and (state['last_ui'].get('focus.id') in (None, 'unknown')
+                   or state['last_ui'].get('focus.index') in (None, 'unknown'))):
+            stop_receipt['unsupported_reader'] = 'ldn.room_list focus'
         _save(ctx, 'routes-wireless-room-stop', stop_receipt)
         raise
 
@@ -1827,6 +1841,10 @@ def _merge_setup_metrics(destination, source):
         destination['bridge_boot'] = source['bridge_boot']
     for provider, revisions in source['revisions'].items():
         destination['revisions'].setdefault(provider, list(revisions))[1] = revisions[1]
+    if 'retries' in source:
+        destination['retries'] = destination.get('retries', 0) + source['retries']
+    if source.get('stalls'):
+        destination.setdefault('stalls', []).extend(source['stalls'])
 
 
 # --- Training: game state ---------------------------------------------------------------------------------------------
@@ -3412,10 +3430,17 @@ INPUT_LAG_S = 3.0
 
 def _send_with_retry(io, macro, until, wait):
     io.send(macro)
+    started = time.monotonic()
     result = wait(min(until, time.monotonic() + INPUT_LAG_S))
     if result is None and time.monotonic() < until:
-        io.send(macro)
+        event = {'kind': 'resend', 'block': 'tr_input', 'step': macro, 'send': 2,
+                 'seconds_on_source': time.monotonic() - started,
+                 'last_bridge_line': _bridge_tail(io.ctx), 'utc': _stall_utc()}
         metrics = getattr(io.ctx.runner, 'setup_metrics', None)
+        if metrics is not None:
+            metrics.setdefault('stalls', []).append(event)
+        _append_stall(io.ctx, 'tr_input', event)
+        io.send(macro)
         if metrics is not None:
             metrics['retries'] = metrics.get('retries', 0) + 1
         result = wait(until)
@@ -3505,7 +3530,7 @@ def _live_body(ctx, seat, kind, cap):
 
 
 def _with_setup_metrics(ctx, action):
-    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}, 'retries': 0, 'stalls': []}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     try:
@@ -3531,7 +3556,7 @@ def _remember(io, state):
 def _block(ctx, block, name, args, action):
     started = time.monotonic()
     metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {},
-               'retries': 0, 'last_seen': {}}
+               'retries': 0, 'stalls': [], 'last_seen': {}}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     try:
@@ -3539,6 +3564,8 @@ def _block(ctx, block, name, args, action):
             receipt = action(metrics)
             receipt.pop('observed', None)
             receipt['ok'] = True
+            receipt['retries'] = metrics['retries']
+            receipt['stalls'] = list(metrics['stalls'])
         except RuntimeError as error:
             last = dict(metrics['last_seen'])
             seen = ' '.join(f'{key}={value}' for key, value in last.items()) or 'none'
@@ -5137,7 +5164,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     wanted_stage = stage_entry(stage)['id']
     wanted_p1 = fighter_entry(p1)['kind']
     wanted_cpu = fighter_entry(cpu)['kind'] if cpu is not None else None
-    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}}
+    metrics = {'inputs': 0, 'bridge_requests': 0, 'bridge_boot': None, 'revisions': {}, 'retries': 0, 'stalls': []}
     previous = getattr(ctx.runner, 'setup_metrics', None)
     ctx.runner.setup_metrics = metrics
     phases = ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
@@ -5147,7 +5174,18 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     stalls, retry_evidence, phase_elapsed = [], {}, {}
     io, ui, last_ui = None, None, None
     known_stage = expected(ctx).get('stage_id')
-    css_picked, retry_same = False, None
+    css_picked, pending_recoveries = False, {}
+
+    def all_stalls():
+        return list(stalls) + list(metrics['stalls'])
+
+    def phase_retries():
+        return {key: count - 1 for key, count in starts.items() if count > 1}
+
+    def metric_fields():
+        return {'inputs': metrics['inputs'], 'bridge_requests': metrics['bridge_requests'],
+                'bridge_boot': metrics['bridge_boot'], 'revisions': metrics['revisions'],
+                'input_retries': metrics['retries']}
 
     def pending():
         entries = getattr(io, 'pending', None) if io is not None else None
@@ -5157,11 +5195,13 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         return value[0] if isinstance(value, tuple) else value
 
     def stop(step, reason):
+        combined_stalls = all_stalls()
         receipt = {
             'block': 'reach_training', 'ok': False, 'step': step, 'reason': reason,
             'starts': dict(starts), 'recovered': list(recovered), 'last_ui': last_ui,
             'phases': dict(receipts), 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)},
-            'pending': pending(), 'stalls': list(stalls), 'result': _stall_result(False, stalls),
+            'pending': pending(), **metric_fields(), 'retries': phase_retries(),
+            'stalls': combined_stalls, 'result': _stall_result(False, combined_stalls),
         }
         _save(ctx, 'routes-reach-training-stop', receipt)
         raise closed_loop.RouteStopped('reach_training', step, reason, receipt)
@@ -5332,11 +5372,13 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                     name = 'back_to_main'
             else:
                 name = 'to_main'
-            if retry_same is not None:
-                retry_name, retry_screen = retry_same
-                retry_same = None
-                if screen == retry_screen:
-                    name = retry_name
+            for failed in tuple(pending_recoveries):
+                if name == failed:
+                    pending_recoveries.pop(failed)
+                elif name is None:
+                    recovered.append(failed)
+                    phase_stall('phase-recovered', failed, retry_evidence[failed])
+                    pending_recoveries.pop(failed)
             if name is None:
                 deadline('deadline expired before final verification')
                 try:
@@ -5373,7 +5415,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                     recovered.append(name)
                     phase_stall('phase-recovered', name, retry_evidence[name])
                 elif after == screen:
-                    retry_same = (name, screen)
+                    pending_recoveries[name] = None
                 if after != 'css.training':
                     css_picked = False
             next_phase = {'to_main': 'main_to_stage', 'back_to_main': 'main_to_stage',
@@ -5384,13 +5426,13 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
         ctx.runner.setup_metrics = previous
         if previous is not None:
             _merge_setup_metrics(previous, metrics)
+    combined_stalls = all_stalls()
     return _save(ctx, 'routes-reach-training', {
         'block': 'reach_training', 'args': {'p1': p1, 'cpu': cpu, 'stage': stage, 'form': form},
-        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metrics,
+        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metric_fields(),
         'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
-        'starts': starts, 'recovered': recovered, 'retries': {key: count - 1 for key, count in starts.items()
-                                                            if count > 1},
-        'stalls': stalls, 'result': _stall_result(True, stalls),
+        'starts': starts, 'recovered': recovered, 'retries': phase_retries(),
+        'stalls': combined_stalls, 'result': _stall_result(True, combined_stalls),
     })
 
 

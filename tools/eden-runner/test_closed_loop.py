@@ -40,6 +40,28 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_a_changed_source_target_never_confirms_a_prepared_retry(self):
+        for change_on in (2, 3):
+            with self.subTest(change_on=change_on):
+                at_three, changed = [], []
+
+                def observe(fake):
+                    if fake.now == 3:
+                        at_three.append(True)
+                        if len(at_three) == change_on:
+                            changed.append(True)
+                    return ('room', 'other' if changed else 'create')
+
+                fake = Script(observe)
+                item = Step('press', lambda value: value == ('room', 'create'),
+                            lambda value: value[0] == 'done', 'press', cap=20, lost_after=2,
+                            target=lambda value: value[1], source=lambda value: value[0] == 'room')
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([item])
+                self.assertIn('source target changed', caught.exception.reason)
+                self.assertEqual(len(fake.sends), 1)
+                self.assertEqual(fake.finishes, 0)
+
     def test_a_continuity_error_from_a_read_stops_with_a_receipt_and_never_sends_again(self):
         message = 'bridge connection or replay continuity changed while input was unconfirmed'
         for before_send in (False, True):

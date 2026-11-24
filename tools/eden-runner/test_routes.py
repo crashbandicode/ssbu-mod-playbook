@@ -2875,6 +2875,7 @@ class WirelessRoomTests(unittest.TestCase):
             self.direct_css = False
             self.stuck_stage = False
             self.lost_stage_sends = 0
+            self.stage_return_rooms_after_send = False
             self.stage_load_seconds = 0
             self.stage_load_until = None
             self.stage_reaction_seconds = 0
@@ -3100,7 +3101,9 @@ class WirelessRoomTests(unittest.TestCase):
             elif macro in ('tap-a1', 'lobby-a') and self.phase == 'stage':
                 self.stage_count += 1
                 self.stage_send_times.append(self.clock())
-                if self.lost_stage_sends:
+                if self.stage_return_rooms_after_send:
+                    self.phase = 'rooms'
+                elif self.lost_stage_sends:
                     self.lost_stage_sends -= 1
                 elif not self.stuck_stage and self.stage_reaction_seconds:
                     self.phase = 'stage_reacting'
@@ -3604,6 +3607,7 @@ class WirelessRoomTests(unittest.TestCase):
         self.assertEqual(caught.exception.step, 'open-create')
         self.assertIn('the Create row is not focused', caught.exception.reason)
         self.assertIn(self.io.room_focus_id, caught.exception.reason)
+        self.assertIn('focus.index=1', caught.exception.reason)
         self.assertNotIn('tap-a1', self.io.actions)
 
     def test_an_unknown_room_list_focus_is_an_unsupported_reader_stop(self):
@@ -3613,6 +3617,7 @@ class WirelessRoomTests(unittest.TestCase):
             self.run_room(unpublished_create='allow')
         self.assertEqual(caught.exception.step, 'open-create')
         self.assertIn('the Create row is not focused', caught.exception.reason)
+        self.assertIn('focus.id=unknown, focus.index=unknown', caught.exception.reason)
         stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
         self.assertEqual(stop['unsupported_reader'], 'ldn.room_list focus')
         self.assertNotIn('tap-a1', self.io.actions)
@@ -3636,6 +3641,18 @@ class WirelessRoomTests(unittest.TestCase):
         result = self.run_room(unpublished_create='allow')
         self.assertEqual(self.io.actions.count('tap-a1'), 2)
         self.assertEqual(result['result'], 'PASS with 1 stall')
+
+    def test_a_bounce_to_an_unfocused_room_list_stops_on_open_create(self):
+        self.io.phase = 'stage'
+        self.io.stage_return_rooms_after_send = True
+        self.io.room_focus_id = self.io.room_focus_index = 'unknown'
+        with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+            self.run_room(unpublished_create='allow')
+        self.assertEqual(caught.exception.step, 'open-create')
+        self.assertIn('the Create row is not focused', caught.exception.reason)
+        self.assertEqual(self.io.actions, ['lobby-a'])
+        stop = json.loads((self.row / 'routes-wireless-room-stop.json').read_text())
+        self.assertEqual(stop['unsupported_reader'], 'ldn.room_list focus')
 
     def test_a_press_on_the_first_stage_select_read_is_refused_while_not_ready(self):
         self.io.phase = 'stage'
