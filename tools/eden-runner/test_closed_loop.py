@@ -40,6 +40,140 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_a_plain_error_containing_busy_is_delivery_unknown_and_never_resent(self):
+        for message in ('input.reset: input_busy', 'macro.play busy'):
+            with self.subTest(message=message):
+                fake = Script(lambda f: 'source')
+                attempts = []
+
+                def dispatch(macro):
+                    attempts.append(macro)
+                    raise RuntimeError(message)
+
+                fake.send = dispatch
+                with self.assertRaises(RouteStopped) as caught:
+                    fake.run([step('press', 'source', 'done')], idle=lambda: None)
+                self.assertEqual(attempts, ['press'])
+                self.assertEqual(fake.finishes, 0)
+                self.assertEqual(caught.exception.receipt['steps'][0]['sends'], 1)
+                self.assertEqual(caught.exception.receipt['steps'][0]['dispatch'], 'unknown')
+                self.assertIn(f'dispatch failed, delivery unknown: {message}', caught.exception.reason)
+
+    def test_only_a_dispatch_rejection_is_retried(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        attempts, send = [], fake.send
+
+        def dispatch(macro):
+            attempts.append(macro)
+            if len(attempts) == 1:
+                raise closed_loop.DispatchRejected('input_busy')
+            send(macro)
+
+        fake.send = dispatch
+        result = fake.run([step('press', 'source', 'done')], idle=lambda: None)
+        self.assertEqual(attempts, ['press', 'press'])
+        self.assertEqual(result['steps'][0]['sends'], 1)
+        self.assertEqual(result['steps'][0]['busy_rejections'], 1)
+        self.assertEqual(fake.finishes, 2)
+
+    def test_alternating_busy_and_idle_cannot_outlast_the_idle_budget(self):
+        fake = Script(lambda f: 'source')
+        calls = []
+
+        def idle():
+            calls.append(fake.now)
+            return 'macro playing' if fake.now < 18 and len(calls) % 2 else None
+
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=15)
+        self.assertEqual(fake.now, 15)
+        self.assertEqual(fake.sends, [])
+        self.assertEqual(fake.finishes, 0)
+        self.assertIn('input channel busy for 15 s over 15 waits', caught.exception.reason)
+        event, = caught.exception.receipt['stalls']
+        self.assertEqual((event['kind'], event['waits']), ('idle-wait', 15))
+
+    def test_the_idle_budget_survives_revalidation_reads(self):
+        def observe(fake):
+            if fake.now:
+                fake.now += 3
+            return 'source'
+
+        fake = Script(observe)
+        calls = []
+
+        def idle():
+            calls.append(True)
+            return 'macro playing' if len(calls) == 1 else None
+
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=3)
+        self.assertGreaterEqual(fake.now, 3)
+        self.assertEqual(fake.sends, [])
+        self.assertIn('input channel busy', caught.exception.reason)
+
+    def test_a_slow_idle_answer_forces_a_fresh_read_before_the_send(self):
+        for duration in (3, 18):
+            with self.subTest(duration=duration):
+                fake = Script(lambda f: 'done' if f.sends else 'source')
+                calls = []
+
+                def idle():
+                    calls.append(True)
+                    if len(calls) == 1:
+                        fake.now += duration
+                    return None
+
+                if duration > 15:
+                    with self.assertRaises(RouteStopped) as caught:
+                        fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=15)
+                    self.assertIn('input channel busy', caught.exception.reason)
+                    self.assertEqual(fake.sends, [])
+                    self.assertEqual(caught.exception.receipt['stalls'][0]['seconds'], duration)
+                else:
+                    result = fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=15)
+                    self.assertEqual(fake.sends, [('press', 3)])
+                    self.assertGreaterEqual(fake.events[:fake.events.index(('send', 'press'))].count(
+                        ('read', 'source')), 2)
+                    event, = result['stalls']
+                    self.assertEqual((event['kind'], event['seconds'], event['waits']), ('idle-wait', 3, 1))
+                    self.assertEqual(result['steps'][0]['idle_wait_ms'], 3000)
+
+    def test_one_idle_wait_event_per_dispatch(self):
+        fake = Script(lambda f: 'done' if f.sends else 'source')
+        calls = []
+
+        def idle():
+            calls.append(True)
+            return 'macro playing' if len(calls) <= 6 and len(calls) % 2 else None
+
+        result = fake.run([step('press', 'source', 'done')], idle=idle)
+        self.assertEqual(fake.sends, [('press', 3)])
+        event, = result['stalls']
+        self.assertEqual((event['kind'], event['seconds'], event['waits']), ('idle-wait', 3, 3))
+        self.assertEqual(result['steps'][0]['idle_waits'], 3)
+        self.assertEqual(result['steps'][0]['idle_wait_ms'], 3000)
+
+    def test_the_idle_budget_is_not_reset_by_a_dispatch_rejection(self):
+        fake = Script(lambda f: 'source')
+        attempts = []
+
+        def dispatch(macro):
+            attempts.append(macro)
+            raise closed_loop.DispatchRejected('input_busy')
+
+        def idle():
+            return 'macro playing' if attempts or fake.now < 10 else None
+
+        fake.send = dispatch
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('press', 'source', 'done')], idle=idle, idle_cap=15)
+        self.assertEqual(fake.now, 15)
+        self.assertEqual(attempts, ['press'])
+        self.assertEqual(fake.finishes, 1)
+        self.assertEqual(caught.exception.receipt['steps'][0]['sends'], 0)
+        self.assertEqual([event['kind'] for event in caught.exception.receipt['stalls']].count('idle-wait'), 1)
+
     def test_a_step_waits_while_the_input_channel_is_busy_and_then_sends_once(self):
         fake = Script(lambda f: 'done' if f.sends else 'source')
         polls = []
@@ -65,7 +199,8 @@ class ClosedLoopTests(unittest.TestCase):
         with self.assertRaises(RouteStopped) as caught:
             fake.run([step('press', 'source', 'done')], idle=lambda: 'macro playing', idle_cap=2)
         self.assertEqual(caught.exception.step, 'press')
-        self.assertIn('input channel busy for 2 s: macro playing; nothing was sent', caught.exception.reason)
+        self.assertIn('input channel busy for 2 s over 1 waits: macro playing; nothing was sent',
+                      caught.exception.reason)
         self.assertEqual(fake.sends, [])
         self.assertEqual(fake.finishes, 0)
         self.assertEqual(caught.exception.receipt['steps'][0]['idle_waits'], 1)
@@ -88,7 +223,7 @@ class ClosedLoopTests(unittest.TestCase):
             attempts.append(macro)
             fake.events.append(('attempt', macro))
             if len(attempts) == 1:
-                raise RuntimeError('macro.play: input_busy')
+                raise closed_loop.DispatchRejected('macro.play: input_busy')
             send(macro)
 
         fake.send = dispatch
@@ -108,7 +243,7 @@ class ClosedLoopTests(unittest.TestCase):
 
         def dispatch(macro):
             attempts.append(macro)
-            raise RuntimeError('macro.play busy')
+            raise closed_loop.DispatchRejected('macro.play busy')
 
         fake.send = dispatch
         with self.assertRaises(RouteStopped) as caught:
@@ -151,7 +286,7 @@ class ClosedLoopTests(unittest.TestCase):
         def dispatch(macro):
             attempts.append(macro)
             if len(attempts) == 2:
-                raise RuntimeError('macro.play busy')
+                raise closed_loop.DispatchRejected('macro.play busy')
             send(macro)
 
         fake.send = dispatch
@@ -172,7 +307,7 @@ class ClosedLoopTests(unittest.TestCase):
         def dispatch(macro):
             attempts.append(macro)
             if len(attempts) == 2:
-                raise RuntimeError('macro.play busy')
+                raise closed_loop.DispatchRejected('macro.play busy')
             send(macro)
 
         fake.send = dispatch
@@ -190,7 +325,7 @@ class ClosedLoopTests(unittest.TestCase):
         def dispatch(macro):
             attempts.append(fake.now)
             if len(attempts) == 1:
-                raise RuntimeError('input_busy')
+                raise closed_loop.DispatchRejected('input_busy')
             send(macro)
 
         fake.send = dispatch
