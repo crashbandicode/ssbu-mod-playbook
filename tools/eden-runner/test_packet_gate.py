@@ -1957,6 +1957,40 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertEqual(self.play_gate({'steps.py': steps}),
                          (['G8 steps.py: ctx.play("spare") names no segment of this plan'], [], ['tap-a']))
 
+    def test_a_helper_play_is_read_however_it_is_imported_and_whatever_the_context_is_called(self):
+        head = self.HOOK_HEAD
+        helper = 'def press(ctx):\n    ctx.play("tap-a")\n'
+        renamed = 'def press(context):\n    context.play("tap-a")\n'
+        kept = 'def press(ctx):\n    session = ctx\n    session.play("tap-a")\n'
+        shapes = {
+            'an import inside the hook': (head + 'def ok(ctx):\n    from helper import press\n    press(ctx)\n', helper),
+            'the module imported inside the hook': (head + 'def ok(ctx):\n    import helper as h\n    h.press(ctx)\n', helper),
+            'a helper that names its context differently': (head + 'import helper\ndef ok(ctx):\n    helper.press(ctx)\n', renamed),
+            'the context passed by name': (head + 'import helper\ndef ok(ctx):\n    helper.press(context=ctx)\n', renamed),
+            'a hook that names its own context differently': (head + 'import helper\ndef ok(run):\n    helper.press(run)\n', renamed),
+            'a context kept in a local': (head + 'import helper\ndef ok(ctx):\n    helper.press(ctx)\n', kept),
+            'a star import': (head + 'from helper import *\ndef ok(ctx):\n    press(ctx)\n', helper),
+            'a module-level name for the helper': (head + 'import helper\nok = helper.press\n', renamed),
+        }
+        for label, (steps, source) in shapes.items():
+            self.plan['segments'].pop('tap-a', None)
+            self.assertEqual(self.play_gate({'steps.py': steps, 'helper.py': source}),
+                             (['G8 helper.py: ctx.play("tap-a") names no segment of this plan'], [], []), label)
+            self.plan['segments']['tap-a'] = {'file': 'tap-a.json'}
+            self.assertEqual(self.play_gate({}), ([], [], ['tap-a']), label)
+        # Where the gate cannot tell that a call is a play of the context, it says so; it does not pass over it.
+        warning = ['G8 helper.py: 1 play call(s) with a computed name or unknown callee are not checked']
+        session = ('class Session:\n    def __init__(self, context):\n        self.run = context\n'
+                   '    def press(self):\n        self.run.play("tap-a")\n')
+        for label, steps, source in (
+                ('a context passed with *', head + 'import helper\ndef ok(ctx):\n    helper.press(*[ctx])\n', renamed),
+                ('a context kept under another attribute',
+                 head + 'import helper\ndef ok(ctx):\n    helper.Session(ctx).press()\n', session),
+                ('a context handed on through a callback',
+                 head + 'import helper\ndef ok(ctx):\n    helper.each(helper.press, ctx)\n',
+                 renamed + 'def each(fn, context):\n    fn(context)\n')):
+            self.assertEqual(self.play_gate({'steps.py': steps, 'helper.py': source}), ([], warning, []), label)
+
     def test_play_names_the_gate_can_resolve(self):
         self.plan['segments'].update({name: {'file': f'{name}.json'} for name in ('tap-a', 'tap-b', 'tap-x', 'hold')})
         tables = 'TAP = {"A": "tap-a", "B": "tap-b", "X": "tap-x"}\nHOLD = "hold"\n'
