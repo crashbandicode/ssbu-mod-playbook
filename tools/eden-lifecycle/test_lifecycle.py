@@ -192,7 +192,8 @@ class LifecycleTests(unittest.TestCase):
         self.ledger_path = self.base / 'coordination.txt'
         self.ledger_path.write_text('# TEMPORARY test data; not OWNER-COORDINATION\n')
         self.runner = self.base / 'fake_runner.py'
-        self.runner.write_text('def dry_run(path):\n return {"result":"READY","rows":1,"errors":[]}\n')
+        self.runner.write_text('def dry_run(path):\n return {"result":"READY","rows":1,"errors":[]}\n'
+                               'def up_check(path, config=None):\n return dry_run(path)\n')
         self.rows = self.base / 'rows.json'
         self.rows.write_text('{"fake": true}')
         self.order = []
@@ -220,6 +221,42 @@ class LifecycleTests(unittest.TestCase):
         second = deepcopy(self.config['instances'][0])
         second.update(key='b', display=':102')
         self.config['instances'].append(second)
+
+    def test_pinned_runner_without_up_check_is_refused_before_a_claim(self):
+        self.runner.write_text('def dry_run(path):\n return {"result":"READY","rows":1,"errors":[]}\n')
+        self.config['runner']['sha256'] = life.digest(self.runner)
+        with self.assertRaisesRegex(life.Refused, 'Pinned runner has no up_check'):
+            self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+        self.assertFalse((Path(self.config['state_dir']) / 'lifecycle.json').exists())
+        self.assertNotIn('claim', self.order)
+
+    def test_the_lifecycle_passes_its_config_to_the_pinned_up_check(self):
+        self.runner.write_text('def up_check(path, config=None):\n'
+                               ' return {"result":"READY","rows":1,"errors":[], "has_config": config is not None}\n')
+        self.config['runner']['sha256'] = life.digest(self.runner)
+        self.assertTrue(self.controller().check_rows()['has_config'])
+
+    def test_target_not_in_plugin_pins_refuses_before_a_claim_or_journal(self):
+        tree = self.base / 'target'
+        tree.mkdir()
+        subprocess.run(['git', '-C', str(tree), 'init', '-q'], check=True)
+        subprocess.run(['git', '-C', str(tree), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '--allow-empty', '-qm', 'fixture'], check=True)
+        commit = subprocess.run(['git', '-C', str(tree), 'rev-parse', 'HEAD'], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        self.rows.write_text(json.dumps({
+            'target': {'plugin': {'tree': str(tree), 'commit': commit, 'nro_sha256': 'a' * 64}},
+            'start': 'main', 'rows': [{'id': 'r', 'start': 'main', 'end': 'main', 'role': 'setup',
+                                       'steps': [{'call': 'status'}]}]}))
+        actual_runner = Path(__file__).resolve().parents[1] / 'eden-runner/runner.py'
+        self.config['runner'] = {'path': str(actual_runner), 'sha256': life.digest(actual_runner)}
+        self.config['rows']['sha256'] = life.digest(self.rows)
+        with self.assertRaisesRegex(life.Refused, 'Shared runner dry-run failed'):
+            self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+        self.assertFalse((Path(self.config['state_dir']) / 'lifecycle.json').exists())
+        self.assertNotIn('claim', self.order)
 
     def test_single_up_writes_shared_runner_instances_and_mutes_before_load(self):
         value = self.controller().up()
@@ -880,11 +917,31 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(life.Refused, 'dry-run failed'):
             self.controller(plan_check=lambda: {'result': 'READY', 'rows': 0, 'errors': []}).up()
 
+    def test_check_rows_uses_up_check_when_the_runner_has_it(self):
+        self.runner.write_text(
+            'def dry_run(path):\n return {"result":"READY","rows":1,"errors":[]}\n'
+            'def up_check(path, config=None):\n return {"result":"BROKEN","rows":1,"errors":["no target"]}\n')
+        self.config['runner']['sha256'] = life.digest(self.runner)
+        self.assertEqual(self.controller().check_rows()['errors'], ['no target'])
+
     def test_real_shared_runner_dryrun_integration_is_offline(self):
         shared = Path(__file__).resolve().parents[1] / 'eden-runner/runner.py'
         self.config['runner'] = {'path': str(shared), 'sha256': life.digest(shared)}
-        self.rows.write_text(json.dumps({'start': 'menu', 'rows': [{'id': 'observe', 'start': 'menu', 'end': 'menu',
-            'steps': [{'gate': 'settings'}]}], 'gates': {'settings': {'kind': 'json', 'source': 'settings', 'expect': {'x': 1}, 'cap': 1}}}))
+        tree = self.base / 'target'
+        tree.mkdir()
+        subprocess.run(['git', '-C', str(tree), 'init', '-q'], check=True)
+        (tree / 'fixture').write_text('target')
+        subprocess.run(['git', '-C', str(tree), 'add', 'fixture'], check=True)
+        subprocess.run(['git', '-C', str(tree), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '-qm', 'fixture'], check=True)
+        commit = subprocess.run(['git', '-C', str(tree), 'rev-parse', 'HEAD'], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        self.plugin.write_bytes(b'fake candidate ' + commit[:8].encode('ascii'))
+        self.config['instances'][0]['plugins'][0]['sha256'] = life.digest(self.plugin)
+        self.rows.write_text(json.dumps({'target': {'plugin': {'tree': str(tree), 'commit': commit,
+                                                               'nro_sha256': life.digest(self.plugin)}},
+            'start': 'menu', 'rows': [{'id': 'observe', 'start': 'menu', 'end': 'menu',
+            'steps': [{'gate': 'settings'}]}], 'gates': {'settings': {'kind': 'json', 'source': 'settings', 'expect': {'x': 1}, 'cap': 1, 'effect': True}}}))
         self.config['rows']['sha256'] = life.digest(self.rows)
         self.assertEqual(self.controller().up()['phase'], 'up')
 

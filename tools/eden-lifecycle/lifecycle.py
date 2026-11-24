@@ -1455,7 +1455,8 @@ class Lifecycle:
         spec = importlib.util.spec_from_file_location('_lifecycle_shared_runner', runner['path'])
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.dry_run(Path(self.c['rows']['path']))
+        require(hasattr(module, 'up_check'), 'Pinned runner has no up_check: a feature Up needs the packet gate')
+        return module.up_check(Path(self.c['rows']['path']), self.c)
 
     def record(self, kind, value):
         with (self.directory / 'actions.jsonl').open('a', encoding='utf-8') as stream:

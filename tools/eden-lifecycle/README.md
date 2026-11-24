@@ -94,6 +94,10 @@ Human lines go to stderr. One JSON
 receipt goes to stdout. Exit 1 when `ok` is false. It does not claim, stage,
 or write the ledger.
 
+Feature Up requires the pinned runner's `up_check`; it refuses a target NRO
+that is not a plugin pin of the run or does not carry the named commit. The
+explicit `lifecycle_only` no-input mode is separate.
+
 `watchdog` needs `--execute`. It watches control-log activity. Idle longer
 than `watchdog.idle_s` (default 300 seconds) outside a declared `safe_states`
 entry, or a detector hit, takes `action` (default `down`). A missing
