@@ -145,7 +145,9 @@ Title prompt is named by the bridge only after it is On. Before the chord the
 evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
 the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.
 Opening playback is not the prompt and can extend the readiness wait to 180 seconds.
-If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event, the same port and the same boot, carrying its pre-On evidence and its Title prompt read.
+If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event,
+the same port and the same boot: a stub-on receipt with its pre-On evidence and its Title prompt read, or a trace
+receipt with its stock opening witness.
 A chord that brings no toggle stops the step; it is not retried.
 The first stub-on receipt in a row is `routes-bridge-on.json`; repeats are `routes-bridge-on-2.json` and so on.
 
