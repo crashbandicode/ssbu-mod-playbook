@@ -212,6 +212,7 @@ Config (`PIN` means `{"path":"/absolute/executor/file","sha256":"64hex"}`):
   "state_dir": "/home/intpa/eden-life-state/e42",
   "ledger": "/tmp/deluxe-surface-1007/OWNER-COORDINATION.md",
   "ledger_ssh": "tr-yoga",
+  "notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md", "to": "tr-primary-2"},
   "runner": "PIN for the existing shared tools/eden-runner/runner.py",
   "rows": "PIN for the run's rows.json",
   "runtime": 5400, "socket_cap": 90, "load_cap": 180,
