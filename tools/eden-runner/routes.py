@@ -898,41 +898,58 @@ def _instance_pids(ctx):
     instance = getattr(ctx, 'instance', None)
     if not isinstance(instance, dict):
         return None
+    pids = set()
     pid = instance.get('pid')
     if type(pid) is int and pid > 0:
-        return {pid}
-    unit = instance.get('unit')
-    if not unit:
-        try:
-            socket_path = Path(instance['socket'])
-            if not socket_path.is_absolute():
-                return None
-            unit = json.loads((socket_path.parent / 'run.json').read_text()).get('unit')
-        except (KeyError, OSError, ValueError, TypeError, AttributeError):
-            return None
-    if not isinstance(unit, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*\.(service|scope)', unit):
-        return None
-    pids = set()
+        pids.add(pid)
+    run = {}
     try:
-        main = subprocess.run(['systemctl', '--user', 'show', '-p', 'MainPID', '--value', unit],
-                              capture_output=True, text=True, timeout=5)
-        if main.returncode == 0 and main.stdout.strip().isascii() and main.stdout.strip().isdecimal():
-            pid = int(main.stdout.strip())
-            if pid > 0:
-                pids.add(pid)
-        group = subprocess.run(['systemctl', '--user', 'show', '-p', 'ControlGroup', '--value', unit],
-                               capture_output=True, text=True, timeout=5)
-        if group.returncode == 0:
-            name = group.stdout.strip()
-            if name.startswith('/') and '..' not in Path(name).parts and unit in Path(name).parts:
-                directory = Path('/sys/fs/cgroup') / name.lstrip('/')
-                for path in [directory / 'cgroup.procs', *directory.glob('*/cgroup.procs')]:
-                    try:
-                        pids.update(int(value) for value in path.read_text().split() if value.isdecimal() and int(value) > 0)
-                    except OSError:
-                        pass
-    except (OSError, subprocess.SubprocessError):
+        socket_path = Path(instance['socket'])
+        if socket_path.is_absolute():
+            run = json.loads((socket_path.parent / 'run.json').read_text())
+            if not isinstance(run, dict):
+                run = {}
+    except (KeyError, OSError, ValueError, TypeError):
         pass
+    unit = run.get('unit') or instance.get('unit')
+    if isinstance(unit, str) and re.fullmatch(r'eden-life-[0-9a-f]{32}-[A-Za-z0-9_-]+\.service', unit):
+        for prop in ('MainPID', 'ControlGroup'):
+            try:
+                result = subprocess.run(['systemctl', '--user', 'show', '-p', prop, '--value', unit],
+                                        capture_output=True, text=True, timeout=5)
+                if result.returncode:
+                    continue
+                value = result.stdout.strip()
+                if prop == 'MainPID' and value.isascii() and value.isdecimal() and int(value) > 0:
+                    pids.add(int(value))
+                elif prop == 'ControlGroup' and value.startswith('/') and '..' not in Path(value).parts \
+                        and unit in Path(value).parts:
+                    directory = Path('/sys/fs/cgroup') / value.lstrip('/')
+                    for path in [directory / 'cgroup.procs', *directory.rglob('cgroup.procs')]:
+                        try:
+                            pids.update(int(item) for item in path.read_text().split()
+                                        if item.isascii() and item.isdecimal() and int(item) > 0)
+                        except OSError:
+                            pass
+            except (OSError, subprocess.SubprocessError):
+                pass
+    owned = run.get('owned_pids')
+    if isinstance(owned, list):
+        try:
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        except OSError:
+            boot = None
+        for entry in owned:
+            if not isinstance(entry, dict) or type(entry.get('pid')) is not int or entry['pid'] <= 0 \
+                    or not isinstance(entry.get('start'), str) or not isinstance(entry.get('boot'), str) \
+                    or boot is None or entry['boot'] != boot:
+                continue
+            try:
+                raw = Path(f"/proc/{entry['pid']}/stat").read_text().rsplit(')', 1)[1].split()
+                if raw[0] != 'Z' and raw[19] == entry['start']:
+                    pids.add(entry['pid'])
+            except (OSError, IndexError):
+                pass
     return pids or None
 
 
@@ -945,6 +962,25 @@ def _udp_holder(listeners, port):
 def _udp_holder_text(holder):
     return (f"{holder['comm']} pid {holder['pid']}"
             if holder['comm'] is not None and holder['pid'] is not None else 'an unknown process')
+
+
+def _owned_room_port(ctx, port):
+    listeners = udp_listeners()
+    if listeners is None:
+        raise RuntimeError(f"frontend_room: cannot read this host's UDP listeners; room port {port} is not verified")
+    pids = _instance_pids(ctx)
+    if pids is None:
+        raise RuntimeError(f'frontend_room: cannot tell which processes belong to this Eden; room port {port} is not verified')
+    bound_ports = sorted({entry['port'] for entry in listeners if entry['pid'] in pids})
+    if int(port) not in bound_ports:
+        message = (f'frontend_room: the room is connected but this Eden listens on UDP {bound_ports}, '
+                   f'not the requested {port}')
+        foreign = _udp_holder([entry for entry in listeners if entry['pid'] is not None and entry['pid'] not in pids],
+                              int(port))
+        if foreign:
+            message += f'; UDP {port} is held by {_udp_holder_text(foreign)}'
+        raise RuntimeError(message)
+    return bound_ports
 
 
 def _frontend_host_wait(ctx, match, cap, port, members=None, confirmation=None, room_name=None):
@@ -1111,6 +1147,17 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     requested_name = room_name
     requested_port = port
 
+    def saved_join_port():
+        saved_port = saved.get('port')
+        if saved_port is not None and saved.get('port_verified') is not True:
+            raise RuntimeError(f'frontend_room: join refuses the saved room port {saved_port}: '
+                               'frontend-room.json does not say it was verified')
+        return saved_port
+
+    def publish_host_port(port, room_name):
+        room_file.write_text(json.dumps({'port': port, 'port_verified': True,
+                                         'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
+
     def reuse(connected, dismissed):
         widget, title, count = connected
         if expected_name is None:
@@ -1122,12 +1169,26 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                          if head is not None and head.find(' - ') != head.rfind(' - ') else '')
             raise RuntimeError(f'frontend_room: this Eden is connected to another room: expected "{expected_name}", '
                                f'saw "{title}"{ambiguous}')
-        return _save(ctx, 'routes-frontend-room', {
-            'role': role, 'port': requested_port if requested_port is not None else saved.get('port'),
+        saved_port = saved_join_port() if role == 'join' and requested_port is None else saved.get('port')
+        if role == 'host' and requested_port is not None and saved_port is not None \
+                and str(requested_port) != str(saved_port):
+            raise RuntimeError(f"frontend_room: this Eden's room was saved with port {saved_port}, "
+                               f'not the requested {requested_port}')
+        port = requested_port if requested_port is not None else saved_port
+        bound_ports, verified = None, None
+        if role == 'host' and port is not None:
+            bound_ports = _owned_room_port(ctx, port)
+            verified = True
+            publish_host_port(port, expected_name)
+        result = {
+            'role': role, 'port': port,
             'nickname': nickname, 'room_name': expected_name, 'ip': ip,
             'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
             'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed, 'game_running': game_running,
-            'confirmed_running_game': None, 'room_matched': True, 'port_verified': None})
+            'confirmed_running_game': None, 'room_matched': True, 'port_verified': verified}
+        if role == 'host':
+            result.update(bound_ports=bound_ports, port_marked_edited=None)
+        return _save(ctx, 'routes-frontend-room', result)
 
     tree = ctx.call('ui.tree', {}) or []
     confirmation = {'game_running': game_running, 'text': None}
@@ -1162,6 +1223,8 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                                    f'not the requested port {requested_port}')
             raise RuntimeError(f'frontend_room: the open Create Room dialog is for room "{dialog_name}" on port '
                                f'{port}, not the requested room "{requested_name}" on port {requested_port}')
+        if role == 'host' and port is None and requested_port is not None:
+            port = requested_port
         nickname = _frontend_dialog_value(ctx, tree, anchor, anchor) or nickname
         _frontend_name('nickname', nickname)
         if role == 'host':
@@ -1179,7 +1242,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         dismissed = None
     else:
         if port is None:
-            port = free_udp_port() if role == 'host' else saved.get('port')
+            port = free_udp_port() if role == 'host' else saved_join_port()
         if port is None:
             raise RuntimeError('frontend_room: join needs a port or the frontend-room.json of this run')
         if role == 'host' and room_name is None:
@@ -1239,20 +1302,13 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, *wait_args,
         confirmation=confirmation, room_name=room_name)
     bound_ports, port_verified = None, None
-    if role == 'host' and port is not None:
-        listeners = udp_listeners()
-        if listeners is not None:
-            pids = _instance_pids(ctx)
-            bound_ports = sorted({entry['port'] for entry in listeners
-                                  if (entry['pid'] in pids if pids is not None
-                                      else (entry['comm'] or '').lower().startswith('eden'))})
-            port_verified = int(port) in bound_ports
-            if not port_verified:
-                raise RuntimeError(f'frontend_room: the room is connected but Eden listens on UDP {bound_ports}, '
-                                   f'not the requested {port}')
-    if role == 'host' and port is not None and room_name is not None:
-        room_file.write_text(json.dumps({'port': port, 'port_verified': port_verified,
-                                         'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
+    if role == 'host':
+        if port is None:
+            raise RuntimeError("frontend_room: cannot determine this Eden's room port; room port is not verified")
+        bound_ports = _owned_room_port(ctx, port)
+        port_verified = True
+        if room_name is not None:
+            publish_host_port(port, room_name)
     result = {'role': role, 'port': port, 'nickname': nickname, 'room_name': room_name, 'ip': ip,
               'evidence': evidence, 'window_title': title, 'member_count': count,
               'already_connected': False, 'reused_dialog': reused_dialog, 'dismissed': dismissed,
