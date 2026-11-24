@@ -3,10 +3,12 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import packet_gate  # noqa: E402
@@ -35,6 +37,13 @@ writeln!(out, "test.only={}", n);
 writeln!(out, "phase={phase}");
 ("wizard.step", fields.wizard_step);
 writeln!(out, "wizard.x={x}\nwizard.y={y}");
+''',
+            'src/model/bridge_events.rs': r'''
+write!(text, "fed p1={} cpu={} run.p1={} run.cpu={} preview={} hides={}", a, b, c, d, e, f);
+write!(text, "hold dir={dir} polls={polls} fires={fires} jump={}");
+write!(text, "room.panel row={row} index={index}");
+write!(text, "room.panel applied partners={partners} behavior={behavior}");
+write!(text, "clip ctx={} total={} in={} out={}");
 ''',
             'src/proto2.rs': ('writeln!(out, "screen={}", screen);\n'
                               'writeln!(out, "ui.focus={}", focus);\n'),
@@ -109,6 +118,162 @@ writeln!(out, "wizard.x={x}\nwizard.y={y}");
         errors = self.errors()
         self.assertEqual(len(errors), 1, errors)
         self.assertIn('no persisted binding menu.play_player in settings.json', errors[0])
+
+    def test_an_undeclared_flown_persisted_chord_is_refused(self):
+        flags_up = [0] * 16
+        flags_up[7] = flags_up[8] = 1
+        flags_left = [0] * 16
+        flags_left[7] = flags_left[10] = 1
+        (self.base / 'settings.json').write_text(json.dumps({
+            'menu': {'input_playback': flags_up, 'play_player': flags_left}}))
+        sample = Path(__file__).parent / 'test-data' / 'i2-play-p1-chord.edenmacro.json'
+        (self.base / 'play.json').write_bytes(sample.read_bytes())
+        self.plan['segments']['play'] = {
+            'file': 'play.json', 'recipe': [{'buttons': 'zr+up', 'frames': 3, 'gap_frames': 8}],
+            'compiled': {'by': 'recipe_macro.py', 'fps': 60, 'min_frames': 2}}
+        errors = self.errors()
+        self.assertIn('G3 segment play: recipe presses ZR+Up but the compiled macro holds ZR+Left', errors)
+        self.assertIn('G3 segment play: presses ZR+Up, the persisted chord of input_playback, without a "binding"',
+                      errors)
+        self.assertIn('G3 segment play: presses ZR+Left, the persisted chord of play_player, without a "binding"',
+                      errors)
+        settings = json.loads((self.base / 'settings.json').read_text())
+        settings['menu']['play_also'] = flags_left
+        (self.base / 'settings.json').write_text(json.dumps(settings))
+        self.assertIn('G3 segment play: presses ZR+Left, the persisted chord of play_also, play_player, '
+                      'without a "binding"', self.errors())
+        segment = self.plan['segments']['play']
+        segment['binding'] = 'play_player'
+        segment['recipe'][0]['buttons'] = 'zr+left'
+        self.assertEqual(self.errors(), [])
+        segment.pop('binding')
+        segment['recipe'][0]['buttons'] = 'a'
+        (self.base / 'play.json').write_text(json.dumps({'events': [{'buttons': 1}, {'buttons': 0}]}))
+        self.assertEqual(self.errors(), [])
+        segment['recipe'][0]['buttons'] = 'b+up'
+        (self.base / 'play.json').write_text(json.dumps({'events': [{'buttons': 8194}, {'buttons': 0}]}))
+        self.assertEqual(self.errors(), [])
+        self.plan['target'].pop('settings')
+        self.assertEqual(self.errors(), [
+            'G3 segment play: presses the chord B+Up but the target names no settings, so its binding cannot be checked'])
+        segment['binding'] = 'play_player'
+        self.assertIn('G3 segment play: presses the chord B+Up but the target names no settings, '
+                      'so its binding cannot be checked', self.errors())
+
+    def test_recorded_recipe_mismatch_warns_when_not_compiled(self):
+        self.plan['segments']['play'] = {'file': 'play.json', 'recipe': [{'buttons': 'a'}]}
+        (self.base / 'play.json').write_text(json.dumps({'events': [{'buttons': 2}, {'buttons': 0}]}))
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertIn('G3 segment play: recipe presses A but the compiled macro holds B', result['warnings'])
+
+    def test_an_event_provider_extracts_each_named_event_key(self):
+        self.plan['rows'][0]['reads'] = ['tr.event:fed run.p1', 'tr.event:fed hides',
+                                         'tr.event:room.panel index', 'tr.event:room.panel partners']
+        self.assertEqual(self.errors(), [])
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/bridge_events.rs'])
+        self.assertTrue({'fed run.p1', 'fed hides', 'room.panel index', 'room.panel partners',
+                         'run.p1', 'hides', 'index', 'partners'} <= keys)
+        self.plan['rows'][0]['reads'] = ['tr.event:fed p2']
+        self.assertIn('tr.event:fed p2 is not written', self.errors()[0])
+        self.plan['rows'][0]['reads'] = []
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    return values.get("room.unknown")\n')
+        self.assertEqual(self.errors(), [])
+
+    def test_hooks_must_import_without_a_previous_hooks_path_change(self):
+        old_path = sys.path[:]
+        self.addCleanup(lambda: sys.path.__setitem__(slice(None), old_path))
+        (self.base / 'helper_for_d3_test.py').write_text('value = 1\n')
+        (self.base / 'first.py').write_text(
+            'import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).parent))\n'
+            'def ok(ctx): return True\n')
+        (self.base / 'second.py').write_text('import helper_for_d3_test\ndef ok(ctx): return True\n')
+        self.plan['rows'][0]['steps'] = [{'run': 'first.py:ok'}, {'run': 'second.py:ok'}]
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('G1 second.py: does not import on its own:', errors[0])
+        self.assertIn('helper_for_d3_test', errors[0])
+        import runner
+        self.plan['start'] = 'main'
+        self.plan['rows'][0].update(start='main', end='main', role='setup')
+        manifest = self.base / 'rows.json'
+        manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertTrue(any(error.startswith('G1 second.py: does not import on its own:') for error in report['errors']))
+        (self.base / 'second.py').write_text(
+            'import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).parent))\n'
+            'import helper_for_d3_test\ndef ok(ctx): return True\n')
+        self.assertEqual(self.errors(), [])
+
+    def test_isolated_import_covers_gate_failure_and_recovery_hooks(self):
+        for name in ('failure', 'recover', 'gate'):
+            (self.base / f'{name}.py').write_text('import missing_d3_sibling\ndef check(*args, **kwargs): pass\n')
+        self.plan['on_failure_hook'] = 'failure.py:check'
+        self.plan['recover'] = [{'run': 'recover.py:check'}]
+        self.plan['gates']['extra'] = {'kind': 'hook', 'module': 'gate.py', 'function': 'check'}
+        self.plan['rows'][0]['steps'] = [{'gate': 'extra'}]
+        errors = self.errors()
+        for module in ('failure.py', 'recover.py', 'gate.py'):
+            self.assertTrue(any(error.startswith(f'G1 {module}: does not import on its own:') for error in errors),
+                            errors)
+        self.assertEqual(len(errors), 3, errors)
+
+    def test_timed_out_isolated_import_reports_its_last_stderr_line(self):
+        error = subprocess.TimeoutExpired(['python'], 60, stderr=b'earlier\nlast useful line\n')
+        errors = []
+        with mock.patch.object(packet_gate.subprocess, 'run', side_effect=error) as run:
+            packet_gate._hooks(self.plan, self.base, errors)
+        self.assertEqual(errors, ['G1 steps.py: does not import on its own: last useful line'])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.kwargs['timeout'], 60)
+        self.assertTrue(run.call_args.kwargs['capture_output'])
+
+    def test_invalid_compiled_button_mask_is_reported_as_g3(self):
+        self.plan['segments']['bad'] = {'file': 'bad.json', 'recipe': [{'buttons': 'a'}]}
+        (self.base / 'bad.json').write_text(json.dumps({'events': [{'buttons': 'not a mask'}]}))
+        errors = self.errors()
+        self.assertTrue(any(error.startswith('G3 segment bad: compiled macro:') for error in errors), errors)
+
+    def test_g5_requires_one_checked_outcome_for_test_rows(self):
+        row = self.plan['rows'][0]
+        row['role'] = 'test'
+        error = ('G5 row r1: a test row with no effect gate, no effect hook, no judged "expected" '
+                 'and no "outcome": "visual"; its PASS would only mean that no step raised')
+        self.assertEqual(self.errors(), [error])
+        row['expected'] = 'a result'
+        self.assertEqual(self.errors(), [error + ' ("expected" is set, but the plan has no judge)'])
+        self.plan['judge'] = {'cmd': 'judge.py'}
+        self.assertEqual(self.errors(), [])
+        row['judge'] = 'skip'
+        self.assertEqual(self.errors(), [error])
+        row.pop('judge')
+        row.pop('expected')
+        self.plan.pop('judge')
+        row['steps'][0]['effect'] = True
+        self.assertEqual(self.errors(), [])
+        row['steps'] = [{'gate': 'fx'}]
+        self.plan['gates']['fx'] = {'kind': 'status', 'effect': True}
+        self.assertEqual(self.errors(), [])
+        self.plan['gates']['fx'].pop('effect')
+        row['steps'][0]['effect'] = True
+        self.assertEqual(self.errors(), [])
+        row['steps'] = [{'run': 'steps.py:ok'}]
+        row['outcome'] = 'visual'
+        self.assertEqual(self.errors(), [])
+        row.pop('outcome')
+        row['role'] = 'setup'
+        self.assertEqual(self.errors(), [])
+
+    def test_g5_blocks_the_real_dry_run(self):
+        import runner
+        self.plan['start'] = 'main'
+        self.plan['rows'][0].update(start='main', end='main', role='test')
+        manifest = self.base / 'rows.json'
+        manifest.write_text(json.dumps(self.plan))
+        report = runner.dry_run(manifest)
+        self.assertEqual(report['result'], 'BROKEN')
+        self.assertTrue(any(error.startswith('G5 row r1:') for error in report['errors']), report['errors'])
 
     def test_a_row_that_reads_a_line_the_build_does_not_write_is_refused(self):
         row = self.plan['rows'][0]
@@ -230,21 +395,55 @@ writeln!(out, "wizard.x={x}\nwizard.y={y}");
         self.assertEqual(self.errors(), [
             'G6 row consumer: needs "partner.behavior=7" but partner.behavior is "1" (set by room)'])
 
+    def test_guard_first_use_gives_a_token_specific_to_its_game(self):
+        self.plan['rows'] = [
+            {'id': 'wizard', 'steps': [{'run': 'fixtures:guard_first_use',
+                                        'args': {'scene': 'training', 'game': 'juggler'}}]},
+            {'id': 'consumer', 'needs': ['guard.ready'], 'steps': []},
+        ]
+        self.assertEqual(self.errors(), [
+            'G6 row consumer: needs "guard.ready": no setup entry and no earlier row gives it'])
+        self.plan['rows'][1]['needs'] = ['practice.ready=juggler']
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['rows']['consumer']['provided_by'], {'practice.ready=juggler': 'wizard'})
+        self.plan['rows'][0]['steps'][0]['args'].pop('game')
+        self.plan['rows'][1]['needs'] = ['guard.ready']
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['rows']['consumer']['provided_by'], {'guard.ready': 'wizard'})
+
     def test_a_hook_that_plays_a_macro_nobody_defines_is_refused(self):
         (self.base / 'steps.py').write_text('def ok(ctx):\n    ctx.play("missing")\n')
         self.assertEqual(self.errors(),
-                         ['G8 steps.py: plays "missing", which is neither a segment of this plan nor a library macro'])
+                         ['G8 steps.py: ctx.play("missing") names no segment of this plan'])
         self.plan['segments']['missing'] = {'file': 'x.json'}
         self.assertEqual(self.errors(), [])
         (self.base / 'steps.py').write_text('def ok(ctx):\n    routes.play(ctx, "tap-a1")\n')
         self.assertEqual(self.errors(), [])
         (self.base / 'steps.py').write_text('def ok(ctx):\n    other.play(ctx, "missing-too")\n')
-        self.assertEqual(self.errors(),
-                         ['G8 steps.py: plays "missing-too", which is neither a segment of this plan nor a library macro'])
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['warnings'],
+                         ['G8 steps.py: 1 play call(s) with a computed name or unknown callee are not checked'])
         (self.base / 'steps.py').write_text('def ok(ctx, name="x"):\n    ctx.play(name)\n    ctx.play(name)\n')
         result = packet_gate.check(self.plan, self.base, self.plan)
         self.assertEqual(result['errors'], [])
-        self.assertEqual(result['warnings'], ['G8 steps.py: 2 play call(s) with a computed name are not checked'])
+        self.assertEqual(result['warnings'],
+                         ['G8 steps.py: 2 play call(s) with a computed name or unknown callee are not checked'])
+
+    def test_play_names_use_the_actual_callees_namespace(self):
+        self.plan['segments']['plan-only'] = {'file': 'plan-only.json'}
+        (self.base / 'steps.py').write_text(
+            'import routes as r\ndef ok(ctx):\n    ctx.play("tap-zr1")\n    r.play(ctx, "plan-only")\n')
+        self.assertEqual(self.errors(), [
+            'G8 steps.py: ctx.play("tap-zr1") names no segment of this plan',
+            'G8 steps.py: routes.play("plan-only") names no routes library macro'])
+        self.plan['segments']['tap-zr1'] = {'file': 'tap-zr1.json'}
+        (self.base / 'steps.py').write_text(
+            'import routes as r\ndef ok(ctx):\n    ctx.play("tap-zr1")\n'
+            '    r.play(ctx, "tap-a1")\n    r.play(ctx, "smash-main")\n')
+        self.assertEqual(self.errors(), [])
 
     def test_a_hook_that_reads_a_key_the_build_does_not_write_is_refused(self):
         (self.base / 'steps.py').write_text(
@@ -278,6 +477,20 @@ writeln!(out, "wizard.x={x}\nwizard.y={y}");
         expected = set(witness) - {'schema'}
         print('extractor keys not in witness:', sorted(keys - expected))
         self.assertEqual(expected - keys, set())
+
+    @unittest.skipUnless(os.environ.get('PACKET_GATE_TR_TREE') and os.environ.get('PACKET_GATE_FED_LOG'),
+                         'recorded fed witness not supplied')
+    def test_recorded_fed_witness(self):
+        keys = packet_gate.emitted_keys(Path(os.environ['PACKET_GATE_TR_TREE']),
+                                        os.environ.get('PACKET_GATE_TR_COMMIT', 'HEAD'),
+                                        ['src/model/bridge_events.rs'])
+        lines = [line for line in Path(os.environ['PACKET_GATE_FED_LOG']).read_text().splitlines() if ' fed p1=' in line]
+        self.assertTrue(lines, 'fed witness has no fed p1 lines')
+        for line in lines:
+            payload = line.split(' fed ', 1)[1]
+            payload = re.sub(r'(?: ev=\d+)? frame=\d+ wall=\d+$', '', payload)
+            expected = {'fed ' + key for key in re.findall(r'(?:^| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', payload)}
+            self.assertEqual(expected - keys, set())
 
 
 if __name__ == '__main__':

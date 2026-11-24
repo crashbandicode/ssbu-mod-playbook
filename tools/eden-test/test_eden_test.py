@@ -59,7 +59,7 @@ FAKE_RUNNER = '''
 import json, sys
 from pathlib import Path
 mode = sys.argv[1]; out = Path(sys.argv[sys.argv.index('--out') + 1]); out.mkdir(parents=True, exist_ok=True)
-if mode == 'dry-run':
+if mode in ('dry-run', 'up-check'):
     print('dry ok'); sys.exit(0)
 (out / 'r1.json').write_text(json.dumps({'status': 'PASS'}))
 fail = (out / 'STOP-INPUT').exists() is False and Path(sys.argv[2]).read_text().count('fail-once')
@@ -767,6 +767,7 @@ class VolatilePinsTests(unittest.TestCase):
                 eden_test.main(['up', str(self.run), '--allow-volatile-pins'])
         self.assertIn('dry run failed', str(caught.exception))
         sh.assert_called_once()
+        self.assertIn('up-check', sh.call_args[0][0])
         lifecycle.assert_not_called()
 
 
@@ -2325,6 +2326,20 @@ class RerunTests(unittest.TestCase):
         (self.run / 'out/r1/sub.json').write_text('{}')
         (self.run / 'out/r1.json').write_text(json.dumps({'id': 'r1', 'status': 'PASS'}))
         (self.run / 'out/STOP-INPUT').write_text('r0')
+
+    def test_bad_admission_preserves_stop_and_previous_receipt_and_row_folder(self):
+        before_receipt = (self.run / 'out/r1.json').read_bytes()
+        before_child = (self.run / 'out/r1/sub.json').read_bytes()
+        with mock.patch.object(eden_test, 'sh', return_value=1) as sh, mock.patch.object(eden_test, 'cmd_pace') as pace:
+            self.assertEqual(eden_test.cmd_run(self.run, retry=True, rows='r1'), 1)
+        self.assertTrue((self.run / 'out/STOP-INPUT').is_file())
+        self.assertEqual((self.run / 'out/STOP-INPUT').read_text(), 'r0')
+        self.assertEqual((self.run / 'out/r1.json').read_bytes(), before_receipt)
+        self.assertEqual((self.run / 'out/r1/sub.json').read_bytes(), before_child)
+        self.assertFalse(list((self.run / 'out').glob('*.rerun-*')))
+        self.assertEqual(sh.call_count, 1)
+        self.assertIn('up-check', sh.call_args[0][0])
+        pace.assert_not_called()
 
     def test_named_rows_are_set_aside_so_a_passed_row_runs_again(self):
         with mock.patch.object(eden_test, 'sh', return_value=0) as sh, mock.patch.object(eden_test, 'cmd_pace'):

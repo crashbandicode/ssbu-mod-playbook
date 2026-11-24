@@ -1,6 +1,7 @@
 """Checked effects, the async judge, the clip check and the consecutive-failure stop rule (judge_queue.py + runner)."""
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -142,6 +143,142 @@ class StatusRules(unittest.TestCase):
 
 
 class RunnerEffects(unittest.TestCase):
+    def hook_run(self, value, *, target=False, effect=False, role='test', outcome=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        step = {'run': 'hooks/result.py:check'}
+        if effect:
+            step['effect'] = True
+        row = {'id': 'a', 'role': role, 'steps': [step]}
+        if outcome:
+            row['outcome'] = outcome
+        r = make_plan(folder, [row], **({'target': {}} if target else {}))
+        (folder / 'hooks/result.py').write_text(f'def check(ctx):\n    return {value!r}\n')
+        self.assertEqual(r.run(), 'DONE')
+        return folder, r
+
+    def record_read(self, folder, still, verdict='PASS', text='the expected text is visible'):
+        return subprocess.run([sys.executable, '-I', '-B', str(HERE / 'runner.py'), 'record-read',
+                               str(folder / 'rows.json'), '--out', str(folder / 'out'), '--rows', 'a',
+                               '--reader', 'reviewer', '--verdict', verdict, '--text', text, '--still', str(still)],
+                              capture_output=True, text=True)
+
+    def test_unverified_hook_markers_never_become_pass_without_a_judge(self):
+        for value, marker in (({'file': None, 'grade': 'NEEDS VISUAL READ'}, 'NEEDS VISUAL READ'),
+                              ({'unverified': 'look at the bar'}, 'look at the bar'),
+                              ({'visual_verdict': 'pending'}, 'pending')):
+            with self.subTest(value=value):
+                folder, _ = self.hook_run(value)
+                r = receipt(folder, 'a')
+                self.assertEqual(r['status'], 'RAN-UNVERIFIED')
+                self.assertEqual((r['gates_status'], r['review'], r['review_kind']), ('PASS', True, 'visual'))
+                self.assertEqual(r['status_reason'], f'hook hooks/result.py:check: {marker}')
+
+    def test_admitted_test_rows_require_a_checked_effect(self):
+        for value, effect, role, status, effects, reason in (
+            (True, False, 'test', 'RAN-UNVERIFIED', [], None),
+            ({'frames': 300}, True, 'test', 'PASS', ['run:hooks/result.py:check'], None),
+            ('a checked result', True, 'test', 'PASS', ['run:hooks/result.py:check'], None),
+            (0, True, 'test', 'PASS', ['run:hooks/result.py:check'], None),
+            (True, True, 'test', 'RAN-UNVERIFIED', [], 'effect hook hooks/result.py:check returned no evidence'),
+            ({}, True, 'test', 'RAN-UNVERIFIED', [], 'effect hook hooks/result.py:check returned no evidence'),
+            ([], True, 'test', 'RAN-UNVERIFIED', [], 'effect hook hooks/result.py:check returned no evidence'),
+            (True, False, 'setup', 'PASS', [], None),
+        ):
+            with self.subTest(value=value, effect=effect, role=role):
+                folder, _ = self.hook_run(value, target=True, effect=effect, role=role)
+                r = receipt(folder, 'a')
+                self.assertEqual((r['status'], r['effects_passed']), (status, effects))
+                if reason:
+                    self.assertEqual(r['status_reason'], reason)
+
+    def test_unverified_effect_hook_is_not_evidence(self):
+        folder, _ = self.hook_run({'unverified': 'read this', 'frames': 300}, target=True, effect=True)
+        r = receipt(folder, 'a')
+        self.assertEqual((r['status'], r['effects_passed']), ('RAN-UNVERIFIED', []))
+        self.assertEqual(r['status_reason'], 'hook hooks/result.py:check: read this')
+
+    def test_a_skipped_judge_cannot_promote_an_unverified_hook(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        r = make_plan(folder, [{'id': 'a', 'judge': 'skip', 'steps': [{'run': 'hooks/result.py:check'}]}],
+                      judge={'cmd': 'judge.py'})
+        (folder / 'hooks/result.py').write_text('def check(ctx): return {"grade": "NEEDS VISUAL READ"}\n')
+        self.assertEqual(r.run(), 'DONE')
+        self.assertEqual(receipt(folder, 'a')['status'], 'RAN-UNVERIFIED')
+
+    def test_a_skipped_judge_cannot_promote_an_effect_hook_without_evidence(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        r = make_plan(folder, [{'id': 'a', 'role': 'test', 'judge': 'skip',
+                                'steps': [{'run': 'hooks/result.py:check', 'effect': True}]}],
+                      judge={'cmd': 'judge.py'}, target={})
+        (folder / 'hooks/result.py').write_text('def check(ctx): return True\n')
+        self.assertEqual(r.run(), 'DONE')
+        result = receipt(folder, 'a')
+        self.assertEqual((result['status'], result['effects_passed']), ('RAN-UNVERIFIED', []))
+        self.assertEqual(result['status_reason'], 'effect hook hooks/result.py:check returned no evidence')
+        self.assertEqual(result['judge'], {'state': 'skipped'})
+
+    def test_unread_visual_row_stays_unverified_on_a_second_run(self):
+        folder, r = self.hook_run({'frames': 300}, target=True, effect=True, outcome='visual')
+        still = folder / 'out/a/still.png'
+        still.write_bytes(b'fixture image')
+        first = receipt(folder, 'a')
+        self.assertEqual((first['status'], first['gates_status'], first.get('review_kind')),
+                         ('RAN-UNVERIFIED', 'PASS', 'visual'))
+        self.assertEqual(first['status_reason'], 'visual read pending')
+        self.assertEqual(first['visual_read'], {'state': 'pending'})
+        self.assertEqual(r.run(), 'DONE')
+        self.assertEqual(receipt(folder, 'a')['status'], 'RAN-UNVERIFIED')
+        self.assertEqual(r.outcomes['a']['status'], 'unverified')
+
+    def test_wrong_text_visual_read_fails_and_cannot_be_promoted(self):
+        folder, _ = self.hook_run(True, outcome='visual')
+        still = folder / 'out/a/still.png'
+        still.write_bytes(b'fixture image')
+        self.assertEqual(receipt(folder, 'a')['status'], 'RAN-UNVERIFIED')
+        result = self.record_read(folder, still, 'FAIL', 'shows 30..127, expected 30..97')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        failed = receipt(folder, 'a')
+        self.assertEqual(failed['status'], 'FAILED')
+        self.assertEqual(failed['visual_read']['text'], 'shows 30..127, expected 30..97')
+        self.assertNotEqual(self.record_read(folder, still).returncode, 0)
+        self.assertEqual(receipt(folder, 'a'), failed)
+
+    def test_record_read_accepts_only_a_pending_visual_receipt_and_owned_still(self):
+        folder, _ = self.hook_run(True, outcome='visual')
+        still = folder / 'out/a/still.png'
+        still.write_bytes(b'fixture image')
+        before = receipt(folder, 'a')
+        self.assertEqual(before['status'], 'RAN-UNVERIFIED')
+        outside = folder / 'outside.png'
+        outside.write_bytes(b'outside')
+        self.assertNotEqual(self.record_read(folder, outside).returncode, 0)
+        self.assertNotEqual(self.record_read(folder, still, text='   ').returncode, 0)
+        self.assertEqual(receipt(folder, 'a'), before)
+        result = self.record_read(folder, still)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = receipt(folder, 'a')
+        self.assertEqual(after['status'], 'PASS')
+        self.assertFalse(after['review'])
+        self.assertEqual(after['visual_read']['still_sha256'], hashlib.sha256(still.read_bytes()).hexdigest())
+        self.assertEqual(after['visual_reads'], [{'state': 'pending'}])
+        changed = {'visual_read', 'visual_reads', 'status', 'status_reason', 'review'}
+        self.assertEqual({key: value for key, value in after.items() if key not in changed},
+                         {key: value for key, value in before.items() if key not in changed})
+        self.assertNotEqual(self.record_read(folder, still).returncode, 0)
+        self.assertEqual(receipt(folder, 'a'), after)
+        plan = json.loads((folder / 'rows.json').read_text())
+        plan['judge'] = {'cmd': 'judge.py'}
+        (folder / 'rows.json').write_text(json.dumps(plan))
+        (folder / 'out/a.json').write_text(json.dumps(before))
+        self.assertNotEqual(self.record_read(folder, still).returncode, 0)
+        self.assertEqual(receipt(folder, 'a'), before)
+
     def test_without_an_effect_gate_a_row_is_ran_unverified_never_pass(self):
         folder = Path(tempfile.mkdtemp())
         r = make_plan(folder, [{'id': 'a', 'steps': [{'gate': 'nav'}, {'gate': 'fx'}]},
@@ -213,6 +350,18 @@ class RunnerEffects(unittest.TestCase):
         self.assertEqual([l.split(' | ')[0] for l in evidence.splitlines() if l.startswith('| p') or l.startswith('| k')],
                          ['| p', '| k'])
         self.assertIn('--rows f,u,e,n', rerun['command'])
+
+    def test_legacy_default_role_with_skipped_judge_and_navigation_gate_passes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        r = make_plan(folder, [{'id': 'a', 'judge': 'skip', 'steps': [{'gate': 'nav'}]}],
+                      require_effect=True, judge={'cmd': 'judge.py'})
+        self.assertEqual(r.run(), 'DONE')
+        result = receipt(folder, 'a')
+        self.assertEqual((result['role'], result['role_source']), ('test', 'default'))
+        self.assertEqual((result['status'], result['judge']['state']), ('PASS', 'skipped'))
+        self.assertEqual(result['status_reason'], 'setup row: judge skipped')
 
     def test_setup_row_with_judge_skip_is_not_judged(self):
         folder = Path(tempfile.mkdtemp())

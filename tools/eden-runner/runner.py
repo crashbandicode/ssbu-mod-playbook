@@ -252,6 +252,10 @@ def expand_library(plan):
     return plan
 
 
+def plan_identity(plan):
+    return None
+
+
 class GifRefused(RuntimeError):
     """The captured GIF breaks its preset. detail is stored on the row receipt."""
 
@@ -1062,7 +1066,7 @@ def dry_run(manifest_path):
     return report
 
 
-def up_check(manifest_path):
+def up_check(manifest_path, config=None):
     report = dry_run(manifest_path)
     if 'target' not in json.loads(manifest_path.read_text()):
         report['errors'].append('packet gate: rows.json has no "target" (the build the rows were checked against)')
@@ -1262,7 +1266,7 @@ class Runner:
     # and step_kind.extra = tuple(step_handlers).
     step_handlers = {}
 
-    def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None, on_failure=None):
+    def __init__(self, manifest_path, instances, out, pace_minutes, client_factory=None, on_failure=None, instances_sha256=None):
         self.manifest_path = manifest_path
         self.base = manifest_path.parent
         self.plan = expand_library(json.loads(manifest_path.read_text()))

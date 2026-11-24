@@ -412,6 +412,11 @@ class FixtureTests(unittest.TestCase):
         gap.pop(45)
         with self.assertRaisesRegex(RuntimeError, '15'):
             fixtures.window_from_wait(gap, 1, 300)
+        initial_wait = [(i, {'entry': '1', 'status': '0', 'situation': '0'}, 'line') for i in range(300)]
+        with self.assertRaisesRegex(RuntimeError, '299 of 300'):
+            fixtures.window_from_wait(initial_wait, 1, 300)
+        initial_wait.append((300, {'entry': '1', 'status': '0', 'situation': '0'}, 'line'))
+        self.assertEqual(len(fixtures.window_from_wait(initial_wait, 1, 300)), 300)
 
     def test_take_t_has_its_jump_at_input_frame_60(self):
         path = routes.ROUTES / 'macros' / 'take-p1-ground-jump.edenmacro.json'
