@@ -86,6 +86,172 @@ class LogCursorTests(unittest.TestCase):
             cursor.wait('never', 0.2)
         self.assertIn('nothing here', str(raised.exception))
 
+    # A held handle blocks the rename on Windows, so only the unheld cursor is replaced there.
+    MODES = (True, False) if os.name != 'nt' else (False,)
+
+    def _replace_with(self, text):
+        """Put another file at the path (a new inode), as a rotation or a rewrite through a temporary file does."""
+        fresh = self.dir / 'replacement.tmp'
+        fresh.write_text(text)
+        os.replace(fresh, self.path)
+
+    def test_an_append_between_the_path_check_and_the_read_is_not_a_truncation(self):
+        # The A1 trace boot of 2026-11-24: the capture appended while the cursor read, the cursor took the larger
+        # read position for a shrunk file and returned the log from its first line again, eleven times.
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('old 1\nold 2\n')
+                cursor = routes.LogCursor(self.path, hold=hold)
+                real_stat, appended = os.stat, []
+
+                def stat_then_append(path, *args, **kwargs):
+                    result = real_stat(path, *args, **kwargs)
+                    if not appended and isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(self.path):
+                        appended.append(True)
+                        with open(self.path, 'a') as f:
+                            f.write('written during the read\n')
+                    return result
+
+                with mock.patch.object(routes.os, 'stat', stat_then_append):
+                    lines = cursor.read()
+                if not appended:  # this mode reads without asking the path first
+                    with open(self.path, 'a') as f:
+                        f.write('written during the read\n')
+                lines += cursor.read()
+                self.assertEqual(lines, ['written during the read'])
+                self.assertEqual(cursor.rotations, 0)
+                cursor.close()
+
+    def test_a_writer_appending_during_fast_polls_gives_every_line_once_in_order(self):
+        import threading
+        wanted = [f'[Bridge] ui screen=stage_select ready=yes ev={n} frame={n}' for n in range(4000)]
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('old 1\nold 2\n')
+                cursor = routes.LogCursor(self.path, hold=hold)
+
+                def write():
+                    with open(self.path, 'ab', buffering=0) as f:
+                        for line in wanted:
+                            f.write(line.encode() + b'\n')
+
+                writer = threading.Thread(target=write)
+                writer.start()
+                got = []
+                while writer.is_alive():
+                    got += cursor.read()
+                writer.join()
+                got += cursor.read()
+                self.assertEqual(len(got), len(wanted))
+                self.assertEqual(got, wanted)
+                self.assertEqual(cursor.rotations, 0)
+                cursor.close()
+
+    def test_wait_ignores_an_old_matching_line_in_a_replaced_log(self):
+        old = 'screen=stage_select ready=yes frame=1013\nscreen=css.smash ready=yes frame=1751\n'
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text(old)
+                cursor = routes.LogCursor(self.path, hold=hold)  # the wait begins here: both lines are old
+                self._replace_with(old)
+                with self.assertRaises(RuntimeError):
+                    cursor.wait('screen=stage_select ready=yes', 0.3)
+                self.assertEqual(cursor.rotations, 1)
+                with self.path.open('a') as f:
+                    f.write('screen=stage_select ready=yes frame=2900\n')
+                found = cursor.wait('screen=stage_select ready=yes', 1)
+                self.assertEqual(found.string, 'screen=stage_select ready=yes frame=2900')
+                cursor.close()
+
+    def test_a_replaced_log_that_kept_the_read_lines_gives_only_the_new_ones(self):
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('old 1\nold 2\n')
+                cursor = routes.LogCursor(self.path, hold=hold)
+                with self.path.open('a') as f:
+                    f.write('read 1\nread 2\n')
+                self.assertEqual(cursor.read(), ['read 1', 'read 2'])
+                self._replace_with('old 1\nold 2\nread 1\nread 2\nnew 1\n')
+                self.assertEqual(cursor.read(), ['new 1'])
+                self.assertEqual(cursor.rotations, 1)
+                cursor.mark()
+                self._replace_with('old 1\nold 2\nread 1\nread 2\nnew 1\n')
+                self.assertEqual(cursor.read(), [])
+                self.assertEqual(cursor.rotations, 2)
+                cursor.close()
+
+    def test_a_long_replaced_log_continues_after_the_lines_already_read(self):
+        long = ''.join(f'[Bridge] ui screen=stage_select ready=yes ev={n} frame={1000 + n}\n' for n in range(400))
+        self.assertGreater(len(long), 3 * 4096)
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text(long)
+                cursor = routes.LogCursor(self.path, hold=hold)
+                self._replace_with(long + 'after the replacement\n')
+                self.assertEqual(cursor.read(), ['after the replacement'])
+                self.assertEqual(cursor.rotations, 1)
+                cursor.close()
+
+    def test_a_rewrite_in_place_with_other_lines_is_read_from_its_start(self):
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('old 1\nold 2\n')
+                cursor = routes.LogCursor(self.path, hold=hold)
+                inode = os.stat(self.path).st_ino
+                with self.path.open('r+') as f:  # the same file, emptied and written again: not smaller than before
+                    f.truncate(0)
+                    f.write('fresh 1\nfresh 2 is longer than the old file\n')
+                self.assertEqual(os.stat(self.path).st_ino, inode)
+                self.assertEqual(cursor.read(), ['fresh 1', 'fresh 2 is longer than the old file'])
+                self.assertEqual(cursor.rotations, 1)
+                with self.path.open('a') as f:
+                    f.write('fresh 3\n')
+                self.assertEqual(cursor.read(), ['fresh 3'])
+                self.assertEqual(cursor.rotations, 1)
+                cursor.close()
+
+    def test_a_partial_line_of_a_replaced_log_is_not_joined_to_the_new_file(self):
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('old 1\n')
+                cursor = routes.LogCursor(self.path, hold=hold)
+                with self.path.open('a') as f:
+                    f.write('cut off')
+                self.assertEqual(cursor.read(), [])
+                self._replace_with('other file\n')
+                self.assertEqual(cursor.read(), ['cut off', 'other file'])
+                cursor.close()
+
+    def test_a_short_log_cut_back_to_lines_already_read_gives_nothing(self):
+        for hold in self.MODES:
+            for replace in (True, False):
+                with self.subTest(hold=hold, replace=replace):
+                    self.path.write_text('old 1\nold 2\n')
+                    cursor = routes.LogCursor(self.path, hold=hold)
+                    if replace:
+                        self._replace_with('old 1\n')
+                    else:
+                        with self.path.open('r+') as f:
+                            f.truncate(len('old 1\n'))
+                    self.assertEqual(cursor.read(), [])
+                    self.assertEqual(cursor.rotations, 1)
+                    with self.path.open('a') as f:
+                        f.write('new 1\n')
+                    self.assertEqual(cursor.read(), ['new 1'])
+                    cursor.close()
+
+    def test_a_long_log_cut_back_before_the_cursors_last_lines_is_read_from_its_start(self):
+        # The limit of the check: the cursor keeps the last 4096 bytes it read, not the whole file.
+        lines = [f'[Bridge] ui screen=stage_select ready=yes ev={n} frame={1000 + n}' for n in range(400)]
+        for hold in self.MODES:
+            with self.subTest(hold=hold):
+                self.path.write_text('\n'.join(lines) + '\n')
+                cursor = routes.LogCursor(self.path, hold=hold)
+                self._replace_with('\n'.join(lines[:3]) + '\n')
+                self.assertEqual(cursor.read(), lines[:3])
+                self.assertEqual(cursor.rotations, 1)
+                cursor.close()
+
 
 class FakeTileGame:
     """A tile grid with the tile cursor's log lines. widths: tiles per row."""
