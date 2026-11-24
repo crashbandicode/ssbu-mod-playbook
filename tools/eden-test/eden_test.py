@@ -1560,6 +1560,18 @@ def row_report(run, row, history):
     return result, reason, proof + [f'out/{name}' for name in asides]
 
 
+def row_stalls(run, row_id, receipt):
+    return []
+
+
+def shown_result(result, stalls):
+    return result
+
+
+def report_rows_with_stalls(run):
+    return [(*row, []) for row in report_rows(run)]
+
+
 def report_rows(run):
     run = Path(run)
     spec = json.loads((run / 'rows' / 'rows.json').read_text())

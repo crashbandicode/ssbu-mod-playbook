@@ -18,6 +18,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eden_test  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'eden-runner'))
+import test_routes as runner_tests  # noqa: E402
 
 
 class FakeMux:
@@ -2930,6 +2932,140 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(sum('| NOT RUN |' in line for line in rows.values()), 15)
         self.assertIn('3 PASS, 1 FAIL, 15 NOT RUN of 19', text)
         self.assertIn('DOWN', text)
+
+
+class ReportStallTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix='eden-report-stall-')
+        self.addCleanup(tmp.cleanup)
+        self.run = Path(tmp.name)
+        (self.run / 'rows').mkdir()
+        (self.run / 'out' / 'r1').mkdir(parents=True)
+        (self.run / 'state').mkdir()
+        self.row = {'id': 'r1', 'steps': [{'run': 'routes:wireless_room'}]}
+        (self.run / 'rows' / 'rows.json').write_text(json.dumps({'rows': [self.row]}))
+        self.config = {
+            'label': 'stall-control', 'host': 'fake',
+            'rows': {'sha256': sha(self.run / 'rows' / 'rows.json')},
+            'instances': [{'key': 'a', 'app': {'path': '/fake', 'sha256': '0' * 64}}],
+        }
+        (self.run / 'config.json').write_text(json.dumps(self.config))
+        (self.run / 'timing.json').write_text(json.dumps({'up_start': 1, 'up_done': 2}))
+
+    def wireless_value(self, lost):
+        fixture = runner_tests.WirelessRoomTests()
+        fixture.setUp()
+        try:
+            fixture.io.form_screen = 'ldn.create'
+            fixture.io.lost_stage_sends = lost
+            with mock.patch.object(runner_tests.routes, '_stall_utc', return_value='2026-11-24T07:14:18+00:00'):
+                value = fixture.run_room()
+            path = fixture.row / 'stall-events.jsonl'
+            journal = path.read_text() if path.exists() else ''
+            return value, journal
+        finally:
+            fixture.doCleanups()
+
+    def write_receipt(self, value, status='PASS', journal=''):
+        receipt = {'id': 'r1', 'status': status, 'results': [
+            {'run': 'routes:wireless_room', 'value': value}]}
+        if status != 'PASS':
+            receipt['error'] = 'route stopped'
+        (self.run / 'out' / 'r1.json').write_text(json.dumps(receipt))
+        if journal:
+            (self.run / 'out' / 'r1' / 'stall-events.jsonl').write_text(journal)
+        return receipt
+
+    def report_row(self):
+        return next(line for line in eden_test.report_md(self.run).splitlines() if line.startswith('| r1 |'))
+
+    def summary(self):
+        with redirect_stdout(io.StringIO()):
+            eden_test.results_md(self.run, self.config)
+        return (self.run / 'RESULTS.md').read_text()
+
+    def test_report_clean_pass_stays_pass(self):
+        value, journal = self.wireless_value(0)
+        self.assertEqual(value['result'], 'PASS')
+        self.assertEqual(value['stalls'], [])
+        self.write_receipt(value, journal=journal)
+        row = self.report_row()
+        self.assertIn('| PASS |', row)
+        self.assertNotIn('stall', row.lower())
+        self.assertIn('1 PASS, 0 FAIL, 0 NOT RUN of 1', eden_test.report_md(self.run))
+        self.assertNotIn('stall', self.summary().lower())
+
+    def test_report_one_lost_input_shows_pass_with_1_stall(self):
+        value, journal = self.wireless_value(1)
+        self.assertEqual(value['result'], 'PASS with 1 stall')
+        event = value['stalls'][0]
+        self.assertEqual((event['kind'], event['step'], event['screen']), ('resend', 'stage-a', 'stage_select'))
+        value['phases'] = {'stage': {'stalls': [dict(event)]}}
+        receipt = self.write_receipt(value, journal=journal)
+        row = self.report_row()
+        self.assertIn('| PASS with 1 stall |', row)
+        self.assertIn('stalls: 1:', row)
+        self.assertIn('resend', row)
+        self.assertIn('stage-a', row)
+        self.assertIn('stage_select', row)
+        self.assertEqual(len(eden_test.row_stalls(self.run, 'r1', receipt)), 1)
+        self.assertEqual(eden_test.row_report(self.run, self.row, {})[0], 'PASS')
+        self.assertEqual(eden_test.report_counts(self.run), {'PASS': 1, 'FAIL': 0, 'NOT RUN': 0})
+        self.assertIn('(1 row passed with stalls, 1 stall in all)', eden_test.report_md(self.run))
+        summary = self.summary()
+        self.assertIn('PASS with 1 stall', summary)
+        self.assertIn('(1 row passed with stalls, 1 stall in all)', summary)
+
+    def test_report_two_distinct_stalls(self):
+        value, journal = self.wireless_value(1)
+        event = dict(value['stalls'][0], step='css-hand', send=2)
+        value['stalls'].append(event)
+        self.write_receipt(value, journal=journal)
+        self.assertIn('| PASS with 2 stalls |', self.report_row())
+        self.assertIn('css-hand', self.report_row())
+        suffix = '(1 row passed with stalls, 2 stalls in all)'
+        self.assertIn(suffix, eden_test.report_md(self.run))
+        self.assertIn(suffix, self.summary())
+
+    def test_report_stopped_row_is_never_relabelled_pass(self):
+        value, journal = self.wireless_value(1)
+        value['result'] = 'STOPPED with 1 stall'
+        self.write_receipt(value, status='FAILED', journal=journal)
+        row = self.report_row()
+        self.assertIn('| FAIL |', row)
+        self.assertNotIn('PASS', row)
+        self.assertIn('stalls: 1:', row)
+        self.assertEqual(eden_test.report_counts(self.run), {'PASS': 0, 'FAIL': 1, 'NOT RUN': 0})
+        summary = self.summary()
+        self.assertIn('FAILED r1', summary)
+        self.assertNotIn('PASS with 1 stall', summary)
+
+    def test_report_stall_only_in_the_jsonl_copy_still_counts(self):
+        value, journal = self.wireless_value(1)
+        value.pop('stalls')
+        value.pop('result')
+        self.write_receipt(value, journal=journal + '{bad json\n')
+        row = self.report_row()
+        self.assertIn('| PASS with 1 stall |', row)
+        self.assertIn('unreadable', row)
+        self.assertIn('stage-a', row)
+
+    def test_shown_result(self):
+        for result, stalls, shown in (
+            ('PASS', [], 'PASS'), ('PASS', [{'step': 'stage-a'}], 'PASS with 1 stall'),
+            ('FAIL', [{'step': 'stage-a'}], 'FAIL'), ('NOT RUN', [{'step': 'stage-a'}], 'NOT RUN'),
+        ):
+            with self.subTest(result=result, stalls=stalls):
+                self.assertEqual(eden_test.shown_result(result, stalls), shown)
+
+    def test_stall_details_are_not_clipped_by_the_reason_limit(self):
+        value, _ = self.wireless_value(1)
+        event = value['stalls'][0]
+        value['stalls'] = [dict(event, step=f'step-{i:02d}') for i in range(30)]
+        self.write_receipt(value)
+        row = self.report_row()
+        self.assertIn('| PASS with 30 stalls |', row)
+        self.assertIn('step-29', row)
 
 
 class RerunTests(unittest.TestCase):
