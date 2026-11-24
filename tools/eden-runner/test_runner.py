@@ -1289,7 +1289,7 @@ class RunnerTests(unittest.TestCase):
                 armed[0] = False
                 raise Cancelled('one-shot STOP')
 
-        def gate(on, name):
+        def gate(on, name, **options):
             calls.append(name)
             if len(calls) == 1:
                 raise RuntimeError('not red')
@@ -1384,6 +1384,7 @@ class RunnerTests(unittest.TestCase):
         run.plan['gates']['red']['cap'] = 40
         run.plan['gates']['blue'] = {**run.plan['gates']['red'], 'recover': None}
         run.plan['segments']['to-red']['start_gate'] = 'blue'
+        del run.plan['segments']['to-red']['sha256']
         checks = []
 
         def check(on, name, **options):
@@ -1400,6 +1401,40 @@ class RunnerTests(unittest.TestCase):
         self.assertAlmostEqual(checks[1][1]['cap'] - checks[2][1]['cap'], 2)
         self.assertEqual(eden.calls.count('macro.play'), 1)
         self.assertEqual(run.row_macro_waits[0]['outcome'], 'requalified, accepted')
+
+    def test_play_library_caps_its_start_gate_recheck_to_the_remaining_budget(self):
+        run, eden, now = self.waiting_run()
+        run.plan['gates']['red']['cap'] = 40
+        entry = {'file': 'segments/to-red.edenmacro.json',
+                 'sha256': sha(self.dir / 'segments/to-red.edenmacro.json'), 'start_gate': 'red'}
+        original = eden.request
+
+        def request(method, params):
+            if method == 'macro.status' and now[0] < 14.2:
+                eden.calls.append(method)
+                return {'ok': True, 'result': {'state': 'playing', 'error': ''}}
+            return original(method, params)
+
+        eden.request = request
+        with mock.patch.object(runner, 'LIBRARY', self.dir), \
+                mock.patch.object(runner, 'library_index', return_value={'segments': {'shared': entry}}), \
+                mock.patch.object(run, 'check_gate_spec', return_value=True) as check:
+            run.play_library('a', 'shared')
+        self.assertEqual(check.call_count, 2)
+        self.assertAlmostEqual(check.call_args_list[1].args[1]['cap'], 15 - now[0])
+        self.assertEqual(run.plan['gates']['red']['cap'], 40)
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+
+    def test_gate_recovery_on_an_idle_channel_keeps_the_existing_fast_path(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['segments']['to-red']['start_gate'] = 'blue'
+        with mock.patch.object(run, 'check_gate', side_effect=[RuntimeError('not red'), True]) as check:
+            run.gate('a', 'red')
+        self.assertEqual([call.args[1] for call in check.call_args_list], ['red', 'red'])
+        self.assertEqual(eden.calls.count('macro.play'), 1)
+        self.assertEqual(getattr(run, 'row_macro_waits', []), [])
 
     def test_a_rejected_dispatch_after_requalification_is_recorded_as_rejected(self):
         run, eden, _ = self.waiting_run()

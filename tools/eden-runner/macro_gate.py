@@ -82,8 +82,8 @@ def dispatch(call, path, *, name, requalify=None, until=None, on_event=None, not
     deadline = min(started + IDLE_CAP, until) if until is not None else started + IDLE_CAP
     waits, why, waited = 0, 'macro.status slow', False
 
-    def emit(outcome):
-        event = {'kind': 'idle-wait', 'step': name, 'seconds': time.monotonic() - started,
+    def emit(outcome, ended=None):
+        event = {'kind': 'idle-wait', 'step': name, 'seconds': (time.monotonic() if ended is None else ended) - started,
                  'waits': waits, 'why': why, 'outcome': outcome}
         if on_event is not None:
             try:
@@ -132,31 +132,45 @@ def dispatch(call, path, *, name, requalify=None, until=None, on_event=None, not
         if requalify is None:
             reject('not sent: no witness to requalify after the wait')
         if requalify is BLIND:
-            outcome = 'sent: the caller declared no witness'
+            how = 'the caller declared no witness'
         else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reject('not sent: the bound passed during requalification')
             try:
-                needed = requalify()
+                needed = requalify(remaining)
             except Exception as error:
                 if stop(error, check) or is_stop is not None and is_stop(error):
                     raise
                 check_cancelled()
                 emit(f'not sent: {error}')
                 raise
-            if until is not None and time.monotonic() >= until:
-                reject("not sent: the caller's bound passed while waiting")
+            if time.monotonic() >= deadline:
+                reject('not sent: the bound passed during requalification')
             if not needed:
                 emit('not sent: no longer needed')
                 return False
-            outcome = 'requalified, sent'
+            how = 'requalified'
         check_cancelled()
-        emit(outcome)
-    if until is not None and time.monotonic() >= until:
-        raise closed_loop.DispatchRejected(f'macro {name} not sent: the caller\'s bound passed while waiting')
+    if time.monotonic() >= deadline:
+        if waited:
+            reject('not sent: the bound passed during requalification' if requalify is not BLIND
+                   else "not sent: the caller's bound passed while waiting")
+        raise closed_loop.DispatchRejected(f'macro {name} not sent: the input bound passed')
+    dispatch_started = time.monotonic()
     try:
         call('macro.play', {'path': str(path)})
     except Exception as error:
         message = str(error).lower()
-        if 'input_busy' in message or 'macro.play busy' in message:
+        if isinstance(error, closed_loop.DispatchRejected) or 'input_busy' in message or 'macro.play busy' in message:
+            if waited:
+                emit(f'{how}, rejected: {error}', dispatch_started)
+            if isinstance(error, closed_loop.DispatchRejected):
+                raise
             raise closed_loop.DispatchRejected(str(error)) from error
+        if waited:
+            emit(f'{how}, delivery unknown: {error}', dispatch_started)
         raise
+    if waited:
+        emit(f'{how}, accepted', dispatch_started)
     return True

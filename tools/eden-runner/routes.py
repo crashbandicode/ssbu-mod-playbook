@@ -2309,8 +2309,8 @@ def fixture(ctx, p1=None, cpu=None, stage=None, reset=True, damage=0.0, lr=None,
     before = read_state(ctx)
     out['before'] = before
     if reset:
-        def requalify():
-            if read_state(ctx) != before:
+        def requalify(remaining):
+            if read_state(ctx, cap=min(6.0, remaining)) != before:
                 raise closed_loop.DispatchRejected('reset-lra not sent: fixture changed while the input channel was busy')
             return True
 

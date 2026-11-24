@@ -226,6 +226,23 @@ class PlayIdleTests(unittest.TestCase):
         self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'],
                          'not sent: no witness to requalify after the wait')
 
+    def test_fixture_requalifies_with_the_remaining_budget(self):
+        class StopAfterCheck(Exception):
+            pass
+
+        sample = {'sample': 'same'}
+
+        def play(ctx, name, *, requalify):
+            self.assertTrue(requalify(1.25))
+            raise StopAfterCheck
+
+        with mock.patch.object(routes, 'expected', return_value={}), \
+                mock.patch.object(routes, 'read_state', return_value=sample) as read, \
+                mock.patch.object(routes, 'play', side_effect=play):
+            with self.assertRaises(StopAfterCheck):
+                routes.fixture(self.ctx)
+        self.assertEqual(read.call_args_list, [mock.call(self.ctx), mock.call(self.ctx, cap=1.25)])
+
     def test_a_stop_during_the_idle_gate_propagates_at_once(self):
         class StopRun(Exception):
             pass

@@ -278,3 +278,31 @@ class MacroGateTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(len(self.events), 1)
         self.assertEqual(self.events[0]['outcome'], 'requalified, delivery unknown: socket closed')
+
+    def test_an_already_typed_rejection_is_not_reported_as_delivery_unknown(self):
+        original = self.call
+
+        def call(method, params=None):
+            if method == 'macro.play':
+                raise closed_loop.DispatchRejected('refused')
+            return original(method, params)
+
+        with mock.patch.object(self, 'call', side_effect=call):
+            with self.assertRaisesRegex(closed_loop.DispatchRejected, 'refused'):
+                self.dispatch(requalify=lambda remaining: True)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]['outcome'], 'requalified, rejected: refused')
+
+    def test_dispatch_event_is_not_emitted_before_macro_play_resolves(self):
+        original = self.call
+
+        def call(method, params=None):
+            if method == 'macro.play':
+                self.assertEqual(self.events, [])
+            return original(method, params)
+
+        with mock.patch.object(self, 'call', side_effect=call):
+            self.assertTrue(self.dispatch(requalify=lambda remaining: True))
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]['outcome'], 'requalified, accepted')

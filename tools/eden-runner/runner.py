@@ -143,6 +143,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+import closed_loop  # noqa: E402
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
 import macro_gate  # noqa: E402
@@ -1766,8 +1767,8 @@ class Runner:
                 f'segment {name} has no sha256; refusing to play an unhashed recording ({path.name})')
         if digest(path) != seg['sha256']:
             raise RuntimeError(f'segment {name} changed since the dry run')
-        def requalify():
-            self.check_gate(on, seg['start_gate'])
+        def requalify(remaining):
+            self.check_gate(on, seg['start_gate'], cap=remaining)
             return True
 
         witness = requalify if seg.get('start_gate') else macro_gate.BLIND
@@ -1909,21 +1910,36 @@ class Runner:
                 if seg.get('sha256') and digest(path) != seg['sha256']:
                     raise RuntimeError(f'segment {gate["recover"]} changed since the dry run')
 
-                def still_needed():
+                def still_needed(remaining):
+                    started = time.monotonic()
                     try:
-                        self.check_gate(on, name)
+                        self.check_gate(on, name, cap=remaining)
                     except RuntimeError as error:
                         if macro_gate.stop(error, self.check_stop):
                             raise
-                        return True
-                    return False
+                    else:
+                        return False
+                    start_gate = seg.get('start_gate')
+                    left = remaining - (time.monotonic() - started)
+                    if start_gate and left > 0:
+                        try:
+                            self.check_gate(on, start_gate, cap=left)
+                        except Exception as error:
+                            if isinstance(error, StopRun) or macro_gate.stop(error, self.check_stop):
+                                raise
+                            raise closed_loop.DispatchRejected(
+                                f'recovery segment {gate["recover"]} not sent: start gate {start_gate} failed: '
+                                f'{error}') from error
+                    return True
 
                 if self.dispatch_macro(on, path, name=gate['recover'], requalify=still_needed):
                     self.wait_macro(on, seg.get('cap', 60))
 
-    def check_gate(self, on, name):
+    def check_gate(self, on, name, *, cap=None):
         self._gate_evidence = True
         gate = self.plan['gates'][name]
+        if cap is not None:
+            gate = {**gate, 'cap': min(gate['cap'], cap)}
         self._arm_frames = True
         self._gate_baseline = None
         self._gate_latest = None
@@ -2557,8 +2573,8 @@ class Runner:
         if start_gate:
             self.gate(on, entry['start_gate'])
 
-        def requalify():
-            self.check_gate(on, start_gate)
+        def requalify(remaining):
+            self.check_gate(on, start_gate, cap=remaining)
             return True
 
         if self.dispatch_macro(on, path, name=name, requalify=requalify if start_gate else macro_gate.BLIND):

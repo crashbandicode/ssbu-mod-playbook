@@ -328,7 +328,8 @@ class BridgePickerIO:
         self.pending[self.ctx.on] = (segment, str(getattr(self.ctx, 'row_dir', None)))
         witness = dict(self.witness)
 
-        def requalify():
+        def requalify(remaining):
+            deadline = time.monotonic() + remaining
             self.in_flight = False
             old_receive = self.__dict__.get('_receive')
             receive = self._receive
@@ -344,7 +345,9 @@ class BridgePickerIO:
                 self._receive = observe_receive
             try:
                 for provider, previous in witness.items():
-                    cap = 2.0 if until is None else min(2.0, until - time.monotonic())
+                    cap = min(2.0, deadline - time.monotonic())
+                    if until is not None:
+                        cap = min(cap, until - time.monotonic())
                     if cap <= 0:
                         raise closed_loop.DispatchRejected(
                             f'{segment} not sent: {provider} changed while the input channel was busy: deadline')

@@ -92,10 +92,12 @@ Look for the current screen and start there; wait for the step's fresh ready obs
 A route starting on a recognised but unready screen waits in that screen's step and stops there, not on `locate`,
 if readiness never arrives; this was found by replaying `rc15-i2-71158421-xps-stop-1`.
 The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,
-with one 15-second budget or the caller's earlier deadline.
+with one 15-second budget or the caller's earlier deadline, including requalification.
 After a wait, bridge IO re-reads the caller's observations and sends only if they are unchanged and its original
 deadline has not passed. A caller without a witness sends nothing after a wait unless it declares `BLIND`.
-Every wait records one stall event, including when nothing is sent. The wireless engine owns its own wait.
+After a wait, recovery requires both the failed gate to remain failed and the recovery segment's own start gate
+to pass when it declares one. Every wait records one stall event, including when nothing is sent; dispatched events
+say whether the call was accepted, rejected or had an unknown delivery outcome. The wireless engine owns its own wait.
 STOP interrupts the idle gate, including a status poll or requalification, without sending or recording a busy stall.
 Eden's `error` state is inactive and releases input; its failure text is retained in the wireless receipt or play log.
 `idle` also releases input, as does `finished` without an error. `countdown`, `recording`, `playing`, and `branch_playing`
