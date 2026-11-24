@@ -1150,6 +1150,9 @@ class EdenTestTests(unittest.TestCase):
         self.rows = self.dir / 'rows-src'
         self.rows.mkdir()
         (self.rows / 'rows.json').write_text('{"setup": [{"state": "Training", "via": "segment", "ref": "s1"}], "rows":[]}')
+        shared = eden_test.RUNS / '_eden-test/base.json'  # these fixtures run as the yoga host
+        shared.parent.mkdir(parents=True)
+        shared.write_text(self.previous.read_text())
         interface_check = mock.patch.object(eden_test, 'host_interface_problem', return_value=None, create=True)
         self.interface_check = interface_check.start()
         self.addCleanup(interface_check.stop)
@@ -1871,7 +1874,7 @@ class EdenTestTests(unittest.TestCase):
     def test_go_local_records_invocation_token(self):
         token = 'd' * 32
         shared = eden_test.RUNS / '_eden-test/base.json'  # a go with a token was sent to this host: it has the base
-        shared.parent.mkdir(parents=True)
+        shared.parent.mkdir(parents=True, exist_ok=True)
         shared.write_text(self.previous.read_text())
         with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
             self.assertEqual(eden_test.main(self.go_args()[:-2] + ['--token', token]), 0)
@@ -1890,7 +1893,7 @@ class EdenTestTests(unittest.TestCase):
         second['key'] = 'b'
         base['instances'].append(second)
         default = eden_test.RUNS / '_eden-test/base.json'
-        default.parent.mkdir(parents=True)
+        default.parent.mkdir(parents=True, exist_ok=True)
         default.write_text(json.dumps(base))
         free = mock.Mock(return_value=6991)
         fake_routes = types.SimpleNamespace(free_port=free)
@@ -2210,6 +2213,7 @@ class EdenTestTests(unittest.TestCase):
         self.assert_refused_here(result, mocks, 'AppImage', sha(other)[:12], str(shared))
 
     def test_received_go_without_this_hosts_base_is_refused_here(self):
+        (eden_test.RUNS / '_eden-test/base.json').unlink()
         result, _, mocks = self.received()
         self.assert_refused_here(result, mocks, 'base.json', 'missing')
         shared, _ = self.host_bases()
@@ -2319,7 +2323,6 @@ class EdenTestTests(unittest.TestCase):
 
     def test_an_unreadable_shared_base_stops_a_typed_go_by_name(self):
         shared = eden_test.RUNS / '_eden-test/base.json'
-        shared.parent.mkdir(parents=True)
         for body in ('{"host": ', '{"instances": []}', '[]'):
             shared.write_text(body)
             for extra in ([], ['--from', str(self.previous)], ['--ssh', 'tr-yoga']):
@@ -2331,16 +2334,34 @@ class EdenTestTests(unittest.TestCase):
                     mocks.new.assert_not_called()
                     mocks.remote.assert_not_called()
 
-    def test_a_machine_without_a_shared_base_or_a_route_runs_a_local_base_as_before(self):
-        result, mocks = self.typed_go(self.go_args())
-        self.assertEqual(str(result), 'go_new called')
-        mocks.remote.assert_not_called()
+    def test_a_machine_without_a_shared_base_is_not_a_host_whatever_the_go_names(self):
+        # rv-fusion-g4, 2026-11-24 08:09Z: no shared base and no route; the copy names yoga. The Surface is such a
+        # machine. A file the go names is no evidence of which machine this is.
+        shared = eden_test.RUNS / '_eden-test/base.json'
+        shared.unlink()
         broken = self.dir / 'broken.json'
         broken.write_text('{"host": ')
-        result, mocks = self.typed_go(self.go_args()[:-2] + ['--from', str(broken)])
-        self.assertIsInstance(result, SystemExit)
-        self.assertIn(str(broken), str(result))
+        for extra in ([], ['--from', str(self.previous)], ['--from', str(broken)],
+                      ['--from', str(self.dir / 'no-such-file.json')]):
+            with self.subTest(extra=extra):
+                result, mocks = self.typed_go(self.go_args()[:-2] + extra)
+                self.assertIsInstance(result, SystemExit)
+                mocks.new.assert_not_called()
+                mocks.remote.assert_not_called()
+                mocks.up.assert_not_called()
+                mocks.sh.assert_not_called()
+                text = str(result)
+                self.assertIn(str(shared), text)
+                self.assertIn("'yoga'", text)
+                self.assertIn('--ssh', text)
+                self.assertIn('nothing was started', text)
+        self.assertFalse((eden_test.RUNS / 'go-1').exists())
+        result, mocks = self.typed_go(self.go_args()[:-2] + ['--from', str(broken), '--ssh', 'tr-yoga'])
+        self.assertEqual(str(result), 'sent to the host')  # with a route the go is sent; the file is not opened
         mocks.new.assert_not_called()
+        shared.write_text(self.previous.read_text())
+        result, mocks = self.typed_go(self.go_args())
+        self.assertEqual(str(result), 'go_new called')  # the host itself, with its shared base back
         mocks.remote.assert_not_called()
 
     def test_go_host_mismatch_without_remote_mapping_names_host_and_map(self):
@@ -2720,7 +2741,7 @@ class EdenTestTests(unittest.TestCase):
 
     def test_go_remote_uses_host_map_and_file_rows(self):
         hosts = eden_test.RUNS / '_eden-test/hosts.json'
-        hosts.parent.mkdir(parents=True)
+        hosts.parent.mkdir(parents=True, exist_ok=True)
         hosts.write_text(json.dumps({'xps': 'mapped-xps'}))
         rowfile = self.rows / 'rows.json'
         def fake_sh(command, log=None):
