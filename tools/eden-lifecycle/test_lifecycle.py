@@ -1148,6 +1148,13 @@ class LifecycleTests(unittest.TestCase):
         self.controller().up()
         self.assertEqual(self.controller().down()['phase'], 'down')
 
+    def test_staged_targets_survive_validation_and_journal_reopen(self):
+        self.config['staged_targets'] = ['a' * 40, 'b' * 40]
+        self.assertEqual(life.validate(self.config)['staged_targets'], self.config['staged_targets'])
+        self.controller().up()
+        self.assertEqual(self.state()['config']['staged_targets'], self.config['staged_targets'])
+        self.assertEqual(self.controller().down()['phase'], 'down')
+
     def test_down_is_idempotent_and_no_second_release(self):
         c = self.controller()
         c.up()

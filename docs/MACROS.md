@@ -395,6 +395,12 @@ repositories as `{"name": {"tree": "/absolute/path", "commit": "<40 hex>"}}`;
 names in its `repo` field, but may not redefine a built-in provider. A legacy
 entry with the same repository and files (in any order), and matching optional
 extraction settings, is ignored with a warning and uses the built-in instead.
+Remote `go` stages the exact named commits under
+`RUNS/_eden-test/stage/<label>/targets/<commit>` without rewriting rows.
+When that tree exists, G2 reads it instead of the producer path and requires
+HEAD to match the commit and the checkout to be clean, including untracked
+and ignored files. Without a staged tree, G2 keeps using the named producer
+tree and permits its working checkout to be dirty.
 The trees are absolute Git
 directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is

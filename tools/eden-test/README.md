@@ -21,6 +21,18 @@ The receipt is in `config.json` (`card_lineup`, `staged_plugins`, `superseded_ba
 `go` and `up` need a `target` in the rows; see [Packet gate](../../docs/MACROS.md#packet-gate).
 `run` checks packet admission before it moves `STOP-INPUT` or earlier row evidence aside.
 On an Eden host the default folder does not exist, so `go` needs `--card-lineup <dir>`; remote dispatch copies the lineup and passes it.
+Remote `go` also packs each named target commit without modifying its producer
+repository and stages a read-only checkout under the run's owned stage path.
+Hosts keep a commit-addressed cache; subsequent runs hardlink the checkout
+instead of transferring it again. The packet itself is unchanged; the run
+config records the commits that must be gated from staged trees. A run made
+with `new --from` a remote run's config retains that requirement: for each
+commit, first run `eden_test.py stage-target --commit SHA --label NEW_LABEL`
+on the host, using the shipped tool from the original run. A cached target
+stages in seconds. Once a run
+no longer needs its target trees, run this on that host, replacing `LABEL`
+with the run label; it removes the run's trees but retains the cache:
+`/usr/bin/python3 -I -B /home/intpa/eden-runs/_eden-test/stage/LABEL/tools/eden-test/eden_test.py unstage-targets --label LABEL`.
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 The repository does not ship a `base.json` template; it is maintained on
 each host. Add `"notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md",
