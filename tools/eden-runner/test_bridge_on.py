@@ -1,5 +1,6 @@
 import fcntl
 import json
+import os
 import re
 import socket
 import subprocess
@@ -73,6 +74,7 @@ class BridgeOnTests(unittest.TestCase):
         self.bridge_requests = []
         self.ready_at = None
         self.chord_started = None
+        self.toggle_enabled = True
 
     def call(self, name, args=None):
         self.calls.append((name, args))
@@ -97,7 +99,7 @@ class BridgeOnTests(unittest.TestCase):
             if STUB_EVENTS[1] not in self.events.read_text():
                 with self.events.open('a') as stream:
                     stream.write(STUB_EVENTS[1] + '\n')
-        if (self.chord_started is not None and self.seconds - self.chord_started >= 3.1
+        if (self.toggle_enabled and self.chord_started is not None and self.seconds - self.chord_started >= 3.1
                 and len([c for c in self.calls if c[0] == 'input.button']) >= 4):
             listening, on = STUB_EVENTS[2:] if self.stub else (LISTENING, ON)
             if on not in self.events.read_text():
@@ -134,10 +136,14 @@ class BridgeOnTests(unittest.TestCase):
         with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
             stream.write(sample)
 
-    def sample(self, *, active='yes', boot=STUB_BOOT, screen='title'):
+    def sample(self, *, active='yes', boot=STUB_BOOT, screen='title', fields=None):
         text = STUB_UI.replace(STUB_BOOT, boot)
         text = text.replace('observation.active=yes', f'observation.active={active}')
         text = text.replace('screen=title', f'screen={screen}')
+        for key, value in (fields or {}).items():
+            pattern = r'(\[Bridge\] state\.\d+ ' + re.escape(key) + r'=).*?( frame=\d+ wall=\d+)$'
+            text, count = re.subn(pattern, lambda m: m[1] + value + m[2], text, flags=re.MULTILINE)
+            self.assertEqual(count, 1, key)
         lines = text.splitlines()
         payload = [state_gate.SUFFIX.sub('', line).split(' ', 2)[2]
                    for line in lines if re.search(r'\[Bridge\] state\.\d+ ', line)]
@@ -147,7 +153,18 @@ class BridgeOnTests(unittest.TestCase):
         self.assertIsNotNone(block)
         self.assertEqual((block['boot'], block['values']['observation.active'], block['values']['screen']),
                          (boot, active, screen))
+        for key, value in (fields or {}).items():
+            self.assertEqual(block['values'][key], value)
         return text
+
+    def opening(self):
+        return self.sample(fields={'screen.context': 'opening', 'focus': 'title.opening_playback',
+                                   'focus.id': 'opening_playback'})
+
+    def title_without_prompt(self):
+        return self.sample(fields={'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
+                                   'focus.index': 'unknown', 'focus.label': 'unknown',
+                                   'input.owner': 'unknown', 'dialog': 'unknown'})
 
     def invoke(self, **kwargs):
         with patch('time.monotonic', side_effect=lambda: self.seconds), \
@@ -271,6 +288,8 @@ class BridgeOnTests(unittest.TestCase):
         self.configure_stub()
         self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
         self.journal.unlink()
+        prior = self.row / 'routes-bridge-on-prior.json'
+        prior.write_text(json.dumps({'witness': 'trace', 'chord': {'event': STUB_EVENTS[3]}}))
         run = self.out / 'bridge-run'
         run.mkdir()
         (run / 'bridge.log').write_text(STUB_PREAMBLE)
@@ -280,12 +299,123 @@ class BridgeOnTests(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             receipt = self.invoke(port=6980)
         title_read.assert_not_called()
-        self.assertEqual(receipt['title'], {'checked': False, 'reason': 'bridge already On before this call'})
+        self.assertEqual(receipt['title'], {
+            'checked': False, 'reason': 'bridge already On before this call',
+            'qualified_by': {'receipt': str(prior), 'witness': 'trace', 'title': None}})
         self.assertEqual(receipt['chord']['chord'], 'already on')
         self.assertTrue(receipt['reused'])
         self.assertEqual(self.popen, [])
         self.assertEqual(self.bridge_requests, [])
         self.assertFalse(any(method == 'input.button' for method, _ in self.calls))
+
+    def test_bridge_on_stub_on_title_record_has_the_checked_blocks_frame(self):
+        self.configure_stub()
+        receipt = self.invoke(port=6980)
+        title = receipt['title']
+        self.assertEqual((title.get('frame'), title['rev'], title['matched']), (31, 4, 'prompt'))
+        self.assertEqual(title.get('wall'), 474261702)
+        self.assertIsInstance(title.get('frame'), int)
+        self.assertIsInstance(title.get('wall'), int)
+        self.assertEqual(receipt['chord']['pre_chord']['status'], self.status)
+        self.assertEqual(receipt['chord']['pre_chord']['journal']['inputs_after_load'], 0)
+
+    def test_bridge_on_stub_on_does_not_accept_the_title_without_its_prompt(self):
+        self.configure_stub()
+        self.stub_samples, self.stub_default = [self.title_without_prompt()], ''
+        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title.*rev=4 frame=31'):
+            self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_does_not_accept_the_opening_playback(self):
+        self.configure_stub()
+        self.stub_samples, self.stub_default = [self.opening()], ''
+        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 180 s.*title/title.opening_playback.*rev=4 frame=31'):
+            self.invoke(port=6980)
+        self.assertGreaterEqual(self.seconds, 180)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_waits_through_the_opening_for_the_prompt(self):
+        self.configure_stub()
+        self.stub_samples = [self.opening()] + [''] * 110 + [STUB_UI]
+        self.stub_default = ''
+        receipt = self.invoke(port=6980)
+        self.assertEqual(receipt['title']['matched'], 'prompt')
+        self.assertGreater(receipt['title'].get('waited_s', 0), 10)
+        self.assertEqual(receipt['title'].get('not_yet'), [{
+            'rev': 4, 'frame': 31, 'screen': 'title', 'screen.context': 'opening',
+            'focus': 'title.opening_playback'}])
+
+    def test_bridge_on_stub_on_resets_prompt_deadline_after_opening_handoff(self):
+        self.configure_stub()
+        self.stub_samples = [self.opening()] + [''] * 110 + [self.title_without_prompt()]
+        self.stub_default = ''
+        with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
+            self.invoke(port=6980)
+        self.assertGreater(self.seconds, 20)
+        self.assertLess(self.seconds, 30)
+
+    def test_bridge_on_stub_on_already_on_without_a_qualified_receipt_refuses(self):
+        self.configure_stub()
+        self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
+        self.journal.unlink()
+        prior = self.row / 'routes-bridge-on-invalid.json'
+        for contents in (None, '{not-json}', json.dumps({'witness': 'stub-on',
+                         'chord': {'chord': 'pad', 'event': STUB_EVENTS[3], 'pre_chord': {}}, 'title': {}}),
+                         json.dumps({'witness': 'trace', 'chord': {'event': 'another event'}})):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    prior.unlink(missing_ok=True)
+                else:
+                    prior.write_text(contents)
+                with self.assertRaisesRegex(RuntimeError, r'bridge is already On .*no qualified bridge_on receipt'):
+                    self.invoke(port=6980)
+                self.assertEqual(self.popen, [])
+                self.assertFalse(any(method == 'input.button' for method, _ in self.calls))
+
+    def test_bridge_on_stub_on_already_on_links_the_qualified_receipt(self):
+        self.configure_stub()
+        first = self.invoke(port=6980)
+        prior = self.row / 'routes-bridge-on.json'
+        self.assertTrue(prior.is_file())
+        presses = len([1 for method, args in self.calls if method == 'input.button' and args['state'] == 'press'])
+        run = self.out / 'bridge-run'
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            second = self.invoke(port=6980)
+        qualified = second['title'].get('qualified_by', {})
+        self.assertEqual(qualified.get('receipt'), str(prior))
+        self.assertEqual(qualified.get('title'), first['title'])
+        self.assertFalse(second['title']['checked'])
+        self.assertEqual(json.loads(prior.read_text()), first)
+        self.assertEqual(len([1 for method, args in self.calls
+                              if method == 'input.button' and args['state'] == 'press']), presses)
+
+    def test_bridge_on_stub_on_already_on_chooses_newest_qualified_receipt(self):
+        self.configure_stub()
+        self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
+        older = self.row / 'routes-bridge-on.json'
+        newer = self.row / 'routes-bridge-on-2.json'
+        corrupt = self.row / 'routes-bridge-on-3.json'
+        older.write_text(json.dumps({'witness': 'trace', 'chord': {'event': STUB_EVENTS[3]}}))
+        newer.write_text(json.dumps({'witness': 'stub-on',
+            'chord': {'event': STUB_EVENTS[3], 'chord': 'pad', 'pre_chord': {}},
+            'title': {'matched': 'prompt', 'frame': 31}}))
+        corrupt.write_text('{bad')
+        for index, path in enumerate((older, newer, corrupt), 1):
+            os.utime(path, ns=(index * 1_000_000_000, index * 1_000_000_000))
+        receipt = self.invoke(port=6980)
+        self.assertEqual(receipt['chord'].get('qualified_by', {}).get('receipt'), str(newer))
+        self.assertEqual(receipt['title'].get('qualified_by', {}).get('title', {}).get('frame'), 31)
+
+    def test_bridge_on_stub_on_no_toggle_stops_without_a_retry(self):
+        self.configure_stub()
+        self.toggle_enabled = False
+        with self.assertRaisesRegex(routes.BridgeOnChordHoldError, 'no toggle within 6 s'):
+            self.invoke(port=6980)
+        self.assertEqual(len([1 for method, args in self.calls
+                              if method == 'input.button' and args['state'] == 'press']), 4)
+        self.assertIsNone(json.loads((self.row / 'chord-hold-1.json').read_text())['event'])
+        self.assertEqual(self.popen, [])
 
     def test_bridge_on_stub_on_rejects_first_active_main_before_title_in_one_read(self):
         self.configure_stub()
