@@ -508,8 +508,9 @@ freshness is `unverified` and remains usable; that is not frame-freshness proof.
 The judge is shown only usable row stills and clip frames; excluded stills are
 listed in the job and the receipt. A judged row with no usable image is
 unverified. A verdict is taken only from a judge run that exited successfully
-and wrote it in that run; earlier verdict files are kept as
-`verdict.attempt-<n>.json`.
+and wrote it in that run. A new pass withdraws the previous verdict first; a
+pass that does not finish leaves the row unverified. Earlier results are kept
+as `verdict.attempt-<n>.json` and `done.attempt-<n>.json`.
 The still's own recorded path selects its capture; otherwise use
 `--capture <row>:<file>` to name its source, or omit it when the hash matches
 exactly one capture. An ambiguous hash is refused.

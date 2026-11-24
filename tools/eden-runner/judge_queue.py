@@ -333,13 +333,34 @@ def apply_verdict(receipt, check, verdict, frames, known=None, shots=None, all_s
 
 
 # ---- the worker ----------------------------------------------------------------------------------------------------
-def archive_verdict(folder):
-    out = Path(folder) / 'verdict.json'
+def archive_verdict(folder, name='verdict'):
+    out = Path(folder) / f'{name}.json'
     if out.exists():
         attempt = 1
-        while (Path(folder) / f'verdict.attempt-{attempt}.json').exists():
+        while (Path(folder) / f'{name}.attempt-{attempt}.json').exists():
             attempt += 1
-        out.rename(Path(folder) / f'verdict.attempt-{attempt}.json')
+        out.rename(Path(folder) / f'{name}.attempt-{attempt}.json')
+
+
+def mark_retry(receipt_path):
+    try:
+        current = json.loads(Path(receipt_path).read_text())
+    except (OSError, ValueError):
+        return
+    judge = current.get('judge') if isinstance(current, dict) else None
+    if not isinstance(judge, dict) or judge.get('state') != 'done':
+        return
+
+    def update(receipt):
+        previous = receipt.get('judge')
+        if not isinstance(previous, dict) or previous.get('state') != 'done':
+            return
+        receipt['judge'] = {'state': 'pending', 'retry': True,
+                            'previous': {'verdict': previous.get('verdict'), 'landed': previous.get('landed')}}
+        if receipt.get('gates_status') == 'PASS':
+            receipt.update(status='RAN-UNVERIFIED', status_reason='judge pending (retry)', review=True)
+
+    merge_receipt(receipt_path, update)
 
 
 def run_judge(job_path, job):
@@ -374,59 +395,77 @@ def work(job_path):
     job_path = Path(job_path)
     job = json.loads(job_path.read_text())
     folder = Path(job['dir'])
-    frames, frames_at, dense, frame_error = {}, {}, {}, None
-    if job.get('clip'):
-        try:
-            receipt = json.loads(Path(job['receipt']).read_text()) if job.get('receipt') else {}
-            frames, frames_at = sample_frames(job['clip'], folder, clip_span_ms(receipt))
-            dense = sample_dense(job['clip'], folder, dense_positions(receipt))
-        except Exception as error:  # noqa: BLE001 - an unreadable clip is recorded, the judge still gets the shots
-            frame_error = repr(error)[:300]
-    # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
-    # the evidence shots first, then the clip frames as shots labelled "clip start/mid/end" (an overlay left on screen
-    # at the clip's end, e.g. a Break the Targets HUD, is a FAIL: session-1 LEG-04)
-    job['frames_by_name'] = frames
-    job['frames_at_ms'] = frames_at  # where each clip frame was cut (clip time, ms): the judge times them from this
-    job['frames'] = []
-    row_shots_path = folder / 'row-shots.json'
-    if job.get('row_shots_saved'):
-        row_shots = json.loads(row_shots_path.read_text())
-    else:
-        row_shots = job.get('shots') or []
-        row_shots_path.write_text(json.dumps(row_shots, indent=2) + '\n')
-        job['row_shots_saved'] = True
-    # evidence-only labels: the row's own still labels (row id prefix dropped); a label that would give the verdict
-    # away (FAIL/PASS) is neutral (judge/make_jobs.py rule)
-    def label(s, i):
-        name = s['name'][len(job['row']) + 1:] if s['name'].startswith(job['row'] + '-') else s['name']
-        return f'shot-{i}' if re.search(r'FAIL|PASS', name) else f'{s.get("phase", "step")}:{name}'
-    job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(row_shots, 1)]
-    job['excluded_shots'] = [
-        {'label': s['label'], 'name': s.get('name'), 'phase': s.get('phase'), 'path': s.get('path'),
-         'reason': still_fresh.unusable_reason(s.get('fresh')) if s.get('path') else 'still was not taken'}
-        for s in job['shots'] if not (s.get('path') and still_fresh.usable(s.get('fresh')))]
-    job['judge_shots'] = [s for s in job['shots'] if s.get('path') and still_fresh.usable(s.get('fresh'))] + \
-        [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip',
-          **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)] + \
-        [{'label': f'dense {ms / 1000:.1f}s', 'path': p, 'phase': 'clip', 'clip_ms': ms} for ms, p in sorted(dense.items())]
-    if frame_error:
-        job['frame_error'] = frame_error
-    job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
+    initial_shots = job.get('shots') or []
+    job['shots'], job['judge_shots'], job['excluded_shots'] = [], [], []
+    frames = {}
     try:
-        archive_verdict(folder)
-        check = clip_check(job, frames)
-        if not check.get('ok', True):
-            verdict = {'verdict': 'FAIL', 'reason': f'clip check: {check["reason"]}', 'shots_cited': [],
-                       'model': 'clip-check'}
-        elif not job['judge_shots']:
-            reason = (f"{len(job['excluded_shots'])} unusable still(s) excluded" if job['excluded_shots']
-                      else 'no row still and no clip frame'
-                           + (f"; clip: {job['frame_error']}" if job.get('frame_error') else ''))
-            verdict = {'verdict': 'UNSURE',
-                       'reason': f'no usable image for the judge: {reason}',
-                       'shots_cited': [], 'model': None}
+        try:
+            mark_retry(job['receipt'])
+        finally:
+            archive_verdict(folder)
+            archive_verdict(folder, 'done')
+        row_shots_path = folder / 'row-shots.json'
+        snapshot_error = None
+        if job.get('row_shots_saved'):
+            try:
+                row_shots = json.loads(row_shots_path.read_text())
+                if not isinstance(row_shots, list):
+                    raise ValueError('expected a list')
+            except (OSError, ValueError) as error:
+                snapshot_error = f'row shots snapshot unreadable: {error!r}'
         else:
-            verdict = run_judge(job_path, job)
+            row_shots = initial_shots
+            row_shots_path.write_text(json.dumps(row_shots, indent=2) + '\n')
+            job['row_shots_saved'] = True
+        if snapshot_error:
+            check = {'ok': True, 'error': snapshot_error}
+            verdict = {'verdict': 'UNSURE', 'reason': snapshot_error, 'shots_cited': [], 'model': None}
+        else:
+            frames_at, dense, frame_error = {}, {}, None
+            if job.get('clip'):
+                try:
+                    receipt = json.loads(Path(job['receipt']).read_text()) if job.get('receipt') else {}
+                    frames, frames_at = sample_frames(job['clip'], folder, clip_span_ms(receipt))
+                    dense = sample_dense(job['clip'], folder, dense_positions(receipt))
+                except Exception as error:  # noqa: BLE001 - an unreadable clip is recorded, the judge still gets the shots
+                    frame_error = repr(error)[:300]
+            # judge.py's job format: shots [{label, path}] (taken ones, in order), frames [start, mid, end] paths
+            # the evidence shots first, then the clip frames as shots labelled "clip start/mid/end" (an overlay left on screen
+            # at the clip's end, e.g. a Break the Targets HUD, is a FAIL: session-1 LEG-04)
+            job['frames_by_name'] = frames
+            job['frames_at_ms'] = frames_at  # where each clip frame was cut (clip time, ms): the judge times them from this
+            job['frames'] = []
+            # evidence-only labels: the row's own still labels (row id prefix dropped); a label that would give the verdict
+            # away (FAIL/PASS) is neutral (judge/make_jobs.py rule)
+            def label(s, i):
+                name = s['name'][len(job['row']) + 1:] if s['name'].startswith(job['row'] + '-') else s['name']
+                return f'shot-{i}' if re.search(r'FAIL|PASS', name) else f'{s.get("phase", "step")}:{name}'
+            job['shots'] = [{**s, 'label': label(s, i)} for i, s in enumerate(row_shots, 1)]
+            job['excluded_shots'] = [
+                {'label': s['label'], 'name': s.get('name'), 'phase': s.get('phase'), 'path': s.get('path'),
+                 'reason': still_fresh.unusable_reason(s.get('fresh')) if s.get('path') else 'still was not taken'}
+                for s in job['shots'] if not (s.get('path') and still_fresh.usable(s.get('fresh')))]
+            job['judge_shots'] = [s for s in job['shots'] if s.get('path') and still_fresh.usable(s.get('fresh'))] + \
+                [{'label': f'clip {k}', 'path': frames[k], 'phase': 'clip',
+                  **({'clip_ms': frames_at[k]} if k in frames_at else {})} for k in FRAME_NAMES if frames.get(k)] + \
+                [{'label': f'dense {ms / 1000:.1f}s', 'path': p, 'phase': 'clip', 'clip_ms': ms}
+                 for ms, p in sorted(dense.items())]
+            if frame_error:
+                job['frame_error'] = frame_error
+            job_path.write_text(json.dumps({**job, 'shots': job['judge_shots']}, indent=2) + '\n')
+            check = clip_check(job, frames)
+            if not check.get('ok', True):
+                verdict = {'verdict': 'FAIL', 'reason': f'clip check: {check["reason"]}', 'shots_cited': [],
+                           'model': 'clip-check'}
+            elif not job['judge_shots']:
+                reason = (f"{len(job['excluded_shots'])} unusable still(s) excluded" if job['excluded_shots']
+                          else 'no row still and no clip frame'
+                               + (f"; clip: {job['frame_error']}" if job.get('frame_error') else ''))
+                verdict = {'verdict': 'UNSURE',
+                           'reason': f'no usable image for the judge: {reason}',
+                           'shots_cited': [], 'model': None}
+            else:
+                verdict = run_judge(job_path, job)
     except Exception as error:  # noqa: BLE001 - a worker error is UNSURE (RAN-UNVERIFIED), never a PASS
         check = {'ok': True, 'error': repr(error)[:300]}
         verdict = {'verdict': 'UNSURE', 'reason': f'judge worker error: {error!r}'[:300], 'shots_cited': [],
