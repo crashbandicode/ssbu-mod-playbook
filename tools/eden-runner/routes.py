@@ -98,25 +98,27 @@ class LogCursor:
 
     The cursor keeps the open handle of the file it started on. It knows its file by device and inode, and it keeps
     the last bytes it read (`anchor`, up to ANCHOR bytes ending at its offset).
-    - Appends: a read returns the whole lines after the offset; a partial last line waits for its newline.
-    - Another file at the path (rotation, or a rewrite through a temporary file): it first drains what the old handle
-      still has, then reads the new file. A new file that carries the text the cursor read last is continued after
-      that text; any other file is read from its start.
-    - The same file cut short or written again from its start: the same rule. A file counts as cut short only by its
-      own size after the read, never by a size taken before it: a writer that appends during the read does not
-      restart the cursor.
-    A partial line of a file that ended is returned as its own line. `rotations` counts the replacements. `mark()`
-    restarts from the current end, so a wait sees only lines written after the input it follows.
-
-    Limit: the cursor knows only the ANCHOR bytes it read last. A new file that keeps older lines without them is
-    taken for a new log and read from its start. For a file shorter than ANCHOR the cursor knows all of it: a new
-    file that is that text cut short gives nothing, any other is a new log.
+    - Appends: a read returns the whole lines after the offset; a partial last line waits for its newline. A line
+      that was already begun when the cursor started at the file's end is not returned.
+    - A file counts as cut short only by its own size, never by a size of the path taken before the read: a writer
+      that appends during the read does not restart the cursor.
+    - Another file at the path, the same file cut short, or the same file written again from its start is a
+      replacement (`rotations` counts them). With another file at the path the old handle is drained first. A
+      replacement that carries the text the cursor read last is continued after that text.
+    - Any other replacement holds text of unknown age. The cursor never returns it: it starts at that file's end,
+      counts the lines it left out in `unqualified`, and returns only what is appended afterwards.
+    - A file that did not exist when the cursor started is read from its first byte: nothing was there before.
+    - `rotates=True` is for a log whose writer starts new files itself (a plugin log it rotates by rename or
+      empties at boot): a file the cursor cannot continue is then new from its first byte. Its limit: the cursor
+      knows only the ANCHOR bytes it read last, so a new file that repeats older lines without them is read again.
+    A partial line of a file that ended is returned as its own line. `mark()` restarts from the current end, so a
+    wait sees only lines written after the input it follows.
     """
 
     ANCHOR = 4096  # bytes of the text read last, kept to find it again in a replaced file
     CHECK = 64     # bytes before the offset compared on every read, to notice a file written again in place
 
-    def __init__(self, path, from_start=False, hold=None):
+    def __init__(self, path, from_start=False, hold=None, rotates=False):
         self.path = Path(path)
         self.handle = None
         self.identity = None
@@ -126,6 +128,9 @@ class LogCursor:
         self.pending = b''
         self.backlog = []
         self.rotations = 0
+        self.rotates = rotates
+        self.unqualified = 0     # lines of replaced files that were left out
+        self._drop_line = False  # the next bytes finish a line that began in text the cursor does not return
         # On Windows an open handle without FILE_SHARE_DELETE would make the plugin's own rotation (rename) fail, so
         # the cursor opens, reads and closes each time; lines written to the old file after the last read and before
         # its rename are then lost. Poll often (wait() polls every 0.1 s).
@@ -143,26 +148,24 @@ class LogCursor:
         stat = os.fstat(f.fileno())
         return stat.st_dev, stat.st_ino
 
-    def _tail(self, f, end):
-        """The bytes of f just before `end`, at most ANCHOR of them."""
-        begin = max(0, end - self.ANCHOR)
-        f.seek(begin)
-        return f.read(end - begin)
-
     def _start_at(self, f, at):
         self.identity = self._identity(f)
         self.inode = self.identity[1]
-        self.offset, self.anchor = at, self._tail(f, at)
+        begin = max(0, at - self.ANCHOR)
+        f.seek(begin)
+        self.offset, self.anchor = at, f.read(at - begin)
 
     def _open(self, seek_end):
         if self.handle is not None:
             self.handle.close()
             self.handle = None
+        self._drop_line = False
         f = self._open_path()
         if f is None:
             self.identity, self.inode, self.offset, self.anchor = None, None, 0, b''
             return
         self._start_at(f, os.fstat(f.fileno()).st_size if seek_end else 0)
+        self._drop_line = seek_end and bool(self.anchor) and not self.anchor.endswith(b'\n')
         if self.hold:
             self.handle = f
         else:
@@ -174,7 +177,7 @@ class LogCursor:
         self._open(seek_end=True)
 
     def _continues(self, f):
-        """True when f still holds, just before the cursor's offset, the bytes the cursor read last."""
+        """True when f is the cursor's file and still holds, just before the offset, the bytes read last."""
         if self._identity(f) != self.identity or os.fstat(f.fileno()).st_size < self.offset:
             return False
         want = self.anchor[-self.CHECK:]
@@ -182,56 +185,68 @@ class LogCursor:
         return f.read(len(want)) == want
 
     def _resume(self, f):
-        """Where unread text starts in a file that is not the cursor's own: after the text read last, else 0."""
+        """(where unread text starts in a file the cursor cannot simply continue, whether that place is proven)."""
         anchor = self.anchor
-        if not anchor:
-            return 0
-        if self.offset == len(anchor):  # the anchor is the cursor's file from its first byte
+        if anchor and self.offset == len(anchor):  # the anchor is the cursor's file from its first byte
             f.seek(0)
             head = f.read(len(anchor) + 1)
             if head.startswith(anchor):
-                return len(anchor)
-            return len(head) if anchor.startswith(head) else 0  # the read text cut short holds nothing new
-        f.seek(self.offset - len(anchor))
-        if f.read(len(anchor)) == anchor:
-            return self.offset
-        f.seek(0)
-        at = f.read().rfind(anchor)
-        return at + len(anchor) if at >= 0 else 0
+                return len(anchor), True
+            if anchor.startswith(head):  # the read text cut short holds nothing new
+                return len(head), True
+        elif anchor:
+            f.seek(self.offset - len(anchor))
+            if f.read(len(anchor)) == anchor:
+                return self.offset, True
+            f.seek(0)
+            at = f.read().rfind(anchor)
+            if at >= 0:
+                return at + len(anchor), True
+        if self.rotates or self.identity is None:
+            return 0, False
+        return os.fstat(f.fileno()).st_size, False  # text of unknown age: only what follows it is new
 
     def _take(self, f):
-        """The bytes of f after the offset, and the offset moved past them."""
+        """The bytes of f after the offset that the cursor returns, and the offset moved past them."""
         f.seek(self.offset)
         data = f.read()
         self.offset += len(data)
         self.anchor = (self.anchor + data)[-self.ANCHOR:]
+        if self._drop_line and data:
+            _, newline, data = data.partition(b'\n')
+            self._drop_line = not newline
         return data
 
     def _replaced(self, f):
-        """Make f the cursor's file and return what it has to give: a line break when f is read from its start."""
+        """Make f the cursor's file and return what it has to give, after a line break unless f continues the text."""
         if self.identity is not None:
             self.rotations += 1
-        at = self._resume(f)
+        at, proven = self._resume(f)
+        self._drop_line = False
+        if at and not proven:
+            f.seek(0)
+            left_out = f.read(at)
+            self.unqualified += sum(1 for line in left_out.split(b'\n') if line.strip())
+            self._drop_line = not left_out.endswith(b'\n')
         self._start_at(f, at)
-        return (b'' if at else b'\n') + self._take(f)
+        return (b'' if proven and at else b'\n') + self._take(f)
+
+    def _read_file(self, f):
+        return self._take(f) if self._continues(f) else self._replaced(f)
 
     def _read_unheld(self):
         f = self._open_path()
         if f is None:
             return b''
         with f:
-            return self._take(f) if self._continues(f) else self._replaced(f)
+            return self._read_file(f)
 
     def _read_held(self):
         if self.handle is None:  # the file was not there yet, or close() was called
             self.handle = self._open_path()
             if self.handle is None:
                 return b''
-        before = self.offset, self.anchor
-        data = self._take(self.handle)
-        if not self._continues_from(self.handle, before):
-            self.offset, self.anchor = before
-            data = self._replaced(self.handle)
+        data = self._read_file(self.handle)
         try:
             now = os.stat(self.path)
         except OSError:
@@ -241,19 +256,10 @@ class LogCursor:
             if f is not None and self._identity(f) != self.identity:
                 self.handle.close()
                 self.handle = f
-                data += self._replaced(f)  # the new file, after what the old handle still had
+                data += self._replaced(f)  # the file now at the path, after what the old handle still had
             elif f is not None:
                 f.close()
         return data
-
-    def _continues_from(self, f, before):
-        """`_continues` for the offset and anchor the cursor had before a read that already moved them."""
-        after = self.offset, self.anchor
-        self.offset, self.anchor = before
-        try:
-            return self._continues(f)
-        finally:
-            self.offset, self.anchor = after
 
     def read(self):
         data = self.pending + (self._read_held() if self.hold else self._read_unheld())
@@ -278,8 +284,9 @@ class LogCursor:
                     self.backlog = lines[index + 1:]  # later lines stay for the next wait
                     return found
             if time.monotonic() >= until:
+                left_out = f'; {self.unqualified} lines of a replaced file were not accepted' if self.unqualified else ''
                 raise RuntimeError(f'no line matching {pattern!r} in {self.path} within {cap} s; '
-                                   f'last lines: {seen[-6:]}')
+                                   f'last lines: {seen[-6:]}{left_out}')
             time.sleep(interval)
 
     def close(self):
@@ -659,7 +666,7 @@ def chord(ctx, name, expect=None, source=None, cap=10):
     a known diag line (or `expect` is given), wait for that line after the press."""
     source, expect = (source, expect) if expect else CHORD_LINES.get(name, (None, None))
     try:
-        cursor = LogCursor(instance_path(ctx, source)) if expect else None
+        cursor = LogCursor(instance_path(ctx, source), rotates=True) if expect else None
     except KeyError:
         cursor = None  # that log isn't available here (a real Switch has no diag log); the chord still plays
     try:
@@ -1557,7 +1564,7 @@ class TileWalker:
 
     def __init__(self, ctx, screen):
         self.ctx, self.screen = ctx, screen
-        self.cursor = LogCursor(instance_path(ctx, 'tile_log'))
+        self.cursor = LogCursor(instance_path(ctx, 'tile_log'), rotates=True)
         self.trace = []
         self.at = None
         self.token = None
@@ -1796,7 +1803,7 @@ def read_state(ctx, cap=6.0):
     `[TrainingRooms] state pos entry=N kind= x= y= lr= dmg= status= situation=` for P1 (0) and the CPU (1) and
     deletes the request (states.rs). Only lines written after the request count."""
     request = instance_path(ctx, 'settings').parent / 'diag-pos.req'
-    cursor = LogCursor(instance_path(ctx, 'diag_log'))
+    cursor = LogCursor(instance_path(ctx, 'diag_log'), rotates=True)
     try:
         request.write_text('')
         bodies = {}
@@ -1946,7 +1953,7 @@ def select_screen(ctx, cap=2.5):
     """'sss' or 'css' when an L3+Up step is logged on that screen (the tile cursor names it), else None. On the CSS a
     step logs only while the hand carries a token; on the SSS the hand always steps."""
     try:
-        cursor = LogCursor(instance_path(ctx, 'tile_log'))
+        cursor = LogCursor(instance_path(ctx, 'tile_log'), rotates=True)
     except KeyError:
         return None  # This legacy probe requires a configured tile log.
     try:
