@@ -3,6 +3,14 @@
 From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ssh`:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 
+Use `tr-yoga` for the Yoga SSH host and `ledger_ssh`. Yoga DNS returns its
+Wi-Fi address first; that path lost up to 36% of packets on 2026-11-24 and
+logins stalled before authentication. Yoga Wi-Fi was switched off at 02:57Z
+on 2026-11-24; DNS may still answer old Wi-Fi addresses and wired IPv4
+`192.168.0.166` is not in DNS. The Claw alias must not be used for TR runs.
+The external `/home/intpa/eden-runs/_eden-test/hosts.json` must have
+`"yoga": "tr-yoga"`; this repository does not change that file.
+
 On the Eden host, run the same command with its local host name:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 By default, `go` stages the full card lineup from the newest stamp and verifies its `SHA256SUMS.txt`.
@@ -38,6 +46,9 @@ Rows continue after a failure; a row whose recovery fails is FAILED without runn
 Rerun one row: `eden_test.py run /home/intpa/eden-runs/my-run --rows r02a`.
 Refresh the report: `eden_test.py report /home/intpa/eden-runs/my-run`.
 Down: `eden_test.py down /home/intpa/eden-runs/my-run` (also printed in the report).
+If local cleanup succeeds while the ledger is unreachable, Down succeeds and
+reports the pending receipt's last line and the settle unit, if started. The claim stays open until
+settlement; running Down again completes settlement when the ledger returns.
 Park in Training for review; if no verdict arrives within 20 minutes, Down and say so.
 Old runs with recovery files directly in row folders cannot distinguish them from row output.
 

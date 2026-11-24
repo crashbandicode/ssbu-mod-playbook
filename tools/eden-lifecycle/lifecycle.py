@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Shared, journalled Eden lifecycle. Import is inert; see README.md for config.
 
-  lifecycle.py up        config.json --execute [--ssh memento-claw-yoga-ubuntu]
-  lifecycle.py down      config.json --execute [--ssh memento-claw-yoga-ubuntu] [--evidence-dir DIR] [--keep-state]
-  lifecycle.py status    config.json           [--ssh memento-claw-yoga-ubuntu]
+  lifecycle.py up        config.json --execute [--ssh tr-yoga]
+  lifecycle.py down      config.json --execute [--ssh tr-yoga] [--evidence-dir DIR] [--keep-state]
+  lifecycle.py settle    config.json --execute [--minutes N]
+  lifecycle.py status    config.json           [--ssh tr-yoga]
   lifecycle.py reserve   config.json --approver NAME --execute
-  lifecycle.py preflight config.json           [--ssh memento-claw-yoga-ubuntu]
-  lifecycle.py watchdog  config.json --execute [--ssh memento-claw-yoga-ubuntu] [--rounds N] [--pause S]
+  lifecycle.py preflight config.json           [--ssh tr-yoga]
+  lifecycle.py watchdog  config.json --execute [--ssh tr-yoga] [--rounds N] [--pause S]
 
 preflight is read-only: pins, game base, declared update version, playbook commit,
 memory floor, disk, compilers (each one's nice; niced compiles are admitted with headroom),
@@ -28,6 +29,7 @@ host; run the shared eden-runner there (no implicit socket forwarding).
 import argparse
 import base64
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime, timezone
 try:
     import fcntl
@@ -41,12 +43,14 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import queue
@@ -72,6 +76,9 @@ MIN_DISK = 60 * 10 ** 9
 # (2.43 GiB). 4 GiB keeps a margin of 1.57 GiB over the larger one.
 COMPILE_RESERVE = 4 * GIB
 COMPILE_NICE_MIN = 10
+LEDGER_ATTEMPT_SECONDS = 10
+SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+               '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
 # Linux comm names that count as a compiler (the same set resources() lists).
 COMPILER_NAMES = ('cargo', 'rustc', 'cc', 'c++', 'gcc', 'g++', 'clang', 'clang++', 'cc1', 'cc1plus', 'ninja', 'cmake')
 # Down copies the files a run wrote to the evidence folder before it prunes the run's copies, except the caches Eden
@@ -86,6 +93,42 @@ RPC_METHODS = {'status', 'settings.set', 'settings.get', 'settings.save', 'game.
 
 class Refused(RuntimeError):
     pass
+
+
+class LedgerTransport(Refused):
+    def __init__(self, diagnoses):
+        if isinstance(diagnoses, str):
+            diagnoses = [{'line': diagnoses, 'cause': 'unknown', 'transient': False, 'phase': 'none',
+                          'evidence': ''}]
+        self.diagnoses = diagnoses
+        self.transient = bool(diagnoses[-1]['transient'])
+        super().__init__('\n'.join(d['line'] for d in diagnoses))
+
+
+class SettleDeadline(Exception):
+    pass
+
+
+@contextmanager
+def settle_attempt_deadline(seconds):
+    require(hasattr(signal, 'setitimer') and threading.current_thread() is threading.main_thread(),
+            'Settle deadline requires the main Linux process')
+    previous = signal.getsignal(signal.SIGALRM)
+    old_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+
+    def expired(_signum, _frame):
+        raise SettleDeadline()
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, max(.001, seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        if old_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(.001, old_timer[0] - (time.monotonic() - started)), old_timer[1])
 
 
 def require(condition, message):
@@ -180,6 +223,11 @@ def safe_absolute(value):
         require(not part.is_symlink() and not getattr(part, 'is_junction', lambda: False)(),
                 'Symlink ancestor refused: ' + str(part))
     return path
+
+
+def pending_release_dir():
+    home = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
+    return safe_absolute(home / 'eden-lifecycle' / 'pending-release')
 
 
 def relative(value):
@@ -490,23 +538,26 @@ class Ledger:
         if globals().get('_LEDGER_BRIDGE'):
             return _LEDGER_BRIDGE(operation, self.token, stale_claim_hours, admission)
         if self.remote:
-            return forward(self.remote, 'ledger-' + operation,
-                           {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
-                            'stale_claim_hours': stale_claim_hours, 'admission': admission,
-                            'label': self.label, 'approver': approver, 'exclusive_host': self.exclusive_host}, True)
+            config = {'ledger': self.path, 'host': self.host, 'owner': self.owner, 'token': self.token,
+                      'stale_claim_hours': stale_claim_hours, 'admission': admission,
+                      'label': self.label, 'approver': approver, 'exclusive_host': self.exclusive_host}
+            return ledger_forward(self.remote, operation, config)
         path = safe_absolute(self.path)
         require(path.is_file(), 'Authoritative ledger must already exist')
         # Never replace/truncate the shared ledger or normalize it on disk.
         with path.open('r+', encoding='utf-8') as stream:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             text = stream.read()
+            claim_suffix = (f' CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
+                            'Eden lifecycle admitted')
+            release_suffix = (f' RELEASED: {self.owner} host={self.host} lifecycle={self.token} '
+                              'Eden stopped; full profile restored and separately verified')
             if operation == 'read':
                 opened = active_claims(text, self.host)
-                exact = lambda line: (f'lifecycle={self.token} ' in line and f'{self.owner} ' in line
-                                      and f'host={self.host} ' in line)
                 return {'open': opened, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
-                        'owned_claim': any(exact(line) for line in opened),
-                        'owned_release': any('RELEASED:' in line and exact(line) for line in text.splitlines())}
+                        'owned_claim': any(line.endswith(claim_suffix) or
+                                           line.endswith(claim_suffix + EXCLUSIVE_HOST_MARKER) for line in opened),
+                        'owned_release': any(line.endswith(release_suffix) for line in text.splitlines())}
             require(operation in ('claim', 'release', 'reserve'), 'Unknown ledger operation')
             now = datetime.now(timezone.utc)
             reservations = []
@@ -515,6 +566,20 @@ class Ledger:
                 reservations = [match for line in opened if (match := RESERVATION.fullmatch(line))]
             expired = [record for record in reservations if reservation_expired(record, now)]
             if operation == 'reserve':
+                converted_suffix = (f' RELEASED: {self.owner} host={self.host} lifecycle={self.token} '
+                                    'Eden reservation converted to lifecycle claim')
+                require(not any(line.endswith(converted_suffix) for line in text.splitlines()),
+                        'Reservation already converted to a lifecycle claim')
+                own_reservations = [record for record in reservations
+                                    if (record['token'], record['owner'], record['host']) ==
+                                    (self.token, self.owner, self.host)]
+                if own_reservations:
+                    require(len(own_reservations) == 1, 'Ambiguous owned reservation')
+                    record = own_reservations[0]
+                    if reservation_expired(record, now) is False:
+                        age = (now - datetime.fromisoformat(record['at'])).total_seconds()
+                        remaining = max(1, int(RESERVATION_TTL_MINUTES * 60 - age))
+                        return {'line': record[0], 'expires_in_seconds': remaining, 'already_reserved': True}
                 line = (f'{now.isoformat()} CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
                         f'Eden reservation run {self.label} approver={approver}')
                 if self.exclusive_host:
@@ -529,11 +594,19 @@ class Ledger:
                     require(not claims, 'Exclusive host reservation requires no open Eden claim')
                     require(isinstance(admission, dict) and isinstance(admission.get('foreign_processes'), list)
                             and not foreign_edens(admission), 'Exclusive host reservation requires no running Eden')
-                append_ledger(stream, [line, *(reservation_release(old, 'expired') for old in expired)])
+                append_ledger(stream, [*(reservation_release(old, 'expired') for old in expired), line])
                 return {'line': line, 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60}
             skipped = []
             reservation = None
             if operation == 'claim':
+                own = [line for line in opened
+                       if line.endswith(claim_suffix) or line.endswith(claim_suffix + EXCLUSIVE_HOST_MARKER)]
+                if own:
+                    # A resent claim must not append twice: release requires exactly one open claim.
+                    require(len(own) == 1, 'Ambiguous owned lifecycle claim')
+                    return {'line': own[0], 'stale_claim_skipped': [], 'already_claimed': True}
+                require(not any(line.endswith(release_suffix) for line in text.splitlines()),
+                        'Lifecycle token already released; a new run needs a new token')
                 policy = claim_admission(text, self.host, self.owner, stale_claim_hours, admission, now,
                                          label=self.label, exclusive_host=self.exclusive_host)
                 require(not policy['blocking'], 'Open host claim; no profile changes permitted')
@@ -543,20 +616,27 @@ class Ledger:
             else:
                 own = [line for line in active_claims(text, self.host)
                        if f'lifecycle={self.token} ' in line and f'{self.owner} ' in line]
+                if not own:
+                    previous = [line for line in text.splitlines() if line.endswith(release_suffix)]
+                    if previous:
+                        return {'line': previous[-1], 'already_released': True}
                 require(len(own) == 1, 'Exact owned lifecycle claim not found; release refused')
             kind = 'CLAIMED' if operation == 'claim' else 'RELEASED'
             line = f'{stamp()} {kind}: {self.owner} host={self.host} lifecycle={self.token} '
             line += 'Eden lifecycle admitted' if operation == 'claim' else 'Eden stopped; full profile restored and separately verified'
             if operation == 'claim' and self.exclusive_host:
                 line += EXCLUSIVE_HOST_MARKER
-            lines = [line]
+            lines = [*(reservation_release(old, 'expired') for old in expired), line]
             if reservation:
                 record = next(item for item in reservations
                               if (item['token'], item['owner'], item['label']) ==
                               (reservation, self.owner, self.label)
                               and not reservation_expired(item, now))
-                lines.append(reservation_release(record, 'converted to lifecycle claim'))
-            lines.extend(reservation_release(old, 'expired') for old in expired)
+                converted = reservation_release(record, 'converted to lifecycle claim')
+                if reservation == self.token:
+                    lines.insert(-1, converted)
+                else:
+                    lines.append(converted)
             append_ledger(stream, lines)
             receipt = {'line': line, 'stale_claim_skipped': skipped}
             if reservation:
@@ -624,6 +704,20 @@ def validate(config):
     require(isinstance(config.get('owner'), str) and re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', config['owner']),
             'owner must be Engine session/stream (no newline or free-form suffix)')
     require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{1,63}', config.get('label', '')), 'Invalid label')
+    if 'notify' in config:
+        notify = config['notify']
+        require(isinstance(notify, dict) and set(notify) <= {'file', 'ssh', 'from', 'to'},
+                'notify must be an object with file, ssh, from and to only')
+        path = notify.get('file')
+        require(isinstance(path, str) and re.fullmatch(r'/[A-Za-z0-9_./@+ -]+', path)
+                and '..' not in Path(path).parts, 'notify file must be an absolute safe path')
+        if 'ssh' in notify:
+            require(isinstance(notify['ssh'], str)
+                    and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', notify['ssh']), 'Unsafe notify SSH host')
+        for key in ('from', 'to'):
+            if key in notify:
+                require(isinstance(notify[key], str) and notify[key]
+                        and not re.search(r'[\r\n]', notify[key]), 'Invalid notify ' + key)
     root, state_dir = safe_absolute(config['work_root']), safe_absolute(config['state_dir'])
     require(len(root.parts) >= 4 and len(state_dir.parts) >= 4 and root != state_dir, 'Dedicated work_root and state_dir required')
     require(root not in state_dir.parents and state_dir not in root.parents, 'State and profile roots must be disjoint')
@@ -992,12 +1086,32 @@ class Host:
                   '--property=RuntimeMaxSec=' + str(int(runtime) + 60),
                   '--setenv=EDEN_WATCHDOG_SIDECAR=1', '--working-directory=' + str(directory), '--', *command])
 
+    def start_settle(self, unit, command, directory, runtime):
+        require(re.fullmatch(r'eden-settle-[0-9a-f]{8}\.service', unit), 'Foreign settle unit refused')
+        argv = ['systemd-run', '--user', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
+                '--property=MemoryMax=256M', '--property=MemorySwapMax=0', '--property=Nice=19',
+                '--property=RuntimeMaxSec=' + str(int(runtime) + 60), '--working-directory=' + str(directory)]
+        if os.environ.get('XDG_STATE_HOME'):
+            argv.append('--setenv=XDG_STATE_HOME=' + os.environ['XDG_STATE_HOME'])
+        self.run([*argv, '--', *command])
+
     def stop_watchdog(self, unit):
         require(re.fullmatch(r'eden-life-[0-9a-f]{32}-watchdog\.service', unit), 'Foreign watchdog unit refused')
         done = subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, text=True, timeout=15)
         detail = (done.stderr or '') + (done.stdout or '')
         require(done.returncode == 0 or 'not loaded' in detail.lower() or 'not-found' in detail.lower(),
                 'Watchdog stop failed: ' + detail[-300:])
+
+    def stop_settle(self, unit):
+        require(re.fullmatch(r'eden-settle-[0-9a-f]{8}\.service', unit), 'Foreign settle unit refused')
+        done = subprocess.run(['systemctl', '--user', 'stop', unit], capture_output=True, text=True, timeout=15)
+        detail = (done.stderr or '') + (done.stdout or '')
+        require(done.returncode == 0 or 'not loaded' in detail.lower() or 'not-found' in detail.lower(),
+                'Settle stop failed: ' + detail[-300:])
+
+    def settle_running(self, unit):
+        require(re.fullmatch(r'eden-settle-[0-9a-f]{8}\.service', unit), 'Foreign settle unit refused')
+        return self.unit(unit).get('ActiveState') in ('active', 'activating', 'reloading', 'deactivating')
 
     def watchdog_running(self, unit):
         return self.unit(unit).get('ActiveState') == 'active'
@@ -1462,6 +1576,36 @@ class Lifecycle:
         with (self.directory / 'actions.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps({'utc': stamp(), 'kind': kind, 'value': value}) + '\n')
 
+    def pending_receipt(self, text):
+        with (self.directory / 'RELEASE-PENDING.md').open('a', encoding='utf-8') as stream:
+            stream.write(text.replace('\r', ' ').replace('\n', ' ') + '\n')
+
+    def notify(self, text):
+        try:
+            spec = self.c.get('notify')
+            if not spec:
+                self.pending_receipt('notify not configured')
+                return
+            line = (f"\n## {datetime.now(timezone.utc):%H:%M:%S}Z {spec.get('from', 'eden-lifecycle')} "
+                    f"{self.c['label']} → {spec.get('to', self.c['owner'])} | {text}\n")
+            if spec.get('ssh'):
+                with SshMux(spec['ssh']) as mux:
+                    done = subprocess.run(['ssh', '-T', *mux.rider_args, spec['ssh'],
+                                           'cat >> ' + shlex.quote(spec['file'])],
+                                          input=line, capture_output=True, text=True, timeout=10)
+                require(done.returncode == 0, 'notify SSH failed: ' + (done.stderr or '')[-500:])
+            else:
+                with safe_absolute(spec['file']).open('a', encoding='utf-8') as stream:
+                    stream.write(line)
+        except Exception as error:
+            try:
+                failure = {'error': repr(error), 'utc': stamp()}
+                self.state.setdefault('notify_errors', []).append(failure)
+                self.record('notify-error', failure)
+                self.write()
+            except Exception:
+                pass
+
     def write(self):
         save(self.journal, self.state)
 
@@ -1491,6 +1635,10 @@ class Lifecycle:
         watched = self.state.get('watchdog_unit')
         if watched:
             require(watched == f'eden-life-{token}-watchdog.service', 'Foreign watchdog unit refused')
+        settle = self.state.get('settle_unit')
+        if settle:
+            require(self.c['host'] != 'ally' and settle == f'eden-settle-{token[:8]}.service',
+                    'Foreign settle unit refused')
 
     def ledger(self, token=None):
         return self.injected_ledger if self.injected_ledger is not None else Ledger(
@@ -2170,6 +2318,11 @@ class Lifecycle:
                           'config': self.c, 'instances': [], 'started': stamp()}
             self.write()
             try:
+                if self.c['host'] != 'ally':
+                    try:
+                        self.settle_pending()
+                    except Exception as error:
+                        self.record('pending-settle-error', {'error': repr(error)})
                 admission = self.admission()
                 problems, lines, checks = self.runtime_checks(admission)
                 require(not problems, '; '.join(problems))
@@ -2179,6 +2332,8 @@ class Lifecycle:
                 self.write()
                 claim = self.ledger().claim(stale_claim_hours=self.c.get('stale_claim_hours'), admission=admission)
                 self.state['claimed'] = True
+                if claim.get('already_claimed'):
+                    self.state['claim_recovered_after_transport_failure'] = True
                 self.state['stale_claim_skipped'] = claim.get('stale_claim_skipped', [])
                 for skipped in self.state['stale_claim_skipped']:
                     self.record('stale_claim_skipped', skipped)
@@ -2300,25 +2455,234 @@ class Lifecycle:
             save(self.directory / (item['key'] + '-source-verify.json'), {'unchanged': True, 'entries': len(original)})
         save(self.directory / (item['key'] + '-verify.json'), {'equal': True, 'snapshot_equal': True, 'entries': len(expected)})
 
+    def _pending_path(self):
+        token = self.state['token']
+        require(re.fullmatch(r'[0-9a-f]{32}', token), 'Invalid owned lifecycle token')
+        return safe_absolute(pending_release_dir() / (token + '.json'))
+
+    def _write_pending(self):
+        path = self._pending_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        config_path = self.directory / 'lifecycle-settle-config.json'
+        save(config_path, self.c)
+        save(path, {'ledger': self.c['ledger'], 'host': self.c['host'], 'owner': self.c['owner'],
+                    'token': self.state['token'], 'ledger_ssh': self.c.get('ledger_ssh'),
+                    'config_path': str(config_path), 'journal_path': str(self.journal), 'time': stamp()})
+
+    def _settle_ledger(self, stop_unit=True):
+        ownership = self.ledger().inspect()
+        self.record('settle-readback', ownership)
+        if ownership['owned_claim']:
+            was_released = self.state.get('released')
+            self.state['claimed'] = True
+            self.state['released'] = False
+            if ownership['owned_release']:
+                self.record('settle-contradiction', ownership)
+            if was_released or ownership['owned_release']:
+                self.write()
+            self.record('release', self.ledger().release())
+            if ownership['owned_release']:
+                readback = self.ledger().inspect()
+                self.record('settle-readback', readback)
+                require(not readback['owned_claim'], 'Open lifecycle claim remains after release')
+            self.state['released'] = True
+        elif ownership['owned_release']:
+            self.state['released'] = True
+        elif self.state['claimed']:
+            raise Refused('Owned claim disappeared without its exact release record')
+        unit = self.state.get('settle_unit')
+        if stop_unit and unit:
+            self.host.stop_settle(unit)
+            self.state['settle_unit'] = None
+        self.state['release_pending'] = False
+        self.write()
+        path = self._pending_path()
+        if path.exists():
+            path.unlink()
+        return True
+
+    def _note_settle_cap(self):
+        unit = self.state.get('settle_unit')
+        if not self.state.get('release_pending') or not unit or self.host.settle_running(unit):
+            return
+        receipt = self.directory / 'RELEASE-PENDING.md'
+        lines = receipt.read_text(encoding='utf-8').splitlines() if receipt.is_file() else []
+        starts = [i for i, line in enumerate(lines) if line.startswith('settle unit started: ')]
+        if starts:
+            lines = lines[starts[-1] + 1:]
+        final = ('released at ', 'release still pending after ', 'release still pending: stopped on ',
+                 'settle unit stopped by its time cap')
+        if not any(line.startswith(final) for line in lines):
+            self.pending_receipt('settle unit stopped by its time cap')
+
+    def _start_settle_unit(self):
+        if self.c['host'] == 'ally':
+            return
+        unit = f"eden-settle-{self.state['token'][:8]}.service"
+        try:
+            previous = self.state.get('settle_unit')
+            if previous:
+                if self.host.settle_running(previous):
+                    return
+                self.host.stop_settle(previous)
+                self.state['settle_unit'] = None
+            script = self.directory / 'lifecycle-settle.py'
+            script.write_text(globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(encoding='utf-8'),
+                              encoding='utf-8')
+            config_path = self.directory / 'lifecycle-settle-config.json'
+            command = ['/usr/bin/python3', '-I', '-B', str(script), 'settle', str(config_path), '--execute']
+            self.host.start_settle(unit, command, self.directory, 30 * 60)
+            self.state['settle_unit'] = unit
+            self.write()
+            self.record('settle-start', {'unit': unit})
+            self.pending_receipt(f'settle unit started: {unit}')
+        except Exception as error:
+            self.record('settle-start-error', {'unit': unit, 'error': repr(error)})
+
+    def _finish_down(self, failures, stop_errors):
+        diagnosis = None
+        if not failures:
+            try:
+                self._settle_ledger()
+            except LedgerTransport as error:
+                self.state['release_pending'] = True
+                diagnosis = error.diagnoses[-1]
+                self.record('release-pending', {'error': str(error)})
+                try:
+                    self._write_pending()
+                    line = f"release pending since {datetime.now(timezone.utc):%H:%M:%S}Z: {diagnosis['line']}"
+                    self.pending_receipt(line)
+                except Exception as pending_error:
+                    failures.append({'stage': 'pending-record', 'error': repr(pending_error)})
+            except Exception as error:
+                failures.append({'stage': 'release', 'error': repr(error)})
+        self.state['cleanup_failures'] = failures
+        self.state['phase'] = 'cleanup-failed' if failures else 'down'
+        self.write()
+        if not failures and self.state.get('release_pending') and diagnosis:
+            if diagnosis['transient']:
+                self._start_settle_unit()
+                self.notify(line)
+            else:
+                unit = self.state.get('settle_unit')
+                if unit:
+                    try:
+                        self.host.stop_settle(unit)
+                        self.state['settle_unit'] = None
+                        self.write()
+                    except Exception as error:
+                        self.record('settle-stop-error', {'unit': unit, 'error': repr(error)})
+                line = f"release pending: not retried (cause: {diagnosis['cause']}); manual Down needed"
+                self.pending_receipt(line)
+                self.notify(line)
+        require(not failures, 'Cleanup incomplete; claim retained: ' + repr(failures))
+        return {'phase': 'down', 'released': self.state['released'],
+                'release_pending': self.state.get('release_pending', False),
+                'settle_unit': self.state.get('settle_unit'), 'game_stop_errors': stop_errors}
+
+    def settle_pending(self):
+        folder = pending_release_dir()
+        if not folder.is_dir():
+            return
+        for path in sorted(folder.glob('*.json')):
+            try:
+                safe_absolute(path)
+                pending = json.loads(path.read_text())
+                if (pending.get('host') != self.c['host'] or pending.get('ledger') != self.c['ledger']
+                        or pending.get('ledger_ssh') != self.c.get('ledger_ssh')):
+                    continue
+                token = pending['token']
+                require(re.fullmatch(r'[0-9a-f]{32}', token) and path.name == token + '.json',
+                        'Invalid pending release token')
+                journal = safe_absolute(pending['journal_path'])
+                value = json.loads(journal.read_text())
+                config = value['config']
+                require(journal.name == 'lifecycle.json' and journal.parent == Path(config['state_dir'])
+                        and value['token'] == token and value['owner'] == pending['owner']
+                        and config['owner'] == pending['owner'] and config['host'] == pending['host']
+                        and config['ledger'] == pending['ledger'] and config.get('ledger_ssh') == pending.get('ledger_ssh'),
+                        'Pending release does not match its journal')
+                other = Lifecycle(config, self.host, self.injected_ledger)
+                with other.lock():
+                    other.state = json.loads(other.journal.read_text())
+                    other.check_state()
+                    require(other.state['token'] == token and other.state['phase'] == 'down'
+                            and (other.state.get('release_pending') or other.state.get('released')),
+                            'Pending release journal is not a clean Down')
+                    other._settle_ledger()
+                self.record('pending-settled', {'token': token})
+            except Exception as error:
+                self.record('pending-settle-error', {'path': str(path), 'error': repr(error)})
+
+    def settle(self, minutes=30):
+        require(self.host.name().casefold() == self.c['hostname'].casefold(), 'Wrong executor hostname')
+        require(isinstance(minutes, (int, float)) and not isinstance(minutes, bool)
+                and math.isfinite(minutes) and 0 < minutes <= 30, 'settle minutes must be between 0 and 30')
+        deadline = self.host.clock() + minutes * 60
+        last_start = deadline - 60
+        next_attempt = self.host.clock() + 60
+        attempts = 0
+        last = 'no attempt completed'
+        while self.host.clock() < deadline:
+            if next_attempt > last_start or self.host.clock() > last_start:
+                self.host.sleep(max(0, deadline - self.host.clock() - 1))
+                break
+            wait = min(next_attempt, deadline) - self.host.clock()
+            if wait > 0:
+                self.host.sleep(wait)
+            if self.host.clock() > last_start:
+                break
+            acquired = False
+            try:
+                with self.lock():
+                    acquired = True
+                    require(self.journal.is_file(), 'No owned lifecycle journal')
+                    self.state = json.loads(self.journal.read_text())
+                    self.check_state()
+                    require(self.state['phase'] == 'down', 'Settle requires a clean Down')
+                    if not self.state.get('release_pending'):
+                        require(self.state['released'] or not self.state['claimed'], 'Settle requires a pending release')
+                        return {'phase': 'down', 'released': self.state['released'], 'release_pending': False}
+                    if self.host.clock() > last_start:
+                        next_attempt = deadline
+                        continue
+                    attempts += 1
+                    next_attempt = self.host.clock() + 60
+                    try:
+                        with settle_attempt_deadline(deadline - self.host.clock() - 5):
+                            self._settle_ledger(stop_unit=False)
+                        self.record('release-settled', {'released': self.state['released']})
+                        line = f"released at {datetime.now(timezone.utc):%H:%M}Z after {attempts} attempts"
+                        self.pending_receipt(line)
+                        self.notify(line)
+                        return {'phase': 'down', 'released': self.state['released'], 'release_pending': False}
+                    except LedgerTransport as error:
+                        diagnosis = error.diagnoses[-1]
+                        last = diagnosis['line']
+                        self.pending_receipt(f"release pending since {datetime.now(timezone.utc):%H:%M:%S}Z: {last}")
+                        self.record('settle-retry', {'error': str(error)})
+                        if not diagnosis['transient']:
+                            line = f'release still pending: stopped on a non-transient cause: {last}; manual Down needed'
+                            self.pending_receipt(line)
+                            self.notify(line)
+                            return {'phase': 'down', 'released': False, 'release_pending': True}
+                    except SettleDeadline:
+                        last = 'attempt exceeded the settle deadline'
+                        break
+            except BlockingIOError:
+                if acquired:
+                    raise
+                self.host.sleep(min(1, max(0, deadline - self.host.clock())))
+        line = f'release still pending after {minutes:g} minutes: manual Down needed; last: {last}'
+        self.pending_receipt(line)
+        self.notify(line)
+        return {'phase': 'down', 'released': False, 'release_pending': True}
+
     def _down(self):
         failures, stop_errors = [], []
         self._stop_watchdog_unit()
         self.state['phase'] = 'stopping'
         self.write()
-        # Claim/release ACK loss must not become an imaginary unclaimed/down state.
-        # The durable token also lets a fresh down recover a crash after append.
-        try:
-            ownership = self.ledger().inspect()
-            self.record('claim-readback', ownership)
-            if ownership['owned_claim']:
-                self.state['claimed'] = True
-            elif ownership['owned_release']:
-                self.state['released'] = True
-            elif self.state['claimed']:
-                raise Refused('Owned claim disappeared without its exact release record')
-        except Exception as error:
-            failures.append({'stage': 'claim-readback', 'error': repr(error)})
-        # Even a ledger outage must not skip owned process stop/restore attempts.
         for item in reversed(self.state['instances']):
             if item['launch_intent']:
                 try:
@@ -2370,17 +2734,9 @@ class Lifecycle:
                     except Exception as error:
                         failures.append({'key': item['key'], 'stage': 'restore/verify', 'error': repr(error)})
         self.state['stop_errors'] = stop_errors
-        self.state['cleanup_failures'] = failures
-        if not failures and self.state['claimed'] and not self.state['released']:
-            try:
-                self.record('release', self.ledger().release())
-                self.state['released'] = True
-            except Exception as error:
-                failures.append({'stage': 'release', 'error': repr(error)})
-        self.state['phase'] = 'cleanup-failed' if failures else 'down'
-        self.write()
-        require(not failures, 'Cleanup incomplete; claim retained: ' + repr(failures))
-        return {'phase': 'down', 'released': self.state['released'], 'game_stop_errors': stop_errors}
+        if failures:
+            return self._finish_down(failures, stop_errors)
+        return self._finish_down(failures, stop_errors)
 
     def prune(self, evidence_dir=None):
         """After a clean Down, copy the files each instance's run wrote (its post-run profile against the snapshot)
@@ -2470,15 +2826,21 @@ class Lifecycle:
             self.check_state()
             if self.state['phase'] == 'down':
                 self._stop_watchdog_unit()
-                result = {'phase': 'down', 'released': self.state['released'], 'already_down': True}
+                if self.state.get('release_pending'):
+                    self._note_settle_cap()
+                    result = self._finish_down([], self.state.get('stop_errors', []))
+                    result['already_down'] = True
+                else:
+                    result = {'phase': 'down', 'released': self.state['released'], 'already_down': True}
             else:
                 result = self._down()
-            # Only a clean Down reaches here: _down raises while anything is left to stop, restore or release.
             prune = self.state.get('prune') or {}
-            if keep_state and not prune.get('done'):
+            may_prune = not self.state.get('release_pending') and (
+                self.state.get('released') or not self.state.get('claimed'))
+            if may_prune and keep_state and not prune.get('done'):
                 self.state['prune'] = {**prune, 'kept': stamp()}
                 self.write()
-            elif not prune.get('done'):
+            elif may_prune and not prune.get('done'):
                 try:
                     self.prune(evidence_dir)
                 except Exception as error:
@@ -2496,10 +2858,540 @@ class Lifecycle:
         self.state = value
         self.check_state()
         unit = value.get('watchdog_unit')
+        settle = value.get('settle_unit')
+        self._note_settle_cap()
+        receipt = self.directory / 'RELEASE-PENDING.md'
+        lines = receipt.read_text(encoding='utf-8').splitlines() if receipt.is_file() else []
         return {'phase': value['phase'], 'claimed': value['claimed'], 'released': value['released'],
+                'release_pending': value.get('release_pending', False), 'settle_unit': settle,
+                'settle_running': bool(settle) and self.host.settle_running(settle),
+                'release_pending_last_line': lines[-1] if lines else None,
                 'owned_pids': {x['key']: self.host.owned(x) for x in value['instances'] if x['launch_intent']},
                 'watchdog_unit': unit, 'watchdog_running': bool(unit) and self.host.watchdog_running(unit),
                 'cleanup_failures': value.get('cleanup_failures', [])}
+
+
+def ssh_phase(text):
+    if not text or not text.strip():
+        return 'unknown'
+    for pattern, phase in ((r'Connecting to', 'none'),
+                           (r'Connection established', 'tcp'),
+                           (r'Remote protocol version', 'banner'),
+                           (r'SSH2_MSG_NEWKEYS received', 'kex'),
+                           (r'Authenticated to', 'auth')):
+        if not re.search(pattern, text, re.I):
+            return phase
+    return 'session'
+
+
+def target_healthy(diag_login, target):
+    if not diag_login.startswith('ok in ') or not isinstance(target, dict):
+        return False
+    if 'cpuLoadPct' in target or target.get('journal') == 'unavailable on Windows':
+        return False
+    keys = ('load1', 'cores', 'memAvailMiB', 'oomKills5m', 'maxStartupsLines', 'sshdUnauth')
+    try:
+        if any(type(target.get(key)) not in (int, float) or not math.isfinite(target[key]) or target[key] < 0
+               for key in keys):
+            return False
+    except OverflowError:
+        return False
+    maximum = re.match(r'^(?:default\s+)?(\d+)', str(target.get('maxStartups', '')))
+    return bool(target['cores'] > 0 and maximum and target['maxStartupsLines'] == 0
+                and target['sshdUnauth'] < int(maximum.group(1)) and target['load1'] / target['cores'] < 4
+                and target['memAvailMiB'] >= 300 and target['oomKills5m'] == 0)
+
+
+def ssh_cause(text, phase, diag_login, tcp, loss, target=None, address='', rtt_min=None, rtt_max=None,
+              attempt_timed_out=False, attempt_killed=False):
+    matches = re.findall(r'^.*(?:timed out|Connection (?:closed|reset|refused)|Permission denied|'
+                         r'Host key verification failed|Could not resolve|No route to host).*$', text, re.I | re.M)
+    message = matches[-1].strip()[:160] if matches else ''
+    if not message and attempt_killed:
+        message = 'none (attempt killed at the 10 s bound)'
+    if re.search('Could not resolve hostname', text, re.I):
+        return 'name does not resolve', False, message
+    if re.search('Host key verification failed', text, re.I):
+        return 'host key', False, message
+    if re.search('Permission denied', text, re.I):
+        return 'authentication refused', False, message
+    if re.search('Connection refused|No route to host', text, re.I) or tcp == 'fail':
+        return 'host down or sshd not listening', False, message
+    if target:
+        maximum = re.match(r'^(?:default\s+)?(\d+)', str(target.get('maxStartups', '')))
+        unauth = target.get('sshdUnauth')
+        drops = target.get('maxStartupsLines')
+        if ((type(drops) in (int, float) and drops > 0) or
+                (type(unauth) in (int, float) and math.isfinite(unauth) and unauth >= 0 and
+                 maximum and unauth >= int(maximum.group(1)))):
+            return 'sshd connection throttling on the target (MaxStartups)', False, message
+        load, cores = target.get('load1'), target.get('cores')
+        memory, oom = target.get('memAvailMiB'), target.get('oomKills5m')
+        if ((isinstance(load, (int, float)) and isinstance(cores, (int, float)) and cores > 0 and load / cores >= 4)
+                or (isinstance(memory, (int, float)) and memory < 300)
+                or (isinstance(oom, (int, float)) and oom > 0)):
+            values = [value if value is not None else 'n/a' for value in (load, cores, memory, oom)]
+            return (f'target overloaded (load {values[0]} on {values[1]} cores, '
+                    f'{values[2]} MiB available, {values[3]} OOM kills)'), False, message
+    match_loss = re.fullmatch(r'(\d+(?:\.\d+)?)%', loss)
+    if phase in ('tcp', 'banner', 'kex', 'auth', 'unknown') and match_loss and float(match_loss.group(1)) > 0:
+        healthy = target_healthy(diag_login, target)
+        suffix = '' if healthy else '; target health not confirmed, no retry'
+        return f'packet loss {loss} on the path to {address}{suffix}', healthy, message
+    if (phase in ('tcp', 'banner', 'kex', 'auth', 'unknown') and rtt_min is not None and rtt_max is not None
+            and float(rtt_max) >= 100 and float(rtt_max) >= 10 * float(rtt_min)):
+        healthy = target_healthy(diag_login, target)
+        suffix = '' if healthy else '; target health not confirmed, no retry'
+        return f'RTT spikes on the path to {address} (max {rtt_max} ms){suffix}', healthy, message
+    if ((attempt_timed_out or re.search('timed out', text, re.I)) and phase in ('tcp', 'banner', 'kex')
+            and tcp == 'ok' and target_healthy(diag_login, target)
+            and type(target.get('load1')) in (int, float) and type(target.get('cores')) in (int, float)
+            and target['cores'] > 0 and type(target.get('memAvailMiB')) in (int, float)):
+        return (f"single {phase} timeout with TCP 22 answering and a healthy target "
+                f"(load {target['load1']} on {target['cores']} cores, {target['memAvailMiB']} MiB available)"), True, message
+    cause = f'not established (attempt stalled in {phase}; {diag_login})'
+    if ((attempt_timed_out or re.search('timed out', text, re.I)) and phase in ('tcp', 'banner', 'kex')
+            and tcp == 'ok' and isinstance(target, dict)
+            and ('cpuLoadPct' in target or target.get('journal') == 'unavailable on Windows')):
+        cause += '; target health not confirmed, no retry'
+    return cause, False, message
+
+
+def _tcp_probe(hostname, port):
+    result = queue.Queue(maxsize=1)
+    def connect():
+        try:
+            with socket.create_connection((hostname, port), timeout=5):
+                result.put(True)
+        except (OSError, ValueError, OverflowError):
+            result.put(False)
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    thread.join(5)
+    return not thread.is_alive() and result.get_nowait()
+
+
+def _ssh_process_count(host, hostname, run=subprocess.run):
+    count = 0
+    proc = Path('/proc')
+    if not proc.is_dir():
+        if os.name != 'nt':
+            return 'n/a'
+        safe_host = host.replace("'", "''")
+        safe_hostname = hostname.replace("'", "''")
+        script = (f"$p = @(Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
+                  f"Where-Object {{ $_.CommandLine.Contains('{safe_host}') -or "
+                  f"$_.CommandLine.Contains('{safe_hostname}') }}); $p.Count")
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode()
+        try:
+            done = run([r'C:\Program Files\PowerShell\7\pwsh.exe', '-NoLogo', '-NoProfile',
+                        '-NonInteractive', '-EncodedCommand', encoded], capture_output=True, text=True, timeout=5)
+            return int(done.stdout.strip()) if done.returncode == 0 else 'n/a'
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return 'n/a'
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            parts = (entry / 'cmdline').read_bytes().split(b'\0')
+            if parts and Path(os.fsdecode(parts[0])).name in ('ssh', 'ssh.exe'):
+                command = b'\0'.join(parts).decode(errors='replace')
+                count += host in command or hostname in command
+        except (OSError, ValueError):
+            pass
+    return count
+
+
+def _control_socket_count(directory):
+    if not directory:
+        return 0
+    count = 0
+    try:
+        for entry in Path(directory).iterdir():
+            try:
+                count += stat.S_ISSOCK(entry.lstat().st_mode)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return count
+
+
+SSH_TARGET_LINUX = r"""
+$client = ($env:SSH_CONNECTION -split '\s+')[0]
+$load1 = [double]::Parse((Get-Content /proc/loadavg -Raw).Split(' ')[0], [Globalization.CultureInfo]::InvariantCulture)
+$memory = @{}
+foreach ($line in (Get-Content /proc/meminfo)) {
+    if ($line -match '^(MemAvailable|SwapFree):\s+(\d+)') { $memory[$Matches[1]] = [math]::Round([double]$Matches[2] / 1024, 1) }
+}
+$kernel = @(& journalctl -k --since '-5 min' --no-pager -o cat 2>$null)
+$oom = if ($LASTEXITCODE -eq 0) { @($kernel | Where-Object { $_ -match 'Out of memory|oom-kill' }).Count } else { $null }
+$journal = @(& journalctl -u ssh -u sshd --since '-5 min' --no-pager -o cat 2>$null)
+$preauth = $null; $drops = $null
+if ($LASTEXITCODE -eq 0) {
+    $lines = @($journal | Where-Object { $_ -match 'Timeout before authentication|Connection (reset|closed) by .* \[preauth\]|kex_exchange_identification' })
+    $ours = if ($client) {
+        $address = '(?<![0-9A-Fa-f:.])' + [regex]::Escape($client) + '(?![0-9A-Fa-f:.])'
+        @($lines | Where-Object { $_ -match $address }).Count
+    } else { 0 }
+    $preauth = [ordered]@{ total = $lines.Count; client = $ours }
+    $drops = @($journal | Where-Object { $_ -match 'MaxStartups|drop connection' }).Count
+}
+$sshd = if (Test-Path /usr/sbin/sshd) { '/usr/sbin/sshd' } else { (Get-Command sshd -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
+$max = $null
+if ($sshd) {
+    $effective = @(& $sshd -T 2>$null)
+    if ($LASTEXITCODE -eq 0) { $max = ($effective | Where-Object { $_ -match '^maxstartups\s+' } | Select-Object -First 1) -replace '^maxstartups\s+', '' }
+}
+if (-not $max) {
+    $files = @('/etc/ssh/sshd_config') + @(Get-ChildItem /etc/ssh/sshd_config.d/*.conf -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object FullName)
+    foreach ($file in $files) {
+        $line = Get-Content -LiteralPath $file -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*MaxStartups\s+(\S+)' } | Select-Object -First 1
+        if ($line -match '^\s*MaxStartups\s+(\S+)') { $max = $Matches[1]; break }
+    }
+}
+if (-not $max) { $max = 'default 10:30:100' }
+$processRows = @(& ps -eo 'pid=,ppid=,comm=,args=' 2>$null)
+$sshdProcesses = $null; $sshdUnauth = $null
+if ($LASTEXITCODE -eq 0) {
+    $sshdProcesses = 0
+    $pending = @{}
+    foreach ($row in $processRows) {
+        if ($row -cmatch '^\s*(\d+)\s+(\d+)\s+(sshd\S*)\s*(.*)$') {
+            $processId = [int]$Matches[1]; $parentId = [int]$Matches[2]
+            $comm = $Matches[3]; $arguments = $Matches[4]
+            $sshdProcesses++
+            if ($comm -ceq 'sshd-auth' -or
+                $arguments -cmatch '\[preauth\]' -or
+                $arguments -cmatch '^sshd(?:-session)?: .*\[net\]' -or
+                $arguments -cmatch '^sshd: (?:\[accepted\]|unknown \[priv\])') {
+                $pending[$processId] = $parentId
+            }
+        }
+    }
+    $sshdUnauth = 0
+    foreach ($processId in $pending.Keys) {
+        if (-not $pending.ContainsKey($pending[$processId])) { $sshdUnauth++ }
+    }
+}
+[ordered]@{ client = $client; load1 = $load1; cores = [Environment]::ProcessorCount
+    memAvailMiB = $memory['MemAvailable']; swapFreeMiB = $memory['SwapFree']; oomKills5m = $oom
+    sshdPreauth5m = $preauth; maxStartupsLines = $drops
+    sshdProcesses = $sshdProcesses; sshdUnauth = $sshdUnauth; maxStartups = $max } | ConvertTo-Json -Depth 4 -Compress
+"""
+
+SSH_TARGET_WINDOWS = r"""
+$cpu = @(Get-CimInstance Win32_Processor | ForEach-Object { $_.LoadPercentage })
+$os = Get-CimInstance Win32_OperatingSystem
+[ordered]@{ client = ($env:SSH_CONNECTION -split '\s+')[0]
+    cpuLoadPct = if ($cpu.Count) { [math]::Round(($cpu | Measure-Object -Average).Average, 1) } else { $null }
+    memAvailMiB = if ($os) { [math]::Round($os.FreePhysicalMemory / 1024, 1) } else { $null }
+    sshdProcesses = @(Get-Process -Name 'sshd*' -ErrorAction SilentlyContinue).Count
+    sshdUnauth = $null
+    journal = 'unavailable on Windows' } | ConvertTo-Json -Compress
+"""
+
+
+def ssh_diagnosis(host, run=subprocess.run, evidence_dir=None, tcp=None, ssh_options=(),
+                  attempt_log=None, mux_dir=None, ssh_bin='ssh', windows=False, allow_retry=True,
+                  attempt_timed_out=False, attempt_killed=False):
+    require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
+    directory = Path(evidence_dir) if evidence_dir is not None else (
+        Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'eden-lifecycle' / 'ssh-diag')
+    directory.mkdir(parents=True, exist_ok=True)
+    evidence = directory / ('ssh-' + uuid.uuid4().hex + '.log')
+    try:
+        text = Path(attempt_log).read_text(encoding='utf-8', errors='replace') if attempt_log else ''
+    except OSError:
+        text = ''
+    evidence.write_text(text, encoding='utf-8')
+    phase = ssh_phase(text)
+    probe_log = evidence.with_suffix('.log.diag')
+    direct = ['-T', *SSH_OPTIONS, *ssh_options, '-o', 'ControlPath=none']
+    started = time.monotonic()
+    try:
+        probe = run([ssh_bin, '-vvv', '-E', str(probe_log), *direct, host, 'exit'],
+                    capture_output=True, text=True, timeout=10)
+        code, probe_text = probe.returncode, probe.stderr or ''
+    except subprocess.TimeoutExpired as error:
+        code, probe_text = 124, error.stderr or ''
+    except OSError as error:
+        code, probe_text = 255, str(error)
+    if isinstance(probe_text, bytes):
+        probe_text = probe_text.decode(errors='replace')
+    probe_text = (probe_log.read_text(encoding='utf-8', errors='replace') if probe_log.exists() else '') + probe_text
+    probe_log.write_text(probe_text, encoding='utf-8')
+    diag_login = f'ok in {time.monotonic() - started:.1f} s' if code == 0 else f'failed, phase {ssh_phase(probe_text)}'
+    target, target_display = None, 'unavailable (diagnostic login failed)'
+    if code == 0:
+        script = SSH_TARGET_WINDOWS if windows else SSH_TARGET_LINUX
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode()
+        exe = r'"C:\Program Files\PowerShell\7\pwsh.exe"' if windows else '/usr/bin/pwsh'
+        command = f'{exe} -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}'
+        try:
+            result = run([ssh_bin, *direct, host, command], capture_output=True, text=True, timeout=10)
+            if result.returncode:
+                target_display = f'unavailable (target command exit {result.returncode})'
+            else:
+                target = json.loads(result.stdout)
+                if not isinstance(target, dict) or not {'sshdProcesses', 'sshdUnauth', 'memAvailMiB'} <= target.keys():
+                    raise ValueError('missing target fields')
+                threshold = re.match(r'^(?:default\s+)?(\d+)', str(target.get('maxStartups', '')))
+                unauth = target.get('sshdUnauth')
+                target_display = ('unauth ' + (str(unauth) if unauth is not None else 'n/a') + '/' +
+                                  (threshold.group(1) if threshold else 'n/a') + ' ' +
+                                  json.dumps(target, separators=(',', ':'), ensure_ascii=False).replace(';', ' '))
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+            target, target_display = None, 'unavailable (invalid target JSON or target command failed)'
+    try:
+        config = run([ssh_bin, '-G', *direct, host], capture_output=True, text=True, timeout=5)
+        hostname_match = re.search(r'(?m)^hostname\s+(\S+)\s*$', config.stdout or '')
+        port_match = re.search(r'(?m)^port\s+(\d+)\s*$', config.stdout or '')
+        hostname = hostname_match.group(1) if hostname_match else host
+        port = int(port_match.group(1)) if port_match else 22
+    except (OSError, subprocess.TimeoutExpired):
+        hostname, port = host, 22
+    try:
+        reachable = (tcp or _tcp_probe)(hostname, port)
+    except OSError:
+        reachable = False
+    tcp_status = 'ok' if reachable else 'fail'
+    try:
+        ping = run(['ping', '-c', '10', '-i', '0.2', '-W', '1', hostname],
+                   capture_output=True, text=True, timeout=8)
+        ping_text = ping.stdout or ''
+    except (OSError, subprocess.TimeoutExpired):
+        ping_text = ''
+    loss_match = re.search(r'(\d+(?:\.\d+)?)%\s+packet loss', ping_text)
+    rtt_match = re.search(r'(?:rtt|round-trip)[^=]*=\s*([\d.]+)/([\d.]+)/([\d.]+)/', ping_text)
+    loss = loss_match.group(1) + '%' if loss_match else 'n/a'
+    avg = rtt_match.group(2) + ' ms' if rtt_match else 'n/a'
+    try:
+        qos = run([ssh_bin, *direct, '-o', 'IPQoS=none', host, 'exit'],
+                  capture_output=True, text=True, timeout=10)
+        qos_status = 'ok' if qos.returncode == 0 else 'fail'
+    except (OSError, subprocess.TimeoutExpired):
+        qos_status = 'fail'
+    cause, transient, message = ssh_cause(text, phase, diag_login, tcp_status, loss, target, hostname,
+                                          rtt_match.group(1) if rtt_match else None,
+                                          rtt_match.group(3) if rtt_match else None,
+                                          attempt_timed_out, attempt_killed)
+    sockets = _control_socket_count(mux_dir)
+    line = (f'ssh diag {socket.gethostname()} -> {host} ({hostname}): attempt phase {phase}; '
+            f'message {message or "none"}; diag login {diag_login}; tcp22 {tcp_status}; ping loss {loss} avg {avg}; '
+            f'IPQoS=none probe {qos_status}; target {target_display}; '
+            f'local ssh processes {_ssh_process_count(host, hostname, run)}; control sockets {sockets}; '
+            f'cause: {cause}; retry: {"yes, once" if transient and allow_retry else "no"}; evidence {evidence}')
+    with (directory / 'ssh-diag.md').open('a', encoding='utf-8') as stream:
+        stream.write(line + '\n')
+    print(line, file=sys.stderr, flush=True)
+    return {'line': line, 'transient': transient, 'phase': phase, 'cause': cause, 'evidence': str(evidence)}
+
+
+class SshMux:
+    _lock = threading.RLock()
+    _directories = {}
+    _references = {}
+    _ready = set()
+    _sequence = 0
+
+    def __init__(self, host, run=subprocess.run, ssh_options=(), ssh_bin='ssh', windows=False,
+                 evidence_dir=None, popen=None):
+        require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
+        self.host, self.run, self.options, self.ssh_bin = host, run, tuple(ssh_options), ssh_bin
+        self.windows, self.evidence_dir, self.popen = windows, evidence_dir, popen or subprocess.Popen
+        self.root = Path(os.environ.get('XDG_RUNTIME_DIR') or tempfile.gettempdir()) / f'eden-ssh-{os.getpid()}'
+        self.key = None
+        self.entered = False
+        self.attempt_deadline = None
+        self.open_generation = 0
+
+    @property
+    def rider_args(self):
+        return [*SSH_OPTIONS, *self.options, '-o', 'ControlMaster=no',
+                '-o', f'ControlPath={self.root}/%C', '-o', 'ProxyCommand=/bin/false']
+
+    def _control(self, operation, timeout=3):
+        return self.run([self.ssh_bin, *self.rider_args, '-O', operation, self.host],
+                        capture_output=True, text=True, timeout=timeout)
+
+    def _connection_key(self):
+        try:
+            result = self.run([self.ssh_bin, '-G', *SSH_OPTIONS, *self.options,
+                               '-o', f'ControlPath={self.root}/%C', self.host],
+                              capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        match = re.search(r'(?m)^controlpath\s+(.+)\s*$', result.stdout or '') if result else None
+        if result is None or result.returncode != 0 or not match:
+            diagnosis = ssh_diagnosis(self.host, run=self.run, evidence_dir=self.evidence_dir,
+                                      ssh_options=self.options, ssh_bin=self.ssh_bin, windows=self.windows,
+                                      allow_retry=False)
+            raise LedgerTransport([diagnosis])
+        path = Path(match.group(1).strip())
+        require(path.parent == self.root and path.name != '%C', 'Unsafe SSH control path')
+        return str(path)
+
+    @staticmethod
+    def _same_user(directory):
+        return not hasattr(os, 'getuid') or directory.stat().st_uid == os.getuid()
+
+    @staticmethod
+    def _pid_alive(pid):
+        if os.name == 'nt':
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+            kernel.OpenProcess.restype = ctypes.c_void_p
+            kernel.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+            kernel.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+            handle = kernel.OpenProcess(0x00100000, False, pid)
+            if not handle:
+                return ctypes.get_last_error() != 87
+            try:
+                return kernel.WaitForSingleObject(handle, 0) != 0
+            finally:
+                kernel.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+
+    def _retire_directory(self, directory):
+        for entry in directory.iterdir():
+            try:
+                if stat.S_ISSOCK(entry.lstat().st_mode):
+                    self.run([self.ssh_bin, *SSH_OPTIONS, '-o', 'ControlMaster=no',
+                              '-o', f'ControlPath={entry}', '-O', 'exit', 'localhost'],
+                             capture_output=True, text=True, timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        shutil.rmtree(directory)
+
+    def _sweep(self):
+        for directory in self.root.parent.glob('eden-ssh-*'):
+            match = re.fullmatch(r'eden-ssh-([1-9][0-9]*)', directory.name)
+            if not match or int(match.group(1)) == os.getpid() or directory.is_symlink():
+                continue
+            try:
+                if not self._same_user(directory) or not directory.is_dir():
+                    continue
+                if self._pid_alive(int(match.group(1))):
+                    continue
+                self._retire_directory(directory)
+            except (OSError, ValueError, OverflowError):
+                continue
+
+    def __enter__(self):
+        self.key = self._connection_key()
+        with self._lock:
+            if not self._directories.get(str(self.root)):
+                self._sweep()
+                require(not self.root.is_symlink(), 'Unsafe SSH mux directory')
+                if self.root.exists():
+                    require(self.root.is_dir() and self._same_user(self.root), 'Foreign SSH mux directory')
+                    self._retire_directory(self.root)
+                self.root.mkdir(mode=0o700, exist_ok=True)
+                require(self._same_user(self.root), 'Foreign SSH mux directory')
+                os.chmod(self.root, 0o700)
+            self._directories[str(self.root)] = self._directories.get(str(self.root), 0) + 1
+            self._references[self.key] = self._references.get(self.key, 0) + 1
+            self.entered = True
+        try:
+            self.ensure()
+            return self
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def ensure(self):
+        with self._lock:
+            if self.key in self._ready:
+                try:
+                    if self._control('check').returncode == 0:
+                        return
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                self._ready.discard(self.key)
+                try:
+                    socket_path = Path(self.key)
+                    if stat.S_ISSOCK(socket_path.lstat().st_mode):
+                        socket_path.unlink()
+                except FileNotFoundError:
+                    pass
+            diagnoses = []
+            for attempt in range(2):
+                type(self)._sequence += 1
+                log = self.root / f'master-{type(self)._sequence}.log'
+                deadline = time.monotonic() + 10
+                command = [self.ssh_bin, '-o', 'ControlMaster=yes', '-o', 'ControlPersist=120',
+                           *SSH_OPTIONS, *self.options, '-o', f'ControlPath={self.root}/%C',
+                           '-vvv', '-E', str(log), '-f', '-N', self.host]
+                process = None
+                attempt_timed_out = attempt_killed = False
+                try:
+                    process = self.popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, start_new_session=True)
+                    result = process.wait(timeout=max(.001, deadline - time.monotonic()))
+                    remaining = deadline - time.monotonic()
+                    if result == 0 and remaining > 0 and self._control('check', min(3, remaining)).returncode == 0:
+                        self._ready.add(self.key)
+                        self.attempt_deadline = deadline
+                        self.open_generation += 1
+                        return
+                    attempt_timed_out = remaining <= 0
+                except subprocess.TimeoutExpired:
+                    attempt_timed_out = True
+                except OSError:
+                    pass
+                finally:
+                    if process is not None and process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            attempt_killed = attempt_timed_out
+                        except ProcessLookupError:
+                            pass
+                        except (OSError, AttributeError):
+                            try:
+                                process.kill()
+                                attempt_killed = attempt_timed_out
+                            except ProcessLookupError:
+                                pass
+                        try:
+                            process.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                diagnosis = ssh_diagnosis(self.host, run=self.run, evidence_dir=self.evidence_dir,
+                                          ssh_options=self.options, attempt_log=log, mux_dir=self.root,
+                                          ssh_bin=self.ssh_bin, windows=self.windows, allow_retry=attempt == 0,
+                                          attempt_timed_out=attempt_timed_out, attempt_killed=attempt_killed)
+                diagnoses.append(diagnosis)
+                if attempt or not diagnosis['transient']:
+                    raise LedgerTransport(diagnoses)
+
+    def __exit__(self, exc_type, exc, traceback):
+        with self._lock:
+            if not self.entered:
+                return
+            self.entered = False
+            remaining = self._references[self.key] - 1
+            if remaining:
+                self._references[self.key] = remaining
+            else:
+                self._references.pop(self.key)
+                try:
+                    self._control('exit')
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                self._ready.discard(self.key)
+            root = str(self.root)
+            self._directories[root] -= 1
+            if not self._directories[root]:
+                self._directories.pop(root)
+                shutil.rmtree(self.root, ignore_errors=True)
 
 
 def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=None, watchdog_pause=None,
@@ -2513,15 +3405,80 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
     script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 900 "
               "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
     encoded = base64.b64encode(script.encode('utf-16-le')).decode()
-    command = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host,
-               '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
     packet = {'mode': mode, 'config': config, 'execute': execute, 'source': source,
               'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause,
               'keep_state': keep_state, 'evidence_dir': evidence_dir}
-    done = run(command, input=json.dumps(packet), capture_output=True, text=True, timeout=900)
-    require(done.returncode == 0, 'SSH lifecycle failed: ' + done.stderr[-2000:] + done.stdout[-2000:])
-    return json.loads(done.stdout)
+    with SshMux(host, run=run) as mux:
+        mux.ensure()
+        log = mux.root / ('rider-' + uuid.uuid4().hex + '.log')
+        command = ['ssh', '-T', *mux.rider_args, '-vvv', '-E', str(log), host,
+                   '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
+        try:
+            done = run(command, input=json.dumps(packet), capture_output=True, text=True, timeout=900)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnosis = ssh_diagnosis(host, run=run, attempt_log=log, mux_dir=mux.root, allow_retry=False)
+            raise Refused('SSH lifecycle failed: ' + diagnosis['line']) from error
+        if done.returncode == 255:
+            diagnosis = ssh_diagnosis(host, run=run, attempt_log=log, mux_dir=mux.root, allow_retry=False)
+            raise Refused('SSH lifecycle failed: ' + diagnosis['line'])
+        require(done.returncode == 0, 'SSH lifecycle failed: ' + done.stderr[-2000:] + done.stdout[-2000:])
+        return json.loads(done.stdout)
+
+
+def ledger_forward(host, operation, config, run=subprocess.run):
+    require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
+    require(operation in ('read', 'claim', 'release', 'reserve'), 'Unknown ledger operation')
+    bootstrap = 'import json,sys; p=json.load(sys.stdin); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
+    script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 6 "
+              "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
+    encoded = base64.b64encode(script.encode('utf-16-le')).decode()
+    source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
+    packet = {'mode': 'ledger-' + operation, 'config': config, 'execute': True, 'source': source}
+    diagnoses = []
+    started = time.monotonic()
+    with SshMux(host, run=run) as mux:
+        deadline = mux.attempt_deadline or started + LEDGER_ATTEMPT_SECONDS
+        for attempt in range(2):
+            if attempt:
+                deadline = time.monotonic() + LEDGER_ATTEMPT_SECONDS
+            generation = mux.open_generation
+            try:
+                mux.ensure()
+            except LedgerTransport as error:
+                raise LedgerTransport([*diagnoses, *error.diagnoses]) from error
+            if mux.open_generation != generation:
+                deadline = mux.attempt_deadline
+            log = mux.root / ('rider-' + uuid.uuid4().hex + '.log')
+            command = ['ssh', '-T', *mux.rider_args, '-vvv', '-E', str(log), host,
+                       '/usr/bin/pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
+            attempt_timed_out = attempt_killed = operation_started = False
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, LEDGER_ATTEMPT_SECONDS)
+                operation_started = True
+                done = run(command, input=json.dumps(packet), capture_output=True, text=True,
+                           timeout=remaining)
+                if done.returncode not in (0, 255):
+                    raise Refused('SSH lifecycle failed: ' + (done.stderr or '')[-2000:] + (done.stdout or '')[-2000:])
+                if done.returncode == 0:
+                    try:
+                        result = json.loads(done.stdout)
+                        if not isinstance(result, dict):
+                            raise ValueError('ledger reply is not an object')
+                        return result
+                    except (ValueError, TypeError):
+                        pass
+            except subprocess.TimeoutExpired:
+                attempt_timed_out, attempt_killed = True, operation_started
+            except OSError:
+                pass
+            diagnosis = ssh_diagnosis(host, run=run, attempt_log=log, mux_dir=mux.root, allow_retry=attempt == 0,
+                                      attempt_timed_out=attempt_timed_out, attempt_killed=attempt_killed)
+            diagnoses.append(diagnosis)
+            if attempt or not diagnosis['transient']:
+                raise LedgerTransport(diagnoses)
 
 
 def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
@@ -2539,6 +3496,8 @@ def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=N
         return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
     if mode == 'watchdog-serve':
         return tool.watchdog_serve()
+    if mode == 'settle':
+        return tool.settle(minutes=30 if watchdog_rounds is None else watchdog_rounds)
     if mode == 'down':
         return tool.down(keep_state=keep_state, evidence_dir=evidence_dir)
     return getattr(tool, mode)()
@@ -2552,6 +3511,15 @@ def remote_main(packet):
             print(json.dumps({'ledger_request': {'operation': operation, 'token': token,
                               'stale_claim_hours': stale_claim_hours, 'admission': admission}}), flush=True)
             reply = json.loads(sys.stdin.readline())
+            if str(reply.get('error', '')).startswith('Ledger transport: '):
+                detail = reply['error'][len('Ledger transport: '):]
+                try:
+                    diagnoses = json.loads(detail)
+                    if not isinstance(diagnoses, list) or not diagnoses:
+                        raise ValueError('missing diagnoses')
+                except (ValueError, TypeError):
+                    diagnoses = detail
+                raise LedgerTransport(diagnoses)
             require('error' not in reply, reply.get('error'))
             return reply['result']
         globals()['_LEDGER_BRIDGE'] = bridge
@@ -2572,18 +3540,22 @@ def forward_windows(host, mode, config, execute, popen=subprocess.Popen, ledger_
                     watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
     # SSH exec is always non-login/noninteractive (-T, explicit MSI pwsh -NoProfile).
     # 1312 is a pre-launch Windows logon failure: retry ONCE, never replay a claim/Up.
-    for attempt in range(2):
-        try:
-            return _forward_windows_once(host, mode, config, execute, popen, ledger_factory,
-                                          watchdog_rounds, watchdog_pause, keep_state, evidence_dir)
-        except Refused as error:
-            if not (attempt == 0 and getattr(error, 'transport_not_started', False)
-                    and 'CreateProcessAsUserW failed: 1312' in str(error)):
-                raise
+    # It is a Windows logon error after SSH succeeds, not an SSH transport failure.
+    options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes')
+    with SshMux(host, ssh_options=options, windows=True) as mux:
+        for attempt in range(2):
+            mux.ensure()
+            try:
+                return _forward_windows_once(host, mode, config, execute, popen, ledger_factory,
+                                              watchdog_rounds, watchdog_pause, keep_state, evidence_dir, mux=mux)
+            except Refused as error:
+                if not (attempt == 0 and getattr(error, 'transport_not_started', False)
+                        and 'CreateProcessAsUserW failed: 1312' in str(error)):
+                    raise
 
 
 def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, ledger_factory=Ledger,
-                          watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None):
+                          watchdog_rounds=None, watchdog_pause=None, keep_state=False, evidence_dir=None, mux=None):
     """Windows cmd-default SSH transport, with Linux-authoritative ledger RPC.
 
     No Windows SSH keys or copied ledger. Both sides retain the same durable token.
@@ -2595,8 +3567,7 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
     script = ('& "C:\\Program Files\\Python312\\python.exe" -I -B -X utf8 -c ' +
               "'" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
     encoded = base64.b64encode(script.encode('utf-16-le')).decode()
-    command = ['ssh', '-T', '-x', '-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes',
-               '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', host,
+    command = ['ssh', '-T', '-x', *mux.rider_args, host,
                '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand ' + encoded]
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
     process = popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2655,6 +3626,8 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
                 try:
                     result = ledger.operate(request['operation'], request.get('stale_claim_hours'), request.get('admission'))
                     reply = {'result': result}
+                except LedgerTransport as error:
+                    reply = {'error': 'Ledger transport: ' + json.dumps(error.diagnoses)}
                 except Exception as error:
                     reply = {'error': str(error)}
                 process.stdin.write(json.dumps(reply) + '\n')
@@ -2685,12 +3658,14 @@ def main(argv=None):
         windows_launch(actual[1])
         return 0
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'reserve', 'watchdog', 'watchdog-serve'))
+    parser.add_argument('mode', choices=('up', 'down', 'status', 'preflight', 'reserve', 'watchdog', 'watchdog-serve',
+                                         'settle'))
     parser.add_argument('config', type=Path)
     parser.add_argument('--execute', action='store_true', help='explicit runtime authorization; NEVER used by offline tests')
     parser.add_argument('--ssh', help='executor host (remote login shell PowerShell 7)')
     parser.add_argument('--rounds', type=int, default=None, help='watchdog polls (default: the config, else 1)')
     parser.add_argument('--pause', type=float, default=None, help='seconds between watchdog polls')
+    parser.add_argument('--minutes', type=float, default=None, help='settle deadline in minutes (default 30)')
     parser.add_argument('--keep-state', action='store_true',
                         help='down: keep the run\'s copies (work_root, state snapshots) for debugging; only when asked')
     parser.add_argument('--evidence-dir', help='down: where the files the run wrote are copied before the prune '
@@ -2703,6 +3678,7 @@ def main(argv=None):
         require(args.mode == 'down' or not (args.keep_state or args.evidence_dir),
                 '--keep-state and --evidence-dir are down options')
         require(args.mode == 'reserve' or args.approver is None, '--approver is a reserve option')
+        require(args.mode == 'settle' or args.minutes is None, '--minutes is a settle option')
         if args.mode == 'reserve':
             require(args.approver, 'reserve requires --approver')
             validate(config)
@@ -2717,14 +3693,17 @@ def main(argv=None):
             print(json.dumps(receipt, indent=2))
             return 0
         options = {'keep_state': args.keep_state, 'evidence_dir': args.evidence_dir}
-        value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=args.rounds, watchdog_pause=args.pause,
+        rounds = args.minutes if args.mode == 'settle' else args.rounds
+        value = (forward(args.ssh, args.mode, config, args.execute, watchdog_rounds=rounds, watchdog_pause=args.pause,
                          **options)
-                 if args.ssh else dispatch(args.mode, config, args.execute, args.rounds, args.pause, **options))
+                 if args.ssh else dispatch(args.mode, config, args.execute, rounds, args.pause, **options))
         if isinstance(value, dict) and args.mode in ('preflight', 'watchdog', 'watchdog-serve'):
             for line in value.get('lines') or []:
                 print(line, file=sys.stderr)
         print(json.dumps(value, indent=2))
         if isinstance(value, dict) and args.mode == 'preflight' and not value.get('ok', False):
+            return 1
+        if isinstance(value, dict) and args.mode == 'settle' and value.get('release_pending'):
             return 1
         return 0
     except Exception as error:

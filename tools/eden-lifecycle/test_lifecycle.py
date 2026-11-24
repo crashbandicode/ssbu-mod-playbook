@@ -8,14 +8,114 @@ import io
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import re
+import socket
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import call, mock_open, patch
 
 spec = importlib.util.spec_from_file_location('lifecycle', Path(__file__).with_name('lifecycle.py'))
 life = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(life)
+real_ssh_mux = life.SshMux
+real_ssh_diagnosis = life.ssh_diagnosis
+
+
+class FakeMux:
+    def __init__(self, host, ssh_options=(), **_kwargs):
+        self.host = host
+        self._temporary = tempfile.TemporaryDirectory(prefix='fake-eden-mux-')
+        self.root = Path(self._temporary.name)
+        self.attempt_deadline = None
+        self.open_generation = 0
+        self.rider_args = [*life.SSH_OPTIONS, *ssh_options, '-o', 'ControlMaster=no',
+                           '-o', 'ControlPath=/tmp/fake-eden-ssh/%C', '-o', 'ProxyCommand=/bin/false']
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self._temporary.cleanup()
+
+    def ensure(self):
+        pass
+
+
+def setUpModule():
+    mux = patch.object(life, 'SshMux', FakeMux)
+    mux.start()
+    unittest.addModuleCleanup(mux.stop)
+
+
+def transport(text='ssh diag fake: temporary stall', transient=True, cause='temporary stall'):
+    return life.LedgerTransport([{'line': text, 'transient': transient, 'cause': cause,
+                                  'phase': 'auth', 'evidence': '/tmp/fake-diag'}])
+
+
+def target_fixture_run(target, attempts, ping_text='0% packet loss\nrtt min/avg/max/mdev = 1.0/2.0/3.0/0.1 ms\n',
+                       succeed_after_failure=False):
+    def run(argv, **kwargs):
+        if 'input' in kwargs:
+            attempts.append(argv)
+            Path(argv[argv.index('-E') + 1]).write_text(
+                'Connecting to fake-host\nConnection established\nRemote protocol version 2.0\n'
+                'SSH2_MSG_KEXINIT sent\nConnection to fake-host port 22 timed out\n')
+            if succeed_after_failure and len(attempts) > 1:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({'owned_claim': True}), '')
+            return subprocess.CompletedProcess(argv, 255, '', '')
+        if '-G' in argv:
+            options = [x for x in argv if x.startswith('ControlPath=')]
+            control = ('controlpath ' + options[-1][len('ControlPath='):].replace('%C', 'fixture') + '\n') if options else ''
+            return subprocess.CompletedProcess(argv, 0, 'hostname fake-host\nport 22\n' + control, '')
+        if argv[0] == 'ping':
+            return subprocess.CompletedProcess(argv, 0, ping_text, '')
+        if '-vvv' in argv:
+            return subprocess.CompletedProcess(argv, 0 if target is not None else 255, '',
+                                               'Authenticated to fake-host' if target is not None else
+                                               'Connecting to fake-host\nConnection established\n')
+        if 'EncodedCommand' in argv[-1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(target), '')
+        return subprocess.CompletedProcess(argv, 0, '', '')
+    return run
+
+
+def health_path_cases():
+    normal = {'load1': 1, 'cores': 8, 'memAvailMiB': 1000, 'oomKills5m': 0,
+              'sshdProcesses': 5, 'sshdUnauth': 0, 'maxStartups': '10:30:100', 'maxStartupsLines': 0}
+    loss = '20% packet loss\nrtt min/avg/max/mdev = 1.000/2.000/3.000/0.100 ms\n'
+    spike = '0% packet loss\nrtt min/avg/max/mdev = 2.000/5.000/140.000/0.100 ms\n'
+    quiet = '0% packet loss\nrtt min/avg/max/mdev = 1.000/2.000/3.000/0.100 ms\n'
+    windows_busy = {'cpuLoadPct': 100, 'memAvailMiB': 4096, 'sshdProcesses': 3, 'sshdUnauth': None,
+                    'journal': 'unavailable on Windows'}
+    windows_idle = {**windows_busy, 'cpuLoadPct': 5, 'memAvailMiB': 8192}
+    return (
+        ('unavailable-loss', None, loss, 1, 'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('missing-memory', {k: v for k, v in normal.items() if k != 'memAvailMiB'}, loss, 1,
+         'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('null-oom', {**normal, 'oomKills5m': None}, loss, 1,
+         'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('unavailable-rtt', None, spike, 1, 'RTT spikes on the path to fake-host (max 140.000 ms); target health not confirmed, no retry'),
+        ('healthy-loss', normal, loss, 2, 'packet loss 20% on the path to fake-host'),
+        ('healthy-rtt', normal, spike, 2, 'RTT spikes on the path to fake-host (max 140.000 ms)'),
+        ('healthy-timeout', normal, quiet, 2,
+         'single kex timeout with TCP 22 answering and a healthy target (load 1 on 8 cores, 1000 MiB available)'),
+        ('overload-loss', {**normal, 'load1': 48, 'memAvailMiB': 150, 'oomKills5m': 2}, loss, 1,
+         'target overloaded (load 48 on 8 cores, 150 MiB available, 2 OOM kills)'),
+        ('throttled-loss', {**normal, 'sshdUnauth': 10}, loss, 1,
+         'sshd connection throttling on the target (MaxStartups)'),
+        ('windows-busy-loss', windows_busy, loss, 1,
+         'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('windows-idle-loss', windows_idle, loss, 1,
+         'packet loss 20% on the path to fake-host; target health not confirmed, no retry'),
+        ('windows-rtt', windows_idle, spike, 1,
+         'RTT spikes on the path to fake-host (max 140.000 ms); target health not confirmed, no retry'),
+        ('windows-timeout', windows_idle, quiet, 1,
+         'target health not confirmed, no retry'),
+    )
 
 
 class FakeLedger:
@@ -68,6 +168,10 @@ class FakeHost:
         self.started_watchdogs = []
         self.stopped_watchdogs = []
         self.watchdog_commands = []
+        self.started_settles = []
+        self.stopped_settles = []
+        self.settle_units = set()
+        self.fail_settle = False
 
     def clock(self):
         return self.now
@@ -152,6 +256,19 @@ class FakeHost:
         self.watchdog_commands.append(command)
         self.live[unit] = [{'pid': 9, 'start': 'wd', 'boot': 'fake'}]
 
+    def start_settle(self, unit, command, directory, runtime):
+        if self.fail_settle:
+            raise RuntimeError('synthetic settle start failure')
+        self.started_settles.append((unit, command, directory, runtime))
+        self.settle_units.add(unit)
+
+    def stop_settle(self, unit):
+        self.stopped_settles.append(unit)
+        self.settle_units.discard(unit)
+
+    def settle_running(self, unit):
+        return unit in self.settle_units
+
     def stop_watchdog(self, unit):
         self.stopped_watchdogs.append(unit)
         self.live.pop(unit, None)
@@ -165,6 +282,9 @@ class LifecycleTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='eden-life-', dir='/tmp/opencode')
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
+        environment = patch.dict(os.environ, {'XDG_STATE_HOME': str(self.base / 'state-home')})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.source = self.base / 'source-b'
         self.source.mkdir()
         config = self.source / life.CONFIG
@@ -1130,6 +1250,89 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.host.calls)
         self.assertFalse(Path(self.config['work_root']).exists())
 
+    def test_contradictory_ledger_history_releases_the_open_claim(self):
+        for already_released in (False, True):
+            with self.subTest(already_released=already_released):
+                self.ledger_path.write_text('')
+                token = ('a' if already_released else 'b') * 32
+                ledger = life.Ledger(self.ledger_path, 'surface', self.config['owner'], token)
+                claim = ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})['line']
+                ledger.release()
+                with self.ledger_path.open('a') as stream:
+                    stream.write(claim + '\n')
+                before = ledger.inspect()
+                self.assertEqual((before['owned_claim'], before['owned_release']), (True, True))
+                original = self.ledger_path.read_bytes()
+                self.assertTrue(ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})['already_claimed'])
+                self.assertEqual(self.ledger_path.read_bytes(), original)
+                config = dict(self.config, state_dir=str(self.base / ('state-' + token)))
+                c = life.Lifecycle(config, self.host)
+                c.directory.mkdir(parents=True)
+                c.state = {'token': token, 'claimed': True, 'released': already_released, 'release_pending': True}
+                c.ledger = lambda: ledger
+                with patch.object(ledger, 'inspect', wraps=ledger.inspect) as inspect:
+                    c._settle_ledger()
+                self.assertEqual(inspect.call_count, 2)
+                self.assertTrue(c.state['released'])
+                self.assertFalse(c.state['release_pending'])
+                self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (False, True))
+                self.assertEqual(self.ledger_path.read_text().count(' RELEASED:'), 2)
+                actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+                self.assertIn('settle-contradiction', actions)
+
+    def test_contradictory_release_readback_refuses_if_claim_reappears(self):
+        self.ledger_path.write_text('')
+        token = 'c' * 32
+        ledger = life.Ledger(self.ledger_path, 'surface', self.config['owner'], token)
+        claim = ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})['line']
+        ledger.release()
+        with self.ledger_path.open('a') as stream:
+            stream.write(claim + '\n')
+        c = life.Lifecycle(self.config, self.host)
+        c.directory.mkdir(parents=True)
+        c.state = {'token': token, 'claimed': True, 'released': True, 'release_pending': True}
+        c.ledger = lambda: ledger
+        actual_release = ledger.release
+        def release_then_reopen():
+            result = actual_release()
+            with self.ledger_path.open('a') as stream:
+                stream.write(claim + '\n')
+            return result
+        with patch.object(ledger, 'release', side_effect=release_then_reopen), \
+                self.assertRaisesRegex(life.Refused, 'Open lifecycle claim remains after release'):
+            c._settle_ledger()
+        self.assertTrue(ledger.inspect()['owned_claim'])
+        self.assertFalse(c.state['released'])
+        self.assertTrue(c.state['release_pending'])
+        self.assertFalse(json.loads(c.journal.read_text())['released'])
+
+    def test_settle_and_settle_pending_release_contradictory_real_ledger(self):
+        for method in ('settle', 'settle_pending'):
+            with self.subTest(method=method):
+                config = dict(self.config, state_dir=str(self.base / ('state-' + method)),
+                              work_root=str(self.base / ('work-' + method)))
+                c = life.Lifecycle(config, self.host)
+                c.up()
+                token = c.state['token']
+                ledger = life.Ledger(self.ledger_path, 'surface', self.config['owner'], token)
+                claim = next(line for line in ledger.inspect()['open'] if f'lifecycle={token} ' in line)
+                c.down(keep_state=True)
+                with self.ledger_path.open('a') as stream:
+                    stream.write(claim + '\n')
+                c.state['released'] = False
+                c.state['release_pending'] = True
+                c.write()
+                c._write_pending()
+                self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (True, True))
+                if method == 'settle':
+                    self.assertTrue(c.settle(minutes=2)['released'])
+                else:
+                    c.settle_pending()
+                self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (False, True))
+                self.assertFalse(json.loads(c.journal.read_text())['release_pending'])
+                actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+                self.assertIn('settle-contradiction', actions)
+
     def test_release_ack_loss_recovers_exact_release_on_next_down(self):
         c = self.controller()
         c.up()
@@ -1153,6 +1356,479 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.ledger.released)
         c.down()
         self.assertTrue(self.ledger.released)
+
+    def test_down_readback_transport_failure_then_later_settlement(self):
+        c = self.controller()
+        c.up()
+        def readback():
+            self.assertTrue(c.state['instances'][0]['verified'])
+            if readback.calls == 0:
+                readback.calls += 1
+                raise transport('ssh diag fake: read unavailable')
+            return {'owned_claim': True, 'owned_release': False}
+        readback.calls = 0
+        with patch.object(self.ledger, 'inspect', side_effect=readback):
+            result = c.down()
+        self.assertEqual(result['phase'], 'down')
+        self.assertFalse(result['released'])
+        self.assertTrue(result['release_pending'])
+        self.assertEqual(self.order.count('release'), 0)
+        actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+        self.assertIn('release-pending', actions)
+        self.assertTrue(c.down()['released'])
+        self.assertEqual(self.order.count('release'), 1)
+
+    def test_down_records_pending_then_second_down_releases_once_and_prunes(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'release', side_effect=transport('ssh diag fake: release unavailable')):
+            result = c.down()
+        self.assertEqual(result['phase'], 'down')
+        self.assertFalse(result['released'])
+        self.assertTrue(result['release_pending'])
+        self.assertFalse(self.host.live)
+        self.assertTrue(c.state['instances'][0]['verified'])
+        self.assertIsNone(result['prune'])
+        path = life.pending_release_dir() / (c.state['token'] + '.json')
+        pending = json.loads(path.read_text())
+        self.assertEqual(pending['ledger'], self.config['ledger'])
+        self.assertEqual(pending['journal_path'], str(c.journal))
+        self.assertEqual(pending['host'], 'surface')
+        self.assertTrue(Path(pending['config_path']).is_file())
+        self.assertEqual(len(self.host.started_settles), 1)
+        self.assertEqual(result['settle_unit'], 'eden-settle-' + c.state['token'][:8] + '.service')
+        status = c.status()
+        self.assertTrue(status['release_pending'])
+        self.assertTrue(status['settle_running'])
+        self.assertEqual(status['release_pending_last_line'], 'notify not configured')
+        self.assertIn('ssh diag fake: release unavailable', (c.directory / 'RELEASE-PENDING.md').read_text())
+        stopped = self.order.count('game.stop-a')
+        result = c.down()
+        self.assertTrue(result['released'])
+        self.assertFalse(result['release_pending'])
+        self.assertTrue(result['prune']['done'])
+        self.assertFalse(path.exists())
+        self.assertEqual(self.host.stopped_settles, [result.get('settle_unit') or self.host.started_settles[0][0]])
+        self.assertEqual(self.order.count('release'), 1)
+        self.assertEqual(self.order.count('game.stop-a'), stopped)
+        self.assertEqual(len(self.host.started_settles), 1)
+
+    def test_nontransient_down_notifies_without_starting_settle(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport(
+                'ssh diag fake: host key', False, 'host key')), patch.object(c, 'notify') as notify:
+            result = c.down()
+        self.assertEqual(result['phase'], 'down')
+        self.assertTrue(result['release_pending'])
+        self.assertIsNone(result['settle_unit'])
+        self.assertEqual(self.host.started_settles, [])
+        line = 'release pending: not retried (cause: host key); manual Down needed'
+        notify.assert_called_once_with(line)
+        receipt = (c.directory / 'RELEASE-PENDING.md').read_text()
+        self.assertIn('ssh diag fake: host key', receipt)
+        self.assertIn(line, receipt)
+        self.assertTrue(c.down()['released'])
+
+    def test_later_nontransient_down_stops_existing_settle(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            first = c.down()
+        unit = first['settle_unit']
+        with patch.object(self.ledger, 'inspect', side_effect=transport(
+                'ssh diag fake: host key', False, 'host key')):
+            second = c.down()
+        self.assertTrue(second['release_pending'])
+        self.assertIsNone(second['settle_unit'])
+        self.assertEqual(self.host.stopped_settles, [unit])
+        self.assertFalse(c.status()['settle_running'])
+        c.down()
+
+    def test_notify_local_format_and_ssh_options(self):
+        target = self.base / 'notifications.md'
+        self.config['notify'] = {'file': str(target), 'from': 'source', 'to': 'recipient'}
+        c = self.controller()
+        c.up()
+        c.notify('one message')
+        self.assertRegex(target.read_text(),
+                         r'^\n## \d\d:\d\d:\d\dZ source test-01 → recipient \| one message\n$')
+        c.down()
+        config = deepcopy(self.config)
+        config.update(label='ssh-notify', state_dir=str(self.base / 'notify-state'),
+                      work_root=str(self.base / 'notify-work'))
+        config['notify'] = {'file': '/tmp/remote messages.md', 'ssh': 'fake-notify'}
+        remote = life.Lifecycle(config, self.host, self.ledger)
+        remote.up()
+        with patch.object(life.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            remote.notify('remote message')
+        argv = run.call_args.args[0]
+        for option in ('BatchMode=yes', 'ConnectTimeout=10', 'ServerAliveInterval=5', 'ServerAliveCountMax=2'):
+            self.assertIn(option, argv)
+        self.assertEqual(run.call_args.kwargs['timeout'], 10)
+        self.assertEqual(argv[-1], "cat >> '/tmp/remote messages.md'")
+        self.assertIn('remote message', run.call_args.kwargs['input'])
+        remote.down()
+
+    def test_failing_notify_does_not_fail_down(self):
+        self.config['notify'] = {'file': str(self.base / 'missing' / 'notifications.md')}
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            result = c.down()
+        self.assertEqual(result['phase'], 'down')
+        self.assertTrue(result['release_pending'])
+        journal = json.loads(c.journal.read_text())
+        self.assertEqual(len(journal['notify_errors']), 1)
+        actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+        self.assertIn('notify-error', actions)
+        c.down()
+
+    def test_notify_validation_rejects_unsafe_fields(self):
+        for spec in ({'file': 'relative'}, {'file': '/tmp/file;touch'}, {'file': '/tmp/../file'},
+                     {'file': '/tmp/file', 'ssh': 'host;bad'}, {'file': '/tmp/file', 'from': 'bad\nname'}):
+            with self.subTest(spec=spec):
+                config = deepcopy(self.config)
+                config['notify'] = spec
+                with self.assertRaises(life.Refused):
+                    life.validate(config)
+
+    def test_down_lost_release_ack_is_not_appended_again(self):
+        c = self.controller()
+        c.up()
+        def lost_ack():
+            self.order.append('release')
+            self.ledger.released = True
+            raise transport('ssh diag fake: lost release ACK')
+        with patch.object(self.ledger, 'release', side_effect=lost_ack):
+            self.assertTrue(c.down()['release_pending'])
+        self.assertTrue(c.down()['released'])
+        self.assertEqual(self.order.count('release'), 1)
+
+    def test_clean_down_without_ever_claiming_still_prunes(self):
+        c = self.controller()
+        with patch.object(self.ledger, 'claim', side_effect=RuntimeError('claim refused before append')):
+            with self.assertRaisesRegex(RuntimeError, 'claim refused before append'):
+                c.up()
+        self.assertFalse(c.state['claimed'])
+        self.assertFalse(c.state['released'])
+        result = c.down()
+        self.assertTrue(result['prune']['done'])
+
+    def test_recovered_claim_receipt_is_visible_in_the_journal(self):
+        c = self.controller()
+        original = self.ledger.claim
+        def recovered(**kwargs):
+            return {**original(**kwargs), 'already_claimed': True}
+        with patch.object(self.ledger, 'claim', side_effect=recovered):
+            c.up()
+        self.assertTrue(json.loads(c.journal.read_text())['claim_recovered_after_transport_failure'])
+        actions = [json.loads(line) for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+        self.assertTrue(next(a for a in actions if a['kind'] == 'claim')['value']['already_claimed'])
+        c.down()
+
+    def test_local_stop_failure_does_not_attempt_the_unreachable_ledger_release(self):
+        c = self.controller()
+        c.up()
+        self.host.leftover = True
+        with patch.object(self.ledger, 'inspect', side_effect=transport()) as read, \
+                patch.object(self.ledger, 'release') as release:
+            with self.assertRaisesRegex(life.Refused, 'Cleanup incomplete'):
+                c.down()
+        read.assert_not_called()
+        release.assert_not_called()
+        self.assertEqual(c.state['phase'], 'cleanup-failed')
+        self.assertTrue(c.state['claimed'])
+        self.assertFalse(c.state['released'])
+
+    def test_settle_start_failure_is_recorded_without_failing_down(self):
+        c = self.controller()
+        c.up()
+        self.host.fail_settle = True
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            result = c.down()
+        self.assertTrue(result['release_pending'])
+        self.assertIsNone(result['settle_unit'])
+        actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+        self.assertIn('settle-start-error', actions)
+
+    def test_settle_retries_twice_then_releases_and_later_down_prunes(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            self.assertTrue(c.down()['release_pending'])
+        path = life.pending_release_dir() / (c.state['token'] + '.json')
+        before = self.host.now
+        with patch.object(self.ledger, 'inspect', side_effect=[
+                transport(),
+                transport(),
+                {'owned_claim': True, 'owned_release': False}]) as inspect:
+            value = c.settle(minutes=4)
+        self.assertEqual(inspect.call_count, 3)
+        self.assertEqual(self.host.now - before, 180)
+        receipt = (c.directory / 'RELEASE-PENDING.md').read_text()
+        self.assertEqual(receipt.count('release pending since '), 3)
+        self.assertIn('after 3 attempts', receipt)
+        self.assertTrue(value['released'])
+        self.assertFalse(path.exists())
+        self.assertNotIn('prune', c.state)
+        self.assertTrue(c.down()['prune']['done'])
+
+    def test_settle_stops_at_deadline_and_cli_reports_pending(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+            before = self.host.now
+            result = c.settle(minutes=0.5)
+        self.assertEqual(self.host.now - before, 29)
+        self.assertTrue(result['release_pending'])
+        config_path = self.base / 'config.json'
+        config_path.write_text(json.dumps(self.config))
+        with patch.object(life, 'Lifecycle', return_value=c), patch.object(c, 'settle', return_value=result) as settle, \
+                patch('sys.stdout', new_callable=io.StringIO):
+            self.assertEqual(life.main(['settle', str(config_path), '--minutes', '0.5', '--execute']), 1)
+            settle.assert_called_once_with(minutes=0.5)
+
+    def test_settle_stops_on_second_nontransient_failure(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        before = self.host.now
+        with patch.object(self.ledger, 'inspect', side_effect=[
+                transport('ssh diag fake: temporary'),
+                transport('ssh diag fake: host key', False, 'host key')]) as inspect, \
+                patch.object(c, 'notify') as notify:
+            result = c.settle(minutes=4)
+        self.assertTrue(result['release_pending'])
+        self.assertEqual(inspect.call_count, 2)
+        self.assertEqual(self.host.now - before, 120)
+        line = 'release still pending: stopped on a non-transient cause: ssh diag fake: host key; manual Down needed'
+        notify.assert_called_once_with(line)
+        self.assertIn(line, (c.directory / 'RELEASE-PENDING.md').read_text())
+        c.down()
+
+    def test_settle_stops_on_target_overload(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        facts = {'load1': 48, 'cores': 8, 'memAvailMiB': 150, 'oomKills5m': 2}
+        cause, transient, _ = life.ssh_cause('timed out', 'kex', 'ok in 0.5 s', 'ok', '0%', facts, 'fake-host')
+        with patch.object(self.ledger, 'inspect', side_effect=transport('ssh diag fake: ' + cause, transient, cause)) as inspect, \
+                patch.object(c, 'notify') as notify:
+            result = c.settle(minutes=4)
+        self.assertTrue(result['release_pending'])
+        inspect.assert_called_once()
+        self.assertFalse(transient)
+        self.assertIn('stopped on a non-transient cause: ssh diag fake: target overloaded',
+                      notify.call_args.args[0])
+        c.down()
+
+    def test_settle_stops_on_loss_without_target_evidence(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        with tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+            attempt = Path(tmp) / 'attempt.log'
+            attempt.write_text('Connecting to x\nConnection established\nRemote protocol version 2.0\n')
+            ping = '20% packet loss\nrtt min/avg/max/mdev = 1.000/2.000/3.000/0.100 ms\n'
+            with patch('sys.stderr', new=io.StringIO()):
+                diagnosis = real_ssh_diagnosis('fake-host', run=target_fixture_run(None, [], ping),
+                                               evidence_dir=tmp, tcp=lambda *_: True, attempt_log=attempt)
+            self.assertFalse(diagnosis['transient'])
+            self.assertIn('packet loss 20% on the path to fake-host; target health not confirmed, no retry',
+                          diagnosis['cause'])
+            with patch.object(self.ledger, 'inspect', side_effect=life.LedgerTransport([diagnosis])) as inspect, \
+                    patch.object(c, 'notify') as notify:
+                result = c.settle(minutes=4)
+            self.assertTrue(result['release_pending'])
+            inspect.assert_called_once()
+            self.assertIn('stopped on a non-transient cause', notify.call_args.args[0])
+        c.down()
+
+    def test_settle_30_minute_giveup_receipt_and_notification(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        before = self.host.now
+        starts = []
+        def fail():
+            starts.append(self.host.now - before)
+            raise transport()
+        with patch.object(self.ledger, 'inspect', side_effect=fail), patch.object(c, 'notify') as notify:
+            result = c.settle()
+        self.assertTrue(result['release_pending'])
+        self.assertEqual(starts, list(range(60, 1741, 60)))
+        self.assertEqual(self.host.now - before, 1799)
+        line = 'release still pending after 30 minutes: manual Down needed; last: ssh diag fake: temporary stall'
+        notify.assert_called_once_with(line)
+        self.assertIn(line, (c.directory / 'RELEASE-PENDING.md').read_text())
+        c.down()
+
+    def test_settle_interrupts_a_blocked_attempt_and_writes_giveup(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        deadline = life.settle_attempt_deadline
+        with patch.object(c, '_settle_ledger', side_effect=lambda **_kw: time.sleep(1)), \
+                patch.object(life, 'settle_attempt_deadline', side_effect=lambda _seconds: deadline(.02)):
+            result = c.settle(minutes=2)
+        self.assertTrue(result['release_pending'])
+        self.assertLessEqual(self.host.now, 120)
+        self.assertIn('last: attempt exceeded the settle deadline',
+                      (c.directory / 'RELEASE-PENDING.md').read_text())
+        c.down()
+
+    def test_settle_retries_when_starting_before_down_releases_the_journal_lock(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        original_sleep = self.host.sleep
+        with (c.directory / '.lock').open('a+') as held:
+            life.fcntl.flock(held, life.fcntl.LOCK_EX | life.fcntl.LOCK_NB)
+            def release_after_sleep(seconds):
+                original_sleep(seconds)
+                if seconds == 1:
+                    life.fcntl.flock(held, life.fcntl.LOCK_UN)
+            with patch.object(self.host, 'sleep', side_effect=release_after_sleep) as sleep:
+                result = c.settle(minutes=3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(1)])
+        self.assertTrue(result['released'])
+        self.assertFalse(result['release_pending'])
+
+    def test_stopped_settle_unit_is_noted_once_on_status_and_down(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        self.host.settle_units.clear()
+        status = c.status()
+        self.assertEqual(status['release_pending_last_line'], 'settle unit stopped by its time cap')
+        c.status()
+        self.assertEqual((c.directory / 'RELEASE-PENDING.md').read_text().count(
+            'settle unit stopped by its time cap'), 1)
+        c.down()
+        self.assertFalse(c.state['release_pending'])
+
+    def test_old_settle_outcome_does_not_mask_new_unit_cap(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+            c.pending_receipt('release still pending after 30 minutes: manual Down needed; last: old')
+            self.host.settle_units.clear()
+            c.down()
+        self.assertEqual(len(self.host.started_settles), 2)
+        self.host.settle_units.clear()
+        self.assertEqual(c.status()['release_pending_last_line'], 'settle unit stopped by its time cap')
+        c.down()
+
+    def test_settle_does_not_treat_a_ledger_lock_error_as_journal_lock_contention(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            c.down()
+        with patch.object(self.ledger, 'inspect', side_effect=BlockingIOError('ledger busy')), \
+                patch.object(self.host, 'sleep', wraps=self.host.sleep) as sleep:
+            with self.assertRaisesRegex(BlockingIOError, 'ledger busy'):
+                c.settle(minutes=2)
+        sleep.assert_called_once_with(60)
+
+    def test_up_settles_only_its_host_and_ledger_before_claim(self):
+        old = self.controller()
+        old.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            old.down()
+        pending_dir = life.pending_release_dir()
+        old_path = pending_dir / (old.state['token'] + '.json')
+        foreign_path = pending_dir / ('b' * 32 + '.json')
+        foreign_path.write_text(json.dumps({'host': 'xps', 'ledger': self.config['ledger'],
+                                            'ledger_ssh': self.config.get('ledger_ssh')}))
+        other_ledger_path = pending_dir / ('c' * 32 + '.json')
+        other_ledger_path.write_text(json.dumps({'host': 'surface', 'ledger': '/tmp/other-ledger'}))
+        other_authority = pending_dir / ('d' * 32 + '.json')
+        other_authority.write_text(json.dumps({'host': 'surface', 'ledger': self.config['ledger'],
+                                               'ledger_ssh': 'another-authority'}))
+        config = deepcopy(self.config)
+        config.update(label='next-run', state_dir=str(self.base / 'next-state'),
+                      work_root=str(self.base / 'next-owned'))
+        current = life.Lifecycle(config, self.host, self.ledger)
+        original_claim = self.ledger.claim
+        def claim(**kwargs):
+            self.assertTrue(self.ledger.released)
+            self.ledger.released = False
+            return original_claim(**kwargs)
+        self.order.clear()
+        with patch.object(self.ledger, 'claim', side_effect=claim):
+            current.up()
+        self.assertLess(self.order.index('release'), self.order.index('claim'))
+        self.assertFalse(old_path.exists())
+        self.assertEqual(self.host.stopped_settles, [self.host.started_settles[0][0]])
+        self.assertTrue(foreign_path.exists())
+        self.assertTrue(other_ledger_path.exists())
+        self.assertTrue(other_authority.exists())
+        current.down()
+
+    def test_up_ignores_pending_scan_errors(self):
+        c = self.controller()
+        with patch.object(c, 'settle_pending', side_effect=OSError('synthetic pending scan error')):
+            self.assertEqual(c.up()['phase'], 'up')
+        actions = [json.loads(line) for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+        self.assertTrue(any(a['kind'] == 'pending-settle-error' for a in actions))
+        c.down()
+
+    def test_pending_release_continues_in_a_fresh_process(self):
+        config_path = self.base / 'resume-config.json'
+        config_path.write_text(json.dumps(self.config))
+        ledger_path = self.base / 'fake-durable-ledger.json'
+        ledger_path.write_text(json.dumps({'claimed': False, 'released': False, 'releases': 0}))
+        script = self.base / 'resume-fake.py'
+        script.write_text("""
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('offline_tests', sys.argv[1])
+tests = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tests)
+life = tests.life
+ledger_path = Path(sys.argv[3])
+class FileLedger:
+    open_text = ''
+    def claim(self, **kwargs):
+        ledger_path.write_text(json.dumps({'claimed': True, 'released': False, 'releases': 0}))
+        return {'line': 'fake claim', 'stale_claim_skipped': []}
+    def inspect(self):
+        if sys.argv[4] == 'save':
+            raise tests.transport('ssh diag fake: outage')
+        value = json.loads(ledger_path.read_text())
+        return {'owned_claim': value['claimed'] and not value['released'], 'owned_release': value['released']}
+    def release(self):
+        value = json.loads(ledger_path.read_text())
+        value['released'] = True
+        value['releases'] += 1
+        ledger_path.write_text(json.dumps(value))
+        return {'line': 'fake release'}
+config = json.loads(Path(sys.argv[2]).read_text())
+c = life.Lifecycle(config, tests.FakeHost([]), FileLedger())
+if sys.argv[4] == 'save':
+    c.up()
+print(json.dumps(c.down()))
+""")
+        command = [sys.executable, '-I', '-B', str(script), str(Path(__file__).resolve()), str(config_path),
+                   str(ledger_path)]
+        first = subprocess.run([*command, 'save'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(json.loads(first.stdout)['release_pending'])
+        self.assertEqual(json.loads(ledger_path.read_text())['releases'], 0)
+        second = subprocess.run([*command, 'resume'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue(json.loads(second.stdout)['released'])
+        self.assertEqual(json.loads(ledger_path.read_text())['releases'], 1)
 
     def test_staging_foreign_nand_path_is_refused_before_launch(self):
         bad = self.base / 'bad-qt.ini'
@@ -1316,7 +1992,11 @@ class LifecycleTests(unittest.TestCase):
             calls.append((host, mode, execute))
             return life.dispatch(mode, packet, execute)
 
-        with patch.object(life, 'forward', forward), patch.object(life, 'Host', return_value=self.host), \
+        def ledger_forward(host, operation, packet, **kwargs):
+            return forward(host, 'ledger-' + operation, packet, True)
+
+        with patch.object(life, 'forward', forward), patch.object(life, 'ledger_forward', ledger_forward), \
+                patch.object(life, 'Host', return_value=self.host), \
                 patch('sys.stdout', new_callable=io.StringIO):
             self.assertEqual(life.main(['reserve', str(config_path), '--ssh', 'executor',
                                        '--approver', 'tr-primary-2', '--execute']), 0)
@@ -1410,15 +2090,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(life.active_claims(self.ledger_path.read_text(), 'surface')), 2)
 
     def test_forwarded_reservation_and_claim_carry_the_run_label(self):
-        def forward(host, mode, config, execute):
+        def ledger_forward(host, operation, config, **kwargs):
             self.assertEqual(host, 'fake-ledger-host')
-            self.assertTrue(execute)
-            return life.dispatch(mode, config, execute)
+            return life.dispatch('ledger-' + operation, config, True)
         reserve = life.Ledger(self.ledger_path, 'xps', self.config['owner'], 'a' * 32,
                               'fake-ledger-host', label='test-01')
         claimant = life.Ledger(self.ledger_path, 'xps', self.config['owner'], 'b' * 32,
                                'fake-ledger-host', label='test-01')
-        with patch.object(life, 'forward', forward):
+        with patch.object(life, 'ledger_forward', ledger_forward):
             reserve.operate('reserve', approver='tr-primary-2')
             claim = claimant.claim(admission={'max_eden': 2})
             self.assertEqual(claim['consumed_reservation'], 'a' * 32)
@@ -1932,6 +2611,898 @@ class LinuxStopTests(unittest.TestCase):
         self.assertFalse(self.live)
 
 
+class LedgerForwardTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.plan = []
+        self.config = {'ledger': '/tmp/unused-fake-ledger', 'host': 'xps', 'owner': 'Codex test/owner',
+                       'token': 'a' * 32}
+        self.line = f"2026 CLAIMED: {self.config['owner']} host=xps lifecycle={'a' * 32} Eden lifecycle admitted"
+        self.diagnoses = []
+        self.diagnosis = patch.object(life, 'ssh_diagnosis', side_effect=lambda *a, **k: self.diagnoses.pop(0))
+        self.diagnosis_mock = self.diagnosis.start()
+        self.addCleanup(self.diagnosis.stop)
+
+    def diag(self, transient=True, cause='synthetic'):
+        return {'line': 'ssh diag fake -> fake-yoga: ' + cause, 'transient': transient, 'phase': 'auth',
+                'cause': cause, 'evidence': '/tmp/fake-diag'}
+
+    def run_fake(self, argv, **kwargs):
+        mode = json.loads(kwargs['input'])['mode']
+        self.calls.append((mode, argv, kwargs))
+        response = self.plan.pop(0) if self.plan else 255
+        if isinstance(response, Exception):
+            raise response
+        if isinstance(response, int):
+            return subprocess.CompletedProcess(argv, response, '', 'synthetic SSH failure')
+        if isinstance(response, str):
+            return subprocess.CompletedProcess(argv, 0, response, '')
+        return subprocess.CompletedProcess(argv, 0, json.dumps(response), '')
+
+    def request(self, operation):
+        return life.ledger_forward('fake-yoga', operation, self.config, run=self.run_fake)
+
+    def read(self, *, claim=False, release=False, opened=None):
+        return {'owned_claim': claim, 'owned_release': release, 'open': opened or []}
+
+    def test_success_first_try_has_bounded_ssh_options(self):
+        self.plan = [self.read()]
+        self.assertEqual(self.request('read'), self.read())
+        self.assertEqual([call[0] for call in self.calls], ['ledger-read'])
+        for _, argv, kwargs in self.calls:
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 10)
+            for option in ('BatchMode=yes', 'ConnectTimeout=10', 'ServerAliveInterval=5',
+                           'ServerAliveCountMax=2'):
+                self.assertIn(option, argv)
+            self.assertIn('ControlMaster=no', argv)
+            self.assertIn('ProxyCommand=/bin/false', argv)
+            self.assertNotIn('IPQoS=none', argv)
+            self.assertIn('/usr/bin/timeout 6', base64.b64decode(argv[-1]).decode('utf-16-le'))
+        self.diagnosis_mock.assert_not_called()
+
+    def test_master_open_consumes_the_same_ledger_attempt_budget(self):
+        class BudgetMux(FakeMux):
+            def __enter__(self):
+                self.attempt_deadline = time.monotonic() + 2
+                return self
+        self.plan = [self.read()]
+        with patch.object(life, 'SshMux', BudgetMux):
+            self.assertEqual(self.request('read'), self.read())
+        self.assertGreater(self.calls[0][2]['timeout'], 0)
+        self.assertLessEqual(self.calls[0][2]['timeout'], 2)
+
+    def test_expired_master_budget_diagnoses_without_starting_a_rider(self):
+        class ExpiredMux(FakeMux):
+            def __enter__(self):
+                self.attempt_deadline = time.monotonic() - 1
+                return self
+        self.diagnoses = [self.diag(False, 'not established')]
+        with patch.object(life, 'SshMux', ExpiredMux), self.assertRaises(life.LedgerTransport):
+            self.request('read')
+        self.assertEqual(self.calls, [])
+        self.diagnosis_mock.assert_called_once()
+
+    def test_bad_json_is_transport_but_other_nonzero_refuses_immediately(self):
+        self.plan = ['not-json', self.read()]
+        self.diagnoses = [self.diag()]
+        self.assertEqual(self.request('read'), self.read())
+        self.calls.clear()
+        self.diagnosis_mock.reset_mock()
+        self.plan = [2]
+        with self.assertRaisesRegex(life.Refused, 'SSH lifecycle failed: synthetic SSH failure'):
+            self.request('read')
+        self.assertEqual(len(self.calls), 1)
+        self.diagnosis_mock.assert_not_called()
+
+    def test_transient_transport_retries_once_and_success(self):
+        self.plan = [255, self.read()]
+        self.diagnoses = [self.diag()]
+        self.assertEqual(self.request('read'), self.read())
+        self.assertEqual([c[0] for c in self.calls], ['ledger-read', 'ledger-read'])
+        self.diagnosis_mock.assert_called_once()
+
+    def test_two_transport_failures_preserve_both_diagnoses(self):
+        self.plan = [255, 255]
+        self.diagnoses = [self.diag(True, 'first'), self.diag(True, 'second')]
+        with self.assertRaises(life.LedgerTransport) as error:
+            self.request('claim')
+        self.assertEqual(len(error.exception.diagnoses), 2)
+        self.assertTrue(error.exception.transient)
+        self.assertIn('first', str(error.exception))
+        self.assertIn('second', str(error.exception))
+        self.assertEqual([c[0] for c in self.calls], ['ledger-claim', 'ledger-claim'])
+
+    def test_non_transient_and_timeout(self):
+        self.plan = [255]
+        self.diagnoses = [self.diag(False, 'host key')]
+        with self.assertRaises(life.LedgerTransport) as error:
+            self.request('read')
+        self.assertFalse(error.exception.transient)
+        self.assertEqual(len(self.calls), 1)
+        self.calls.clear()
+        self.plan = [subprocess.TimeoutExpired('ssh', 10), self.read()]
+        self.diagnoses = [self.diag()]
+        self.assertEqual(self.request('read'), self.read())
+        self.assertEqual(len(self.calls), 2)
+
+    def test_real_classifier_without_target_never_retries_fake_packet_loss(self):
+        for loss, expected_attempts in ((20, 1), (0, 1)):
+            with self.subTest(loss=loss), tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+                attempts = []
+                def run(argv, **kwargs):
+                    if 'input' in kwargs:
+                        attempts.append(argv)
+                        return subprocess.CompletedProcess(argv, 255 if len(attempts) == 1 else 0,
+                                                           '' if len(attempts) == 1 else json.dumps(self.read()), '')
+                    if '-G' in argv:
+                        return subprocess.CompletedProcess(argv, 0, 'hostname fake-host\nport 22\n', '')
+                    if argv[0] == 'ping':
+                        return subprocess.CompletedProcess(argv, 0, f'{loss}% packet loss\n', '')
+                    return subprocess.CompletedProcess(argv, 255, '', 'Connecting to fake-host\nConnection established\n')
+                def diagnose(host, **kwargs):
+                    return real_ssh_diagnosis(host, **kwargs, evidence_dir=tmp, tcp=lambda *_: True)
+                self.diagnosis_mock.side_effect = diagnose
+                with patch('sys.stderr', new=io.StringIO()):
+                    with self.assertRaises(life.LedgerTransport) as error:
+                        life.ledger_forward('fake-host', 'read', self.config, run=run)
+                    self.assertIn('target health not confirmed, no retry' if loss else 'not established',
+                                  str(error.exception))
+                self.assertEqual(len(attempts), expected_attempts)
+
+    def test_real_classifier_target_health_matrix_for_ledger(self):
+        for label, facts, ping, expected_attempts, expected_cause in health_path_cases():
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+                attempts = []
+                run = target_fixture_run(facts, attempts, ping, succeed_after_failure=True)
+                self.diagnosis_mock.side_effect = lambda host, **kw: real_ssh_diagnosis(
+                    host, **kw, evidence_dir=tmp, tcp=lambda *_: True)
+                with patch('sys.stderr', new=io.StringIO()):
+                    if expected_attempts == 2:
+                        self.assertEqual(life.ledger_forward('fake-host', 'read', self.config, run=run),
+                                         {'owned_claim': True})
+                    else:
+                        with self.assertRaises(life.LedgerTransport) as error:
+                            life.ledger_forward('fake-host', 'read', self.config, run=run)
+                        self.assertIn(expected_cause, error.exception.diagnoses[0]['cause'])
+                        self.assertFalse(error.exception.transient)
+                self.assertEqual(len(attempts), expected_attempts)
+
+    def test_real_overloaded_target_stops_ledger_after_one_attempt(self):
+        facts = {'load1': 48, 'cores': 8, 'memAvailMiB': 150, 'oomKills5m': 2,
+                 'sshdProcesses': 5, 'sshdUnauth': 0, 'maxStartups': '10:30:100', 'maxStartupsLines': 0}
+        with tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+            attempts = []
+            run = target_fixture_run(facts, attempts)
+            self.diagnosis_mock.side_effect = lambda host, **kw: real_ssh_diagnosis(
+                host, **kw, evidence_dir=tmp, tcp=lambda *_: True)
+            with patch('sys.stderr', new=io.StringIO()), self.assertRaises(life.LedgerTransport) as error:
+                life.ledger_forward('fake-host', 'read', self.config, run=run)
+            self.assertEqual(len(attempts), 1)
+            self.assertFalse(error.exception.transient)
+            self.assertIn('target overloaded (load 48 on 8 cores, 150 MiB available, 2 OOM kills)',
+                          str(error.exception))
+
+    def test_claim_lost_ack_retries_idempotently(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-ack-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            path.write_text('')
+            ledger = life.Ledger(path, 'xps', self.config['owner'], self.config['token'])
+            admission = {'max_eden': 2, 'foreign_processes': []}
+            calls = []
+            def run(argv, **kwargs):
+                self.assertEqual(json.loads(kwargs['input'])['mode'], 'ledger-claim')
+                calls.append(argv)
+                result = ledger.claim(admission=admission)
+                return subprocess.CompletedProcess(argv, 255, '', 'lost ACK') if len(calls) == 1 else \
+                    subprocess.CompletedProcess(argv, 0, json.dumps(result), '')
+            self.diagnoses = [self.diag()]
+            result = life.ledger_forward('fake-yoga', 'claim', self.config, run=run)
+            self.assertTrue(result['already_claimed'])
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(path.read_text().count(' CLAIMED:'), 1)
+
+    def test_idempotent_claim_release_and_absent_release(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-idempotent-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            path.write_text('')
+            ledger = life.Ledger(path, 'xps', self.config['owner'], 'a' * 32)
+            admission = {'max_eden': 2, 'foreign_processes': []}
+            with self.assertRaisesRegex(life.Refused, 'Exact owned lifecycle claim not found'):
+                ledger.release()
+            first = ledger.claim(admission=admission)
+            second = ledger.claim(admission=admission)
+            self.assertEqual(first['line'], second['line'])
+            self.assertTrue(second['already_claimed'])
+            self.assertEqual(second['stale_claim_skipped'], [])
+            released = ledger.release()
+            again = ledger.release()
+            self.assertEqual(released['line'], again['line'])
+            self.assertTrue(again['already_released'])
+            self.assertEqual(path.read_text().count(' CLAIMED:'), 1)
+            self.assertEqual(path.read_text().count(' RELEASED:'), 1)
+
+    def test_released_lifecycle_token_is_terminal_and_new_token_still_works(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-terminal-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            path.write_text('')
+            ledger = life.Ledger(path, 'xps', self.config['owner'], 'a' * 32)
+            admission = {'max_eden': 2, 'foreign_processes': []}
+            ledger.claim(admission=admission)
+            self.assertTrue(ledger.claim(admission=admission)['already_claimed'])
+            ledger.release()
+            self.assertTrue(ledger.release()['already_released'])
+            before = path.read_bytes()
+            with self.assertRaisesRegex(life.Refused, 'Lifecycle token already released; a new run needs a new token'):
+                ledger.claim(admission=admission)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (False, True))
+            new = life.Ledger(path, 'xps', self.config['owner'], 'b' * 32)
+            new.claim(admission=admission)
+            self.assertTrue(new.inspect()['owned_claim'])
+            new.release()
+            self.assertEqual((new.inspect()['owned_claim'], new.inspect()['owned_release']), (False, True))
+
+    def test_idempotent_reserve(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-reserve-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            path.write_text('')
+            ledger = life.Ledger(path, 'xps', self.config['owner'], 'b' * 32, label='test-run')
+            first = ledger.operate('reserve', approver='operator')
+            again = ledger.operate('reserve', approver='operator')
+            self.assertEqual(first['line'], again['line'])
+            self.assertEqual(first['expires_in_seconds'], 1200)
+            self.assertGreaterEqual(again['expires_in_seconds'], 1198)
+            self.assertLessEqual(again['expires_in_seconds'], 1200)
+            self.assertTrue(again['already_reserved'])
+            self.assertEqual(path.read_text().count(' CLAIMED:'), 1)
+
+    def test_reservation_replay_uses_remaining_time_and_renews_expired_token(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-age-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            ledger = life.Ledger(path, 'xps', self.config['owner'], 'b' * 32, label='test-run')
+            suffix = (f"CLAIMED: {self.config['owner']} host=xps lifecycle={'b' * 32} "
+                      'Eden reservation run test-run approver=operator')
+            now = datetime.now(timezone.utc)
+            path.write_text(f'{(now - timedelta(minutes=10)).isoformat()} {suffix}\n')
+            result = ledger.operate('reserve', approver='operator')
+            self.assertTrue(result['already_reserved'])
+            self.assertGreaterEqual(result['expires_in_seconds'], 598)
+            self.assertLessEqual(result['expires_in_seconds'], 600)
+            old = f'{(now - timedelta(minutes=22)).isoformat()} {suffix}'
+            path.write_text(old + '\n')
+            renewed = ledger.operate('reserve', approver='operator')
+            self.assertNotIn('already_reserved', renewed)
+            self.assertEqual(renewed['expires_in_seconds'], 1200)
+            text = path.read_text()
+            self.assertLess(text.index('Eden reservation expired'), text.index(renewed['line']))
+            self.assertEqual(life.active_claims(text, 'xps'), [renewed['line']])
+            self.assertTrue(ledger.operate('reserve', approver='operator')['already_reserved'])
+            path.write_text(old + '\n')
+            claim = ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})
+            text = path.read_text()
+            self.assertLess(text.index('Eden reservation expired'), text.index(claim['line']))
+            self.assertTrue(ledger.inspect()['owned_claim'])
+            self.assertFalse(ledger.inspect()['owned_release'])
+            ledger.release()
+
+    def test_converted_reservation_replay_refused_for_same_or_new_claim_token(self):
+        for same_token in (False, True):
+            with self.subTest(same_token=same_token), tempfile.TemporaryDirectory(prefix='eden-ledger-convert-') as tmp:
+                path = Path(tmp) / 'ledger.txt'
+                path.write_text('')
+                reservation = life.Ledger(path, 'xps', self.config['owner'], 'a' * 32, label='test-run')
+                reservation.operate('reserve', approver='operator')
+                claimant = life.Ledger(path, 'xps', self.config['owner'],
+                                       ('a' if same_token else 'b') * 32, label='test-run')
+                self.assertEqual(claimant.claim(admission={'max_eden': 2})['consumed_reservation'], 'a' * 32)
+                self.assertTrue(claimant.inspect()['owned_claim'])
+                self.assertFalse(claimant.inspect()['owned_release'])
+                before = path.read_bytes()
+                with self.assertRaisesRegex(life.Refused, 'Reservation already converted to a lifecycle claim'):
+                    reservation.operate('reserve', approver='operator')
+                self.assertEqual(path.read_bytes(), before)
+                claimant.release()
+                self.assertFalse(claimant.inspect()['owned_claim'])
+
+    def test_different_tokens_can_still_claim_two_instance_host(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-concurrent-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            path.write_text('')
+            first = life.Ledger(path, 'xps', self.config['owner'], 'a' * 32)
+            second = life.Ledger(path, 'xps', self.config['owner'], 'b' * 32)
+            admission = {'max_eden': 2, 'foreign_processes': []}
+            first.claim(admission=admission)
+            second.claim(admission=admission)
+            self.assertEqual(len(first.inspect()['open']), 2)
+
+    def test_linux_settle_unit_is_bounded_collected_and_low_priority(self):
+        host = life.Host()
+        command = ['/usr/bin/python3', 'fake-script']
+        with patch.dict(os.environ, {'XDG_STATE_HOME': '/tmp/fake-state-home'}), patch.object(host, 'run') as run:
+            host.start_settle('eden-settle-1234abcd.service', command, Path('/tmp/fake-state'), 1800)
+        argv = run.call_args.args[0]
+        self.assertIn('--collect', argv)
+        self.assertIn('--property=Nice=19', argv)
+        self.assertIn('--property=MemoryMax=256M', argv)
+        self.assertIn('--property=RuntimeMaxSec=1860', argv)
+        self.assertIn('--setenv=XDG_STATE_HOME=/tmp/fake-state-home', argv)
+        self.assertEqual(argv[-2:], command)
+        with self.assertRaisesRegex(life.Refused, 'Foreign settle unit'):
+            host.start_settle('foreign.service', command, Path('/tmp/fake-state'), 1800)
+        with patch.object(life.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as stop:
+            host.stop_settle('eden-settle-1234abcd.service')
+        self.assertEqual(stop.call_args.args[0], ['systemctl', '--user', 'stop', 'eden-settle-1234abcd.service'])
+        self.assertEqual(stop.call_args.kwargs['timeout'], 15)
+        with self.assertRaisesRegex(life.Refused, 'Foreign settle unit'):
+            host.stop_settle('foreign.service')
+        for state in ('active', 'activating', 'reloading', 'deactivating', 'inactive', 'failed'):
+            with self.subTest(state=state), patch.object(host, 'unit', return_value={'ActiveState': state}):
+                self.assertEqual(host.settle_running('eden-settle-1234abcd.service'),
+                                 state in ('active', 'activating', 'reloading', 'deactivating'))
+
+
+class SshDiagnosisTests(unittest.TestCase):
+    def test_inaccessible_or_disappearing_socket_does_not_mask_diagnosis(self):
+        with tempfile.TemporaryDirectory(prefix='eden-socket-') as tmp:
+            (Path(tmp) / 'socket').touch()
+            with patch.object(Path, 'lstat', side_effect=OSError('socket vanished')):
+                self.assertEqual(life._control_socket_count(tmp), 0)
+
+    def test_gate_fixture_phases_and_causes(self):
+        fixtures = Path(__file__).with_name('test-data') / 'ssh-vvv'
+        for name in ('tcp', 'banner', 'kex', 'auth-timeout', 'auth-refused', 'session'):
+            with self.subTest(name=name):
+                text = (fixtures / (name + '.txt')).read_text()
+                self.assertEqual(life.ssh_phase(text), 'tcp')
+                cause, transient, _ = life.ssh_cause(text, 'tcp', 'failed, phase tcp', 'ok', '0%')
+                expected = 'authentication refused' if name == 'auth-refused' else \
+                    'not established (attempt stalled in tcp; failed, phase tcp)'
+                self.assertEqual((cause, transient), (expected, False))
+        text = (fixtures / 'review-kex.txt').read_text()
+        self.assertEqual(life.ssh_phase(text), 'kex')
+        cause, transient, _ = life.ssh_cause(text, 'kex', 'failed, phase kex', 'ok', '0%')
+        self.assertEqual(cause, 'not established (attempt stalled in kex; failed, phase kex)')
+        self.assertFalse(transient)
+        prefix = 'Connecting to x\nConnection established\nRemote protocol version 2.0\n'
+        for sample, phase in (('', 'unknown'), ('other', 'none'), ('Connecting to x', 'tcp'),
+                              ('Connecting to x\nConnection established', 'banner'),
+                              (prefix, 'kex'), (prefix + 'SSH2_MSG_NEWKEYS received', 'auth'),
+                              (prefix + 'SSH2_MSG_NEWKEYS received\nAuthenticated to x', 'session')):
+            self.assertEqual(life.ssh_phase(sample), phase)
+
+    def test_cause_precedence_and_tcp_failure(self):
+        for text, cause in (('Could not resolve hostname x', 'name does not resolve'),
+                            ('Host key verification failed', 'host key'),
+                            ('Permission denied', 'authentication refused'),
+                            ('Connection refused', 'host down or sshd not listening')):
+            with self.subTest(text=text):
+                actual, transient, _ = life.ssh_cause(text, 'none', 'failed, phase none', 'fail', 'n/a')
+                self.assertEqual(actual, cause)
+                self.assertFalse(transient)
+
+    def test_named_cause_rows_and_preauth_only(self):
+        throttled = {'maxStartupsLines': 0, 'sshdUnauth': 10, 'maxStartups': '10:30:100'}
+        overload = {'load1': 32, 'cores': 8, 'memAvailMiB': 999, 'oomKills5m': 0}
+        history = {'maxStartupsLines': 0, 'sshdUnauth': 0, 'maxStartups': '10:30:100',
+                   'sshdPreauth5m': {'total': 2, 'client': 1}, 'sshdProcesses': 20}
+        cases = (
+            ({'maxStartupsLines': 1}, '0%', 'sshd connection throttling on the target (MaxStartups)', False),
+            (throttled, '0%', 'sshd connection throttling on the target (MaxStartups)', False),
+            (overload, '0%', 'target overloaded (load 32 on 8 cores, 999 MiB available, 0 OOM kills)', False),
+            (None, '20%', 'packet loss 20% on the path to fake-host; target health not confirmed, no retry', False),
+            (history, '0%', 'not established (attempt stalled in kex; ok in 0.5 s)', False),
+            ({**history, 'sshdUnauth': '10', 'maxStartupsLines': -1}, '0%',
+             'not established (attempt stalled in kex; ok in 0.5 s)', False),
+        )
+        for facts, loss, expected, transient in cases:
+            with self.subTest(expected=expected):
+                cause, actual, _ = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', loss, facts, 'fake-host')
+                self.assertEqual((cause, actual), (expected, transient))
+
+    def test_i6_health_facts_and_windows_gate(self):
+        normal = {'load1': 1, 'cores': 8, 'memAvailMiB': 1000, 'oomKills5m': 0,
+                  'maxStartupsLines': 0, 'sshdUnauth': 0, 'maxStartups': '10:30:100'}
+        for facts in (None, {k: v for k, v in normal.items() if k != 'memAvailMiB'},
+                      {**normal, 'oomKills5m': None}, {**normal, 'oomKills5m': '0'},
+                      {**normal, 'oomKills5m': False}, {**normal, 'cores': 0},
+                      {k: v for k, v in normal.items() if k != 'maxStartups'}):
+            with self.subTest(facts=facts):
+                self.assertFalse(life.target_healthy('ok in 0.5 s', facts))
+                for loss, low, high in (('20%', None, None), ('0%', '2', '140')):
+                    cause, transient, _ = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', loss, facts,
+                                                          'x', low, high, True)
+                    self.assertFalse(transient)
+                    self.assertTrue(cause.endswith('; target health not confirmed, no retry'))
+                self.assertFalse(life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '0%', facts, 'x',
+                                                attempt_timed_out=True)[1])
+        self.assertFalse(life.target_healthy('failed, phase kex', normal))
+        for cpu, memory in ((100, 4096), (5, 8192), (None, 1000)):
+            windows = {'cpuLoadPct': cpu, 'memAvailMiB': memory, 'sshdUnauth': None,
+                       'journal': 'unavailable on Windows'}
+            self.assertFalse(life.target_healthy('ok in 0.5 s', windows))
+            for loss, low, high in (('20%', None, None), ('0%', '2', '140')):
+                cause, transient, _ = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', loss, windows, 'x', low, high)
+                self.assertFalse(transient)
+                self.assertTrue(cause.endswith('; target health not confirmed, no retry'))
+            cause, transient, _ = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '0%', windows, 'x',
+                                                  attempt_timed_out=True)
+            self.assertEqual(cause, 'not established (attempt stalled in kex; ok in 0.5 s); '
+                                    'target health not confirmed, no retry')
+            self.assertFalse(transient)
+        self.assertFalse(life.target_healthy('ok in 0.5 s', {**normal, 'cpuLoadPct': 5}))
+
+    def test_i5_rtt_timeout_and_real_message_boundaries(self):
+        normal = {'load1': 1, 'cores': 8, 'memAvailMiB': 1000, 'oomKills5m': 0,
+                  'maxStartupsLines': 0, 'sshdUnauth': 0, 'maxStartups': '10:30:100'}
+        red = {**normal, 'load1': 48, 'memAvailMiB': 150, 'oomKills5m': 2}
+        for facts, expected in ((red, 'target overloaded (load 48 on 8 cores, 150 MiB available, 2 OOM kills)'),
+                                ({**normal, 'sshdUnauth': 10}, 'sshd connection throttling on the target (MaxStartups)')):
+            cause, transient, _ = life.ssh_cause('Connection to x timed out', 'kex', 'ok in 0.5 s',
+                                                  'ok', '0%', facts, 'x', '1', '200', True)
+            self.assertEqual((cause, transient), (expected, False))
+        spike = life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '0%', normal, 'x', '10.000', '100.000')
+        self.assertEqual(spike[:2], ('RTT spikes on the path to x (max 100.000 ms)', True))
+        for low, high in (('10.001', '100.000'), ('1', '99.999')):
+            self.assertFalse(life.ssh_cause('', 'kex', 'ok in 0.5 s', 'ok', '0%', normal, 'x', low, high)[1])
+        for phase in ('tcp', 'banner', 'kex'):
+            cause, transient, _ = life.ssh_cause('', phase, 'ok in 0.5 s', 'ok', '0%', normal, 'x',
+                                                 attempt_timed_out=True)
+            self.assertEqual((cause, transient),
+                             (f'single {phase} timeout with TCP 22 answering and a healthy target '
+                              '(load 1 on 8 cores, 1000 MiB available)', True))
+        for phase, diag, target in (('kex', 'failed, phase kex', None), ('auth', 'ok in 0.5 s', normal),
+                                    ('kex', 'failed, phase kex', normal)):
+            self.assertFalse(life.ssh_cause('', phase, diag, 'ok', '0%', target, 'x',
+                                             attempt_timed_out=True)[1])
+        retained = (Path(__file__).with_name('test-data') / 'ssh-vvv' / 'i4-kex-timeout.txt').read_text()
+        self.assertEqual(life.ssh_cause(retained, 'kex', 'failed, phase kex', 'ok', '0%')[2],
+                         'Connection to 127.0.0.1 port 56029 timed out')
+        self.assertEqual(life.ssh_cause('Connection reset by old\n  Connection to x timed out  ',
+                                        'kex', 'failed', 'ok', '0%')[2], 'Connection to x timed out')
+        self.assertEqual(len(life.ssh_cause('Permission denied ' + 'x' * 200, 'auth', '', 'ok', '0%')[2]), 160)
+        self.assertEqual(life.ssh_cause('', 'kex', 'failed', 'ok', '0%', attempt_killed=True)[2],
+                         'none (attempt killed at the 10 s bound)')
+        self.assertEqual(life.ssh_cause('', 'kex', 'failed', 'ok', '0%')[2], '')
+
+    def test_diagnosis_parses_rtt_and_qualifying_timeout(self):
+        target = {'load1': 1, 'cores': 8, 'memAvailMiB': 1000, 'oomKills5m': 0,
+                  'sshdProcesses': 5, 'sshdUnauth': 0, 'maxStartups': '10:30:100', 'maxStartupsLines': 0}
+        with tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+            attempt = Path(tmp) / 'master.log'
+            attempt.write_text('Connecting to x\nConnection established\nRemote protocol version 2.0\n')
+            for ping_text, timed, expected in (
+                    ('0% packet loss\nrtt min/avg/max/mdev = 10.000/20.000/100.000/1.000 ms\n', False,
+                     'RTT spikes on the path to fake-host (max 100.000 ms)'),
+                    ('0% packet loss\nrtt min/avg/max/mdev = 1.000/2.000/3.000/1.000 ms\n', True,
+                     'single kex timeout with TCP 22 answering and a healthy target (load 1 on 8 cores, 1000 MiB available)')):
+                with self.subTest(expected=expected), patch('sys.stderr', new=io.StringIO()):
+                    result = life.ssh_diagnosis('fake-host', run=target_fixture_run(target, [], ping_text),
+                                                evidence_dir=tmp, tcp=lambda *_: True, attempt_log=attempt,
+                                                attempt_timed_out=timed, attempt_killed=timed)
+                self.assertEqual((result['cause'], result['transient']), (expected, True))
+                if timed:
+                    self.assertIn('message none (attempt killed at the 10 s bound);', result['line'])
+
+    def test_attempt_log_is_distinct_from_diagnostic_login(self):
+        with tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+            attempt = Path(tmp) / 'master.log'
+            text = (Path(__file__).with_name('test-data') / 'ssh-vvv' / 'review-kex.txt').read_text()
+            attempt.write_text(text)
+            def run(argv, **kwargs):
+                if '-vvv' in argv:
+                    return subprocess.CompletedProcess(argv, 255, '', 'Connecting to x\nConnection established\n')
+                if '-G' in argv:
+                    return subprocess.CompletedProcess(argv, 0, 'hostname fake-host\nport 22\n', '')
+                if argv[0] == 'ping':
+                    return subprocess.CompletedProcess(argv, 0, '10 packets transmitted, 10 received, 0% packet loss\n', '')
+                return subprocess.CompletedProcess(argv, 255, '', '')
+            with patch('sys.stderr', new=io.StringIO()):
+                result = life.ssh_diagnosis('fake-host', run=run, evidence_dir=tmp,
+                                            tcp=lambda *_: True, attempt_log=attempt)
+            self.assertEqual((result['phase'], result['transient']), ('kex', False))
+            self.assertEqual(Path(result['evidence']).read_text(), text)
+            self.assertIn('diag login failed, phase banner', result['line'])
+            self.assertIn('retry: no', result['line'])
+
+    def test_successful_diagnostic_collects_target_facts(self):
+        with tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
+            attempt = Path(tmp) / 'master.log'
+            attempt.write_text((Path(__file__).with_name('test-data') / 'ssh-vvv' / 'review-kex.txt').read_text())
+            calls = []
+            def run(argv, **kwargs):
+                calls.append((argv, kwargs))
+                if '-vvv' in argv:
+                    return subprocess.CompletedProcess(argv, 0, '', 'Authenticated to fake-host')
+                if '-G' in argv:
+                    return subprocess.CompletedProcess(argv, 0, 'hostname fake-host\nport 22\n', '')
+                if argv[0] == 'ping':
+                    return subprocess.CompletedProcess(argv, 0, '0% packet loss\n', '')
+                if 'EncodedCommand' in argv[-1]:
+                    target = {'sshdProcesses': 12, 'sshdUnauth': 10, 'maxStartups': '10:30:100',
+                              'maxStartupsLines': 0, 'memAvailMiB': 1000}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(target), '')
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            with patch('sys.stderr', new=io.StringIO()):
+                result = life.ssh_diagnosis('fake-host', run=run, evidence_dir=tmp,
+                                            tcp=lambda *_: True, attempt_log=attempt)
+            self.assertEqual(result['cause'], 'sshd connection throttling on the target (MaxStartups)')
+            self.assertFalse(result['transient'])
+            self.assertIn('unauth 10/10', result['line'])
+            self.assertEqual([kwargs['timeout'] for _, kwargs in calls], [10, 10, 5, 8, 10])
+
+
+class SshMuxTests(unittest.TestCase):
+    def test_real_classifier_target_health_matrix_for_master(self):
+        for label, facts, ping, expected_attempts, expected_cause in health_path_cases():
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='emux-') as tmp, \
+                    patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
+                attempts, diagnoses = [], []
+                run = target_fixture_run(facts, [], ping)
+                class Process:
+                    pid = 123456
+                    def __init__(self, status):
+                        self.status = status
+                    def wait(self, timeout=None):
+                        return self.status
+                    def poll(self):
+                        return self.status
+                def popen(argv, **_kwargs):
+                    attempts.append(argv)
+                    Path(argv[argv.index('-E') + 1]).write_text(
+                        'Connecting to fake-host\nConnection established\nRemote protocol version 2.0\n'
+                        'SSH2_MSG_KEXINIT sent\nConnection to fake-host port 22 timed out\n')
+                    return Process(0 if len(attempts) > 1 else 255)
+                def diagnose(host, **kw):
+                    result = real_ssh_diagnosis(host, **kw, tcp=lambda *_: True)
+                    diagnoses.append(result)
+                    return result
+                with patch.object(life, 'ssh_diagnosis', side_effect=diagnose), patch('sys.stderr', new=io.StringIO()):
+                    if expected_attempts == 2:
+                        with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp,
+                                          windows=label.startswith('windows-')):
+                            pass
+                    else:
+                        with self.assertRaises(life.LedgerTransport):
+                            with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp,
+                                              windows=label.startswith('windows-')):
+                                self.fail('unexpected successful master')
+                self.assertEqual(len(attempts), expected_attempts)
+                self.assertEqual(len(diagnoses), 1)
+                self.assertIn(expected_cause, diagnoses[0]['cause'])
+                self.assertEqual(diagnoses[0]['transient'], expected_attempts == 2)
+
+    def test_real_overloaded_target_stops_master_after_one_attempt(self):
+        facts = {'load1': 48, 'cores': 8, 'memAvailMiB': 150, 'oomKills5m': 2,
+                 'sshdProcesses': 5, 'sshdUnauth': 0, 'maxStartups': '10:30:100', 'maxStartupsLines': 0}
+        with tempfile.TemporaryDirectory(prefix='emux-') as tmp, patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
+            attempts = []
+            run = target_fixture_run(facts, [])
+            class Process:
+                pid = 123456
+                def wait(self, timeout=None):
+                    return 255
+                def poll(self):
+                    return 255
+            def popen(argv, **_kwargs):
+                attempts.append(argv)
+                Path(argv[argv.index('-E') + 1]).write_text(
+                    'Connecting to fake-host\nConnection established\nRemote protocol version 2.0\n'
+                    'SSH2_MSG_KEXINIT sent\nConnection to fake-host port 22 timed out\n')
+                return Process()
+            def diagnose(host, **kw):
+                return real_ssh_diagnosis(host, **kw, tcp=lambda *_: True)
+            with patch.object(life, 'ssh_diagnosis', side_effect=diagnose), patch('sys.stderr', new=io.StringIO()), \
+                    self.assertRaises(life.LedgerTransport) as error:
+                with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=tmp):
+                    self.fail('overloaded target retried')
+            self.assertEqual(len(attempts), 1)
+            self.assertFalse(error.exception.transient)
+            self.assertIn('target overloaded (load 48 on 8 cores, 150 MiB available, 2 OOM kills)',
+                          str(error.exception))
+
+    def test_master_riders_nested_cleanup_and_stale_socket(self):
+        commands, masters = [], []
+        class Process:
+            pid = 123456
+            def wait(self, timeout=None):
+                return 0
+            def poll(self):
+                return 0
+        def popen(argv, **kwargs):
+            masters.append((argv, kwargs))
+            return Process()
+        def run(argv, **kwargs):
+            commands.append((argv, kwargs))
+            if '-G' in argv:
+                template = next(item for item in argv if item.startswith('ControlPath='))[len('ControlPath='):]
+                return subprocess.CompletedProcess(argv, 0, 'controlpath ' + template.replace('%C', 'resolved') + '\n', '')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+                patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
+            stale = Path(temporary) / 'eden-ssh-999999999'
+            stale.mkdir()
+            recycled = Path(temporary) / f'eden-ssh-{os.getpid()}'
+            recycled.mkdir()
+            sock = socket.socket(socket.AF_UNIX)
+            sock.bind(str(stale / 'socket'))
+            old_sock = socket.socket(socket.AF_UNIX)
+            old_sock.bind(str(recycled / 'socket'))
+            try:
+                with real_ssh_mux('fake-host', run=run, popen=popen) as outer:
+                    self.assertEqual(outer.root.stat().st_mode & 0o777, 0o700)
+                    self.assertFalse(stale.exists())
+                    with real_ssh_mux('fake-host', run=run, popen=popen) as inner:
+                        inner.ensure()
+                        self.assertEqual(outer.rider_args, inner.rider_args)
+                        self.assertIn('ProxyCommand=/bin/false', inner.rider_args)
+                        self.assertEqual(len(masters), 1)
+                    with real_ssh_mux('another-alias', run=run, popen=popen,
+                                      ssh_options=('-o', 'IdentitiesOnly=yes')) as alias:
+                        self.assertEqual(outer.key, alias.key)
+                        self.assertEqual(len(masters), 1)
+                    self.assertTrue(outer.root.is_dir())
+                self.assertFalse(outer.root.exists())
+            finally:
+                sock.close()
+                old_sock.close()
+            self.assertEqual(len([argv for argv, _ in commands if '-O' in argv and
+                                  argv[argv.index('-O') + 1] == 'exit']), 3)
+            self.assertIn('ControlMaster=yes', masters[0][0])
+            self.assertIn('ControlPersist=120', masters[0][0])
+            self.assertTrue(masters[0][1]['start_new_session'])
+            for option in life.SSH_OPTIONS:
+                self.assertIn(option, masters[0][0])
+
+    def test_unavailable_ssh_config_is_a_diagnosed_transport_failure(self):
+        calls = []
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 255, '', 'cannot read configuration')
+        diagnosis = {'line': 'ssh diag fake: not established', 'transient': False,
+                     'cause': 'not established', 'phase': 'unknown', 'evidence': '/tmp/diag'}
+        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+                patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
+                patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+            with self.assertRaisesRegex(life.LedgerTransport, 'ssh diag fake: not established'):
+                with real_ssh_mux('fake-host', run=run):
+                    self.fail('master started')
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(diag.call_args.kwargs['allow_retry'])
+
+    def test_nontransient_master_failure_never_starts_rider(self):
+        class Process:
+            pid = 123456
+            def wait(self, timeout=None):
+                return 255
+            def poll(self):
+                return 255
+        calls = []
+        def popen(argv, **_kwargs):
+            calls.append(argv)
+            return Process()
+        def run(argv, **_kwargs):
+            if '-G' in argv:
+                template = next(item for item in argv if item.startswith('ControlPath='))[len('ControlPath='):]
+                return subprocess.CompletedProcess(argv, 0, 'controlpath ' + template.replace('%C', 'resolved') + '\n', '')
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        diagnosis = {'line': 'ssh diag fake: host key', 'transient': False,
+                     'cause': 'host key', 'phase': 'kex', 'evidence': '/tmp/diag'}
+        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+                patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
+                patch.object(life, 'ssh_diagnosis', return_value=diagnosis):
+            with self.assertRaisesRegex(life.Refused, 'ssh diag fake: host key'):
+                with real_ssh_mux('fake-host', run=run, popen=popen):
+                    self.fail('rider started')
+        self.assertEqual(len(calls), 1)
+
+    def _expired_master_ledger(self, restart_ok):
+        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+                patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
+            checks, masters, riders = [], [], []
+            class Process:
+                pid = 123456
+                def __init__(self, status):
+                    self.status = status
+                def wait(self, timeout=None):
+                    return self.status
+                def poll(self):
+                    return self.status
+            def popen(argv, **_kwargs):
+                if masters:
+                    self.assertFalse(Path(control_path).exists(), 'expired socket was not removed')
+                masters.append(argv)
+                return Process(0 if len(masters) == 1 or restart_ok else 255)
+            def run(argv, **kwargs):
+                if '-G' in argv:
+                    template = next(x for x in argv if x.startswith('ControlPath='))[len('ControlPath='):]
+                    return subprocess.CompletedProcess(argv, 0, 'controlpath ' + template.replace('%C', 'c') + '\n', '')
+                if '-O' in argv and argv[argv.index('-O') + 1] == 'check':
+                    checks.append(argv)
+                    return subprocess.CompletedProcess(argv, 255 if len(checks) == 2 else 0, '', '')
+                if 'input' in kwargs:
+                    riders.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({'owned_claim': True}), '')
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            diagnosis = {'line': 'ssh diag fake: not established', 'transient': False,
+                         'cause': 'not established', 'phase': 'kex', 'evidence': '/tmp/diag'}
+            config = {'ledger': '/tmp/fake-ledger', 'host': 'xps', 'owner': 'test', 'token': 'a' * 32}
+            with patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                with real_ssh_mux('fake-host', run=run, popen=popen) as mux:
+                    control_path = mux.key
+                    with socket.socket(socket.AF_UNIX) as stale:
+                        stale.bind(control_path)
+                    with patch.object(life, 'SshMux') as constructor:
+                        constructor.return_value.__enter__.return_value = mux
+                        if restart_ok:
+                            self.assertEqual(life.ledger_forward('fake-host', 'read', config, run=run),
+                                             {'owned_claim': True})
+                        else:
+                            with self.assertRaises(life.LedgerTransport) as error:
+                                life.ledger_forward('fake-host', 'read', config, run=run)
+                            self.assertEqual(error.exception.diagnoses, [diagnosis])
+                    self.assertEqual(len(masters), 2)
+                    self.assertEqual(len(riders), 1 if restart_ok else 0)
+                    if restart_ok:
+                        diag.assert_not_called()
+                    else:
+                        diag.assert_called_once()
+                        self.assertTrue(diag.call_args.kwargs['allow_retry'])
+
+    def test_expired_master_reopens_and_ledger_operation_succeeds(self):
+        self._expired_master_ledger(True)
+
+    def test_expired_master_failed_restart_gets_one_diagnosis(self):
+        self._expired_master_ledger(False)
+
+    def test_attempt_alarm_interrupts_a_blocked_operation(self):
+        with self.assertRaises(life.SettleDeadline):
+            with life.settle_attempt_deadline(.02):
+                time.sleep(1)
+
+    def test_attempt_alarm_refuses_a_worker_thread(self):
+        errors = []
+        def worker():
+            try:
+                with life.settle_attempt_deadline(.02):
+                    self.fail('worker installed an alarm')
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], life.Refused)
+        self.assertIn('Settle deadline requires the main Linux process', str(errors[0]))
+
+
+@unittest.skipIf(os.environ.get('EDEN_SKIP_SSH_STALL_TESTS'), 'real SSH loopback tests explicitly skipped')
+class SshLoopbackTests(unittest.TestCase):
+    def _stall(self, banner, expected):
+        with tempfile.TemporaryDirectory(prefix='es-') as temporary:
+            listener = socket.socket()
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            listener.settimeout(.2)
+            port = listener.getsockname()[1]
+            stop = threading.Event()
+            accepted = []
+            def handle(conn, event):
+                try:
+                    if banner:
+                        conn.sendall(b'SSH-2.0-OpenSSH_9.9\r\n')
+                    conn.settimeout(.5)
+                    while not stop.is_set():
+                        try:
+                            data = conn.recv(4096)
+                            if not data:
+                                break
+                            event['bytes'].extend(data)
+                        except socket.timeout:
+                            pass
+                finally:
+                    conn.close()
+            def serve():
+                while not stop.is_set():
+                    try:
+                        conn, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    event = {'time': time.monotonic(), 'bytes': bytearray()}
+                    accepted.append(event)
+                    threading.Thread(target=handle, args=(conn, event), daemon=True).start()
+            server = threading.Thread(target=serve, daemon=True)
+            server.start()
+            timings, processes, logs, master_starts, diag_args = [], [], [], [], []
+            class TimedProcess:
+                def __init__(self, argv, **kwargs):
+                    self.process = subprocess.Popen(argv, **kwargs)
+                    self.pid = self.process.pid
+                    self.started = time.monotonic()
+                    processes.append(self.process)
+                    master_starts.append(self.started)
+                def wait(self, timeout=None):
+                    try:
+                        return self.process.wait(timeout=timeout)
+                    finally:
+                        if not timings:
+                            timings.append(time.monotonic() - self.started)
+                def poll(self):
+                    return self.process.poll()
+                def kill(self):
+                    self.process.kill()
+            def run(argv, **kwargs):
+                if argv[0] == 'ping':
+                    argv = ['/usr/bin/ping', *argv[1:]]
+                return subprocess.run(argv, **kwargs)
+            real_diag = life.ssh_diagnosis
+            def diagnose(*args, **kwargs):
+                logs.extend(Path(kwargs['mux_dir']).glob('master-*.log'))
+                diag_args.append(kwargs)
+                return real_diag(*args, **kwargs)
+            options = ('-F', '/dev/null', '-o', f'Port={port}',
+                       '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null')
+            started = time.monotonic()
+            try:
+                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
+                        patch.object(life, 'ssh_diagnosis', side_effect=diagnose), \
+                        patch('sys.stderr', new=io.StringIO()):
+                    with self.assertRaises(life.LedgerTransport) as caught:
+                        with real_ssh_mux('127.0.0.1', run=run, popen=TimedProcess, ssh_bin='/usr/bin/ssh',
+                                          ssh_options=options,
+                                          evidence_dir=os.environ.get('EDEN_TEST_EVIDENCE_DIR') or temporary):
+                            self.fail('unexpected master')
+                total = time.monotonic() - started
+                self.assertEqual(len(processes), 1)
+                self.assertEqual(len(logs), 1)
+                self.assertTrue(9.5 <= timings[0] <= 11, timings)
+                self.assertIsNotNone(processes[0].poll())
+                master_connections = [event for event in accepted
+                                      if event['time'] <= master_starts[0] + timings[0]
+                                      and event['bytes'].startswith(b'SSH-2.0-')]
+                self.assertEqual(len(master_connections), 1)
+                remaining = []
+                for entry in Path('/proc').iterdir():
+                    if entry.name.isdigit():
+                        try:
+                            parts = (entry / 'cmdline').read_bytes().split(b'\0')
+                            if parts and Path(os.fsdecode(parts[0])).name == 'ssh' and \
+                                    f'Port={port}'.encode() in parts:
+                                remaining.append(entry.name)
+                        except (OSError, ValueError):
+                            pass
+                self.assertEqual(remaining, [])
+                diagnosis = caught.exception.diagnoses[0]
+                self.assertEqual(diagnosis['phase'], expected)
+                self.assertFalse(diagnosis['transient'])
+                self.assertIn(f'diag login failed, phase {expected}', diagnosis['line'])
+                self.assertIn('tcp22 ok; ping loss 0%', diagnosis['line'])
+                self.assertIn('cause: not established', diagnosis['line'])
+                self.assertIn('retry: no', diagnosis['line'])
+                text = Path(diagnosis['evidence']).read_text()
+                matches = [line.strip() for line in text.splitlines()
+                           if re.search(r'timed out|Connection (?:closed|reset|refused)|Permission denied|'
+                                        r'Host key verification failed|Could not resolve|No route to host', line, re.I)]
+                expected_message = matches[-1][:160] if matches else (
+                    'none (attempt killed at the 10 s bound)' if diag_args[0]['attempt_killed'] else 'none')
+                self.assertIn(f'message {expected_message};', diagnosis['line'])
+                print(f'loopback {expected}: master {timings[0]:.3f}s total {total:.3f}s, one master, no ssh left')
+                print(diagnosis['line'])
+            finally:
+                stop.set()
+                listener.close()
+                server.join(timeout=2)
+
+    def test_banner_stall(self):
+        self._stall(False, 'banner')
+
+    def test_kex_stall(self):
+        self._stall(True, 'kex')
+
+
 class ProtocolTests(unittest.TestCase):
     def test_stale_policy_fails_closed_on_missing_process_evidence_or_ambiguous_claims(self):
         now = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
@@ -1965,11 +3536,11 @@ class ProtocolTests(unittest.TestCase):
         path = Path('/tmp/opencode/in-memory-ledger-not-created')
         remote = life.Ledger(path, 'surface', 'OpenCode test/owner', 'own-token', remote='yoga')
         packets = []
-        def forward(host, mode, config, execute):
-            packets.append((host, mode, json.loads(json.dumps(config)), execute))
+        def ledger_forward(host, operation, config, **kwargs):
+            packets.append((host, 'ledger-' + operation, json.loads(json.dumps(config)), True))
             # Exercise the same dispatch boundary as SSH, without a subprocess/file write.
-            return life.dispatch(mode, packets[-1][2], execute)
-        with patch.object(life, 'forward', side_effect=forward), patch.object(Path, 'is_file', return_value=True), \
+            return life.dispatch('ledger-' + operation, packets[-1][2], True)
+        with patch.object(life, 'ledger_forward', side_effect=ledger_forward), patch.object(Path, 'is_file', return_value=True), \
                 patch.object(Path, 'open', file), patch.object(life.fcntl, 'flock'), patch.object(life.os, 'fsync'), \
                 patch.object(life, 'datetime', wraps=datetime) as clock:
             clock.now.return_value = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
@@ -1997,8 +3568,9 @@ class ProtocolTests(unittest.TestCase):
             file().read.return_value = text + released['line'] + '\n'
             self.assertEqual(remote.inspect()['open'], [old.rstrip('\n')])
             file().write.reset_mock()
+            remote = life.Ledger(path, 'surface', 'OpenCode test/owner', 'new-token', remote='yoga')
             with self.assertRaisesRegex(life.Refused, 'Open host claim'):
-                remote.claim()  # same foreign history still blocks the strict policy
+                remote.claim()
             file().write.assert_not_called()
 
     def test_real_ledger_shapes_from_2026_11_03(self):
@@ -2105,10 +3677,22 @@ class ProtocolTests(unittest.TestCase):
     def test_ssh_failure_is_not_success_and_unsafe_host_refuses(self):
         def fail(command, **kwargs):
             return subprocess.CompletedProcess(command, 255, '', 'synthetic ssh transport failure')
-        with self.assertRaisesRegex(life.Refused, 'SSH lifecycle failed'):
-            life.forward('yoga', 'status', {}, False, run=fail)
+        with patch.object(life, 'ssh_diagnosis', return_value={'line': 'fake diagnosis'}):
+            with self.assertRaisesRegex(life.Refused, 'SSH lifecycle failed'):
+                life.forward('yoga', 'status', {}, False, run=fail)
         with self.assertRaisesRegex(life.Refused, 'Unsafe SSH host'):
             life.forward('yoga;bad', 'status', {}, False, run=fail)
+
+    def test_ssh_rider_timeout_is_diagnosed_without_retry(self):
+        calls = []
+        def timeout(command, **kwargs):
+            calls.append(command)
+            raise subprocess.TimeoutExpired(command, 900)
+        with patch.object(life, 'ssh_diagnosis', return_value={'line': 'named diagnosis'}) as diagnose:
+            with self.assertRaisesRegex(life.Refused, 'named diagnosis'):
+                life.forward('fake-host', 'status', {}, False, run=timeout)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(diagnose.call_args.kwargs['allow_retry'])
 
     def test_real_host_rejects_input_before_loading_any_cli_client(self):
         with self.assertRaisesRegex(life.Refused, 'cannot send input'):
@@ -2173,6 +3757,94 @@ class WindowsTests(unittest.TestCase):
         item['app'] = {'path': str(app), 'sha256': life.digest(app)}
         item.pop('display')
         self.host = FakeWindowsHost(self.order)
+
+    def test_ally_pending_release_does_not_start_a_settle_unit(self):
+        c = self.controller()
+        c.up()
+        with patch.object(self.ledger, 'inspect', side_effect=transport()):
+            result = c.down()
+        self.assertTrue(result['release_pending'])
+        self.assertIsNone(result['settle_unit'])
+        self.assertEqual(self.host.started_settles, [])
+        self.assertTrue(c.down()['released'])
+
+    def test_windows_bridge_preserves_ledger_transport_classification(self):
+        token = 'a' * 32
+        def dispatch(*args):
+            with self.assertRaises(life.LedgerTransport) as error:
+                life._LEDGER_BRIDGE('read', token, None, None)
+            self.assertTrue(error.exception.transient)
+            self.assertEqual(error.exception.diagnoses[0]['cause'], 'temporary stall')
+            return {'ok': True}
+        packet = {'source': 'unused', 'ledger_bridge': True, 'mode': 'down',
+                  'config': {}, 'execute': True}
+        detail = transport().diagnoses
+        reply = io.StringIO(json.dumps({'error': 'Ledger transport: ' + json.dumps(detail)}) + '\n')
+        with patch.dict(life.__dict__, {'_LEDGER_BRIDGE': None}), \
+                patch.object(life, 'dispatch', side_effect=dispatch), \
+                patch('sys.stdin', reply), patch('sys.stdout', new_callable=io.StringIO):
+            life.remote_main(packet)
+
+    def test_ally_down_receives_transport_errors_over_the_existing_bridge_reply(self):
+        initial = self.controller()
+        initial.up()
+        c = life.Lifecycle(self.config, self.host)
+        packet = {'source': 'unused', 'ledger_bridge': True, 'mode': 'down',
+                  'config': self.config, 'execute': True}
+        reply = json.dumps({'error': 'Ledger transport: read unavailable'}) + '\n'
+        output = io.StringIO()
+        with patch.dict(life.__dict__, {'_LEDGER_BRIDGE': None}), \
+                patch.object(life, 'Lifecycle', return_value=c), \
+                patch('sys.stdin', io.StringIO(reply * 2)), patch('sys.stdout', output):
+            life.remote_main(packet)
+        lines = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([line['ledger_request']['operation'] for line in lines[:-1]], ['read'])
+        result = lines[-1]['lifecycle_result']
+        self.assertEqual(result['phase'], 'down')
+        self.assertTrue(result['release_pending'])
+        self.assertFalse(result['released'])
+        self.assertEqual(self.host.started_settles, [])
+
+    def test_ally_up_skips_pending_and_bridge_mutates_only_its_claim(self):
+        folder = life.pending_release_dir()
+        folder.mkdir(parents=True)
+        pending = folder / ('a' * 32 + '.json')
+        pending.write_text(json.dumps({'host': 'ally', 'ledger': self.config['ledger'], 'token': 'a' * 32}))
+        requests = []
+        def bridge(operation, token, stale, admission):
+            requests.append({'ledger_request': {'operation': operation, 'token': token,
+                                                 'stale_claim_hours': stale, 'admission': admission}})
+            if operation == 'read':
+                return {'open': [], 'owned_claim': False, 'owned_release': False}
+            return {'line': 'fake claim', 'stale_claim_skipped': []}
+        c = life.Lifecycle(self.config, self.host)
+        with patch.dict(life.__dict__, {'_LEDGER_BRIDGE': bridge}), patch.object(c, 'settle_pending') as settle:
+            self.assertEqual(c.up()['phase'], 'up')
+        settle.assert_not_called()
+        self.assertTrue(pending.exists())
+        self.assertEqual([r['ledger_request']['operation'] for r in requests if r['ledger_request']['operation'] != 'read'],
+                         ['claim'])
+        class Process:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(''.join(json.dumps(x) + '\n' for x in requests) +
+                                          json.dumps({'lifecycle_result': {'phase': 'up'}}) + '\n')
+                self.stderr = io.StringIO()
+            def poll(self):
+                return 0
+            def wait(self, timeout):
+                return 0
+        mutations = []
+        class Ledger:
+            def __init__(self, *args):
+                pass
+            def operate(self, operation, stale, admission):
+                if operation != 'read':
+                    mutations.append(operation)
+                return {'open': []} if operation == 'read' else {'line': 'fake claim'}
+        value = life.forward_windows('fake-ally', 'up', self.config, True, lambda *a, **kw: Process(), Ledger)
+        self.assertEqual(value['phase'], 'up')
+        self.assertEqual(mutations, ['claim'])
 
     def test_windows_full_fake_up_down_pipe_private_clone_and_source_verification(self):
         original = life.inventory(self.source)
@@ -2458,6 +4130,37 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(packet['ledger_bridge'])
         self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]), {'result': {'line': 'FAKE claim'}})
 
+    def test_windows_controller_serializes_transport_in_the_existing_error_reply(self):
+        request = {'ledger_request': {'operation': 'read', 'token': 'a' * 32,
+                                      'admission': None, 'stale_claim_hours': None}}
+        class Input(io.StringIO):
+            def close(self):
+                self.saved = self.getvalue()
+                super().close()
+        class Process:
+            def __init__(self):
+                self.stdin = Input()
+                self.stdout = io.StringIO(json.dumps(request) + '\n' +
+                                          json.dumps({'lifecycle_result': {'phase': 'down'}}) + '\n')
+                self.stderr = io.StringIO()
+            def poll(self):
+                return 0
+            def wait(self, timeout):
+                return 0
+        class Ledger:
+            def __init__(self, *args):
+                pass
+            def operate(self, operation, stale, admission):
+                raise transport('ssh diag fake: outage')
+        process = Process()
+        life.forward_windows('fake-ally', 'down', self.config, True, lambda *args, **kwargs: process, Ledger)
+        reply = json.loads(process.stdin.saved.splitlines()[1])
+        self.assertEqual(set(reply), {'error'})
+        self.assertTrue(reply['error'].startswith('Ledger transport: '))
+        diagnoses = json.loads(reply['error'].removeprefix('Ledger transport: '))
+        self.assertTrue(diagnoses[0]['transient'])
+        self.assertEqual(diagnoses[0]['line'], 'ssh diag fake: outage')
+
     def test_windows_up_reads_with_the_inspect_token_then_claims_with_its_own(self):
         # Up's admission reads the ledger with the read-only inspect token ('0' * 32, Lifecycle.ledger_text) before
         # it claims with the run token. Reads bind nothing; a second mutating token is still refused.
@@ -2494,18 +4197,24 @@ class WindowsTests(unittest.TestCase):
     def test_windows_1312_retries_once_only_before_any_ledger_action(self):
         error = life.Refused('CreateProcessAsUserW failed: 1312')
         error.transport_not_started = True
-        with patch.object(life, '_forward_windows_once', side_effect=[error, {'phase': 'absent'}]) as once:
+        with patch.object(life, 'ssh_diagnosis') as diag, \
+                patch.object(life, '_forward_windows_once', side_effect=[error, {'phase': 'absent'}]) as once:
             self.assertEqual(life.forward_windows('intpa@dreamland-ally', 'status', self.config, False), {'phase': 'absent'})
             self.assertEqual(once.call_count, 2)
-        with patch.object(life, '_forward_windows_once', side_effect=error) as once:
+            diag.assert_not_called()
+        with patch.object(life, 'ssh_diagnosis') as diag, \
+                patch.object(life, '_forward_windows_once', side_effect=error) as once:
             with self.assertRaises(life.Refused):
                 life.forward_windows('intpa@dreamland-ally', 'status', self.config, False)
             self.assertEqual(once.call_count, 2)
+            diag.assert_not_called()
         error.transport_not_started = False
-        with patch.object(life, '_forward_windows_once', side_effect=error) as once:
+        with patch.object(life, 'ssh_diagnosis') as diag, \
+                patch.object(life, '_forward_windows_once', side_effect=error) as once:
             with self.assertRaises(life.Refused):
                 life.forward_windows('intpa@dreamland-ally', 'up', self.config, True)
             self.assertEqual(once.call_count, 1)
+            diag.assert_not_called()
 
     def test_windows_real_transport_classifies_broken_pipe_1312_without_replaying_a_claim(self):
         class BrokenInput:
@@ -2531,7 +4240,7 @@ class WindowsTests(unittest.TestCase):
         def popen(command, **kwargs):
             commands.append(command)
             return processes[len(commands) - 1]
-        with patch.object(life, 'Ledger') as ledger:
+        with patch.object(life, 'Ledger') as ledger, patch.object(life, 'ssh_diagnosis') as diag:
             result = life.forward_windows('intpa@dreamland-ally', 'status', self.config, False, popen, ledger)
         self.assertEqual(result, {'phase': 'absent'})
         self.assertEqual(len(commands), 2)
@@ -2539,6 +4248,7 @@ class WindowsTests(unittest.TestCase):
         self.assertIn('-NoProfile -NonInteractive -EncodedCommand', commands[0][-1])
         self.assertEqual(commands[0][1:3], ['-T', '-x'])
         ledger.assert_not_called()
+        diag.assert_not_called()
 
 
 if __name__ == '__main__':

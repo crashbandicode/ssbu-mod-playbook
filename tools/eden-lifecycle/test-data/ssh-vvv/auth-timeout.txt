@@ -1,0 +1,5 @@
+debug1: Connecting to example.test [192.0.2.1] port 22.
+debug1: Remote protocol version 2.0, remote software version OpenSSH_9.2
+debug1: SSH2_MSG_KEXINIT sent
+debug1: SSH2_MSG_NEWKEYS received
+debug1: Authenticating to example.test:22 as 'test'

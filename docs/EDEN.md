@@ -15,10 +15,14 @@ a label `eNN`, and every file a run writes is named after it.
     `current`.
   - The XPS (`ubuntu-xps`, Ubuntu 26.04, Iris Xe, added 2026-11-06) is a
     Linux executor like the Surface: config `"host": "xps"`, `"hostname":
-    "ubuntu-xps"`, `"ledger_ssh": "memento-claw-yoga-ubuntu"`. It runs two Eden
+    "ubuntu-xps"`, `"ledger_ssh": "tr-yoga"`. It runs two Eden
     instances at a time, like the Surface and Yoga (operator 2026-11-06: "the
     default should just be what yoga can do. I'm not using it to game it's for
-    development").
+    development"). Use the TR-owned `tr-yoga` alias: the Yoga DNS name returns
+    Wi-Fi first, which lost up to 36% of packets on 2026-11-24 and stalled
+    logins before authentication. Yoga Wi-Fi was switched off at 02:57Z on
+    2026-11-24; DNS may still answer old Wi-Fi addresses, and wired IPv4
+    `192.168.0.166` is not in DNS. The Claw alias must not be used for TR runs.
     - Run `xps-dual-02` (2026-11-06, an online pair, match and rematch, at 1x)
       ended cleanly on both instances: `desync_seen=0`, the rematch connected,
       MemAvailable stayed at or above 12.8 GiB. The pair ran about 53
@@ -354,8 +358,16 @@ separately, and releases only when both pass. Eden's `game.stop` rarely
 finishes within its 30 s cap: on 2026-11-03 it timed out on lr-02 to lr-05
 and pkg4's pair. The journal retains that under `stop_errors`; successful
 bounded cleanup can still restore/verify/release, but does not establish
-graceful shutdown or waive a fatal console tail. Non-empty `cleanup_failures`,
-unequal verification or an unreleased claim always mean cleanup failure.
+graceful shutdown or waive a fatal console tail. Non-empty `cleanup_failures`
+or unequal verification mean cleanup failure. If the ledger is unreachable
+after local cleanup, Down reports `release_pending` and keeps the claim for
+retry instead of reporting a cleanup failure. Linux starts a bounded settle
+unit only for a retryable path diagnosis with confirmed healthy target facts; target distress stops retries, and
+the Ally does not start a unit. `RELEASE-PENDING.md`
+records each attempt and an optional `notify` posts its status. Run
+`lifecycle.py settle config.json --execute` or
+Down again to complete the release. Ally Up does not settle pending records;
+repeat Down on the Ally. Pending releases are not pruned.
 
 **A clean Down prunes the run's copies** (2026-11-09): the files the run wrote go to `out/post-run-<key>/` (`eden_test.py down`;
 `lifecycle.py down` alone puts them in `<state_dir>/evidence/` unless given `--evidence-dir`), then

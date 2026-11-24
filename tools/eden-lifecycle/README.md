@@ -35,6 +35,9 @@ appends one reservation to the configured authoritative ledger, using
 `ledger_ssh` when present. The approver name records the approval already
 granted. A host can have one live reservation. It can be left for an existing
 run to finish and expires 20 minutes after issuance if still unclaimed.
+Repeating an open reservation reports its remaining time; after expiry it
+closes the old reservation before issuing a new one. A converted reservation
+cannot be replayed.
 
 Preflight is read-only. It ignores an exact matching reservation and refuses a
 different owner or label while the reservation is open. Up still checks
@@ -44,6 +47,7 @@ claim. An elapsed reservation stays in ledger history, and the next
 successful reservation or claim on that host records its release. For new reserve,
 preflight and Up operations use the current shared lifecycle on the executor.
 Existing runtime owners can Down with their already-pinned tools.
+An exactly released lifecycle token is terminal; a new run needs a new token.
 
 ### Whole-host hold
 
@@ -69,7 +73,31 @@ python3 -B -I lifecycle.py up config.json --execute
 python3 -B -I ../eden-runner/runner.py run rows.json --instances <state_dir>/instances.json
 python3 -B -I lifecycle.py watchdog config.json --execute
 python3 -B -I lifecycle.py down config.json --execute
+python3 -B -I lifecycle.py settle config.json --execute [--minutes 30]
 ```
+
+SSH opens an authenticated master within ten seconds; ledger, lifecycle,
+staging and transfer calls ride that master and cannot start a new login.
+Transport failures are diagnosed before at most one retry, only for a named
+path cause with target facts that have been read and establish health. MaxStartups throttling and target
+overload stop without retry. A single TCP, banner or key-exchange timeout is
+retryable only when TCP answers and a successful diagnostic login provides
+healthy target evidence. Windows target health cannot be confirmed, so failed
+SSH transport is never retried to the Ally. Token-idempotent ledger mutations
+make a retry safe. Down stops, restores and verifies locally before release. A transport outage
+leaves `release_pending` in the journal and a token record under
+`$XDG_STATE_HOME/eden-lifecycle/pending-release/` (or `~/.local/state`).
+Linux starts a low-priority `eden-settle-<token prefix>` user unit only for a
+transient diagnosis; the Ally does not. `settle` attempts once per minute,
+starts none after minute 29, writes its give-up line by minute 30 and stops on
+a non-transient cause. A 31-minute unit cap is a backstop; a later status or
+Down records a stopped unit without a final receipt. Repeat Down to settle manually.
+`RELEASE-PENDING.md` records each diagnosis and outcome. Optional `notify`
+configuration (`file`, optional `ssh`, `from` and `to`) posts the same status.
+`status` exposes the pending state, unit, running state and last receipt line.
+Pending runs are not pruned. Before claiming, Linux Up best-effort settles
+records for the same host and authoritative ledger. Ally Up does not settle
+pending records; repeat Down on the Ally.
 
 `preflight` is read-only. On its own it checks resources, ledger claims and
 the display as well as the pins. `up` repeats the pin, game, update, commit
@@ -151,12 +179,16 @@ must place `down` in its own cleanup/finally, even if runner execution fails.
 Controller death leaves a durable journal/claim for a fresh `down`, never an
 expired-claim assumption or silent restart. `up` refuses a reused journal/root.
 
-Append `--ssh memento-claw-yoga-ubuntu` to run the SAME lifecycle code on Yoga
+Append `--ssh tr-yoga` to run the SAME lifecycle code on Yoga
 through its PowerShell7 login shell, with source/config on stdin, no script
 staging. **All config paths and generated instances paths are executor-host
 paths.** Run the shared runner on that host too; no implicit socket forwarding.
 For local Surface or XPS with the authoritative ledger on Yoga, set `ledger_ssh` to
-that SSH host. Hosts are `surface`, `yoga`, `xps` (hostname `ubuntu-xps`) and
+`tr-yoga`. The Yoga DNS name returns its Wi-Fi address first; that path lost
+up to 36% of packets on 2026-11-24 and logins stalled before authentication.
+Yoga Wi-Fi was switched off at 02:57Z on 2026-11-24; DNS may still answer old
+Wi-Fi addresses and wired IPv4 `192.168.0.166` is not in DNS.
+The Claw alias must not be used for TR runs. Hosts are `surface`, `yoga`, `xps` (hostname `ubuntu-xps`) and
 `ally`; the XPS runs two Eden instances, like the Surface and Yoga. Every XPS
 Eden boots at 0.5x (`core.resolution_setup` = 1, `Res1_2X`) before `game.load`.
 Operator 2026-11-06: "yes, make half res the XPS default". Thermald stays on.
@@ -179,7 +211,7 @@ Config (`PIN` means `{"path":"/absolute/executor/file","sha256":"64hex"}`):
   "work_root": "/home/intpa/eden-life-e42",
   "state_dir": "/home/intpa/eden-life-state/e42",
   "ledger": "/tmp/deluxe-surface-1007/OWNER-COORDINATION.md",
-  "ledger_ssh": "memento-claw-yoga-ubuntu",
+  "ledger_ssh": "tr-yoga",
   "runner": "PIN for the existing shared tools/eden-runner/runner.py",
   "rows": "PIN for the run's rows.json",
   "runtime": 5400, "socket_cap": 90, "load_cap": 180,
