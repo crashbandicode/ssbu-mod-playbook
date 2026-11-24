@@ -205,12 +205,14 @@ class PlayIdleTests(unittest.TestCase):
             self.play()
         self.assertEqual(self.sent, [])
 
-    def test_play_keeps_accepted_delivery_explicit_if_the_stall_journal_fails(self):
+    def test_a_stall_journal_failure_is_raised_only_after_the_macro_was_waited_for(self):
         self.status = lambda: {'state': 'playing'} if self.now < 1.2 else {'state': 'idle'}
         self.ctx.row_dir = self.row / 'missing'
-        with self.assertRaisesRegex(routes.closed_loop.DeliveryUnknown, 'macro training-input was accepted'):
+        with self.assertRaisesRegex(RuntimeError,
+                                    'macro training-input finished, but its stall event could not be recorded'):
             self.play()
         self.assertEqual(len(self.sent), 1)
+        self.runner.wait_macro.assert_called_once_with('a', 3)
         self.assertEqual(len(self.runner.setup_metrics['stalls']), 1)
 
     def test_play_does_not_wait_when_the_engine_owns_the_idle_check(self):

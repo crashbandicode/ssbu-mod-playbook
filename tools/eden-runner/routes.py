@@ -797,22 +797,23 @@ def play(ctx, name):
         if 'input_busy' in message or 'macro.play busy' in message:
             raise closed_loop.DispatchRejected(str(error)) from error
         raise
-    if stall is not None:
-        seconds, waits, why = stall
-        try:
-            event = {'kind': 'idle-wait', 'block': 'play', 'step': name, 'seconds': seconds,
-                     'waits': waits, 'why': why, 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
-            metrics = getattr(ctx.runner, 'setup_metrics', None)
-            if isinstance(metrics, dict):
-                metrics.setdefault('stalls', []).append(event)
-            if getattr(ctx, 'row_dir', None) is not None:
-                _append_stall(ctx, 'play', event)
-        except Exception as error:
-            raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
     try:
         ctx.runner.wait_macro(ctx.on, cap)
     except RuntimeError as error:
         raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
+    if stall is not None:
+        # Recorded after the macro has finished, so a failure here never leaves a macro playing unwatched.
+        seconds, waits, why = stall
+        event = {'kind': 'idle-wait', 'block': 'play', 'step': name, 'seconds': seconds,
+                 'waits': waits, 'why': why, 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
+        metrics = getattr(ctx.runner, 'setup_metrics', None)
+        if isinstance(metrics, dict):
+            metrics.setdefault('stalls', []).append(event)
+        try:
+            if getattr(ctx, 'row_dir', None) is not None:
+                _append_stall(ctx, 'play', event)
+        except OSError as error:
+            raise RuntimeError(f'macro {name} finished, but its stall event could not be recorded: {error}') from error
     ctx.log({'route_macro': name, 'sha256': sha})
     return sha
 
