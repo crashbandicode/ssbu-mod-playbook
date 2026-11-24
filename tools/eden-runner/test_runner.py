@@ -1276,6 +1276,16 @@ class RunnerTests(unittest.TestCase):
                 run.gate('a', 'red')
         self.assertNotIn('macro.play', eden.calls)
 
+    def test_gate_recovery_refuses_a_segment_without_a_hash(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['segments']['to-red'].pop('sha256', None)
+        with mock.patch.object(run, 'check_gate', side_effect=RuntimeError('not red')):
+            with self.assertRaisesRegex(RuntimeError, 'to-red has no sha256; refusing to play an unhashed'):
+                run.gate('a', 'red')
+        self.assertNotIn('macro.play', eden.calls)
+        self.assertNotIn('macro.status', eden.calls)
+
     def test_a_stop_from_the_recovery_gate_recheck_is_not_mistaken_for_a_failed_gate(self):
         class Cancelled(RuntimeError):
             pass
@@ -1384,7 +1394,6 @@ class RunnerTests(unittest.TestCase):
         run.plan['gates']['red']['cap'] = 40
         run.plan['gates']['blue'] = {**run.plan['gates']['red'], 'recover': None}
         run.plan['segments']['to-red']['start_gate'] = 'blue'
-        del run.plan['segments']['to-red']['sha256']
         checks = []
 
         def check(on, name, **options):
