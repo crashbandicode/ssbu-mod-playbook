@@ -69,6 +69,7 @@ class BridgeOnTests(unittest.TestCase):
         self.listener = 'LISTEN users:(("eden",pid=712,fd=42))'
         self.stub_samples = []
         self.stub_default = STUB_UI
+        self.stub_preamble = STUB_PREAMBLE
         self.bridge_requests = []
         self.ready_at = None
         self.chord_started = None
@@ -106,7 +107,7 @@ class BridgeOnTests(unittest.TestCase):
     def spawn(self, argv, **kwargs):
         self.popen.append((argv, kwargs))
         run = self.out / 'bridge-run'
-        (run / 'bridge.log').write_text(STUB_PREAMBLE if self.stub else
+        (run / 'bridge.log').write_text(self.stub_preamble if self.stub else
                                        '[Adapter] bridge connected boot=0x46024760bd126949\n'
                                        + HELLO + '\n' + INSTALL + '\n' + self.backup + '\n')
         return SimpleNamespace(pid=4321)
@@ -265,6 +266,57 @@ class BridgeOnTests(unittest.TestCase):
         receipt = self.invoke(port=6980)
         self.assertEqual((receipt['title']['boot'], receipt['title']['matched']), (STUB_BOOT, 'prompt'))
         self.assertEqual(len(self.bridge_requests), 3)
+
+    def test_bridge_on_stub_on_already_on_checks_no_title_and_sends_no_chord(self):
+        self.configure_stub()
+        self.events.write_text('\n'.join(STUB_EVENTS) + '\n')
+        self.journal.unlink()
+        run = self.out / 'bridge-run'
+        run.mkdir()
+        (run / 'bridge.log').write_text(STUB_PREAMBLE)
+        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6980}))
+        with (run / 'bridge.lock').open('w') as lock, \
+             patch.object(routes, '_bridge_on_stub_title', return_value={'unexpected': True}) as title_read:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            receipt = self.invoke(port=6980)
+        title_read.assert_not_called()
+        self.assertEqual(receipt['title'], {'checked': False, 'reason': 'bridge already On before this call'})
+        self.assertEqual(receipt['chord']['chord'], 'already on')
+        self.assertTrue(receipt['reused'])
+        self.assertEqual(self.popen, [])
+        self.assertEqual(self.bridge_requests, [])
+        self.assertFalse(any(method == 'input.button' for method, _ in self.calls))
+
+    def test_bridge_on_stub_on_rejects_first_active_main_before_title_in_one_read(self):
+        self.configure_stub()
+        self.stub_default = self.sample(screen='main') + ''.join(STUB_CAPTURE[11:])
+        blocks = state_gate.blocks(self.stub_default, 'ssbu.ui')
+        self.assertEqual([block['values']['screen'] for block in blocks], ['main', 'title'])
+        with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
+            self.invoke(port=6980)
+        self.assertEqual(len(self.bridge_requests), 1)
+
+    def test_bridge_on_stub_on_skips_inactive_and_foreign_before_title_in_one_read(self):
+        self.configure_stub()
+        self.stub_default = self.sample(active='no') + self.sample(boot=FOREIGN_BOOT) + STUB_UI
+        blocks = state_gate.blocks(self.stub_default, 'ssbu.ui')
+        self.assertEqual([(block['boot'], block['values']['observation.active']) for block in blocks],
+                         [(STUB_BOOT, 'no'), (FOREIGN_BOOT, 'yes'), (STUB_BOOT, 'yes')])
+        receipt = self.invoke(port=6980)
+        self.assertEqual((receipt['title']['boot'], receipt['title']['matched']), (STUB_BOOT, 'prompt'))
+        self.assertEqual(len(self.bridge_requests), 1)
+
+    def test_bridge_on_stub_on_ignores_blocks_before_the_capture_hello(self):
+        self.configure_stub()
+        self.stub_preamble = self.sample(screen='main') + STUB_PREAMBLE
+        receipt = self.invoke(port=6980)
+        self.assertEqual(receipt['title']['matched'], 'prompt')
+
+    def test_bridge_on_stub_on_keeps_first_active_across_a_reconnect_in_one_read(self):
+        self.configure_stub()
+        self.stub_default = self.sample(screen='main') + '[Adapter] reconnect reason=test\n' + STUB_UI
+        with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
+            self.invoke(port=6980)
 
     def test_bridge_on_stub_on_refuses_a_listener_owned_by_another_pid(self):
         self.configure_stub()
