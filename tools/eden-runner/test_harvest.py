@@ -106,6 +106,14 @@ class HarvestTests(unittest.TestCase):
             harvest.harvest(self.manifest, self.out, 'test', self.library)
         self.assertFalse(self.index.exists())
 
+    def test_reserved_manifest_cannot_be_harvested(self):
+        candidate = self.base / '.gate-candidate-manifest'
+        candidate.write_bytes(self.manifest.read_bytes())
+        self.receipt('PASS')
+        with self.assertRaisesRegex(ValueError, 'candidate'):
+            harvest.harvest(candidate, self.out, 'test', self.library)
+        self.assertFalse(self.index.exists())
+
     def test_reference_that_becomes_pending_during_read_is_not_harvested(self):
         reference = self.base / 'reference.png'
         reference.write_bytes(b'old reference')

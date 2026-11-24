@@ -2544,6 +2544,31 @@ class RunnerTests(unittest.TestCase):
             run.check_gate('a', 'red')
         self.assertFalse((run.out / 'stills.jsonl').exists())
 
+    def test_reserved_manifest_cannot_be_opened_as_a_plan(self):
+        candidate = self.dir / '.gate-candidate-manifest'
+        candidate.write_bytes(self.manifest.read_bytes())
+        with self.assertRaisesRegex(ValueError, 'candidate'):
+            runner.dry_run(candidate)
+        with self.assertRaisesRegex(ValueError, 'candidate'):
+            runner.Runner(candidate, self.instances, self.dir / 'out', 15)
+
+    def test_reference_cannot_be_approved_if_its_decision_is_late(self):
+        run = self.stopped_acquisition()
+        now = [time.monotonic()]
+        finish = run._commit_evidence
+
+        def late_decision(ticket):
+            now[0] = ticket.deadline + 1
+            return finish(ticket)
+
+        with mock.patch.object(run, '_commit_evidence', side_effect=late_decision), \
+                mock.patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]):
+            with self.assertRaisesRegex(RuntimeError, 'deadline'):
+                run.check_gate('a', 'red')
+        self.assertIn('red', runner.dry_run(self.manifest)['references_to_acquire'])
+        self.assertFalse((run.out / 'stills.jsonl').exists())
+        self.assertEqual(run.acquired, [])
+
     def test_gate_does_not_compare_against_another_gates_uncommitted_reference(self):
         run = self.stopped_acquisition()
 
