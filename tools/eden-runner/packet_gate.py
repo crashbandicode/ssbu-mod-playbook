@@ -742,6 +742,27 @@ def _target(plan, base, errors):
     if not isinstance(target, dict):
         errors.append('G2 target: target must be an object')
         return {}, None
+    required = []
+    if base.name == 'rows':
+        config_path = base.parent / 'config.json'
+        try:
+            try:
+                config_path.lstat()
+            except FileNotFoundError:
+                config = {}
+            else:
+                config = json.loads(config_path.read_text(encoding='utf-8'))
+                if not isinstance(config, dict):
+                    raise ValueError('expected a JSON object')
+        except (OSError, UnicodeError, ValueError) as error:
+            errors.append(f'G2 target: run config {config_path} cannot be read: {error}')
+            return {}, None
+        if 'staged_targets' in config:
+            required = config['staged_targets']
+            if (not isinstance(required, list) or any(not isinstance(commit, str)
+                    or not re.fullmatch(r'[0-9a-f]{40}', commit) for commit in required)):
+                errors.append('G2 target: run config staged_targets is invalid')
+                return {}, None
     repos = {}
     extra = target.get('repos', {})
     if not isinstance(extra, dict):
@@ -769,6 +790,13 @@ def _target(plan, base, errors):
             errors.append(f'G2 target: {label}.commit must be 40 lower-case hex characters')
             continue
         staged = base.parent.parent / '_eden-test' / 'stage' / base.parent.name / 'targets' / commit
+        if required and commit not in required:
+            errors.append(f'G2 target: {label}.commit {commit} was not staged for this run')
+            continue
+        if commit in required and not staged.is_dir():
+            errors.append(f'G2 target: {label} staged tree {staged} is missing; this run gates staged targets only '
+                          f'(stage-target --commit {commit} --label {base.parent.name})')
+            continue
         if base.name == 'rows' and (staged.exists() or staged.is_symlink()):
             try:
                 paths = [base.parent.parent / '_eden-test',

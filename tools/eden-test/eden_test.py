@@ -103,6 +103,14 @@ def _target_commit(commit):
         raise ValueError('target commit must be 40 lower-case hex characters')
 
 
+def _staged_target_arg(commit):
+    try:
+        _target_commit(commit)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return commit
+
+
 def _target_label(label):
     if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{1,63}', label):
         raise ValueError('invalid target stage label')
@@ -599,8 +607,17 @@ def network_row_overrides(rows, interface):
 
 
 def go_new(args):
+    staged_targets = getattr(args, 'staged_target', None) or []
+    try:
+        for commit in staged_targets:
+            _target_commit(commit)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
+    config.pop('staged_targets', None)
+    if staged_targets:
+        config['staged_targets'] = sorted(set(staged_targets))
     if config.get('host') != args.host:
         raise SystemExit(f'base {base} is for host {config.get("host")!r}, not {args.host!r}')
     lineup = _go_card_lineup(args)
@@ -1743,13 +1760,13 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     else:
         commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
     script = f'{stage}/tools/eden-test/eden_test.py'
+    staged_commits = {}
     for index, command in enumerate(commands):
         mux.ensure()
         command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
         if code := _go_sh(command):
             raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}')
         if index == 0:
-            staged_commits = {}
             for target in targets:
                 commit, label = target['commit'], target['label']
                 if commit in staged_commits:
@@ -1817,6 +1834,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         remote.extend(('--network-interface', args.network_interface))
     if args.no_lobby:
         remote.append('--no-lobby')
+    for commit in sorted(staged_commits):
+        remote.extend(('--staged-target', commit))
     remote.extend(('--owner', args.owner))
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
@@ -1997,6 +2016,7 @@ def main(argv=None):
     p.add_argument('--from', dest='from_config')
     p.add_argument('--ssh')
     p.add_argument('--token', help=argparse.SUPPRESS)
+    p.add_argument('--staged-target', action='append', type=_staged_target_arg, default=[], help=argparse.SUPPRESS)
     p = sub.add_parser('stage-target', help='build or reuse a target cache and stage it for a run')
     p.add_argument('--commit', required=True)
     p.add_argument('--label', required=True)

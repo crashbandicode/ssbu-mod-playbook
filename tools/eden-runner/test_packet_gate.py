@@ -146,6 +146,7 @@ for side in ["p1", "cpu"] {
         packed = eden_test.pack_target(self.tree, self.commit, Path(self.tmp.name) / 'packs')
         receipt = eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=runs)
         staged = Path(receipt['staged'])
+        (self.base.parent / 'config.json').write_text(json.dumps({'staged_targets': [self.commit]}))
         with mock.patch.object(packet_gate, '_git', wraps=packet_gate._git) as git:
             after = packet_gate.check(self.plan, self.base, self.plan)
         self.assertEqual(after['errors'], [])
@@ -236,6 +237,101 @@ for side in ["p1", "cpu"] {
         errors = self.errors()
         self.assertEqual(len(errors), 1, errors)
         self.assertIn('writes cpu.{entry}.ai_thinks with entry = 1 to 7', errors[0])
+
+    def required_targets(self):
+        runs = self.target_run_layout()
+        first = self.commit
+        (self.tree / 'second.txt').write_text('second')
+        self.git('add', 'second.txt')
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'second')
+        second = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['bridge']['commit'] = second
+        stage = runs / '_eden-test' / 'stage' / 'run-01' / 'targets'
+        for commit in (first, second):
+            pack = eden_test.pack_target(self.tree, commit, Path(self.tmp.name) / 'packs')
+            eden_test.stage_target(commit, 'run-01', pack['pack_file'], runs=runs)
+        (self.base.parent / 'config.json').write_text(json.dumps({'staged_targets': [first, second]}))
+        return runs, stage, first, second
+
+    def test_missing_one_required_target_never_falls_back_to_existing_producer(self):
+        runs, stage, first, second = self.required_targets()
+        self.plan['target']['providers'] = {'custom.bridge': {'repo': 'bridge', 'files': ['src/proto2.rs']}}
+        self.plan['rows'][0]['reads'] = ['custom.bridge:screen']
+        self.assertEqual(self.errors(), [])
+        eden_test._remove_target_tree(stage / first)
+        with mock.patch.object(packet_gate, '_git', wraps=packet_gate._git) as git:
+            result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(result['errors'], [
+            f'G2 target: plugin staged tree {stage / first} is missing; this run gates staged targets only '
+            f'(stage-target --commit {first} --label run-01)'])
+        self.assertIn('screen', result['emitted']['custom.bridge'])
+        self.assertTrue(any(Path(call.args[0]) == stage / second and call.args[1] == 'show'
+                            for call in git.call_args_list))
+        self.assertFalse(any(Path(call.args[0]) == self.tree for call in git.call_args_list))
+
+    def test_unstage_all_required_targets_never_falls_back_to_existing_producer(self):
+        runs, stage, first, second = self.required_targets()
+        eden_test.unstage_targets('run-01', runs=runs)
+        errors = self.errors()
+        self.assertEqual(errors, [
+            f'G2 target: plugin staged tree {stage / first} is missing; this run gates staged targets only '
+            f'(stage-target --commit {first} --label run-01)',
+            f'G2 target: bridge staged tree {stage / second} is missing; this run gates staged targets only '
+            f'(stage-target --commit {second} --label run-01)'])
+
+    def test_required_target_that_is_not_a_directory_is_missing(self):
+        runs = self.target_run_layout()
+        (self.base.parent / 'config.json').write_text(json.dumps({'staged_targets': [self.commit]}))
+        staged = runs / '_eden-test' / 'stage' / 'run-01' / 'targets' / self.commit
+        staged.parent.mkdir(parents=True)
+        staged.write_text('not a checkout')
+        self.assertIn(f'G2 target: plugin staged tree {staged} is missing; this run gates staged targets only '
+                      f'(stage-target --commit {self.commit} --label run-01)', self.errors())
+
+    def test_local_run_without_staged_targets_uses_the_producer(self):
+        self.target_run_layout()
+        self.plan['rows'][0]['reads'] = ['tr.menu:ack']
+        for config in ({}, {'staged_targets': []}):
+            with self.subTest(config=config):
+                (self.base.parent / 'config.json').write_text(json.dumps(config))
+                with mock.patch.object(packet_gate, '_git', wraps=packet_gate._git) as git:
+                    self.assertEqual(self.errors(), [])
+                self.assertTrue(any(Path(call.args[0]) == self.tree and call.args[1] == 'show'
+                                    for call in git.call_args_list))
+
+    def test_invalid_staged_targets_in_run_config_fail_closed(self):
+        self.target_run_layout()
+        for value in (None, {}, 'bad', [1], ['A' * 40], ['a' * 39], [self.commit, None]):
+            with self.subTest(value=value):
+                (self.base.parent / 'config.json').write_text(json.dumps({'staged_targets': value}))
+                self.assertIn('G2 target: run config staged_targets is invalid', self.errors())
+
+    def test_unreadable_or_malformed_run_config_fails_closed(self):
+        self.target_run_layout()
+        config = self.base.parent / 'config.json'
+        for content in ('{', 'null', '[]'):
+            with self.subTest(content=content):
+                config.write_text(content)
+                self.assertTrue(any(error.startswith(f'G2 target: run config {config} cannot be read: ')
+                                    for error in self.errors()))
+        config.unlink()
+        config.mkdir()
+        self.assertTrue(any(error.startswith(f'G2 target: run config {config} cannot be read: ')
+                            for error in self.errors()))
+        original_lstat = Path.lstat
+        def denied(path, *args, **kwargs):
+            if path == config:
+                raise PermissionError('access denied')
+            return original_lstat(path, *args, **kwargs)
+        with mock.patch.object(Path, 'lstat', denied):
+            self.assertIn(f'G2 target: run config {config} cannot be read: access denied', self.errors())
+
+    def test_target_commit_not_listed_for_run_is_refused(self):
+        self.target_run_layout()
+        (self.base.parent / 'config.json').write_text(json.dumps({'staged_targets': ['f' * 40]}))
+        errors = self.errors()
+        self.assertIn(f'G2 target: plugin.commit {self.commit} was not staged for this run', errors)
+        self.assertIn(f'G2 target: bridge.commit {self.commit} was not staged for this run', errors)
 
     def practice(self, old, new):
         self.assertIn(old, PRACTICE_STATE)

@@ -1190,6 +1190,43 @@ class EdenTestTests(unittest.TestCase):
             result = eden_test.main(args)
         return result, output.getvalue(), up
 
+    def test_go_records_sorted_unique_staged_targets_in_run_config(self):
+        first, second = 'a' * 40, 'b' * 40
+        args = self.go_args() + ['--staged-target', second, '--staged-target', first,
+                                 '--staged-target', second]
+        result, _, _ = self.run_go_without_up(args)
+        self.assertEqual(result, 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertEqual(config['staged_targets'], [first, second])
+
+    def test_local_go_without_staged_target_clears_inherited_requirement(self):
+        previous = json.loads(self.previous.read_text())
+        previous['staged_targets'] = ['a' * 40]
+        self.previous.write_text(json.dumps(previous))
+        result, _, _ = self.run_go_without_up(self.go_args())
+        self.assertEqual(result, 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertNotIn('staged_targets', config)
+
+    def test_invalid_staged_target_is_refused_by_go_cli(self):
+        for value in ('a' * 39, 'A' * 40, 'g' * 40):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(eden_test, 'cmd_up') as up:
+                with self.assertRaises(SystemExit) as caught:
+                    eden_test.main(self.go_args() + ['--staged-target', value])
+                self.assertEqual(caught.exception.code, 2)
+                up.assert_not_called()
+                self.assertFalse((eden_test.RUNS / 'go-1').exists())
+
+    def test_new_from_config_copies_staged_target_requirement(self):
+        previous = json.loads(self.previous.read_text())
+        previous['staged_targets'] = ['a' * 40]
+        self.previous.write_text(json.dumps(previous))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test.main(['new', *self.args()]), 0)
+        config = json.loads((eden_test.RUNS / 'lr-14/config.json').read_text())
+        self.assertEqual(config['staged_targets'], ['a' * 40])
+
     def assert_lineup_refused(self, args, label):
         with mock.patch.object(eden_test, 'cmd_up') as up, mock.patch.object(eden_test, 'sh') as sh, \
              mock.patch.object(eden_test.shutil, 'copy2') as copy:
@@ -2117,6 +2154,10 @@ class EdenTestTests(unittest.TestCase):
                 if kind == 'pack-rsync':
                     self.assertIn('--partial', command)
             elif command[0] == 'ssh':
+                flags = [command[index + 1] for index, value in enumerate(command)
+                         if value == '--staged-target']
+                self.assertEqual(flags, sorted([plugin, bridge]))
+                self.assertEqual(sum(kind == 'stage' for kind, _ in events), 2)
                 events.append(('go', None))
             elif command[0] == 'scp' and command[-2].endswith('/go-result.json'):
                 Path(command[-1]).write_text(json.dumps(
