@@ -880,10 +880,28 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(life.Refused, 'dry-run failed'):
             self.controller(plan_check=lambda: {'result': 'READY', 'rows': 0, 'errors': []}).up()
 
+    def test_check_rows_uses_up_check_when_the_runner_has_it(self):
+        self.runner.write_text(
+            'def dry_run(path):\n return {"result":"READY","rows":1,"errors":[]}\n'
+            'def up_check(path):\n return {"result":"BROKEN","rows":1,"errors":["no target"]}\n')
+        self.config['runner']['sha256'] = life.digest(self.runner)
+        self.assertEqual(self.controller().check_rows()['errors'], ['no target'])
+
     def test_real_shared_runner_dryrun_integration_is_offline(self):
         shared = Path(__file__).resolve().parents[1] / 'eden-runner/runner.py'
         self.config['runner'] = {'path': str(shared), 'sha256': life.digest(shared)}
-        self.rows.write_text(json.dumps({'start': 'menu', 'rows': [{'id': 'observe', 'start': 'menu', 'end': 'menu',
+        tree = self.base / 'target'
+        tree.mkdir()
+        subprocess.run(['git', '-C', str(tree), 'init', '-q'], check=True)
+        (tree / 'fixture').write_text('target')
+        subprocess.run(['git', '-C', str(tree), 'add', 'fixture'], check=True)
+        subprocess.run(['git', '-C', str(tree), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                        'commit', '-qm', 'fixture'], check=True)
+        commit = subprocess.run(['git', '-C', str(tree), 'rev-parse', 'HEAD'], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        self.rows.write_text(json.dumps({'target': {'plugin': {'tree': str(tree), 'commit': commit,
+                                                               'nro_sha256': 'a' * 64}},
+            'start': 'menu', 'rows': [{'id': 'observe', 'start': 'menu', 'end': 'menu',
             'steps': [{'gate': 'settings'}]}], 'gates': {'settings': {'kind': 'json', 'source': 'settings', 'expect': {'x': 1}, 'cap': 1}}}))
         self.config['rows']['sha256'] = life.digest(self.rows)
         self.assertEqual(self.controller().up()['phase'], 'up')

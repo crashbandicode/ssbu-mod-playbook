@@ -98,6 +98,30 @@ class TileTakeRowsTests(unittest.TestCase):
                     inspect.signature(function).bind(object(), **step.get('args', {}))
 
 
+class TargetNroTests(unittest.TestCase):
+    def test_check_run_requires_the_target_nro_and_embedded_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder) / 'run'
+            rows = run / 'rows'
+            rows.mkdir(parents=True)
+            commit = '12345678' + 'f' * 32
+            sha256 = 'a' * 64
+            (rows / 'rows.json').write_text(json.dumps(
+                {'target': {'plugin': {'commit': commit, 'nro_sha256': sha256}}, 'rows': []}))
+            config = {'instances': [{'plugins': []}]}
+            (run / 'config.json').write_text(json.dumps(config))
+            self.assertIn(f'target NRO {sha256[:12]}… is not staged in this run',
+                          eden_test.check_run(run, skip_setup_plan=True))
+            nro = run / 'training.nro'
+            nro.write_bytes(b'no embedded revision')
+            config['instances'][0]['plugins'] = [{'path': str(nro), 'sha256': sha256}]
+            (run / 'config.json').write_text(json.dumps(config))
+            self.assertIn(f'target NRO {nro.name} does not carry commit {commit[:8]}',
+                          eden_test.check_run(run, skip_setup_plan=True))
+            nro.write_bytes(b'binary ' + commit[:8].encode() + b' payload')
+            self.assertEqual(eden_test.check_run(run, skip_setup_plan=True), [])
+
+
 class SetupFixtureTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

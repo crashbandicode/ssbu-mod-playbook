@@ -1132,6 +1132,17 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report['missing_segments'], ['to-blue'])
         self.assertEqual(report['result'], 'READY_TO_RECORD')
 
+    def test_run_refuses_a_plan_without_a_target_and_dry_run_reports_it(self):
+        check = getattr(runner, 'up_check', None)
+        self.assertTrue(callable(check))
+        report = check(self.manifest)
+        self.assertIn('packet gate: rows.json has no "target" (the build the rows were checked against)',
+                      report['errors'])
+        self.assertEqual(report['result'], 'BROKEN')
+        report = runner.dry_run(self.manifest)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['packet_gate']['result'], 'NO TARGET')
+
     def test_state_gate_poll_s_validation(self):
         state = {'kind': 'state', 'provider': 'tr.menu', 'where': {'phase': 'flight'}, 'cap': 1}
         self.plan['gates']['timed'] = state
@@ -1828,6 +1839,36 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(summary['failed'], 1)
         self.assertIn('trace.counters', eden.calls)
         self.assertIn('trace.read', eden.calls)
+
+    def test_a_dependent_row_is_not_played_after_its_source_failed(self):
+        self._continue_plan()
+        self.plan['rows'][0]['gives'] = ['drill:a']
+        self.plan['rows'][1]['needs'] = ['drill:a']
+        self.plan['rows'][1]['steps'] = [{'call': 'settings.get'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        out = self.dir / 'out'
+        out.mkdir()
+        (out / 'packet-gate.json').write_text(json.dumps(
+            {'rows': {'r2': {'needs': ['drill:a'], 'provided_by': {'drill:a': 'r1'}}}}))
+        eden = FakeEden({'to-red': RED}, log_path=self.log)
+        self.assertEqual(self.make(eden).run(), 'FAILED')
+        receipt = json.loads((out / 'r2.json').read_text())
+        self.assertEqual(receipt['status'], 'FAILED')
+        self.assertEqual(receipt['error'], 'NOT RUN (setup): needs "drill:a" from row r1, which did not pass')
+        self.assertTrue(receipt['not_executed'])
+        self.assertEqual(receipt['failure_kind'], 'harness-suspect')
+        self.assertNotIn('settings.get', eden.calls)
+        self.assertEqual(json.loads((out / 'r3.json').read_text())['status'], 'PASS')
+        shutil.rmtree(out)
+        self.plan['rows'][0]['steps'] = [{'call': 'status'}]
+        self.manifest.write_text(json.dumps(self.plan))
+        out.mkdir()
+        (out / 'packet-gate.json').write_text(json.dumps(
+            {'rows': {'r2': {'needs': ['drill:a'], 'provided_by': {'drill:a': 'r1'}}}}))
+        eden = FakeEden({'to-red': RED}, log_path=self.log)
+        self.assertEqual(self.make(eden).run(), 'DONE')
+        self.assertEqual(json.loads((out / 'r2.json').read_text())['status'], 'PASS')
+        self.assertIn('settings.get', eden.calls)
 
     def _third_row_recovers_to_red(self):
         original = self.dir / 'segments/to-red.edenmacro.json'
