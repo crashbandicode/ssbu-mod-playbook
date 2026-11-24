@@ -5330,6 +5330,7 @@ class DashboardRouteTests(unittest.TestCase):
             self.a_delay = None
             self.a_sent_at = None
             self.close_after_a = False
+            self.focus_after_a = False
 
         def read(self, provider, cap):
             if (self.phase == 'main' and self.a_sent_at is not None and self.a_delay is not None
@@ -5391,6 +5392,12 @@ class DashboardRouteTests(unittest.TestCase):
                     if self.close_after_a:
                         self.close_after_a = False
                         self.dashboard = 'closed'
+                        if self.a_delay is not None:
+                            self.a_sent_at = self.clock()
+                    elif self.focus_after_a:
+                        self.dashboard_index = 0
+                        if self.a_delay is not None:
+                            self.a_sent_at = self.clock()
                     elif self.a_delay is not None:
                         self.a_sent_at = self.clock()
                     else:
@@ -5524,7 +5531,68 @@ class DashboardRouteTests(unittest.TestCase):
                 with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
                     self.run_route(guest)
                 self.assertEqual(caught.exception.step, 'dashboard-a')
-                self.assertEqual(self.io.actions, ['lobby-a', 'tap-zr1'])
+                self.assertEqual(self.io.actions, ['lobby-a'])
+                self.assertIn('the room list did not appear', caught.exception.reason)
+
+    def test_after_a_closed_dashboard_is_only_observed_until_a_ready_list(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index = 'open', 2
+                self.io.close_after_a, self.io.a_delay = True, 10
+                result = self.run_route(guest)
+                a = self.io.events.index(('send', 'lobby-a'))
+                ready = next(i for i, event in enumerate(self.io.events[a + 1:], a + 1)
+                             if event[:2] == ('read', 'ssbu.ui') and event[2].get('screen') == 'ldn.room_list'
+                             and event[2].get('input.ready') == 'yes')
+                self.assertFalse(any(event[0] == 'send' for event in self.io.events[a + 1:ready]))
+                self.assertEqual(self.io.actions[:1], ['lobby-a'])
+                self.assertTrue(result['result'].startswith('PASS'))
+
+    def test_after_a_a_changed_dashboard_focus_cannot_authorize_down(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index = 'open', 2
+                self.io.focus_after_a, self.io.a_delay = True, 10
+                self.run_route(guest)
+                self.assertNotIn('main-menu-down', self.io.actions)
+
+    def test_after_a_list_must_be_ready_before_the_step_completes(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index = 'open', 2
+                self.io.a_delay, self.io.room_ready, self.io.room_ready_after = 2, 'no', 30
+                result = self.run_route(guest)
+                self.assertTrue(result['result'].startswith('PASS'))
+                self.assertGreaterEqual(self.now, 30)
+                self.assertEqual(next(step for step in result['steps'] if step['name'] == 'dashboard-a')['sends'], 1)
+                a = self.io.events.index(('send', 'lobby-a'))
+                ready = next(i for i, event in enumerate(self.io.events[a + 1:], a + 1)
+                             if event[:2] == ('read', 'ssbu.ui') and event[2].get('screen') == 'ldn.room_list'
+                             and event[2].get('input.ready') == 'yes')
+                self.assertFalse(any(event[0] == 'send' for event in self.io.events[a + 1:ready]))
+
+    def test_after_a_a_list_that_never_becomes_ready_stops_on_dashboard_a(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                self.io = self.IO()
+                self.now = 0
+                self.io.dashboard, self.io.dashboard_index = 'open', 2
+                self.io.a_delay, self.io.room_ready = 2, 'no'
+                with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
+                    self.run_route(guest)
+                self.assertEqual(caught.exception.step, 'dashboard-a')
+                self.assertIn('the room list was reached but never read ready', caught.exception.reason)
+                self.assertEqual(self.io.actions, ['lobby-a'])
+                name = 'routes-wireless-room-list-stop.json' if guest else 'routes-wireless-room-stop.json'
+                stop = json.loads((self.row / name).read_text())
+                self.assertTrue(stop['on_list'])
+                self.assertFalse(stop['list_ready'])
 
     def test_dashboard_presses_require_the_dashboard_owner_and_dialog(self):
         # The bridge author's table: an open dashboard that takes input reads owner dashboard, dialog dashboard.

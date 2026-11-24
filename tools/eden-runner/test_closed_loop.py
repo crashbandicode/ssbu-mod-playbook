@@ -40,6 +40,41 @@ def step(name, source, destination, **kwargs):
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_a_latched_step_never_jumps_or_sends_after_its_send(self):
+        fake = Script(lambda f: 'other' if f.sends else 'source')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                       'a', cap=3, lost_after=1, latch=True)
+        other = step('other', 'other', 'done')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([latched, other])
+        self.assertEqual(caught.exception.step, 'latched')
+        self.assertIn('no transition within cap', caught.exception.reason)
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 0)
+
+    def test_a_latched_step_still_recovers_before_its_send(self):
+        def observe(fake):
+            if not fake.sends:
+                return 'waiting' if fake.now == 0 else 'recover'
+            return 'source' if len(fake.sends) == 1 else 'done'
+
+        fake = Script(observe)
+        recover = step('recover', 'recover', 'source')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'done',
+                       'a', cap=5, screen=lambda obs: obs == 'waiting', latch=True)
+        fake.run([recover, latched])
+        self.assertEqual([name for name, _ in fake.sends], ['recover', 'a'])
+
+    def test_a_latched_step_ends_when_the_final_step_is_done(self):
+        fake = Script(lambda f: 'final' if f.sends else 'source')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
+                       'a', cap=5, latch=True)
+        final = step('last', 'elsewhere', 'final')
+        result = fake.run([latched, final])
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 1)
+        self.assertTrue(result['steps'][-1]['skipped'])
+
     def test_a_step_repeated_after_the_route_went_back_is_a_stall(self):
         fake = Script(lambda f: ('a', 'b', 'a', 'done')[min(len(f.sends), 3)])
         result = fake.run([step('a', 'a', 'b'), step('b', 'b', 'done')])

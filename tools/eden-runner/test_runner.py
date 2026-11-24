@@ -1235,6 +1235,59 @@ class RunnerTests(unittest.TestCase):
         self.addCleanup(sleep.stop)
         return run, eden, now
 
+    def test_an_abandoned_recheck_cannot_disarm_a_successor_image_gate(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                eden = FakeEden({})
+                eden.colour = RED
+                run = self.make(eden)
+                run.plan['gates']['status'] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
+                run.plan['segments']['to-red']['start_gate'] = 'status'
+                entered, release = threading.Event(), threading.Event()
+                workers, armed, status_count, poll_count = [], [], [], []
+                original = eden.request
+
+                def request(method, params):
+                    if method == 'status':
+                        status_count.append(1)
+                        if len(status_count) == 2:
+                            workers.append(threading.current_thread())
+                            entered.set()
+                            release.wait(2)
+                        return {'ok': True, 'result': {'running': True}}
+                    if method == 'macro.status':
+                        poll_count.append(1)
+                        return {'ok': True, 'result': {'state': 'playing' if len(poll_count) == 1 else 'idle'}}
+                    if method == 'ui.screenshot':
+                        armed.append(run._arm_frames)
+                        if overlap and workers:
+                            release.set()
+                            workers[0].join(1)
+                            self.assertFalse(workers[0].is_alive())
+                            armed.append(run._arm_frames)
+                    return original(method, params)
+
+                eden.request = request
+                try:
+                    if overlap:
+                        with mock.patch.object(runner.macro_gate, 'IDLE_CAP', .4):
+                            with self.assertRaises(routes.closed_loop.DispatchRejected):
+                                run.play('a', 'to-red')
+                        self.assertTrue(entered.is_set())
+                        self.assertNotIn('macro.play', eden.calls)
+                    with mock.patch.object(runner.still_fresh, 'usable', return_value=True):
+                        run.check_gate('a', 'red')
+                    self.assertTrue(all(armed))
+                    self.assertIsNotNone(run._gate_baseline)
+                    self.assertIsNotNone(run._gate_latest)
+                    self.assertEqual(run.last_gate_outcome['gate'], 'red')
+                    self.assertTrue(run.last_gate_outcome['passed'])
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(1)
+                        self.assertFalse(worker.is_alive())
+
     def test_runner_play_waits_for_idle_and_rechecks_the_start_gate(self):
         run, eden, now = self.waiting_run()
         run.plan['segments']['to-red']['start_gate'] = 'red'
