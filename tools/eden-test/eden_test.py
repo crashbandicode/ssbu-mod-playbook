@@ -1700,17 +1700,6 @@ def _go_target_rsync(command):
     return result.returncode, int(match.group(1).replace(',', '')) if match else None
 
 
-def _go_pack_targets(targets, directory):
-    packs = {}
-    for target in targets:
-        if target['commit'] not in packs:
-            try:
-                packs[target['commit']] = pack_target(target['tree'], target['commit'], directory)
-            except (ValueError, OSError, subprocess.SubprocessError) as error:
-                raise SystemExit(f'target {target["label"]}: {error}') from error
-    return packs
-
-
 def _go_remote(args, lineup):
     hosts = RUNS / '_eden-test' / 'hosts.json'
     mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
@@ -1725,22 +1714,20 @@ def _go_remote(args, lineup):
         raise SystemExit(str(error)) from error
     targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
-    with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
-        packs = _go_pack_targets(targets, directory)
-        with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
-            return _go_remote_with_mux(args, lineup, host, mux, targets, packs)
+    with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
+        return _go_remote_with_mux(args, lineup, host, mux, targets)
 
 
-def _go_remote_with_mux(args, lineup, host, mux, targets=None, packs=None):
+def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     if targets is None:
         try:
             _target_label(args.label)
         except ValueError as error:
             raise SystemExit(str(error)) from error
         targets = _go_targets(args.rows)
-    if packs is None:
+    if pack_dir is None:
         with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
-            return _go_remote_with_mux(args, lineup, host, mux, targets, _go_pack_targets(targets, directory))
+            return _go_remote_with_mux(args, lineup, host, mux, targets, directory)
     stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
     commands = [
         ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
@@ -1775,17 +1762,26 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, packs=None):
                 if code not in (0, 4):
                     raise SystemExit(f'target {label} cache probe failed ({code})')
                 sent = 0
-                if code == 4:
-                    pack = packs[commit]
-                    incoming = f'{stage}/targets/.incoming/{commit}.pack'
-                    transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--partial', '--stats',
-                                '--mkpath', pack['pack_file'], f'{host}:{incoming}']
-                    mux.ensure()
-                    failure, sent = _go_target_rsync(transfer)
-                    if failure:
-                        raise SystemExit(f'target {label} pack rsync failed ({failure}): {shlex.join(transfer)}')
-                    helper.extend(('--pack', incoming))
-                code, output = _go_target_ssh(host, mux, helper, 900)
+                pack_file = None
+                try:
+                    if code == 4:
+                        try:
+                            pack = pack_target(target['tree'], commit, pack_dir)
+                        except (ValueError, OSError, subprocess.SubprocessError) as error:
+                            raise SystemExit(f'target {label}: {error}') from error
+                        pack_file = Path(pack['pack_file'])
+                        incoming = f'{stage}/targets/.incoming/{commit}.pack'
+                        transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--partial', '--stats',
+                                    '--mkpath', str(pack_file), f'{host}:{incoming}']
+                        mux.ensure()
+                        failure, sent = _go_target_rsync(transfer)
+                        if failure:
+                            raise SystemExit(f'target {label} pack rsync failed ({failure}): {shlex.join(transfer)}')
+                        helper.extend(('--pack', incoming))
+                    code, output = _go_target_ssh(host, mux, helper, 900)
+                finally:
+                    if pack_file is not None:
+                        pack_file.unlink(missing_ok=True)
                 if code:
                     raise SystemExit(f'target {label} staging failed ({code})')
                 try:

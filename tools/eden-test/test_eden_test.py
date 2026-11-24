@@ -2055,21 +2055,31 @@ class EdenTestTests(unittest.TestCase):
         git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'bridge')
         bridge = git('rev-parse', 'HEAD').stdout.strip()
         plan = {'target': {'plugin': {'tree': str(repo), 'commit': plugin, 'nro_sha256': 'a' * 64},
-                           'bridge': {'tree': str(repo), 'commit': bridge}}, 'rows': []}
+                           'bridge': {'tree': str(repo), 'commit': bridge},
+                           'repos': {'same': {'tree': str(repo), 'commit': plugin}}}, 'rows': []}
         rowfile = self.rows / 'rows.json'
         rowfile.write_text(json.dumps(plan))
         original_rows = rowfile.read_bytes()
         events = []
+        pack_files = {}
         original_run = subprocess.run
         original_pack = eden_test.pack_target
+        class RecordingMux(FakeMux):
+            def ensure(self):
+                events.append(('ensure', None))
         def pack(tree, commit, directory):
             events.append(('pack', commit))
-            return original_pack(tree, commit, directory)
+            packed = original_pack(tree, commit, directory)
+            pack_files[commit] = Path(packed['pack_file'])
+            return packed
         def run(command, **kwargs):
             if command[0] == 'rsync' and command[-1].endswith('.pack'):
                 self.assertIn('ProxyCommand=/bin/false', ' '.join(command))
                 self.assertIn('--partial', command)
                 self.assertIn('--stats', command)
+                self.assertEqual(events[-1][0], 'ensure')
+                self.assertEqual(events[-2], ('pack', plugin))
+                self.assertTrue(pack_files[plugin].is_file())
                 events.append(('pack-rsync', command[-1]))
                 return subprocess.CompletedProcess(command, 0, 'Total bytes sent: 1,234\n', '')
             if command[0] != 'ssh':
@@ -2079,8 +2089,12 @@ class EdenTestTests(unittest.TestCase):
             probe = '--probe' in command
             events.append(('probe' if probe else 'stage', commit))
             if probe:
+                if commit == bridge:
+                    self.assertFalse(pack_files[plugin].exists())
                 return subprocess.CompletedProcess(command, 4 if commit == plugin else 0, '', '')
             self.assertEqual('--pack' in command, commit == plugin)
+            if commit == plugin:
+                self.assertTrue(pack_files[plugin].is_file())
             result = {'commit': commit, 'cache': 'built' if commit == plugin else 'reused'}
             return subprocess.CompletedProcess(command, 0, json.dumps(result) + '\n', '')
         def fake_sh(command, log=None):
@@ -2100,18 +2114,54 @@ class EdenTestTests(unittest.TestCase):
             return 0
         output = io.StringIO()
         with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex='b' * 32)), \
+                mock.patch.object(eden_test, 'SshMux', RecordingMux), \
                 mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
                 mock.patch.object(eden_test.subprocess, 'run', side_effect=run), \
                 mock.patch.object(eden_test, 'sh', side_effect=fake_sh), redirect_stdout(output):
             self.assertEqual(eden_test.main(self.go_args(host='xps', rows=rowfile) + ['--ssh', 'mapped-xps']), 0)
         kinds = [event[0] for event in events]
-        self.assertEqual(kinds[:3], ['pack', 'pack', 'rsync'])
-        self.assertEqual([event[0] for event in events if event[0] in ('probe', 'pack-rsync', 'stage')],
-                         ['probe', 'pack-rsync', 'stage', 'probe', 'stage'])
+        self.assertEqual([event[0] for event in events if event[0] in ('probe', 'pack', 'pack-rsync', 'stage')],
+                         ['probe', 'pack', 'pack-rsync', 'stage', 'probe', 'stage'])
         self.assertLess(kinds.index('stage'), kinds.index('go'))
         self.assertEqual(sum(event[0] == 'pack-rsync' for event in events), 1)
+        self.assertEqual([event for event in events if event[0] == 'pack'], [('pack', plugin)])
         self.assertIn('1234 bytes shipped', output.getvalue())
+        self.assertIn(f'target bridge {bridge[:12]}: cache reused, 0 bytes shipped', output.getvalue())
+        self.assertIn(f'target repos.same {plugin[:12]}: cache reused, 0 bytes shipped', output.getvalue())
         self.assertEqual(rowfile.read_bytes(), original_rows)
+
+    def test_go_remote_cache_hit_never_packs_or_transfers_a_pack(self):
+        repo = self.dir / 'cached-source'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
+        git('init', '-q')
+        (repo / 'file').write_text('fixture')
+        git('add', 'file')
+        git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'fixture')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        (self.rows / 'rows.json').write_text(json.dumps(
+            {'target': {'plugin': {'tree': str(repo), 'commit': commit, 'nro_sha256': 'a' * 64}}, 'rows': []}))
+        def remote(host, mux, argv, timeout):
+            return (0, '') if '--probe' in argv else (0, json.dumps({'commit': commit, 'cache': 'reused'}))
+        def sh(command):
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps(
+                    {'token': 'd' * 32, 'code': 0, 'counts': {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}}))
+            elif command[0] == 'scp':
+                Path(command[-1]).write_text('report')
+            return 0
+        output = io.StringIO()
+        with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex='d' * 32)), \
+                mock.patch.object(eden_test, '_go_sh', side_effect=sh), \
+                mock.patch.object(eden_test, '_go_target_ssh', side_effect=remote), \
+                mock.patch.object(eden_test, 'pack_target') as pack, \
+                mock.patch.object(eden_test, '_go_target_rsync') as rsync, redirect_stdout(output):
+            self.assertEqual(eden_test._go_remote_with_mux(
+                self.go_new_args(), None, 'fake-host', FakeMux('fake-host')), 0)
+        pack.assert_not_called()
+        rsync.assert_not_called()
+        self.assertIn(f'target plugin {commit[:12]}: cache reused, 0 bytes shipped', output.getvalue())
 
     def test_go_remote_missing_commit_stops_before_mux_or_remote_command(self):
         repo = self.dir / 'source'
@@ -2119,23 +2169,72 @@ class EdenTestTests(unittest.TestCase):
         subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
         (self.rows / 'rows.json').write_text(json.dumps(
             {'target': {'plugin': {'tree': str(repo), 'commit': 'a' * 40, 'nro_sha256': 'b' * 64}}, 'rows': []}))
-        with mock.patch.object(eden_test, 'SshMux') as mux, mock.patch.object(eden_test, 'sh') as sh:
+        with mock.patch.object(eden_test, 'SshMux') as mux, mock.patch.object(eden_test, 'sh') as sh, \
+                mock.patch.object(eden_test, 'pack_target') as pack:
             with self.assertRaisesRegex(SystemExit, 'target plugin:'):
                 eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
         mux.assert_not_called()
         sh.assert_not_called()
+        pack.assert_not_called()
+
+    def test_go_remote_validates_all_targets_before_packing_or_remote_commands(self):
+        repo = self.dir / 'source'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
+        git('init', '-q')
+        (repo / 'file').write_text('fixture')
+        git('add', 'file')
+        git('-c', 'user.name=fixture', '-c', 'user.email=f@f', 'commit', '-qm', 'fixture')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        (self.rows / 'rows.json').write_text(json.dumps({
+            'target': {'plugin': {'tree': str(repo), 'commit': commit, 'nro_sha256': 'b' * 64},
+                       'bridge': {'tree': str(repo), 'commit': 'a' * 40}}, 'rows': []}))
+        with mock.patch.object(eden_test, 'SshMux') as mux, mock.patch.object(eden_test, 'sh') as sh, \
+                mock.patch.object(eden_test, 'pack_target') as pack:
+            with self.assertRaisesRegex(SystemExit, 'target bridge:'):
+                eden_test.main(self.go_args(host='xps') + ['--ssh', 'mapped-xps'])
+        mux.assert_not_called()
+        sh.assert_not_called()
+        pack.assert_not_called()
 
     def test_go_target_pack_rsync_failure_reports_exit_before_go(self):
         commit = 'a' * 40
         args = self.go_new_args()
         targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
-        packs = {commit: {'pack_file': str(self.dir / 'pack'), 'bytes': 20}}
+        pack_file = self.dir / 'pack'
+        def pack(*_args):
+            pack_file.write_text('pack')
+            return {'pack_file': str(pack_file), 'bytes': 20}
         with mock.patch.object(eden_test, '_go_sh', return_value=0) as sh, \
                 mock.patch.object(eden_test, '_go_target_ssh', return_value=(4, '')), \
+                mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
                 mock.patch.object(eden_test, '_go_target_rsync', return_value=(23, None)):
             with self.assertRaisesRegex(SystemExit, r'target plugin pack rsync failed \(23\)'):
-                eden_test._go_remote_with_mux(args, None, 'fake-host', FakeMux('fake-host'), targets, packs)
+                eden_test._go_remote_with_mux(args, None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
         self.assertEqual(sh.call_count, 1)
+        self.assertFalse(pack_file.exists())
+
+    def test_go_target_pack_is_removed_when_staging_fails(self):
+        commit = 'a' * 40
+        pack_file = self.dir / 'pack'
+        targets = [{'label': 'plugin', 'tree': str(self.dir), 'commit': commit}]
+        def pack(*_args):
+            pack_file.write_text('pack')
+            return {'pack_file': str(pack_file), 'bytes': 20}
+        def remote(host, mux, argv, timeout):
+            if '--probe' in argv:
+                return 4, ''
+            self.assertTrue(pack_file.exists())
+            return 1, ''
+        with mock.patch.object(eden_test, '_go_sh', return_value=0), \
+                mock.patch.object(eden_test, '_go_target_ssh', side_effect=remote), \
+                mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
+                mock.patch.object(eden_test, '_go_target_rsync', return_value=(0, 20)):
+            with self.assertRaisesRegex(SystemExit, r'target plugin staging failed \(1\)'):
+                eden_test._go_remote_with_mux(
+                    self.go_new_args(), None, 'fake-host', FakeMux('fake-host'), targets, self.dir)
+        self.assertFalse(pack_file.exists())
 
     def test_go_remote_with_mux_packs_targets_when_called_directly(self):
         repo = self.dir / 'direct-source'
