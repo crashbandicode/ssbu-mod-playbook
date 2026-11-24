@@ -389,7 +389,10 @@ The rules:
 
 `rows.json` names the build it was checked against in `target`: `plugin.tree`,
 `plugin.commit`, and `plugin.nro_sha256`, with optional `bridge.tree` and
-`bridge.commit`, `settings`, and `providers`. The trees are absolute Git
+`bridge.commit`, `settings`, and `providers`. `target.repos` can name additional
+repositories as `{"name": {"tree": "/absolute/path", "commit": "<40 hex>"}}`;
+`plugin` and `bridge` are reserved names. `target.providers` may use these
+names in its `repo` field. The trees are absolute Git
 directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is
 read from the rows folder.
@@ -447,10 +450,13 @@ The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
 an exact `key` with a `reason`. Play calls with computed names or unknown
 callees are warned about, not checked. The built-in providers are `tr.menu`,
-`tr.practice` and `tr.event`;
-event reads use names such as `tr.event:fed run.p1`. A dotted
-string literal in a provider's source file is accepted as a key. The packet
-gate has host tests; it has not been proven in a runtime acceptance.
+`tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need
+`target.bridge`. Example reads include `tr.event:fed run.p1`,
+`ssbu.ui:input.ready`, `bridge:fighter status` and `bridge:input lx`.
+An event can follow one leading bracket tag, as in `[Bridge] fighter entry=...`;
+continuation literals without their own event contribute bare keys only.
+A dotted string literal in a provider's source file is accepted as a key.
+The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means
 

@@ -14,6 +14,8 @@ PROVIDERS = {
     'tr.menu': {'repo': 'plugin', 'files': ['src/model/bridge_state.rs', 'src/model/record_place.rs']},
     'tr.practice': {'repo': 'plugin', 'files': ['src/model/practice_state.rs']},
     'tr.event': {'repo': 'plugin', 'files': ['src/model/bridge_events.rs']},
+    'ssbu.ui': {'repo': 'bridge', 'files': ['src/native_ui/mod.rs']},
+    'bridge': {'repo': 'bridge', 'files': ['src/proto2.rs', 'src/hooks.rs', 'src/model.rs']},
 }
 BUTTONS = (
     ('A', 1), ('B', 2), ('X', 4), ('Y', 8), ('L', 64), ('R', 128), ('ZL', 256), ('ZR', 512),
@@ -165,12 +167,16 @@ def _git(tree, *args):
 def emitted_keys(tree, commit, files):
     keys = set()
     for path in files:
-        text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
+            raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
         text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
         for literal in re.findall(r'"((?:\\.|[^"\\])*)"', text):
             found = re.findall(r'(?:^|\\n| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal)
             keys.update(found)
-            event = re.match(r'^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
+            event = re.match(r'^(?:\[[A-Za-z]+\] )?([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*) ', literal)
             if event:
                 keys.update(f'{event.group(1)} {key}' for key in found)
             if re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
@@ -186,24 +192,35 @@ def _target(plan, base, errors):
         errors.append('G2 target: target must be an object')
         return {}, None
     repos = {}
-    for name in ('plugin', 'bridge'):
-        if name == 'bridge' and name not in target:
-            continue
-        spec = target.get(name)
+    extra = target.get('repos', {})
+    if not isinstance(extra, dict):
+        errors.append('G2 target: repos must be an object')
+        extra = {}
+    specs = [('plugin', target.get('plugin'), 'plugin')]
+    if 'bridge' in target:
+        specs.append(('bridge', target['bridge'], 'bridge'))
+    for name, spec in extra.items():
+        if name in ('plugin', 'bridge'):
+            errors.append(f'G2 target: repos.{name} is reserved')
+        elif not isinstance(name, str) or not name:
+            errors.append(f'G2 target: invalid repository name {name!r}')
+        else:
+            specs.append((name, spec, f'repos.{name}'))
+    for name, spec, label in specs:
         if not isinstance(spec, dict):
-            errors.append(f'G2 target: {name} must be an object')
+            errors.append(f'G2 target: {label} must be an object')
             continue
         tree, commit = spec.get('tree'), spec.get('commit')
         if not isinstance(tree, str) or not Path(tree).is_absolute() or not Path(tree).is_dir():
-            errors.append(f'G2 target: {name}.tree must be an existing absolute directory')
+            errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
             continue
         if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
-            errors.append(f'G2 target: {name}.commit must be 40 lower-case hex characters')
+            errors.append(f'G2 target: {label}.commit must be 40 lower-case hex characters')
             continue
         try:
             _git(tree, 'cat-file', '-e', f'{commit}^{{commit}}')
         except (OSError, subprocess.SubprocessError):
-            errors.append(f'G2 target: {name}.commit {commit} is not a commit in {tree}')
+            errors.append(f'G2 target: {label}.commit {commit} is not a commit in {tree}')
             continue
         repos[name] = spec
         if name == 'plugin' and not re.fullmatch(r'[0-9a-fA-F]{64}', str(spec.get('nro_sha256', ''))):
@@ -329,6 +346,9 @@ def _reads(plan, repos, errors):
         errors.append('G2 target: providers must be an object')
         declared = {}
     providers = {**PROVIDERS, **declared}
+    extra = plan['target'].get('repos', {})
+    repo_names = {'plugin', 'bridge'} | ({name for name in extra if isinstance(name, str)}
+                                         if isinstance(extra, dict) else set())
     emitted = {}
     failed = set()
     for row in plan.get('rows', []):
@@ -339,17 +359,20 @@ def _reads(plan, repos, errors):
                 continue
             provider, key = read.split(':', 1)
             source = providers.get(provider)
-            if not isinstance(source, dict) or source.get('repo') not in ('plugin', 'bridge'):
+            if (not isinstance(source, dict) or not isinstance(source.get('repo'), str)
+                    or source['repo'] not in repo_names):
                 errors.append(f'G2 row {row_id}: no extractor for provider {provider} (add target.providers)')
                 continue
             repo = repos.get(source['repo'])
             if repo is None:
-                errors.append(f'G2 row {row_id}: provider {provider} needs target.{source["repo"]}')
+                name = source['repo']
+                label = name if name in ('plugin', 'bridge') else f'repos.{name}'
+                errors.append(f'G2 row {row_id}: provider {provider} needs target.{label}')
                 continue
             if provider not in emitted and provider not in failed:
                 try:
                     emitted[provider] = emitted_keys(repo['tree'], repo['commit'], source['files'])
-                except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError) as error:
+                except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError) as error:
                     errors.append(f'G2 row {row_id}: extractor {provider}: {error}')
                     failed.add(provider)
             if provider in emitted and key not in emitted[provider]:
@@ -487,7 +510,7 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
     providers = {**PROVIDERS, **(declared if isinstance(declared, dict) else {})}
     written = set()
     for source in providers.values():
-        if not isinstance(source, dict) or source.get('repo') not in repos:
+        if not isinstance(source, dict) or not isinstance(source.get('repo'), str) or source['repo'] not in repos:
             continue
         repo = repos[source['repo']]
         files = source.get('files')
@@ -496,9 +519,9 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
         for file in files:
             try:
                 written.update(emitted_keys(repo['tree'], repo['commit'], [file]))
-            except (KeyError, TypeError, OSError, UnicodeError, subprocess.SubprocessError):
+            except (KeyError, TypeError, ValueError, OSError, UnicodeError, subprocess.SubprocessError):
                 continue
-    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key}
+    prefixes = {key.split('.', 1)[0] for key in written if ' ' not in key and '.' in key}
     ignored = {item['key'] for item in plan.get('reads_ignore', [])
                if isinstance(item, dict) and isinstance(item.get('key'), str)
                and isinstance(item.get('reason'), str) and item['reason'].strip()}
