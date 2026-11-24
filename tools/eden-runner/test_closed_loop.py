@@ -69,6 +69,26 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertGreaterEqual(fake.now, 40)
         self.assertEqual(result['steps'][0]['sends'], 1)
 
+    def test_source_reads_after_the_send_then_the_destination_need_one_send(self):
+        def observe(f):
+            if not f.sends:
+                return 'source'
+            elapsed = f.now - f.sends[0][1]
+            return 'source' if elapsed < 3 else 'flight' if elapsed < 6 else 'done'
+        fake = Script(observe)
+        result = fake.run([step('press', 'source', 'done', lost_after=4)])
+        self.assertEqual(len(fake.sends), 1)
+        self.assertEqual(result['steps'][0]['sends'], 1)
+
+    def test_a_bounce_does_not_restart_the_retry_budget(self):
+        fake = Script(lambda f: 'two' if len(f.sends) % 2 == 0 else 'one')
+        with self.assertRaises(RouteStopped) as caught:
+            fake.run([step('first', 'one', 'two'), step('second', 'two', 'done')])
+        self.assertEqual(caught.exception.step, 'second')
+        self.assertEqual(caught.exception.reason, 'no transition after 3 sends')
+        self.assertEqual([macro for macro, _ in fake.sends], ['second', 'first'] * 3)
+        self.assertEqual(caught.exception.receipt['steps'][1]['sends'], 3)
+
     def test_a_flicker_back_to_the_source_resets_the_lost_timer(self):
         def observe(f):
             if not f.sends:
