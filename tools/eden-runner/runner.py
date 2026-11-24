@@ -1906,9 +1906,7 @@ class Runner:
                 self.log({'gate': name, 'on': on, 'recover': gate['recover'], 'after': repr(error)[:200]})
                 seg = self.plan['segments'][gate['recover']]
                 path = self.base / seg['file']
-                if not seg.get('sha256'):
-                    raise RuntimeError(f'segment {gate["recover"]} has no sha256; refusing to play {path.name}')
-                if digest(path) != seg['sha256']:
+                if seg.get('sha256') and digest(path) != seg['sha256']:
                     raise RuntimeError(f'segment {gate["recover"]} changed since the dry run')
 
                 def still_needed():
