@@ -526,6 +526,128 @@ class WorkerJudgeInput(unittest.TestCase):
         self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
         self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
 
+    def test_vanished_before_is_excluded_in_fresh_worker_retry(self):
+        before = self.shot('base', 'before', 20, {'status': 'fresh'})
+        _, result, _, verdict, marker = self.run_worker([before], 'NO-CITE')
+        self.assertEqual((result['status'], verdict['verdict']), ('PASS', 'PASS'))
+        self.assertTrue(marker.is_file())
+        marker.unlink()
+        Path(before['path']).rename(self.folder / 'moved.png')
+        proc = subprocess.run([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                               str(self.job_path)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(marker.exists())
+        result = json.loads(self.receipt_path.read_text())
+        done = json.loads((self.workdir / 'done.json').read_text())
+        self.assertEqual((done['verdict']['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(done['verdict']['reason'],
+                         'no usable image for the judge: 1 unusable still(s) excluded')
+        self.assertEqual(done['excluded_shots'], [
+            {'label': 'before:base', 'name': 'base', 'phase': 'before', 'path': before['path'],
+             'reason': 'still file is missing or unreadable'}])
+        self.assertEqual(result['judge']['excluded_shots'], done['excluded_shots'])
+
+    def test_missing_before_excludes_it_and_makes_comparison_unmeasured(self):
+        good = {'status': 'fresh'}
+        before = self.shot('base', 'before', 20, good)
+        after = self.shot('result', 'after', 220, good)
+        Path(before['path']).unlink()
+        job, result, done, verdict, marker = self.run_worker([before, after], 'after:result')
+        self.assertEqual(json.loads(marker.read_text()), ['after:result'])
+        self.assertEqual([s['path'] for s in job['shots']], [after['path']])
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+        self.assertTrue(done['clip_check']['unmeasured'])
+        self.assertEqual(done['clip_check']['excluded'][0]['reason'], 'still file is missing or unreadable')
+        self.assertEqual(result['blockers'], [
+            {'kind': 'evidence', 'source': 'before:base',
+             'text': f"still {before['path']} is not usable evidence: still file is missing or unreadable"}])
+
+    def test_untaken_before_blocks_uncited_clip_verdict(self):
+        before = {'name': 'base', 'phase': 'before', 'path': None, 'fresh': {'status': 'fresh'}}
+        start = self.shot('clip-start', 'clip', 20, None)['path']
+        end = self.shot('clip-end', 'clip', 220, None)['path']
+        _, result, done, verdict, marker = self.run_worker(
+            [before], 'NO-CITE', frames={'start': start, 'end': end})
+        self.assertEqual(json.loads(marker.read_text()), ['clip start', 'clip end'])
+        self.assertTrue(done['clip_check']['ok'])
+        self.assertNotIn('excluded', done['clip_check'])
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+        self.assertEqual(result['blockers'], [
+            {'kind': 'evidence', 'source': 'before:base',
+             'text': 'still None is not usable evidence: still was not taken'}])
+
+    def test_missing_expected_shot_and_failed_gate_remain_authoritative(self):
+        good = {'status': 'fresh'}
+        before = self.shot('base', 'before', 20, good)
+        after = self.shot('result', 'after', 220, good)
+        Path(after['path']).unlink()
+        _, result, done, verdict, marker = self.run_worker([before, after], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('FAIL', 'FAILED'))
+        self.assertEqual(done['clip_check']['reason'], 'expected-result shot missing: result')
+        result['gates_status'] = 'FAILED'
+        self.receipt_path.write_text(json.dumps(result))
+        verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual((verdict['verdict'], result['status'], result['status_reason']),
+                         ('FAIL', 'FAILED', 'deterministic gate failed'))
+
+    def test_capture_hash_changed_original_and_absent(self):
+        shot = self.shot('base', 'before', 20, {'status': 'fresh'})
+        original = Path(shot['path']).read_bytes()
+        shot['fresh']['sha256'] = hashlib.sha256(original).hexdigest()
+        replacement = self.shot('replacement', 'before', 220, {'status': 'fresh'})
+        Path(shot['path']).write_bytes(Path(replacement['path']).read_bytes())
+        job, result, done, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['excluded_shots'][0]['reason'], 'still bytes differ from the capture record')
+        self.assertEqual(done['excluded_shots'], job['excluded_shots'])
+        Path(shot['path']).write_bytes(original)
+        job, result, _, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+        self.assertEqual(json.loads(marker.read_text()), ['before:base'])
+        self.assertEqual(job['excluded_shots'], [])
+        Path(shot['path']).write_bytes(Path(replacement['path']).read_bytes())
+        shot['fresh'].pop('sha256')
+        _, result, _, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+        self.assertEqual(json.loads(marker.read_text()), ['before:base'])
+
+    def test_directory_and_unreadable_file_are_excluded(self):
+        good = {'status': 'fresh'}
+        directory = {'name': 'directory', 'phase': 'before', 'path': str(self.folder), 'fresh': good}
+        job, result, _, verdict, marker = self.run_worker([directory], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['excluded_shots'][0]['reason'], 'still file is missing or unreadable')
+        shot = self.shot('unreadable', 'before', 20, good)
+        open_path = Path.open
+
+        def denied(path, *args, **kwargs):
+            if path == Path(shot['path']):
+                raise PermissionError('unreadable still')
+            return open_path(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'open', autospec=True, side_effect=denied):
+            job, result, _, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['excluded_shots'][0]['reason'], 'still file is missing or unreadable')
+
+    def test_missing_clip_and_dense_frames_are_excluded(self):
+        missing = str(self.folder / 'missing-frame.png')
+        dense = str(self.folder / 'missing-dense.png')
+        job, result, done, verdict, marker = self.run_worker([], 'NO-CITE', frames={'start': missing},
+                                                            dense={1000: dense})
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['shots'], [])
+        self.assertEqual([(s['label'], s['path'], s['reason']) for s in job['excluded_shots']],
+                         [('clip start', missing, 'clip frame file is missing'),
+                          ('dense 1.0s', dense, 'clip frame file is missing')])
+        self.assertEqual(done['excluded_shots'], job['excluded_shots'])
+
     def test_non_object_and_missing_verdict_are_not_trusted(self):
         for body, reason in (('[]', 'invalid verdict'), ('', 'judge gave no verdict (exit 0)')):
             with self.subTest(body=body):
@@ -602,17 +724,25 @@ class WorkerJudgeInput(unittest.TestCase):
 
 
 class StatusRules(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.paths = {name: str(Path(tmp.name) / f'{name}.png') for name in ('before', 'diagnostic', 'after')}
+        for path in self.paths.values():
+            Path(path).write_bytes(b'still')
+
     def test_freshness_selection_uses_citations_or_before_and_expected_fallback(self):
         select = getattr(jq, 'evidence_blockers', None)
         self.assertTrue(callable(select))
         good = {'status': 'unverified', 'reason': 'no game frame source'}
         bad = {'status': 'error', 'reason': 'journal failed'}
-        shots = [{'phase': 'before', 'path': '/before.png', 'label': 'before:base', 'fresh': bad},
-                 {'phase': 'step', 'path': '/diagnostic.png', 'label': 'step:diagnostic', 'fresh': bad},
-                 {'phase': 'after', 'path': '/after.png', 'label': 'after:result', 'fresh': good}]
-        for cited, expected in ((['/after.png'], []), (['step:diagnostic'], ['step:diagnostic']),
+        before, diagnostic, after = (self.paths[name] for name in ('before', 'diagnostic', 'after'))
+        shots = [{'phase': 'before', 'path': before, 'label': 'before:base', 'fresh': bad},
+                 {'phase': 'step', 'path': diagnostic, 'label': 'step:diagnostic', 'fresh': bad},
+                 {'phase': 'after', 'path': after, 'label': 'after:result', 'fresh': good}]
+        for cited, expected in (([after], []), (['step:diagnostic'], ['step:diagnostic']),
                                 ([], ['before:base']), (['not-a-shot'], ['before:base']),
-                                (['/after.png', 'not-a-shot'], ['before:base'])):
+                                ([after, 'not-a-shot'], ['before:base'])):
             with self.subTest(cited=cited):
                 blockers = select(shots, {'verdict': 'PASS', 'shots_cited': cited})
                 self.assertEqual([item['source'] for item in blockers], expected)
@@ -621,27 +751,37 @@ class StatusRules(unittest.TestCase):
         self.assertEqual([item['source'] for item in missing], ['before:base', 'after:result'])
         self.assertTrue(all('no freshness record' in item['text'] for item in missing))
         mixed = [shots[0], {key: value for key, value in shots[-1].items() if key != 'fresh'}]
-        blockers = select(mixed, {'verdict': 'PASS', 'shots_cited': ['/after.png']})
+        blockers = select(mixed, {'verdict': 'PASS', 'shots_cited': [after]})
         self.assertEqual(len(blockers), 1)
         self.assertIn('no freshness record', blockers[0]['text'])
         mixed[-1]['fresh'] = None
-        self.assertIn('no freshness record', select(mixed, {'shots_cited': ['/after.png']})[0]['text'])
+        self.assertIn('no freshness record', select(mixed, {'shots_cited': [after]})[0]['text'])
         shots[-1]['fresh'] = bad
         fallback = select(shots, {'shots_cited': []})
-        self.assertEqual(fallback[0]['text'], 'still /before.png is not usable evidence: journal failed')
+        self.assertEqual(fallback[0]['text'], f'still {before} is not usable evidence: journal failed')
         self.assertEqual([item['source'] for item in fallback],
                          ['before:base', 'after:result'])
         self.assertEqual([item['source'] for item in select(shots[:2], {'shots_cited': []})],
                          ['before:base', 'step:diagnostic'])
 
+    def test_untaken_shot_is_blocked_when_cited_or_used_as_fallback(self):
+        shot = {'phase': 'before', 'path': None, 'label': 'before:base', 'fresh': {'status': 'fresh'}}
+        clip = {'phase': 'clip', 'path': self.paths['after'], 'label': 'clip end'}
+        expected = [{'kind': 'evidence', 'source': 'before:base',
+                     'text': 'still None is not usable evidence: still was not taken'}]
+        for cited in ([], ['before:base']):
+            with self.subTest(cited=cited):
+                self.assertEqual(jq.evidence_blockers([shot], {'shots_cited': cited}, [clip]), expected)
+
     def test_failed_gate_remains_authoritative_with_bad_verdict_stills(self):
-        shot = {'name': 'before', 'phase': 'before', 'path': '/before.png', 'label': 'before:base',
+        before = self.paths['before']
+        shot = {'name': 'before', 'phase': 'before', 'path': before, 'label': 'before:base',
                 'fresh': {'status': 'error', 'reason': 'journal failed'}}
         for word in ('PASS', 'FAIL', 'UNSURE'):
             with self.subTest(verdict=word):
                 receipt = {'gates_status': 'FAILED', 'status': 'RAN-UNVERIFIED', 'review_kind': 'existing',
                            'blockers': [{'kind': 'effect', 'source': 'gate', 'text': 'gate evidence'}]}
-                verdict = {'verdict': word, 'reason': 'known failure', 'shots_cited': ['/before.png']}
+                verdict = {'verdict': word, 'reason': 'known failure', 'shots_cited': [before]}
                 known = {'known': {'title': 'known', 'reason': 'known failure'}}
                 jq.apply_verdict(receipt, {'ok': True}, verdict, {}, known=known, shots=[shot])
                 self.assertEqual((receipt['status'], receipt['status_reason']),
@@ -653,7 +793,7 @@ class StatusRules(unittest.TestCase):
                 self.assertEqual(receipt['blockers'], [
                     {'kind': 'effect', 'source': 'gate', 'text': 'gate evidence'},
                     {'kind': 'evidence', 'source': 'before:base',
-                     'text': 'still /before.png is not usable evidence: journal failed'}])
+                     'text': f'still {before} is not usable evidence: journal failed'}])
                 if word == 'FAIL':
                     clean = {'gates_status': 'FAILED', 'status': 'RAN-UNVERIFIED'}
                     usable = {**shot, 'fresh': {'status': 'unverified', 'reason': 'no game frame source'}}
@@ -666,32 +806,33 @@ class StatusRules(unittest.TestCase):
         good = {'status': 'unverified', 'reason': 'no game frame source'}
         refused = {'status': 'refused', 'reason': 'unchanged across 200 game frames'}
         error = {'status': 'error', 'reason': 'journal failed'}
+        before_path, diagnostic_path, after_path = (self.paths[name] for name in ('before', 'diagnostic', 'after'))
         cases = (
             ('missing expected', error, refused,
              {'ok': False, 'reason': 'expected-result shot missing: after'}, 'FAILED', []),
             ('all usable', good, good,
-             {'ok': False, 'reason': 'no-visible-effect', 'before': '/before.png',
-              'diffs': {'/after.png': 0}}, 'FAILED', []),
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'FAILED', []),
             ('refused after', good, refused,
-             {'ok': False, 'reason': 'no-visible-effect', 'before': '/before.png',
-              'diffs': {'/after.png': 0}}, 'RAN-UNVERIFIED', ['after:result']),
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'RAN-UNVERIFIED', ['after:result']),
             ('error before', error, good,
-             {'ok': False, 'reason': 'no-visible-effect', 'before': '/before.png',
-              'diffs': {'/after.png': 0}}, 'RAN-UNVERIFIED', ['before:base']),
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'RAN-UNVERIFIED', ['before:base']),
             ('both unusable', error, refused,
-             {'ok': False, 'reason': 'no-visible-effect', 'before': '/before.png',
-              'diffs': {'/after.png': 0}}, 'RAN-UNVERIFIED', ['before:base', 'after:result']),
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'RAN-UNVERIFIED', ['before:base', 'after:result']),
             ('clip frames only', error, refused,
              {'ok': False, 'reason': 'no-visible-effect', 'before': '/clip-start.png',
               'diffs': {'/clip-end.png': 0}}, 'FAILED', []),
         )
         for name, before, after, check, status, sources in cases:
             with self.subTest(case=name):
-                shots = [{'name': 'before', 'phase': 'before', 'path': '/before.png',
+                shots = [{'name': 'before', 'phase': 'before', 'path': before_path,
                           'label': 'before:base', 'fresh': before},
-                         {'name': 'diagnostic', 'phase': 'step', 'path': '/diagnostic.png',
+                         {'name': 'diagnostic', 'phase': 'step', 'path': diagnostic_path,
                           'label': 'step:diagnostic', 'fresh': refused},
-                         {'name': 'after', 'phase': 'after', 'path': '/after.png',
+                         {'name': 'after', 'phase': 'after', 'path': after_path,
                           'label': 'after:result', 'fresh': after}]
                 receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
                 verdict = {'verdict': 'FAIL', 'reason': 'clip check: ' + check['reason'], 'shots_cited': []}
