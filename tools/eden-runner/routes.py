@@ -869,6 +869,103 @@ def host_network(ctx, interface=None, lan_online=False, ldn_mitm=False):
                                               'lan_online': lan_online, 'ldn_mitm': ldn_mitm, 'readback': readback})
 
 
+def udp_listeners(run=subprocess.run):
+    try:
+        result = run(['ss', '-H', '-lunp'], capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            return None
+        listeners = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            address, separator, port = fields[3].rpartition(':')
+            if not separator or not port.isascii() or not port.isdecimal() or not address:
+                continue
+            address = address[1:-1] if address.startswith('[') and address.endswith(']') else address
+            users = re.findall(r'\("([^"]+)",\s*pid=(\d+)(?:,|\))', line)
+            if not users:
+                listeners.append({'port': int(port), 'address': address, 'comm': None, 'pid': None})
+            else:
+                listeners.extend({'port': int(port), 'address': address, 'comm': comm, 'pid': int(pid)}
+                                 for comm, pid in users)
+        return listeners
+    except Exception:
+        return None
+
+
+def _instance_pids(ctx):
+    instance = getattr(ctx, 'instance', None)
+    if not isinstance(instance, dict):
+        return None
+    pid = instance.get('pid')
+    if type(pid) is int and pid > 0:
+        return {pid}
+    unit = instance.get('unit')
+    if not unit:
+        try:
+            socket_path = Path(instance['socket'])
+            if not socket_path.is_absolute():
+                return None
+            unit = json.loads((socket_path.parent / 'run.json').read_text()).get('unit')
+        except (KeyError, OSError, ValueError, TypeError, AttributeError):
+            return None
+    if not isinstance(unit, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*\.(service|scope)', unit):
+        return None
+    pids = set()
+    try:
+        main = subprocess.run(['systemctl', '--user', 'show', '-p', 'MainPID', '--value', unit],
+                              capture_output=True, text=True, timeout=5)
+        if main.returncode == 0 and main.stdout.strip().isascii() and main.stdout.strip().isdecimal():
+            pid = int(main.stdout.strip())
+            if pid > 0:
+                pids.add(pid)
+        group = subprocess.run(['systemctl', '--user', 'show', '-p', 'ControlGroup', '--value', unit],
+                               capture_output=True, text=True, timeout=5)
+        if group.returncode == 0:
+            name = group.stdout.strip()
+            if name.startswith('/') and '..' not in Path(name).parts and unit in Path(name).parts:
+                directory = Path('/sys/fs/cgroup') / name.lstrip('/')
+                for path in [directory / 'cgroup.procs', *directory.glob('*/cgroup.procs')]:
+                    try:
+                        pids.update(int(value) for value in path.read_text().split() if value.isdecimal() and int(value) > 0)
+                    except OSError:
+                        pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return pids or None
+
+
+def _udp_holder(listeners, port):
+    matching = [entry for entry in listeners or [] if entry['port'] == port]
+    return next((entry for entry in matching if entry['comm'] is not None and entry['pid'] is not None),
+                matching[0] if matching else None)
+
+
+def _udp_holder_text(holder):
+    return (f"{holder['comm']} pid {holder['pid']}"
+            if holder['comm'] is not None and holder['pid'] is not None else 'an unknown process')
+
+
+def _frontend_host_wait(ctx, match, cap, port, members=None, confirmation=None, room_name=None):
+    try:
+        return _frontend_wait(ctx, match, cap, members, confirmation=confirmation, room_name=room_name)
+    except RuntimeError as error:
+        if 'Eden showed "Creating a room failed. Please retry. Restarting Eden might be necessary."' not in str(error):
+            raise
+        listeners = udp_listeners()
+        requested = _udp_holder(listeners, int(port))
+        default = _udp_holder(listeners, 24872)
+        message = f'frontend_room: Eden could not open the room on UDP port {port}'
+        if requested:
+            message += f"; port {port} is held by {_udp_holder_text(requested)}"
+        elif default:
+            message += f"; port 24872 (Eden's default) is held by {_udp_holder_text(default)}"
+        else:
+            message += f'; no holder of {port} or 24872 found'
+        raise RuntimeError(message) from error
+
+
 def _frontend_title(node):
     title = node.get('title')
     if title in (None, ''):
@@ -1030,7 +1127,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             'nickname': nickname, 'room_name': expected_name, 'ip': ip,
             'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
             'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed, 'game_running': game_running,
-            'confirmed_running_game': None, 'room_matched': True})
+            'confirmed_running_game': None, 'room_matched': True, 'port_verified': None})
 
     tree = ctx.call('ui.tree', {}) or []
     confirmation = {'game_running': game_running, 'text': None}
@@ -1041,6 +1138,15 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     connected = _frontend_connected(ctx, tree, members)
     if connected and not warning:
         return reuse(connected, None)
+    if role == 'host' and requested_port is not None and not warning:
+        try:
+            numeric_port = int(requested_port)
+        except (TypeError, ValueError):
+            numeric_port = None
+        holder = _udp_holder(udp_listeners(), numeric_port)
+        if holder:
+            raise RuntimeError(f'frontend_room: UDP port {requested_port} is already in use on this host by '
+                               f'{_udp_holder_text(holder)}; pass another port or omit it')
     if warning:
         anchor = 'username' if role == 'host' else 'nickname'
         actual_port = _frontend_dialog_value(ctx, tree, anchor, 'port')
@@ -1088,8 +1194,8 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     connected = _frontend_connected(ctx, tree, members)
     if connected and not warning:
         return reuse(connected, dismissed)
-
     evidence = {}
+    port_marked_edited = None
     dialog = {'class': 'QLineEdit', 'name': 'username' if role == 'host' else 'nickname'}
     reused_dialog = any(ctx.runner.ui_matches(n, dialog) for n in tree)
     if not warning and role == 'host':
@@ -1101,11 +1207,21 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         for name, value in (('username', nickname), ('room_name', room_name), ('port', str(port))):
             ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
                                    'property': 'text', 'value': value})
+        try:
+            ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': 'port'},
+                                   'property': 'modified', 'value': True})
+            port_marked_edited = True
+        except Exception as error:
+            ctx.check_stop()
+            if str(port) != '24872':
+                raise RuntimeError(f'frontend_room: this Eden refused to mark the port field as edited ({error}); '
+                                   f'it would host on its default port 24872, not {port}') from error
+            port_marked_edited = False
         ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QComboBox', 'name': 'host_type'},
                                'property': 'currentIndex', 'value': 1})
         ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'host'}})
-        evidence['frontend_leave'] = _frontend_wait(
-            ctx, {'class': 'QPushButton', 'name': 'disconnect', 'text': '^Leave Room$'}, cap,
+        evidence['frontend_leave'] = _frontend_host_wait(
+            ctx, {'class': 'QPushButton', 'name': 'disconnect', 'text': '^Leave Room$'}, cap, port,
             confirmation=confirmation)
     elif not warning:
         action = {'class': 'QAction', 'name': 'action_Connect_To_Room'}
@@ -1117,18 +1233,34 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
                                    'property': 'text', 'value': value})
         ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'connect'}})
-    evidence['frontend_connected'], title, count = _frontend_wait(
-        ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, members,
+    wait = _frontend_host_wait if role == 'host' and port is not None else _frontend_wait
+    wait_args = (port, members) if wait is _frontend_host_wait else (members,)
+    evidence['frontend_connected'], title, count = wait(
+        ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, *wait_args,
         confirmation=confirmation, room_name=room_name)
+    bound_ports, port_verified = None, None
+    if role == 'host' and port is not None:
+        listeners = udp_listeners()
+        if listeners is not None:
+            pids = _instance_pids(ctx)
+            bound_ports = sorted({entry['port'] for entry in listeners
+                                  if (entry['pid'] in pids if pids is not None
+                                      else (entry['comm'] or '').lower().startswith('eden'))})
+            port_verified = int(port) in bound_ports
+            if not port_verified:
+                raise RuntimeError(f'frontend_room: the room is connected but Eden listens on UDP {bound_ports}, '
+                                   f'not the requested {port}')
     if role == 'host' and port is not None and room_name is not None:
-        room_file.write_text(json.dumps({'port': port, 'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
-    return _save(ctx, 'routes-frontend-room', {'role': role, 'port': port, 'nickname': nickname,
-                                               'room_name': room_name, 'ip': ip, 'evidence': evidence,
-                                               'window_title': title, 'member_count': count,
-                                               'already_connected': False, 'reused_dialog': reused_dialog,
-                                               'dismissed': dismissed, 'game_running': game_running,
-                                               'confirmed_running_game': confirmation['text'],
-                                               'room_matched': True if room_name is not None else None})
+        room_file.write_text(json.dumps({'port': port, 'port_verified': port_verified,
+                                         'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
+    result = {'role': role, 'port': port, 'nickname': nickname, 'room_name': room_name, 'ip': ip,
+              'evidence': evidence, 'window_title': title, 'member_count': count,
+              'already_connected': False, 'reused_dialog': reused_dialog, 'dismissed': dismissed,
+              'game_running': game_running, 'confirmed_running_game': confirmation['text'],
+              'room_matched': True if room_name is not None else None}
+    if role == 'host':
+        result.update(bound_ports=bound_ports, port_verified=port_verified, port_marked_edited=port_marked_edited)
+    return _save(ctx, 'routes-frontend-room', result)
 
 
 def _wireless_read(ctx, io, provider, cap, screens, *, on_sample=None):

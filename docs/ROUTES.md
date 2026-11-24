@@ -85,6 +85,18 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `fixture` `{p1, cpu, stage, reset, damage, lr}` | Training | kinds, stage id, damage and facing read from game state and asserted; after the native L+R+A reset, both bodies grounded and waiting, x/y unchanged on two fresh reads |
 | `back_to_main` | Training, a select, or a menu | (from Training) native pause and Quit, then a held B out of each select, until the `main` gate passes |
 
+For a new `frontend_room` host, the route marks the port field edited before
+clicking Host and checks the connected room's UDP listener with `ss` when
+available. Two Edens on one host can therefore use separate ports; the
+handoff records whether the requested port was verified. An explicitly
+occupied port stops before Host. A rejected edited flag stops a nondefault
+port, and a room-creation failure names the requested or default-port
+holder when known. A connected room listening on a different port also
+stops instead of writing a handoff. Without `ss`, verification is recorded
+as unknown; when instance PIDs are unavailable, the check uses Eden process
+names. Reusing a connected room does not verify its port. The port-field
+cause and the new behavior have not yet been confirmed in a live run.
+
 ### Closed-loop steps (`closed_loop.py`)
 
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
