@@ -548,13 +548,16 @@ class Ledger:
         with path.open('r+', encoding='utf-8') as stream:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             text = stream.read()
+            claim_suffix = (f' CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
+                            'Eden lifecycle admitted')
+            release_suffix = (f' RELEASED: {self.owner} host={self.host} lifecycle={self.token} '
+                              'Eden stopped; full profile restored and separately verified')
             if operation == 'read':
                 opened = active_claims(text, self.host)
-                exact = lambda line: (f'lifecycle={self.token} ' in line and f'{self.owner} ' in line
-                                      and f'host={self.host} ' in line)
                 return {'open': opened, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
-                        'owned_claim': any(exact(line) for line in opened),
-                        'owned_release': any('RELEASED:' in line and exact(line) for line in text.splitlines())}
+                        'owned_claim': any(line.endswith(claim_suffix) or
+                                           line.endswith(claim_suffix + EXCLUSIVE_HOST_MARKER) for line in opened),
+                        'owned_release': any(line.endswith(release_suffix) for line in text.splitlines())}
             require(operation in ('claim', 'release', 'reserve'), 'Unknown ledger operation')
             now = datetime.now(timezone.utc)
             reservations = []
@@ -563,13 +566,20 @@ class Ledger:
                 reservations = [match for line in opened if (match := RESERVATION.fullmatch(line))]
             expired = [record for record in reservations if reservation_expired(record, now)]
             if operation == 'reserve':
+                converted_suffix = (f' RELEASED: {self.owner} host={self.host} lifecycle={self.token} '
+                                    'Eden reservation converted to lifecycle claim')
+                require(not any(line.endswith(converted_suffix) for line in text.splitlines()),
+                        'Reservation already converted to a lifecycle claim')
                 own_reservations = [record for record in reservations
                                     if (record['token'], record['owner'], record['host']) ==
                                     (self.token, self.owner, self.host)]
                 if own_reservations:
                     require(len(own_reservations) == 1, 'Ambiguous owned reservation')
-                    return {'line': own_reservations[0][0], 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60,
-                            'already_reserved': True}
+                    record = own_reservations[0]
+                    if reservation_expired(record, now) is False:
+                        age = (now - datetime.fromisoformat(record['at'])).total_seconds()
+                        remaining = max(1, int(RESERVATION_TTL_MINUTES * 60 - age))
+                        return {'line': record[0], 'expires_in_seconds': remaining, 'already_reserved': True}
                 line = (f'{now.isoformat()} CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
                         f'Eden reservation run {self.label} approver={approver}')
                 if self.exclusive_host:
@@ -584,19 +594,19 @@ class Ledger:
                     require(not claims, 'Exclusive host reservation requires no open Eden claim')
                     require(isinstance(admission, dict) and isinstance(admission.get('foreign_processes'), list)
                             and not foreign_edens(admission), 'Exclusive host reservation requires no running Eden')
-                append_ledger(stream, [line, *(reservation_release(old, 'expired') for old in expired)])
+                append_ledger(stream, [*(reservation_release(old, 'expired') for old in expired), line])
                 return {'line': line, 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60}
             skipped = []
             reservation = None
             if operation == 'claim':
-                claim_suffix = (f' CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
-                                'Eden lifecycle admitted')
                 own = [line for line in opened
                        if line.endswith(claim_suffix) or line.endswith(claim_suffix + EXCLUSIVE_HOST_MARKER)]
                 if own:
                     # A resent claim must not append twice: release requires exactly one open claim.
                     require(len(own) == 1, 'Ambiguous owned lifecycle claim')
                     return {'line': own[0], 'stale_claim_skipped': [], 'already_claimed': True}
+                require(not any(line.endswith(release_suffix) for line in text.splitlines()),
+                        'Lifecycle token already released; a new run needs a new token')
                 policy = claim_admission(text, self.host, self.owner, stale_claim_hours, admission, now,
                                          label=self.label, exclusive_host=self.exclusive_host)
                 require(not policy['blocking'], 'Open host claim; no profile changes permitted')
@@ -607,9 +617,7 @@ class Ledger:
                 own = [line for line in active_claims(text, self.host)
                        if f'lifecycle={self.token} ' in line and f'{self.owner} ' in line]
                 if not own:
-                    suffix = (f' RELEASED: {self.owner} host={self.host} lifecycle={self.token} '
-                              'Eden stopped; full profile restored and separately verified')
-                    previous = [line for line in text.splitlines() if line.endswith(suffix)]
+                    previous = [line for line in text.splitlines() if line.endswith(release_suffix)]
                     if previous:
                         return {'line': previous[-1], 'already_released': True}
                 require(len(own) == 1, 'Exact owned lifecycle claim not found; release refused')
@@ -618,14 +626,17 @@ class Ledger:
             line += 'Eden lifecycle admitted' if operation == 'claim' else 'Eden stopped; full profile restored and separately verified'
             if operation == 'claim' and self.exclusive_host:
                 line += EXCLUSIVE_HOST_MARKER
-            lines = [line]
+            lines = [*(reservation_release(old, 'expired') for old in expired), line]
             if reservation:
                 record = next(item for item in reservations
                               if (item['token'], item['owner'], item['label']) ==
                               (reservation, self.owner, self.label)
                               and not reservation_expired(item, now))
-                lines.append(reservation_release(record, 'converted to lifecycle claim'))
-            lines.extend(reservation_release(old, 'expired') for old in expired)
+                converted = reservation_release(record, 'converted to lifecycle claim')
+                if reservation == self.token:
+                    lines.insert(-1, converted)
+                else:
+                    lines.append(converted)
             append_ledger(stream, lines)
             receipt = {'line': line, 'stale_claim_skipped': skipped}
             if reservation:
@@ -2458,17 +2469,26 @@ class Lifecycle:
                     'config_path': str(config_path), 'journal_path': str(self.journal), 'time': stamp()})
 
     def _settle_ledger(self, stop_unit=True):
-        if not self.state.get('released'):
-            ownership = self.ledger().inspect()
-            self.record('settle-readback', ownership)
+        ownership = self.ledger().inspect()
+        self.record('settle-readback', ownership)
+        if ownership['owned_claim']:
+            was_released = self.state.get('released')
+            self.state['claimed'] = True
+            self.state['released'] = False
             if ownership['owned_release']:
-                self.state['released'] = True
-            elif ownership['owned_claim']:
-                self.state['claimed'] = True
-                self.record('release', self.ledger().release())
-                self.state['released'] = True
-            elif self.state['claimed']:
-                raise Refused('Owned claim disappeared without its exact release record')
+                self.record('settle-contradiction', ownership)
+            if was_released or ownership['owned_release']:
+                self.write()
+            self.record('release', self.ledger().release())
+            if ownership['owned_release']:
+                readback = self.ledger().inspect()
+                self.record('settle-readback', readback)
+                require(not readback['owned_claim'], 'Open lifecycle claim remains after release')
+            self.state['released'] = True
+        elif ownership['owned_release']:
+            self.state['released'] = True
+        elif self.state['claimed']:
+            raise Refused('Owned claim disappeared without its exact release record')
         unit = self.state.get('settle_unit')
         if stop_unit and unit:
             self.host.stop_settle(unit)

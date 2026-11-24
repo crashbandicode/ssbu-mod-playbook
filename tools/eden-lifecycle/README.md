@@ -35,6 +35,9 @@ appends one reservation to the configured authoritative ledger, using
 `ledger_ssh` when present. The approver name records the approval already
 granted. A host can have one live reservation. It can be left for an existing
 run to finish and expires 20 minutes after issuance if still unclaimed.
+Repeating an open reservation reports its remaining time; after expiry it
+closes the old reservation before issuing a new one. A converted reservation
+cannot be replayed.
 
 Preflight is read-only. It ignores an exact matching reservation and refuses a
 different owner or label while the reservation is open. Up still checks
@@ -44,6 +47,7 @@ claim. An elapsed reservation stays in ledger history, and the next
 successful reservation or claim on that host records its release. For new reserve,
 preflight and Up operations use the current shared lifecycle on the executor.
 Existing runtime owners can Down with their already-pinned tools.
+An exactly released lifecycle token is terminal; a new run needs a new token.
 
 ### Whole-host hold
 

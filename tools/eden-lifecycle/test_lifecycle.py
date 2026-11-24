@@ -1193,6 +1193,89 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.host.calls)
         self.assertFalse(Path(self.config['work_root']).exists())
 
+    def test_contradictory_ledger_history_releases_the_open_claim(self):
+        for already_released in (False, True):
+            with self.subTest(already_released=already_released):
+                self.ledger_path.write_text('')
+                token = ('a' if already_released else 'b') * 32
+                ledger = life.Ledger(self.ledger_path, 'surface', self.config['owner'], token)
+                claim = ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})['line']
+                ledger.release()
+                with self.ledger_path.open('a') as stream:
+                    stream.write(claim + '\n')
+                before = ledger.inspect()
+                self.assertEqual((before['owned_claim'], before['owned_release']), (True, True))
+                original = self.ledger_path.read_bytes()
+                self.assertTrue(ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})['already_claimed'])
+                self.assertEqual(self.ledger_path.read_bytes(), original)
+                config = dict(self.config, state_dir=str(self.base / ('state-' + token)))
+                c = life.Lifecycle(config, self.host)
+                c.directory.mkdir(parents=True)
+                c.state = {'token': token, 'claimed': True, 'released': already_released, 'release_pending': True}
+                c.ledger = lambda: ledger
+                with patch.object(ledger, 'inspect', wraps=ledger.inspect) as inspect:
+                    c._settle_ledger()
+                self.assertEqual(inspect.call_count, 2)
+                self.assertTrue(c.state['released'])
+                self.assertFalse(c.state['release_pending'])
+                self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (False, True))
+                self.assertEqual(self.ledger_path.read_text().count(' RELEASED:'), 2)
+                actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+                self.assertIn('settle-contradiction', actions)
+
+    def test_contradictory_release_readback_refuses_if_claim_reappears(self):
+        self.ledger_path.write_text('')
+        token = 'c' * 32
+        ledger = life.Ledger(self.ledger_path, 'surface', self.config['owner'], token)
+        claim = ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})['line']
+        ledger.release()
+        with self.ledger_path.open('a') as stream:
+            stream.write(claim + '\n')
+        c = life.Lifecycle(self.config, self.host)
+        c.directory.mkdir(parents=True)
+        c.state = {'token': token, 'claimed': True, 'released': True, 'release_pending': True}
+        c.ledger = lambda: ledger
+        actual_release = ledger.release
+        def release_then_reopen():
+            result = actual_release()
+            with self.ledger_path.open('a') as stream:
+                stream.write(claim + '\n')
+            return result
+        with patch.object(ledger, 'release', side_effect=release_then_reopen), \
+                self.assertRaisesRegex(life.Refused, 'Open lifecycle claim remains after release'):
+            c._settle_ledger()
+        self.assertTrue(ledger.inspect()['owned_claim'])
+        self.assertFalse(c.state['released'])
+        self.assertTrue(c.state['release_pending'])
+        self.assertFalse(json.loads(c.journal.read_text())['released'])
+
+    def test_settle_and_settle_pending_release_contradictory_real_ledger(self):
+        for method in ('settle', 'settle_pending'):
+            with self.subTest(method=method):
+                config = dict(self.config, state_dir=str(self.base / ('state-' + method)),
+                              work_root=str(self.base / ('work-' + method)))
+                c = life.Lifecycle(config, self.host)
+                c.up()
+                token = c.state['token']
+                ledger = life.Ledger(self.ledger_path, 'surface', self.config['owner'], token)
+                claim = next(line for line in ledger.inspect()['open'] if f'lifecycle={token} ' in line)
+                c.down(keep_state=True)
+                with self.ledger_path.open('a') as stream:
+                    stream.write(claim + '\n')
+                c.state['released'] = False
+                c.state['release_pending'] = True
+                c.write()
+                c._write_pending()
+                self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (True, True))
+                if method == 'settle':
+                    self.assertTrue(c.settle(minutes=2)['released'])
+                else:
+                    c.settle_pending()
+                self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (False, True))
+                self.assertFalse(json.loads(c.journal.read_text())['release_pending'])
+                actions = [json.loads(line)['kind'] for line in (c.directory / 'actions.jsonl').read_text().splitlines()]
+                self.assertIn('settle-contradiction', actions)
+
     def test_release_ack_loss_recovers_exact_release_on_next_down(self):
         c = self.controller()
         c.up()
@@ -2682,6 +2765,27 @@ class LedgerForwardTests(unittest.TestCase):
             self.assertEqual(path.read_text().count(' CLAIMED:'), 1)
             self.assertEqual(path.read_text().count(' RELEASED:'), 1)
 
+    def test_released_lifecycle_token_is_terminal_and_new_token_still_works(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-terminal-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            path.write_text('')
+            ledger = life.Ledger(path, 'xps', self.config['owner'], 'a' * 32)
+            admission = {'max_eden': 2, 'foreign_processes': []}
+            ledger.claim(admission=admission)
+            self.assertTrue(ledger.claim(admission=admission)['already_claimed'])
+            ledger.release()
+            self.assertTrue(ledger.release()['already_released'])
+            before = path.read_bytes()
+            with self.assertRaisesRegex(life.Refused, 'Lifecycle token already released; a new run needs a new token'):
+                ledger.claim(admission=admission)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual((ledger.inspect()['owned_claim'], ledger.inspect()['owned_release']), (False, True))
+            new = life.Ledger(path, 'xps', self.config['owner'], 'b' * 32)
+            new.claim(admission=admission)
+            self.assertTrue(new.inspect()['owned_claim'])
+            new.release()
+            self.assertEqual((new.inspect()['owned_claim'], new.inspect()['owned_release']), (False, True))
+
     def test_idempotent_reserve(self):
         with tempfile.TemporaryDirectory(prefix='eden-ledger-reserve-') as temporary:
             path = Path(temporary) / 'ledger.txt'
@@ -2690,9 +2794,59 @@ class LedgerForwardTests(unittest.TestCase):
             first = ledger.operate('reserve', approver='operator')
             again = ledger.operate('reserve', approver='operator')
             self.assertEqual(first['line'], again['line'])
-            self.assertEqual(first['expires_in_seconds'], again['expires_in_seconds'])
+            self.assertEqual(first['expires_in_seconds'], 1200)
+            self.assertGreaterEqual(again['expires_in_seconds'], 1198)
+            self.assertLessEqual(again['expires_in_seconds'], 1200)
             self.assertTrue(again['already_reserved'])
             self.assertEqual(path.read_text().count(' CLAIMED:'), 1)
+
+    def test_reservation_replay_uses_remaining_time_and_renews_expired_token(self):
+        with tempfile.TemporaryDirectory(prefix='eden-ledger-age-') as temporary:
+            path = Path(temporary) / 'ledger.txt'
+            ledger = life.Ledger(path, 'xps', self.config['owner'], 'b' * 32, label='test-run')
+            suffix = (f"CLAIMED: {self.config['owner']} host=xps lifecycle={'b' * 32} "
+                      'Eden reservation run test-run approver=operator')
+            now = datetime.now(timezone.utc)
+            path.write_text(f'{(now - timedelta(minutes=10)).isoformat()} {suffix}\n')
+            result = ledger.operate('reserve', approver='operator')
+            self.assertTrue(result['already_reserved'])
+            self.assertGreaterEqual(result['expires_in_seconds'], 598)
+            self.assertLessEqual(result['expires_in_seconds'], 600)
+            old = f'{(now - timedelta(minutes=22)).isoformat()} {suffix}'
+            path.write_text(old + '\n')
+            renewed = ledger.operate('reserve', approver='operator')
+            self.assertNotIn('already_reserved', renewed)
+            self.assertEqual(renewed['expires_in_seconds'], 1200)
+            text = path.read_text()
+            self.assertLess(text.index('Eden reservation expired'), text.index(renewed['line']))
+            self.assertEqual(life.active_claims(text, 'xps'), [renewed['line']])
+            self.assertTrue(ledger.operate('reserve', approver='operator')['already_reserved'])
+            path.write_text(old + '\n')
+            claim = ledger.claim(admission={'max_eden': 2, 'foreign_processes': []})
+            text = path.read_text()
+            self.assertLess(text.index('Eden reservation expired'), text.index(claim['line']))
+            self.assertTrue(ledger.inspect()['owned_claim'])
+            self.assertFalse(ledger.inspect()['owned_release'])
+            ledger.release()
+
+    def test_converted_reservation_replay_refused_for_same_or_new_claim_token(self):
+        for same_token in (False, True):
+            with self.subTest(same_token=same_token), tempfile.TemporaryDirectory(prefix='eden-ledger-convert-') as tmp:
+                path = Path(tmp) / 'ledger.txt'
+                path.write_text('')
+                reservation = life.Ledger(path, 'xps', self.config['owner'], 'a' * 32, label='test-run')
+                reservation.operate('reserve', approver='operator')
+                claimant = life.Ledger(path, 'xps', self.config['owner'],
+                                       ('a' if same_token else 'b') * 32, label='test-run')
+                self.assertEqual(claimant.claim(admission={'max_eden': 2})['consumed_reservation'], 'a' * 32)
+                self.assertTrue(claimant.inspect()['owned_claim'])
+                self.assertFalse(claimant.inspect()['owned_release'])
+                before = path.read_bytes()
+                with self.assertRaisesRegex(life.Refused, 'Reservation already converted to a lifecycle claim'):
+                    reservation.operate('reserve', approver='operator')
+                self.assertEqual(path.read_bytes(), before)
+                claimant.release()
+                self.assertFalse(claimant.inspect()['owned_claim'])
 
     def test_different_tokens_can_still_claim_two_instance_host(self):
         with tempfile.TemporaryDirectory(prefix='eden-ledger-concurrent-') as temporary:
@@ -3357,8 +3511,9 @@ class ProtocolTests(unittest.TestCase):
             file().read.return_value = text + released['line'] + '\n'
             self.assertEqual(remote.inspect()['open'], [old.rstrip('\n')])
             file().write.reset_mock()
+            remote = life.Ledger(path, 'surface', 'OpenCode test/owner', 'new-token', remote='yoga')
             with self.assertRaisesRegex(life.Refused, 'Open host claim'):
-                remote.claim()  # same foreign history still blocks the strict policy
+                remote.claim()
             file().write.assert_not_called()
 
     def test_real_ledger_shapes_from_2026_11_03(self):
