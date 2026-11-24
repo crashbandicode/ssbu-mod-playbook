@@ -1,0 +1,10 @@
+[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0-rc.15 port=6980 guards=0x7fffff boot=0x3dec61593ef80877 uptime_ms=455329676 reconnects=0 event_latest=2 state_api=1 toggle_gen=1 toggle_reason=pad_chord refusals=0 last_refusal=none frame=13 wall=455329677
+[Bridge] req roster result=ok entries=0x3 frame=5774 wall=455428104
+[Bridge] roster entry=0 kind=0 nana=false ev=123 frame=5775 wall=455428119
+[Bridge] item entry=0 held=false kind=-1 ev=124 frame=5775 wall=455428119
+[Bridge] roster entry=1 kind=7 nana=false ev=125 frame=5775 wall=455428119
+[Bridge] item entry=1 held=false kind=-1 ev=126 frame=5775 wall=455428119
+[Bridge] req fighters result=ok frame=5788 wall=455428337
+[Bridge] fighter entry=0 kind=0 x=-35.999996 y=0.010259508 lr=1 dmg=0 status=0 situation=0 stock=0 dead=0 item=-1 ev=127 frame=5789 wall=455428353
+[Bridge] fighter entry=1 kind=7 x=36 y=0.010259508 lr=-1 dmg=0 status=0 situation=0 stock=0 dead=0 item=-1 ev=128 frame=5789 wall=455428353
+[Bridge] fighters entries=0x3 count=4 ev=129 frame=5789 wall=455428353

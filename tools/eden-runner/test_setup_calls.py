@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_picker as picker
 import routes
 import test_native_picker as recorded
-from test_setup_calls_rework import SetupReworkTests
+from test_setup_calls_rework import SetupReworkTests, logged_native
 
 
 MARIO = picker.Target('0', 'Mario', 'default')
@@ -547,7 +547,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         state = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         saved = []
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', return_value=state), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, state)), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: saved.append(name) or value):
             receipt = routes.reach_training(self.ctx, 'Mario', cpu='Fox', stage='Final Destination')
         json.dumps(receipt)
@@ -649,7 +649,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         calls = []
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k:
                           calls.append('quit') or replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', side_effect=lambda *a, **k: calls.append(('pick', k))), \
@@ -671,7 +671,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
              patch.object(routes, '_native_enter_training', side_effect=lambda *a, **k:
@@ -692,7 +692,7 @@ class SetupCallsR2Tests(unittest.TestCase):
             return {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
 
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=lose_owner), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, lose_owner)), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             with self.assertRaisesRegex(RuntimeError, 'not owned by native'):
                 routes.reach_training(self.ctx, 'Mario', cpu='Fox')
@@ -704,7 +704,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
              patch.object(routes, '_native_enter_training', side_effect=lambda *a, **k:
@@ -749,7 +749,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}, {'kind': 7, 'name': 'Fox'}]
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'tables', return_value=tables), \
-             patch.object(routes, 'native_state', side_effect=[initial, final, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final, final])), \
              patch.object(routes, 'wait_native', return_value=final), \
              patch.object(routes, '_fetch_settings', return_value=b'{"menu":{"cpu_character":[1,0]}}'), \
              patch.object(routes, '_live_body', return_value={'kind': 0}), \
@@ -792,7 +792,7 @@ class SetupCallsR2Tests(unittest.TestCase):
 
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
              patch.object(routes, 'tables', return_value=tables), \
-             patch.object(routes, 'native_state', side_effect=[initial, entered, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, entered, final])), \
              patch.object(routes, 'wait_native', return_value=final), \
              patch.object(routes, '_fetch_settings', return_value=b'{"menu":{"cpu_character":[1,0]}}'), \
              patch.object(routes, '_live_body', return_value={'kind': 0}), \
@@ -812,7 +812,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 0}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
              patch.object(routes, 'enter_training', side_effect=lambda *a, **k: replay.set_screen('training')), \
@@ -853,7 +853,7 @@ class SetupCallsR2Tests(unittest.TestCase):
         entered = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 0}}}
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=[initial, entered, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, entered, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
              patch.object(routes, '_native_enter_training', side_effect=lambda *a, **k:
@@ -878,7 +878,7 @@ class SetupCallsR2Tests(unittest.TestCase):
             return {}
 
         with patch.object(routes, 'BridgePickerIO', return_value=replay), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: replay.set_screen('css.training')), \
              patch.object(routes, 'pick_fighters', return_value={}), \
              patch.object(routes, 'enter_training', side_effect=enter), \
@@ -1061,14 +1061,28 @@ class TileTakeRouteTests(unittest.TestCase):
             self.assertEqual(normal['args'], {'holding': 'p1'})
 
     def test_expect_fighters_needs_roster_and_body_to_agree(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.log = Path(temp.name) / 'bridge.log'
+        self.ctx.instance = {'bridge_log': str(self.log)}
         io = recorded.Replay(native_blocks=[recorded.l8w_native(1)])
         ui = recorded.native(1, screen='training', **{'screen.context': 'training'})
         state = {'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         bodies = {0: {'kind': 0}, 1: {'kind': 3}}
+
+        def fighters_now(*args, **kwargs):
+            with self.log.open('a') as stream:
+                stream.write('[Bridge] req fighters result=ok frame=1 wall=1\n')
+                for seat, body in sorted(bodies.items()):
+                    stream.write(f"[Bridge] fighter entry={seat} kind={body['kind']} x=0 y=0 lr=1 dmg=0 "
+                                 f"status=0 situation=0 stock=0 dead=0 item=-1 frame=2 wall=2\n")
+                stream.write('[Bridge] fighters entries=0x3 count=2 frame=2 wall=2\n')
+            return bodies
+
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(picker, 'wait_sample', return_value=ui), \
-             patch.object(routes, 'native_state', return_value=state), \
-             patch.object(routes, '_switch_hw', return_value=SimpleNamespace(fighters_now=lambda *a, **k: bodies)), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, state)), \
+             patch.object(routes, '_switch_hw', return_value=SimpleNamespace(fighters_now=fighters_now)), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
             with self.assertRaisesRegex(RuntimeError, 'entry 1.*Fox.*7.*3'):
                 routes.expect_fighters(self.ctx, p1='Mario', cpu='Fox')
@@ -1165,17 +1179,21 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.row = Path(temp.name)
         runner = SimpleNamespace(routes_expect={'stage_id': 3}, native_ui_pending={})
+        self.log = self.row / 'effect-capture.log'
         self.ctx = SimpleNamespace(runner=runner, on='s', row_dir=self.row, check_stop=lambda: None)
         self.io = ReachTrainingPhaseReplay(self.ctx)
         self.state = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
 
     def invoke(self, *, set_fighter=None, picker_factory=None, **kwargs):
+        capture = routes._effect_capture_start
+        capture_ctx = SimpleNamespace(instance={'bridge_log': str(self.log)})
         with ExitStack() as stack:
             stack.enter_context(patch.object(routes, 'BridgePickerIO', **(
                 {'side_effect': picker_factory} if picker_factory else {'return_value': self.io})))
             stack.enter_context(patch.object(routes.time, 'monotonic', side_effect=lambda: self.io.now))
             stack.enter_context(patch.object(routes.time, 'sleep', side_effect=self.sleep))
-            stack.enter_context(patch.object(routes, 'native_state', return_value=self.state))
+            stack.enter_context(patch.object(routes, 'native_state', side_effect=logged_native(self.log, self.state)))
+            stack.enter_context(patch.object(routes, '_effect_capture_start', side_effect=lambda _: capture(capture_ctx)))
             stack.enter_context(patch.object(routes, 'library_topology', return_value={'path': 'modelled'}))
             for name in ('to_main', 'back_to_main', 'main_to_stage', 'pick_stage', 'quit_training',
                          'pick_fighters', 'enter_training'):
