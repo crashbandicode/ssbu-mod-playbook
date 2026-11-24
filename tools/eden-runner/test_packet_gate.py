@@ -62,6 +62,10 @@ pub fn lanes(slots: &[u64], name: &str, out: &mut String) {
 }
 '''
 
+# Bridge 95abb28, src/native_ui/mod.rs (excerpt, see tools/PROVENANCE.md): the first bridge whose state-block file
+# has a `#[cfg(test)]` item in the middle, a test-only fn inside `impl Sample`, in front of the real writer.
+UI_95ABB28 = (Path(__file__).resolve().parent / 'test-data/bridge-ui/95abb28/src/native_ui/mod.rs').read_text()
+
 
 class PacketGateTests(unittest.TestCase):
     def setUp(self):
@@ -79,7 +83,11 @@ out.push_str("strip.aims=\"");
 for key in ["zone.bins", "zone.y", "zone.left", "zone.right"] {}
 write!(out, "rows={rows}");
 #[cfg(test)]
-writeln!(out, "test.only={}", n);
+mod tests {
+    fn line(out: &mut String, n: u32) {
+        writeln!(out, "test.only={}", n);
+    }
+}
 ''',
             'src/model/record_place.rs': 'writeln!(out, "recording.page.role={}", role);\n',
             'src/model/practice_state.rs': PRACTICE_STATE,
@@ -843,6 +851,36 @@ for side in ["p1", "cpu"] {
         self.plan['rows'][0]['reads'] = ['tr.practice:step', 'tr.practice:score', 'tr.practice:cpu.4.ai_thinks']
         self.assertEqual(self.errors(), [])
 
+    def test_a_test_only_item_hides_nothing_that_follows_it(self):
+        probe = '#[cfg(test)]\nfn probe(out: &mut String) {\n    let _ = writeln!(out, "probe.only={}", 1);\n}\n'
+        self.practice('pub fn lanes(', probe + 'pub fn lanes(')
+        self.plan['rows'][0]['reads'] = ['tr.practice:phase', 'tr.practice:cpu.4.ai_thinks',
+                                         'tr.practice:lane.2.frames', 'tr.practice:player.left']
+        self.assertEqual(self.errors(), [])
+        self.refused('tr.practice:probe.only')
+        # The same for a condition that can only hold in a test build; one that also holds on the console stays.
+        host = ('#[cfg(all(test, not(target_os = "switch")))]\nfn host(out: &mut String) {\n'
+                '    let _ = writeln!(out, "host.only={}", 1);\n}\n'
+                '#[cfg(any(test, target_os = "switch"))]\nfn console(out: &mut String) {\n'
+                '    let _ = writeln!(out, "console.key={}", 1);\n}\n')
+        self.practice('pub fn lanes(', host + 'pub fn lanes(')
+        self.plan['rows'][0]['reads'] = ['tr.practice:console.key', 'tr.practice:lane.2.frames']
+        self.assertEqual(self.errors(), [])
+        self.refused('tr.practice:host.only')
+        # A test module written out at the end of the file still hides its own strings.
+        end = '        let _ = writeln!(out, "medal.{rank}.{medal}=1");\n    }\n}\n'
+        self.assertTrue(PRACTICE_STATE.endswith(end))
+        self.practice(end, end + '#[cfg(test)]\nmod tests {\n    fn t() { let _ = format!("tests.only={}", 1); }\n}\n')
+        self.refused('tr.practice:tests.only')
+        self.plan['rows'][0]['reads'] = ['tr.practice:medal.0.gold']
+        self.assertEqual(self.errors(), [])
+        # A test-only item that never closes is refused, with the file named.
+        self.practice('pub fn lanes(', '#[cfg(test)]\nfn probe(out: &mut String) {\npub fn lanes(')
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('extractor tr.practice: src/model/practice_state.rs', errors[0])
+        self.assertIn('could not be scanned', errors[0])
+
     def test_an_event_line_with_a_format_key_names_its_event(self):
         self.plan['rows'][0]['reads'] = ['tr.event:seat owner.p1', 'tr.event:seat owner.cpu', 'tr.event:owner.cpu']
         self.assertEqual(self.errors(), [])
@@ -1146,6 +1184,110 @@ write!(out, "[Bridge] provider name={name} schema_id={schema_id} version={versio
         self.plan['target']['bridge']['commit'] = git('rev-parse', 'HEAD').stdout.strip()
         self.assertTrue(any('extractor ssbu.ui: could not be scanned' in error for error in self.errors()))
 
+    def ui_source(self, text, reads):
+        """The gate's report for a bridge whose src/native_ui/mod.rs is `text`, with a row that reads the given
+        ssbu.ui keys; and the commit's first eight characters."""
+        tree = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        (tree / 'src/native_ui').mkdir(parents=True)
+        (tree / 'src/native_ui/mod.rs').write_text(text)
+
+        def git(*args):
+            return subprocess.run(['git', '-C', str(tree), *args], check=True, capture_output=True, text=True)
+
+        git('init', '-q')
+        git('add', 'src')
+        git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'source')
+        commit = git('rev-parse', 'HEAD').stdout.strip()
+        self.plan['target']['bridge'] = {'tree': str(tree), 'commit': commit}
+        self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}' for key in reads]
+        return packet_gate.check(self.plan, self.base, self.plan), commit[:8]
+
+    def test_a_test_only_fn_inside_an_impl_is_skipped(self):
+        self.assertIn('impl Sample {\n', UI_95ABB28)
+        self.assertIn('    #[cfg(test)]\n    fn encode(self, rev: u64, boot: u64) -> Line<MAX_PAYLOAD> {\n', UI_95ABB28)
+        self.assertLess(UI_95ABB28.index('#[cfg(test)]'), UI_95ABB28.index('schema=ssbu.ui/1'))
+        # The file scans, and the real writer, which stands after the test-only fn, is read.
+        written = ('schema', 'screen', 'observation.active', 'input.ready', 'screen.gen', 'picker.phase',
+                   'focus.index', 'ldn.role', 'ldn.request.slot', 'ldn.prompt', 'ldn.room.key', 'ldn.net.key',
+                   'ldn.net.nodes')
+        report, _ = self.ui_source(UI_95ABB28, written)
+        self.assertEqual(report['errors'], [])
+        keys = report['emitted']['ssbu.ui']
+        print('95abb28 excerpt block keys:', len(keys))
+        for key in ('css.training', 'tile.cursor', 'ldn.create'):
+            report, commit = self.ui_source(UI_95ABB28, [key])
+            self.assertEqual(report['errors'], [f'G2 row r1: ssbu.ui:{key} is not written by bridge '
+                                                f'{commit} (src/native_ui/mod.rs)'])
+        # A key that only the test-only fn writes is not a written key, and the others stay as they were.
+        body = '        self.encode_with_net(rev, boot, ldn_join::NetInfo::default())\n'
+        self.assertEqual(UI_95ABB28.count(body), 1)
+        marked = UI_95ABB28.replace(body, '        let _ = write!(out, "schema=ssbu.ui/1\\ntest.only={rev}\\n");\n' + body)
+        report, _ = self.ui_source(marked, written)
+        self.assertEqual((report['errors'], report['emitted'].get('ssbu.ui')), ([], keys))
+        report, commit = self.ui_source(marked, ['test.only'])
+        self.assertEqual(report['errors'], [f'G2 row r1: ssbu.ui:test.only is not written by bridge '
+                                            f'{commit} (src/native_ui/mod.rs)'])
+
+    def test_a_test_only_module_is_skipped_and_console_code_is_kept(self):
+        module = ('#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod probe {\n    fn write(out: &mut Line<64>) {\n'
+                  '        let _ = write!(out, "schema=ssbu.ui/1\\nmodule.only={}\\n", 1);\n    }\n}\n\n')
+        # Not test-only: this item is built for the console too.
+        console = ('#[cfg(any(test, target_os = "switch"))]\nfn console(out: &mut Line<64>) {\n'
+                   '    let _ = write!(out, "schema=ssbu.ui/1\\nconsole.key={}\\n", 1);\n}\n\n')
+        self.assertEqual(UI_95ABB28.count('impl Sample {\n'), 1)
+
+        def item(cfg, key):
+            return (f'#[cfg({cfg})]\nfn {key.replace(".", "_")}(out: &mut Line<64>) {{\n'
+                    f'    let _ = write!(out, "schema=ssbu.ui/1\\n{key}={{}}\\n", 1);\n}}\n\n')
+
+        # Other conditions that name `test`: read when the item can be built outside a test build, left out when
+        # it cannot. A feature or a target is not followed.
+        more = (item('not(test)', 'release.key') + item('any(feature = "diag", test)', 'diag.key')
+                + item('not(any(test, feature = "diag"))', 'plain.key')
+                + item('all(test, not(target_os = "switch"))', 'host.only')
+                + item('all(any(test), feature = "diag")', 'nested.only'))
+        source = UI_95ABB28.replace('impl Sample {\n', module + console + more + 'impl Sample {\n')
+        report, _ = self.ui_source(source, ['screen', 'ldn.role', 'console.key', 'release.key', 'diag.key',
+                                            'plain.key'])
+        self.assertEqual(report['errors'], [])
+        for key in ('module.only', 'host.only', 'nested.only'):
+            report, commit = self.ui_source(source, [key])
+            self.assertEqual(report['errors'], [f'G2 row r1: ssbu.ui:{key} is not written by bridge '
+                                                f'{commit} (src/native_ui/mod.rs)'])
+        # The declaration form the real file ends with, and a module written on the attribute's own line.
+        self.assertTrue(UI_95ABB28.endswith('#[cfg(test)]\nmod tests;\n#[cfg(test)]\nmod gate_tests;\n'))
+        one_line = '#[cfg(test)] mod more { fn w() { write!(out, "schema=ssbu.ui/1\\nmore.only={}"); } }\n'
+        report, _ = self.ui_source(UI_95ABB28 + one_line, ['screen', 'ldn.role'])
+        self.assertEqual(report['errors'], [])
+        report, _ = self.ui_source(UI_95ABB28 + one_line, ['more.only'])
+        self.assertEqual(len(report['errors']), 1, report['errors'])
+        self.assertIn('ssbu.ui:more.only is not written by bridge', report['errors'][0])
+
+    def test_a_source_that_does_not_balance_still_fails_loudly(self):
+        def refused(text):
+            report, _ = self.ui_source(text, ['screen'])
+            return any('extractor ssbu.ui: could not be scanned' in error for error in report['errors'])
+
+        report, _ = self.ui_source(UI_95ABB28, ['screen'])
+        self.assertEqual(report['errors'], [])
+        # A real item that never closes.
+        tail = '        pause.write(&mut out);\n        out\n    }\n}\n'
+        self.assertEqual(UI_95ABB28.count(tail), 1)
+        self.assertTrue(refused(UI_95ABB28.replace(tail, tail[:-2])))
+        # A test-only item that never closes.
+        self.assertTrue(refused(UI_95ABB28 + '#[cfg(test)]\nfn open(out: &mut Line<8>) {\n    let _ = 1;\n'))
+        # A test-only attribute on something that is not an item: the gate does not guess where it ends.
+        field = '    observed: u64,\n'
+        self.assertEqual(UI_95ABB28.count(field), 1)
+        self.assertTrue(refused(UI_95ABB28.replace(field, '    #[cfg(test)]\n' + field)))
+        # A file that is test-only as a whole.
+        writer = 'fn w(out: &mut Line<8>) {\n    let _ = write!(out, "schema=ssbu.ui/1\\nscreen={}", 1);\n}\n'
+        self.assertTrue(refused('#![cfg(test)]\n' + writer))
+        self.assertFalse(refused('#![cfg(any(test, target_os = "switch"))]\n' + writer))
+        # A condition the gate cannot read.
+        self.assertTrue(refused('#[cfg(test all)]\n' + writer))
+        self.assertTrue(refused('#[cfg(any(test)]\n' + writer))
+
     def test_rust_function_scanner_ignores_literals_comments_and_lifetimes(self):
         source = r'''
 fn first<'a>(x: &'a str) {
@@ -1429,6 +1571,156 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertEqual(self.errors(), [
             'G6 row consumer: needs "partner.effective=34" but partner.effective is "1" (set by watch)'])
 
+    def shared_case_setup(self):
+        shared = Path(self.tmp.name) / 'shared'
+        shared.mkdir()
+        (shared / 'sibling.py').write_text(
+            'def evaluate(lines):\n'
+            '    if "walking" in lines: raise RuntimeError("walking frame 2")\n'
+            '    return {"frames": len(lines)}\n')
+        (shared / 'sharedfx.py').write_text(
+            'from sibling import evaluate\n'
+            'EFFECT_JUDGES = {"hook": {"judge": "judge", "cases": "sample"}}\n'
+            'def hook(ctx): return judge(lines=["standing"])\n'
+            'def judge(lines): return evaluate(lines)\n')
+        cases = shared / 'library' / 'cases' / 'sample'
+        cases.mkdir(parents=True)
+        (cases / 'standing.log').write_text('standing\n')
+        (cases / 'walking.log').write_text('walking\n')
+        (cases / 'a.json').write_text(json.dumps(
+            {'files': {'lines': 'standing.log'}, 'expect': 'accept'}))
+        (cases / 'b.json').write_text(json.dumps(
+            {'files': {'lines': 'walking.log'}, 'expect': 'reject', 'contains': 'walking'}))
+        plan = {'rows': [{'id': 'trial', 'role': 'test',
+                          'steps': [{'run': 'sharedfx:hook', 'effect': True}]}]}
+        return shared, cases, plan
+
+    def shared_case_check(self, shared, plan):
+        with mock.patch.object(packet_gate, 'SHARED_DIR', shared, create=True), \
+             mock.patch.object(packet_gate, 'shared_hook_names', return_value=('sharedfx', 'fixtures'), create=True):
+            return packet_gate.check(plan, self.base, plan)
+
+    def test_shared_hook_without_entry_and_fixture_cases_belong_to_runner(self):
+        shared, _, plan = self.shared_case_setup()
+        (shared / 'sharedfx.py').write_text('raise RuntimeError("must not import")\ndef hook(ctx): return 1\n')
+        message = 'G9 row trial: effect hook sharedfx:hook has no judge cases; its evidence is trusted'
+        report = self.shared_case_check(shared, plan)
+        self.assertIn(message, report['warnings'])
+        plan['require_cases'] = True
+        self.assertIn(message + ' (require_cases)', self.shared_case_check(shared, plan)['errors'])
+        (shared / 'sharedfx.py').write_text('EFFECT_JUDGES = {"other": {"judge": "j", "cases": "sample"}}\n')
+        self.assertIn(message + ' (require_cases)', self.shared_case_check(shared, plan)['errors'])
+        plan['rows'][0]['steps'] = [{'run': 'fixtures:cpu_standing', 'effect': True,
+                                     'cases': {'judge': 'unused.py:judge', 'dir': 'unused'}}]
+        report = self.shared_case_check(shared, plan)
+        self.assertIn('G9 row trial: fixtures:cpu_standing is a shared hook; its judge cases belong to '
+                      'the runner (remove "cases")', report['errors'])
+
+    def test_fixture_effect_judge_replays_cases_and_enforces_binding(self):
+        shared, cases, plan = self.shared_case_setup()
+        fixture = shared / 'fixtures.py'
+        source = (shared / 'sharedfx.py').read_text()
+        fixture.write_text(source)
+        plan['rows'][0]['steps'] = [{'run': 'fixtures:hook', 'effect': True}]
+        report = self.shared_case_check(shared, plan)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'], [])
+        self.assertEqual(report['cases'].get('trial', {}).get('fixtures:judge'), {'accept': 1, 'reject': 1})
+        (cases / 'standing.log').write_text('walking\n')
+        self.assertIn('G9 row trial: case a.json: expected accept, the judge refused: walking frame 2',
+                      self.shared_case_check(shared, plan)['errors'])
+        (cases / 'standing.log').write_text('standing\n')
+        fixture.write_text(source.replace('return judge(lines=["standing"])', 'return 1'))
+        self.assertIn('G9 row trial: fixtures:hook does not call its judge judge',
+                      self.shared_case_check(shared, plan)['errors'])
+
+    def test_non_effect_and_setup_fixture_hooks_do_not_need_cases(self):
+        shared, _, plan = self.shared_case_setup()
+        plan['require_cases'] = True
+        plan['rows'] = [
+            {'id': 'trial', 'role': 'test', 'steps': [
+                {'run': 'fixtures:seeded_room'}, {'run': 'fixtures:guard_first_use'}]},
+            {'id': 'setup', 'role': 'setup', 'steps': [
+                {'run': 'fixtures:cpu_standing', 'effect': True},
+                {'run': 'fixtures:seeded_room', 'effect': True,
+                 'cases': {'judge': 'unused.py:judge', 'dir': 'unused'}}]},
+        ]
+        report = self.shared_case_check(shared, plan)
+        self.assertFalse(any(item.startswith('G9 ') for item in report['errors'] + report['warnings']))
+
+    def test_shared_judge_cases_use_siblings_and_run_once_for_multiple_rows(self):
+        shared, _, plan = self.shared_case_setup()
+        plan['rows'].append({'id': 'again', 'role': 'test', 'steps': plan['rows'][0]['steps']})
+        original = subprocess.run
+        with mock.patch.object(packet_gate.subprocess, 'run', wraps=original) as calls:
+            report = self.shared_case_check(shared, plan)
+        self.assertEqual(report['errors'], [])
+        self.assertEqual(report['warnings'], [])
+        loaders = [call for call in calls.call_args_list if packet_gate.CASE_LOADER in call.args[0]]
+        self.assertEqual(len(loaders), 1)
+        for row in ('trial', 'again'):
+            self.assertEqual(report['cases'][row]['sharedfx:judge'], {'accept': 1, 'reject': 1})
+        module = shared / 'sharedfx.py'
+        module.write_text(module.read_text().replace(
+            'def hook(ctx): return judge(lines=["standing"])',
+            'def hook(ctx):\n    def nested(): return judge(lines=["standing"])\n    return nested()'))
+        self.assertEqual(self.shared_case_check(shared, plan)['errors'], [])
+
+    def test_shared_judge_rejects_mismatched_outcomes_and_missing_polarity(self):
+        shared, cases, plan = self.shared_case_setup()
+        (cases / 'standing.log').write_text('walking\n')
+        report = self.shared_case_check(shared, plan)
+        self.assertIn('G9 row trial: case a.json: expected accept, the judge refused: walking frame 2',
+                      report['errors'])
+        (cases / 'standing.log').write_text('standing\n')
+        (cases / 'walking.log').write_text('standing\n')
+        self.assertIn('G9 row trial: case b.json: expected reject, the judge accepted',
+                      self.shared_case_check(shared, plan)['errors'])
+        (cases / 'walking.log').write_text('walking\n')
+        (cases / 'b.json').write_text(json.dumps(
+            {'files': {'lines': 'walking.log'}, 'expect': 'reject', 'contains': 'not present'}))
+        self.assertIn('G9 row trial: case b.json: refused, but not with "not present": walking frame 2',
+                      self.shared_case_check(shared, plan)['errors'])
+        (cases / 'b.json').unlink()
+        self.assertIn('G9 row trial: cases need at least one accept and one reject (found 1 accept, 0 reject)',
+                      self.shared_case_check(shared, plan)['errors'])
+
+    def test_shared_judge_validates_binding_folder_and_table(self):
+        shared, _, plan = self.shared_case_setup()
+        module = shared / 'sharedfx.py'
+        source = module.read_text()
+        module.write_text(source.replace('return judge(lines=["standing"])', 'return 1'))
+        self.assertIn('G9 row trial: sharedfx:hook does not call its judge judge',
+                      self.shared_case_check(shared, plan)['errors'])
+        module.write_text(source.replace('def judge(lines): return evaluate(lines)', 'def other(lines): return 1'))
+        self.assertIn('G9 row trial: sharedfx:judge is not a function of sharedfx',
+                      self.shared_case_check(shared, plan)['errors'])
+        for folder in ('missing', '../sample', '.', '/tmp', 'one\\two', 'bad\x00name'):
+            with self.subTest(folder=folder):
+                module.write_text(source.replace('"cases": "sample"', f'"cases": {json.dumps(folder)}'))
+                self.assertIn(f'G9 row trial: cases folder library/cases/{folder} is missing',
+                              self.shared_case_check(shared, plan)['errors'])
+        module.write_text(source)
+        plan['rows'][0]['steps'][0]['cases'] = {'judge': 'fake.py:judge', 'dir': 'fake'}
+        self.assertIn('G9 row trial: sharedfx:hook is a shared hook; its judge cases belong to '
+                      'the runner (remove "cases")', self.shared_case_check(shared, plan)['errors'])
+        del plan['rows'][0]['steps'][0]['cases']
+        for table in ('EFFECT_JUDGES = dict()', 'EFFECT_JUDGES = "judge"',
+                      'EFFECT_JUDGES = {"hook": "judge"}'):
+            with self.subTest(table=table):
+                module.write_text(table + '\ndef hook(ctx): return 1\n')
+                self.assertTrue(any(item.startswith('G9 row trial: sharedfx.EFFECT_JUDGES is malformed:')
+                                    for item in self.shared_case_check(shared, plan)['errors']))
+
+    def test_shared_judge_cases_cannot_read_outside_library_cases(self):
+        shared, cases, plan = self.shared_case_setup()
+        (shared / 'outside.log').write_text('standing\n')
+        (cases / 'a.json').write_text(json.dumps(
+            {'files': {'lines': '../../../outside.log'}, 'expect': 'accept'}))
+        report = self.shared_case_check(shared, plan)
+        self.assertTrue(any(item.startswith('G9 row trial: cases:') and 'leaves the rows folder' in item
+                            for item in report['errors']))
+
     def case_setup(self):
         (self.base / 'judge.py').write_text(
             'def judge(lines):\n'
@@ -1574,7 +1866,7 @@ fn elsewhere() { write!(out, "outside=1"); }
             'from judge import judge\ndef ok(ctx): return {"frames": 3}\n')
         self.assertEqual(self.errors(), [])
 
-    def test_missing_hook_cases_warn_or_refuse_but_shared_fixtures_are_exempt(self):
+    def test_missing_hook_cases_warn_or_refuse_including_shared_fixtures(self):
         self.plan['rows'] = [{'id': 'trial', 'role': 'test', 'steps': [{'run': 'steps.py:ok', 'effect': True}]}]
         message = 'G9 row trial: effect hook steps.py:ok has no judge cases; its evidence is trusted'
         result = packet_gate.check(self.plan, self.base, self.plan)
@@ -1583,7 +1875,12 @@ fn elsewhere() { write!(out, "outside=1"); }
         self.assertIn(message + ' (require_cases)', self.errors())
         self.plan['rows'][0]['steps'] = [{'run': 'fixtures:cpu_standing', 'effect': True}]
         result = packet_gate.check(self.plan, self.base, self.plan)
-        self.assertFalse(any(message.startswith('G9 ') for message in result['errors'] + result['warnings']))
+        fixture = 'G9 row trial: effect hook fixtures:cpu_standing has no judge cases; its evidence is trusted'
+        self.assertIn(fixture + ' (require_cases)', result['errors'])
+        self.plan.pop('require_cases')
+        result = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertIn(fixture, result['warnings'])
+        self.assertFalse(any(message.startswith('G9 ') for message in result['errors']))
 
     def test_require_cases_is_checked_without_a_target_too(self):
         self.plan.pop('target')
@@ -1713,6 +2010,24 @@ fn elsewhere() { write!(out, "outside=1"); }
         missing = {key for key in words if key not in keys and f'fighter {key}' not in keys}
         print('bridge witness keys the extractor lacks:', sorted(missing))
         self.assertEqual(missing, set())
+
+    @unittest.skipUnless(os.environ.get('PACKET_GATE_BRIDGE_TREE'), 'bridge source not supplied')
+    def test_real_bridge_95abb28_is_scanned(self):
+        tree = os.environ['PACKET_GATE_BRIDGE_TREE']
+        self.plan['target']['bridge'] = {'tree': tree, 'commit': '95abb2829574c49f28789cd2a9c3df63a1181d0b'}
+        positive = ('schema', 'screen', 'observation.active', 'input.ready', 'screen.gen', 'picker.phase',
+                    'focus.index', 'focus.label', 'ldn.members', 'ldn.room.key', 'ldn.net.key', 'ldn.net.session',
+                    'pause.open', 'pause.cpu_behavior', 'pause.panel')
+        self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}' for key in positive]
+        report = packet_gate.check(self.plan, self.base, self.plan)
+        self.assertEqual(report['errors'], [])
+        print('95abb28 real block keys:', len(report['emitted']['ssbu.ui']))
+        # This bridge no longer writes ldn.room.session (it writes ldn.net.session); the gate follows the source.
+        for key in ('css.training', 'tile.cursor', 'ui ready', 'ready', 'menu.admission', 'ldn.create',
+                    'ldn.room.session'):
+            self.plan['rows'][0]['reads'] = [f'ssbu.ui:{key}']
+            self.assertEqual(self.errors(), ['G2 row r1: ssbu.ui:' + key + ' is not written by bridge '
+                                             '95abb282 (src/native_ui/mod.rs)'])
 
     @unittest.skipUnless(os.environ.get('PACKET_GATE_BRIDGE_TREE'), 'bridge source not supplied')
     def test_real_bridge_ui_block_provider(self):

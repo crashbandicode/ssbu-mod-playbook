@@ -53,12 +53,18 @@ except ImportError:
 import closed_loop
 import native_picker
 import state_gate
+import switch_hw
 import trace_attempts
 from native_picker_io import BridgePickerIO
 
 HERE = Path(__file__).resolve().parent
 ROUTES = HERE / 'library' / 'routes'
 LIBRARY = HERE / 'library'
+
+EFFECT_JUDGES = {
+    'reach_training': {'judge': 'judge_reach_training', 'cases': 'reach_training'},
+    'expect_fighters': {'judge': 'judge_expect_fighters', 'cases': 'expect_fighters'},
+}
 
 
 # --- small utilities ------------------------------------------------------------------------------------------------
@@ -3241,17 +3247,77 @@ def place_cpu(ctx, fighter, must_move=False):
     })
 
 
-def expect_fighters(ctx, p1=None, cpu=None):
-    """Confirm the requested Training fighters against roster and live bodies."""
-    started = time.monotonic()
-    io = BridgePickerIO(ctx)
-    ui = native_picker.wait_sample(io, native_picker.UI, started + 6)
-    if not _fields_match(ui, TRAINING_SCREEN):
-        raise RuntimeError('expect_fighters needs Training with native input')
-    state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
-    bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent)
-    roster = state.get('roster', {})
-    for seat, name in ((0, p1), (1, cpu)):
+def _effect_boot(lines, boot):
+    if not lines or '[Bridge] hello ' not in lines[0]:
+        raise RuntimeError('the bridge greeting is missing from the judged lines')
+    match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', lines[0])
+    if match is None:
+        raise RuntimeError('the bridge greeting has no boot id')
+    current = match[1]
+    if boot is not None and current != boot:
+        raise RuntimeError(f'the bridge greeting is from boot {current}, not this boot {boot}')
+    for line in lines[1:]:
+        if state_gate.BOUNDARY.search(line):
+            raise RuntimeError('the bridge connection changed during the read')
+        if (other := re.search(r'\bboot=(0x[0-9a-f]{16})\b', line)) and other[1] != current:
+            raise RuntimeError(f'the bridge record is from boot {other[1]}, not this boot {current}')
+    return current
+
+
+def _effect_partial(lines, reply_pattern, key):
+    reply = None
+    start = 0
+    for index, line in enumerate(lines):
+        if match := reply_pattern.search(line):
+            reply, start = int(match['frame']), index + 1
+    if reply is None:
+        return {}
+    fresh = [line for line in lines[start:]
+             if (tail := switch_hw.SUFFIX.search(line)) and int(tail[1]) >= reply]
+    return switch_hw.parse_bridge_state(fresh)[key]
+
+
+def _effect_roster(lines, names, *, require_both=False):
+    roster = switch_hw.roster_response(lines, entries=(0, 1))
+    if roster is None:
+        pattern = re.compile(r'\[Bridge\] req roster result=ok(?: entries=0x[0-9a-f]+)? '
+                             r'frame=(?P<frame>\d+) wall=')
+        partial = _effect_partial(lines, pattern, 'roster')
+        for seat, name in names:
+            if name is not None and seat not in partial:
+                raise RuntimeError(f'entry {seat} wanted {name}: no roster entry')
+        if require_both and 1 not in partial:
+            raise RuntimeError('entry 1: no roster entry')
+        raise RuntimeError('bridge roster: no complete answer')
+    for seat, name in names:
+        if name is not None and seat not in roster:
+            raise RuntimeError(f'entry {seat} wanted {name}: no roster entry')
+    if require_both and 1 not in roster:
+        raise RuntimeError('entry 1: no roster entry')
+    return roster
+
+
+def _effect_bodies(lines, names):
+    bodies = switch_hw.fighters_response(lines)
+    if bodies is None:
+        pattern = re.compile(r'\[Bridge\] req fighters result=ok frame=(?P<frame>\d+)(?: |$)')
+        partial = _effect_partial(lines, pattern, 'fighters')
+        for seat, name in names:
+            if name is not None and seat not in partial:
+                raise RuntimeError(f'entry {seat} wanted {name}: no live body')
+        raise RuntimeError('bridge fighters: no complete answer')
+    for seat, name in names:
+        if name is not None and seat not in bodies:
+            raise RuntimeError(f'entry {seat} wanted {name}: no live body')
+    return bodies
+
+
+def judge_expect_fighters(lines, p1=None, cpu=None, boot=None):
+    _effect_boot(lines, boot)
+    names = ((0, p1), (1, cpu))
+    roster = _effect_roster(lines, names)
+    bodies = _effect_bodies(lines, names)
+    for seat, name in names:
         if name is not None:
             wanted = fighter_entry(name)['kind']
             roster_kind = roster.get(seat, {}).get('kind')
@@ -3259,10 +3325,100 @@ def expect_fighters(ctx, p1=None, cpu=None):
             if roster_kind != wanted or body_kind != wanted:
                 raise RuntimeError(f'entry {seat} wanted {name} kind {wanted}: '
                                    f'roster kind {roster_kind}, body kind {body_kind}')
+    return {'roster': {seat: value.get('kind') for seat, value in roster.items()},
+            'bodies': {seat: value.get('kind') for seat, value in bodies.items()}}
+
+
+def judge_reach_training(lines, p1, cpu=None, stage='Final Destination', form='normal', boot=None):
+    _effect_boot(lines, boot)
+    stage_id = switch_hw.parse_bridge_state(lines).get('stage')
+    if stage_id is None:
+        raise RuntimeError('no stage observation in this bridge connection')
+    roster = _effect_roster(lines, ((0, p1), (1, cpu)), require_both=True)
+    wanted_stage = stage_entry(stage)['id']
+    wanted_p1 = fighter_entry(p1)['kind']
+    wanted_cpu = fighter_entry(cpu)['kind'] if cpu is not None else None
+    if (stage_id != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
+            or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
+        raise RuntimeError(f'live Training state does not match the requested setup: '
+                           f"{{'stage': {stage_id!r}, 'roster': {roster!r}}}")
+    return {'stage_id': stage_id, 'roster': roster}
+
+
+def _effect_capture_start(ctx):
+    log = instance_path(ctx, 'bridge_log')
+    with log.open('rb') as stream:
+        text = stream.read()
+        stat = os.fstat(stream.fileno())
+    connection = _bridge_on_latest_connection(text.decode(errors='replace'), require_install=False)
+    if connection is None:
+        raise RuntimeError('the bridge has no current greeting for the read')
+    hello = connection[0]
+    boot = _effect_boot([hello], None)
+    return log, len(text), hello, boot, (stat.st_dev, stat.st_ino), connection[2]
+
+
+def _effect_capture_stages(capture):
+    log, start, hello, boot, identity, greeting_index = capture
+    with log.open('rb') as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino) != identity or stat.st_size < start:
+            raise RuntimeError('the bridge log rotated or truncated during the read')
+        text = stream.read(start).decode(errors='replace')
+    connection = _bridge_on_latest_connection(text, require_install=False)
+    if connection is None or connection[0] != hello or connection[2] != greeting_index:
+        raise RuntimeError('the bridge connection changed during the read')
+    return [line for line in text.splitlines()[greeting_index + 1:] if switch_hw.STAGE.search(line)]
+
+
+def _effect_capture_lines(capture):
+    log, start, hello, boot, identity = capture[:5]
+    with log.open('rb') as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino) != identity or stat.st_size < start:
+            raise RuntimeError('the bridge log rotated or truncated during the read')
+        stream.seek(start)
+        lines = stream.read().decode(errors='replace').splitlines()
+    return [hello, *lines]
+
+
+def _effect_compare_live(lines, boot, live, hook, judged=None):
+    _effect_boot(lines, boot)
+    roster = switch_hw.roster_response(lines, entries=(0, 1))
+    if hook == 'expect_fighters':
+        bodies = switch_hw.fighters_response(lines)
+        judged = {
+            'roster': None if roster is None else {seat: value.get('kind') for seat, value in roster.items()},
+            'bodies': None if bodies is None else {seat: value.get('kind') for seat, value in bodies.items()},
+        }
+    elif judged is None:
+        judged = {'stage_id': switch_hw.parse_bridge_state(lines).get('stage'), 'roster': roster}
+    if judged != live:
+        raise RuntimeError(f'{hook}: the judged lines and the live read disagree: judged={judged!r} live={live!r}')
+
+
+def expect_fighters(ctx, p1=None, cpu=None):
+    """Confirm the requested Training fighters against roster and live bodies."""
+    started = time.monotonic()
+    io = BridgePickerIO(ctx)
+    ui = native_picker.wait_sample(io, native_picker.UI, started + 6)
+    if not _fields_match(ui, TRAINING_SCREEN):
+        raise RuntimeError('expect_fighters needs Training with native input')
+    capture = _effect_capture_start(ctx)
+    state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
+    bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent)
+    roster = state.get('roster', {})
+    lines = _effect_capture_lines(capture)
+    live = {'roster': {seat: value.get('kind') for seat, value in roster.items()},
+            'bodies': {seat: value.get('kind') for seat, value in bodies.items()}}
+    _effect_compare_live(lines, capture[3], live, 'expect_fighters')
+    verified = judge_expect_fighters(lines, p1=p1, cpu=cpu, boot=capture[3])
+    if verified != live:
+        raise RuntimeError(f'expect_fighters: the judged lines and the live read disagree: '
+                           f'judged={verified!r} live={live!r}')
     return _save(ctx, 'routes-expect-fighters', {
         'block': 'expect_fighters', 'args': {'p1': p1, 'cpu': cpu},
-        'verified': {'roster': {seat: value.get('kind') for seat, value in roster.items()},
-                     'bodies': {seat: value.get('kind') for seat, value in bodies.items()}},
+        'verified': verified,
         'inputs': 0, 'ms': {'total': round((time.monotonic() - started) * 1000)},
     })
 
@@ -3844,7 +4000,7 @@ def _bridge_on_owned_listener(ctx, port):
     return listener
 
 
-def _bridge_on_latest_connection(text):
+def _bridge_on_latest_connection(text, *, require_install=True):
     hello = install = None
     start = None
     for index, line in enumerate(text.splitlines()):
@@ -3854,7 +4010,7 @@ def _bridge_on_latest_connection(text):
             start = index if hello is not None else None
         elif hello is not None and install is None and 'plugin=ssbu-hw-bridge/' in line and 'result=' in line:
             install = line
-    return (hello, install, start) if hello is not None and install is not None else None
+    return (hello, install, start) if hello is not None and (install is not None or not require_install) else None
 
 
 def _bridge_on_connection_changed(line):
@@ -6073,6 +6229,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                     if ui.values.get('input.owner') != 'native':
                         stop('locate', 'reach_training needs native Training input ownership')
                     try:
+                        capture = _effect_capture_start(ctx)
+                        stage_lines = _effect_capture_stages(capture)
                         final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
                                              roster_entries=(0, 1))
                     except RuntimeError as error:
@@ -6112,10 +6270,21 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                     stop('locate', str(error))
                 if not _fields_match(final_ui, TRAINING_SCREEN):
                     stop('locate', 'final Training screen is not owned by native input')
-                roster = final.get('roster', {})
-                if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
-                        or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
-                    stop('locate', f'live Training state does not match the requested setup: {final}')
+                lines = _effect_capture_lines(capture)
+                lines[1:1] = stage_lines
+                live = {'stage_id': final.get('stage'), 'roster': final.get('roster', {})}
+                try:
+                    verified = judge_reach_training(lines, p1=p1, cpu=cpu, stage=stage, form=form,
+                                                    boot=capture[3])
+                except RuntimeError as error:
+                    if str(error).startswith('live Training state does not match the requested setup:'):
+                        _effect_compare_live(lines, capture[3], live, 'reach_training')
+                        stop('locate', f'live Training state does not match the requested setup: {final}')
+                    stop('locate', str(error))
+                _effect_compare_live(lines, capture[3], live, 'reach_training', judged=verified)
+                if verified != live:
+                    raise RuntimeError(f'reach_training: the judged lines and the live read disagree: '
+                                       f'judged={verified!r} live={live!r}')
                 break
             next_phase = name
             try:
@@ -6153,7 +6322,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     combined_stalls = all_stalls()
     return _save(ctx, 'routes-reach-training', {
         'block': 'reach_training', 'args': {'p1': p1, 'cpu': cpu, 'stage': stage, 'form': form},
-        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metric_fields(),
+        'verified': verified, **metric_fields(),
         'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
         'starts': starts, 'recovered': recovered, 'retries': phase_retries(),
         'stalls': combined_stalls, 'result': _stall_result(True, combined_stalls),

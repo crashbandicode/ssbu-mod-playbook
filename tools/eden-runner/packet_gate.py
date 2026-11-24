@@ -25,6 +25,12 @@ BUTTONS = (
     ('L-stick', 16), ('R-stick', 32),
 )
 RUNS = Path('/home/intpa/eden-runs')
+SHARED_DIR = Path(__file__).resolve().parent
+
+
+def shared_hook_names():
+    from runner import SHARED_HOOKS
+    return SHARED_HOOKS
 
 
 def packet_digest(base):
@@ -505,10 +511,9 @@ def _template_hint(tree, commit, files, key):
     """For a refused read: the format-string key it has the shape of, and what that template writes; '' if none."""
     for path in files:
         try:
-            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
-        except (OSError, UnicodeError, subprocess.SubprocessError):
+            text = _without_test_items(_git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8'))
+        except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
             continue
-        text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
         for template, line, said, reason in _template_keys(text)[1]:
             pieces = re.split(r'(\{[^{}]*\})', template)
             if not any(re.search(r'[a-z0-9_]', piece) for piece in pieces if not piece.startswith('{')):
@@ -534,7 +539,10 @@ def emitted_keys(tree, commit, files, whole_literals=True):
         except subprocess.CalledProcessError as error:
             detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
             raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
-        text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
+        try:
+            text = _without_test_items(text)
+        except ValueError as error:
+            raise ValueError(f'{path} at {commit[:8]}: {error}') from error
         for literal in re.findall(r'"((?:\\.|[^"\\])*)"', text):
             found = re.findall(r'(?:^|\\n| )([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)=', literal)
             keys.update(found)
@@ -603,6 +611,156 @@ def _rust_lex(text):
                 continue
         code[start:i] = ['\n' if ch == '\n' else ' ' for ch in text[start:i]]
     return ''.join(code), literals
+
+
+_CFG = re.compile(r'#\s*(!?)\s*\[\s*cfg\s*\(')
+_TEST_ITEM = re.compile(r'(?:pub(?:\s*\([^()]*\))?\s+)?(?:(?:default|const|async|unsafe|extern)\s+)*'
+                        r'(fn|mod|struct|enum|union|impl|trait|extern|macro_rules|use|const|static|type)\b')
+
+
+def _test_item_end(code, pos, to_semicolon):
+    """The offset after the item that starts at `pos` in lexed code: after the `;` that ends it, or after the
+    closing brace of its body. `use`, `const`, `static` and `type` items end at their `;` only."""
+    size = len(code)
+    paren = bracket = angle = depth = 0
+    while pos < size:
+        char = code[pos]
+        if to_semicolon:
+            if char in '([{':
+                depth += 1
+            elif char in ')]}':
+                depth -= 1
+                if depth < 0:
+                    break
+            elif char == ';' and not depth:
+                return pos + 1
+        elif char == '(':
+            paren += 1
+        elif char == ')':
+            paren -= 1
+        elif char == '[':
+            bracket += 1
+        elif char == ']':
+            bracket -= 1
+        elif char == '<':
+            angle += 1
+        elif char == '>':
+            if angle and code[pos - 1] != '-':
+                angle -= 1
+        elif not (paren or bracket or angle):
+            if char == ';':
+                return pos + 1
+            if char == '}':
+                break
+            if char == '{':
+                depth = 1
+                pos += 1
+                while pos < size and depth:
+                    depth += (code[pos] == '{') - (code[pos] == '}')
+                    pos += 1
+                if depth:
+                    break
+                return pos
+        if paren < 0 or bracket < 0:
+            break
+        pos += 1
+    raise ValueError('could not be scanned')
+
+
+def _cfg_outside_tests(predicate):
+    """Whether a `cfg` predicate (lexed, so `feature = "x"` reads `feature =`) can hold in a build that is not a
+    test build: False when it cannot, so the item is test-only; True when it always holds; None when that depends
+    on a feature, the target or anything else the gate does not follow."""
+    tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*|[(),=]', predicate)
+    pos = 0
+
+    def parse():
+        nonlocal pos
+        name = tokens[pos]
+        if name in '(),=':
+            raise ValueError
+        pos += 1
+        if pos < len(tokens) and tokens[pos] == '(':
+            pos += 1
+            parts = []
+            while tokens[pos] != ')':
+                parts.append(parse())
+                if tokens[pos] == ',':
+                    pos += 1
+                elif tokens[pos] != ')':
+                    raise ValueError
+            pos += 1
+            if name == 'not' and len(parts) == 1:
+                return None if parts[0] is None else not parts[0]
+            if name == 'any':
+                return True if True in parts else None if None in parts else False
+            if name == 'all':
+                return False if False in parts else None if None in parts else True
+            return None
+        if pos < len(tokens) and tokens[pos] == '=':
+            pos += 1
+            return None
+        return False if name == 'test' else None
+
+    try:
+        value = parse()
+        if pos != len(tokens):
+            raise ValueError
+    except (IndexError, ValueError):
+        raise ValueError('could not be scanned') from None
+    return value
+
+
+def _without_test_items(text):
+    """Rust source with every test-only item blanked, line breaks kept: the `#[cfg(...)]` attribute, any attributes
+    after it, and the item itself up to the `;` that ends it or the closing brace of its body. An item is test-only
+    when its condition cannot hold outside a test build: `cfg(test)`, `cfg(all(test, ...))`. An item under
+    `cfg(any(test, target_os = "switch"))` or `cfg(not(test))` is built for the console and stays.
+
+    What the gate cannot follow fails loudly as `could not be scanned`: a condition it cannot read, a test-only
+    attribute on something that is not an item (a field, a statement, a match arm), a test-only item that never
+    closes, and a file or module that is test-only as a whole (`#![cfg(test)]`)."""
+    if not (_CFG.search(text) and 'test' in text):
+        return text
+    code, _ = _rust_lex(text)
+    kept = list(text)
+    size = len(code)
+    done = 0
+    for attribute in _CFG.finditer(code):
+        if attribute.start() < done:
+            continue
+        depth, pos = 1, attribute.end()
+        while pos < size and depth:
+            depth += (code[pos] == '(') - (code[pos] == ')')
+            pos += 1
+        closing = re.compile(r'\s*\]').match(code, pos)
+        if depth or not closing:
+            raise ValueError('could not be scanned')
+        if _cfg_outside_tests(code[attribute.end():pos - 1]) is not False:
+            continue
+        if attribute.group(1):
+            raise ValueError('could not be scanned')
+        pos = closing.end()
+        while True:
+            while pos < size and code[pos].isspace():
+                pos += 1
+            more = re.compile(r'#\s*\[').match(code, pos)
+            if not more:
+                break
+            depth, pos = 1, more.end()
+            while pos < size and depth:
+                depth += (code[pos] == '[') - (code[pos] == ']')
+                pos += 1
+            if depth:
+                raise ValueError('could not be scanned')
+        item = _TEST_ITEM.match(code, pos)
+        if not item:
+            raise ValueError('could not be scanned')
+        done = _test_item_end(code, pos, item.group(1) in ('use', 'const', 'static', 'type'))
+        for index in range(attribute.start(), done):
+            if kept[index] != '\n':
+                kept[index] = ' '
+    return ''.join(kept)
 
 
 def _rust_function_bodies(text):
@@ -708,7 +866,10 @@ def _provider_keys(tree, commit, source, partial=False):
                 continue
             detail = error.stderr.decode('utf-8', errors='replace').strip() if error.stderr else ''
             raise ValueError(f'{path} at {commit}: {detail or f"git show exit {error.returncode}"}') from error
-        texts.append(re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0])
+        try:
+            texts.append(_without_test_items(text))
+        except ValueError as error:
+            raise ValueError(f'{error} at {commit[:8]}') from error
     keys = set()
     found = False
     for text in texts:
@@ -732,6 +893,7 @@ def _provider_keys(tree, commit, source, partial=False):
             text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
         except subprocess.CalledProcessError:
             continue
+        text = _without_test_items(text)
         list(_rust_function_bodies(text))
         keys.update(_block_keys(text))
     return keys
@@ -1285,13 +1447,17 @@ def _effects(plan, errors):
 
 
 CASE_LOADER = r'''
-import importlib.util, json, pathlib, sys
+import importlib, importlib.util, json, pathlib, sys
 judge_path = pathlib.Path(sys.argv[2])
 sys.path.insert(0, str(judge_path.parent))
 sys.path.insert(0, sys.argv[1])
-spec = importlib.util.spec_from_file_location(judge_path.stem, judge_path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+if len(sys.argv) > 5:
+    sys.path.insert(0, str(judge_path.parent))
+    module = importlib.import_module(sys.argv[5])
+else:
+    spec = importlib.util.spec_from_file_location(judge_path.stem, judge_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 judge = getattr(module, sys.argv[3])
 from judge_queue import effect_evidence
 result = {}
@@ -1312,6 +1478,59 @@ print(json.dumps(result))
 '''
 
 
+def _shared_judge(module, hook, row_id, errors):
+    path = SHARED_DIR / f'{module}.py'
+    try:
+        tree = ast.parse(path.read_text())
+        assignments = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == 'EFFECT_JUDGES' for target in node.targets):
+                assignments.append(node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == 'EFFECT_JUDGES':
+                assignments.append(node.value)
+        if not assignments:
+            return None
+        if len(assignments) != 1 or not isinstance(assignments[0], ast.Dict):
+            raise ValueError('must be one dict literal')
+        table = ast.literal_eval(assignments[0])
+        if not isinstance(table, dict):
+            raise ValueError('must be a dict')
+        for name, entry in table.items():
+            if (not isinstance(name, str) or not isinstance(entry, dict)
+                    or set(entry) != {'judge', 'cases'} or not isinstance(entry['judge'], str)
+                    or not isinstance(entry['cases'], str)):
+                raise ValueError('entries need a hook name, judge and cases strings')
+    except (OSError, SyntaxError, UnicodeError, ValueError, TypeError) as error:
+        errors.append(f'G9 row {row_id}: {module}.EFFECT_JUDGES is malformed: {error}')
+        return False
+    if hook not in table:
+        return None
+    entry = table[hook]
+    judge, folder = entry['judge'], entry['cases']
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    valid = True
+    if judge not in functions:
+        errors.append(f'G9 row {row_id}: {module}:{judge} is not a function of {module}')
+        valid = False
+    hook_function = functions.get(hook)
+    if not hook_function or not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                                    and node.func.id == judge for node in ast.walk(hook_function)):
+        errors.append(f'G9 row {row_id}: {module}:{hook} does not call its judge {judge}')
+        valid = False
+    try:
+        root = (SHARED_DIR / 'library' / 'cases').resolve()
+        component = bool(folder) and folder not in ('.', '..') and not any(ch in folder for ch in '/\\\0')
+        directory = (root / folder).resolve() if component else None
+        exists = directory is not None and directory.is_relative_to(root) and directory.is_dir()
+    except (OSError, ValueError, RuntimeError):
+        exists = False
+    if not exists:
+        errors.append(f'G9 row {row_id}: cases folder library/cases/{folder} is missing')
+        valid = False
+    return (path, judge, directory, root) if valid else False
+
+
 def _cases(plan, base, errors, warnings):
     from runner import row_role
 
@@ -1322,9 +1541,23 @@ def _cases(plan, base, errors, warnings):
         is_test = (('role' in row or ('start' in row and 'end' in row)) and row_role(row) == 'test')
         for step in _steps(row.get('steps')):
             spec = step.get('run')
-            if not isinstance(spec, str) or not step.get('effect') or spec.startswith('fixtures:'):
+            if not isinstance(spec, str) or not step.get('effect'):
                 continue
-            if 'cases' not in step:
+            module, separator, hook = spec.partition(':')
+            if module == 'fixtures' and separator and not is_test:
+                continue
+            shared_module = module if is_test and separator and module in shared_hook_names() else None
+            case_root = root
+            shared = None
+            if shared_module:
+                if 'cases' in step:
+                    errors.append(f'G9 row {row_id}: {spec} is a shared hook; its judge cases belong to '
+                                  'the runner (remove "cases")')
+                    continue
+                shared = _shared_judge(shared_module, hook, row_id, errors)
+                if shared is False:
+                    continue
+            if not shared and 'cases' not in step:
                 if is_test:
                     message = f'G9 row {row_id}: effect hook {spec} has no judge cases; its evidence is trusted'
                     if plan.get('require_cases'):
@@ -1332,25 +1565,29 @@ def _cases(plan, base, errors, warnings):
                     else:
                         warnings.append(message)
                 continue
-            cases = step['cases']
-            if not isinstance(cases, dict) or not isinstance(cases.get('judge'), str) or not isinstance(cases.get('dir'), str):
-                errors.append(f'G9 row {row_id}: cases: needs judge and dir')
-                continue
-            judge_spec, directory = cases['judge'], (base / cases['dir']).resolve()
-            judge_file, separator, function = judge_spec.partition(':')
-            path = (base / judge_file).resolve()
-            if (not separator or not judge_file or not function or not path.is_relative_to(root)):
-                errors.append(f'G9 row {row_id}: cases: invalid judge {judge_spec!r}')
-                continue
-            if not directory.is_relative_to(root) or not directory.is_dir():
-                errors.append(f'G9 row {row_id}: cases: directory {cases["dir"]!r} is not a folder inside the rows folder')
-                continue
+            if shared:
+                path, function, directory, case_root = shared
+                judge_file, judge_spec = f'{module}.py', f'{module}:{function}'
+            else:
+                cases = step['cases']
+                if not isinstance(cases, dict) or not isinstance(cases.get('judge'), str) or not isinstance(cases.get('dir'), str):
+                    errors.append(f'G9 row {row_id}: cases: needs judge and dir')
+                    continue
+                judge_spec, directory = cases['judge'], (base / cases['dir']).resolve()
+                judge_file, separator, function = judge_spec.partition(':')
+                path = (base / judge_file).resolve()
+                if (not separator or not judge_file or not function or not path.is_relative_to(root)):
+                    errors.append(f'G9 row {row_id}: cases: invalid judge {judge_spec!r}')
+                    continue
+                if not directory.is_relative_to(root) or not directory.is_dir():
+                    errors.append(f'G9 row {row_id}: cases: directory {cases["dir"]!r} is not a folder inside the rows folder')
+                    continue
             files = sorted(directory.rglob('*.json'), key=lambda p: p.relative_to(directory).as_posix())
             parsed, malformed = {}, False
             for case_path in files:
                 case_name = case_path.relative_to(directory).as_posix()
                 try:
-                    if not case_path.resolve().is_relative_to(root):
+                    if not case_path.resolve().is_relative_to(case_root):
                         raise ValueError(f'{case_name}: case leaves the rows folder')
                     case = json.loads(case_path.read_text())
                     if not isinstance(case, dict) or case.get('expect') not in ('accept', 'reject'):
@@ -1364,7 +1601,7 @@ def _cases(plan, base, errors, warnings):
                         if not isinstance(key, str) or not isinstance(name, str) or key in args:
                             raise ValueError(f'{case_name}: invalid file argument {key!r}')
                         source = (case_path.parent / name).resolve()
-                        if not source.is_relative_to(root) or not source.is_file():
+                        if not source.is_relative_to(case_root) or not source.is_file():
                             raise ValueError(f'{case_name}: file {name!r} leaves the rows folder or is missing')
                     parsed[case_name] = case
                 except (OSError, ValueError, TypeError) as error:
@@ -1378,7 +1615,7 @@ def _cases(plan, base, errors, warnings):
                 errors.append(f'G9 row {row_id}: cases need at least one accept and one reject '
                               f'(found {accepts} accept, {rejects} reject)')
             hook_file = (base / spec.partition(':')[0]).resolve()
-            if hook_file != path:
+            if not shared and hook_file != path:
                 try:
                     tree = ast.parse(hook_file.read_text())
                     imported = any(
@@ -1393,8 +1630,11 @@ def _cases(plan, base, errors, warnings):
             if key not in cache:
                 runner_dir = Path(__file__).resolve().parent
                 try:
-                    proc = subprocess.run([sys.executable, '-I', '-B', '-c', CASE_LOADER, str(runner_dir),
-                                           str(path), function, str(directory)],
+                    command = [sys.executable, '-I', '-B', '-c', CASE_LOADER, str(runner_dir),
+                               str(path), function, str(directory)]
+                    if shared:
+                        command.append(shared_module)
+                    proc = subprocess.run(command,
                                           timeout=120, capture_output=True, text=True, errors='replace')
                     lines = [line for line in proc.stderr.splitlines() if line.strip()]
                     if proc.returncode:

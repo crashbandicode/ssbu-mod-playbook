@@ -1,0 +1,1 @@
+{"args":{"p1":"Mario","cpu":"Greninja","boot":"0x3dec61593ef80877"},"files":{"lines":"accept-tk06.lines"},"expect":"reject","contains":"entry 1 wanted Greninja kind 53: roster kind 7, body kind 7"}

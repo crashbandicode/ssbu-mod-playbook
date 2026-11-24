@@ -1,0 +1,1 @@
+{"args":{"p1":null,"cpu":"Greninja","boot":"0xa1e80deccd2a9a15"},"files":{"lines":"missing-body-yoga.lines"},"expect":"reject","contains":"entry 1 wanted Greninja: no live body"}

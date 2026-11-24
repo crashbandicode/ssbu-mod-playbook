@@ -243,6 +243,36 @@ These are host test inputs, not runtime acceptance of this change.
 `ed2655d4` and `1a9b28ad`.
 Host tests only; no runtime acceptance.
 
+2026-11-24: The `eden-runner/library/cases/expect_fighters` and `reach_training` cases cut whole recorded
+bridge-log lines without editing them. Source `152629cd` is
+`rc15-fix-152629cd-yoga-training-1/out/bridge-run/bridge.log`; source `71158421` is
+`rc15-i2-71158421-yoga-1/out/bridge-run/bridge.log`; source `ib-practice` is
+`ib-practice-publisher/combined-yoga-main-1/out/bridge-run/bridge.log` in the phase23 artifacts.
+The cut files and SHA-256 values are:
+
+| Case JSON | Source and one-based lines | Cut file SHA-256 |
+| --- | --- | --- |
+| `expect_fighters/accept-tk06.json` | 152629cd: 2, 18830–18838 | `1be82a1217bced288c50072970da7d6720ee24f31da829d4bbcead5c2c65834c` |
+| `expect_fighters/reject-other-fighter.json` | 152629cd: 2, 18830–18838 | `1be82a1217bced288c50072970da7d6720ee24f31da829d4bbcead5c2c65834c` |
+| `expect_fighters/reject-other-boot.json` | 152629cd: 2, 18830–18838 | `1be82a1217bced288c50072970da7d6720ee24f31da829d4bbcead5c2c65834c` |
+| `expect_fighters/reject-missing-roster.json` | 71158421: 2, 9396–9399 | `98d570fb690c9388628952090dab970aa3ff5e3430ae8a7424066c60051c541b` |
+| `expect_fighters/reject-missing-body.json` | 71158421: 2, 9390–9394, 9396 | `c5ea4a2694c904bc1cd28c868876e556a4431cec16874c07352e26fb9b93a73a` |
+| `expect_fighters/reject-other-run.json` | 71158421: 2, 9397–9398, 9401, 9405–9408 | `6568bb08c9a3bd32c1c5e1613166c38f957e8c682d110e9f0fb9ff9f0e3637ad` |
+| `reach_training/accept-docs-enter-training.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-other-fighter.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-other-stage.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-other-boot.json` | 71158421: 2, 8184, 9409–9413 | `167ed58f9724cea66239470038ed28981706f46731cc5693ca0f036422a90842` |
+| `reach_training/reject-missing-roster.json` | 71158421: 2, 8184, 9396–9399 | `1d3fb68bf365d14baead5f2b4f984556902457ed426feee8f512b250248c41f7` |
+| `reach_training/reject-other-run.json` | 152629cd: 2, 18786, 18830–18834 | `d9be3ddeb732a2a8cb1f8e09604f3fc4ef8cffd5e5023691314754c27e0c56e9` |
+| `reach_training/reject-no-stage.json` | 71158421: 2, 9409–9413 | `ef32d8a3da408ec5497fd9ae297fd55062e6c199da00740be0330f5e0c5a6cb4` |
+| `reach_training/reject-superseded-stage.json` | ib-practice: 49661, 55199, 82764, 82851–82855 | `4b2da8a5ca838e189718efc9507dcff4c4249893bfbb0f6f20108021a83524bb` |
+
+The missing-roster cases end after the old CPU goes and before the new CPU appears. The missing-body case has no
+fresh fighters reply in that interval. Reach stage lines come from the current connection. In the superseded-stage
+case, the recorded Training stage 308 is superseded by Battlefield 0 before the recorded roster reply. The
+wrong-stage case requests Battlefield against the recorded Final Destination stage. These are host test inputs,
+not runtime acceptance of this change.
+
 2026-11-24: `eden-runner/test-data/bridge-ui/c5efb86/src/native_ui/mod.rs` excerpts
 `/home/intpa/ssbu-hw-bridge` commit `c5efb86`, `src/native_ui/mod.rs` lines 13, 513–530,
 763–780, 885–970, 973–979 and 1040–1045; full blob SHA-256
@@ -254,3 +284,17 @@ and commit, `src/native_ui/pause_focus.rs` lines 26–63 and 65–71; full blob 
 commit `ed2655d4`, `src/native_ui/mod.rs` lines 507–524, 634–711 and 714–720; full blob SHA-256
 `265aa2441a219d917066d3ed60a090836dce15cacb90fe7f51ed7f7133d9df4e`.
 Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/test-data/bridge-ui/95abb28/src/native_ui/mod.rs` excerpts
+`/home/intpa/ssbu-hw-bridge` commit `95abb2829574c49f28789cd2a9c3df63a1181d0b`,
+`src/native_ui/mod.rs` lines 15, 982–1117 and 1388–1391, joined in that order and unchanged; full blob
+SHA-256 `8033bb93846cb19243e8dcc86f178b5ecda23fa375eb584f1e5bdf23cdcf05ce`. It holds the test-only
+`fn encode` inside `impl Sample` (line 994), the real state-block writer after it, and the two test
+module declarations the file ends with.
+Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/packet_gate.py` G9 supports shared-hook
+`EFFECT_JUDGES` and library cases. Host tests only; no runtime acceptance.
+
+2026-11-24: `eden-runner/packet_gate.py` G9 checks fixture effect hooks in
+test rows under the shared-hook case rules. Host tests only; no runtime acceptance.

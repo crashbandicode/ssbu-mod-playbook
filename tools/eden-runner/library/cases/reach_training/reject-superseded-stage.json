@@ -1,0 +1,1 @@
+{"args":{"p1":"Mario","cpu":"Little Mac","stage":"Training","form":"normal","boot":"0x0b774a7580185f1b"},"files":{"lines":"superseded-stage-yoga.lines"},"expect":"reject","contains":"live Training state does not match the requested setup"}
