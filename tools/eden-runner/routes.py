@@ -3597,17 +3597,34 @@ def _bridge_on_owned_listener(ctx, port):
     return listener
 
 
-def _bridge_on_ui_blocks_since_hello(text, hello):
-    lines = text.splitlines()
-    try:
-        start = lines.index(hello)
-    except ValueError:
-        raise RuntimeError('bridge_on (stub on): bridge greeting disappeared from capture log') from None
-    segment = []
-    for line in lines[start:]:
+def _bridge_on_latest_connection(text):
+    hello = install = None
+    start = None
+    for index, line in enumerate(text.splitlines()):
         if state_gate.BOUNDARY.search(line):
-            segment = []
-        elif state_gate.BEGIN.search(line):
+            hello = line if '[Bridge] hello ' in line else None
+            install = None
+            start = index if hello is not None else None
+        elif hello is not None and install is None and 'plugin=ssbu-hw-bridge/' in line and 'result=' in line:
+            install = line
+    return (hello, install, start) if hello is not None and install is not None else None
+
+
+def _bridge_on_connection_changed(line):
+    return RuntimeError(f"bridge_on (stub on): the bridge connection changed after the greeting "
+                        f"({line[:120]}): the Title cannot be read from an earlier connection")
+
+
+def _bridge_on_ui_blocks_since_hello(text, hello, start):
+    lines = text.splitlines()
+    if start >= len(lines) or lines[start] != hello:
+        raise RuntimeError('bridge_on (stub on): bridge greeting disappeared from capture log')
+    for line in lines[start + 1:]:
+        if state_gate.BOUNDARY.search(line):
+            raise _bridge_on_connection_changed(line)
+    segment = []
+    for line in lines[start + 1:]:
+        if state_gate.BEGIN.search(line):
             segment = [line]
         elif segment:
             segment.append(line)
@@ -3622,7 +3639,7 @@ def _bridge_on_ui_blocks_since_hello(text, hello):
                 segment = []
 
 
-def _bridge_on_stub_title(ctx, hello):
+def _bridge_on_stub_title(ctx, hello, start):
     match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
     if match is None:
         raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
@@ -3644,7 +3661,7 @@ def _bridge_on_stub_title(ctx, hello):
         if now >= next_request:
             bridge_v2(ctx, 'providers', 'state ssbu.ui')
             next_request = now + .1
-        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello))
+        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello, start))
         if len(blocks) < seen:
             raise RuntimeError('bridge_on (stub on): bridge observation history changed')
         for block in blocks[seen:]:
@@ -3768,13 +3785,23 @@ def bridge_on(ctx, port=None, cap=60):
     ctx.runner.instances.setdefault(ctx.on, {})['bridge_log'] = str(log)
     text = ''
     until = time.monotonic() + cap
-    while 'plugin=ssbu-hw-bridge/' not in text or 'tr_export=' not in text:
-        if time.monotonic() > until:
-            raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
-        time.sleep(0.2)
-        text = log.read_text(errors='replace')
-    hello = next(l for l in text.splitlines() if '[Bridge] hello' in l)
-    install = next(l for l in text.splitlines() if 'plugin=ssbu-hw-bridge/' in l and 'result=' in l)
+    if trace is None:
+        connection = None
+        while connection is None:
+            if time.monotonic() > until:
+                raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
+            time.sleep(0.2)
+            text = log.read_text(errors='replace')
+            connection = _bridge_on_latest_connection(text)
+        hello, install, start = connection
+    else:
+        while 'plugin=ssbu-hw-bridge/' not in text or 'tr_export=' not in text:
+            if time.monotonic() > until:
+                raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
+            time.sleep(0.2)
+            text = log.read_text(errors='replace')
+        hello = next(l for l in text.splitlines() if '[Bridge] hello' in l)
+        install = next(l for l in text.splitlines() if 'plugin=ssbu-hw-bridge/' in l and 'result=' in l)
     guard = next((field for field in install.split() if field.startswith('guards=')), '')
     if not guard or int(guard.split('=', 1)[1], 16) & 0x3fffff != 0x3fffff:
         raise RuntimeError(f'bridge core guards incomplete: {install}')
@@ -3799,7 +3826,7 @@ def bridge_on(ctx, port=None, cap=60):
                                    f"is boot {match[1]}: cannot show how this boot's bridge was enabled")
             title = {'checked': False, 'reason': 'bridge already On before this call', 'qualified_by': qualified}
         else:
-            title = _bridge_on_stub_title(ctx, hello)
+            title = _bridge_on_stub_title(ctx, hello, start)
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:
@@ -3823,6 +3850,14 @@ def bridge_on(ctx, port=None, cap=60):
         while (Path(ctx.row_dir) / f'{name}.json').exists():
             name = f'routes-bridge-on-{suffix}'
             suffix += 1
+        text = log.read_text(errors='replace')
+        connection = _bridge_on_latest_connection(text)
+        if connection is None or connection[0] != hello or connection[2] != start:
+            lines = text.splitlines()
+            boundary = next((line for line in lines[start + 1:] if state_gate.BOUNDARY.search(line)), None)
+            if boundary is None:
+                boundary = lines[start] if start < len(lines) else 'greeting disappeared'
+            raise _bridge_on_connection_changed(boundary)
     return _save(ctx, name, receipt)
 
 
