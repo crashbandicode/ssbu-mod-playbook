@@ -34,6 +34,13 @@ no longer needs its target trees, run this on that host, replacing `LABEL`
 with the run label; it removes the run's trees but retains the cache:
 `/usr/bin/python3 -I -B /home/intpa/eden-runs/_eden-test/stage/LABEL/tools/eden-test/eden_test.py unstage-targets --label LABEL`.
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
+A remote go uses that shared base unless `--from` names another one. `--from` is then a path on the host, a `.json`
+file directly in the run's own stage folder `/home/intpa/eden-runs/_eden-test/stage/<label>/`; it is forwarded, and a
+local file is never copied there. The host refuses a base that is missing, is for another host, is a symlink, or
+pins another Eden AppImage than its shared base does, and starts nothing. A base without a `trace` section needs no
+`--elf` and no trace points: use one for a stub-on run on a host whose shared base is a trace base. The shared base
+is only read. On a machine that reaches the host over ssh (`--ssh` or `hosts.json`), a local file given as `--from`
+is refused even when it names that host.
 The repository does not ship a `base.json` template; it is maintained on
 each host. Add `"notify": {"file": "/home/intpa/eden-run-notify/NOTIFY.md",
 "to": "tr-primary-2"}` to that base, without an `ssh` key. Notifications
