@@ -3674,9 +3674,11 @@ class WirelessRoomTests(unittest.TestCase):
                     values.update({'focus': self.main_focus, 'screen.layer': 'top', 'dialog': 'none',
                                    'dashboard': self.dashboard})
                     if self.dashboard == 'open':
+                        # An open dashboard that takes input: owner and dialog both read `dashboard`.
                         values.update({'focus.id': ('dashboard.local_wireless' if self.dashboard_index == 2
                                                     else f'dashboard.item{self.dashboard_index}'),
-                                       'focus.index': str(self.dashboard_index)})
+                                       'focus.index': str(self.dashboard_index),
+                                       'input.owner': 'dashboard', 'dialog': 'dashboard'})
                 if self.phase == self.ready_no_phase:
                     values['input.ready'] = 'no'
                 elif self.phase == 'stage' and self.stage_ready_after:
@@ -5323,7 +5325,8 @@ class DashboardRouteTests(unittest.TestCase):
             self.room_ready = 'yes'
             self.room_ready_after = None
             self.form_ready = 'yes'
-            self.dashboard_dialog = 'none'
+            self.dashboard_owner = 'dashboard'
+            self.dashboard_dialog = 'dashboard'
             self.a_delay = None
             self.a_sent_at = None
             self.close_after_a = False
@@ -5347,8 +5350,10 @@ class DashboardRouteTests(unittest.TestCase):
                         values.pop('input.ready', None)
                     if self.dashboard == 'open':
                         values['dialog'] = self.dashboard_dialog
-                        if self.main_owner is None:
+                        if self.dashboard_owner is None:
                             values.pop('input.owner', None)
+                        else:
+                            values['input.owner'] = self.dashboard_owner
                         if self.missing_dashboard_ready:
                             values.pop('input.ready', None)
                         values['focus.id'] = ('dashboard.local_wireless' if self.dashboard_index == self.local_index
@@ -5521,16 +5526,19 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(caught.exception.step, 'dashboard-a')
                 self.assertEqual(self.io.actions, ['lobby-a', 'tap-zr1'])
 
-    def test_dashboard_presses_require_native_owner_and_no_dialog(self):
+    def test_dashboard_presses_require_the_dashboard_owner_and_dialog(self):
+        # The bridge author's table: an open dashboard that takes input reads owner dashboard, dialog dashboard.
+        # Anything else on an open dashboard, the Main Menu's own native/none included, is a contradiction.
         for guest in (False, True):
-            for owner, dialog in (('popup', 'confirmation'), ('native', 'confirmation'),
-                                  (None, 'none'), ('unknown', 'none')):
+            for owner, dialog in (('popup', 'confirmation'), ('native', 'none'), ('native', 'dashboard'),
+                                  ('dashboard', 'none'), ('dashboard', 'confirmation'),
+                                  (None, 'dashboard'), ('unknown', 'dashboard'), ('unknown', 'unknown')):
                 for index in (0, 2):
                     with self.subTest(guest=guest, owner=owner, dialog=dialog, index=index):
                         self.io = self.IO()
                         self.now = 0
                         self.io.dashboard, self.io.dashboard_index = 'open', index
-                        self.io.main_owner, self.io.dashboard_dialog = owner, dialog
+                        self.io.dashboard_owner, self.io.dashboard_dialog = owner, dialog
                         with self.assertRaises(routes.closed_loop.RouteStopped) as caught:
                             self.run_route(guest)
                         self.assertNotEqual(caught.exception.step, 'locate')

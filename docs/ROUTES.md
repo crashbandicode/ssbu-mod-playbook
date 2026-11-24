@@ -96,7 +96,9 @@ observed Down steps as needed. The proposed `dashboard`, `dashboard.*` focus and
 `dashboard.local_wireless` keys are unflown; without `dashboard` the route stops before ZR.
 Main, dashboard, room list and Create form require `input.ready=yes`; only the tile-gated pickers accept
 an absent readiness key. The guest waits up to 20 seconds for a positively ready room list without input.
-Dashboard Down and A also require `input.owner` in `DASHBOARD_OWNERS` (currently `native`) and `dialog=none`.
+Dashboard Down and A also require what an open, input-taking dashboard publishes: `input.owner=dashboard` and
+`dialog=dashboard` (`DASHBOARD_OWNERS`, `DASHBOARD_DIALOG`). The Main Menu's own `native` / `none` on an open
+dashboard is a contradiction and gets no press.
 Dashboard A is sent at most once per run, even if the route leaves and later returns to that step.
 A repeated step after a jump back is recorded as a stall; a retry within one visit is not counted twice.
 The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,

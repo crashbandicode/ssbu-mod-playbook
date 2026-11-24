@@ -1156,7 +1156,10 @@ def _wireless_placed(tile):
 DASHBOARD_KEY = 'dashboard'
 DASHBOARD_FOCUS = 'dashboard.'
 DASHBOARD_LOCAL_WIRELESS = 'dashboard.local_wireless'
-DASHBOARD_OWNERS = ('native',)
+# What an open dashboard that takes input publishes (the bridge author's table, 2026-11-24): owner and dialog both
+# read `dashboard`. The Main Menu's own native/none on an open dashboard is a contradiction and gets no press.
+DASHBOARD_OWNERS = ('dashboard',)
+DASHBOARD_DIALOG = 'dashboard'
 
 
 def _wireless_ready(ui):
@@ -1212,7 +1215,7 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
     def dashboard_ready(obs):
         ui = obs['ui']
         return (dashboard(obs) and _wireless_ready(ui)
-                and ui.get('input.owner') in DASHBOARD_OWNERS and ui.get('dialog') == 'none')
+                and ui.get('input.owner') in DASHBOARD_OWNERS and ui.get('dialog') == DASHBOARD_DIALOG)
 
     def open_at(obs):
         ui = obs['ui']
