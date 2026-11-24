@@ -8,7 +8,10 @@ import io
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import pwd
 import re
+import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -26,10 +29,17 @@ real_ssh_diagnosis = life.ssh_diagnosis
 
 
 class FakeMux:
-    def __init__(self, host, ssh_options=(), **_kwargs):
+    def __init__(self, host, ssh_options=(), **kwargs):
         self.host = host
+        self.run = kwargs.get('run', subprocess.run)
+        self.options = ssh_options
+        self.evidence_dir = kwargs.get('evidence_dir')
+        self.ssh_bin = kwargs.get('ssh_bin', 'ssh')
+        self.windows = kwargs.get('windows', False)
         self._temporary = tempfile.TemporaryDirectory(prefix='fake-eden-mux-')
         self.root = Path(self._temporary.name)
+        self.master_log = self.root / 'master-1.log'
+        self.master_log.write_text('Authenticated to fake-host\nEntering interactive session\n')
         self.attempt_deadline = None
         self.open_generation = 0
         self.rider_args = [*life.SSH_OPTIONS, *ssh_options, '-o', 'ControlMaster=no',
@@ -44,8 +54,16 @@ class FakeMux:
     def ensure(self):
         pass
 
+    def _control(self, operation):
+        return subprocess.CompletedProcess(['ssh', '-O', operation], 0, '', '')
+
 
 def setUpModule():
+    temporary = tempfile.TemporaryDirectory(prefix='lifecycle-test-state-')
+    unittest.addModuleCleanup(temporary.cleanup)
+    environment = patch.dict(os.environ, {'XDG_STATE_HOME': temporary.name})
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
     mux = patch.object(life, 'SshMux', FakeMux)
     mux.start()
     unittest.addModuleCleanup(mux.stop)
@@ -2668,8 +2686,10 @@ class LedgerForwardTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.plan = []
+        self.temporary = tempfile.TemporaryDirectory(prefix='ledger-forward-state-')
+        self.addCleanup(self.temporary.cleanup)
         self.config = {'ledger': '/tmp/unused-fake-ledger', 'host': 'xps', 'owner': 'Codex test/owner',
-                       'token': 'a' * 32}
+                       'token': 'a' * 32, 'state_dir': self.temporary.name}
         self.line = f"2026 CLAIMED: {self.config['owner']} host=xps lifecycle={'a' * 32} Eden lifecycle admitted"
         self.diagnoses = []
         self.diagnosis = patch.object(life, 'ssh_diagnosis', side_effect=lambda *a, **k: self.diagnoses.pop(0))
@@ -2736,35 +2756,44 @@ class LedgerForwardTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.diagnosis_mock.assert_called_once()
 
-    def test_bad_json_is_transport_but_other_nonzero_refuses_immediately(self):
+    def test_bad_json_and_other_nonzero_refuse_without_diagnosis(self):
         self.plan = ['not-json', self.read()]
-        self.diagnoses = [self.diag()]
-        self.assertEqual(self.request('read'), self.read())
+        with self.assertRaisesRegex(life.Refused, 'invalid ledger reply'):
+            self.request('read')
+        self.assertEqual(len(self.calls), 1)
+        self.diagnosis_mock.assert_not_called()
         self.calls.clear()
-        self.diagnosis_mock.reset_mock()
         self.plan = [2]
         with self.assertRaisesRegex(life.Refused, 'SSH lifecycle failed: synthetic SSH failure'):
             self.request('read')
         self.assertEqual(len(self.calls), 1)
         self.diagnosis_mock.assert_not_called()
 
-    def test_transient_transport_retries_once_and_success(self):
+    def test_transient_transport_diagnoses_without_replaying(self):
         self.plan = [255, self.read()]
         self.diagnoses = [self.diag()]
-        self.assertEqual(self.request('read'), self.read())
-        self.assertEqual([c[0] for c in self.calls], ['ledger-read', 'ledger-read'])
+        with self.assertRaises(life.LedgerTransport) as error:
+            self.request('read')
+        self.assertEqual(str(error.exception),
+                         'SSH lifecycle failed: synthetic SSH failure; ssh diag fake -> fake-yoga: synthetic; '
+                         f'ssh-diag receipt: {Path(self.temporary.name) / "ssh-diag.md"}')
+        forwarded = life.LedgerTransport(json.loads(json.dumps(error.exception.diagnoses)))
+        self.assertEqual(str(forwarded), str(error.exception))
+        self.assertEqual([c[0] for c in self.calls], ['ledger-read'])
         self.diagnosis_mock.assert_called_once()
+        self.assertFalse(self.diagnosis_mock.call_args.kwargs['allow_retry'])
+        self.assertEqual(len((Path(self.temporary.name) / 'ssh-diag.md').read_text().splitlines()), 1)
 
-    def test_two_transport_failures_preserve_both_diagnoses(self):
+    def test_transport_failure_preserves_one_diagnosis_without_replaying_claim(self):
         self.plan = [255, 255]
         self.diagnoses = [self.diag(True, 'first'), self.diag(True, 'second')]
         with self.assertRaises(life.LedgerTransport) as error:
             self.request('claim')
-        self.assertEqual(len(error.exception.diagnoses), 2)
-        self.assertTrue(error.exception.transient)
+        self.assertEqual(len(error.exception.diagnoses), 1)
+        self.assertFalse(error.exception.transient)
         self.assertIn('first', str(error.exception))
-        self.assertIn('second', str(error.exception))
-        self.assertEqual([c[0] for c in self.calls], ['ledger-claim', 'ledger-claim'])
+        self.assertNotIn('second', str(error.exception))
+        self.assertEqual([c[0] for c in self.calls], ['ledger-claim'])
 
     def test_non_transient_and_timeout(self):
         self.plan = [255]
@@ -2776,8 +2805,12 @@ class LedgerForwardTests(unittest.TestCase):
         self.calls.clear()
         self.plan = [subprocess.TimeoutExpired('ssh', 10), self.read()]
         self.diagnoses = [self.diag()]
-        self.assertEqual(self.request('read'), self.read())
-        self.assertEqual(len(self.calls), 2)
+        with self.assertRaises(life.LedgerTransport) as error:
+            self.request('read')
+        self.assertEqual(str(error.exception), 'SSH lifecycle failed: ' +
+                         str(subprocess.TimeoutExpired('ssh', 10)) + '; ssh diag fake -> fake-yoga: synthetic; '
+                         f'ssh-diag receipt: {Path(self.temporary.name) / "ssh-diag.md"}')
+        self.assertEqual(len(self.calls), 1)
 
     def test_real_classifier_without_target_never_retries_fake_packet_loss(self):
         for loss, expected_attempts in ((20, 1), (0, 1)):
@@ -2794,13 +2827,13 @@ class LedgerForwardTests(unittest.TestCase):
                         return subprocess.CompletedProcess(argv, 0, f'{loss}% packet loss\n', '')
                     return subprocess.CompletedProcess(argv, 255, '', 'Connecting to fake-host\nConnection established\n')
                 def diagnose(host, **kwargs):
-                    return real_ssh_diagnosis(host, **kwargs, evidence_dir=tmp, tcp=lambda *_: True)
+                    kwargs['evidence_dir'] = tmp
+                    return real_ssh_diagnosis(host, **kwargs, tcp=lambda *_: True)
                 self.diagnosis_mock.side_effect = diagnose
                 with patch('sys.stderr', new=io.StringIO()):
                     with self.assertRaises(life.LedgerTransport) as error:
                         life.ledger_forward('fake-host', 'read', self.config, run=run)
-                    self.assertIn('target health not confirmed, no retry' if loss else 'not established',
-                                  str(error.exception))
+                    self.assertIn('not established', str(error.exception))
                 self.assertEqual(len(attempts), expected_attempts)
 
     def test_real_classifier_target_health_matrix_for_ledger(self):
@@ -2808,18 +2841,20 @@ class LedgerForwardTests(unittest.TestCase):
             with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
                 attempts = []
                 run = target_fixture_run(facts, attempts, ping, succeed_after_failure=True)
-                self.diagnosis_mock.side_effect = lambda host, **kw: real_ssh_diagnosis(
-                    host, **kw, evidence_dir=tmp, tcp=lambda *_: True)
+                def diagnose(host, **kwargs):
+                    kwargs['evidence_dir'] = tmp
+                    return real_ssh_diagnosis(host, **kwargs, tcp=lambda *_: True)
+                self.diagnosis_mock.side_effect = diagnose
                 with patch('sys.stderr', new=io.StringIO()):
-                    if expected_attempts == 2:
-                        self.assertEqual(life.ledger_forward('fake-host', 'read', self.config, run=run),
-                                         {'owned_claim': True})
-                    else:
-                        with self.assertRaises(life.LedgerTransport) as error:
-                            life.ledger_forward('fake-host', 'read', self.config, run=run)
+                    with self.assertRaises(life.LedgerTransport) as error:
+                        life.ledger_forward('fake-host', 'read', self.config, run=run)
+                    if label in ('overload-loss', 'throttled-loss'):
                         self.assertIn(expected_cause, error.exception.diagnoses[0]['cause'])
-                        self.assertFalse(error.exception.transient)
-                self.assertEqual(len(attempts), expected_attempts)
+                    else:
+                        self.assertIn('not established (attempt stalled in session;', error.exception.diagnoses[0]['cause'])
+                    self.assertFalse(error.exception.transient)
+                self.assertEqual(len(attempts), 1)
+                self.assertFalse(self.diagnosis_mock.call_args.kwargs['allow_retry'])
 
     def test_real_overloaded_target_stops_ledger_after_one_attempt(self):
         facts = {'load1': 48, 'cores': 8, 'memAvailMiB': 150, 'oomKills5m': 2,
@@ -2827,8 +2862,10 @@ class LedgerForwardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='eden-diag-') as tmp:
             attempts = []
             run = target_fixture_run(facts, attempts)
-            self.diagnosis_mock.side_effect = lambda host, **kw: real_ssh_diagnosis(
-                host, **kw, evidence_dir=tmp, tcp=lambda *_: True)
+            def diagnose(host, **kwargs):
+                kwargs['evidence_dir'] = tmp
+                return real_ssh_diagnosis(host, **kwargs, tcp=lambda *_: True)
+            self.diagnosis_mock.side_effect = diagnose
             with patch('sys.stderr', new=io.StringIO()), self.assertRaises(life.LedgerTransport) as error:
                 life.ledger_forward('fake-host', 'read', self.config, run=run)
             self.assertEqual(len(attempts), 1)
@@ -2836,7 +2873,7 @@ class LedgerForwardTests(unittest.TestCase):
             self.assertIn('target overloaded (load 48 on 8 cores, 150 MiB available, 2 OOM kills)',
                           str(error.exception))
 
-    def test_claim_lost_ack_retries_idempotently(self):
+    def test_claim_lost_ack_is_not_replayed(self):
         with tempfile.TemporaryDirectory(prefix='eden-ledger-ack-') as temporary:
             path = Path(temporary) / 'ledger.txt'
             path.write_text('')
@@ -2850,9 +2887,9 @@ class LedgerForwardTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 255, '', 'lost ACK') if len(calls) == 1 else \
                     subprocess.CompletedProcess(argv, 0, json.dumps(result), '')
             self.diagnoses = [self.diag()]
-            result = life.ledger_forward('fake-yoga', 'claim', self.config, run=run)
-            self.assertTrue(result['already_claimed'])
-            self.assertEqual(len(calls), 2)
+            with self.assertRaises(life.LedgerTransport):
+                life.ledger_forward('fake-yoga', 'claim', self.config, run=run)
+            self.assertEqual(len(calls), 1)
             self.assertEqual(path.read_text().count(' CLAIMED:'), 1)
 
     def test_idempotent_claim_release_and_absent_release(self):
@@ -2996,6 +3033,301 @@ class LedgerForwardTests(unittest.TestCase):
 
 
 class SshDiagnosisTests(unittest.TestCase):
+    def test_transport_classifier_and_receipt_preserve_application_failures(self):
+        with tempfile.TemporaryDirectory(prefix='transport-test-') as temporary:
+            mux = FakeMux('fake-host')
+            self.addCleanup(mux._temporary.cleanup)
+            diagnosis = {'line': 'ssh diag fake: fixture', 'phase': 'session', 'transient': False,
+                         'cause': 'fixture', 'evidence': 'unavailable'}
+            cases = [('ssh', 255, '', True), ('ssh', 1, 'remote application failed', False),
+                     ('rsync', 255, '', True), ('rsync', 10, '', True), ('rsync', 12, '', True),
+                     ('rsync', 30, '', True), ('rsync', 35, '', True), ('rsync', 23, '', False),
+                     ('scp', 255, '', True), ('scp', 1, 'Connection reset by peer', True),
+                     ('scp', 1, 'no such file', False)]
+            for kind, code, stderr, expected in cases:
+                with self.subTest(kind=kind, code=code, stderr=stderr), \
+                        patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diagnose:
+                    value = life.ssh_transport_failure(mux, kind, code, stderr)
+                    self.assertEqual(value is not None, expected)
+                    self.assertEqual(diagnose.call_count, int(expected))
+                    if expected:
+                        self.assertEqual(diagnose.call_args.kwargs['attempt_log'], mux.master_log)
+                        self.assertFalse(diagnose.call_args.kwargs['allow_retry'])
+                        self.assertTrue(diagnose.call_args.kwargs['rider'])
+            with patch.object(mux, '_control', return_value=subprocess.CompletedProcess([], 255)), \
+                    patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diagnose:
+                self.assertEqual(life.ssh_transport_failure(mux, 'scp', 1, 'no such file'), diagnosis)
+                diagnose.assert_called_once()
+            for kind in ('ssh', 'rsync', 'scp'):
+                with self.subTest(timeout=kind), patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                    self.assertEqual(life.ssh_transport_failure(mux, kind, None, '', timed_out=True), diagnosis)
+                    self.assertTrue(diag.call_args.kwargs['attempt_timed_out'])
+            life.ssh_receipt({**diagnosis, 'kind': 'scp', 'what': 'report'}, temporary)
+            lines = (Path(temporary) / 'ssh-diag.md').read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertIn(' scp report : ssh diag fake: fixture', lines[0])
+            with patch.object(Path, 'mkdir', side_effect=PermissionError('read only')):
+                life.ssh_receipt({**diagnosis, 'kind': 'ssh', 'what': 'probe'}, temporary)
+
+    def test_rider_uses_master_session_and_separate_diagnostic_login(self):
+        with tempfile.TemporaryDirectory(prefix='rider-phase-') as temporary:
+            attempt = Path(temporary) / 'master.log'
+            attempt.write_text('SSH2_MSG_NEWKEYS received\nAuthenticated to fake-host\n')
+            run = target_fixture_run(None, [])
+            with patch('sys.stderr', new=io.StringIO()):
+                result = real_ssh_diagnosis('fake-host', run=run, evidence_dir=temporary,
+                                            tcp=lambda *_: True, attempt_log=attempt, rider=True,
+                                            allow_retry=False)
+            self.assertEqual(result['phase'], 'session')
+            self.assertIn('attempt phase session (rider on an open master)', result['line'])
+            self.assertIn('diag login failed, phase banner', result['line'])
+            self.assertIn('retry: no', result['line'])
+
+    def test_forward_and_notify_diagnose_once_without_replay(self):
+        for code in (255, 1):
+            with self.subTest(code=code), tempfile.TemporaryDirectory(prefix='rider-forward-') as temporary:
+                diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+                response = subprocess.CompletedProcess([], code, 'application output', 'application error')
+                run = unittest.mock.Mock(return_value=response)
+                with patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                    with self.assertRaises(life.Refused) as error:
+                        life.forward('fake-host', 'status', {'state_dir': temporary}, False, run=run)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(diag.call_count, int(code == 255))
+                self.assertEqual('ssh diag named' in str(error.exception), code == 255)
+                self.assertEqual(str(error.exception), 'SSH lifecycle failed: application errorapplication output' +
+                                 (f'; ssh diag named; ssh-diag receipt: {Path(temporary) / "ssh-diag.md"}'
+                                  if code == 255 else ''))
+                receipt = Path(temporary) / 'ssh-diag.md'
+                self.assertEqual(receipt.is_file(), code == 255)
+                if receipt.exists():
+                    self.assertEqual(len(receipt.read_text().splitlines()), 1)
+
+                notify_dir = Path(temporary) / 'notify'
+                notify_dir.mkdir()
+                controller = life.Lifecycle.__new__(life.Lifecycle)
+                controller.c = {'notify': {'ssh': 'fake-host', 'file': '/fake/notice'},
+                                'label': 'fixture', 'owner': 'Codex test/owner'}
+                controller.directory, controller.state = notify_dir, {}
+                controller.record = unittest.mock.Mock()
+                controller.write = unittest.mock.Mock()
+                with patch.object(life.subprocess, 'run', return_value=response) as run, \
+                        patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                    controller.notify('failure')
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(diag.call_count, int(code == 255))
+                self.assertEqual('ssh diag named' in controller.state['notify_errors'][0]['error'], code == 255)
+                self.assertIn('notify SSH failed: application error' +
+                              ('; ssh diag named' if code == 255 else ''),
+                              controller.state['notify_errors'][0]['error'])
+                self.assertEqual((notify_dir / 'ssh-diag.md').is_file(), code == 255)
+
+    def test_notify_journals_diagnosis_when_master_retry_succeeds(self):
+        with tempfile.TemporaryDirectory(prefix='notify-retry-') as temporary:
+            receipt = Path(temporary) / 'ssh-diag.md'
+            line = f'ssh diag packet loss; retry: yes, once; ssh-diag receipt: {receipt}'
+            class RetriedMux:
+                rider_args = []
+                diagnoses = [{'line': 'ssh diag packet loss; retry: yes, once', 'receipt': str(receipt),
+                              'reported_line': line}]
+                def __init__(self, *_args, **_kwargs):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+            controller = life.Lifecycle.__new__(life.Lifecycle)
+            controller.c = {'notify': {'ssh': 'fake-host', 'file': '/fake/notice'},
+                            'label': 'fixture', 'owner': 'test'}
+            controller.directory, controller.state = Path(temporary), {}
+            controller.record = unittest.mock.Mock()
+            controller.write = unittest.mock.Mock()
+            with patch.object(life, 'SshMux', RetriedMux), \
+                    patch.object(life.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+                controller.notify('ready')
+            run.assert_called_once()
+            controller.record.assert_called_once_with('ssh-diagnosis', {'line': line})
+            self.assertFalse(controller.state.get('notify_errors'))
+
+    def test_receipt_write_failure_does_not_mask_forward_stop(self):
+        with tempfile.TemporaryDirectory(prefix='receipt-readonly-') as temporary:
+            response = subprocess.CompletedProcess([], 255, '', 'connection reset')
+            diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+            original_open = Path.open
+            def open_file(path, *args, **kwargs):
+                if path.name == 'ssh-diag.md':
+                    raise PermissionError('read only')
+                return original_open(path, *args, **kwargs)
+            with patch.dict(os.environ, {'XDG_STATE_HOME': str(Path(temporary) / 'state')}), \
+                    patch.object(life, 'ssh_diagnosis', return_value=diagnosis), patch.object(Path, 'open', open_file):
+                with self.assertRaises(life.Refused) as error:
+                    life.forward('fake-host', 'status', {'state_dir': temporary}, False,
+                                 run=lambda *_args, **_kwargs: response)
+            fallback = Path(temporary) / 'state/eden-lifecycle/ssh-diag/ssh-diag-fallback.md'
+            self.assertEqual(str(error.exception), 'SSH lifecycle failed: connection reset; ssh diag named; '
+                             f'ssh-diag receipt: {fallback}')
+            self.assertEqual(len(fallback.read_text().splitlines()), 1)
+            self.assertIn(f'intended {Path(temporary) / "ssh-diag.md"}:', fallback.read_text())
+
+    def test_receipt_primary_fallback_and_unwritable_destinations(self):
+        diagnosis = {'line': 'ssh diag named', 'kind': 'ssh', 'what': 'test'}
+        with tempfile.TemporaryDirectory(prefix='receipt-fallback-') as temporary:
+            root = Path(temporary)
+            primary, state, temp = root / 'run', root / 'state', root / 'temp'
+            primary.mkdir()
+            temp.mkdir()
+            fallback = state / 'eden-lifecycle/ssh-diag/ssh-diag-fallback.md'
+            last = temp / f'eden-ssh-diag-{os.getuid()}.md'
+            with patch.dict(os.environ, {'XDG_STATE_HOME': str(state)}), \
+                    patch.object(life.tempfile, 'gettempdir', return_value=str(temp)):
+                normal = life.ssh_receipt(diagnosis, primary)
+                self.assertEqual(normal, str(primary / 'ssh-diag.md'))
+                self.assertEqual(len(Path(normal).read_text().splitlines()), 1)
+                Path(normal).unlink()
+                (primary / 'ssh-diag.md').mkdir()
+                selected = life.ssh_receipt(diagnosis, primary)
+                self.assertEqual(selected, str(fallback))
+                self.assertEqual(len(fallback.read_text().splitlines()), 1)
+                self.assertTrue(fallback.read_text().startswith(f'intended {primary / "ssh-diag.md"}: '))
+                fallback.unlink()
+                fallback.mkdir()
+                selected = life.ssh_receipt(diagnosis, primary)
+                self.assertEqual(selected, str(last))
+                self.assertTrue(last.read_text().startswith(f'intended {primary / "ssh-diag.md"}: '))
+                last.unlink()
+                victim = root / 'unrelated'
+                victim.write_text('untouched')
+                last.symlink_to(victim)
+                self.assertIsNone(life.ssh_receipt(diagnosis, primary))
+                self.assertEqual(victim.read_text(), 'untouched')
+                last.unlink()
+                last.mkdir()
+                self.assertIsNone(life.ssh_receipt(diagnosis, primary))
+
+    def test_classifier_diagnosis_error_has_complete_keys_and_master_phase(self):
+        with tempfile.TemporaryDirectory(prefix='diagnosis-error-') as temporary:
+            mux = FakeMux('fake-host', evidence_dir=temporary)
+            try:
+                with patch.object(life, 'ssh_diagnosis', side_effect=OSError('diagnostic denied')):
+                    diagnosis = life.ssh_transport_failure(mux, 'ssh', 255, 'connection reset')
+                self.assertEqual(set(diagnosis), {'line', 'transient', 'phase', 'cause', 'evidence'})
+                self.assertEqual(diagnosis['phase'], 'session')
+                self.assertEqual(diagnosis['cause'], 'diagnosis failed: diagnostic denied')
+                self.assertEqual(diagnosis['evidence'], 'unavailable')
+                self.assertFalse(diagnosis['transient'])
+                self.assertIn('evidence unavailable', diagnosis['line'])
+            finally:
+                mux.__exit__(None, None, None)
+
+    def test_classifier_fills_missing_diagnostic_fields(self):
+        with tempfile.TemporaryDirectory(prefix='diagnosis-incomplete-') as temporary:
+            mux = FakeMux('fake-host', evidence_dir=temporary)
+            try:
+                with patch.object(life, 'ssh_diagnosis', return_value={'line': 'ssh diag partial', 'phase': 'auth'}):
+                    diagnosis = life.ssh_transport_failure(mux, 'ssh', 255, 'connection reset')
+                self.assertEqual(diagnosis, {'line': 'ssh diag partial', 'transient': False, 'phase': 'auth',
+                                             'cause': 'unknown', 'evidence': 'unavailable'})
+            finally:
+                mux.__exit__(None, None, None)
+
+    def test_executor_does_not_duplicate_master_failure_receipt(self):
+        with tempfile.TemporaryDirectory(prefix='executor-master-receipt-') as temporary:
+            diagnosis = {'line': 'ssh diag master failed', 'phase': 'auth', 'cause': 'not established',
+                         'evidence': 'fixture', 'transient': False}
+            class FailedMux:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+                def __enter__(self):
+                    recorded = life.ssh_record(diagnosis, 'ssh', 'master', temporary)
+                    raise life.LedgerTransport([recorded], 'SSH master failed')
+                def __exit__(self, *_args):
+                    return False
+            with patch.object(life, 'SshMux', FailedMux):
+                with self.assertRaises(life.LedgerTransport) as error:
+                    life.forward('fake-host', 'status', {'state_dir': temporary}, False)
+            receipt = Path(temporary) / 'ssh-diag.md'
+            self.assertIn(f'ssh-diag receipt: {receipt}', str(error.exception))
+            self.assertEqual(len(receipt.read_text().splitlines()), 1)
+
+    def test_notify_timeout_preserves_original_error_representation(self):
+        with tempfile.TemporaryDirectory(prefix='notify-timeout-') as temporary:
+            controller = life.Lifecycle.__new__(life.Lifecycle)
+            controller.c = {'notify': {'ssh': 'fake-host', 'file': '/fake/notice'},
+                            'label': 'fixture', 'owner': 'Codex test/owner'}
+            controller.directory, controller.state = Path(temporary), {}
+            controller.record = unittest.mock.Mock()
+            controller.write = unittest.mock.Mock()
+            timeout = subprocess.TimeoutExpired(['ssh', 'fixture'], 10)
+            diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+            with patch.object(life.subprocess, 'run', side_effect=timeout) as run, \
+                    patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                controller.notify('failure')
+            run.assert_called_once()
+            diag.assert_called_once()
+            expected = repr(life.Refused(f'{timeout!r}; ssh diag named; ssh-diag receipt: '
+                                         f'{Path(temporary) / "ssh-diag.md"}'))
+            self.assertEqual(controller.state['notify_errors'][0]['error'], expected)
+            self.assertTrue((Path(temporary) / 'ssh-diag.md').is_file())
+
+    def test_unwritable_diagnostic_directory_uses_temporary_evidence(self):
+        with tempfile.TemporaryDirectory(prefix='unwritable-diag-') as temporary:
+            blocked = Path(temporary) / 'not-a-directory'
+            blocked.write_text('fixture')
+            run = target_fixture_run(None, [])
+            with patch('sys.stderr', new=io.StringIO()):
+                diagnosis = real_ssh_diagnosis('fake-host', run=run, evidence_dir=blocked,
+                                               tcp=lambda *_: True, allow_retry=False)
+            evidence = Path(diagnosis['evidence'])
+            try:
+                self.assertTrue(evidence.is_file())
+                self.assertIn('attempt phase unknown', diagnosis['line'])
+            finally:
+                shutil.rmtree(evidence.parent)
+
+    def test_windows_disconnection_diagnoses_255_not_application_exit(self):
+        class Process:
+            def __init__(self, code):
+                self.code = code
+                self.stdin, self.stdout, self.stderr = io.StringIO(), io.StringIO(''), io.StringIO('remote failed')
+            def wait(self, timeout=None):
+                return self.code
+            def poll(self):
+                return self.code
+        for code in (255, 1):
+            with self.subTest(code=code), tempfile.TemporaryDirectory(prefix='rider-windows-') as temporary:
+                process = Process(code)
+                calls = unittest.mock.Mock(return_value=process)
+                diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+                with patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                    with self.assertRaises(life.Refused) as error:
+                        life.forward_windows('fake-ally', 'status', {'state_dir': temporary}, False, calls)
+                self.assertEqual(calls.call_count, 1)
+                self.assertEqual(diag.call_count, int(code == 255))
+                self.assertEqual('ssh diag named' in str(error.exception), code == 255)
+                self.assertEqual(str(error.exception), 'Windows SSH disconnected: remote failed' +
+                                 (f'; ssh diag named; ssh-diag receipt: {Path(temporary) / "ssh-diag.md"}'
+                                  if code == 255 else ''))
+                self.assertEqual((Path(temporary) / 'ssh-diag.md').is_file(), code == 255)
+
+    def test_windows_wait_timeout_preserves_exception_text_and_diagnosis(self):
+        class Process:
+            def __init__(self):
+                self.stdin, self.stdout, self.stderr = io.StringIO(), io.StringIO(''), io.StringIO('')
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(['ssh', 'fixture'], timeout)
+            def poll(self):
+                return 255
+        with tempfile.TemporaryDirectory(prefix='windows-timeout-') as temporary:
+            diagnosis = {'line': 'ssh diag named', 'phase': 'session', 'transient': False}
+            with patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
+                with self.assertRaises(life.Refused) as error:
+                    life.forward_windows('fake-ally', 'status', {'state_dir': temporary}, False,
+                                         unittest.mock.Mock(return_value=Process()))
+            self.assertEqual(str(error.exception),
+                             str(subprocess.TimeoutExpired(['ssh', 'fixture'], 3)) + '; ssh diag named; '
+                             f'ssh-diag receipt: {Path(temporary) / "ssh-diag.md"}')
+            diag.assert_called_once()
+
     def test_inaccessible_or_disappearing_socket_does_not_mask_diagnosis(self):
         with tempfile.TemporaryDirectory(prefix='eden-socket-') as tmp:
             (Path(tmp) / 'socket').touch()
@@ -3004,13 +3336,15 @@ class SshDiagnosisTests(unittest.TestCase):
 
     def test_gate_fixture_phases_and_causes(self):
         fixtures = Path(__file__).with_name('test-data') / 'ssh-vvv'
-        for name in ('tcp', 'banner', 'kex', 'auth-timeout', 'auth-refused', 'session'):
+        phases = {'tcp': 'tcp', 'banner': 'kex', 'kex': 'kex', 'auth-timeout': 'auth',
+                  'auth-refused': 'auth', 'session': 'session', 'later-kex': 'kex', 'unrelated': 'unknown'}
+        for name, phase in phases.items():
             with self.subTest(name=name):
                 text = (fixtures / (name + '.txt')).read_text()
-                self.assertEqual(life.ssh_phase(text), 'tcp')
-                cause, transient, _ = life.ssh_cause(text, 'tcp', 'failed, phase tcp', 'ok', '0%')
+                self.assertEqual(life.ssh_phase(text), phase)
+                cause, transient, _ = life.ssh_cause(text, phase, f'failed, phase {phase}', 'ok', '0%')
                 expected = 'authentication refused' if name == 'auth-refused' else \
-                    'not established (attempt stalled in tcp; failed, phase tcp)'
+                    f'not established (attempt stalled in {phase}; failed, phase {phase})'
                 self.assertEqual((cause, transient), (expected, False))
         text = (fixtures / 'review-kex.txt').read_text()
         self.assertEqual(life.ssh_phase(text), 'kex')
@@ -3018,10 +3352,12 @@ class SshDiagnosisTests(unittest.TestCase):
         self.assertEqual(cause, 'not established (attempt stalled in kex; failed, phase kex)')
         self.assertFalse(transient)
         prefix = 'Connecting to x\nConnection established\nRemote protocol version 2.0\n'
-        for sample, phase in (('', 'unknown'), ('other', 'none'), ('Connecting to x', 'tcp'),
+        for sample, phase in (('', 'unknown'), ('other', 'unknown'), ('Connecting to x', 'tcp'),
                               ('Connecting to x\nConnection established', 'banner'),
                               (prefix, 'kex'), (prefix + 'SSH2_MSG_NEWKEYS received', 'auth'),
-                              (prefix + 'SSH2_MSG_NEWKEYS received\nAuthenticated to x', 'session')):
+                              (prefix + 'SSH2_MSG_NEWKEYS received\nAuthenticated to x', 'session'),
+                              ('SSH2_MSG_NEWKEYS received', 'auth'), ('Authenticated to x', 'session'),
+                              ('Entering interactive session', 'session')):
             self.assertEqual(life.ssh_phase(sample), phase)
 
     def test_cause_precedence_and_tcp_failure(self):
@@ -3030,7 +3366,7 @@ class SshDiagnosisTests(unittest.TestCase):
                             ('Permission denied', 'authentication refused'),
                             ('Connection refused', 'host down or sshd not listening')):
             with self.subTest(text=text):
-                actual, transient, _ = life.ssh_cause(text, 'none', 'failed, phase none', 'fail', 'n/a')
+                actual, transient, _ = life.ssh_cause(text, 'unknown', 'failed, phase unknown', 'fail', 'n/a')
                 self.assertEqual(actual, cause)
                 self.assertFalse(transient)
 
@@ -3186,9 +3522,196 @@ class SshDiagnosisTests(unittest.TestCase):
 
 
 class SshMuxTests(unittest.TestCase):
+    def test_master_retry_requires_a_prior_durable_receipt(self):
+        case = next(case for case in health_path_cases() if case[0] == 'healthy-loss')
+        _, facts, ping, _, expected_cause = case
+        for mode in ('primary', 'fallback', 'none'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='master-receipt-', dir='/tmp') as temporary:
+                root = Path(temporary)
+                primary, state, temp = root / 'run', root / 'state', root / 'temp'
+                primary.mkdir()
+                temp.mkdir()
+                fallback = state / 'eden-lifecycle/ssh-diag/ssh-diag-fallback.md'
+                last = temp / f'eden-ssh-diag-{os.getuid()}.md'
+                if mode != 'primary':
+                    (primary / 'ssh-diag.md').mkdir()
+                if mode == 'none':
+                    fallback.mkdir(parents=True)
+                    last.mkdir()
+                receipt = primary / 'ssh-diag.md' if mode == 'primary' else fallback
+                attempts = []
+                run = target_fixture_run(facts, [], ping)
+                class Process:
+                    pid = 123456
+                    def __init__(self, status):
+                        self.status = status
+                    def wait(self, timeout=None):
+                        return self.status
+                    def poll(self):
+                        return self.status
+                def popen(argv, **_kwargs):
+                    if attempts:
+                        self.assertTrue(receipt.is_file(), 'second master started before a receipt existed')
+                        self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                        if mode == 'fallback':
+                            self.assertTrue(receipt.read_text().startswith(f'intended {primary / "ssh-diag.md"}: '))
+                    attempts.append(argv)
+                    Path(argv[argv.index('-E') + 1]).write_text(
+                        'Connecting to fake-host\nConnection established\nRemote protocol version 2.0\n'
+                        'SSH2_MSG_KEXINIT sent\nConnection to fake-host port 22 timed out\n')
+                    return Process(0 if len(attempts) > 1 else 255)
+                def diagnose(host, **kwargs):
+                    return real_ssh_diagnosis(host, **kwargs, tcp=lambda *_: True)
+                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(root), 'XDG_STATE_HOME': str(state)}), \
+                        patch.object(life.tempfile, 'gettempdir', return_value=str(temp)), \
+                        patch.object(life, 'ssh_diagnosis', side_effect=diagnose), \
+                        patch('sys.stderr', new=io.StringIO()) as stderr:
+                    if mode == 'none':
+                        with self.assertRaises(life.LedgerTransport) as error:
+                            with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=root / 'evidence',
+                                              receipt_dir=primary):
+                                self.fail('master retried without a receipt')
+                        self.assertIn(expected_cause, str(error.exception))
+                        self.assertIn('retry: no (no durable receipt)', str(error.exception))
+                        self.assertIn('ssh-diag receipt could not be written anywhere', str(error.exception))
+                        self.assertEqual(len(attempts), 1)
+                    else:
+                        with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=root / 'evidence',
+                                          receipt_dir=primary) as mux:
+                            self.assertEqual(len(mux.diagnoses), 1)
+                            self.assertIn(f'ssh-diag receipt: {receipt}', mux.diagnoses[0]['reported_line'])
+                        self.assertEqual(len(attempts), 2)
+                        self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                        self.assertIn(expected_cause, stderr.getvalue())
+                        self.assertIn(f'ssh-diag receipt: {receipt}', stderr.getvalue())
+                        self.assertEqual(stderr.getvalue().count(
+                            f'ssh retried once: {expected_cause}; ssh-diag receipt: {receipt}'), 1)
+
+    def _retry_caller(self, operation, action):
+        _, facts, ping, _, expected_cause = next(case for case in health_path_cases() if case[0] == 'healthy-loss')
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
+            root = Path(temporary)
+            receipt = root / 'ssh-diag.md'
+            starts, riders = [], []
+            base_run = target_fixture_run(facts, [], ping)
+            class Process:
+                pid = 123456
+                def __init__(self, status):
+                    self.status = status
+                def wait(self, timeout=None):
+                    return self.status
+                def poll(self):
+                    return self.status
+            def popen(argv, **_kwargs):
+                if starts:
+                    self.assertEqual(len(receipt.read_text().splitlines()), 1)
+                starts.append(argv)
+                Path(argv[argv.index('-E') + 1]).write_text(
+                    'Connecting to fake-host\nConnection established\nRemote protocol version 2.0\n'
+                    'SSH2_MSG_KEXINIT sent\nConnection to fake-host port 22 timed out\n')
+                return Process(0 if len(starts) > 1 else 255)
+            def run(argv, **kwargs):
+                if 'input' in kwargs:
+                    riders.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({'owned_claim': True}), '')
+                return base_run(argv, **kwargs)
+            def diagnose(host, **kwargs):
+                return real_ssh_diagnosis(host, **kwargs, tcp=lambda *_: True)
+            def mux(host, **kwargs):
+                return real_ssh_mux(host, popen=popen, **kwargs)
+            captured = io.StringIO()
+            with patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
+                    patch.object(life, 'SshMux', side_effect=mux), \
+                    patch.object(life, 'ssh_diagnosis', side_effect=diagnose), \
+                    patch('sys.stderr', captured):
+                if action == 'executor':
+                    result = life.forward('fake-host', 'status', {'host': 'xps', 'state_dir': temporary},
+                                          False, run=run)
+                else:
+                    controller = life.Lifecycle.__new__(life.Lifecycle)
+                    controller.c = {'ledger': '/tmp/fake-ledger', 'host': 'xps', 'owner': 'test',
+                                    'label': 'fixture', 'ledger_ssh': 'fake-host'}
+                    controller.state = {'token': 'a' * 32}
+                    controller.directory = root
+                    controller.injected_ledger = None
+                    forward = life.ledger_forward
+                    with patch.object(life, 'ledger_forward',
+                                      side_effect=lambda host, op, config: forward(host, op, config, run=run)):
+                        result = controller.ledger().operate(operation)
+                    controller.record(action, result)
+            self.assertEqual(len(starts), 2)
+            self.assertEqual(len(riders), 1)
+            self.assertEqual(len(receipt.read_text().splitlines()), 1)
+            retry = {'phase': 'kex', 'cause': expected_cause, 'receipt': str(receipt)}
+            compact = f'ssh retried once: {expected_cause}; ssh-diag receipt: {receipt}'
+            self.assertEqual(captured.getvalue().count(compact), 1)
+            if action != 'executor':
+                self.assertEqual(result['ssh_retry'], retry)
+                entry = json.loads((root / 'actions.jsonl').read_text())
+                self.assertEqual((entry['kind'], entry['ssh_retry']), (action, retry))
+            else:
+                self.assertEqual(result, {'owned_claim': True})
+
+    def test_retry_metadata_reaches_ledger_action_journal(self):
+        for operation, action in (('claim', 'claim'), ('release', 'release'), ('reserve', 'reserve'),
+                                  ('read', 'read'), ('read', 'claim-readback'), ('read', 'settle-readback')):
+            with self.subTest(operation=operation, action=action):
+                self._retry_caller(operation, action)
+
+    def test_executor_reports_one_master_retry_without_replaying_rider(self):
+        self._retry_caller(None, 'executor')
+
+    def test_remote_claim_readback_and_exclusive_reserve_record_retry_metadata(self):
+        retry = {'phase': 'kex', 'cause': 'packet loss', 'receipt': '/tmp/receipt'}
+        controller = life.Lifecycle.__new__(life.Lifecycle)
+        controller.c = {'ledger': '/tmp/fake-ledger', 'host': 'xps', 'owner': 'test',
+                        'ledger_ssh': 'fake-host', 'hostname': 'fake-host', 'exclusive_host': True,
+                        'work_root': '/tmp', 'label': 'fixture'}
+        controller.directory = Path('/tmp')
+        controller.injected_ledger = None
+        controller.record = unittest.mock.Mock()
+        controller.host = unittest.mock.Mock()
+        controller.host.name.return_value = 'fake-host'
+        controller.host.resources.return_value = {'foreign_processes': []}
+        remote = unittest.mock.Mock()
+        remote.inspect.return_value = {'open': ['claimed'], 'ssh_retry': retry}
+        remote.operate.return_value = {'reserved': True, 'ssh_retry': retry}
+        with patch.object(life, 'Ledger', return_value=remote):
+            self.assertEqual(controller.ledger_text(), 'claimed')
+            self.assertEqual(controller.reserve_exclusive('test'), remote.operate.return_value)
+        self.assertEqual(controller.record.call_args_list, [
+            call('claim-readback', remote.inspect.return_value), call('reserve', remote.operate.return_value)])
+
+    def test_control_path_length_guard_precedes_all_ssh(self):
+        calls = unittest.mock.Mock()
+        starts = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
+            long_root = Path(temporary) / ('x' * 90)
+            with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(long_root)}):
+                with self.assertRaises(life.Refused) as error:
+                    real_ssh_mux('fake-host', run=calls, popen=starts)
+            template = long_root / f'eden-ssh-{os.getpid()}' / '%C'
+            self.assertEqual(str(error.exception),
+                             f'SSH control path too long: {template}; set XDG_RUNTIME_DIR to a short directory')
+            calls.assert_not_called()
+            starts.assert_not_called()
+
+        max_parent = 87 - len(os.fsencode(f'/eden-ssh-{os.getpid()}')) - 1 - 40
+        for length in (max_parent, max_parent + 1):
+            runtime = '/' + 'x' * (length - 1)
+            with self.subTest(runtime_bytes=length), patch.dict(os.environ, {'XDG_RUNTIME_DIR': runtime}):
+                if length == max_parent:
+                    mux = real_ssh_mux('fake-host', run=calls, popen=starts)
+                    self.assertEqual(len(os.fsencode(mux.root)) + 1 + 40, 87)
+                else:
+                    with self.assertRaisesRegex(life.Refused, 'SSH control path too long:'):
+                        real_ssh_mux('fake-host', run=calls, popen=starts)
+        calls.assert_not_called()
+        starts.assert_not_called()
+
     def test_real_classifier_target_health_matrix_for_master(self):
         for label, facts, ping, expected_attempts, expected_cause in health_path_cases():
-            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='emux-') as tmp, \
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as tmp, \
                     patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
                 attempts, diagnoses = [], []
                 run = target_fixture_run(facts, [], ping)
@@ -3228,7 +3751,7 @@ class SshMuxTests(unittest.TestCase):
     def test_real_overloaded_target_stops_master_after_one_attempt(self):
         facts = {'load1': 48, 'cores': 8, 'memAvailMiB': 150, 'oomKills5m': 2,
                  'sshdProcesses': 5, 'sshdUnauth': 0, 'maxStartups': '10:30:100', 'maxStartupsLines': 0}
-        with tempfile.TemporaryDirectory(prefix='emux-') as tmp, patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as tmp, patch.dict(os.environ, {'XDG_RUNTIME_DIR': tmp}):
             attempts = []
             run = target_fixture_run(facts, [])
             class Process:
@@ -3271,7 +3794,7 @@ class SshMuxTests(unittest.TestCase):
                 template = next(item for item in argv if item.startswith('ControlPath='))[len('ControlPath='):]
                 return subprocess.CompletedProcess(argv, 0, 'controlpath ' + template.replace('%C', 'resolved') + '\n', '')
             return subprocess.CompletedProcess(argv, 0, '', '')
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
             stale = Path(temporary) / 'eden-ssh-999999999'
             stale.mkdir()
@@ -3314,7 +3837,7 @@ class SshMuxTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 255, '', 'cannot read configuration')
         diagnosis = {'line': 'ssh diag fake: not established', 'transient': False,
                      'cause': 'not established', 'phase': 'unknown', 'evidence': '/tmp/diag'}
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
                 patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
             with self.assertRaisesRegex(life.LedgerTransport, 'ssh diag fake: not established'):
@@ -3341,7 +3864,7 @@ class SshMuxTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, '', '')
         diagnosis = {'line': 'ssh diag fake: host key', 'transient': False,
                      'cause': 'host key', 'phase': 'kex', 'evidence': '/tmp/diag'}
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}), \
                 patch.object(life, 'ssh_diagnosis', return_value=diagnosis):
             with self.assertRaisesRegex(life.Refused, 'ssh diag fake: host key'):
@@ -3350,7 +3873,7 @@ class SshMuxTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def _expired_master_ledger(self, restart_ok):
-        with tempfile.TemporaryDirectory(prefix='emux-') as temporary, \
+        with tempfile.TemporaryDirectory(prefix='emux-', dir='/tmp') as temporary, \
                 patch.dict(os.environ, {'XDG_RUNTIME_DIR': temporary}):
             checks, masters, riders = [], [], []
             class Process:
@@ -3381,7 +3904,7 @@ class SshMuxTests(unittest.TestCase):
                          'cause': 'not established', 'phase': 'kex', 'evidence': '/tmp/diag'}
             config = {'ledger': '/tmp/fake-ledger', 'host': 'xps', 'owner': 'test', 'token': 'a' * 32}
             with patch.object(life, 'ssh_diagnosis', return_value=diagnosis) as diag:
-                with real_ssh_mux('fake-host', run=run, popen=popen) as mux:
+                with real_ssh_mux('fake-host', run=run, popen=popen, evidence_dir=temporary) as mux:
                     control_path = mux.key
                     with socket.socket(socket.AF_UNIX) as stale:
                         stale.bind(control_path)
@@ -3393,7 +3916,11 @@ class SshMuxTests(unittest.TestCase):
                         else:
                             with self.assertRaises(life.LedgerTransport) as error:
                                 life.ledger_forward('fake-host', 'read', config, run=run)
-                            self.assertEqual(error.exception.diagnoses, [diagnosis])
+                            receipt = str(Path(temporary) / 'ssh-diag.md')
+                            self.assertEqual(error.exception.diagnoses,
+                                             [{**diagnosis, 'stop': 'SSH master failed', 'receipt': receipt,
+                                               'reported_line': diagnosis['line'] + f'; ssh-diag receipt: {receipt}'}])
+                            self.assertEqual(len((Path(temporary) / 'ssh-diag.md').read_text().splitlines()), 1)
                     self.assertEqual(len(masters), 2)
                     self.assertEqual(len(riders), 1 if restart_ok else 0)
                     if restart_ok:
@@ -3432,8 +3959,154 @@ class SshMuxTests(unittest.TestCase):
 
 @unittest.skipIf(os.environ.get('EDEN_SKIP_SSH_STALL_TESTS'), 'real SSH loopback tests explicitly skipped')
 class SshLoopbackTests(unittest.TestCase):
+    def test_auth_stall_after_real_key_exchange_and_successful_control(self):
+        def free_port():
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                return sock.getsockname()[1]
+
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
+            root = Path(temporary)
+            runtime_length = 87 - len(os.fsencode(f'/eden-ssh-{os.getpid()}')) - 1 - 40
+            runtime = root / ('x' * (runtime_length - len(os.fsencode(root)) - 1))
+            runtime.mkdir(mode=0o700)
+            key = root / 'key'
+            subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)],
+                           check=True, capture_output=True, timeout=10)
+            (root / 'authorized_keys').write_text(key.with_suffix('.pub').read_text())
+            target_port = free_port()
+            config = root / 'sshd_config'
+            config.write_text(f'Port {target_port}\nListenAddress 127.0.0.1\nHostKey {key}\nPidFile none\n'
+                              f'UsePAM no\nAuthorizedKeysFile {root / "authorized_keys"}\nStrictModes no\n'
+                              f'PubkeyAuthentication yes\nPasswordAuthentication no\n'
+                              f'AllowUsers {pwd.getpwuid(os.getuid()).pw_name}\n')
+            sshd_log = (root / 'sshd.log').open('w+')
+            sshd = subprocess.Popen(['/usr/sbin/sshd', '-D', '-e', '-f', str(config)],
+                                    stdout=subprocess.DEVNULL, stderr=sshd_log, start_new_session=True)
+            proxies, logs = [], []
+            def stop(process):
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=3)
+            def proxy(stall):
+                port = free_port()
+                log = (root / ('stall.log' if stall else 'pass.log')).open('w+')
+                logs.append(log)
+                argv = ['/usr/bin/python3', '-I', '-B', str(Path(__file__).with_name('test-data') / 'stall_proxy.py'),
+                        '--port', str(port), '--target', str(target_port)]
+                if stall:
+                    argv.append('--stall')
+                process = subprocess.Popen(argv, stdout=log, stderr=log, start_new_session=True)
+                proxies.append(process)
+                for _ in range(100):
+                    log.flush()
+                    if 'READY' in Path(log.name).read_text():
+                        return port
+                    if process.poll() is not None:
+                        break
+                    time.sleep(.02)
+                self.fail(f'loopback proxy did not start: {Path(log.name).read_text()}')
+            def options(port):
+                return ('-F', '/dev/null', '-o', f'Port={port}', '-o', 'StrictHostKeyChecking=no',
+                        '-o', 'UserKnownHostsFile=/dev/null', '-o', f'IdentityFile={key}',
+                        '-o', 'IdentitiesOnly=yes')
+            def run(argv, **kwargs):
+                if argv[0] == 'ping':
+                    argv = ['/usr/bin/ping', *argv[1:]]
+                return subprocess.run(argv, **kwargs)
+            try:
+                time.sleep(.3)
+                if sshd.poll() is not None:
+                    sshd_log.flush()
+                    self.fail(f'unprivileged sshd failed: {(root / "sshd.log").read_text()}')
+                pass_port = proxy(False)
+                started = time.monotonic()
+                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(runtime)}):
+                    with real_ssh_mux('127.0.0.1', run=run, ssh_bin='/usr/bin/ssh',
+                                      ssh_options=options(pass_port), evidence_dir=root / 'pass-evidence') as mux:
+                        self.assertEqual(len(os.fsencode(mux.root)) + 1 + 40, 87)
+                        rider = subprocess.run(['/usr/bin/ssh', *mux.rider_args, '127.0.0.1', 'exit'],
+                                               capture_output=True, text=True, timeout=5)
+                        self.assertEqual(rider.returncode, 0, rider.stderr)
+                positive = time.monotonic() - started
+                self.assertLess(positive, 10)
+                stall_port = proxy(True)
+                timings, processes = [], []
+                class TimedProcess:
+                    def __init__(self, argv, **kwargs):
+                        self.process = subprocess.Popen(argv, **kwargs)
+                        self.pid, self.started = self.process.pid, time.monotonic()
+                        processes.append(self.process)
+                    def wait(self, timeout=None):
+                        try:
+                            return self.process.wait(timeout=timeout)
+                        finally:
+                            if not timings:
+                                timings.append(time.monotonic() - self.started)
+                    def poll(self):
+                        return self.process.poll()
+                    def kill(self):
+                        self.process.kill()
+                evidence = Path(os.environ.get('EDEN_TEST_EVIDENCE_DIR') or root / 'stall-evidence')
+                started = time.monotonic()
+                with patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(runtime)}), patch('sys.stderr', new=io.StringIO()):
+                    with self.assertRaises(life.LedgerTransport) as caught:
+                        with real_ssh_mux('127.0.0.1', run=run, ssh_bin='/usr/bin/ssh',
+                                          popen=TimedProcess, ssh_options=options(stall_port),
+                                          evidence_dir=evidence):
+                            self.fail('stalled master unexpectedly opened')
+                total = time.monotonic() - started
+                self.assertEqual(len(processes), 1)
+                self.assertTrue(9.5 <= timings[0] <= 11, timings)
+                self.assertIsNotNone(processes[0].poll())
+                diagnosis = caught.exception.diagnoses[0]
+                self.assertEqual(diagnosis['phase'], 'auth')
+                self.assertIn('attempt phase auth;', diagnosis['line'])
+                self.assertIn('diag login failed, phase auth', diagnosis['line'])
+                self.assertIn('cause: not established', diagnosis['line'])
+                self.assertIn('retry: no', diagnosis['line'])
+                self.assertEqual(len((evidence / 'ssh-diag.md').read_text().splitlines()), 1)
+                self.assertIn('BOTH_NEWKEYS', (root / 'stall.log').read_text())
+                print(f'loopback auth: positive {positive:.3f}s; master {timings[0]:.3f}s; total {total:.3f}s')
+                print(diagnosis['line'])
+            finally:
+                for process in proxies:
+                    stop(process)
+                stop(sshd)
+                for log in logs:
+                    log.close()
+                sshd_log.close()
+            self.assertIsNotNone(sshd.poll())
+            self.assertTrue(all(process.poll() is not None for process in proxies))
+            owned_groups = {sshd.pid, *(process.pid for process in proxies)}
+            remaining = []
+            for entry in Path('/proc').iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    group = os.getpgid(int(entry.name))
+                    parts = (entry / 'cmdline').read_bytes().split(b'\0')
+                    name = Path(os.fsdecode(parts[0])).name if parts else ''
+                    command = b'\0'.join(parts)
+                    if (group in owned_groups or
+                            (name in ('ssh', 'sshd', 'sshd-session') and
+                         (str(root).encode() in command or f'Port={pass_port}'.encode() in command
+                          or f'Port={stall_port}'.encode() in command)) or
+                            (b'stall_proxy.py' in command and str(root).encode() in command)):
+                        remaining.append(entry.name)
+                except (OSError, ValueError):
+                    pass
+            self.assertEqual(remaining, [])
+
     def _stall(self, banner, expected):
-        with tempfile.TemporaryDirectory(prefix='es-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='es-', dir='/tmp') as temporary:
             listener = socket.socket()
             listener.bind(('127.0.0.1', 0))
             listener.listen()
@@ -4170,6 +4843,7 @@ class WindowsTests(unittest.TestCase):
 
     def test_windows_transport_keeps_authoritative_ledger_on_controller(self):
         token = 'b' * 32
+        retry = {'phase': 'kex', 'cause': 'packet loss', 'receipt': '/tmp/fixture-ssh-diag.md'}
         request = {'ledger_request': {'operation': 'claim', 'token': token,
                    'admission': {'foreign_processes': []}, 'stale_claim_hours': None}}
         class Input(io.StringIO):
@@ -4194,7 +4868,7 @@ class WindowsTests(unittest.TestCase):
                 ledgers.append(args)
             def operate(self, operation, stale, admission):
                 self.test = operation
-                return {'line': 'FAKE claim'}
+                return {'line': 'FAKE claim', 'ssh_retry': retry}
         self.config['ledger_ssh'] = 'yoga'
         value = life.forward_windows('intpa@dreamland-ally', 'up', self.config, True, popen, Ledger)
         self.assertEqual(value['phase'], 'up')
@@ -4202,7 +4876,8 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(commands[0][-1].startswith('"C:\\Program Files\\PowerShell\\7\\pwsh.exe"'))
         packet = json.loads(process.stdin.saved.splitlines()[0])
         self.assertTrue(packet['ledger_bridge'])
-        self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]), {'result': {'line': 'FAKE claim'}})
+        self.assertEqual(json.loads(process.stdin.saved.splitlines()[1]),
+                         {'result': {'line': 'FAKE claim', 'ssh_retry': retry}})
 
     def test_windows_controller_serializes_transport_in_the_existing_error_reply(self):
         request = {'ledger_request': {'operation': 'read', 'token': 'a' * 32,
@@ -4268,19 +4943,14 @@ class WindowsTests(unittest.TestCase):
             life.forward_windows('intpa@dreamland-ally', 'up', self.config, True,
                                  transport(stream(('claim', run_token), ('release', other))), Ledger)
 
-    def test_windows_1312_retries_once_only_before_any_ledger_action(self):
+    def test_windows_1312_never_replays_the_operation(self):
         error = life.Refused('CreateProcessAsUserW failed: 1312')
         error.transport_not_started = True
-        with patch.object(life, 'ssh_diagnosis') as diag, \
-                patch.object(life, '_forward_windows_once', side_effect=[error, {'phase': 'absent'}]) as once:
-            self.assertEqual(life.forward_windows('intpa@dreamland-ally', 'status', self.config, False), {'phase': 'absent'})
-            self.assertEqual(once.call_count, 2)
-            diag.assert_not_called()
         with patch.object(life, 'ssh_diagnosis') as diag, \
                 patch.object(life, '_forward_windows_once', side_effect=error) as once:
             with self.assertRaises(life.Refused):
                 life.forward_windows('intpa@dreamland-ally', 'status', self.config, False)
-            self.assertEqual(once.call_count, 2)
+            self.assertEqual(once.call_count, 1)
             diag.assert_not_called()
         error.transport_not_started = False
         with patch.object(life, 'ssh_diagnosis') as diag, \
@@ -4290,7 +4960,7 @@ class WindowsTests(unittest.TestCase):
             self.assertEqual(once.call_count, 1)
             diag.assert_not_called()
 
-    def test_windows_real_transport_classifies_broken_pipe_1312_without_replaying_a_claim(self):
+    def test_windows_real_transport_1312_does_not_replay(self):
         class BrokenInput:
             def write(self, text):
                 raise BrokenPipeError('server did not start a remote process')
@@ -4315,10 +4985,9 @@ class WindowsTests(unittest.TestCase):
             commands.append(command)
             return processes[len(commands) - 1]
         with patch.object(life, 'Ledger') as ledger, patch.object(life, 'ssh_diagnosis') as diag:
-            result = life.forward_windows('intpa@dreamland-ally', 'status', self.config, False, popen, ledger)
-        self.assertEqual(result, {'phase': 'absent'})
-        self.assertEqual(len(commands), 2)
-        self.assertEqual(commands[0], commands[1])
+            with self.assertRaisesRegex(life.Refused, 'CreateProcessAsUserW failed: 1312'):
+                life.forward_windows('intpa@dreamland-ally', 'status', self.config, False, popen, ledger)
+        self.assertEqual(len(commands), 1)
         self.assertIn('-NoProfile -NonInteractive -EncodedCommand', commands[0][-1])
         self.assertEqual(commands[0][1:3], ['-T', '-x'])
         ledger.assert_not_called()

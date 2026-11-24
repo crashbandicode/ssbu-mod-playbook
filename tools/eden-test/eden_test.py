@@ -87,6 +87,13 @@ def stamp(run, key):
     timing_path.write_text(json.dumps(timing, indent=2) + '\n')
 
 
+class _ExitCode(int):
+    def __new__(cls, code, stderr='', diagnosis=None, timed_out=False):
+        result = super().__new__(cls, code)
+        result.stderr, result.diagnosis, result.timed_out = stderr, diagnosis, timed_out
+        return result
+
+
 def sh(argv, log=None):
     """Run a tool, echo its output, keep a copy in the run folder; returns the exit code."""
     done = subprocess.run(argv, capture_output=True, text=True)
@@ -95,7 +102,7 @@ def sh(argv, log=None):
     if log:
         with open(log, 'a') as f:
             f.write(f'$ {" ".join(map(str, argv))}\n{out}\n')
-    return done.returncode
+    return _ExitCode(done.returncode, done.stderr or '')
 
 
 def _target_commit(commit):
@@ -1753,6 +1760,18 @@ def _go_sh(argv):
     return sh(argv)
 
 
+def _go_diagnosis(mux, kind, code, what, *, timed_out=False):
+    diagnosis = _lifecycle_module.ssh_transport_failure(
+        mux, kind, code, getattr(code, 'stderr', ''), timed_out=timed_out)
+    if diagnosis:
+        diagnosis = _lifecycle_module.ssh_record(diagnosis, kind, what, getattr(mux, 'receipt_dir', None))
+    return diagnosis
+
+
+def _go_suffix(diagnosis):
+    return '; ' + _lifecycle_module.ssh_diagnosis_with_receipt(diagnosis) if diagnosis else ''
+
+
 def _pwsh_arg(value):
     value = str(value)
     if re.fullmatch(r'[A-Za-z0-9_./:@!=+-]+', value):
@@ -1803,23 +1822,30 @@ def _go_target_ssh(host, mux, remote, timeout):
     print('$ ' + shlex.join(command), flush=True)
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as error:
+    except subprocess.TimeoutExpired as error:
+        diagnosis = _go_diagnosis(mux, 'ssh', None, 'target staging', timed_out=True)
+        raise SystemExit(f'target staging SSH failed: {error}{_go_suffix(diagnosis)}') from error
+    except OSError as error:
         raise SystemExit(f'target staging SSH failed: {error}') from error
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
-    return result.returncode, result.stdout, result.stderr
+    code = _ExitCode(result.returncode, result.stderr or '')
+    diagnosis = _go_diagnosis(mux, 'ssh', code, 'target probe' if '--probe' in remote else 'target staging')
+    return _ExitCode(code, code.stderr, diagnosis), result.stdout, result.stderr
 
 
 def _go_target_rsync(command):
     print('$ ' + shlex.join(command), flush=True)
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
-    except (OSError, subprocess.SubprocessError) as error:
+    except subprocess.TimeoutExpired as error:
+        return _ExitCode(124, str(error), timed_out=True), None
+    except OSError as error:
         raise SystemExit(f'target pack rsync failed: {error}') from error
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     match = re.search(r'(?m)^Total bytes sent:\s*([0-9,]+)', result.stdout)
-    return result.returncode, int(match.group(1).replace(',', '')) if match else None
+    return _ExitCode(result.returncode, result.stderr or ''), int(match.group(1).replace(',', '')) if match else None
 
 
 _GO_BASE_NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*\.json'
@@ -1938,7 +1964,9 @@ def _go_remote(args, lineup):
     _go_remote_base(args)
     targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
-    with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
+    receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
+    with SshMux(host, ssh_options=options, windows=args.host == 'ally', evidence_dir=receipt_dir,
+                receipt_dir=receipt_dir) as mux:
         return _go_remote_with_mux(args, lineup, host, mux, targets)
 
 
@@ -1953,6 +1981,7 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     if pack_dir is None:
         with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
             return _go_remote_with_mux(args, lineup, host, mux, targets, directory)
+    mux.receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
     stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
     commands = [
         ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
@@ -1973,7 +2002,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         mux.ensure()
         command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
         if code := _go_sh(command):
-            raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}')
+            diagnosis = _go_diagnosis(mux, 'rsync', code, 'go staging')
+            raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}{_go_suffix(diagnosis)}')
         if index == 0:
             for target in targets:
                 commit, label = target['commit'], target['label']
@@ -1986,7 +2016,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                 code, output, stderr = _go_target_ssh(host, mux, [*helper, '--probe'], 180)
                 detail = stderr.strip()[-2000:] or 'no stderr'
                 if code:
-                    raise SystemExit(f'target {label} cache probe failed: {detail}')
+                    raise SystemExit(f'target {label} cache probe failed: {detail}'
+                                     f'{_go_suffix(getattr(code, "diagnosis", None))}')
                 try:
                     probe = json.loads(output.strip().splitlines()[-1])
                     if not isinstance(probe, dict) or probe.get('commit') != commit \
@@ -2009,14 +2040,20 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                         mux.ensure()
                         failure, sent = _go_target_rsync(transfer)
                         if failure:
-                            raise SystemExit(f'target {label} pack rsync failed ({failure}): {shlex.join(transfer)}')
+                            diagnosis = _go_diagnosis(mux, 'rsync', failure, f'target {label} pack',
+                                                     timed_out=getattr(failure, 'timed_out', False))
+                            if getattr(failure, 'timed_out', False):
+                                raise SystemExit(f'target pack rsync failed: {failure.stderr}{_go_suffix(diagnosis)}')
+                            raise SystemExit(f'target {label} pack rsync failed ({failure}): '
+                                             f'{shlex.join(transfer)}{_go_suffix(diagnosis)}')
                         helper.extend(('--pack', incoming))
                     code, output, _ = _go_target_ssh(host, mux, helper, 900)
                 finally:
                     if pack_file is not None:
                         pack_file.unlink(missing_ok=True)
                 if code:
-                    raise SystemExit(f'target {label} staging failed ({code})')
+                    raise SystemExit(f'target {label} staging failed ({code})'
+                                     f'{_go_suffix(getattr(code, "diagnosis", None))}')
                 try:
                     result = json.loads(output.strip().splitlines()[-1])
                     if result['commit'] != commit or result['cache'] not in ('built', 'reused'):
@@ -2051,12 +2088,17 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     remote.extend(('--token', token))
     mux.ensure()
     ssh_code = _go_sh(['ssh', *mux.rider_args, host, *(_pwsh_arg(arg) for arg in remote)])
+    if ssh_code == 255 or _lifecycle_module.ssh_master_dead(mux):
+        diagnosis = _go_diagnosis(mux, 'ssh', _ExitCode(255, getattr(ssh_code, 'stderr', '')), 'remote go')
+        raise SystemExit(f'remote go failed (ssh exit {ssh_code}); the remote go may be running; '
+                         f'check the host before starting another{_go_suffix(diagnosis)}')
     run = f'/home/intpa/eden-runs/{args.label}'
     prefix = f'on {host}: /usr/bin/python3 -I -B {script}'
     with tempfile.TemporaryDirectory(prefix='eden-go-') as directory:
         result_file = Path(directory) / 'go-result.json'
         mux.ensure()
         result_error = _go_sh(['scp', *mux.rider_args, f'{host}:{run}/go-result.json', str(result_file)])
+        result_diagnosis = _go_diagnosis(mux, 'scp', result_error, 'go-result transfer') if result_error else None
         try:
             result = json.loads(result_file.read_text()) if not result_error else {}
             code = result['code']
@@ -2065,12 +2107,13 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                 raise ValueError('invalid or mismatched result')
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise SystemExit(f'remote go produced no result for this call (ssh exit {ssh_code}); '
-                             'nothing was copied; see the output above') from error
+                             f'nothing was copied; see the output above{_go_suffix(result_diagnosis)}') from error
     report = f'./REPORT-{args.label}.md'
     mux.ensure()
     if report_error := _go_sh(['scp', *mux.rider_args, f'{host}:{run}/REPORT.md', report]):
+        diagnosis = _go_diagnosis(mux, 'scp', report_error, 'report transfer')
         print(f'Down: {prefix} down {run}')
-        raise SystemExit(f'copying remote report failed ({report_error})')
+        raise SystemExit(f'copying remote report failed ({report_error}){_go_suffix(diagnosis)}')
     print(f'Report: {Path(report).resolve()}')
     print(f'Re-run: {prefix} run {run} --rows <id>; then {prefix} report {run}')
     print(f'Down: {prefix} down {run}')

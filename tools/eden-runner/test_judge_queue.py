@@ -1,18 +1,27 @@
 """Checked effects, the async judge, the clip check and the consecutive-failure stop rule (judge_queue.py + runner)."""
 import hashlib
+import io
 import json
+import os
+import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
+
+from PIL import Image, ImageCms, ImageFile, PngImagePlugin
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import harness  # noqa: E402
 import judge_queue as jq  # noqa: E402
 import runner  # noqa: E402
+import still_fresh  # noqa: E402
 
 HOOK = '''
 def ok(path, gate):
@@ -26,6 +35,24 @@ job = json.load(open(a.job))
 word = next(w for w in ("PASS", "FAIL", "UNSURE") if w in (job.get("expected") or "UNSURE"))
 json.dump({"verdict": word, "reason": "stand-in judge: " + word, "shots_cited": [s["path"] for s in job["shots"]],
            "model": "stand-in", "saw_expected": job["expected"]}, open(a.out, "w"))
+'''
+
+INPUT_JUDGE = '''
+import argparse, json
+from pathlib import Path
+from PIL import Image
+ap = argparse.ArgumentParser(); ap.add_argument("--job"); ap.add_argument("--out"); a = ap.parse_args()
+job = json.loads(Path(a.job).read_text())
+Path(job["plan_dir"], "judge-ran.json").write_text(json.dumps([s["label"] for s in job["shots"]]))
+mode = job["expected"]
+if mode == "PERSIST":
+    bright = sum(Image.open(s["path"]).convert("RGB").getpixel((0, 0))[0] >= 128 for s in job["shots"])
+    word, cited = ("PASS" if bright >= 2 else "UNSURE"), ["step:bright-step"]
+else:
+    word = "PASS"
+    cited = [] if mode == "NO-CITE" else ["not-an-image"] if mode == "UNRESOLVED" else [mode]
+json.dump({"verdict": word, "reason": "stand-in input judge", "shots_cited": cited, "model": "stand-in"},
+          open(a.out, "w"))
 '''
 
 
@@ -92,7 +119,1336 @@ def receipt(folder, row):
     return json.loads((folder / 'out' / f'{row}.json').read_text())
 
 
+def complete_file_samples(png):
+    bad_crc = png[:-1] + bytes([png[-1] ^ 1])
+    wrong_iend = struct.pack('>I', 1) + b'IEND' + b'\x00' + struct.pack('>I', zlib.crc32(b'IEND\x00'))
+    output = io.BytesIO()
+    Image.new('RGB', (1, 1)).save(output, format='JPEG')
+    jpeg = output.getvalue()
+    return {'valid.png': png, 'short-iend.png': png[:-1], 'bad-iend-crc.png': bad_crc,
+            'extra.png': png + b'\x00', 'long-iend.png': png[:-12] + wrong_iend,
+            'valid.jpg': jpeg, 'short-eoi.jpg': jpeg[:-1], 'extra.jpg': jpeg + b'\x00'}
+
+
+class WorkerJudgeInput(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+        self.workdir = self.folder / 'judge'
+        self.workdir.mkdir()
+        self.job_path = self.folder / 'job.json'
+        self.receipt_path = self.folder / 'receipt.json'
+        (self.folder / 'judge.py').write_text(INPUT_JUDGE)
+
+    def shot(self, name, phase, level, fresh):
+        from PIL import Image
+        path = self.folder / f'{name}.png'
+        Image.new('RGB', (32, 18), (level, level, level)).save(path)
+        shot = {'name': name, 'phase': phase, 'path': str(path)}
+        if fresh is not None:
+            shot['fresh'] = fresh
+        return shot
+
+    def run_worker(self, shots, expected, frames=None, dense=None):
+        marker = self.folder / 'judge-ran.json'
+        marker.unlink(missing_ok=True)
+        self.receipt_path.write_text(json.dumps({'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED',
+                                                 'blockers': []}))
+        job = {'row': 'a', 'shots': shots, 'expected': expected, 'clip': 'fake.mp4' if frames is not None else None,
+               'dir': str(self.workdir), 'receipt': str(self.receipt_path),
+               'plan_dir': str(self.folder), 'judge_cmd': 'judge.py'}
+        self.job_path.write_text(json.dumps(job))
+        with mock.patch.object(jq, 'sample_frames', return_value=(frames or {}, {'start': 0, 'end': 2000})), \
+             mock.patch.object(jq, 'sample_dense', return_value=dense or {}):
+            verdict = jq.work(self.job_path)
+        return (json.loads(self.job_path.read_text()), json.loads(self.receipt_path.read_text()),
+                json.loads((self.workdir / 'done.json').read_text()), verdict, marker)
+
+    def test_persistence_judge_does_not_see_refused_after(self):
+        good = {'status': 'fresh'}
+        refused = {'status': 'refused', 'reason': 'unchanged across 200 game frames'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('bright-step', 'step', 220, good),
+                 self.shot('bright-after', 'after', 220, refused)]
+        job, result, done, verdict, marker = self.run_worker(shots, 'PERSIST')
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads(marker.read_text()), ['before:base', 'step:bright-step'])
+        self.assertEqual([s['path'] for s in job['shots']], [shots[0]['path'], shots[1]['path']])
+        excluded = [{'label': 'after:bright-after', 'name': 'bright-after', 'phase': 'after',
+                     'path': shots[2]['path'], 'reason': refused['reason']}]
+        self.assertEqual(job.get('excluded_shots'), excluded)
+        self.assertEqual(done.get('excluded_shots'), excluded)
+        self.assertEqual(result['judge'].get('excluded_shots'), excluded)
+
+        shots[2]['fresh'] = good
+        job, result, done, verdict, marker = self.run_worker(shots, 'PERSIST')
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+        self.assertEqual(json.loads(marker.read_text()), ['before:base', 'step:bright-step', 'after:bright-after'])
+        self.assertEqual(len(job['shots']), 3)
+        self.assertEqual(job.get('excluded_shots'), [])
+        self.assertEqual(done.get('excluded_shots'), [])
+        self.assertNotIn('excluded_shots', result['judge'])
+
+    def test_all_unusable_stills_skip_judge_and_are_audited(self):
+        shots = [self.shot('base', 'before', 20, {'status': 'error', 'reason': 'journal failed'}),
+                 self.shot('after', 'after', 220, None)]
+        job, result, done, verdict, marker = self.run_worker(shots, 'PERSIST')
+        self.assertFalse(marker.exists())
+        self.assertEqual(verdict, {'verdict': 'UNSURE',
+                                   'reason': 'no usable image for the judge: 2 unusable still(s) excluded',
+                                   'shots_cited': [], 'model': None})
+        self.assertEqual((result['status'], result['review']), ('RAN-UNVERIFIED', True))
+        self.assertEqual(job['shots'], [])
+        excluded = [{'label': 'before:base', 'name': 'base', 'phase': 'before',
+                     'path': shots[0]['path'], 'reason': 'journal failed'},
+                    {'label': 'after:after', 'name': 'after', 'phase': 'after',
+                     'path': shots[1]['path'], 'reason': 'no freshness record'}]
+        self.assertEqual(job.get('excluded_shots'), excluded)
+        self.assertEqual(done.get('excluded_shots'), excluded)
+        self.assertEqual(result['judge'].get('excluded_shots'), excluded)
+
+    def test_unrelated_excluded_diagnostic_preserves_pass_and_labels(self):
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('diagnostic', 'step', 200, good),
+                 self.shot('result', 'after', 220, good)]
+        full, result, _, _, marker = self.run_worker(shots, 'after:result')
+        self.assertEqual(result['status'], 'PASS')
+        full_labels = json.loads(marker.read_text())
+        self.assertEqual(full_labels, ['before:base', 'step:diagnostic', 'after:result'])
+        shots[1]['fresh'] = {'status': 'error', 'reason': 'diagnostic journal failed'}
+        job, result, done, _, marker = self.run_worker(shots, 'after:result')
+        self.assertEqual((result['status'], result['blockers']), ('PASS', []))
+        self.assertEqual(json.loads(marker.read_text()), [full_labels[0], full_labels[2]])
+        self.assertEqual(job.get('excluded_shots'), [
+            {'label': full_labels[1], 'name': 'diagnostic', 'phase': 'step', 'path': shots[1]['path'],
+             'reason': 'diagnostic journal failed'}])
+        self.assertEqual(done.get('excluded_shots'), job['excluded_shots'])
+        self.assertEqual(result['judge'].get('excluded_shots'), job['excluded_shots'])
+
+    def test_clip_only_runs_judge_but_no_images_do_not(self):
+        start = self.shot('clip-start', 'clip', 20, None)['path']
+        end = self.shot('clip-end', 'clip', 220, None)['path']
+        dense = self.shot('clip-dense', 'clip', 120, None)['path']
+        job, result, done, _, marker = self.run_worker([], 'clip end',
+                                                       frames={'start': start, 'end': end}, dense={1000: dense})
+        self.assertEqual((result['status'], json.loads(marker.read_text())),
+                         ('PASS', ['clip start', 'clip end', 'dense 1.0s']))
+        self.assertEqual(job.get('excluded_shots'), [])
+        self.assertEqual(done.get('excluded_shots'), [])
+        self.assertNotIn('excluded_shots', result['judge'])
+        job, result, _, verdict, marker = self.run_worker([], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(verdict['reason'], 'no usable image for the judge: no row still and no clip frame')
+        self.assertEqual(job['shots'], [])
+
+    def test_missing_clip_without_stills_does_not_run_judge(self):
+        self.receipt_path.write_text(json.dumps({'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED'}))
+        self.job_path.write_text(json.dumps({
+            'row': 'a', 'shots': [], 'expected': 'NO-CITE', 'clip': str(self.folder / 'missing.mp4'),
+            'dir': str(self.workdir), 'receipt': str(self.receipt_path),
+            'plan_dir': str(self.folder), 'judge_cmd': 'judge.py'}))
+        with mock.patch.object(jq, 'sample_frames', side_effect=FileNotFoundError('missing clip')):
+            verdict = jq.work(self.job_path)
+        job = json.loads(self.job_path.read_text())
+        result = json.loads(self.receipt_path.read_text())
+        self.assertFalse((self.folder / 'judge-ran.json').exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(verdict['reason'], 'no usable image for the judge: no row still and no clip frame'
+                         + '; clip: ' + job['frame_error'])
+
+    def prepare_verdict_retry(self):
+        (self.folder / 'judge.py').write_text(INPUT_JUDGE)
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('result', 'after', 220, good)]
+        _, result, _, verdict, marker = self.run_worker(shots, 'after:result')
+        self.assertEqual((result['status'], verdict['verdict']), ('PASS', 'PASS'))
+        self.assertTrue(marker.is_file())
+        marker.unlink()
+        return shots, verdict, marker
+
+    def test_retry_nonzero_never_borrows_verdict_even_if_it_writes(self):
+        for writes in (False, True):
+            with self.subTest(writes=writes):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.workdir = Path(tmp.name)
+                _, first, marker = self.prepare_verdict_retry()
+                (self.folder / 'judge.py').write_text(
+                    'import json, sys\nfrom pathlib import Path\n'
+                    'Path(__file__).with_name("judge-ran.json").write_text("ran")\n'
+                    + ('json.dump({"verdict":"PASS"}, open(sys.argv[sys.argv.index("--out")+1],"w"))\n'
+                       if writes else '')
+                    + 'print("broken run", file=sys.stderr)\nsys.exit(3)\n')
+                second = jq.work(self.job_path)
+                result = json.loads(self.receipt_path.read_text())
+                self.assertTrue(marker.is_file())
+                self.assertEqual((second['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+                self.assertEqual(second['reason'], 'judge failed (exit 3): broken run\n')
+                self.assertTrue((self.workdir / 'verdict.attempt-1.json').is_file())
+                self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+                self.assertEqual((self.workdir / 'verdict.json').exists(), writes)
+                (self.folder / 'judge.py').write_text(INPUT_JUDGE)
+
+    def test_retry_timeout_archives_previous_verdict(self):
+        _, first, marker = self.prepare_verdict_retry()
+        (self.folder / 'judge.py').write_text(
+            'import time\nfrom pathlib import Path\nPath(__file__).with_name("judge-ran.json").write_text("ran")\n'
+            'time.sleep(2)\n')
+        job = json.loads(self.job_path.read_text())
+        job['timeout_s'] = 0.5
+        self.job_path.write_text(json.dumps(job))
+        verdict = jq.work(self.job_path)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(verdict['reason'], 'judge timed out')
+        self.assertTrue((self.workdir / 'verdict.attempt-1.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        self.assertFalse((self.workdir / 'verdict.json').exists())
+        self.assertEqual(json.loads(self.receipt_path.read_text())['status'], 'RAN-UNVERIFIED')
+
+    def test_successive_verdicts_are_archived_in_order(self):
+        _, first, _ = self.prepare_verdict_retry()
+        (self.folder / 'judge.py').write_text(
+            'import json,sys\njson.dump({"verdict":"FAIL","reason":"second","shots_cited":[]},'
+            'open(sys.argv[sys.argv.index("--out")+1],"w"))\n')
+        second = jq.work(self.job_path)
+        self.assertEqual(second['verdict'], 'FAIL')
+        self.assertEqual(json.loads(self.receipt_path.read_text())['status'], 'FAILED')
+        self.assertTrue((self.workdir / 'verdict.attempt-1.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        (self.folder / 'judge.py').write_text(INPUT_JUDGE)
+        third = jq.work(self.job_path)
+        self.assertEqual(third['verdict'], 'PASS')
+        self.assertTrue((self.workdir / 'verdict.attempt-2.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-2.json').read_text()), second)
+        self.assertEqual(json.loads((self.workdir / 'verdict.json').read_text()), third)
+
+    def test_failed_clip_retry_archives_prior_verdict_without_running_judge(self):
+        shots, first, marker = self.prepare_verdict_retry()
+        Path(shots[1]['path']).write_bytes(Path(shots[0]['path']).read_bytes())
+        verdict = jq.work(self.job_path)
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], verdict['model']), ('FAIL', 'clip-check'))
+        self.assertEqual(json.loads(self.receipt_path.read_text())['status'], 'FAILED')
+        self.assertTrue((self.workdir / 'verdict.attempt-1.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        self.assertFalse((self.workdir / 'verdict.json').exists())
+
+    def test_failed_gate_with_no_images_keeps_failure_and_archives_verdict(self):
+        old = {'verdict': 'PASS', 'reason': 'prior'}
+        (self.workdir / 'verdict.json').write_text(json.dumps(old))
+        self.receipt_path.write_text(json.dumps({'gates_status': 'FAILED', 'status': 'FAILED'}))
+        self.job_path.write_text(json.dumps({
+            'row': 'a', 'shots': [], 'clip': None, 'dir': str(self.workdir), 'receipt': str(self.receipt_path),
+            'plan_dir': str(self.folder), 'judge_cmd': 'judge.py', 'expected': 'NO-CITE'}))
+        verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual((verdict['verdict'], result['status'], result['status_reason']),
+                         ('UNSURE', 'FAILED', 'deterministic gate failed'))
+        self.assertFalse((self.folder / 'judge-ran.json').exists())
+        self.assertTrue((self.workdir / 'verdict.attempt-1.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), old)
+        self.assertFalse((self.workdir / 'verdict.json').exists())
+
+    def test_retry_with_unreadable_shot_snapshot_withdraws_prior_pass(self):
+        for mode in ('missing', 'invalid-json', 'not-list'):
+            with self.subTest(snapshot=mode):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.workdir = Path(tmp.name)
+                _, first, marker = self.prepare_verdict_retry()
+                original_job = self.job_path.read_bytes()
+                first_done = json.loads((self.workdir / 'done.json').read_text())
+                snapshot = self.workdir / 'row-shots.json'
+                if mode == 'missing':
+                    snapshot.rename(self.workdir / 'row-shots.hold')
+                else:
+                    snapshot.write_text('{' if mode == 'invalid-json' else '{"shots": []}')
+                with mock.patch.object(jq, 'clip_check', side_effect=AssertionError('must not check')), \
+                     mock.patch.object(jq, 'run_judge', side_effect=AssertionError('must not judge')):
+                    try:
+                        verdict = jq.work(self.job_path)
+                    except Exception as error:
+                        self.fail(f'work raised on {mode}: {error!r}')
+                self.assertFalse(marker.exists())
+                self.assertEqual(verdict['verdict'], 'UNSURE')
+                self.assertTrue(verdict['reason'].startswith('row shots snapshot unreadable: '))
+                self.assertEqual((verdict['shots_cited'], verdict['model']), ([], None))
+                result = json.loads(self.receipt_path.read_text())
+                self.assertEqual((result['status'], result['judge']['verdict']), ('RAN-UNVERIFIED', 'UNSURE'))
+                self.assertIn(verdict['reason'], result['status_reason'])
+                self.assertNotIn('retry', result['judge'])
+                self.assertNotIn('previous', result['judge'])
+                self.assertEqual(self.job_path.read_bytes(), original_job)
+                done = json.loads((self.workdir / 'done.json').read_text())
+                self.assertEqual(done['verdict'], verdict)
+                self.assertEqual(done['clip_check'], {'ok': True, 'error': verdict['reason']})
+                self.assertEqual(done['excluded_shots'], [])
+                for name, expected in (('verdict', first), ('done', first_done)):
+                    archive = self.workdir / f'{name}.attempt-1.json'
+                    self.assertTrue(archive.is_file())
+                    self.assertEqual(json.loads(archive.read_text()), expected)
+                self.assertFalse((self.workdir / 'verdict.json').exists())
+
+    def test_killed_retry_leaves_pending_receipt_and_archived_results(self):
+        _, first, marker = self.prepare_verdict_retry()
+        previous = json.loads(self.receipt_path.read_text())['judge']
+        first_done = json.loads((self.workdir / 'done.json').read_text())
+        (self.folder / 'judge.py').write_text(
+            'import time\nfrom pathlib import Path\n'
+            'Path(__file__).with_name("judge-ran.json").write_text("started")\ntime.sleep(60)\n')
+        worker = subprocess.Popen([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                                   str(self.job_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline and worker.poll() is None:
+                time.sleep(0.02)
+            self.assertTrue(marker.is_file(), 'retry did not reach the stand-in judge')
+            pending = json.loads(self.receipt_path.read_text())
+            self.assertEqual((pending['status'], pending['status_reason'], pending.get('review')),
+                             ('RAN-UNVERIFIED', 'judge pending (retry)', True))
+            self.assertEqual(pending['judge'],
+                             {'state': 'pending', 'retry': True,
+                              'previous': {'verdict': first['verdict'], 'landed': previous['landed']}})
+            self.assertFalse((self.workdir / 'verdict.json').exists())
+            self.assertFalse((self.workdir / 'done.json').exists())
+            self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+            self.assertEqual(json.loads((self.workdir / 'done.attempt-1.json').read_text()), first_done)
+        finally:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.communicate(timeout=5)
+        self.assertNotEqual(worker.returncode, 0)
+        pending = json.loads(self.receipt_path.read_text())
+        self.assertEqual((pending['status'], pending['judge']['state']), ('RAN-UNVERIFIED', 'pending'))
+
+    def test_retry_preserves_failed_gate_before_and_after_judge(self):
+        self.prepare_verdict_retry()
+        result = json.loads(self.receipt_path.read_text())
+        result.update(gates_status='FAILED', status='FAILED', status_reason='deterministic gate failed')
+        self.receipt_path.write_text(json.dumps(result))
+        check = jq.clip_check
+
+        def observe(job, frames, image_cache=None):
+            pending = json.loads(self.receipt_path.read_text())
+            self.assertEqual((pending['status'], pending['status_reason'], pending['judge']['state']),
+                             ('FAILED', 'deterministic gate failed', 'pending'))
+            return check(job, frames) if image_cache is None else check(job, frames, image_cache)
+
+        with mock.patch.object(jq, 'clip_check', side_effect=observe):
+            verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual(verdict['verdict'], 'PASS')
+        self.assertEqual((result['status'], result['status_reason']), ('FAILED', 'deterministic gate failed'))
+
+    def test_successful_retry_lands_new_result_without_pending_metadata(self):
+        _, first, _ = self.prepare_verdict_retry()
+        previous_done = json.loads((self.workdir / 'done.json').read_text())
+        (self.folder / 'judge.py').write_text(
+            'import json,sys\njson.dump({"verdict":"FAIL","reason":"new result","shots_cited":[]},'
+            'open(sys.argv[sys.argv.index("--out")+1],"w"))\n')
+        verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual((verdict['verdict'], result['status'], result['judge']['state']), ('FAIL', 'FAILED', 'done'))
+        self.assertNotIn('retry', result['judge'])
+        self.assertNotIn('previous', result['judge'])
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        self.assertTrue((self.workdir / 'done.attempt-1.json').is_file())
+        self.assertEqual(json.loads((self.workdir / 'done.attempt-1.json').read_text()), previous_done)
+        self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
+
+    def test_first_pass_does_not_change_receipt_before_judge(self):
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('result', 'after', 220, good)]
+        original = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'status_reason': 'judge pending',
+                    'judge': {'state': 'pending', 'job': 'original'}, 'blockers': []}
+        self.receipt_path.write_text(json.dumps(original))
+        self.job_path.write_text(json.dumps({
+            'row': 'a', 'shots': shots, 'clip': None, 'dir': str(self.workdir), 'receipt': str(self.receipt_path),
+            'plan_dir': str(self.folder), 'judge_cmd': 'judge.py', 'expected': 'after:result'}))
+        run = jq.run_judge
+        seen = []
+
+        def observe(path, job):
+            seen.append(json.loads(self.receipt_path.read_text()))
+            return run(path, job)
+
+        with mock.patch.object(jq, 'run_judge', side_effect=observe):
+            verdict = jq.work(self.job_path)
+        self.assertEqual(seen, [original])
+        self.assertEqual(verdict['verdict'], 'PASS')
+        self.assertEqual(json.loads(self.receipt_path.read_text())['judge']['state'], 'done')
+        self.assertEqual(list(self.workdir.glob('*.attempt-*.json')), [])
+
+    def test_label_error_is_merged_as_unsure(self):
+        bad = self.shot('bad', 'before', 20, {'status': 'fresh'})
+        bad.pop('name')
+        try:
+            _, result, done, verdict, marker = self.run_worker([bad], 'NO-CITE')
+        except Exception as error:
+            self.fail(f'work raised on bad label: {error!r}')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertIn("judge worker error: KeyError('name')", verdict['reason'])
+        self.assertEqual(done['verdict'], verdict)
+
+    def test_job_write_error_is_merged_as_unsure(self):
+        _, first, marker = self.prepare_verdict_retry()
+        original = self.job_path.read_bytes()
+        write = Path.write_text
+
+        def deny_job(path, *args, **kwargs):
+            if path == self.job_path:
+                raise OSError('cannot write job')
+            return write(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'write_text', autospec=True, side_effect=deny_job):
+            try:
+                verdict = jq.work(self.job_path)
+            except Exception as error:
+                self.fail(f'work raised on job write: {error!r}')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], json.loads(self.receipt_path.read_text())['status']),
+                         ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertIn("judge worker error: OSError('cannot write job')", verdict['reason'])
+        self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+        self.assertEqual(self.job_path.read_bytes(), original)
+
+    def test_retry_receipt_write_error_does_not_run_judge(self):
+        _, first, marker = self.prepare_verdict_retry()
+        merge = jq.merge_receipt
+        calls = []
+
+        def fail_once(path, update):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError('cannot mark retry pending')
+            return merge(path, update)
+
+        with mock.patch.object(jq, 'merge_receipt', side_effect=fail_once):
+            try:
+                verdict = jq.work(self.job_path)
+            except Exception as error:
+                self.fail(f'work raised on retry receipt write: {error!r}')
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], json.loads(self.receipt_path.read_text())['status']),
+                         ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertIn("judge worker error: OSError('cannot mark retry pending')", verdict['reason'])
+        self.assertEqual(json.loads((self.workdir / 'done.json').read_text())['verdict'], verdict)
+        self.assertEqual(json.loads((self.workdir / 'verdict.attempt-1.json').read_text()), first)
+
+    def test_vanished_before_is_excluded_in_fresh_worker_retry(self):
+        before = self.shot('base', 'before', 20, {'status': 'fresh'})
+        _, result, _, verdict, marker = self.run_worker([before], 'NO-CITE')
+        self.assertEqual((result['status'], verdict['verdict']), ('PASS', 'PASS'))
+        self.assertTrue(marker.is_file())
+        marker.unlink()
+        Path(before['path']).rename(self.folder / 'moved.png')
+        proc = subprocess.run([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                               str(self.job_path)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(marker.exists())
+        result = json.loads(self.receipt_path.read_text())
+        done = json.loads((self.workdir / 'done.json').read_text())
+        self.assertEqual((done['verdict']['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(done['verdict']['reason'],
+                         'no usable image for the judge: 1 unusable still(s) excluded')
+        self.assertEqual(done['excluded_shots'], [
+            {'label': 'before:base', 'name': 'base', 'phase': 'before', 'path': before['path'],
+             'reason': 'still file is missing or unreadable'}])
+        self.assertEqual(result['judge']['excluded_shots'], done['excluded_shots'])
+
+    def test_missing_before_excludes_it_and_makes_comparison_unmeasured(self):
+        good = {'status': 'fresh'}
+        before = self.shot('base', 'before', 20, good)
+        after = self.shot('result', 'after', 220, good)
+        Path(before['path']).unlink()
+        job, result, done, verdict, marker = self.run_worker([before, after], 'after:result')
+        self.assertEqual(json.loads(marker.read_text()), ['after:result'])
+        self.assertEqual([s['path'] for s in job['shots']], [after['path']])
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+        self.assertTrue(done['clip_check']['unmeasured'])
+        self.assertEqual(done['clip_check']['excluded'][0]['reason'], 'still file is missing or unreadable')
+        self.assertEqual(result['blockers'], [
+            {'kind': 'evidence', 'source': 'before:base',
+             'text': f"still {before['path']} is not usable evidence: still file is missing or unreadable"}])
+
+    def test_untaken_before_blocks_uncited_clip_verdict(self):
+        before = {'name': 'base', 'phase': 'before', 'path': None, 'fresh': {'status': 'fresh'}}
+        start = self.shot('clip-start', 'clip', 20, None)['path']
+        end = self.shot('clip-end', 'clip', 220, None)['path']
+        _, result, done, verdict, marker = self.run_worker(
+            [before], 'NO-CITE', frames={'start': start, 'end': end})
+        self.assertEqual(json.loads(marker.read_text()), ['clip start', 'clip end'])
+        self.assertTrue(done['clip_check']['ok'])
+        self.assertNotIn('excluded', done['clip_check'])
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+        self.assertEqual(result['blockers'], [
+            {'kind': 'evidence', 'source': 'before:base',
+             'text': 'still None is not usable evidence: still was not taken'}])
+
+    def test_missing_expected_shot_and_failed_gate_remain_authoritative(self):
+        good = {'status': 'fresh'}
+        before = self.shot('base', 'before', 20, good)
+        after = self.shot('result', 'after', 220, good)
+        Path(after['path']).unlink()
+        _, result, done, verdict, marker = self.run_worker([before, after], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('FAIL', 'FAILED'))
+        self.assertEqual(done['clip_check']['reason'], 'expected-result shot missing: result')
+        result['gates_status'] = 'FAILED'
+        self.receipt_path.write_text(json.dumps(result))
+        verdict = jq.work(self.job_path)
+        result = json.loads(self.receipt_path.read_text())
+        self.assertEqual((verdict['verdict'], result['status'], result['status_reason']),
+                         ('FAIL', 'FAILED', 'deterministic gate failed'))
+
+    def test_capture_hash_changed_original_and_absent(self):
+        shot = self.shot('base', 'before', 20, {'status': 'fresh'})
+        original = Path(shot['path']).read_bytes()
+        shot['fresh']['sha256'] = hashlib.sha256(original).hexdigest()
+        replacement = self.shot('replacement', 'before', 220, {'status': 'fresh'})
+        Path(shot['path']).write_bytes(Path(replacement['path']).read_bytes())
+        job, result, done, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['excluded_shots'][0]['reason'], 'still bytes differ from the capture record')
+        self.assertEqual(done['excluded_shots'], job['excluded_shots'])
+        Path(shot['path']).write_bytes(original)
+        job, result, _, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+        self.assertEqual(json.loads(marker.read_text()), ['before:base'])
+        self.assertEqual(job['excluded_shots'], [])
+        Path(shot['path']).write_bytes(Path(replacement['path']).read_bytes())
+        shot['fresh'].pop('sha256')
+        _, result, _, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+        self.assertEqual(json.loads(marker.read_text()), ['before:base'])
+
+    def test_directory_and_unreadable_file_are_excluded(self):
+        good = {'status': 'fresh'}
+        directory = {'name': 'directory', 'phase': 'before', 'path': str(self.folder), 'fresh': good}
+        job, result, _, verdict, marker = self.run_worker([directory], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['excluded_shots'][0]['reason'], 'still file is missing or unreadable')
+        shot = self.shot('unreadable', 'before', 20, good)
+        open_path = Path.open
+
+        def denied(path, *args, **kwargs):
+            if path == Path(shot['path']):
+                raise PermissionError('unreadable still')
+            return open_path(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'open', autospec=True, side_effect=denied):
+            job, result, _, verdict, marker = self.run_worker([shot], 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['excluded_shots'][0]['reason'], 'still file is missing or unreadable')
+
+    def test_missing_clip_and_dense_frames_are_excluded(self):
+        missing = str(self.folder / 'missing-frame.png')
+        dense = str(self.folder / 'missing-dense.png')
+        job, result, done, verdict, marker = self.run_worker([], 'NO-CITE', frames={'start': missing},
+                                                            dense={1000: dense})
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job['shots'], [])
+        self.assertEqual([(s['label'], s['path'], s['reason']) for s in job['excluded_shots']],
+                         [('clip start', missing, 'clip frame file is missing'),
+                          ('dense 1.0s', dense, 'clip frame file is missing')])
+        self.assertEqual(done['excluded_shots'], job['excluded_shots'])
+
+    def test_non_object_and_missing_verdict_are_not_trusted(self):
+        for body, reason in (('[]', 'invalid verdict'), ('', 'judge gave no verdict (exit 0)')):
+            with self.subTest(body=body):
+                self.prepare_verdict_retry()
+                (self.folder / 'judge.py').write_text(
+                    'import sys\nfrom pathlib import Path\n'
+                    + ('Path(sys.argv[sys.argv.index("--out")+1]).write_text(' + repr(body) + ')\n' if body else ''))
+                verdict = jq.work(self.job_path)
+                self.assertEqual(verdict['verdict'], 'UNSURE')
+                self.assertIn(reason, verdict['reason'])
+                (self.folder / 'judge.py').write_text(INPUT_JUDGE)
+
+    def test_uncited_or_unresolved_verdict_still_checks_expected_after(self):
+        good = {'status': 'fresh'}
+        shots = [self.shot('base', 'before', 20, good), self.shot('bright-step', 'step', 220, good),
+                 self.shot('result', 'after', 220, {'status': 'refused', 'reason': 'frozen'})]
+        for mode in ('NO-CITE', 'UNRESOLVED'):
+            with self.subTest(mode=mode):
+                job, result, _, verdict, marker = self.run_worker(shots, mode)
+                self.assertTrue(marker.is_file())
+                self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+                self.assertEqual(result['blockers'], [
+                    {'kind': 'evidence', 'source': 'after:result',
+                     'text': f"still {shots[2]['path']} is not usable evidence: frozen"}])
+                self.assertEqual(job.get('excluded_shots', [{}])[0].get('label'), 'after:result')
+
+    def test_missing_path_and_phaseless_row_shots_are_audited(self):
+        good = {'status': 'fresh'}
+        diagnostic = self.shot('diagnostic', 'step', 100, {'status': 'error', 'reason': 'bad'})
+        diagnostic.pop('phase')
+        shots = [self.shot('base', 'before', 20, good), diagnostic,
+                 self.shot('result', 'after', 220, good)]
+        job, result, _, _, _ = self.run_worker(shots, 'after:result')
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(job.get('excluded_shots'), [
+            {'label': 'step:diagnostic', 'name': 'diagnostic', 'phase': None,
+             'path': diagnostic['path'], 'reason': 'bad'}])
+        missing = [{'name': 'missing', 'phase': 'before', 'path': None}]
+        job, result, _, verdict, marker = self.run_worker(missing, 'NO-CITE')
+        self.assertFalse(marker.exists())
+        self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+        self.assertEqual(job.get('excluded_shots'), [
+            {'label': 'before:missing', 'name': 'missing', 'phase': 'before', 'path': None,
+             'reason': 'still was not taken'}])
+
+    def test_saved_job_replay_preserves_exclusions_in_fresh_worker_processes(self):
+        shots = [self.shot('base', 'before', 20, {'status': 'error', 'reason': 'journal failed'}),
+                 self.shot('after', 'after', 220, None)]
+        self.receipt_path.write_text(json.dumps({'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED',
+                                                 'blockers': []}))
+        self.job_path.write_text(json.dumps({
+            'row': 'a', 'shots': shots, 'expected': 'NO-CITE', 'clip': None, 'dir': str(self.workdir),
+            'receipt': str(self.receipt_path), 'plan_dir': str(self.folder), 'judge_cmd': 'judge.py'}))
+        marker = self.folder / 'judge-ran.json'
+        exclusions = None
+        for _ in range(2):
+            worker = subprocess.run([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                                     str(self.job_path)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(worker.returncode, 0, worker.stderr)
+            verdict = json.loads(worker.stdout)
+            job = json.loads(self.job_path.read_text())
+            result = json.loads(self.receipt_path.read_text())
+            done = json.loads((self.workdir / 'done.json').read_text())
+            self.assertFalse(marker.exists())
+            self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+            self.assertEqual(verdict['reason'], 'no usable image for the judge: 2 unusable still(s) excluded')
+            if exclusions is None:
+                exclusions = job.get('excluded_shots')
+                self.assertEqual(len(exclusions), 2)
+            self.assertEqual(job.get('excluded_shots'), exclusions)
+            self.assertEqual(done.get('excluded_shots'), exclusions)
+            self.assertEqual(result['judge'].get('excluded_shots'), exclusions)
+            self.assertEqual(json.loads((self.workdir / 'row-shots.json').read_text()), shots)
+
+
+class ImageAndEvidenceAttempts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.folder = self.base / 'job'
+        self.folder.mkdir()
+        self.job = self.base / 'job.json'
+        self.receipt = self.base / 'receipt.json'
+        (self.base / 'judge.py').write_text(INPUT_JUDGE)
+
+    def shot(self, name, phase, data):
+        path = self.base / f'{name}.png'
+        path.write_bytes(data)
+        record = still_fresh.Ledger(self.base).record(
+            'a', path, {}, {'boot': 'test', 'frame': 1, 'wall': 1})
+        self.assertEqual(record['status'], 'fresh')
+        self.assertEqual(record['sha256'], hashlib.sha256(data).hexdigest())
+        return {'name': name, 'phase': phase, 'path': str(path), 'fresh': record}
+
+    def png(self, level):
+        out = io.BytesIO()
+        Image.new('RGB', (8, 8), (level, level, level)).save(out, format='PNG')
+        return out.getvalue()
+
+    def prepare(self, shots, expected='NO-CITE', gates='PASS', blockers=None):
+        self.receipt.write_text(json.dumps({'gates_status': gates, 'status': 'RAN-UNVERIFIED',
+                                            'blockers': blockers or []}))
+        self.job.write_text(json.dumps({'row': 'a', 'shots': shots, 'expected': expected, 'clip': None,
+                                        'dir': str(self.folder), 'receipt': str(self.receipt),
+                                        'plan_dir': str(self.base), 'judge_cmd': 'judge.py'}))
+
+    def fresh_worker(self):
+        proc = subprocess.run([sys.executable, '-I', '-B', str(HERE / 'judge_queue.py'), 'work',
+                               str(self.job)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(self.receipt.read_text()), json.loads((self.folder / 'done.json').read_text())
+
+    def integrity_inputs(self):
+        output = io.BytesIO()
+        image = Image.new('RGB', (4, 4), (20, 30, 40))
+        image.save(output, format='PNG')
+        png = output.getvalue()
+        self.assertEqual(len(png), 77)
+        offset = 8
+        idat = iend = None
+        while offset < len(png):
+            length, kind = struct.unpack('>I4s', png[offset:offset + 8])
+            if kind == b'IDAT':
+                idat = (offset + 8, length)
+            if kind == b'IEND':
+                iend = offset
+            offset += length + 12
+        self.assertIsNotNone(idat)
+        self.assertIsNotNone(iend)
+        self.assertEqual(iend + 12, len(png))
+        start, length = idat
+        self.assertGreater(length, 2)
+        corrupt_crc = bytearray(png)
+        corrupt_crc[start + length] ^= 1
+        jpeg_output = io.BytesIO()
+        image.save(jpeg_output, format='JPEG')
+        jpeg = jpeg_output.getvalue()
+        scan = jpeg.find(b'\xff\xda')
+        self.assertGreater(scan, 0)
+        scan_data = scan + 2 + struct.unpack('>H', jpeg[scan + 2:scan + 4])[0]
+        self.assertLess(scan_data + 1, len(jpeg))
+        metadata = PngImagePlugin.PngInfo()
+        metadata.add_text('Comment', 'visible metadata')
+        png_output = io.BytesIO()
+        image.save(png_output, format='PNG', pnginfo=metadata)
+        return {'valid.png': png, 'truncated.png': png[:start + length - 2],
+                'no-iend.png': png[:iend], 'bad-crc.png': bytes(corrupt_crc),
+                'valid.jpg': jpeg, 'half.jpg': jpeg[:len(jpeg) // 2], 'short-scan.jpg': jpeg[:scan_data + 1],
+                'metadata.png': png_output.getvalue()}
+
+    def integrity_shot(self, name, data):
+        path = self.base / name
+        path.write_bytes(data)
+        self.assertEqual(path.read_bytes(), data)
+        fresh = still_fresh.Ledger(self.base).record(
+            'a', path, {}, {'boot': 'test', 'frame': 1, 'wall': 1})
+        self.assertEqual((fresh['status'], fresh['sha256']), ('fresh', hashlib.sha256(path.read_bytes()).hexdigest()))
+        return {'name': name, 'phase': 'before', 'path': str(path), 'fresh': fresh}
+
+    def test_worker_requires_complete_77_byte_png_and_jpeg_endings(self):
+        samples = complete_file_samples(self.integrity_inputs()['valid.png'])
+        for name, data in samples.items():
+            with self.subTest(name=name):
+                valid = name in ('valid.png', 'valid.jpg')
+                shot = self.integrity_shot(name, data)
+                self.assertEqual(jq.image_issue(shot['path']), None if valid else 'not a decodable image')
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                worker_receipt, done = self.fresh_worker()
+                self.assertEqual(done['verdict']['verdict'], 'PASS' if valid else 'UNSURE')
+                self.assertEqual(worker_receipt['status'], 'PASS' if valid else 'RAN-UNVERIFIED')
+                self.assertEqual(marker.exists(), valid)
+                if not valid:
+                    self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+
+    def test_refused_incomplete_image_leaves_no_preview(self):
+        samples = complete_file_samples(self.integrity_inputs()['valid.png'])
+        for name in ('short-iend.png', 'bad-iend-crc.png', 'valid.png'):
+            with self.subTest(name=name):
+                path = self.base / name
+                path.write_bytes(samples[name])
+                self.assertEqual(path.read_bytes(), samples[name])
+                previews = {}
+                with mock.patch.object(Image, 'open', wraps=Image.open) as opened:
+                    issue = jq.image_issue(path, previews=previews)
+                if name == 'valid.png':
+                    self.assertIsNone(issue)
+                    self.assertEqual(list(previews), [str(path)])
+                    self.assertEqual(previews[str(path)].size, (320, 180))
+                    self.assertEqual(opened.call_count, 2)
+                else:
+                    self.assertEqual(issue, 'not a decodable image')
+                    self.assertEqual(previews, {})
+                    self.assertEqual(opened.call_count, 1)
+
+    def test_stdlib_77_byte_png_requires_the_complete_iend(self):
+        png = self.integrity_inputs()['valid.png']
+        with mock.patch.object(jq, 'Image', None):
+            for name, data, expected in (('valid', png, None),
+                                         ('missing-final-byte', png[:-1], 'not a decodable image')):
+                with self.subTest(name=name):
+                    path = self.base / f'{name}.png'
+                    path.write_bytes(data)
+                    self.assertEqual(jq.image_issue(path), expected)
+
+    def test_file_ends_complete_formats_and_short_files(self):
+        helper = getattr(jq, '_file_ends_complete', None)
+        self.assertTrue(callable(helper))
+        samples = complete_file_samples(self.integrity_inputs()['valid.png'])
+        for name, image_format, expected in (('valid.png', 'PNG', True), ('short-iend.png', 'PNG', False),
+                                             ('bad-iend-crc.png', 'PNG', False), ('extra.png', 'PNG', False),
+                                             ('long-iend.png', 'PNG', False), ('valid.jpg', 'JPEG', True),
+                                             ('short-eoi.jpg', 'JPEG', False), ('extra.jpg', 'JPEG', False),
+                                             ('valid.jpg', 'MPO', True), ('short-eoi.jpg', 'MPO', False)):
+            with self.subTest(name=name, format=image_format):
+                path = self.base / name
+                path.write_bytes(samples[name])
+                self.assertEqual(helper(path, image_format), expected)
+        short = self.base / 'short'
+        short.write_bytes(b'\xff')
+        self.assertFalse(helper(short, 'PNG'))
+        self.assertFalse(helper(short, 'JPEG'))
+        self.assertFalse(helper(short, 'MPO'))
+        self.assertTrue(helper(short, 'GIF'))
+
+    def test_pil_integrity_inputs_in_fresh_workers(self):
+        inputs = self.integrity_inputs()
+        bad = {'truncated.png', 'no-iend.png', 'bad-crc.png', 'half.jpg', 'short-scan.jpg'}
+        for name, data in inputs.items():
+            with self.subTest(name=name):
+                shot = self.integrity_shot(name, data)
+                path = Path(shot['path'])
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', False):
+                    if name in {'truncated.png', 'no-iend.png', 'bad-crc.png'}:
+                        with self.assertRaises(Exception):
+                            with Image.open(path) as reference:
+                                reference.verify()
+                        with Image.open(path) as reference:
+                            reference.load()
+                    elif name not in bad:
+                        with Image.open(path) as reference:
+                            reference.verify()
+                        with Image.open(path) as reference:
+                            reference.load()
+                            if name == 'metadata.png':
+                                self.assertEqual(reference.info['Comment'], 'visible metadata')
+                    else:
+                        if name == 'short-scan.jpg':
+                            with Image.open(path) as reference:
+                                reference.verify()
+                        with self.assertRaises(Exception):
+                            with Image.open(path) as reference:
+                                reference.load()
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                receipt, done = self.fresh_worker()
+                self.assertEqual(done['verdict']['verdict'], 'UNSURE' if name in bad else 'PASS')
+                self.assertEqual(receipt['status'], 'RAN-UNVERIFIED' if name in bad else 'PASS')
+                self.assertEqual(marker.exists(), name not in bad)
+                if name in bad:
+                    self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+                else:
+                    self.assertEqual(done['excluded_shots'], [])
+                self.assertEqual(jq.image_issue(path), 'not a decodable image' if name in bad else None)
+
+    def test_pil_truncated_tolerance_is_disabled_and_restored(self):
+        inputs = self.integrity_inputs()
+        for name in ('truncated.png', 'bad-crc.png', 'valid.png'):
+            with self.subTest(name=name):
+                shot = self.integrity_shot(name, inputs[name])
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', True):
+                    verdict = jq.work(self.job)
+                    self.assertTrue(ImageFile.LOAD_TRUNCATED_IMAGES)
+                    expected = 'PASS' if name == 'valid.png' else 'UNSURE'
+                    self.assertEqual(verdict['verdict'], expected)
+                    self.assertEqual(marker.exists(), name == 'valid.png')
+                    self.assertEqual(jq.image_issue(shot['path']),
+                                     None if name == 'valid.png' else 'not a decodable image')
+                    self.assertTrue(ImageFile.LOAD_TRUNCATED_IMAGES)
+
+    def test_pil_load_failure_restores_flag_after_successful_verify(self):
+        verified = mock.MagicMock()
+        loaded = mock.MagicMock()
+        loaded.load.side_effect = OSError('decoder failed')
+        opened = [mock.MagicMock(), mock.MagicMock()]
+        opened[0].__enter__.return_value = verified
+        opened[1].__enter__.return_value = loaded
+        with (mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', True),
+              mock.patch.object(Image, 'open', side_effect=opened)):
+            self.assertEqual(jq.image_issue(self.base / 'image'), 'not a decodable image')
+            self.assertTrue(ImageFile.LOAD_TRUNCATED_IMAGES)
+        verified.verify.assert_called_once_with()
+        loaded.load.assert_called_once_with()
+
+    def test_pil_corrupt_clip_and_dense_frames_are_excluded(self):
+        inputs = self.integrity_inputs()
+        for name in ('truncated.png', 'no-iend.png', 'bad-crc.png'):
+            with self.subTest(name=name):
+                path = self.base / name
+                path.write_bytes(inputs[name])
+                self.assertEqual(path.read_bytes(), inputs[name])
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', False):
+                    with self.assertRaises(Exception):
+                        with Image.open(path) as reference:
+                            reference.verify()
+                self.prepare([])
+                job = json.loads(self.job.read_text())
+                job['clip'] = 'fake.mp4'
+                self.job.write_text(json.dumps(job))
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                with (mock.patch.object(jq, 'sample_frames', return_value=({'start': str(path)}, {'start': 0})),
+                      mock.patch.object(jq, 'sample_dense', return_value={1000: str(path)})):
+                    verdict = jq.work(self.job)
+                done = json.loads((self.folder / 'done.json').read_text())
+                self.assertEqual(verdict['verdict'], 'UNSURE')
+                self.assertFalse(marker.exists())
+                self.assertEqual([entry['reason'] for entry in done['excluded_shots']],
+                                 ['clip frame is not a decodable image'] * 2)
+
+    def test_ledger_corrupt_only_image_never_reaches_judge_and_valid_control_passes(self):
+        for index, data in enumerate((b'', self.png(10)[:20], self.png(10))):
+            with self.subTest(index=index):
+                shot = self.shot(f'only-{index}', 'before', data)
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                verdict = jq.work(self.job)
+                result = json.loads(self.receipt.read_text())
+                done = json.loads((self.folder / 'done.json').read_text())
+                if index < 2:
+                    self.assertEqual((verdict['verdict'], result['status']), ('UNSURE', 'RAN-UNVERIFIED'))
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+                else:
+                    self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'PASS'))
+                    self.assertTrue(marker.exists())
+                    self.assertEqual(done['excluded_shots'], [])
+
+    def test_corrupt_cited_after_is_excluded_but_other_stills_reach_judge(self):
+        shots = [self.shot('before', 'before', self.png(10)),
+                 self.shot('step', 'step', self.png(200)),
+                 self.shot('after', 'after', self.png(220)[:20])]
+        self.prepare(shots, 'after:after')
+        verdict = jq.work(self.job)
+        result = json.loads(self.receipt.read_text())
+        done = json.loads((self.folder / 'done.json').read_text())
+        self.assertEqual(json.loads((self.base / 'judge-ran.json').read_text()), ['before:before', 'step:step'])
+        self.assertEqual((verdict['verdict'], result['status']), ('PASS', 'RAN-UNVERIFIED'))
+        self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+        self.assertIn('still file is not a decodable image', result['blockers'][0]['text'])
+
+    def test_png_stdlib_fallback_refuses_bad_crc_truncated_stream_and_other_formats(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        signature = b'\x89PNG\r\n\x1a\n'
+        header = chunk(b'IHDR', struct.pack('>IIBBBBB', 2, 1, 8, 2, 0, 0, 0))
+        compressed = zlib.compress(b'\x00' + b'\x11\x22\x33' * 2)
+        valid = signature + header + chunk(b'IDAT', compressed) + chunk(b'IEND', b'')
+        with Image.open(io.BytesIO(valid)) as reference:
+            reference.load()
+            self.assertEqual((reference.size, reference.getpixel((0, 0))), ((2, 1), (17, 34, 51)))
+        crc_bad = bytearray(valid)
+        crc_bad[-1] ^= 1
+        short_stream = signature + header + chunk(b'IDAT', compressed[:-2]) + chunk(b'IEND', b'')
+        bad_filter = signature + header + chunk(b'IDAT', zlib.compress(b'\x05' + b'\x11\x22\x33' * 2)) \
+            + chunk(b'IEND', b'')
+        jpeg = self.base / 'other.jpg'
+        Image.new('RGB', (2, 1)).save(jpeg)
+        with mock.patch.object(jq, 'Image', None):
+            for name, data, expected in (('valid', valid, None), ('empty', b'', 'not a decodable image'),
+                                         ('truncated', valid[:20], 'not a decodable image'),
+                                         ('bad-crc', bytes(crc_bad), 'not a decodable image'),
+                                         ('short-idat', short_stream, 'not a decodable image'),
+                                         ('bad-filter', bad_filter, 'not a decodable image')):
+                with self.subTest(name=name):
+                    path = self.base / f'{name}.png'
+                    path.write_bytes(data)
+                    self.assertEqual(jq.image_issue(path), expected)
+            self.assertEqual(jq.image_issue(jpeg), 'not a decodable image')
+
+    def test_stdlib_fallback_accepts_pillow_png_variants(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        for mode in ('1', 'L', 'RGB', 'RGBA'):
+            with self.subTest(mode=mode):
+                path = self.base / f'{mode}.png'
+                Image.new(mode, (257, 263)).save(path)
+                with Image.open(path) as reference:
+                    reference.load()
+                    self.assertEqual(reference.size, (257, 263))
+                with mock.patch.object(jq, 'Image', None):
+                    self.assertIsNone(jq.image_issue(path))
+
+    def test_stdlib_fallback_filters_worker_inputs(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        header = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 2, 1, 8, 2, 0, 0, 0))
+        compressed = zlib.compress(b'\x00' + b'\x11\x22\x33' * 2)
+        valid = header + chunk(b'IDAT', compressed) + chunk(b'IEND', b'')
+        bad_crc = bytearray(valid)
+        bad_crc[-1] ^= 1
+        short_idat = header + chunk(b'IDAT', compressed[:-2]) + chunk(b'IEND', b'')
+        jpeg = io.BytesIO()
+        Image.new('RGB', (2, 1)).save(jpeg, format='JPEG')
+        for name, data, expected in (('valid', valid, 'PASS'), ('empty', b'', 'UNSURE'),
+                                     ('truncated', valid[:20], 'UNSURE'), ('bad-crc', bytes(bad_crc), 'UNSURE'),
+                                     ('short-idat', short_idat, 'UNSURE'), ('jpeg', jpeg.getvalue(), 'UNSURE')):
+            with self.subTest(name=name):
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                shot = self.shot(name, 'before', data)
+                self.prepare([shot])
+                with mock.patch.object(jq, 'Image', None):
+                    verdict = jq.work(self.job)
+                done = json.loads((self.folder / 'done.json').read_text())
+                self.assertEqual(verdict['verdict'], expected)
+                self.assertEqual(marker.exists(), expected == 'PASS')
+                if expected == 'UNSURE':
+                    self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+
+    def test_stdlib_fallback_accepts_interlaced_png_checked_by_pillow(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        width = height = 5
+        passes = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+                  (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+        raw = bytearray()
+        for x, y, dx, dy in passes:
+            for row in range(y, height, dy):
+                pixels = [(col * 30, row * 30, 7) for col in range(x, width, dx)]
+                if pixels:
+                    raw.append(0)
+                    raw.extend(channel for pixel in pixels for channel in pixel)
+        path = self.base / 'interlaced.png'
+        path.write_bytes(b'\x89PNG\r\n\x1a\n'
+                         + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 1))
+                         + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+        with Image.open(path) as reference:
+            reference.load()
+            self.assertEqual(reference.getpixel((4, 3)), (120, 90, 7))
+        with mock.patch.object(jq, 'Image', None):
+            self.assertIsNone(jq.image_issue(path))
+
+    def test_stdlib_fallback_rejects_malformed_png_metadata_in_worker(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        header = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+        tail = chunk(b'IDAT', zlib.compress(b'\x00\x11\x22\x33')) + chunk(b'IEND', b'')
+        for kind, value in ((b'tRNS', b'X' * 3), (b'gAMA', b'X'), (b'cHRM', b'X' * 3),
+                            (b'iCCP', b'X' * 4), (b'pHYs', b'X' * 4)):
+            with self.subTest(kind=kind):
+                data = header + chunk(kind, value) + tail
+                with self.assertRaises(Exception):
+                    with Image.open(io.BytesIO(data)) as reference:
+                        reference.load()
+                shot = self.shot(kind.decode(), 'before', data)
+                self.prepare([shot])
+                marker = self.base / 'judge-ran.json'
+                marker.unlink(missing_ok=True)
+                with mock.patch.object(jq, 'Image', None):
+                    verdict = jq.work(self.job)
+                done = json.loads((self.folder / 'done.json').read_text())
+                self.assertEqual(verdict['verdict'], 'UNSURE')
+                self.assertFalse(marker.exists())
+                self.assertEqual(done['excluded_shots'][0]['reason'], 'still file is not a decodable image')
+
+    def test_stdlib_fallback_checks_common_metadata_and_refuses_unsupported_profile(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        path = self.base / 'metadata.png'
+        data = (b'\x89PNG\r\n\x1a\n'
+                + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+                + chunk(b'gAMA', struct.pack('>I', 45455))
+                + chunk(b'pHYs', struct.pack('>IIB', 2835, 2835, 1))
+                + chunk(b'tEXt', b'Comment\x00ok')
+                + chunk(b'IDAT', zlib.compress(b'\x00\x11\x22\x33')) + chunk(b'IEND', b''))
+        path.write_bytes(data)
+        with Image.open(path) as reference:
+            reference.load()
+            self.assertEqual(reference.getpixel((0, 0)), (17, 34, 51))
+        with mock.patch.object(jq, 'Image', None):
+            self.assertIsNone(jq.image_issue(path))
+        profile = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
+        buf = io.BytesIO()
+        Image.new('RGB', (1, 1)).save(buf, format='PNG', icc_profile=profile)
+        path.write_bytes(buf.getvalue())
+        with Image.open(path) as reference:
+            reference.load()
+            self.assertEqual(reference.info.get('icc_profile'), profile)
+        with mock.patch.object(jq, 'Image', None):
+            self.assertEqual(jq.image_issue(path), 'not a decodable image')
+
+    def test_corrupt_clip_and_dense_frames_are_excluded_and_skip_judge(self):
+        start, dense = self.base / 'start.png', self.base / 'dense.png'
+        start.write_bytes(b'')
+        dense.write_bytes(self.png(10)[:20])
+        self.prepare([])
+        job = json.loads(self.job.read_text())
+        job['clip'] = 'fake.mp4'
+        self.job.write_text(json.dumps(job))
+        with (mock.patch.object(jq, 'sample_frames', return_value=({'start': str(start)}, {'start': 0})),
+              mock.patch.object(jq, 'sample_dense', return_value={1000: str(dense)})):
+            verdict = jq.work(self.job)
+        done = json.loads((self.folder / 'done.json').read_text())
+        self.assertEqual(verdict['verdict'], 'UNSURE')
+        self.assertFalse((self.base / 'judge-ran.json').exists())
+        self.assertEqual([entry['reason'] for entry in done['excluded_shots']],
+                         ['clip frame is not a decodable image'] * 2)
+
+    def test_retry_in_fresh_processes_retires_only_previous_evidence(self):
+        independent = {'kind': 'unverified', 'source': 'hook', 'text': 'hook needs review'}
+        for gates, blockers, expected in (('PASS', [], 'PASS'), ('PASS', [independent], 'RAN-UNVERIFIED'),
+                                          ('FAILED', [], 'FAILED')):
+            with self.subTest(gates=gates, blockers=blockers):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.base = Path(tmp.name)
+                self.folder = self.base / 'job'
+                self.folder.mkdir()
+                self.job = self.base / 'job.json'
+                self.receipt = self.base / 'receipt.json'
+                (self.base / 'judge.py').write_text(INPUT_JUDGE)
+                original = self.png(220)
+                shots = [self.shot('before', 'before', self.png(10)),
+                         self.shot('step', 'step', self.png(150)),
+                         self.shot('after', 'after', original)]
+                self.prepare(shots, blockers=blockers, gates=gates)
+                Path(shots[-1]['path']).write_bytes(self.png(180))
+                first, done = self.fresh_worker()
+                self.assertEqual(first['status'], 'FAILED' if gates == 'FAILED' else 'RAN-UNVERIFIED')
+                self.assertEqual(done['verdict']['verdict'], 'PASS')
+                evidence = [item for item in first['blockers'] if item['kind'] == 'evidence']
+                self.assertEqual(len(evidence), 1)
+                self.assertIn('still bytes differ from the capture record', evidence[0]['text'])
+                previous = {'verdict': first['judge']['verdict'], 'landed': first['judge']['landed'],
+                            'blockers': evidence}
+                second, _ = self.fresh_worker()
+                self.assertEqual([b for b in second['blockers'] if b['kind'] == 'evidence'], evidence)
+                self.assertIn('evidence_attempts', second)
+                self.assertEqual(second['evidence_attempts'], [previous])
+                second_previous = {'verdict': second['judge']['verdict'], 'landed': second['judge']['landed'],
+                                   'blockers': evidence}
+                Path(shots[-1]['path']).write_bytes(original)
+                third, done = self.fresh_worker()
+                self.assertEqual(third['status'], expected)
+                self.assertEqual(third['blockers'], blockers)
+                self.assertEqual(third['evidence_attempts'], [previous, second_previous])
+                self.assertEqual(done['excluded_shots'], [])
+                self.assertEqual(json.loads((self.base / 'judge-ran.json').read_text()),
+                                 ['before:before', 'step:step', 'after:after'])
+                if expected == 'PASS':
+                    self.assertNotIn('review', third)
+                    self.assertNotIn('review_kind', third)
+
+    def test_direct_apply_retires_previous_evidence_before_new_pass(self):
+        shot = self.shot('before', 'before', self.png(10))
+        original = Path(shot['path']).read_bytes()
+        Path(shot['path']).write_bytes(self.png(180))
+        receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
+        verdict = {'verdict': 'PASS', 'shots_cited': [shot['path']]}
+        jq.apply_verdict(receipt, {'ok': True}, verdict, {}, shots=[shot])
+        self.assertEqual(receipt['status'], 'RAN-UNVERIFIED')
+        old = {'verdict': 'PASS', 'landed': receipt['judge']['landed'], 'blockers': receipt['blockers'][:]}
+        Path(shot['path']).write_bytes(original)
+        jq.apply_verdict(receipt, {'ok': True}, verdict, {}, shots=[shot])
+        self.assertIn('evidence_attempts', receipt)
+        self.assertEqual((receipt['status'], receipt['blockers'], receipt['evidence_attempts']), ('PASS', [], [old]))
+        self.assertNotIn('review', receipt)
+        self.assertNotIn('review_kind', receipt)
+
+    def test_retry_pending_archives_evidence_without_touching_other_blockers(self):
+        self.assertTrue(hasattr(jq, 'retire_evidence'))
+        evidence = {'kind': 'evidence', 'source': 's', 'text': 'bad'}
+        visual = {'kind': 'visual', 'source': 'v', 'text': 'read'}
+        current = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': [visual, evidence],
+                   'judge': {'state': 'done', 'verdict': 'PASS', 'landed': 123}}
+        self.receipt.write_text(json.dumps(current))
+        jq.mark_retry(self.receipt)
+        result = json.loads(self.receipt.read_text())
+        self.assertEqual(result['blockers'], [visual])
+        self.assertEqual(result['evidence_attempts'], [{'verdict': 'PASS', 'landed': 123, 'blockers': [evidence]}])
+        self.assertEqual(result['judge']['state'], 'pending')
+        untouched = {'blockers': [visual]}
+        jq.retire_evidence(untouched)
+        self.assertEqual(untouched, {'blockers': [visual]})
+
+    def test_each_shot_is_decoded_once_per_worker_pass(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        shots = [self.shot('before', 'before', self.png(10)), self.shot('after', 'after', self.png(220))]
+        self.prepare(shots)
+        original = jq.image_issue
+        seen = []
+        def inspect(path, *, previews=None):
+            seen.append(str(path))
+            return original(path, previews=previews)
+        with (mock.patch.object(jq, 'image_issue', side_effect=inspect),
+              mock.patch.object(jq, 'frame_diff', wraps=jq.frame_diff) as diff):
+            jq.work(self.job)
+        self.assertCountEqual(seen, [shot['path'] for shot in shots])
+        self.assertEqual(diff.call_count, 1)
+        self.assertTrue(all(not isinstance(arg, (str, Path)) for arg in diff.call_args.args))
+
+    def test_direct_clip_check_reuses_decoded_row_and_clip_frames(self):
+        self.assertTrue(hasattr(jq, 'image_issue'))
+        shots = [self.shot('before', 'before', self.png(10)), self.shot('after', 'after', self.png(220))]
+        calls = []
+        original = jq.image_issue
+        def inspect(path, *, previews=None):
+            calls.append(str(path))
+            return original(path, previews=previews)
+        frames = {'start': shots[0]['path'], 'end': shots[1]['path']}
+        with (mock.patch.object(jq, 'image_issue', side_effect=inspect),
+              mock.patch.object(jq, 'frame_diff', wraps=jq.frame_diff) as diff):
+            check = jq.clip_check({'shots': shots}, frames)
+        self.assertTrue(check['ok'])
+        self.assertCountEqual(calls, [shot['path'] for shot in shots])
+        self.assertTrue(all(not isinstance(arg, (str, Path)) for call in diff.call_args_list for arg in call.args))
+
+
 class StatusRules(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.paths = {name: str(Path(tmp.name) / f'{name}.png') for name in ('before', 'diagnostic', 'after')}
+        for path in self.paths.values():
+            Image.new('RGB', (4, 4), (10, 20, 30)).save(path)
+
+    def test_freshness_selection_uses_citations_or_before_and_expected_fallback(self):
+        select = getattr(jq, 'evidence_blockers', None)
+        self.assertTrue(callable(select))
+        good = {'status': 'unverified', 'reason': 'no game frame source'}
+        bad = {'status': 'error', 'reason': 'journal failed'}
+        before, diagnostic, after = (self.paths[name] for name in ('before', 'diagnostic', 'after'))
+        shots = [{'phase': 'before', 'path': before, 'label': 'before:base', 'fresh': bad},
+                 {'phase': 'step', 'path': diagnostic, 'label': 'step:diagnostic', 'fresh': bad},
+                 {'phase': 'after', 'path': after, 'label': 'after:result', 'fresh': good}]
+        for cited, expected in (([after], []), (['step:diagnostic'], ['step:diagnostic']),
+                                ([], ['before:base']), (['not-a-shot'], ['before:base']),
+                                ([after, 'not-a-shot'], ['before:base'])):
+            with self.subTest(cited=cited):
+                blockers = select(shots, {'verdict': 'PASS', 'shots_cited': cited})
+                self.assertEqual([item['source'] for item in blockers], expected)
+        old = [{key: value for key, value in shot.items() if key != 'fresh'} for shot in shots]
+        missing = select(old, {'verdict': 'PASS', 'shots_cited': []})
+        self.assertEqual([item['source'] for item in missing], ['before:base', 'after:result'])
+        self.assertTrue(all('no freshness record' in item['text'] for item in missing))
+        mixed = [shots[0], {key: value for key, value in shots[-1].items() if key != 'fresh'}]
+        blockers = select(mixed, {'verdict': 'PASS', 'shots_cited': [after]})
+        self.assertEqual(len(blockers), 1)
+        self.assertIn('no freshness record', blockers[0]['text'])
+        mixed[-1]['fresh'] = None
+        self.assertIn('no freshness record', select(mixed, {'shots_cited': [after]})[0]['text'])
+        shots[-1]['fresh'] = bad
+        fallback = select(shots, {'shots_cited': []})
+        self.assertEqual(fallback[0]['text'], f'still {before} is not usable evidence: journal failed')
+        self.assertEqual([item['source'] for item in fallback],
+                         ['before:base', 'after:result'])
+        self.assertEqual([item['source'] for item in select(shots[:2], {'shots_cited': []})],
+                         ['before:base', 'step:diagnostic'])
+
+    def test_untaken_shot_is_blocked_when_cited_or_used_as_fallback(self):
+        shot = {'phase': 'before', 'path': None, 'label': 'before:base', 'fresh': {'status': 'fresh'}}
+        clip = {'phase': 'clip', 'path': self.paths['after'], 'label': 'clip end'}
+        expected = [{'kind': 'evidence', 'source': 'before:base',
+                     'text': 'still None is not usable evidence: still was not taken'}]
+        for cited in ([], ['before:base']):
+            with self.subTest(cited=cited):
+                self.assertEqual(jq.evidence_blockers([shot], {'shots_cited': cited}, [clip]), expected)
+
+    def test_failed_gate_remains_authoritative_with_bad_verdict_stills(self):
+        before = self.paths['before']
+        shot = {'name': 'before', 'phase': 'before', 'path': before, 'label': 'before:base',
+                'fresh': {'status': 'error', 'reason': 'journal failed'}}
+        for word in ('PASS', 'FAIL', 'UNSURE'):
+            with self.subTest(verdict=word):
+                receipt = {'gates_status': 'FAILED', 'status': 'RAN-UNVERIFIED', 'review_kind': 'existing',
+                           'blockers': [{'kind': 'effect', 'source': 'gate', 'text': 'gate evidence'}]}
+                verdict = {'verdict': word, 'reason': 'known failure', 'shots_cited': [before]}
+                known = {'known': {'title': 'known', 'reason': 'known failure'}}
+                jq.apply_verdict(receipt, {'ok': True}, verdict, {}, known=known, shots=[shot])
+                self.assertEqual((receipt['status'], receipt['status_reason']),
+                                 ('FAILED', 'deterministic gate failed'))
+                self.assertNotIn('review', receipt)
+                self.assertEqual(receipt['review_kind'], 'existing')
+                self.assertEqual(receipt['judge']['verdict'], word)
+                self.assertNotIn('known_issue', receipt)
+                self.assertEqual(receipt['blockers'], [
+                    {'kind': 'effect', 'source': 'gate', 'text': 'gate evidence'},
+                    {'kind': 'evidence', 'source': 'before:base',
+                     'text': f'still {before} is not usable evidence: journal failed'}])
+                if word == 'FAIL':
+                    clean = {'gates_status': 'FAILED', 'status': 'RAN-UNVERIFIED'}
+                    usable = {**shot, 'fresh': {'status': 'unverified', 'reason': 'no game frame source'}}
+                    jq.apply_verdict(clean, {'ok': True}, verdict, {}, known=known, shots=[usable])
+                    self.assertEqual((clean['status'], clean['status_reason']),
+                                     ('FAILED', 'deterministic gate failed'))
+                    self.assertNotIn('known_issue', clean)
+
+    def test_failed_clip_only_checks_freshness_of_compared_stills(self):
+        good = {'status': 'unverified', 'reason': 'no game frame source'}
+        refused = {'status': 'refused', 'reason': 'unchanged across 200 game frames'}
+        error = {'status': 'error', 'reason': 'journal failed'}
+        before_path, diagnostic_path, after_path = (self.paths[name] for name in ('before', 'diagnostic', 'after'))
+        cases = (
+            ('missing expected', error, refused,
+             {'ok': False, 'reason': 'expected-result shot missing: after'}, 'FAILED', []),
+            ('all usable', good, good,
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'FAILED', []),
+            ('refused after', good, refused,
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'RAN-UNVERIFIED', ['after:result']),
+            ('error before', error, good,
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'RAN-UNVERIFIED', ['before:base']),
+            ('both unusable', error, refused,
+             {'ok': False, 'reason': 'no-visible-effect', 'before': before_path,
+              'diffs': {after_path: 0}}, 'RAN-UNVERIFIED', ['before:base', 'after:result']),
+            ('clip frames only', error, refused,
+             {'ok': False, 'reason': 'no-visible-effect', 'before': '/clip-start.png',
+              'diffs': {'/clip-end.png': 0}}, 'FAILED', []),
+        )
+        for name, before, after, check, status, sources in cases:
+            with self.subTest(case=name):
+                shots = [{'name': 'before', 'phase': 'before', 'path': before_path,
+                          'label': 'before:base', 'fresh': before},
+                         {'name': 'diagnostic', 'phase': 'step', 'path': diagnostic_path,
+                          'label': 'step:diagnostic', 'fresh': refused},
+                         {'name': 'after', 'phase': 'after', 'path': after_path,
+                          'label': 'after:result', 'fresh': after}]
+                receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
+                verdict = {'verdict': 'FAIL', 'reason': 'clip check: ' + check['reason'], 'shots_cited': []}
+                jq.apply_verdict(receipt, check, verdict, {}, shots=shots)
+                self.assertEqual(receipt['status'], status)
+                self.assertEqual(receipt['judge']['verdict'], 'FAIL')
+                self.assertEqual([blocker['source'] for blocker in receipt['blockers']], sources)
+                if sources:
+                    self.assertEqual((receipt['review'], receipt['review_kind']), (True, 'unverified'))
+                    self.assertEqual(receipt['status_reason'], receipt['blockers'][0]['text'])
+                else:
+                    self.assertEqual(receipt['status_reason'], check['reason'])
+                    self.assertNotIn('review', receipt)
+
+    def test_real_clip_check_failure_uses_compared_still_freshness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            before, after = Path(tmp) / 'before.png', Path(tmp) / 'after.png'
+            Image.new('RGB', (4, 4), (20, 20, 20)).save(before)
+            Image.new('RGB', (4, 4), (220, 220, 220)).save(after)
+            shots = [{'name': 'before', 'phase': 'before', 'path': str(before), 'label': 'before:base',
+                      'fresh': {'status': 'same'}},
+                     {'name': 'after', 'phase': 'after', 'path': str(after), 'label': 'after:result',
+                      'fresh': {'status': 'same'}}]
+            with mock.patch.object(jq, 'frame_diff', return_value=0):
+                check = jq.clip_check({'shots': shots}, {})
+            self.assertEqual((check['reason'], check['before'], set(check['diffs'])),
+                             ('no-visible-effect', str(before), {str(after)}))
+            shots[0]['fresh'] = {'status': 'error', 'reason': 'journal failed'}
+            receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
+            jq.apply_verdict(receipt, check, {'verdict': 'FAIL', 'shots_cited': []}, {}, shots=shots)
+            self.assertEqual((receipt['status'], receipt['review_kind']), ('RAN-UNVERIFIED', 'unverified'))
+            self.assertEqual([item['source'] for item in receipt['blockers']], ['before:base'])
+
+    def test_clip_only_job_without_row_stills_keeps_verdict(self):
+        clip = {'phase': 'clip', 'path': '/clip.png', 'label': 'clip end'}
+        for word, status in (('PASS', 'PASS'), ('FAIL', 'FAILED')):
+            with self.subTest(verdict=word):
+                receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
+                verdict = {'verdict': word, 'reason': 'visible', 'shots_cited': ['clip end']}
+                jq.apply_verdict(receipt, {'ok': True}, verdict, {}, shots=[], all_shots=[clip])
+                self.assertEqual(receipt['status'], status)
+                self.assertEqual(receipt['judge']['verdict'], word)
+                self.assertEqual(receipt['blockers'], [])
+
     def test_clip_frames_use_the_rows_real_length(self):
         # 2026-11-18: GStreamer reported CPU-F001's per-row file as 8.3 s against an 11.4 s row, so "clip end" fell
         # before the effect stills; the positions now come from the receipt's span in the file's own time
@@ -141,16 +1497,114 @@ class StatusRules(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         for name, colour in (('a', (90, 90, 90)), ('b', (91, 90, 90)), ('c', (200, 30, 30))):
             Image.new('RGB', (64, 36), colour).save(d / f'{name}.png')
-        same = {'shots': [{'name': 'x-a', 'phase': 'before', 'path': str(d / 'a.png')},
-                          {'name': 'x-b', 'phase': 'after', 'path': str(d / 'b.png')}]}
+        good = {'status': 'unverified', 'reason': 'no game frame source'}
+        same = {'shots': [{'name': 'x-a', 'phase': 'before', 'path': str(d / 'a.png'), 'fresh': good},
+                          {'name': 'x-b', 'phase': 'after', 'path': str(d / 'b.png'), 'fresh': good}]}
         self.assertEqual(jq.clip_check(same, {})['reason'], 'no-visible-effect')
-        changed = {'shots': [same['shots'][0], {'name': 'x-c', 'phase': 'after', 'path': str(d / 'c.png')}]}
+        changed = {'shots': [same['shots'][0], {'name': 'x-c', 'phase': 'after', 'path': str(d / 'c.png'),
+                                               'fresh': good}]}
         self.assertTrue(jq.clip_check(changed, {})['ok'])
         missing = {'shots': [same['shots'][0], {'name': 'x-d', 'phase': 'after', 'path': None}]}
         self.assertIn('expected-result shot missing', jq.clip_check(missing, {})['reason'])
         # the clip frames count too: start vs end
         self.assertEqual(jq.clip_check({'shots': []}, {'start': str(d / 'a.png'), 'end': str(d / 'b.png')})['reason'],
                          'no-visible-effect')
+
+    def test_clip_check_excludes_refused_step_from_visible_change(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {name: str(Path(tmp) / f'{name}.png') for name in ('before', 'step', 'after')}
+            for name, level in (('before', 20), ('step', 220), ('after', 20)):
+                Image.new('RGB', (32, 18), (level, level, level)).save(paths[name])
+            good = {'status': 'fresh'}
+            refused = {'status': 'refused', 'reason': 'unchanged across 200 game frames'}
+            for step_record, expected in ((refused, 'FAILED'), (good, 'PASS')):
+                with self.subTest(step=step_record['status']):
+                    shots = [{'name': name, 'phase': phase, 'path': paths[name], 'label': f'{phase}:{name}',
+                              'fresh': step_record if name == 'step' else good}
+                             for name, phase in (('before', 'before'), ('step', 'step'), ('after', 'after'))]
+                    check = jq.clip_check({'shots': shots}, {})
+                    verdict = {'verdict': 'PASS', 'reason': 'visible', 'shots_cited': [paths['after']]}
+                    receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
+                    jq.apply_verdict(receipt, check, verdict, {}, shots=shots)
+                    self.assertEqual(receipt['status'], expected)
+                    if step_record is refused:
+                        self.assertEqual((check['ok'], check['reason'], check['max_diff']),
+                                         (False, 'no-visible-effect', 0.0))
+                        self.assertEqual(check['excluded'], [{'path': paths['step'], 'label': 'step:step',
+                                                             'reason': refused['reason']}])
+                        self.assertEqual(receipt['status_reason'], 'no-visible-effect')
+                        self.assertEqual(receipt['blockers'], [])
+                    else:
+                        self.assertTrue(check['ok'])
+                        self.assertEqual(check['max_diff'], 200.0)
+                        self.assertNotIn('excluded', check)
+
+    def test_clip_check_unmeasured_blocks_pass_and_fail_without_duplicates(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            before, after = (str(Path(tmp) / f'{name}.png') for name in ('before', 'after'))
+            for path, level in ((before, 20), (after, 220)):
+                Image.new('RGB', (32, 18), (level, level, level)).save(path)
+            shots = [{'name': 'before', 'phase': 'before', 'path': before, 'label': 'before:base',
+                      'fresh': {'status': 'fresh'}},
+                     {'name': 'after', 'phase': 'after', 'path': after, 'label': 'after:result',
+                      'fresh': {'status': 'refused', 'reason': 'frozen'}}]
+            check = jq.clip_check({'shots': shots}, {})
+            self.assertEqual(check, {'ok': True, 'unmeasured': True,
+                                     'note': 'change not measured: 1 unusable still(s) excluded',
+                                     'excluded': [{'path': after, 'label': 'after:result', 'reason': 'frozen'}]})
+            for word, cited in (('PASS', after), ('PASS', before), ('FAIL', after), ('FAIL', before)):
+                with self.subTest(verdict=word, cited=cited):
+                    receipt = {'gates_status': 'PASS', 'status': 'RAN-UNVERIFIED', 'blockers': []}
+                    jq.apply_verdict(receipt, check, {'verdict': word, 'shots_cited': [cited]}, {}, shots=shots)
+                    self.assertEqual((receipt['status'], receipt['review'], receipt['review_kind']),
+                                     ('RAN-UNVERIFIED', True, 'unverified'))
+                    self.assertEqual(receipt['judge']['verdict'], word)
+                    self.assertEqual(receipt['blockers'], [{'kind': 'evidence', 'source': 'after:result',
+                                                            'text': f'still {after} is not usable evidence: frozen'}])
+            missing = {'shots': [shots[0], {'name': 'missing', 'phase': 'after', 'path': str(Path(tmp) / 'missing')}]}
+            self.assertEqual(jq.clip_check(missing, {})['reason'], 'expected-result shot missing: missing')
+
+    def test_clip_check_uses_clip_baseline_and_old_jobs_do_not_gain_evidence(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {name: str(Path(tmp) / f'{name}.png')
+                     for name in ('before', 'after', 'clip-start', 'clip-end')}
+            for name, level in (('before', 220), ('after', 20), ('clip-start', 20), ('clip-end', 220)):
+                Image.new('RGB', (32, 18), (level, level, level)).save(paths[name])
+            shots = [{'name': 'before', 'phase': 'before', 'path': paths['before'], 'label': 'before:base',
+                      'fresh': {'status': 'error', 'reason': 'journal failed'}},
+                     {'name': 'after', 'phase': 'after', 'path': paths['after'], 'label': 'after:result',
+                      'fresh': {'status': 'fresh'}}]
+            frames = {'start': paths['clip-start'], 'end': paths['clip-end']}
+            check = jq.clip_check({'shots': shots}, frames)
+            self.assertEqual((check['ok'], check['before'], check['max_diff']), (True, frames['start'], 200.0))
+            self.assertEqual(check['excluded'][0]['label'], 'before:base')
+            old = [{key: value for key, value in shot.items() if key != 'fresh'} for shot in shots]
+            check = jq.clip_check({'shots': old}, frames)
+            self.assertEqual((check['ok'], check['before'], check['max_diff']), (True, frames['start'], 200.0))
+            self.assertEqual(len(check['excluded']), 2)
+            self.assertTrue(all(item['reason'] == 'no freshness record' for item in check['excluded']))
+            unmeasured = jq.clip_check({'shots': old}, {})
+            self.assertTrue(unmeasured['unmeasured'])
+            self.assertEqual(len(unmeasured['excluded']), 2)
+            clips_only = jq.clip_check({'shots': []}, frames)
+            self.assertEqual(clips_only, {'ok': True, 'max_diff': 200.0, 'before': frames['start']})
+
+    def test_clip_check_unreadable_pair_with_exclusion_is_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {name: str(Path(tmp) / name) for name in ('before', 'step', 'after')}
+            for path in paths.values():
+                Image.new('RGB', (4, 4), (10, 20, 30)).save(path, format='PNG')
+            shots = [{'name': name, 'phase': phase, 'path': paths[name],
+                      'fresh': {'status': 'error', 'reason': 'bad'} if name == 'step' else {'status': 'fresh'}}
+                     for name, phase in (('before', 'before'), ('step', 'step'), ('after', 'after'))]
+            with mock.patch.object(jq, 'frame_diff', side_effect=OSError('unreadable')):
+                check = jq.clip_check({'shots': shots}, {})
+            self.assertEqual(check, {'ok': True, 'unmeasured': True,
+                                     'note': 'change not measured: 1 unusable still(s) excluded',
+                                     'excluded': [{'path': paths['step'], 'name': 'step', 'reason': 'bad'}]})
 
 
 class RunnerEffects(unittest.TestCase):
@@ -182,6 +1636,399 @@ class RunnerEffects(unittest.TestCase):
         captures = receipt(folder, row).get('captures')
         self.assertTrue(captures)
         return folder / 'out' / row / captures[0]['file']
+
+    def visual_fresh_run(self, state):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        count = 2 if state in ('same', 'refused') else 1
+        engine = make_plan(folder, [{'id': 'a', 'outcome': 'visual',
+                                     'steps': [{'shot': 'same'} for _ in range(count)]}])
+        if state in ('fresh', 'same', 'refused'):
+            bridge = folder / 'bridge.log'
+            engine.instances['sw']['bridge_log'] = str(bridge)
+            frames = iter([1000, 1200 if state == 'refused' else 1060])
+            client = engine.clients['sw']
+            request = client.request
+
+            def call(method, params=None):
+                if method == 'ui.screenshot':
+                    frame = next(frames)
+                    with bridge.open('a') as stream:
+                        stream.write(f'[Bridge] boot=0xabc frame={frame} wall={frame * 17}\n')
+                return request(method, params)
+
+            client.request = call
+        if state == 'error':
+            (engine.out / 'stills.jsonl').mkdir()
+        self.assertEqual(engine.run(), 'DONE')
+        capture = receipt(folder, 'a')['captures'][-1]
+        return folder, engine.out / 'a' / capture['file']
+
+    def visual_payloads(self):
+        image = Image.new('RGB', (4, 4), (20, 30, 40))
+        output = io.BytesIO()
+        image.save(output, format='PNG')
+        png = output.getvalue()
+        self.assertEqual(len(png), 77)
+        offset = 8
+        idat = iend = None
+        while offset < len(png):
+            length, kind = struct.unpack('>I4s', png[offset:offset + 8])
+            if kind == b'IDAT':
+                idat = (offset + 8, length)
+            if kind == b'IEND':
+                iend = offset
+            offset += length + 12
+        self.assertIsNotNone(idat)
+        self.assertIsNotNone(iend)
+        self.assertEqual(iend + 12, len(png))
+        start, length = idat
+        self.assertGreater(length, 2)
+        bad_crc = bytearray(png)
+        bad_crc[start + length] ^= 1
+        output = io.BytesIO()
+        image.save(output, format='JPEG')
+        return {'empty': b'', 'short-header': png[:20], 'cut-idat': png[:start + length - 2],
+                'no-iend': png[:iend], 'bad-crc': bytes(bad_crc), 'png': png, 'jpeg': output.getvalue()}
+
+    def visual_payload_run(self, data, copied=False):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        rows = ([{'id': 'a', 'role': 'setup', 'steps': [{'shot': 'visual'}]},
+                 {'id': 'b', 'outcome': 'visual', 'steps': []}] if copied else
+                [{'id': 'a', 'outcome': 'visual', 'steps': [{'shot': 'visual'}]}])
+        engine = make_plan(folder, rows)
+        bridge = engine.out / 'bridge.log'
+        engine.instances['sw']['bridge_log'] = str(bridge)
+        client = engine.clients['sw']
+        request = client.request
+
+        def call(method, params=None):
+            if method == 'ui.screenshot':
+                Path(params['path']).write_bytes(data)
+                bridge.write_text('[Bridge] boot=0xabc frame=1000 wall=17000\n')
+                return {'ok': True, 'result': {}}
+            return request(method, params)
+
+        client.request = call
+        self.assertEqual(engine.run(), 'DONE')
+        original = self.captured(folder)
+        self.assertEqual(original.read_bytes(), data)
+        source = receipt(folder, 'a')
+        self.assertEqual(len(source['captures']), 1)
+        capture = source['captures'][0]
+        self.assertEqual(capture['fresh']['status'], 'fresh')
+        self.assertEqual(capture['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(capture['fresh']['sha256'], capture['sha256'])
+        row = 'b' if copied else 'a'
+        if copied:
+            self.assertEqual(source['inputs_identity'], receipt(folder, 'b')['inputs_identity'])
+            still = folder / 'out/b/copied.png'
+            still.write_bytes(data)
+        else:
+            still = original
+        current = receipt(folder, row)
+        self.assertEqual((current['status'], current['gates_status']), ('RAN-UNVERIFIED', 'PASS'))
+        self.assertTrue(any(item['kind'] == 'visual' for item in current['blockers']))
+        return folder, original, still, row
+
+    def test_record_read_refuses_undecodable_fresh_captures_for_both_verdicts(self):
+        payloads = self.visual_payloads()
+        for name in ('empty', 'short-header', 'cut-idat', 'no-iend', 'bad-crc'):
+            with self.subTest(name=name):
+                folder, original, still, row = self.visual_payload_run(payloads[name])
+                with mock.patch.object(ImageFile, 'LOAD_TRUNCATED_IMAGES', False):
+                    with self.assertRaises(Exception):
+                        with Image.open(still) as reference:
+                            reference.verify()
+                before = (folder / 'out' / f'{row}.json').read_bytes()
+                for verdict in ('PASS', 'FAIL'):
+                    with self.subTest(verdict=verdict):
+                        result = self.record_read(folder, still, verdict=verdict, row=row)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f'the capture {row}/{original.name} is not usable evidence: '
+                                      'still file is not a decodable image', result.stderr)
+                        self.assertEqual((folder / 'out' / f'{row}.json').read_bytes(), before)
+                        self.assertTrue(any(item['kind'] == 'visual' for item in receipt(folder, row)['blockers']))
+
+    def test_record_read_accepts_fresh_png_and_jpeg_captures(self):
+        payloads = self.visual_payloads()
+        for name in ('png', 'jpeg'):
+            with self.subTest(name=name):
+                folder, original, still, row = self.visual_payload_run(payloads[name])
+                with Image.open(still) as reference:
+                    self.assertEqual(reference.format, 'PNG' if name == 'png' else 'JPEG')
+                    reference.verify()
+                with Image.open(still) as reference:
+                    reference.load()
+                if name == 'jpeg':
+                    still = original.parent / 'copy.jpg'
+                    still.write_bytes(original.read_bytes())
+                    capture = f'{row}:{original.name}'
+                else:
+                    capture = None
+                result = self.record_read(folder, still, row=row, capture=capture)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                current = receipt(folder, row)
+                self.assertEqual(current['status'], 'PASS')
+                self.assertEqual(current['visual_read']['capture']['fresh']['status'], 'fresh')
+                self.assertEqual(current['visual_read']['capture']['sha256'],
+                                 hashlib.sha256(payloads[name]).hexdigest())
+
+    def test_record_read_requires_complete_77_byte_png_and_accepts_jpeg(self):
+        samples = complete_file_samples(self.visual_payloads()['png'])
+        for name in ('valid.png', 'short-iend.png', 'bad-iend-crc.png', 'valid.jpg'):
+            valid = name in ('valid.png', 'valid.jpg')
+            for verdict in (('PASS',) if valid else ('PASS', 'FAIL')):
+                with self.subTest(name=name, verdict=verdict):
+                    folder, original, still, row = self.visual_payload_run(samples[name])
+                    before = (folder / 'out' / f'{row}.json').read_bytes()
+                    result = self.record_read(folder, still, verdict=verdict, row=row)
+                    if valid:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(receipt(folder, row)['status'], 'PASS')
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f'the capture {row}/{original.name} is not usable evidence: '
+                                      'still file is not a decodable image', result.stderr)
+                        self.assertEqual((folder / 'out' / f'{row}.json').read_bytes(), before)
+
+    def test_record_read_checks_identity_before_declared_non_image_copy(self):
+        data = self.visual_payloads()['short-header']
+        folder, original, still, row = self.visual_payload_run(data, copied=True)
+        source_path = folder / 'out/a.json'
+        source_bytes = source_path.read_bytes()
+        selected = f'a:{original.name}'
+        target_path = folder / 'out' / f'{row}.json'
+        before = target_path.read_bytes()
+        for field in ('plan_identity', 'instances_sha256', 'inputs_identity'):
+            with self.subTest(field=field):
+                source = json.loads(source_bytes)
+                source[field] = 'another'
+                source_path.write_text(json.dumps(source))
+                result = self.record_read(folder, still, row=row, capture=selected)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'--capture {selected} is not a capture of this run with these bytes', result.stderr)
+                self.assertNotIn('still file is not a decodable image', result.stderr)
+                self.assertEqual(target_path.read_bytes(), before)
+        source_path.write_bytes(source_bytes)
+        for capture in (selected, None):
+            for verdict in ('PASS', 'FAIL'):
+                with self.subTest(capture=capture, verdict=verdict):
+                    result = self.record_read(folder, still, verdict=verdict, row=row, capture=capture)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f'the capture a/{original.name} is not usable evidence: '
+                                  'still file is not a decodable image', result.stderr)
+                    self.assertEqual(target_path.read_bytes(), before)
+                    self.assertTrue(any(item['kind'] == 'visual' for item in receipt(folder, row)['blockers']))
+
+    def test_record_read_checks_hash_and_freshness_before_image(self):
+        data = self.visual_payloads()['short-header']
+        folder, original, still, row = self.visual_payload_run(data)
+        target_path = folder / 'out' / f'{row}.json'
+        before = target_path.read_bytes()
+        still.write_bytes(b'other non-image bytes')
+        result = self.record_read(folder, still, row=row)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"the still's bytes differ from the capture recorded for {row}/{original.name}", result.stderr)
+        self.assertNotIn('still file is not a decodable image', result.stderr)
+        self.assertEqual(target_path.read_bytes(), before)
+        still.write_bytes(data)
+        current = json.loads(before)
+        current['captures'][0]['fresh'].update(status='refused', reason='frozen frame')
+        target_path.write_text(json.dumps(current))
+        before = target_path.read_bytes()
+        for verdict in ('PASS', 'FAIL'):
+            with self.subTest(verdict=verdict):
+                result = self.record_read(folder, still, verdict=verdict, row=row)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('still refused as evidence: frozen frame', result.stderr)
+                self.assertNotIn('still file is not a decodable image', result.stderr)
+                self.assertEqual(target_path.read_bytes(), before)
+                self.assertTrue(any(item['kind'] == 'visual' for item in receipt(folder, row)['blockers']))
+
+    def test_record_read_requires_usable_freshness_for_pass_and_fail(self):
+        for state in ('fresh', 'same', 'unverified', 'refused', 'error', 'missing'):
+            with self.subTest(state=state):
+                folder, still = self.visual_fresh_run(state)
+                before = receipt(folder, 'a')
+                capture = before['captures'][-1]
+                if state == 'missing':
+                    capture.pop('fresh', None)
+                    (folder / 'out/a.json').write_text(json.dumps(before))
+                else:
+                    self.assertEqual((capture.get('fresh') or {}).get('status'), state)
+                before = receipt(folder, 'a')
+                if state in ('refused', 'error', 'missing'):
+                    for verdict in ('PASS', 'FAIL'):
+                        result = self.record_read(folder, still, verdict=verdict)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f'the capture a/{still.name} is not usable evidence:', result.stderr)
+                        self.assertIn('no freshness record' if state == 'missing'
+                                      else runner.still_fresh.unusable_reason(capture['fresh']), result.stderr)
+                        self.assertEqual(receipt(folder, 'a'), before)
+                else:
+                    result = self.record_read(folder, still)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(receipt(folder, 'a')['visual_read']['capture']['fresh'], capture['fresh'])
+
+    def test_visual_read_preserves_evidence_and_next_judge_pass_retires_it(self):
+        folder, still = self.visual_fresh_run('unverified')
+        current = receipt(folder, 'a')
+        blocker = {'kind': 'evidence', 'source': 'after', 'text': 'still cannot be trusted'}
+        current['blockers'].append(blocker)
+        (folder / 'out/a.json').write_text(json.dumps(current))
+        result = self.record_read(folder, still)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = receipt(folder, 'a')
+        self.assertEqual((after['status'], after['review_kind'], after['blockers']),
+                         ('RAN-UNVERIFIED', 'unverified', [blocker]))
+        refused = self.record_read(folder, still)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('the row has no pending visual read', refused.stderr)
+        jq.apply_verdict(after, {'ok': True}, {'verdict': 'PASS', 'reason': 'visible'}, {})
+        self.assertEqual((after['status'], after['blockers']), ('PASS', []))
+        self.assertEqual(after['evidence_attempts'][-1]['blockers'], [blocker])
+
+    def test_async_verdict_cannot_use_errored_stills(self):
+        for broken, word in ((False, 'PASS'), (True, 'PASS'), (True, 'FAIL')):
+            with self.subTest(broken=broken, word=word):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                folder = Path(tmp.name)
+                row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': f'say {word}',
+                       'steps': [{'shot': 'before'}, {'shot': 'after'}],
+                       'shots': [{'name': 'before', 'phase': 'before'}, {'name': 'after', 'phase': 'after'}]}
+                if broken:
+                    row['steps'].append({'shot': 'witness'})
+                    row['shots'].append({'name': 'witness', 'phase': 'diagnostic'})
+                engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60},
+                                   known_issues={'known': {'title': 'known', 'reason': 'stand-in judge: FAIL',
+                                                           'rows': ['a']}})
+                if broken:
+                    (engine.out / 'stills.jsonl').mkdir()
+                    record = engine.stills.record
+
+                    def record_with_witness(on, path, reply, frame):
+                        if 'witness' in path.name:
+                            return {'status': 'unverified', 'reason': 'no game frame source'}
+                        return record(on, path, reply, frame)
+
+                    engine.stills.record = record_with_witness
+                self.assertEqual(engine.run(), 'DONE')
+                result = receipt(folder, 'a')
+                self.assertEqual(result['judge']['verdict'], word)
+                job = json.loads((engine.out / 'judge/jobs/a.json').read_text())
+                self.assertEqual([shot.get('fresh', {}).get('status') for shot in job['shots']],
+                                 ['unverified'] if broken else ['unverified', 'unverified'])
+                if broken:
+                    self.assertEqual((result['status'], result['review'], result['review_kind']),
+                                     ('RAN-UNVERIFIED', True, 'unverified'))
+                    blockers = [item for item in result['blockers'] if item['kind'] == 'evidence']
+                    self.assertEqual(len(blockers), 2)
+                    excluded = job.get('excluded_shots') or []
+                    self.assertEqual([shot['name'] for shot in excluded], ['before', 'after'])
+                    for shot in excluded:
+                        self.assertTrue(any(shot['path'] in item['text'] for item in blockers))
+                    self.assertNotIn('known_issue', result)
+                else:
+                    self.assertEqual(result['status'], 'PASS')
+                    self.assertEqual(result['blockers'], [])
+
+    def test_async_judge_refuses_a_frozen_after_and_ignores_uncited_diagnostic(self):
+        for stale in (True, False):
+            with self.subTest(stale=stale):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                folder = Path(tmp.name)
+                names = ('before', 'same-step', 'same-after') if stale else ('before', 'diagnostic', 'after')
+                row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': 'say PASS',
+                       'steps': [{'shot': name} for name in names],
+                       'shots': [{'name': name, 'phase': phase}
+                                 for name, phase in zip(names, ('before', 'step', 'after'))]}
+                engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60})
+                if stale:
+                    bridge = folder / 'bridge.log'
+                    engine.instances['sw']['bridge_log'] = str(bridge)
+                    frames = iter((1000, 1000, 1200))
+                    client = engine.clients['sw']
+                    request = client.request
+
+                    def call(method, params=None):
+                        if method == 'ui.screenshot':
+                            frame = next(frames)
+                            with bridge.open('a') as stream:
+                                stream.write(f'[Bridge] boot=0xabc frame={frame} wall={frame * 17}\n')
+                        return request(method, params)
+
+                    client.request = call
+                    (folder / 'judge.py').write_text(JUDGE.replace(
+                        '[s["path"] for s in job["shots"]]', '[]'))
+                else:
+                    record = engine.stills.record
+
+                    def record_without_diagnostic(on, path, reply, frame):
+                        if 'diagnostic' in path.name:
+                            raise OSError('diagnostic journal failure')
+                        return record(on, path, reply, frame)
+
+                    engine.stills.record = record_without_diagnostic
+                    (folder / 'judge.py').write_text(JUDGE.replace(
+                        '[s["path"] for s in job["shots"]]',
+                        '[s["path"] for s in job["shots"] if s["phase"] in ("before", "after")]'))
+                self.assertEqual(engine.run(), 'DONE')
+                result = receipt(folder, 'a')
+                self.assertEqual(result['judge']['verdict'], 'PASS')
+                job = json.loads((engine.out / 'judge/jobs/a.json').read_text())
+                if stale:
+                    excluded = job.get('excluded_shots') or []
+                    self.assertEqual([shot['name'] for shot in excluded], ['same-after'])
+                    self.assertIn('unchanged across 200 game frames', excluded[0]['reason'])
+                    self.assertEqual(result['status'], 'RAN-UNVERIFIED')
+                    self.assertTrue(any(item['kind'] == 'evidence' and excluded[0]['path'] in item['text']
+                                        for item in result['blockers']))
+                else:
+                    excluded = job.get('excluded_shots') or []
+                    self.assertEqual([shot['name'] for shot in excluded], ['diagnostic'])
+                    self.assertIn('diagnostic journal failure', excluded[0]['reason'])
+                    self.assertEqual(result['status'], 'PASS')
+                    self.assertEqual(result['blockers'], [])
+
+    def test_legacy_job_without_freshness_records_is_unverified(self):
+        for word in ('PASS', 'FAIL'):
+            with self.subTest(verdict=word):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                folder = Path(tmp.name)
+                row = {'id': 'a', 'role': 'test', 'outcome': 'visual', 'expected': f'say {word}',
+                       'steps': [{'shot': 'before'}, {'shot': 'after'}],
+                       'shots': [{'name': 'before', 'phase': 'before'}, {'name': 'after', 'phase': 'after'}]}
+                engine = make_plan(folder, [row], target={}, judge={'cmd': 'judge.py', 'wait_s': 60})
+                self.assertEqual(engine.run(), 'DONE')
+                job_path = engine.out / 'judge/jobs/a.json'
+                job = json.loads(job_path.read_text())
+                for shot in job['shots']:
+                    shot.pop('fresh', None)
+                job.pop('row_shots_saved', None)
+                clip = folder / 'clip-start.png'
+                clip.write_bytes(Path(job['shots'][0]['path']).read_bytes())
+                job['clip'] = str(clip)
+                job_path.write_text(json.dumps(job))
+                current = receipt(folder, 'a')
+                current.update(status='RAN-UNVERIFIED', judge={'state': 'pending'},
+                               blockers=[{'kind': 'visual', 'source': 'row', 'text': 'visual read pending'}])
+                (engine.out / 'a.json').write_text(json.dumps(current))
+                with mock.patch.object(jq, 'sample_frames', return_value=({'start': str(clip)}, {'start': 0})), \
+                     mock.patch.object(jq, 'sample_dense', return_value={}):
+                    jq.work(job_path)
+                result = receipt(folder, 'a')
+                self.assertEqual((result['status'], result['judge']['verdict'], result.get('review_kind')),
+                                 ('RAN-UNVERIFIED', word, 'unverified'))
+                evidence = [item for item in result['blockers'] if item['kind'] == 'evidence']
+                self.assertEqual(len(evidence), 2)
+                self.assertTrue(all('no freshness record' in item['text'] for item in evidence))
 
     def test_unverified_hook_markers_never_become_pass_without_a_judge(self):
         for value, marker in (({'file': None, 'grade': 'NEEDS VISUAL READ'}, 'NEEDS VISUAL READ'),
@@ -261,7 +2108,7 @@ class RunnerEffects(unittest.TestCase):
     def test_failed_verdict_receipt_cannot_be_promoted_by_record_read(self):
         folder, _ = self.hook_run({'verdict': 'FAIL', 'reason': 'x'}, target=True, effect=True)
         still = folder / 'out/a/still.png'
-        still.write_bytes(b'fixture image')
+        Image.new('RGB', (4, 4), (10, 20, 30)).save(still)
         before = receipt(folder, 'a')
         self.assertEqual(before['status'], 'RAN-UNVERIFIED')
         self.assertNotEqual(self.record_read(folder, still).returncode, 0)
@@ -385,7 +2232,7 @@ class RunnerEffects(unittest.TestCase):
         before = receipt(folder, 'a')
         self.assertEqual(before['status'], 'RAN-UNVERIFIED')
         outside = folder / 'outside.png'
-        outside.write_bytes(b'outside')
+        Image.new('RGB', (4, 4), (10, 20, 30)).save(outside)
         self.assertNotEqual(self.record_read(folder, outside).returncode, 0)
         self.assertNotEqual(self.record_read(folder, still, text='   ').returncode, 0)
         self.assertEqual(receipt(folder, 'a'), before)

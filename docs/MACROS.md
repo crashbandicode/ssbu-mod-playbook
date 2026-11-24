@@ -593,9 +593,9 @@ is not evidence. A dictionary with `verdict` is evidence only for PASS
 (case-insensitive); one with `pass` is evidence only when that value is true.
 A hook's `unverified` text, `NEEDS VISUAL READ` grade or
 pending visual verdict leaves the row RAN-UNVERIFIED even without a target.
-A receipt records separate visual, unverified and effect blockers. A visual
+A receipt records separate visual, unverified, effect and evidence blockers. A visual
 read can clear only visual blockers, never a missing deterministic observation
-or effect; a judge's PASS likewise clears only visual blockers. Remaining
+or effect or an evidence blocker; a judge's PASS likewise clears only visual blockers. Remaining
 blockers keep the row RAN-UNVERIFIED.
 A row with `outcome: visual` stays RAN-UNVERIFIED until its still is read;
 resuming without naming it does not promote it. A setup row's PASS still means
@@ -605,10 +605,33 @@ Record a visual read with
 `runner.py record-read rows.json --out out --rows <id> --reader <who> --verdict PASS|FAIL --text "<what the still shows>" --still <out/id/still>`.
 The still must be inside the row folder and match a runner capture from the same
 plan and instances file; a copied capture also needs the same inputs identity.
-The read stores the capture's name, hash, UTC time and scalar status snapshot. The runner
-records every still taken inside a row, including image-gate polling stills, as a
-capture with one `status` call after each. It does not yet check still freshness
-against the game frame.
+The read stores the capture's name, hash, UTC time, scalar status snapshot and
+freshness record. A read is refused when its still fails the same image integrity
+and full-load checks as the judge. Both PASS and FAIL reads require a usable capture; a judge's
+PASS or FAIL requires usable stills on which the verdict rests. Refused or
+errored stills cannot establish either result; a judged verdict that rests on
+them leaves evidence blockers. A job written without freshness records also
+leaves the verdict unverified when it rests on row stills. A failed
+deterministic gate stays FAILED regardless of the stills. A failed clip check
+stays FAILED unless a row still it compared is unusable. The clip check compares
+only usable row stills, lists exclusions, and leaves an evidence blocker when
+nothing usable can be compared. The runner records
+every still taken inside a row, including image-gate polling stills, as a
+capture with one `status` call after each. Without a game-frame source the
+freshness is `unverified` and remains usable; that is not frame-freshness proof.
+The judge and clip check use a still only when its file is present, readable and
+passes an integrity check and fully loads as an image, its freshness record is
+usable and, where recorded, its SHA-256 matches the file's bytes. Clip and dense
+frames must also decode.
+An image counts as evidence only if the whole file is there: a PNG must end with its IEND chunk and a JPEG with its end marker.
+Without PIL, the PNG check refuses unsupported metadata and non-PNG formats.
+Evidence blockers belong to the latest judge pass; earlier ones are kept under
+`evidence_attempts`. The judge is shown only usable row stills and clip frames; excluded stills are
+listed in the job and the receipt. A judged row with no usable image is
+unverified. A verdict is taken only from a judge run that exited successfully
+and wrote it in that run. A new pass withdraws the previous verdict first; a
+pass that does not finish leaves the row unverified. Earlier results are kept
+as `verdict.attempt-<n>.json` and `done.attempt-<n>.json`.
 The still's own recorded path selects its capture; otherwise use
 `--capture <row>:<file>` to name its source, or omit it when the hash matches
 exactly one capture. An ambiguous hash is refused.
@@ -671,10 +694,36 @@ Python in the plugin's repo, `eden/steps.py`.
 
 - **Hooks are the flexible part.** A step `{"run": "eden/steps.py:open_defaults",
   "args": {...}}` gets the runner's tools: `call`, `press`, `stick`, `play`,
-  `gate`, `ui`, `shot`, `wait_log` and `log`. Write the plugin's own menu
+  `gate`, `ui`, `shot`, `wait_log`, `ssh` and `log`. Write the plugin's own menu
   navigation and checks there, freely. They still run inside the row, so
   stop files, the pace cap and `actions.jsonl` apply. Add `"check": true`
   when the hook verifies the screen it leaves.
+- **Remote commands:** `ctx.ssh(host, command, timeout=60, input=None)` opens
+  a bounded shared SSH master and sends the command once. `host` is an SSH
+  alias or `user@host` made of letters, digits, `_`, `.`, `@` and `-`, starting
+  with a letter, digit or `_`. `command` is a non-empty command-line string
+  or list of strings; `timeout` is greater than 0 and at most 900 seconds.
+  It returns `{"returncode": int, "stdout": str, "stderr": str, "seconds": float}`
+  for a completed remote command, including a non-zero application result.
+  Transport failure instead raises a named stop and records a diagnosis in
+  `ssh-diag.md` and `actions.jsonl`. A timed-out command may still be running
+  on the host; inspect it before sending another. The command is never replayed.
+  Because an arbitrary alias does not identify its target OS before login,
+  this call does not retry a failed master on any target.
+  Write it for the host's login shell: Yoga uses PowerShell and XPS uses bash.
+  PowerShell login shells map non-zero results to 1, so do not rely on a
+  particular non-zero exit code there. The action log records the argv, not
+  command output or stdin. Fixture replay refuses this live-only call.
+  Do not spawn `ssh`, `scp` or `rsync` yourself: dry-run will refuse it
+  once G10 is merged from its separate branch.
+  For example, instead of a direct subprocess in a join hook:
+
+  ```python
+  result = ctx.ssh('tr-yoga', ['Get-Content', '/path/to/room.json'], timeout=30)
+  if result['returncode'] != 0:
+      raise RuntimeError('could not read the room handoff')
+  room = result['stdout']
+  ```
 - **Bring only generic needs to the shared tool**: something any plugin's
   test would want (a new gate kind, a frontend operation). Add it with a
   test in `test_runner.py`. Don't copy or fork `runner.py`.

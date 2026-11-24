@@ -78,13 +78,17 @@ python3 -B -I lifecycle.py settle config.json --execute [--minutes 30]
 
 SSH opens an authenticated master within ten seconds; ledger, lifecycle,
 staging and transfer calls ride that master and cannot start a new login.
-Transport failures are diagnosed before at most one retry, only for a named
-path cause with target facts that have been read and establish health. MaxStartups throttling and target
-overload stop without retry. A single TCP, banner or key-exchange timeout is
-retryable only when TCP answers and a successful diagnostic login provides
-healthy target evidence. Windows target health cannot be confirmed, so failed
-SSH transport is never retried to the Ally. Token-idempotent ledger mutations
-make a retry safe. Down stops, restores and verifies locally before release. A transport outage
+Only a failed master login can be retried, at most once, for a named path cause
+with target facts that have been read and establish health. A single TCP,
+banner or key-exchange timeout qualifies only when TCP answers and a successful
+diagnostic login provides healthy target evidence. MaxStartups throttling,
+target overload and Windows target health uncertainty stop without retry.
+An SSH, rsync or scp rider transport failure is diagnosed once and never
+replayed; a non-transport application failure is not diagnosed. SSH phases use
+the furthest affirmative login marker, and the diagnostic login is reported
+separately. Each diagnosis is recorded in `ssh-diag.md` in the state folder
+when known, otherwise the default diagnostic evidence folder. Down stops,
+restores and verifies locally before release. A transport outage
 leaves `release_pending` in the journal and a token record under
 `$XDG_STATE_HOME/eden-lifecycle/pending-release/` (or `~/.local/state`).
 Linux starts a low-priority `eden-settle-<token prefix>` user unit only for a
@@ -468,9 +472,8 @@ fake/command/bridge tests and Primary's concurrent deferred-load regression.
 Native single-boot qualification passed later that day (below);
 pair mode and transport-loss recovery remained unqualified. SSH always uses a
 non-login exec, no PTY and explicit `-NoProfile -NonInteractive` MSI PowerShell;
-`CreateProcessAsUserW failed: 1312` is retried once only before any ledger
-operation, never by replaying an admitted Up. That retry contract is fault-tested
-offline, not natively triggered. Tasks use the current user's SID rather than
+`CreateProcessAsUserW failed: 1312` stops without replaying the operation.
+Tasks use the current user's SID rather than
 SSH's unreliable USERDOMAIN string. No alternate shell is substituted.
 
 The follow-up branch starts at `ceae08f`; `lifecycle.py`, `defer_load`, its

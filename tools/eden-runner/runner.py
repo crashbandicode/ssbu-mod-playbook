@@ -134,6 +134,7 @@ import importlib.util
 import itertools
 import json
 import math
+import numbers
 import os
 import re
 import shutil
@@ -155,6 +156,21 @@ import still_fresh  # noqa: E402
 import packet_gate  # noqa: E402
 import trace_text  # noqa: E402
 import subprocess  # noqa: E402
+
+_SSH_LIFECYCLE = None
+_SSH_OPTIONS_FOR_TESTS = None
+
+
+def _ssh_lifecycle():
+    global _SSH_LIFECYCLE
+    if _SSH_LIFECYCLE is None:
+        path = _HERE.parent / 'eden-lifecycle' / 'lifecycle.py'
+        spec = importlib.util.spec_from_file_location('eden_runner_ssh_lifecycle', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SSH_LIFECYCLE = module
+    return _SSH_LIFECYCLE
+
 
 EDENCTL_DIR = '/home/intpa/Applications/Eden-GIF/current/tools'
 GATE_KINDS = ('image', 'log', 'json', 'hook', 'change', 'ui', 'status', 'state', 'text')
@@ -1195,6 +1211,76 @@ class StepContext:
     def call(self, method, params=None, job_cap=15):
         return self.runner.call(self.on, method, params, job_cap=job_cap)
 
+    def ssh(self, host, command, timeout=60, input=None):
+        self.check_stop()
+        if getattr(self.runner, 'replaying', False):
+            raise RuntimeError('ctx.ssh is not available in replay: a fixture has no remote host')
+        if not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host):
+            raise RuntimeError(f'ctx.ssh: unsafe host {host!r}')
+        if isinstance(command, str):
+            remote = [command] if command else []
+        elif isinstance(command, list) and command and all(isinstance(arg, str) for arg in command):
+            remote = command
+        else:
+            remote = []
+        if not remote or any('\0' in arg for arg in remote):
+            raise RuntimeError('ctx.ssh: command must be a non-empty string or list of strings without NUL')
+        if isinstance(timeout, bool) or not isinstance(timeout, numbers.Real) or not 0 < timeout <= 900:
+            raise RuntimeError('ctx.ssh: timeout must be a number in (0, 900]')
+        options = _SSH_OPTIONS_FOR_TESTS
+        if options is not None and host != '127.0.0.1':
+            raise RuntimeError('ctx.ssh: test options are restricted to 127.0.0.1')
+        life = _ssh_lifecycle()
+        argv = None
+        opened = False
+
+        def stop(diagnosis, prefix=''):
+            detail = life.ssh_diagnosis_with_receipt(diagnosis)
+            self.log({'ssh': host, 'argv': argv, 'transport_failure': True,
+                      'phase': diagnosis.get('phase', 'unknown'), 'cause': diagnosis.get('cause', 'unknown'),
+                      'evidence': diagnosis.get('evidence', 'unavailable'), 'diagnosis': detail})
+            raise RuntimeError(f'ctx.ssh {host}: {prefix}{detail}')
+
+        try:
+            with life.SshMux(host, ssh_options=options or (), evidence_dir=self.runner.out,
+                             receipt_dir=self.runner.out, allow_master_retry=False) as mux:
+                opened = True
+                argv = ['ssh', '-T', *mux.rider_args, host, *remote]
+                try:
+                    self.check_stop()
+                except StopRun as error:
+                    self.log({'ssh': host, 'argv': argv, 'stopped': True, 'reason': str(error)})
+                    raise
+                started = time.monotonic()
+                try:
+                    done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input)
+                except subprocess.TimeoutExpired:
+                    diagnosis = life.ssh_transport_failure(mux, 'ssh', None, '', timed_out=True)
+                    diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh', self.runner.out)
+                    stop(diagnosis, f'remote command exceeded {timeout} s; it may still be running on the host; ')
+                except OSError as error:
+                    diagnosis = life.ssh_transport_failure(mux, 'ssh', 255, str(error))
+                    diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh', self.runner.out)
+                    stop(diagnosis)
+                elapsed = time.monotonic() - started
+                diagnosis = life.ssh_transport_failure(mux, 'ssh', done.returncode, done.stderr)
+                if diagnosis:
+                    diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh', self.runner.out)
+                    stop(diagnosis)
+                self.log({'ssh': host, 'argv': argv, 'returncode': done.returncode, 'seconds': elapsed})
+                return {'returncode': done.returncode, 'stdout': done.stdout, 'stderr': done.stderr,
+                        'seconds': elapsed}
+        except life.LedgerTransport as error:
+            stop(error.diagnoses[-1])
+        except (life.Refused, OSError) as error:
+            if opened:
+                raise
+            diagnosis = {'line': f'ssh mux failed: {error}; attempt phase unknown; cause: local mux failure; retry: no',
+                         'transient': False, 'phase': 'unknown', 'cause': 'local mux failure',
+                         'evidence': 'unavailable'}
+            diagnosis = life.ssh_record(diagnosis, 'ssh', 'ctx.ssh master', self.runner.out)
+            stop(diagnosis)
+
     def shot(self, name):
         return self.runner.shot(self.on, name)
 
@@ -1399,6 +1485,7 @@ class Runner:
         self.pace = json.loads(pace.read_text())
         self.pace_seconds = pace_minutes * 60
         self.capture_fixtures = False
+        self.replaying = False
         self.cause_counts = {}
         self.early_stop = None
         self.screen_reached = False
@@ -1496,7 +1583,7 @@ class Runner:
             return None
         try:
             job = judge_queue.write_job(self.out, row, receipt_path, self.base, cfg, clip,
-                                        self.plan.get('known_issues'))
+                                        self.plan.get('known_issues'), self.still_records)
             proc = judge_queue.start_worker(job, self.out / 'judge' / 'workers.log')
         except Exception as error:  # noqa: BLE001 - a job that can't start leaves the row RAN-UNVERIFIED
             judge_queue.merge_receipt(receipt_path, lambda r: r.update(
@@ -1737,8 +1824,7 @@ class Runner:
                 if not self._gate_valid():
                     raise
                 status = None
-            gate['captures'].append({'name': name, 'file': final.name, 'sha256': digest(path), 'utc': utc,
-                                     'status': status})
+            gate['captures'].append(self._capture_record(name, path, final, utc, status))
         data = path.read_bytes()
         if gate['baseline'] is None:
             gate['baseline'] = data
@@ -1749,6 +1835,12 @@ class Runner:
         gate = getattr(self._gate_context, 'gate', None)
         records = gate['still_records'] if gate is not None else self.still_records
         return records.get(str(path))
+
+    def _capture_record(self, name, path, final, utc, status):
+        record = self._still_record(path)
+        fresh = ({key: value for key, value in record.items() if isinstance(value, (str, int, float, bool, type(None)))}
+                 if isinstance(record, dict) else None)
+        return {'name': name, 'file': final.name, 'sha256': digest(path), 'utc': utc, 'status': status, 'fresh': fresh}
 
     def _retire_gate_picture(self, path):
         gate = getattr(self._gate_context, 'gate', None)
@@ -2105,12 +2197,11 @@ class Runner:
                 if not self._gate_valid():
                     raise
                 status = None
-            sha256 = digest(path)
+            capture = self._capture_record(name, path, path, utc, status)
             with self._gate_publication():
                 if not self._gate_valid():
                     raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
-                self.captures.append({'name': name, 'file': path.name, 'sha256': sha256, 'utc': utc,
-                                      'status': status})
+                self.captures.append(capture)
         return path
 
     # --- steps ---------------------------------------------------------------------------------------------------
@@ -3624,6 +3715,14 @@ class Runner:
 
     def replay_checks(self, row_id):
         """Run gate steps and project step hooks for one row. Plays are not repeated."""
+        previous = self.replaying
+        self.replaying = True
+        try:
+            return self._replay_checks(row_id)
+        finally:
+            self.replaying = previous
+
+    def _replay_checks(self, row_id):
         row = next(item for item in self.plan['rows'] if item['id'] == row_id)
         self.current_row = row
         self.row_dir = self.out / str(row_id)
@@ -4224,7 +4323,8 @@ def record_read(manifest, out, row_id, reader, verdict, text, still, capture=Non
                 if (isinstance(item, dict) and all(key in item for key in ('name', 'file', 'sha256', 'utc', 'status'))
                         and isinstance(item['file'], str) and item['file'] and Path(item['file']).name == item['file']):
                     captures.append({'row': candidate.stem, **{key: item[key]
-                                                              for key in ('name', 'file', 'sha256', 'utc', 'status')}})
+                                                              for key in ('name', 'file', 'sha256', 'utc', 'status')},
+                                     **({'fresh': item['fresh']} if 'fresh' in item else {})})
         own = [item for item in captures if item['row'] == row_id and still.parent == row_dir
                and item['file'] == still.name]
         if own:
@@ -4250,6 +4350,13 @@ def record_read(manifest, out, row_id, reader, verdict, text, still, capture=Non
                 labels = ', '.join(f"{item['row']}/{item['file']}" for item in matches)
                 raise ValueError(f'the still matches {len(matches)} captures ({labels}); name one with --capture <row>:<file>')
             selected = matches[0]
+        if not still_fresh.usable(selected.get('fresh')):
+            raise ValueError(f"the capture {selected['row']}/{selected['file']} is not usable evidence: "
+                             f"{still_fresh.evidence_issue(selected.get('fresh'))}")
+        issue = judge_queue.image_issue(still)
+        if issue is not None:
+            raise ValueError(f"the capture {selected['row']}/{selected['file']} is not usable evidence: "
+                             f"still file is {issue}")
         read['capture'] = selected
         previous = receipt.get('visual_read')
         history = list(receipt.get('visual_reads') or [])
