@@ -76,6 +76,7 @@ class BridgeOnTests(unittest.TestCase):
         self.ready_at = None
         self.chord_started = None
         self.toggle_enabled = True
+        self.sleep_hook = None
 
     def call(self, name, args=None):
         self.calls.append((name, args))
@@ -96,6 +97,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def sleep(self, amount):
         self.seconds += amount
+        if self.sleep_hook is not None:
+            self.sleep_hook(amount)
         if self.stub and self.ready_at is not None and self.seconds >= self.ready_at:
             if STUB_EVENTS[1] not in self.events.read_text():
                 with self.events.open('a') as stream:
@@ -184,6 +187,21 @@ class BridgeOnTests(unittest.TestCase):
         path = self.row / 'routes-bridge-on.json'
         self.assertEqual(json.loads(path.read_text()), receipt)
         return receipt, path
+
+    def stub_connection(self, boot=STUB_BOOT, *, reconnect=False, hello=None, install=True):
+        if reconnect:
+            note = f'[Adapter] reconnect same_boot=1 boot={boot} connects=2 cursor=0\n'
+        else:
+            note = f'[Adapter] bridge connected boot={boot}\n'
+        hello = hello if hello is not None else STUB_CAPTURE[1].replace(STUB_BOOT, boot)
+        return note + hello + (STUB_CAPTURE[2].replace(STUB_BOOT, boot) if install else '')
+
+    def locked_capture(self, text):
+        run = self.out / 'bridge-run'
+        run.mkdir()
+        (run / 'bridge.log').write_text(text)
+        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6980}))
+        return run
 
     def test_bridge_on_uses_real_witness_and_detached_capture(self):
         receipt = self.invoke(port=6979)
@@ -576,6 +594,166 @@ class BridgeOnTests(unittest.TestCase):
         self.assertIsNone(json.loads((self.row / 'chord-hold-1.json').read_text())['event'])
         self.assertEqual(self.popen, [])
 
+    def test_bridge_on_stub_on_reads_the_title_only_from_the_latest_connection(self):
+        self.configure_stub()
+        main = self.sample(boot=FOREIGN_BOOT, screen='main_menu', fields={'focus': 'main_menu.top.smash'})
+        run = self.locked_capture(''.join(STUB_CAPTURE) + self.stub_connection(FOREIGN_BOOT) + main)
+        self.stub_default = ''
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main_menu/main_menu.top.smash, not the Title'):
+                self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_latest_connection_without_active_block_times_out(self):
+        self.configure_stub()
+        run = self.locked_capture(''.join(STUB_CAPTURE) + self.stub_connection(FOREIGN_BOOT))
+        self.stub_default = ''
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation of this boot within 10 s'):
+                self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_uses_the_last_identical_hello_position(self):
+        self.configure_stub()
+        main = self.sample(screen='main_menu', fields={'focus': 'main_menu.top.smash'})
+        run = self.locked_capture(''.join(STUB_CAPTURE) + self.stub_connection(reconnect=True) + main)
+        self.stub_default = ''
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main_menu/main_menu.top.smash, not the Title'):
+                self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_reuse_compares_against_the_latest_connection(self):
+        self.cold_stub_receipt()
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        requests = list(self.bridge_requests)
+        run = self.out / 'bridge-run'
+        with (run / 'bridge.log').open('a') as stream:
+            stream.write(self.stub_connection(FOREIGN_BOOT))
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, f'from boot {STUB_BOOT}.*greeting is boot {FOREIGN_BOOT}'):
+                self.invoke(port=6980)
+        self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+        self.assertEqual(self.bridge_requests, requests)
+
+    def test_bridge_on_stub_on_same_boot_reconnect_still_qualifies(self):
+        self.cold_stub_receipt()
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        requests = list(self.bridge_requests)
+        hello = STUB_CAPTURE[1].replace('reconnects=0', 'reconnects=1')
+        run = self.out / 'bridge-run'
+        with (run / 'bridge.log').open('a') as stream:
+            stream.write(self.stub_connection(reconnect=True, hello=hello))
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            receipt = self.invoke(port=6980)
+        self.assertEqual(receipt['hello'], hello.rstrip('\n'))
+        self.assertEqual(receipt['chord']['qualified_by']['boot'], STUB_BOOT)
+        self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+        self.assertEqual(self.bridge_requests, requests)
+
+    def test_bridge_on_stub_on_stops_when_the_connection_changes_during_the_title_read(self):
+        self.configure_stub()
+        self.stub_default = f'[Adapter] reconnect same_boot=1 boot={STUB_BOOT} connects=2 cursor=0\n' + STUB_UI
+        with self.assertRaisesRegex(RuntimeError, r'connection changed after the greeting .*Title cannot be read'):
+            self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_does_not_accept_prompt_before_a_later_boundary_in_same_read(self):
+        self.configure_stub()
+        self.stub_default = STUB_UI + '[Adapter] connection idle 6.1 s: reconnecting\n'
+        with self.assertRaisesRegex(RuntimeError, r'connection changed after the greeting .*Title cannot be read'):
+            self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_waits_for_a_complete_latest_connection(self):
+        self.configure_stub()
+        self.stub_preamble = STUB_PREAMBLE + self.stub_connection(FOREIGN_BOOT, install=False)
+        self.stub_default = STUB_UI + self.sample(boot=FOREIGN_BOOT)
+        run = self.out / 'bridge-run'
+        waits = []
+
+        def complete(amount):
+            if amount == .2 and (run / 'bridge.log').exists():
+                waits.append(amount)
+                if len(waits) == 2:
+                    with (run / 'bridge.log').open('a') as stream:
+                        stream.write(STUB_CAPTURE[2])
+
+        self.sleep_hook = complete
+        receipt = self.invoke(port=6980)
+        self.assertGreaterEqual(len(waits), 2)
+        self.assertIn(FOREIGN_BOOT, receipt['hello'])
+        self.assertEqual(receipt['title']['boot'], FOREIGN_BOOT)
+
+    def test_bridge_on_stub_on_stops_if_connection_changes_before_cold_receipt_save(self):
+        self.configure_stub()
+        self.stub_preamble = STUB_PREAMBLE.replace(STUB_CAPTURE[3], '')
+        run = self.out / 'bridge-run'
+
+        def reconnect(amount):
+            if amount == .1 and self.bridge_requests:
+                self.sleep_hook = None
+                with (run / 'bridge.log').open('a') as stream:
+                    stream.write(self.stub_connection(reconnect=True) + STUB_CAPTURE[3])
+
+        self.sleep_hook = reconnect
+        with self.assertRaisesRegex(RuntimeError, r'connection changed after the greeting .*Title cannot be read'):
+            self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_stops_if_connection_changes_before_reuse_receipt_save(self):
+        self.cold_stub_receipt()
+        requests = list(self.bridge_requests)
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        run = self.out / 'bridge-run'
+        log = run / 'bridge.log'
+        log.write_text(log.read_text().replace(STUB_CAPTURE[3], ''))
+
+        def reconnect(amount):
+            if amount == .1:
+                self.sleep_hook = None
+                with log.open('a') as stream:
+                    stream.write(self.stub_connection(reconnect=True) + STUB_CAPTURE[3])
+
+        self.sleep_hook = reconnect
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, r'connection changed after the greeting .*Title cannot be read'):
+                self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on-2.json').exists())
+        self.assertEqual(self.bridge_requests, requests)
+        self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)
+
+    def test_bridge_on_latest_connection_requires_a_complete_latest_greeting(self):
+        latest = getattr(routes, '_bridge_on_latest_connection', lambda _: None)
+        first = ''.join(STUB_CAPTURE)
+        second = self.stub_connection(FOREIGN_BOOT)
+        first_hello = STUB_CAPTURE[1].rstrip('\n')
+        second_hello = STUB_CAPTURE[1].replace(STUB_BOOT, FOREIGN_BOOT).rstrip('\n')
+        install = STUB_CAPTURE[2].rstrip('\n')
+        cases = (
+            ('one', first, (first_hello, install, 1)),
+            ('two', first + second, (second_hello, install, len(first.splitlines()) + 1)),
+            ('idle', first + '[Adapter] connection idle 6.1 s: reconnecting\n', None),
+            ('opening', first + self.stub_connection(FOREIGN_BOOT, install=False), None),
+        )
+        for label, text, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(latest(text), expected)
+
+    def test_bridge_on_trace_keeps_the_first_greeting_across_two_connections(self):
+        self.stub = True
+        self.events.write_text('\n'.join(STUB_EVENTS[:2]) + '\n')
+        self.stub_preamble = ''.join(STUB_CAPTURE) + self.stub_connection(FOREIGN_BOOT)
+        receipt = self.invoke(port=6980)
+        self.assertEqual(receipt['hello'], STUB_CAPTURE[1].rstrip('\n'))
+        self.assertEqual(receipt['witness'], 'trace')
+
     def test_bridge_on_stub_on_rejects_first_active_main_before_title_in_one_read(self):
         self.configure_stub()
         self.stub_default = self.sample(screen='main') + ''.join(STUB_CAPTURE[11:])
@@ -604,7 +782,7 @@ class BridgeOnTests(unittest.TestCase):
     def test_bridge_on_stub_on_keeps_first_active_across_a_reconnect_in_one_read(self):
         self.configure_stub()
         self.stub_default = self.sample(screen='main') + '[Adapter] reconnect reason=test\n' + STUB_UI
-        with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
+        with self.assertRaisesRegex(RuntimeError, r'connection changed after the greeting .*Title cannot be read'):
             self.invoke(port=6980)
 
     def test_bridge_on_stub_on_ignores_a_bad_crc_before_the_title(self):
