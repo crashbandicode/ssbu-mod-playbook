@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 import time
 
+import closed_loop
 import native_picker
 import state_gate
 
@@ -68,6 +69,7 @@ class BridgePickerIO:
         self.request_count = 0
         self.input_count = 0
         self.revisions = {}
+        self.witness = {}
         self.in_flight = False
         self.stage_window = None
         self.pending = getattr(ctx.runner, 'native_ui_pending', {})
@@ -248,6 +250,7 @@ class BridgePickerIO:
 
     def _record(self, state):
         provider, rev = state.block['name'], state.block['rev']
+        self.witness[provider] = state
         self.revisions.setdefault(provider, [rev, rev])[1] = rev
         metrics = getattr(self.ctx.runner, 'setup_metrics', None)
         if metrics is not None:
@@ -315,7 +318,7 @@ class BridgePickerIO:
             time.sleep(min(.05, max(0, until - time.monotonic())))
         raise RuntimeError('no fresh gameplay stage event after Training launch')
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         # Process any boundary written after the query, before the one input.
         self.in_flight = True
         lines = self._receive()
@@ -323,7 +326,70 @@ class BridgePickerIO:
             for line in lines:
                 self.stage_window.observe_before_press(line)
         self.pending[self.ctx.on] = (segment, str(getattr(self.ctx, 'row_dir', None)))
-        self.routes.play(self.ctx, segment)
+        witness = dict(self.witness)
+
+        def requalify():
+            self.in_flight = False
+            old_receive = self.__dict__.get('_receive')
+            receive = self._receive
+
+            def observe_receive():
+                fresh = receive()
+                if self.stage_window is not None:
+                    for line in fresh:
+                        self.stage_window.observe_before_press(line)
+                return fresh
+
+            if self.stage_window is not None:
+                self._receive = observe_receive
+            try:
+                for provider, previous in witness.items():
+                    cap = 2.0 if until is None else min(2.0, until - time.monotonic())
+                    if cap <= 0:
+                        raise closed_loop.DispatchRejected(
+                            f'{segment} not sent: {provider} changed while the input channel was busy: deadline')
+                    try:
+                        current = self.read(provider, cap)
+                    except Exception as error:
+                        if self.routes.macro_gate.stop(error):
+                            raise
+                        check = getattr(self.ctx, 'check_stop', None)
+                        if check is not None:
+                            check()
+                        raise closed_loop.DispatchRejected(
+                            f'{segment} not sent: {provider} changed while the input channel was busy: {error}') from error
+                    changed = []
+                    if current.block['boot'] != previous.block['boot']:
+                        changed.append('boot')
+                    if current.connection != previous.connection:
+                        changed.append('connection')
+                    keys = (current.values.keys() | previous.values.keys()) - {'rev', 'observation'}
+                    missing = object()
+                    changed.extend(sorted(key for key in keys
+                                          if current.values.get(key, missing) != previous.values.get(key, missing)))
+                    if changed:
+                        raise closed_loop.DispatchRejected(
+                            f'{segment} not sent: {provider} changed while the input channel was busy: '
+                            + ', '.join(dict.fromkeys(changed)))
+                return True
+            finally:
+                if old_receive is None:
+                    self.__dict__.pop('_receive', None)
+                else:
+                    self._receive = old_receive
+                self.in_flight = True
+
+        try:
+            if getattr(self.ctx.runner, 'closed_loop_owns_idle', False):
+                self.routes.play(self.ctx, segment)
+            else:
+                self.routes.play(self.ctx, segment, requalify=requalify if witness else None, until=until)
+        except Exception as error:
+            if isinstance(error, closed_loop.DispatchRejected) or self.routes.macro_gate.stop(error):
+                self.pending.pop(self.ctx.on, None)
+                self.in_flight = False
+            raise
+        self.witness.clear()
         self.input_count += 1
         metrics = getattr(self.ctx.runner, 'setup_metrics', None)
         if metrics is not None:
@@ -333,6 +399,7 @@ class BridgePickerIO:
         self.pending.pop(self.ctx.on, None)
         self.in_flight = False
         self.stage_window = None
+        self.witness.clear()
 
     def log(self, evidence):
         self.ctx.log(evidence)

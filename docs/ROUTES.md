@@ -90,13 +90,16 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 Look for the current screen and start there; wait for the step's fresh ready observation before acting.
 A route starting on a recognised but unready screen waits in that screen's step and stops there, not on `locate`,
 if readiness never arrives; this was found by replaying `rc15-i2-71158421-xps-stop-1`.
-Before every `routes.play` input, wait up to one 15-second budget for an idle macro channel; a wait over one second
-that sends an input records a stall event, and an exhausted budget sends nothing. The wireless engine owns this wait
-for its own inputs.
+The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,
+with one 15-second budget or the caller's earlier deadline.
+After a wait, bridge IO re-reads the caller's observations and sends only if they are unchanged and its original
+deadline has not passed. A caller without a witness sends nothing after a wait unless it declares `BLIND`.
+Every wait records one stall event, including when nothing is sent. The wireless engine owns its own wait.
+STOP interrupts the idle gate, including a status poll or requalification, without sending or recording a busy stall.
 Eden's `error` state is inactive and releases input; its failure text is retained in the wireless receipt or play log.
 `idle` also releases input, as does `finished` without an error. `countdown`, `recording`, `playing`, and `branch_playing`
 wait; any other or unreadable status is treated as busy.
-One 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
+In the wireless engine, one 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
 a fresh read. Each `macro.status` poll is limited to the remaining budget; its control-client timeout cannot
 extend that budget, and an unanswered poll counts as busy. Stall diagnostic `status` reads are capped at one
 second and skipped on idle and stop paths. Only a refusal of the `macro.play` call itself (`input_busy`) is

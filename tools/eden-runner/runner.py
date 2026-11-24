@@ -145,6 +145,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import harness  # noqa: E402
 import judge_queue  # noqa: E402
+import macro_gate  # noqa: E402
 import still_fresh  # noqa: E402
 import packet_gate  # noqa: E402
 import trace_text  # noqa: E402
@@ -1730,6 +1731,26 @@ class Runner:
         self.manifest_path.write_text(json.dumps(self.plan, indent=2) + '\n')
         self.log({'recorded': name, 'path': str(path), 'sha256': seg['sha256']})
 
+    def dispatch_macro(self, on, path, *, name, requalify):
+        def on_event(event):
+            event = {**event, 'block': 'runner'}
+            if not hasattr(self, 'row_macro_waits'):
+                self.row_macro_waits = []
+            self.row_macro_waits.append(event)
+            try:
+                self.log({'macro_idle_wait': event})
+            except Exception:
+                pass
+            try:
+                with (self.row_dir / 'stall-events.jsonl').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps(event) + '\n')
+            except Exception:
+                pass
+
+        return macro_gate.dispatch(lambda method, params=None: self.call(on, method, params), path,
+                                   name=name, requalify=requalify, on_event=on_event, check=self.check_stop,
+                                   is_stop=lambda error: isinstance(error, StopRun))
+
     def play(self, on, name):
         seg = self.plan['segments'][name]
         if seg.get('start_gate'):
@@ -1745,8 +1766,13 @@ class Runner:
                 f'segment {name} has no sha256; refusing to play an unhashed recording ({path.name})')
         if digest(path) != seg['sha256']:
             raise RuntimeError(f'segment {name} changed since the dry run')
-        self.call(on, 'macro.play', {'path': str(path)})
-        self.wait_macro(on, seg.get('cap', 60))
+        def requalify():
+            self.check_gate(on, seg['start_gate'])
+            return True
+
+        witness = requalify if seg.get('start_gate') else macro_gate.BLIND
+        if self.dispatch_macro(on, path, name=name, requalify=witness):
+            self.wait_macro(on, seg.get('cap', 60))
 
     def source(self, on, key):
         """An instance file by key. "diag" and "diag_log" name the same file, so library gates work with any
@@ -1879,8 +1905,21 @@ class Runner:
                     raise
                 self.log({'gate': name, 'on': on, 'recover': gate['recover'], 'after': repr(error)[:200]})
                 seg = self.plan['segments'][gate['recover']]
-                self.call(on, 'macro.play', {'path': str(self.base / seg['file'])})
-                self.wait_macro(on, seg.get('cap', 60))
+                path = self.base / seg['file']
+                if not seg.get('sha256'):
+                    raise RuntimeError(f'segment {gate["recover"]} has no sha256; refusing to play {path.name}')
+                if digest(path) != seg['sha256']:
+                    raise RuntimeError(f'segment {gate["recover"]} changed since the dry run')
+
+                def still_needed():
+                    try:
+                        self.check_gate(on, name)
+                    except RuntimeError:
+                        return True
+                    return False
+
+                if self.dispatch_macro(on, path, name=gate['recover'], requalify=still_needed):
+                    self.wait_macro(on, seg.get('cap', 60))
 
     def check_gate(self, on, name):
         self._gate_evidence = True
@@ -2514,10 +2553,16 @@ class Runner:
             raise RuntimeError(f'library segment {name} file missing: {path}')
         if entry.get('sha256') and digest(path) != entry['sha256']:
             raise RuntimeError(f'library segment {name} sha256 mismatch')
-        if entry.get('start_gate') and entry['start_gate'] in self.plan.get('gates', {}):
+        start_gate = entry.get('start_gate') if entry.get('start_gate') in self.plan.get('gates', {}) else None
+        if start_gate:
             self.gate(on, entry['start_gate'])
-        self.call(on, 'macro.play', {'path': str(path)})
-        self.wait_macro(on, entry.get('cap', 60))
+
+        def requalify():
+            self.check_gate(on, start_gate)
+            return True
+
+        if self.dispatch_macro(on, path, name=name, requalify=requalify if start_gate else macro_gate.BLIND):
+            self.wait_macro(on, entry.get('cap', 60))
 
     def _step_library(self, on, step):
         self.play_library(on, step['library'])
@@ -3090,6 +3135,7 @@ class Runner:
             self.row_offsets = self.log_offsets()
             self.marks, self.copies, self.acquired = {}, {}, []
             self.row_stills_refused, self.row_still_errors = [], []
+            self.row_macro_waits = []
             self.scales_used, self.gate_saw_evidence = [], []
             self.last_image_scale = None
             self.last_hook_evidence = None
@@ -3244,6 +3290,8 @@ class Runner:
                     receipt['stills_refused'] = list(self.row_stills_refused)
                 if self.row_still_errors:
                     receipt['still_errors'] = list(self.row_still_errors)
+                if self.row_macro_waits:
+                    receipt['macro_waits'] = list(self.row_macro_waits)
                 receipt_path.write_text(json.dumps(receipt, indent=2, default=str) + '\n')
                 self.record_attempt(receipt)
                 self.captures = None
@@ -3256,6 +3304,7 @@ class Runner:
                                   'seconds': round(receipt['ended'] - receipt['started'], 1),
                                   **({'stills_refused': len(self.row_stills_refused)} if self.row_stills_refused else {}),
                                   **({'still_errors': len(self.row_still_errors)} if self.row_still_errors else {}),
+                                  **({'macro_waits': len(self.row_macro_waits)} if self.row_macro_waits else {}),
                                   'receipt': str(receipt_path)}), flush=True)
                 if not (self.session_config() or {}).get('per_row_files') or self.session is None:
                     self.queue_judge(row['id'])  # no per-row clip file: judge the shots now

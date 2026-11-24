@@ -69,7 +69,7 @@ class ProducerReplay:
             name = 'unacknowledged'
         return sample(name, self.rev)
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         transitions = {
             ('rest', 'tile-left'): ('reach-moving', 'reach-settled'),
             ('reach-settled', 'tap-a1'): ('held-moving', 'held'),
@@ -115,7 +115,7 @@ class HeldRichterReplay:
             self.tile.values['observation'] = str(int(self.tile.values['observation']) + 1)
         return copy.deepcopy(self.tile)
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
         values = self.tile.values
         if segment.startswith('tile-'):
@@ -184,8 +184,8 @@ class ProducerReplayTests(unittest.TestCase):
         replay = ProducerReplay('reach-settled')
         original = replay.send
 
-        def send(segment):
-            original(segment)
+        def send(segment, until=None):
+            original(segment, until=until)
             replay.pending = deque(['held-moving'])
 
         replay.send = send

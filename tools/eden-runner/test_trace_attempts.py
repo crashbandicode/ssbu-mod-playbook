@@ -485,7 +485,7 @@ class StartIO(fake.RowsIO):
                           'notice.header': 'Edge · 4/4' if wizard else '',
                           'notice.body': 'CPU (1, 1) · 0% · P1 (0, 0)' if wizard else ''})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment == 'tap-a1' and (self.wizard or self.menu['depth'] == '1'):
             self.actions.append(segment)
             if self.ctx.runner.setup_metrics is not None:
@@ -499,7 +499,7 @@ class StartIO(fake.RowsIO):
                 if self.fault != 'start_stuck':
                     self.menu.update({'open': '0', 'game': 'Guard the Edge', 'game.running': '1'})
         else:
-            super().send(segment)
+            super().send(segment, until=until)
 
 
 class StartTests(ObserveTests):
@@ -529,8 +529,8 @@ class StartTests(ObserveTests):
         self.io = StartIO(self.ctx)
         send = self.io.send
 
-        def wrong_game(segment):
-            send(segment)
+        def wrong_game(segment, until=None):
+            send(segment, until=until)
             self.io.menu.update({'game': 'Eggs-ercise', 'game.running': '0'})
 
         self.io.send = wrong_game
@@ -545,8 +545,8 @@ class StartTests(ObserveTests):
         self.io = StartIO(self.ctx, wizard=False)
         send = self.io.send
 
-        def wrong_game(segment):
-            send(segment)
+        def wrong_game(segment, until=None):
+            send(segment, until=until)
             if segment == 'tap-a1' and self.io.menu['open'] == '0':
                 self.io.menu.update({'game': 'Eggs-ercise', 'game.running': '0'})
 

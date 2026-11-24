@@ -37,7 +37,6 @@ import re
 import socket
 import subprocess
 import sys
-import threading
 import time
 import unicodedata
 from collections import deque
@@ -50,6 +49,7 @@ except ImportError:
     fcntl = None
 
 import closed_loop
+import macro_gate
 import native_picker
 import state_gate
 import trace_attempts
@@ -95,18 +95,7 @@ def _bridge_tail(ctx):
 
 
 def _bounded_call(ctx, method, cap):
-    result = []
-
-    def call():
-        try:
-            result.append((True, ctx.call(method)))
-        except BaseException as error:
-            result.append((False, error))
-
-    worker = threading.Thread(target=call, daemon=True)
-    worker.start()
-    worker.join(cap)
-    return result[0] if not worker.is_alive() else (False, None)
+    return macro_gate.bounded_call(ctx.call, method, cap)
 
 
 def _eden_macro_note(status):
@@ -114,25 +103,7 @@ def _eden_macro_note(status):
 
 
 def _eden_macro_busy(ctx, remaining, note=None):
-    try:
-        answered, status = _bounded_call(ctx, 'macro.status', remaining)
-        if not answered:
-            if status is None:
-                return f'macro.status not answered within {remaining:g} s'
-            return f'macro.status not understood: {repr(status)[:160]}'
-        if isinstance(status, dict):
-            state, error = status.get('state'), status.get('error')
-            if state == 'error':
-                if note is not None:
-                    note(_eden_macro_note(status))
-                return None
-            if state in ('countdown', 'recording', 'playing', 'branch_playing'):
-                return f'macro {state}'
-            if state == 'idle' or (state == 'finished' and error in (None, '')):
-                return None
-        return f'macro.status not understood: {repr(status)[:160]}'
-    except Exception as error:
-        return f'macro.status not understood: {repr(error)[:160]}'
+    return macro_gate.busy(ctx.call, remaining, note=note)
 
 
 def _stall_result(ok, stalls):
@@ -756,64 +727,36 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
-PLAY_IDLE_CAP = 15.0
-
-
-def play(ctx, name):
+def play(ctx, name, *, requalify=None, until=None):
     """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
     path, sha, cap = macro_file(name)
-    stall = None
-    if not getattr(ctx.runner, 'closed_loop_owns_idle', False):
-        started, waits, why = time.monotonic(), 0, 'macro.status slow'
-        while True:
-            remaining = PLAY_IDLE_CAP - (time.monotonic() - started)
-            if remaining <= 1e-6:
-                if remaining > 0:
-                    time.sleep(remaining)
-                seconds = time.monotonic() - started
-                raise closed_loop.DispatchRejected(
-                    f'macro {name} not sent: input channel busy for {seconds:g} s over {waits} waits: {why}')
-            current = _eden_macro_busy(ctx, remaining, note=lambda text: ctx.log({'last_macro_error': text}))
-            waits += 1
-            if current is not None:
-                why = current
-            seconds = time.monotonic() - started
-            if seconds >= PLAY_IDLE_CAP:
-                raise closed_loop.DispatchRejected(
-                    f'macro {name} not sent: input channel busy for {seconds:g} s over {waits} waits: {why}')
-            if current is None:
-                if seconds > 1.0:
-                    stall = (seconds, waits, why)
-                break
-            time.sleep(min(.2, PLAY_IDLE_CAP - seconds))
-        seconds = time.monotonic() - started
-        if seconds >= PLAY_IDLE_CAP:
-            raise closed_loop.DispatchRejected(
-                f'macro {name} not sent: input channel busy for {seconds:g} s over {waits} waits: {why}')
-    try:
-        ctx.call('macro.play', {'path': str(path)})
-    except RuntimeError as error:
-        message = str(error).lower()
-        if 'input_busy' in message or 'macro.play busy' in message:
-            raise closed_loop.DispatchRejected(str(error)) from error
-        raise
+    def on_event(event):
+        event = {**event, 'block': 'play', 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
+        try:
+            metrics = getattr(ctx.runner, 'setup_metrics', None)
+            if isinstance(metrics, dict):
+                metrics.setdefault('stalls', []).append(event)
+            if getattr(ctx, 'row_dir', None) is not None:
+                _append_stall(ctx, 'play', event)
+        except Exception as error:
+            ctx.log({'stall_error': repr(error)})
+
+    if getattr(ctx.runner, 'closed_loop_owns_idle', False):
+        try:
+            ctx.call('macro.play', {'path': str(path)})
+        except RuntimeError as error:
+            message = str(error).lower()
+            if 'input_busy' in message or 'macro.play busy' in message:
+                raise closed_loop.DispatchRejected(str(error)) from error
+            raise
+    elif not macro_gate.dispatch(ctx.call, path, name=name, requalify=requalify, until=until,
+                                 on_event=on_event, note=lambda text: ctx.log({'last_macro_error': text}),
+                                 check=getattr(ctx, 'check_stop', None)):
+        return None
     try:
         ctx.runner.wait_macro(ctx.on, cap)
     except RuntimeError as error:
         raise closed_loop.DeliveryUnknown(f'macro {name} was accepted; {error}') from error
-    if stall is not None:
-        # Recorded after the macro has finished, so a failure here never leaves a macro playing unwatched.
-        seconds, waits, why = stall
-        event = {'kind': 'idle-wait', 'block': 'play', 'step': name, 'seconds': seconds,
-                 'waits': waits, 'why': why, 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
-        metrics = getattr(ctx.runner, 'setup_metrics', None)
-        if isinstance(metrics, dict):
-            metrics.setdefault('stalls', []).append(event)
-        try:
-            if getattr(ctx, 'row_dir', None) is not None:
-                _append_stall(ctx, 'play', event)
-        except OSError as error:
-            raise RuntimeError(f'macro {name} finished, but its stall event could not be recorded: {error}') from error
     ctx.log({'route_macro': name, 'sha256': sha})
     return sha
 
@@ -837,7 +780,7 @@ def chord(ctx, name, expect=None, source=None, cap=10):
     except KeyError:
         cursor = None  # that log isn't available here (a real Switch has no diag log); the chord still plays
     try:
-        sha = play(ctx, name)
+        sha = play(ctx, name, requalify=macro_gate.BLIND)
         line = cursor.wait(expect, cap, ctx).group(0) if cursor else None
     finally:
         if cursor:
@@ -1861,7 +1804,7 @@ def to_main(ctx, tries=8, look_s=6, *, cap=None):
             raise _missing_navigation_state(route, before, f'qualified {route} source after arming')
         if time.monotonic() >= until:
             raise RuntimeError(f'{route} source deadline expired before Plus')
-        io.send('attract-cancel')
+        io.send('attract-cancel', until=until)
         presses += 1
         state = native_picker.wait_scene_transition(
             io, before, until, source, destinations[0], label=route,
@@ -2044,7 +1987,7 @@ def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=N
 def _probe_step(ctx, walker, direction='left', cap=2.5):
     """One L3 step and its line, or None when the hand moved nothing (an empty hand logs no step)."""
     walker.cursor.mark()
-    play(ctx, f'tile-{direction}')
+    play(ctx, f'tile-{direction}', requalify=macro_gate.BLIND)
     try:
         found = walker.cursor.wait(STEP.format(screen='css', dir=direction), cap, ctx)
     except RuntimeError:
@@ -2268,7 +2211,12 @@ def fixture(ctx, p1=None, cpu=None, stage=None, reset=True, damage=0.0, lr=None,
     before = read_state(ctx)
     out['before'] = before
     if reset:
-        play(ctx, 'reset-lra')
+        def requalify():
+            if read_state(ctx) != before:
+                raise closed_loop.DispatchRejected('reset-lra not sent: fixture changed while the input channel was busy')
+            return True
+
+        play(ctx, 'reset-lra', requalify=requalify)
     previous = None
     for n in range(reads):
         current = read_state(ctx)
@@ -2316,7 +2264,7 @@ def select_screen(ctx, cap=2.5):
     except KeyError:
         return None  # This legacy probe requires a configured tile log.
     try:
-        play(ctx, 'tile-up')
+        play(ctx, 'tile-up', requalify=macro_gate.BLIND)
         return cursor.wait(r'step screen=(css|sss) ', cap, ctx).group(1)
     except RuntimeError:
         return None
@@ -2359,7 +2307,7 @@ def _take_back_training_token(io, state):
         raise RuntimeError('local medal placement changed before B')
     if time.monotonic() >= until:
         raise RuntimeError('Training return source deadline expired before leave-css')
-    io.send('leave-css')
+    io.send('leave-css', until=until)
     current = tile_before
     while time.monotonic() < until:
         try:
@@ -2650,7 +2598,7 @@ def _watched_native_input(io, initial, source, target, macro, until, *, route='M
     if not _fields_match(before, source):
         raise RuntimeError(f'{route} source changed before {macro!r} at {source_focus!r}')
 
-    io.send(macro)
+    io.send(macro, until=until)
     if scene_change:
         return before, native_picker.wait_scene_transition(
             io, before, until, source, target, label=route, pending_destinations=pending_destinations,
@@ -2779,7 +2727,7 @@ def _native_enter_training(ctx, cap, stage_ids):
     source = {**owner, 'screen': 'css.training', 'focus.source': native_picker.TILE, 'focus': ui.values['focus']}
     live = {**owner, 'screen': 'training'}
     io.mark_training_stage(ui, 5)
-    io.send('enter-training')
+    io.send('enter-training', until=until)
     after = native_picker.wait_scene_transition(io, ui, time.monotonic() + cap, source, live, label='native')
     stage_id = expected(ctx).get('stage_id')
     if stage_ids is None and stage_id is not None:
@@ -3246,7 +3194,7 @@ def tr_menu(ctx):
         if not _fields_match(before, source):
             raise _missing_navigation_state('Training Mod menu', before, str(source))
         native_picker.same_epoch(before, current, in_flight=True)
-        io.send(macro)
+        io.send(macro, until=until)
         until = time.monotonic() + (cap if opened else 10)
         confirmed = _wait_tr_menu(io, until, not opened, current)
         _wait_training_owner(io, confirmed, until, 'native' if opened else 'tr.menu')
@@ -3978,7 +3926,7 @@ INPUT_LAG_S = 3.0
 
 
 def _send_with_retry(io, macro, until, wait):
-    io.send(macro)
+    io.send(macro, until=until)
     started = time.monotonic()
     result = wait(min(until, time.monotonic() + INPUT_LAG_S))
     if result is None and time.monotonic() < until:
@@ -3989,7 +3937,7 @@ def _send_with_retry(io, macro, until, wait):
         if metrics is not None:
             metrics.setdefault('stalls', []).append(event)
         _append_stall(io.ctx, 'tr_input', event)
-        io.send(macro)
+        io.send(macro, until=until)
         if metrics is not None:
             metrics['retries'] = metrics.get('retries', 0) + 1
         result = wait(until)
@@ -4303,7 +4251,7 @@ def _tr_idle(ctx, cap, metrics):
             header = last['notice.header']
             input_steps += 1
             try:
-                io.send('tap-b1')
+                io.send('tap-b1', until=until)
                 after = _try_tr_condition(
                     io, menu, until,
                     lambda state: any(state.values.get(key) != menu.values.get(key)
@@ -4800,7 +4748,7 @@ def _wizard_next(io, menu, game, until):
 
 def _wizard_pulse(io, menu, game, macro, until, pulse_cap):
     page = _wizard_body(menu, game)
-    io.send(macro)
+    io.send(macro, until=until)
     deadline = min(until, time.monotonic() + pulse_cap)
 
     def read(cap):
@@ -5482,7 +5430,7 @@ def _set_fighter(ctx, fighter, seat, cap, metrics):
     if menu.values['open'] == '0':
         if time.monotonic() >= until:
             raise RuntimeError('Training Mod deadline expired before opening the menu')
-        io.send('tr-menu-open')
+        io.send('tr-menu-open', until=until)
         menu = _wait_tr_menu(io, until, opened=True, after=menu)
         _wait_training_owner(io, menu, until, 'tr.menu')
         io.finish()

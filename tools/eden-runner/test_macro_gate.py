@@ -1,4 +1,5 @@
 """Offline tests for the shared bounded macro dispatch gate."""
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -96,6 +97,56 @@ class MacroGateTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertLessEqual(self.now, 9.000001)
         self.assertEqual(len(self.events), 1)
+
+    def test_a_stop_during_the_idle_gate_propagates_at_once(self):
+        class StopRun(Exception):
+            pass
+
+        for phase in ('check', 'status', 'waiting', 'requalification'):
+            with self.subTest(phase=phase):
+                self.now, self.polls, self.sent, self.events = 0.0, [], [], []
+                self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
+
+                def check():
+                    if phase == 'check' or phase == 'waiting' and self.now >= .2:
+                        raise StopRun('STOP-INPUT')
+
+                def stopped_status():
+                    raise StopRun('STOP-INPUT')
+
+                def requalify():
+                    if phase == 'requalification':
+                        raise StopRun('STOP-INPUT')
+                    return True
+
+                if phase == 'status':
+                    self.status = stopped_status
+                with self.assertRaisesRegex(StopRun, 'STOP-INPUT'):
+                    self.dispatch(requalify=requalify, check=check)
+                self.assertEqual(self.sent, [])
+                self.assertEqual(self.events, [])
+                self.assertLessEqual(self.now, .4)
+
+        entered, release = threading.Event(), threading.Event()
+        self.now, self.polls, self.sent, self.events = 0.0, [], [], []
+
+        def blocked_status():
+            entered.set()
+            release.wait()
+            return {'state': 'idle'}
+
+        def check_blocked():
+            if entered.is_set():
+                raise StopRun('STOP-INPUT')
+
+        self.status = blocked_status
+        try:
+            with self.assertRaisesRegex(StopRun, 'STOP-INPUT'):
+                self.dispatch(requalify=macro_gate.BLIND, check=check_blocked)
+            self.assertEqual(self.sent, [])
+            self.assertEqual(self.events, [])
+        finally:
+            release.set()
 
     def test_a_slow_first_idle_poll_counts_as_a_wait(self):
         def status():

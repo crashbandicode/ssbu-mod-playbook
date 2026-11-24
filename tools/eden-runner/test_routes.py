@@ -226,6 +226,38 @@ class PlayIdleTests(unittest.TestCase):
         self.assertEqual(self.runner.setup_metrics['stalls'][0]['outcome'],
                          'not sent: no witness to requalify after the wait')
 
+    def test_a_stop_during_the_idle_gate_propagates_at_once(self):
+        class StopRun(Exception):
+            pass
+
+        for phase in ('check', 'status', 'status_direct', 'requalification'):
+            with self.subTest(phase=phase):
+                self.now, self.status_calls, self.sent, self.logs = 0.0, [], [], []
+                self.runner.setup_metrics = {}
+                self.status = lambda: {'state': 'playing'} if self.now < .4 else {'state': 'idle'}
+
+                def check():
+                    if phase == 'check' or phase == 'status' and self.status_calls:
+                        raise StopRun('STOP-INPUT')
+
+                def stopped_status():
+                    raise StopRun('STOP-INPUT')
+
+                def requalify():
+                    if phase == 'requalification':
+                        raise StopRun('STOP-INPUT')
+                    return True
+
+                self.ctx.check_stop = check
+                if phase in ('status', 'status_direct'):
+                    self.status = stopped_status
+                with self.assertRaisesRegex(StopRun, 'STOP-INPUT'):
+                    self.play(requalify=requalify)
+                self.assertEqual(self.sent, [])
+                self.assertFalse(self.runner.setup_metrics.get('stalls'))
+                self.assertFalse((self.row / 'stall-events.jsonl').exists())
+                self.runner.wait_macro.assert_not_called()
+
     def test_play_does_not_wait_when_the_engine_owns_the_idle_check(self):
         self.runner.closed_loop_owns_idle = True
         self.status = lambda: {'state': 'playing'}
@@ -593,7 +625,7 @@ class LogCursorTests(unittest.TestCase):
             with self.subTest(options=options):
                 self.path.write_text(self._boot_log() + old + '\n')
 
-                def replaces(_ctx, _name):  # the chord is played; the log is replaced and gains nothing
+                def replaces(_ctx, _name, **_options):  # the chord is played; the log is replaced and gains nothing
                     self._replace_with(old + '\n' + self.CSS_READY + '\n')
                     return 'sha'
 
@@ -601,7 +633,7 @@ class LogCursorTests(unittest.TestCase):
                     routes.chord(ctx, name, cap=0.3, **options)
                 new = old.replace('frame=', 'frame=77')
 
-                def answers(_ctx, _name):
+                def answers(_ctx, _name, **_options):
                     with self.path.open('a') as f:
                         f.write(new + '\n')
                     return 'sha'
@@ -3012,7 +3044,7 @@ class TrainingReturnTests(unittest.TestCase):
         def arm(self, provider, cap):
             pass
 
-        def send(self, macro):
+        def send(self, macro, until=None):
             self.actions.append(macro)
             if self.screen == 0 and self.token == 'placed':
                 self.token = 'held'
@@ -3097,7 +3129,7 @@ class TrainingReturnTests(unittest.TestCase):
 
     def test_changed_placed_target_after_b_is_rejected(self):
         io = self.IO('placed')
-        io.send = io.actions.append
+        io.send = lambda macro, until=None: io.actions.append(macro)
         read = io.read
 
         def changed_target(provider, cap):
@@ -3130,12 +3162,12 @@ class TrainingReturnTests(unittest.TestCase):
         io = self.IO('placed')
         send = io.send
 
-        def return_directly(macro):
+        def return_directly(macro, until=None):
             if not io.actions:
                 io.actions.append(macro)
                 io.screen = 2
             else:
-                send(macro)
+                send(macro, until=until)
 
         io.send = return_directly
         result = self.execute(io)
@@ -3146,8 +3178,8 @@ class TrainingReturnTests(unittest.TestCase):
         io = self.IO('placed')
         send, read = io.send, io.read
 
-        def return_to_stage(macro):
-            send(macro)
+        def return_to_stage(macro, until=None):
+            send(macro, until=until)
             if len(io.actions) == 1:
                 io.screen = 1
 
@@ -3367,8 +3399,8 @@ class TrainingReturnTests(unittest.TestCase):
         io = self.IO('placed')
         send = io.send
 
-        def send_and_leave(macro):
-            send(macro)
+        def send_and_leave(macro, until=None):
+            send(macro, until=until)
             if len(io.actions) == 1:
                 io.screen = 1
 
@@ -3384,7 +3416,7 @@ class TrainingReturnTests(unittest.TestCase):
         from unittest.mock import patch
 
         io = self.IO('placed')
-        io.send = io.actions.append
+        io.send = lambda macro, until=None: io.actions.append(macro)
         clock = count(step=.25)
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
                 patch.object(routes.time, 'monotonic', side_effect=lambda: next(clock)), \

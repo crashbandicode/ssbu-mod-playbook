@@ -1267,6 +1267,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(check.call_count, 3)
         self.assertNotIn('macro.play', eden.calls)
 
+    def test_gate_recovery_refuses_a_segment_changed_after_the_dry_run(self):
+        run, eden, _ = self.waiting_run()
+        run.plan['gates']['red']['recover'] = 'to-red'
+        run.plan['segments']['to-red']['sha256'] = '0' * 64
+        with mock.patch.object(run, 'check_gate', side_effect=RuntimeError('not red')):
+            with self.assertRaisesRegex(RuntimeError, 'changed since the dry run'):
+                run.gate('a', 'red')
+        self.assertNotIn('macro.play', eden.calls)
+
     def test_play_library_uses_the_same_gate(self):
         run, eden, _ = self.waiting_run()
         entry = {'file': 'segments/to-red.edenmacro.json', 'sha256': sha(self.dir / 'segments/to-red.edenmacro.json'),

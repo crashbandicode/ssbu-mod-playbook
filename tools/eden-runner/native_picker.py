@@ -311,7 +311,7 @@ def baseline(io, screen, tile=None, previous_ui=None, cap=4, *, expected_context
 
 def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, expected_context=None):
     until = time.monotonic() + cap
-    io.send('tile-' + direction)
+    io.send('tile-' + direction, until=until)
     prior_ack = number(before, 'ack')
     prior_applied = number(before, 'applied')
     latest = before
@@ -615,7 +615,7 @@ def take_back_local_token(io, current, ui, cap=4, *, expected_context=None):
             or Target.read(before, 'placed.') != wanted
             or number(before, 'placed.at') != number(current, 'placed.at')):
         raise RuntimeError('local medal placement changed before B')
-    io.send('tap-b1')
+    io.send('tap-b1', until=until)
     until = time.monotonic() + cap
     state = before
     while True:

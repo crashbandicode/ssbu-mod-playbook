@@ -13,6 +13,11 @@ import native_picker_io
 import routes
 
 
+class DeadlineSend(Mock):
+    def __call__(self, segment, until=None):
+        return super().__call__(segment)
+
+
 def snapshot(provider, rev, fields, epoch=1):
     boot = '0x0000000000000001'
     schema = provider + '/1'
@@ -77,6 +82,7 @@ class IORequalificationTests(unittest.TestCase):
         self.io = native_picker_io.BridgePickerIO(self.ctx)
         self.before = native(1, screen='css.training', **{'screen.context': 'training'})
         self.after = native(2, screen='css.training', **{'screen.context': 'training'})
+        self.after_tile = None
         self.io._record(self.before)
 
     def call(self, method, params=None):
@@ -90,6 +96,9 @@ class IORequalificationTests(unittest.TestCase):
     def read(self, provider, cap):
         self.reads.append((provider, cap, self.io.in_flight))
         self.assertFalse(self.io.in_flight)
+        if provider == 'tile.cursor':
+            self.assertIsNotNone(self.after_tile)
+            return self.io._record(self.after_tile)
         self.assertEqual(provider, 'ssbu.ui')
         return self.io._record(self.after)
 
@@ -133,6 +142,33 @@ class IORequalificationTests(unittest.TestCase):
             self.send()
         self.assertEqual(self.sent, [])
         self.assertFalse(self.io.in_flight)
+
+    def test_a_stop_during_requalification_is_not_wrapped_or_recorded_as_a_stall(self):
+        class StopRun(Exception):
+            pass
+
+        self.read = Mock(side_effect=StopRun('STOP-INPUT'))
+        with self.assertRaisesRegex(StopRun, 'STOP-INPUT'):
+            self.send()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+        self.assertFalse(self.io.in_flight)
+        self.assertEqual(self.runner.setup_metrics['stalls'], [])
+
+    def test_every_witness_provider_must_remain_unchanged(self):
+        self.io._record(tile(1, at='7', token='placed'))
+        self.after_tile = tile(2, at='12', token='placed')
+        with self.assertRaisesRegex(routes.closed_loop.DispatchRejected, 'tile.cursor changed.*at'):
+            self.send()
+        self.assertEqual([provider for provider, _, _ in self.reads], ['ssbu.ui', 'tile.cursor'])
+        self.assertEqual(self.sent, [])
+        self.assertNotIn('a', self.io.pending)
+
+    def test_requalification_read_is_capped_by_the_remaining_caller_deadline(self):
+        self.send(until=1.5)
+        self.assertEqual(len(self.reads), 1)
+        self.assertAlmostEqual(self.reads[0][1], 1.5 - self.sent[0][0])
+        self.assertEqual(len(self.sent), 1)
 
     def test_an_idle_channel_sends_at_once_as_before(self):
         self.free_at = 0
@@ -227,7 +263,7 @@ class Replay:
         except StopIteration:
             raise RuntimeError(f'{provider} missing') from None
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
 
     def finish(self):
@@ -1398,7 +1434,7 @@ class TrainingStageProofTests(unittest.TestCase):
                     if request == 'events on':
                         dst.write(before_press)
 
-            def start(_ctx, name):
+            def start(_ctx, name, **_options):
                 actions.append(name)
                 self.assertEqual(requests, [
                     'state ssbu.ui', 'state tile.cursor', 'state_watch ssbu.ui keys=observation max=1',
@@ -1577,6 +1613,7 @@ class MainMenuStepTests(unittest.TestCase):
 
         self.ctx = SimpleNamespace()
         self.io = Mock(connection=1, boot=self.top(1, 'smash').clock[0])
+        self.io.attach_mock(DeadlineSend(), 'send')
         test_io = patch.object(routes, 'BridgePickerIO', return_value=self.io)
         save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
         self.addCleanup(test_io.stop)
@@ -1718,6 +1755,7 @@ class TrainingSubmenuRouteTests(unittest.TestCase):
 
         import routes
 
+        io.attach_mock(DeadlineSend(), 'send')
         focuses = self.chain[start:]
         frames = [focuses[0]]
         for source, target in zip(focuses, focuses[1:]):
@@ -2014,6 +2052,7 @@ class NativeQuitTrainingTests(unittest.TestCase):
 
         self.ctx = SimpleNamespace()
         self.io = Mock(connection=1, boot=self.state(1, 'training').clock[0])
+        self.io.attach_mock(DeadlineSend(), 'send')
         adapter = patch.object(routes, 'BridgePickerIO', return_value=self.io)
         save = patch.object(routes, '_save', side_effect=lambda _ctx, _name, result: result)
         self.addCleanup(adapter.stop)

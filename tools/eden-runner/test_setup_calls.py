@@ -139,7 +139,7 @@ class CoinReplay:
                                 'ack.result': 'unknown', 'result': 'unknown', 'direction': 'unknown',
                                 'from': 'unknown', 'to': 'unknown'})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
         if segment == 'tap-a1':
             held = self.values.get('p1.carried', self.values.get('carried', 'none'))
@@ -354,7 +354,7 @@ class MenuReplay:
     def finish(self):
         pass
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         self.actions.append(segment)
         values = self.menu
         if segment != 'tr-menu-open':
@@ -399,12 +399,12 @@ def retrying_menu(ctx, advance):
         advance()
         return original_read(provider, cap)
 
-    def send(macro):
+    def send(macro, until=None):
         if macro == 'tap-a1' and not dropped:
             dropped.append(True)
             replay.actions.append(macro)
             return
-        original_send(macro)
+        original_send(macro, until=until)
 
     replay.read, replay.send = read, send
     return replay
@@ -430,10 +430,10 @@ class SetupCallsR2Tests(unittest.TestCase):
             before = menu.read('tr.menu', 2)
             original = menu.send
 
-            def send(macro):
+            def send(macro, until=None):
                 witness = dict(menu.menu)
-                routes.play(ctx, macro, requalify=lambda: menu.menu == witness)
-                original(macro)
+                routes.play(ctx, macro, requalify=lambda: menu.menu == witness, until=until)
+                original(macro, until=until)
 
             menu.send = send
             with patch.object(routes, 'macro_file', return_value=(Path('/macro'), 'sha', 3)), \
@@ -983,7 +983,7 @@ class TakeRouteReplay(CoinReplay):
         super().__init__(**kwargs)
         self.values.update({'take.ack': '0', 'take.applied': '0'})
 
-    def send(self, segment):
+    def send(self, segment, until=None):
         if segment == 'tile-take':
             self.actions.append(segment)
             self.values['take.ack'] = str(int(self.values['take.ack']) + 1)
@@ -995,7 +995,7 @@ class TakeRouteReplay(CoinReplay):
             self.actions.append(segment)
             self._take('0')
             return
-        return super().send(segment)
+        return super().send(segment, until=until)
 
 
 class TileTakeRouteTests(unittest.TestCase):
@@ -1315,8 +1315,8 @@ class ReachTrainingClosedLoopTests(unittest.TestCase):
         menu.writer_log = log
         original_send = menu.send
 
-        def send(macro):
-            original_send(macro)
+        def send(macro, until=None):
+            original_send(macro, until=until)
             if menu.menu['depth'] == '1' and not menu.picked:
                 menu.menu['editor.sel'] = '7'
 
