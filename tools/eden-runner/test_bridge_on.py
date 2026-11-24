@@ -47,6 +47,7 @@ FOREIGN_BOOT = '0x1111111111111111'
 RUN1 = (Path(__file__).parent / 'fixtures' / 'bridge-on' / 'stub-on-yoga-e-run1' / 'bridge.log').read_text().splitlines(keepends=True)
 RUN1_PREAMBLE = ''.join(RUN1[:3])
 RUN1_OPENING = ''.join(RUN1[51:99])
+RUN1_LAST_OPENING = ''.join(RUN1[99:147])
 RUN1_PROMPT = ''.join(RUN1[147:195])
 RUN1_BOOT = '0x1dc637526fb29a71'
 
@@ -85,7 +86,7 @@ class BridgeOnTests(unittest.TestCase):
         self.sleep_hook = None
         self.prompt_after_skip = False
         self.macro_error = None
-        self.recorded_open_seen = False
+        self.recorded_open_seen = 0
 
     def call(self, name, args=None):
         self.calls.append((name, args))
@@ -153,9 +154,9 @@ class BridgeOnTests(unittest.TestCase):
         if self.prompt_after_skip and any(method == 'macro.play' for method, _ in self.calls):
             sample = RUN1_PROMPT
         if sample == RUN1_OPENING:
-            if self.recorded_open_seen:
+            self.recorded_open_seen += 1
+            if self.recorded_open_seen > 2:
                 return
-            self.recorded_open_seen = True
         with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
             stream.write(sample)
 
@@ -392,7 +393,7 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_does_not_accept_the_opening_playback(self):
         self.configure_stub()
-        self.stub_samples, self.stub_default = [self.opening()], ''
+        self.stub_samples, self.stub_default = [self.opening(), self.opening()], ''
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=4 frame=31.*within 10 s.*title/title.opening_playback'):
             self.invoke(port=6980)
         self.assertLess(self.seconds, 20)
@@ -401,7 +402,7 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_waits_through_the_opening_for_the_prompt(self):
         self.configure_stub()
-        self.stub_samples = [self.opening()] + [''] * 4 + [STUB_UI]
+        self.stub_samples = [self.opening(), self.opening()] + [''] * 4 + [STUB_UI]
         self.stub_default = ''
         receipt = self.invoke(port=6980)
         self.assertEqual(receipt['title']['matched'], 'prompt')
@@ -413,7 +414,7 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_resets_prompt_deadline_after_opening_handoff(self):
         self.configure_stub()
-        self.stub_samples = [self.opening()] + [''] * 4 + [self.title_without_prompt()]
+        self.stub_samples = [self.opening(), self.opening()] + [''] * 4 + [self.title_without_prompt()]
         self.stub_default = ''
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press.*within 10 s.*title/title'):
             self.invoke(port=6980)
@@ -444,6 +445,69 @@ class BridgeOnTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=12 frame=72.*within 10 s'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
+
+    def test_bridge_on_stub_on_stale_opening_and_silent_bridge_sends_nothing(self):
+        self.recorded_opening(prompt_after_skip=False)
+        self.stub_preamble = RUN1_PREAMBLE + RUN1_OPENING
+        self.stub_default = ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+
+    def test_bridge_on_stub_on_stale_opening_then_modelled_prompt_does_not_pass_on_a_stale_press(self):
+        self.recorded_opening()
+        self.stub_preamble = RUN1_PREAMBLE + RUN1_OPENING
+        self.stub_default = ''
+        try:
+            self.invoke(port=6980)
+        except RuntimeError as error:
+            stopped = error
+        else:
+            self.fail('stale opening incorrectly sent a press and reached the modelled prompt')
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
+    def test_bridge_on_stub_on_fresh_opening_reply_sends_once(self):
+        self.recorded_opening()
+        self.stub_samples, self.stub_default = [RUN1_OPENING, RUN1_LAST_OPENING], ''
+        try:
+            title = self.invoke(port=6980)['title']
+        except RuntimeError as error:
+            self.fail(f'expected rechecked opening and modelled prompt: {error}')
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assertEqual((title['skip']['sent_on']['rev'], title['skip']['sent_on']['frame'],
+                          title['skip']['sent_on']['wall']), (1193, 7849, 506147525))
+        self.assertEqual(title['skip']['fresh'], {'request_blocks_before': 1, 'block_index': 1})
+        self.assertEqual((title['matched'], title['frame']), ('prompt', 7860))
+
+    def test_bridge_on_stub_on_opening_gone_at_the_recheck_sends_nothing(self):
+        self.recorded_opening(prompt_after_skip=False)
+        self.stub_samples, self.stub_default = [RUN1_OPENING, RUN1_PROMPT], ''
+        try:
+            title = self.invoke(port=6980)['title']
+        except RuntimeError as error:
+            self.fail(f'expected prompt without an opening press: {error}')
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertEqual((title['matched'], title['frame'], title['skip']), ('prompt', 7860, None))
+
+    def test_bridge_on_stub_on_other_screen_at_the_recheck_sends_nothing(self):
+        self.recorded_opening(prompt_after_skip=False)
+        main = self.sample(boot=RUN1_BOOT, screen='main_menu')
+        self.stub_samples, self.stub_default = [RUN1_OPENING, main], ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'main_menu/title.press_any, not the Title')
+
+    def test_bridge_on_stub_on_recheck_without_reply_sends_nothing(self):
+        self.recorded_opening(prompt_after_skip=False)
+        self.stub_samples, self.stub_default = [RUN1_OPENING], ''
+        with self.assertRaises(RuntimeError) as stopped:
+            self.invoke(port=6980)
+        self.assertEqual(self.macro_attempts(), [])
+        self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
 
     def test_bridge_on_stub_on_does_not_press_on_other_screens(self):
         self.configure_stub()
@@ -506,28 +570,32 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_stops_if_screen_changes_after_the_skip(self):
         self.configure_stub()
-        self.stub_samples, self.stub_default = [self.opening(), self.sample(screen='main')], ''
+        self.stub_samples, self.stub_default = [self.opening(), self.opening(), self.sample(screen='main')], ''
         with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
 
     def test_bridge_on_stub_on_stops_if_connection_changes_after_the_skip(self):
         self.configure_stub()
-        self.stub_samples, self.stub_default = [self.opening(), '[Adapter] connection idle\n'], ''
+        self.stub_samples, self.stub_default = [self.opening(), self.opening(), '[Adapter] connection idle\n'], ''
         with self.assertRaisesRegex(RuntimeError, 'bridge connection changed after the greeting'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
 
-    def test_bridge_on_stub_on_refuses_if_opening_changes_while_checking_idle(self):
+    def test_bridge_on_stub_on_accepts_prompt_arriving_while_checking_idle_without_press(self):
         self.recorded_opening()
         def idle_changes_screen(_ctx, _remaining):
             with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
                 stream.write(RUN1_PROMPT)
             return None
         with patch.object(routes, '_eden_macro_busy', side_effect=idle_changes_screen):
-            with self.assertRaisesRegex(RuntimeError, 'opening observation changed before Plus; nothing was sent'):
-                self.invoke(port=6980)
+            try:
+                receipt = self.invoke(port=6980)
+            except RuntimeError as error:
+                self.fail(f'expected already-arrived prompt without a press: {error}')
         self.assertEqual(self.macro_attempts(), [])
+        self.assertIsNone(receipt['title']['skip'])
+        self.assertEqual(receipt['title']['frame'], 7860)
 
     def test_bridge_on_stub_on_skip_follows_chord_without_earlier_input(self):
         self.recorded_opening()
