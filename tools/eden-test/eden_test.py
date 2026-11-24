@@ -98,6 +98,236 @@ def sh(argv, log=None):
     return done.returncode
 
 
+def _target_commit(commit):
+    if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise ValueError('target commit must be 40 lower-case hex characters')
+
+
+def _staged_target_arg(commit):
+    try:
+        _target_commit(commit)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return commit
+
+
+def _target_label(label):
+    if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{1,63}', label):
+        raise ValueError('invalid target stage label')
+
+
+def _target_git(tree, *args, timeout=600, env=None):
+    result = subprocess.run(['git', '--no-optional-locks', '-C', str(tree), *args],
+                            capture_output=True, text=True, timeout=timeout, env=env)
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or f'git exit {result.returncode}')
+    return result.stdout.strip()
+
+
+def _strict_target(tree, commit):
+    tree = Path(tree)
+    try:
+        if tree.is_symlink() or not tree.is_dir() or not (tree / '.git').is_dir() or (tree / '.git').is_symlink():
+            raise ValueError('not a checkout directory')
+        env = _target_build_environment()
+        head = _target_git(tree, 'rev-parse', 'HEAD', timeout=120, env=env)
+        if head != commit:
+            raise ValueError(f'is at {head}, not {commit}')
+        status = _target_git(tree, 'status', '--porcelain', '--untracked-files=all', '--ignored', timeout=120, env=env)
+        if status:
+            raise ValueError(f'changed after staging: {status.splitlines()[0]}')
+        _target_git(tree, 'cat-file', '-e', f'{commit}^{{commit}}', timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f'cannot be read: {error}') from error
+
+
+def _target_build_environment():
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', GIT_TERMINAL_PROMPT='0')
+    return env
+
+
+def _readonly_target(root):
+    for directory, names, files in os.walk(root, topdown=False, followlinks=False):
+        for name in [*files, *names]:
+            path = Path(directory) / name
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o222)
+        Path(directory).chmod(Path(directory).stat().st_mode & ~0o222)
+
+
+def _remove_target_tree(root):
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f'not an owned target directory: {root}')
+    for directory, names, _ in os.walk(root, topdown=True, followlinks=False):
+        path = Path(directory)
+        path.chmod(path.stat().st_mode | 0o700)
+        names[:] = [name for name in names if not (path / name).is_symlink()]
+    shutil.rmtree(root)
+
+
+def _target_size(root):
+    files, size = 0, 0
+    for directory, _, names in os.walk(root, followlinks=False):
+        for name in names:
+            files += 1
+            size += (Path(directory) / name).lstat().st_size
+    return files, size
+
+
+def _owned_target_directory(runs, parts, create=False):
+    path = Path(runs)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f'symlink in target directory: {path}')
+        if create:
+            path.mkdir(exist_ok=True)
+        elif not path.exists():
+            return None
+        if not path.is_dir():
+            raise ValueError(f'not a target directory: {path}')
+    return path
+
+
+def _incoming_target(commit, label, runs, create=False):
+    parent = _owned_target_directory(runs, ('_eden-test', 'stage', label, 'targets', '.incoming'), create=create)
+    if parent is None:
+        return None
+    pack = parent / f'{commit}.pack'
+    if pack.is_symlink():
+        raise ValueError(f'symlink in target pack: {pack}')
+    return pack
+
+
+def pack_target(tree, commit, out_dir):
+    _target_commit(commit)
+    tree, out_dir = Path(tree), Path(out_dir)
+    if not tree.is_absolute() or not tree.is_dir():
+        raise ValueError(f'target tree is not an existing absolute directory: {tree}')
+    _target_git(tree, 'cat-file', '-e', f'{commit}^{{commit}}', timeout=20)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pack = out_dir / f'{commit}.pack'
+    environment = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
+    rev = subprocess.Popen(['nice', '-n', '19', 'git', '-C', str(tree),
+                            'rev-list', '--objects', '--no-walk', commit],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+    try:
+        with pack.open('wb') as stream:
+            writer = subprocess.Popen(['nice', '-n', '19', 'git', '-C', str(tree), 'pack-objects', '--stdout'],
+                                      stdin=rev.stdout, stdout=stream, stderr=subprocess.PIPE, env=environment)
+            rev.stdout.close()
+            rev.stdout = None
+            try:
+                _, pack_error = writer.communicate(timeout=600)
+                _, rev_error = rev.communicate(timeout=10)
+            except BaseException:
+                writer.kill()
+                rev.kill()
+                writer.wait()
+                rev.wait()
+                raise
+        if rev.returncode or writer.returncode:
+            detail = (rev_error + pack_error).decode('utf-8', errors='replace').strip()
+            raise ValueError(f'packing {commit} failed: {detail or f"git exits {rev.returncode}/{writer.returncode}"}')
+        return {'commit': commit, 'pack_file': str(pack), 'pack_sha256': sha256(pack), 'bytes': pack.stat().st_size}
+    except BaseException:
+        if rev.poll() is None:
+            rev.kill()
+            rev.wait()
+        pack.unlink(missing_ok=True)
+        raise
+
+
+def probe_target(commit, runs=RUNS):
+    _target_commit(commit)
+    parent = _owned_target_directory(runs, ('_eden-test', 'target-cache'))
+    if parent is None:
+        return False
+    cache = parent / commit
+    if not cache.exists() and not cache.is_symlink():
+        return False
+    try:
+        _strict_target(cache, commit)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def stage_target(commit, label, pack=None, runs=RUNS):
+    _target_commit(commit)
+    _target_label(label)
+    runs = Path(runs)
+    cache_parent = _owned_target_directory(runs, ('_eden-test', 'target-cache'), create=True)
+    cache = cache_parent / commit
+    targets = _owned_target_directory(runs, ('_eden-test', 'stage', label, 'targets'), create=True)
+    staged = targets / commit
+    if pack is not None and Path(pack) == targets / '.incoming' / f'{commit}.pack':
+        _incoming_target(commit, label, runs)
+    if staged.exists() or staged.is_symlink():
+        try:
+            _strict_target(staged, commit)
+        except ValueError as error:
+            raise ValueError(f'staged tree {staged} {error}') from error
+    built = False
+    if cache.exists() or cache.is_symlink():
+        try:
+            _strict_target(cache, commit)
+        except ValueError:
+            suffix = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + f'-{time.time_ns()}'
+            cache.rename(cache_parent / f'.rejected-{commit}-{suffix}')
+    if not cache.exists():
+        if pack is None:
+            raise ValueError(f'no valid cache or pack for target {commit}')
+        temporary = cache_parent / f'.tmp-{commit}-{os.getpid()}'
+        temporary.mkdir()
+        try:
+            env = _target_build_environment()
+            subprocess.run(['git', 'init', '-q', '--template=', str(temporary)], capture_output=True, text=True,
+                           check=True, timeout=120, env=env)
+            with Path(pack).open('rb') as stream:
+                subprocess.run(['git', '-C', str(temporary), 'index-pack', '--stdin'], stdin=stream,
+                               capture_output=True, check=True, timeout=600, env=env)
+            if _target_git(temporary, 'cat-file', '-t', commit, env=env) != 'commit':
+                raise ValueError(f'pack does not contain commit {commit}')
+            (temporary / '.git' / 'shallow').write_text(commit + '\n')
+            _target_git(temporary, 'checkout', '-q', '--detach', commit, env=env)
+            _strict_target(temporary, commit)
+            _readonly_target(temporary)
+            temporary.rename(cache)
+            built = True
+        finally:
+            if temporary.exists():
+                _remove_target_tree(temporary)
+    _readonly_target(cache)
+    if not staged.exists():
+        temporary = targets / f'.tmp-{commit}-{os.getpid()}'
+        try:
+            shutil.copytree(cache, temporary, symlinks=True, copy_function=os.link)
+            _readonly_target(temporary)
+            _strict_target(temporary, commit)
+            temporary.rename(staged)
+        finally:
+            if temporary.exists():
+                _remove_target_tree(temporary)
+    _strict_target(staged, commit)
+    files, size = _target_size(staged)
+    if pack is not None and Path(pack) == targets / '.incoming' / f'{commit}.pack':
+        Path(pack).unlink(missing_ok=True)
+    return {'commit': commit, 'cache': 'built' if built else 'reused', 'staged': str(staged),
+            'files': files, 'bytes': size}
+
+
+def unstage_targets(label, runs=RUNS):
+    _target_label(label)
+    targets = _owned_target_directory(runs, ('_eden-test', 'stage', label, 'targets'))
+    if targets is not None:
+        _remove_target_tree(targets)
+
+
 def cmd_new(args):
     previous = json.loads(Path(args.from_config).read_text())
     run = RUNS / args.label
@@ -377,8 +607,17 @@ def network_row_overrides(rows, interface):
 
 
 def go_new(args):
+    staged_targets = getattr(args, 'staged_target', None) or []
+    try:
+        for commit in staged_targets:
+            _target_commit(commit)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
+    config.pop('staged_targets', None)
+    if staged_targets:
+        config['staged_targets'] = sorted(set(staged_targets))
     if config.get('host') != args.host:
         raise SystemExit(f'base {base} is for host {config.get("host")!r}, not {args.host!r}')
     lineup = _go_card_lineup(args)
@@ -1143,6 +1382,10 @@ def time_split(run):
 
 def results_md(run, config):
     passed, failed, unrun, retained = row_accounting(run)
+    reported = report_rows_with_stalls(run)
+    stalled = [(row, result, stalls) for row, result, _, _, stalls in reported
+               if result == 'PASS' and stalls]
+    stall_suffix = _stall_totals(reported)
     journal = json.loads((run / 'state' / 'lifecycle.json').read_text()) if (run / 'state' / 'lifecycle.json').exists() else {}
     timing = json.loads((run / 'timing.json').read_text())
     runs = [(start, end) for start, end in timing.get('runs', []) if end]
@@ -1161,8 +1404,12 @@ def results_md(run, config):
     lines = [f'# {config["label"]} — {time.strftime("%Y-%m-%d", time.gmtime())}',
              f'- Eden: {"; ".join(apps)}',
              f'- Plugins: ' + ', '.join(f'{Path(p["path"]).name} {p["sha256"][:8]}' for p in config['instances'][0].get('plugins', [])),
-             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun; {retained} earlier failed attempts retained '
+             f'- Rows: {len(passed)} PASS, {len(failed)} FAILED, {len(unrun)} unrun{stall_suffix}; {retained} earlier failed attempts retained '
              f'(receipts in `out/`); final rows.json {rows_note}; {len(manifests)} runner manifests in `out/manifests/`']
+    for row, result, stalls in stalled[:6]:
+        lines.append(f'  - {shown_result(result, stalls)} {row["id"]}')
+    if len(stalled) > 6:
+        lines.append(f'  - and {len(stalled) - 6} more rows passed with stalls (see REPORT.md)')
     for row, error in failed[:6]:
         lines.append(f'  - FAILED {row}: {one_line(error)}')
     if unrun:
@@ -1181,8 +1428,8 @@ def results_md(run, config):
               + (' (incomplete timing)' if split['incomplete'] else '')
               + (f' ({split["roles_defaulted"]} roles defaulted)' if split['roles_defaulted'] else ''),
               '- Next: ']
-    (run / 'RESULTS.md').write_text('\n'.join(lines[:20]) + '\n')
-    print('\n'.join(lines[:20]))
+    (run / 'RESULTS.md').write_text('\n'.join(lines) + '\n')
+    print('\n'.join(lines))
 
 
 PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'  # lifecycle.py PLUGINS
@@ -1321,6 +1568,93 @@ def row_report(run, row, history):
     return result, reason, proof + [f'out/{name}' for name in asides]
 
 
+class _RowStalls(list):
+    def __init__(self):
+        super().__init__()
+        self.unreadable = 0
+
+
+def row_stalls(run, row_id, receipt) -> list[dict]:
+    stalls = _RowStalls()
+    seen = {}
+
+    def add(event):
+        if not isinstance(event, dict):
+            return
+        identity = json.dumps({key: value for key, value in event.items() if key != 'block'},
+                              sort_keys=True, default=str)
+        if identity not in seen:
+            seen[identity] = len(stalls)
+            stalls.append(dict(event))
+        elif 'block' in event:
+            stalls[seen[identity]].setdefault('block', event['block'])
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == 'stalls' and isinstance(child, list):
+                    for event in child:
+                        add(event)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for step in receipt.get('results', []):
+        if isinstance(step, dict):
+            walk(step.get('value'))
+    path = Path(run) / 'out' / row_id / 'stall-events.jsonl'
+    if path.exists():
+        try:
+            with path.open(encoding='utf-8', errors='replace') as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        stalls.unreadable += 1
+                        continue
+                    if isinstance(event, dict):
+                        add(event)
+                    else:
+                        stalls.unreadable += 1
+        except OSError:
+            stalls.unreadable += 1
+    return stalls
+
+
+def shown_result(result, stalls):
+    if result != 'PASS' or not stalls:
+        return result
+    count = len(stalls)
+    return f'PASS with {count} {"stall" if count == 1 else "stalls"}'
+
+
+def report_rows_with_stalls(run):
+    run = Path(run)
+    rows = []
+    for row, result, reason, proof in report_rows(run):
+        path = run / 'out' / f'{row["id"]}.json'
+        receipt = json.loads(path.read_text()) if path.exists() else {}
+        rows.append((row, result, reason, proof, row_stalls(run, row['id'], receipt)))
+    return rows
+
+
+def _stall_totals(rows):
+    passed_stalls = [stalls for _, result, _, _, stalls in rows if result == 'PASS' and stalls]
+    if not passed_stalls:
+        return ''
+    passed = len(passed_stalls)
+    total = sum(len(stalls) for stalls in passed_stalls)
+    return (f' ({passed} {"row" if passed == 1 else "rows"} passed with stalls, '
+            f'{total} {"stall" if total == 1 else "stalls"} in those rows)')
+
+
+def _stall_text(event):
+    fields = ('block', 'kind', 'step', 'screen', 'send')
+    parts = [f'{key}={event[key]}' for key in fields if key in event]
+    return ', '.join(parts) if parts else json.dumps(event, sort_keys=True, default=str)
+
+
 def report_rows(run):
     run = Path(run)
     spec = json.loads((run / 'rows' / 'rows.json').read_text())
@@ -1348,7 +1682,7 @@ def report_md(run):
     from the run folder alone. Works while Eden is still up and again after Down."""
     run = Path(run)
     config = json.loads((run / 'config.json').read_text())
-    rows = report_rows(run)
+    rows = report_rows_with_stalls(run)
     timing = json.loads((run / 'timing.json').read_text()) if (run / 'timing.json').exists() else {}
 
     def utc(key):
@@ -1365,10 +1699,18 @@ def report_md(run):
     else:
         state = f'no Up recorded on {host}'
     table, counts = [], {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}
-    for row, result, reason, proof in rows:
+    for row, result, reason, proof, stalls in rows:
         counts[result] += 1
         blocks = ', '.join(str(step.get('run', next(iter(step), '?'))).split(':')[-1] for step in row.get('steps', []))
-        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {result} | {cell(reason, 420)} | {"<br>".join(proof)} |')
+        details = []
+        if stalls:
+            text = f'stalls: {len(stalls)}: ' + '; '.join(_stall_text(event) for event in stalls)
+            details.append(cell(text, len(text)))
+        if stalls.unreadable:
+            details.append(f'unreadable stall-event lines: {stalls.unreadable}')
+        details.append(cell(reason, 420))
+        table.append(f'| {row["id"]} | {cell(blocks, 60)} | {shown_result(result, stalls)} | '
+                     f'{"; ".join(details)} | {"<br>".join(proof)} |')
     split = time_split(run)
     ends = []  # how each runner call ended: its last status line that is not a row's
     runner_log = run / 'runner.log'
@@ -1385,8 +1727,8 @@ def report_md(run):
              f'- Runner: {len(ends)} call(s) ended: ' + ('; '.join(ends) if ends else 'no end line in runner.log'),
              card_lineup_report(config),
              '- NROs:', *nro_lines(run, config),
-             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)} '
-             f'(proof paths are relative to `{run}`)',
+             f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)}'
+             f'{_stall_totals(rows)} (proof paths are relative to `{run}`)',
              '', '| Row | Steps | Result | Reason | Proof |', '| --- | --- | --- | --- | --- |', *table, '',
              f'- Times: Up {utc("up_start")} to {utc("up_done")}; rows {utc("run_start")} to {utc("run_end")} over '
              f'{len(timing.get("runs", [])) or 1} runner call(s); setup rows {split["setup"]:.0f} s, test rows '
@@ -1416,20 +1758,199 @@ def _pwsh_arg(value):
     return "'" + value.replace("'", "''") + "'"
 
 
+def _go_targets(rows):
+    rows = Path(rows)
+    path = rows / 'rows.json' if rows.is_dir() else rows
+    try:
+        plan = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot read rows plan {path}: {error}') from error
+    if not isinstance(plan, dict):
+        raise SystemExit(f'rows plan {path} must be an object')
+    if 'target' not in plan:
+        return []
+    target = plan['target']
+    if not isinstance(target, dict):
+        raise SystemExit('target must be an object')
+    repos = target.get('repos', {})
+    if not isinstance(repos, dict):
+        raise SystemExit('target repos must be an object')
+    specs = [('plugin', target.get('plugin'))]
+    if 'bridge' in target:
+        specs.append(('bridge', target['bridge']))
+    specs.extend((f'repos.{name}', spec) for name, spec in repos.items())
+    found = []
+    for label, spec in specs:
+        if not isinstance(spec, dict):
+            raise SystemExit(f'target {label} must be an object')
+        tree, commit = spec.get('tree'), spec.get('commit')
+        try:
+            _target_commit(commit)
+            if not isinstance(tree, str) or not Path(tree).is_absolute() or not Path(tree).is_dir():
+                raise ValueError(f'tree {tree!r} is not an existing absolute directory')
+            _target_git(tree, 'cat-file', '-e', f'{commit}^{{commit}}', timeout=20)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            raise SystemExit(f'target {label}: {error}') from error
+        found.append({'label': label, 'tree': tree, 'commit': commit})
+    return found
+
+
+def _go_target_ssh(host, mux, remote, timeout):
+    mux.ensure()
+    command = ['ssh', *mux.rider_args, host, *(_pwsh_arg(arg) for arg in remote)]
+    print('$ ' + shlex.join(command), flush=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f'target staging SSH failed: {error}') from error
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    return result.returncode, result.stdout, result.stderr
+
+
+def _go_target_rsync(command):
+    print('$ ' + shlex.join(command), flush=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(f'target pack rsync failed: {error}') from error
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    match = re.search(r'(?m)^Total bytes sent:\s*([0-9,]+)', result.stdout)
+    return result.returncode, int(match.group(1).replace(',', '')) if match else None
+
+
+_GO_BASE_NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*\.json'
+
+
+def _go_this_host():
+    """The host this machine is, by its shared base, or None when it has no shared base. A local copy of another
+    host's base never answers this. A shared base that cannot say is a stop, not a guess."""
+    shared = RUNS / '_eden-test' / 'base.json'
+    if not shared.exists():
+        return None
+    try:
+        config = json.loads(shared.read_text())
+        host = config.get('host') if isinstance(config, dict) else None
+        if not isinstance(host, str) or not host:
+            raise ValueError('it names no host')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'this machine\'s shared base {shared} cannot say which host this is: {error}; '
+                         'nothing was started') from error
+    return host
+
+
+def _go_route(args):
+    """The ssh name this machine reaches args.host by: --ssh, else its hosts.json entry, else None. A hosts.json
+    that exists and cannot be read is a stop: it must not look like a machine with no route."""
+    if args.ssh:
+        return args.ssh
+    hosts = RUNS / '_eden-test' / 'hosts.json'
+    if not hosts.exists():
+        return None
+    try:
+        mapping = json.loads(hosts.read_text())
+        if not isinstance(mapping, dict):
+            raise ValueError('it is not an object of host names')
+        route = mapping.get(args.host)
+        if route is not None and (not isinstance(route, str) or not route):
+            raise ValueError(f'its entry for {args.host!r} is not an ssh name')
+    except (OSError, ValueError) as error:
+        raise SystemExit(f'cannot find the ssh name for host {args.host!r}: {hosts} cannot be used: {error}; '
+                         'nothing was started') from error
+    return route
+
+
+def _go_remote_base(args):
+    """The --from of a go that is sent to another host: a path on that host, in this run's own stage folder. It is
+    forwarded as given; a local file is never copied there."""
+    value = getattr(args, 'from_config', None)
+    if not value:
+        return None
+    stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
+    name = value[len(stage) + 1:] if value.startswith(stage + '/') else ''
+    if not re.fullmatch(_GO_BASE_NAME, name):
+        raise SystemExit(
+            f'--from {value!r}: a go sent to another host takes a base that is on the host, a .json file directly in '
+            f'this run\'s own stage folder {stage}/ (a plain name of letters, digits, "_", "-" and "."). '
+            'A local file is not copied there, and it does not make this machine the host')
+    return value
+
+
+def _go_received_base(args):
+    """Check the base of a go a controller sent to this host (it carries --token). Such a go runs here or not at
+    all: a missing or foreign base is refused here and is never sent on. --from must be a file in this run's own
+    stage folder, reached without a symlink, for this host, and it must pin the Eden AppImage this host's shared
+    base pins (go_new then checks that file's hash). The shared base is only read."""
+    shared = RUNS / '_eden-test' / 'base.json'
+
+    def load(path, what):
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f'{what} {path} is missing on this host or is not a plain file; nothing was started')
+        try:
+            config = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise SystemExit(f'{what} {path} cannot be read: {error}; nothing was started') from error
+        host = config.get('host') if isinstance(config, dict) else None
+        if host != args.host or not isinstance(config.get('instances'), list):
+            raise SystemExit(f'{what} {path} is for host {host!r}, not {args.host!r}; nothing was started')
+        return config
+
+    if not args.from_config:
+        load(shared, 'the base')
+        return
+    stage = RUNS / '_eden-test' / 'stage' / args.label
+    try:
+        _target_label(args.label)
+        name = args.from_config[len(str(stage)) + 1:] if args.from_config.startswith(f'{stage}/') else ''
+        if not re.fullmatch(_GO_BASE_NAME, name):
+            raise ValueError('not a .json file directly in that folder')
+        if _owned_target_directory(RUNS, ('_eden-test', 'stage', args.label)) is None:
+            raise ValueError('that folder does not exist')
+    except ValueError as error:
+        raise SystemExit(f'--from {args.from_config!r}: {error}; a go sent to a host takes its base from the run\'s '
+                         f'own stage folder {stage}/; nothing was started') from error
+    config = load(stage / name, '--from')
+    released = {(item.get('app', {}).get('path'), item.get('app', {}).get('sha256'))
+                for item in load(shared, "this host's shared base")['instances'] if isinstance(item, dict)}
+    for item in config['instances']:
+        app = item.get('app', {}) if isinstance(item, dict) else {}
+        if (app.get('path'), app.get('sha256')) not in released:
+            pinned = ', '.join(sorted(f'{path} ({str(digest)[:12]}…)' for path, digest in released))
+            raise SystemExit(f'--from {stage / name}: it pins Eden AppImage {app.get("path")} '
+                             f'({str(app.get("sha256"))[:12]}…), not the released AppImage this host\'s shared base '
+                             f'{shared} pins: {pinned}; nothing was started')
+
+
 def _go_remote(args, lineup):
     hosts = RUNS / '_eden-test' / 'hosts.json'
-    mapping = json.loads(hosts.read_text()) if hosts.is_file() else {}
-    host = args.ssh or mapping.get(args.host)
+    host = _go_route(args)
     if not host:
         raise SystemExit(f'no SSH host for {args.host!r}; use --ssh or add it to {hosts}')
     if host.startswith('-'):
         raise SystemExit(f'invalid SSH host {host!r}')
+    try:
+        _target_label(args.label)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    _go_remote_base(args)
+    targets = _go_targets(args.rows)
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
     with SshMux(host, ssh_options=options, windows=args.host == 'ally') as mux:
-        return _go_remote_with_mux(args, lineup, host, mux)
+        return _go_remote_with_mux(args, lineup, host, mux, targets)
 
 
-def _go_remote_with_mux(args, lineup, host, mux):
+def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
+    base = _go_remote_base(args)
+    if targets is None:
+        try:
+            _target_label(args.label)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        targets = _go_targets(args.rows)
+    if pack_dir is None:
+        with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
+            return _go_remote_with_mux(args, lineup, host, mux, targets, directory)
     stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
     commands = [
         ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
@@ -1444,13 +1965,68 @@ def _go_remote_with_mux(args, lineup, host, mux):
         commands.append(['rsync', '-a', '--mkpath', str(rows) + '/', f'{host}:{stage}/rows/'])
     else:
         commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
-    for command in commands:
+    script = f'{stage}/tools/eden-test/eden_test.py'
+    staged_commits = {}
+    for index, command in enumerate(commands):
         mux.ensure()
         command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
         if code := _go_sh(command):
             raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}')
-    script = f'{stage}/tools/eden-test/eden_test.py'
+        if index == 0:
+            for target in targets:
+                commit, label = target['commit'], target['label']
+                if commit in staged_commits:
+                    print(f'target {label} {commit[:12]}: cache reused, 0 bytes shipped in 0.0 s')
+                    continue
+                started = time.monotonic()
+                helper = ['/usr/bin/python3', '-I', '-B', script, 'stage-target',
+                          '--commit', commit, '--label', args.label]
+                code, output, stderr = _go_target_ssh(host, mux, [*helper, '--probe'], 180)
+                detail = stderr.strip()[-2000:] or 'no stderr'
+                if code:
+                    raise SystemExit(f'target {label} cache probe failed: {detail}')
+                try:
+                    probe = json.loads(output.strip().splitlines()[-1])
+                    if not isinstance(probe, dict) or probe.get('commit') != commit \
+                            or type(probe.get('cached')) is not bool:
+                        raise ValueError('invalid probe receipt')
+                except (ValueError, IndexError, TypeError) as error:
+                    raise SystemExit(f'target {label} cache probe failed: {detail}') from error
+                sent = 0
+                pack_file = None
+                try:
+                    if not probe['cached']:
+                        try:
+                            pack = pack_target(target['tree'], commit, pack_dir)
+                        except (ValueError, OSError, subprocess.SubprocessError) as error:
+                            raise SystemExit(f'target {label}: {error}') from error
+                        pack_file = Path(pack['pack_file'])
+                        incoming = f'{stage}/targets/.incoming/{commit}.pack'
+                        transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--partial', '--stats',
+                                    '--mkpath', str(pack_file), f'{host}:{incoming}']
+                        mux.ensure()
+                        failure, sent = _go_target_rsync(transfer)
+                        if failure:
+                            raise SystemExit(f'target {label} pack rsync failed ({failure}): {shlex.join(transfer)}')
+                        helper.extend(('--pack', incoming))
+                    code, output, _ = _go_target_ssh(host, mux, helper, 900)
+                finally:
+                    if pack_file is not None:
+                        pack_file.unlink(missing_ok=True)
+                if code:
+                    raise SystemExit(f'target {label} staging failed ({code})')
+                try:
+                    result = json.loads(output.strip().splitlines()[-1])
+                    if result['commit'] != commit or result['cache'] not in ('built', 'reused'):
+                        raise ValueError('invalid target receipt')
+                except (ValueError, KeyError, IndexError, TypeError) as error:
+                    raise SystemExit(f'target {label} returned invalid staging receipt') from error
+                staged_commits[commit] = result
+                print(f'target {label} {commit[:12]}: cache {result["cache"]}, '
+                      f'{sent if sent is not None else "unknown"} bytes shipped in {time.monotonic() - started:.1f} s')
     remote = ['/usr/bin/python3', '-I', '-B', script, 'go', '--host', args.host, '--label', args.label]
+    if base:
+        remote.extend(('--from', base))
     for nro in args.nro:
         remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
     remote.extend(('--rows', f'{stage}/rows'))
@@ -1466,6 +2042,8 @@ def _go_remote_with_mux(args, lineup, host, mux):
         remote.extend(('--network-interface', args.network_interface))
     if args.no_lobby:
         remote.append('--no-lobby')
+    for commit in sorted(staged_commits):
+        remote.extend(('--staged-target', commit))
     remote.extend(('--owner', args.owner))
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
@@ -1502,11 +2080,33 @@ def cmd_go(args):
     if not re.fullmatch(r'(OpenCode|Codex|Claude|Cursor)\s+\S+', args.owner):
         raise SystemExit('--owner must be "<Engine> <session>/<stream>" (OpenCode|Codex|Claude|Cursor), '
                          f'e.g. "Claude devin-<lane>/<label>"; got: {args.owner!r}')
-    base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
-    if not base.is_file() or json.loads(base.read_text()).get('host') != args.host:
-        _go_trace(args)
-        lineup = _go_card_lineup(args)
-        return _go_remote(args, lineup)
+    if args.token:  # a controller sent this go here: it runs on this machine or not at all
+        _go_received_base(args)
+    else:
+        # Which machine this is comes from its own shared base, never from the base the go names: a local copy of
+        # the host's base does not make this machine the host.
+        shared = RUNS / '_eden-test' / 'base.json'
+        this_host = _go_this_host()
+        if this_host == args.host:
+            remote = False  # this is the host: any local --from, as before; an ssh name is not needed
+        elif _go_route(args):
+            remote = True  # the host is elsewhere: --from is a path there, and a local file is not opened
+        elif this_host is not None:
+            raise SystemExit(
+                f'this machine is host {this_host!r} by its shared base {shared}, not {args.host!r}, and it has no '
+                f'ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'nothing was started')
+        else:
+            # No shared base and no route: nothing says this machine is the host, and a file the go names is no
+            # evidence of it. A host is set up by giving it its shared base.
+            raise SystemExit(
+                f'this machine has no shared base {shared}, so it is not known to be host {args.host!r}, and it has '
+                f'no ssh name for {args.host!r} (pass --ssh or add it to {RUNS / "_eden-test" / "hosts.json"}); '
+                'a base named with --from does not say which machine this is; nothing was started')
+        if remote:
+            _go_trace(args)
+            lineup = _go_card_lineup(args)
+            return _go_remote(args, lineup)
     run = go_new(args)
     config = json.loads((run / 'config.json').read_text())
     for key, entries in config['staged_plugins'].items():
@@ -1646,6 +2246,14 @@ def main(argv=None):
     p.add_argument('--from', dest='from_config')
     p.add_argument('--ssh')
     p.add_argument('--token', help=argparse.SUPPRESS)
+    p.add_argument('--staged-target', action='append', type=_staged_target_arg, default=[], help=argparse.SUPPRESS)
+    p = sub.add_parser('stage-target', help='build or reuse a target cache and stage it for a run')
+    p.add_argument('--commit', required=True)
+    p.add_argument('--label', required=True)
+    p.add_argument('--pack')
+    p.add_argument('--probe', action='store_true', help=argparse.SUPPRESS)
+    p = sub.add_parser('unstage-targets', help='remove the run target trees, retaining the cache')
+    p.add_argument('--label', required=True)
     sub.add_parser('pace').add_argument('run', type=Path)
     sub.add_parser('report').add_argument('run', type=Path)
     p = sub.add_parser('down')
@@ -1667,6 +2275,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.mode == 'go':
         return cmd_go(args)
+    if args.mode == 'stage-target':
+        try:
+            _target_label(args.label)
+            if args.probe:
+                _target_commit(args.commit)
+                _incoming_target(args.commit, args.label, RUNS, create=True)
+                print(json.dumps({'commit': args.commit, 'cached': probe_target(args.commit, runs=RUNS)}))
+                return 0
+            print(json.dumps(stage_target(args.commit, args.label, args.pack, runs=RUNS)))
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            raise SystemExit(f'stage-target: {error}') from error
+    elif args.mode == 'unstage-targets':
+        try:
+            unstage_targets(args.label, runs=RUNS)
+        except (ValueError, OSError) as error:
+            raise SystemExit(f'unstage-targets: {error}') from error
     if args.mode == 'new':
         cmd_new(args)
     elif args.mode == 'check':

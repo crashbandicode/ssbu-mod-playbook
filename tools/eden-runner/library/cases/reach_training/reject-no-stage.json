@@ -1,0 +1,1 @@
+{"args":{"p1":"Mr. Game & Watch","cpu":"Greninja","stage":"Final Destination","form":"normal","boot":"0xa1e80deccd2a9a15"},"files":{"lines":"no-stage-docs-enter-training.lines"},"expect":"reject","contains":"no stage observation"}

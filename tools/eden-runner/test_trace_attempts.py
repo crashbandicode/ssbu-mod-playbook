@@ -4,14 +4,17 @@ import importlib
 import json
 import struct
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import fake_clock
+import native_picker
+import native_picker_io
 import routes
 import test_setup_blocks as fake
+import trace_attempts
 
 
 # Source: /home/intpa/smash-training-lobby/artifacts/phase23/edge-juggle/evidence/cp1b-pyra38-1/trace/edge-juggle-p0-83eecc32.trace.jsonl
@@ -99,12 +102,14 @@ class AttemptDecodeTests(unittest.TestCase):
 
 class ObserveTests(unittest.TestCase):
     def setUp(self):
+        self.clock = fake_clock.install(self, routes, native_picker, native_picker_io, trace_attempts)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / 'trace.jsonl'
         self.path.write_text('')
         self.ctx = SimpleNamespace(runner=SimpleNamespace(), row_dir=directory.name, on='s',
                                    instance={'trace_jsonl': str(self.path)})
+        self.ctx.clock = self.clock
         self.pending = []
 
         def counters(point):
@@ -394,7 +399,7 @@ class ObserveTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 3:
-                time.sleep(.03)
+                self.clock.sleep(.03)
             return original(method, params)
 
         self.ctx.call = call
@@ -477,13 +482,24 @@ class ObserveTests(unittest.TestCase):
 
 
 class StartIO(fake.RowsIO):
+    UNCHANGED_READ_S = .001  # New revisions with unchanged contents still take time to arrive.
+
     def __init__(self, ctx, *, wizard=True, fault=None):
         super().__init__(ctx, fault=fault)
         self.wizard = wizard
+        self.last_reads = {}
         self.menu.update({'open': '0' if wizard else '1', 'game': 'Guard the Edge' if wizard else '',
                           'game.running': '1' if wizard else '0',
                           'notice.header': 'Edge · 4/4' if wizard else '',
                           'notice.body': 'CPU (1, 1) · 0% · P1 (0, 0)' if wizard else ''})
+
+    def read(self, provider, cap):
+        state = super().read(provider, cap)
+        values = {key: value for key, value in state.values.items() if key not in ('rev', 'observation')}
+        if self.last_reads.get(provider) == values:
+            self.ctx.clock.spend(min(cap, self.UNCHANGED_READ_S))
+        self.last_reads[provider] = values
+        return state
 
     def send(self, segment, until=None):
         if segment == 'tap-a1' and (self.wizard or self.menu['depth'] == '1'):

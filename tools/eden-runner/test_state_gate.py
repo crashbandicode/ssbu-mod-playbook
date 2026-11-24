@@ -115,7 +115,9 @@ class LinkTests(unittest.TestCase):
     def test_a_silent_connection_gets_a_heartbeat_then_is_reconnected(self):
         import socket
         import tempfile
+        import fake_clock
         import switch_hw
+        clock = fake_clock.install(self, switch_hw)
         sent, connects = [], []
 
         class Silent:
@@ -126,7 +128,7 @@ class LinkTests(unittest.TestCase):
                 sent.append(data)
 
             def recv(self, _):
-                time.sleep(0.02)
+                clock.sleep(0.02)
                 raise socket.timeout()
 
             def close(self):

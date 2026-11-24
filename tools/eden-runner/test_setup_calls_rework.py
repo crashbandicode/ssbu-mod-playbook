@@ -3,15 +3,17 @@
 import copy
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import fake_clock
 import native_picker as picker
 import routes
 import switch_hw
+
+READ_COST = .001  # One bridge read, as the fake models it.
 
 
 REPLAY = (
@@ -40,12 +42,41 @@ REAL_SET = '[Bridge] req set result=ok frame=2899 wall=383391489'
 REAL_RELOAD = '[TrainingRooms] diag_settings_reload rerolls=0x0 issues=0 ev=110 frame=2899 wall=383391484'
 
 
-def delayed_coin(*, action='a', pending='once'):
+def logged_native(log, values):
+    hello = (Path(__file__).parent / 'library' / 'cases' / 'expect_fighters' / 'accept-tk06.lines').read_text().splitlines()[0]
+    stage = (Path(__file__).parent / 'library' / 'cases' / 'reach_training' / 'other-run-tk06.lines').read_text().splitlines()[1]
+    log.write_text(hello + '\n' + stage + '\n')
+    if callable(values):
+        get = values
+    elif isinstance(values, list):
+        items = iter(values)
+        get = lambda *args, **kwargs: next(items)
+    else:
+        get = lambda *args, **kwargs: values
+
+    def read(*args, **kwargs):
+        state = get(*args, **kwargs)
+        roster = state.get('roster', {})
+        mask = sum(1 << int(seat) for seat in roster)
+        with log.open('a') as stream:
+            stream.write(f'[Bridge] req roster result=ok entries=0x{mask:x} frame=1 wall=1\n')
+            for seat, fighter in sorted(roster.items()):
+                fighter.setdefault('nana', False)
+                nana = str(fighter['nana']).lower()
+                stream.write(f"[Bridge] roster entry={seat} kind={fighter['kind']} nana={nana} frame=2 wall=2\n")
+        return state
+
+    return read
+
+
+def delayed_coin(clock, *, action='a', pending='once'):
     from test_setup_calls import CoinReplay
 
     class Replay(CoinReplay):
         def __init__(self):
             super().__init__()
+            self.clock = clock
+            self.last_values = {}
             self.pending = None
             self.pending_reads = 0
 
@@ -75,18 +106,25 @@ def delayed_coin(*, action='a', pending='once'):
                         self._place(value)
                     else:
                         self.values.update(value)
-            return super().read(provider, cap)
+            sample = super().read(provider, cap)
+            values = {key: value for key, value in sample.values.items() if key not in ('rev', 'observation')}
+            if self.last_values.get(provider) == values:
+                self.clock.spend(min(cap, READ_COST))
+            self.last_values[provider] = values
+            return sample
 
     return Replay()
 
 
-def menu_replay(*, idle=False, delay_ack=False):
+def menu_replay(clock, *, idle=False, delay_ack=False):
     from test_setup_calls import MenuReplay
     import test_native_picker as recorded
 
     class Replay(MenuReplay):
         def __init__(self):
             super().__init__()
+            self.clock = clock
+            self.last_values = {}
             self.cached = None
             self.previous = None
 
@@ -101,19 +139,26 @@ def menu_replay(*, idle=False, delay_ack=False):
             if provider == 'tr.menu' and self.previous is not None:
                 self.rev += 1
                 value, self.previous = self.previous, None
-                return recorded.snapshot(provider, self.rev, value)
-            if provider == 'tr.menu' and idle:
+                sample = recorded.snapshot(provider, self.rev, value)
+            elif provider == 'tr.menu' and idle:
                 if self.cached is None:
                     self.rev += 1
                     self.cached = recorded.snapshot(provider, self.rev, dict(self.menu))
-                return self.cached
-            return super().read(provider, cap)
+                sample = self.cached
+            else:
+                sample = super().read(provider, cap)
+            values = {key: value for key, value in sample.values.items() if key not in ('rev', 'observation')}
+            if self.last_values.get(provider) == values:
+                self.clock.spend(min(cap, READ_COST))
+            self.last_values[provider] = values
+            return sample
 
     return Replay()
 
 
 class SetupReworkTests(unittest.TestCase):
     def setUp(self):
+        self.clock = fake_clock.install(self, routes, picker)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -165,7 +210,7 @@ class SetupReworkTests(unittest.TestCase):
         self.assertEqual(state['roster'], {0: {'kind': 85, 'nana': False}, 1: {'kind': 86, 'nana': False}})
 
     def test_take_token_waits_through_a_block_published_before_the_a_lands(self):
-        io = delayed_coin()
+        io = delayed_coin(self.clock)
         io.values.update({'hand.token': '1', 'target.token': '1', 'token.settled': '1',
                           'at': io.cpu_tile, 'focus': 'css.medal.1'})
         result = picker.take_token(io, 1, cap=.2)
@@ -176,7 +221,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_take_token_times_out_or_rejects_a_different_coin(self):
         for fault in ('timeout', 'wrong', 'wrong_unsettled'):
             with self.subTest(fault=fault):
-                io = delayed_coin(pending='forever')
+                io = delayed_coin(self.clock, pending='forever')
                 io.values.update({'hand.token': '1', 'target.token': '1', 'token.settled': '1',
                                   'at': io.cpu_tile, 'focus': 'css.medal.1'})
                 send = io.send
@@ -195,7 +240,7 @@ class SetupReworkTests(unittest.TestCase):
                 self.assertEqual(io.actions, ['tap-a1'])
 
     def test_take_p1_token_waits_through_the_pre_a_block(self):
-        io = delayed_coin()
+        io = delayed_coin(self.clock)
         io.values.update({'hand.token': '0', 'target.token': '0', 'token.settled': '1',
                           'at': io.p1_tile, 'focus': 'css.medal.0'})
         result = picker.take_token(io, 0, cap=.2)
@@ -204,7 +249,7 @@ class SetupReworkTests(unittest.TestCase):
 
     def test_place_cpu_waits_through_the_held_block_before_the_a_lands(self):
         from test_setup_calls import FOX, modelled_block
-        io = delayed_coin()
+        io = delayed_coin(self.clock)
         medal = picker.p1_medal(modelled_block(1, io.values))
         io.cpu_tile = '85'
         io._take('1')
@@ -217,7 +262,7 @@ class SetupReworkTests(unittest.TestCase):
         from test_setup_calls import FOX, modelled_block
         for fault in ('identity', 'tile', 'p1', 'timeout'):
             with self.subTest(fault=fault):
-                io = delayed_coin(pending='forever')
+                io = delayed_coin(self.clock, pending='forever')
                 medal = picker.p1_medal(modelled_block(1, io.values))
                 io.cpu_tile = '85'
                 io._take('1')
@@ -242,7 +287,7 @@ class SetupReworkTests(unittest.TestCase):
 
     def test_walk_cpu_waits_for_the_carried_identity_after_settling(self):
         from test_setup_calls import FOX, TOPOLOGY
-        io = delayed_coin(action='step')
+        io = delayed_coin(self.clock, action='step')
         io._take('1')
         result, goal = picker.walk_cpu(io, FOX, TOPOLOGY, cap=.2)
         self.assertEqual((goal, result.values['carried.name']), ('85', 'Fox'))
@@ -251,7 +296,7 @@ class SetupReworkTests(unittest.TestCase):
 
     def test_walk_cpu_rejects_a_known_wrong_carried_identity(self):
         from test_setup_calls import FOX, TOPOLOGY
-        io = delayed_coin(action='step')
+        io = delayed_coin(self.clock, action='step')
         io._take('1')
         send = io.send
 
@@ -272,7 +317,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_tr_input_waits_through_a_newer_block_without_the_ack(self):
         for macro, opened in (('tap-a1', True), ('tap-b1', False)):
             with self.subTest(macro=macro):
-                io = menu_replay(delay_ack=True)
+                io = menu_replay(self.clock, delay_ack=True)
                 before = io.read('tr.menu', .2)
                 send = io.send
 
@@ -282,7 +327,7 @@ class SetupReworkTests(unittest.TestCase):
                         io.previous['scene'] = 'notice'
 
                 io.send = press
-                result = routes._tr_input(io, before, macro, time.monotonic() + .2, opened=opened)
+                result = routes._tr_input(io, before, macro, self.clock.monotonic() + .2, opened=opened)
                 self.assertEqual(result.values['ack'], '1')
                 self.assertEqual(result.values['open'], str(int(opened)))
                 self.assertEqual(io.actions, [macro])
@@ -290,7 +335,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_tr_input_rejects_ack_gap_ignored_and_timeout(self):
         for fault in ('gap', 'ignored', 'timeout'):
             with self.subTest(fault=fault):
-                io = menu_replay()
+                io = menu_replay(self.clock)
                 before = io.read('tr.menu', .2)
                 send = io.send
 
@@ -305,13 +350,13 @@ class SetupReworkTests(unittest.TestCase):
 
                 io.send = press
                 with self.assertRaisesRegex(RuntimeError, 'was not handled' if fault == 'timeout' else 'ACK'):
-                    routes._tr_input(io, before, 'tap-a1', time.monotonic() + .02)
+                    routes._tr_input(io, before, 'tap-a1', self.clock.monotonic() + .02)
                 self.assertEqual(io.actions, ['tap-a1'])
 
     def test_set_cpu_starts_from_an_idle_menu_with_no_newer_block(self):
         for initially_open in (False, True):
             with self.subTest(initially_open=initially_open):
-                io = menu_replay(idle=True)
+                io = menu_replay(self.clock, idle=True)
                 io.menu['open'] = str(int(initially_open))
                 tables = copy.deepcopy(routes.tables())
                 tables['roster_catalog'] = [{'kind': 0, 'name': 'Mario'}]
@@ -330,7 +375,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_writer_line_wait_is_not_a_bridge_request(self):
         self.ctx.runner.setup_metrics = {'bridge_requests': 7}
         with patch.object(routes, '_wait_bridge_lines', return_value='[TrainingRooms] settings.json written'):
-            routes._wait_writer(self.ctx, object(), time.monotonic() + 1)
+            routes._wait_writer(self.ctx, object(), self.clock.monotonic() + 1)
         self.assertEqual(self.ctx.runner.setup_metrics['bridge_requests'], 7)
 
     def bridge_spool(self, replies, body=b'settings'):
@@ -422,7 +467,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_tr_settings_file_reports_sent_values_without_readback(self):
         path = self.root / 'settings.json'
         path.write_text('{"menu":{"cpu_level":[1,0]},"version":1}')
-        with patch.object(routes, 'BridgePickerIO', return_value=menu_replay()), \
+        with patch.object(routes, 'BridgePickerIO', return_value=menu_replay(self.clock)), \
              patch.object(routes, '_fetch_settings', return_value=b'{"menu":{}}'), \
              patch.object(routes, '_apply_settings', return_value=(REAL_SET, REAL_RELOAD)), \
              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value):
@@ -455,12 +500,12 @@ class SetupReworkTests(unittest.TestCase):
             cpu.assert_called_once_with(self.ctx, 'Fox', topology=topology, form='default')
 
     def test_reach_training_requests_take_back_on_the_css_suffix(self):
-        io = menu_replay()
+        io = menu_replay(self.clock)
         io.menu['open'] = '0'
         initial = {'stage': 3, 'roster': {0: {'kind': 7}, 1: {'kind': 7}}}
         final = {'stage': 3, 'roster': {0: {'kind': 0}, 1: {'kind': 7}}}
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
-             patch.object(routes, 'native_state', side_effect=[initial, final]), \
+             patch.object(routes, 'native_state', side_effect=logged_native(self.log, [initial, final])), \
              patch.object(routes, 'quit_training', side_effect=lambda *a, **k: io.set_screen('css.training')), \
              patch.object(routes, 'enter_training', side_effect=lambda *a, **k: io.set_screen('training')), \
              patch.object(routes, 'pick_fighters', return_value={}) as fighters, \
@@ -484,7 +529,8 @@ class SetupReworkTests(unittest.TestCase):
         self.assertIsNone(switch_hw.fighters_response(lines[:-1]))
         self.assertIsNone(switch_hw.fighters_response([old, reply, body0, summary]))
         self.assertIsNone(switch_hw.fighters_response(lines + [reply, body0]))
-        with self.assertRaisesRegex(RuntimeError, 'fighters'):
+        with patch.object(switch_hw, 'time', self.clock), \
+             self.assertRaisesRegex(RuntimeError, 'fighters'):
             switch_hw.fighters_now(self.root, cap=0.01)
 
         self.log.write_text(old + '\n')
@@ -505,7 +551,7 @@ class SetupReworkTests(unittest.TestCase):
     def test_set_player_requests_take_back_at_training_character_select(self):
         import test_native_picker as recorded
 
-        io = menu_replay()
+        io = menu_replay(self.clock)
         io.read = lambda provider, cap: recorded.l8w_native(2)
         with patch.object(routes, 'BridgePickerIO', return_value=io), \
              patch.object(routes, 'pick_local_fighter', return_value={'placed': True}) as local, \

@@ -395,6 +395,12 @@ repositories as `{"name": {"tree": "/absolute/path", "commit": "<40 hex>"}}`;
 names in its `repo` field, but may not redefine a built-in provider. A legacy
 entry with the same repository and files (in any order), and matching optional
 extraction settings, is ignored with a warning and uses the built-in instead.
+Remote `go` stages the exact named commits under
+`RUNS/_eden-test/stage/<label>/targets/<commit>` without rewriting rows.
+When that tree exists, G2 reads it instead of the producer path and requires
+HEAD to match the commit and the checkout to be clean, including untracked
+and ignored files. Without a staged tree, G2 keeps using the named producer
+tree and permits its working checkout to be dirty.
 The trees are absolute Git
 directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is
@@ -419,7 +425,9 @@ the exact `path` and a `reason`. Packet-gate errors name their check:
 - **G4:** a path points into another run, or a local file is missing.
 - **G5:** a test row has no checked effect, judged expectation, or visual outcome.
 - **G6:** a need has no matching earlier giver.
-- **G8:** `ctx.play` names no plan segment, or `routes.play` names no library macro.
+- **G8:** a hook the plan reaches plays a name that is no plan segment
+  (`ctx.play`) or no library macro (`routes.play`); a name declared with
+  `among=` is neither; or a written name is outside its own declared set.
 - **G9:** an effect hook's judge cases are malformed, disagree, or are not
   connected to that hook.
 
@@ -430,8 +438,16 @@ relative line-file paths), `expect` (`accept` or `reject`), and optionally
 must hold only case JSON files, with data files in other formats or outside it.
 The judge returns evidence for accept; a reject
 raises or returns a non-evidence value. A test effect hook with no cases warns,
-or refuses when the plan sets `require_cases: true`. Setup rows, effect gates
-and shared `fixtures:` hooks are not asked for cases.
+or refuses when the plan sets `require_cases: true`. Non-effect setup steps
+and effect gates are not asked for cases.
+
+Shared effect hooks can declare a module-level literal `EFFECT_JUDGES` mapping
+each hook name to `{"judge": "function", "cases": "folder"}`. The judge is a
+function in the same module, which the hook calls by name; its cases live under
+`tools/eden-runner/library/cases/<folder>`. The gate runs them automatically;
+packets must not declare `cases` on a shared hook. Effect hooks of every shared
+module, including `fixtures`, are asked in test rows; fixture hooks in setup
+rows are not.
 
 A dependent row whose source row did not pass is not played. Its receipt says
 `NOT RUN (setup): needs "<token>" from row <id>, which did not pass`.
@@ -451,8 +467,60 @@ segment files, acquired or acquirable gate references, and a GIF step's named
 a packet input (including any `.py` or `.json`), and it is not excluded as a GIF.
 The G2 undeclared-read net checks dotted subscript and `.get` keys in local
 hooks when their first segment is known to a provider; `reads_ignore` can list
-an exact `key` with a `reason`. Play calls with computed names or unknown
-callees are warned about, not checked. The built-in providers are `tr.menu`,
+an exact `key` with a `reason`.
+
+G8 follows the plan into its hooks. It starts at the functions the manifest
+names (steps, recovery, failure hooks, hook gates) and follows calls and
+references into the same module and into other modules of the rows folder. A
+module a step names is read as a whole; a module that is only imported is read
+in the functions the plan reaches. The gate resolves a play name when it is:
+
+- written at the call, or a choice between such names (`"a" if fast else "b"`);
+- a module constant, or an entry of a module table written out with constant
+  keys (`TAP["A"]`; `TAP[button]` stands for every entry);
+- a local set once to one of these;
+- a parameter of a function, when every argument resolves: at each call the
+  plan reaches, and in the step's `args` or the default where the manifest
+  names the function;
+- declared at the call: `ctx.play(name, among=("a", "b"))` or
+  `routes.play(ctx, name, among=NAMES)` with `NAMES` a module constant. Every
+  declared name is checked like a written one.
+
+A name written at the play, a choice, a constant or a table entry with a written
+key is what the play takes: it is refused when it is no segment (or no library
+macro), and when it is outside the set the play declares. Names that reach a
+play through a parameter, or through a table read with a computed key, are
+names it may take. They refuse nothing, because a helper can send some of them
+elsewhere: one that plays a plan segment with `ctx.play` and anything else
+with `routes.play` is valid for a name of either kind. Such a play is checked
+when every name fits; otherwise it warns until it declares its own set, and
+then only the declared names are checked.
+
+The gate knows the step context as the first parameter of every function the
+manifest names, as any parameter that is given the context at a call the plan
+reaches (by place or by keyword), as a local set once to it, and by the name
+`ctx` or an attribute `.ctx`. Imports are followed where they stand, at module
+level or inside a function, also `from helper import *`.
+
+Any other play warns: a name built at run time, a parameter of a method, of a
+nested function or of a function handed on as a value, and arguments passed
+with `*`. In code the plan reaches, a `.play(` on anything the gate cannot
+place warns too: a context kept under another attribute, passed with `*` or
+handed on through a callback, and a play on `ctx.runner` directly. A packet
+does not fly with a warning; declare the set, or call `ctx.play` on a context
+the gate can follow. Code reached only through a dynamic import or `getattr`
+is not read; a `ctx.play` in it stops at run time.
+
+At run time `ctx.play` refuses a name the gate did not check for this plan,
+before anything is sent, and a name outside its `among=` set. So a call the
+gate could not follow stops the row; it does not play an unchecked name. A
+manifest `{"play": ...}` step and `routes.play` are not restricted this way;
+library macros are hash-checked by the library index. This is not a check of
+every input a hook can send: a hook that calls `ctx.call("macro.play", ...)`
+or `ctx.press` sends input G8 does not see. The report lists the checked names
+as `plays`.
+
+The built-in providers are `tr.menu`,
 `tr.practice`, `tr.event`, `ssbu.ui` and `bridge`; the last two need
 `target.bridge`. Example reads include `tr.event:fed run.p1`,
 `ssbu.ui:input.ready`, `bridge:fighter status`, `bridge:input lx` and `bridge:ev`.
@@ -468,6 +536,51 @@ diagnostic literals and whole dotted values are not keys. `ssbu.ui` reads its
 block writer and the pause helper when available; values of `screen` and
 `focus.source` are not keys. Without `block`, dotted string literals are keys
 unless a provider sets `whole_literals: false`, as the `bridge` provider does.
+
+Every provider skips test-only code. An item is test-only when its `cfg`
+condition cannot hold outside a test build: `#[cfg(test)]`,
+`#[cfg(all(test, not(target_os = "switch")))]`. Such an item is left out
+wherever it stands (a test module at the end of a file, a test-only `fn` inside
+an `impl`), and the source after it is still read. An item under
+`#[cfg(any(test, target_os = "switch"))]` or `#[cfg(not(test))]` is console code
+and is read; a feature or a target in a condition is not followed. The
+extractor refuses a file with `could not be scanned` when it cannot read a
+condition, when a test-only attribute stands on something that is not an item
+(a field, a statement, a match arm), when a test-only item never closes, or
+when the file or a module is test-only as a whole (`#![cfg(test)]`).
+
+Without `block`, a key the source builds in a format string, such as
+`writeln!(out, "cpu.{entry}.ai_thinks={count}")`, is accepted for the values the
+gate can read from the loop that binds each `{name}`:
+
+- a range, `for lane in 2..=3`;
+- a list written out in the loop header, `for (key, value) in [("step", a),
+  ("score", b)]`: the strings at that place;
+- the index of `.enumerate()`, after an optional `.skip(n)`, over such a list
+  or over an array the function declares with its length, `thinks: [u64;
+  CPU_ENTRIES]`.
+
+A number is one written out or the one integer `const` of that name in the
+file. So with `CPU_ENTRIES = 8` and `.skip(1)` the gate accepts `cpu.1.ai_thinks`
+to `cpu.7.ai_thinks` and refuses `cpu.0`, `cpu.8` and `cpu.04`. Placeholders
+bound by the same loop are taken together, pass by pass: a loop over
+`[("player", "left"), ("partner", "right")]` writing `{group}.{kind}` gives
+`player.left` and `partner.right` only. Placeholders of different loops combine.
+
+A template writes no key when the gate cannot show which values reach the
+write:
+
+- a placeholder bound any other way (a function parameter, a slice, another
+  iterator adapter);
+- a `mut` binding;
+- a loop with a `break`, `continue` or `return` in it;
+- the name used inside its loop before the key is written (a condition on it,
+  arithmetic, a new binding).
+
+The G2 error for a read of that shape names the template, its line and the
+reason. A `{name:…}` format or a positional `{}` in a key is not read as a
+template. The gate does not follow which branch runs otherwise: a key written
+under a condition on something else counts as written.
 The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means

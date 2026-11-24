@@ -1160,7 +1160,14 @@ class StepContext:
     def shot(self, name):
         return self.runner.shot(self.on, name)
 
-    def play(self, segment):
+    def play(self, segment, *, among=None):
+        """Play a plan segment. `among` declares the closed set of names this call may take, for a name computed at
+        run time: the packet gate checks every declared name (G8), and a name outside the set stops before any input."""
+        if among is not None and segment not in among:
+            raise RuntimeError(f'{segment} is not among the names this step declares')
+        if segment not in self.runner.play_names():
+            raise RuntimeError(f'G8: ctx.play("{segment}") is a name the packet gate did not check for this plan; '
+                               'nothing was sent')
         return self.runner.play(self.on, segment)
 
     def gate(self, name):
@@ -1309,6 +1316,7 @@ class Runner:
         self.instances = instances
         self.instances_sha256 = instances_sha256
         self.default = next(iter(instances))
+        self._play_names = None
         self.out = out
         self.out.mkdir(parents=True, exist_ok=True)
         self.stills = still_fresh.Ledger(self.out, frames=(self.plan.get('still_freshness') or {}).get('frames', 180))
@@ -1813,6 +1821,13 @@ class Runner:
         return macro_gate.dispatch(lambda method, params=None: self.call(on, method, params), path,
                                    name=name, requalify=requalify, on_event=on_event, check=self.check_stop,
                                    is_stop=lambda error: isinstance(error, StopRun))
+
+    def play_names(self):
+        """The segment names the packet gate checked for `ctx.play` in this plan's hooks (G8): written at a call
+        the plan reaches, resolved by the gate, or declared with `among=`. A hook plays no other name."""
+        if self._play_names is None:
+            self._play_names = set(packet_gate.play_names(self.plan, self.base))
+        return self._play_names
 
     def play(self, on, name):
         seg = self.plan['segments'][name]

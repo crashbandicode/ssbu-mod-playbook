@@ -37,6 +37,8 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -52,12 +54,18 @@ import closed_loop
 import macro_gate
 import native_picker
 import state_gate
+import switch_hw
 import trace_attempts
 from native_picker_io import BridgePickerIO
 
 HERE = Path(__file__).resolve().parent
 ROUTES = HERE / 'library' / 'routes'
 LIBRARY = HERE / 'library'
+
+EFFECT_JUDGES = {
+    'reach_training': {'judge': 'judge_reach_training', 'cases': 'reach_training'},
+    'expect_fighters': {'judge': 'judge_expect_fighters', 'cases': 'expect_fighters'},
+}
 
 
 # --- small utilities ------------------------------------------------------------------------------------------------
@@ -727,8 +735,12 @@ def macro_file(name):
     return path, entry['sha256'], entry.get('cap', 30)
 
 
-def play(ctx, name, *, requalify=None, until=None):
-    """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it."""
+def play(ctx, name, *, among=None, requalify=None, until=None):
+    """Play one macro by name (same-frame chords live in these files, never as separate presses) and wait for it.
+    `among` declares the closed set of names this call may take, for a name computed at run time: the packet gate
+    checks every declared name (G8), and a name outside the set stops before any input."""
+    if among is not None and name not in among:
+        raise RuntimeError(f'{name} is not among the names this step declares')
     path, sha, cap = macro_file(name)
     def on_event(event):
         event = {**event, 'block': 'play', 'last_bridge_line': _bridge_tail(ctx), 'utc': _stall_utc()}
@@ -863,6 +875,169 @@ def host_network(ctx, interface=None, lan_online=False, ldn_mitm=False):
                                               'lan_online': lan_online, 'ldn_mitm': ldn_mitm, 'readback': readback})
 
 
+def udp_listeners(run=subprocess.run):
+    try:
+        result = run(['ss', '-H', '-lunp'], capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            return None
+        listeners = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            address, separator, port = fields[3].rpartition(':')
+            if not separator or not port.isascii() or not port.isdecimal() or not address:
+                continue
+            address = address[1:-1] if address.startswith('[') and address.endswith(']') else address
+            users = re.findall(r'\("([^"]+)",\s*pid=(\d+)(?:,|\))', line)
+            if not users:
+                listeners.append({'port': int(port), 'address': address, 'comm': None, 'pid': None})
+            else:
+                listeners.extend({'port': int(port), 'address': address, 'comm': comm, 'pid': int(pid)}
+                                 for comm, pid in users)
+        return listeners
+    except Exception:
+        return None
+
+
+def _instance_pids(ctx):
+    return _instance_record_pids(getattr(ctx, 'instance', None))
+
+
+def _instance_record_pids(instance):
+    if not isinstance(instance, dict):
+        return None
+    pids = set()
+    pid = instance.get('pid')
+    if type(pid) is int and pid > 0:
+        pids.add(pid)
+    run = {}
+    try:
+        socket_path = Path(instance['socket'])
+        if socket_path.is_absolute():
+            run = json.loads((socket_path.parent / 'run.json').read_text())
+            if not isinstance(run, dict):
+                run = {}
+    except (KeyError, OSError, ValueError, TypeError):
+        pass
+    unit = run.get('unit') or instance.get('unit')
+    if isinstance(unit, str) and re.fullmatch(r'eden-life-[0-9a-f]{32}-[A-Za-z0-9_-]+\.service', unit):
+        for prop in ('MainPID', 'ControlGroup'):
+            try:
+                result = subprocess.run(['systemctl', '--user', 'show', '-p', prop, '--value', unit],
+                                        capture_output=True, text=True, timeout=5)
+                if result.returncode:
+                    continue
+                value = result.stdout.strip()
+                if prop == 'MainPID' and value.isascii() and value.isdecimal() and int(value) > 0:
+                    pids.add(int(value))
+                elif prop == 'ControlGroup' and value.startswith('/') and '..' not in Path(value).parts \
+                        and unit in Path(value).parts:
+                    directory = Path('/sys/fs/cgroup') / value.lstrip('/')
+                    for path in [directory / 'cgroup.procs', *directory.rglob('cgroup.procs')]:
+                        try:
+                            pids.update(int(item) for item in path.read_text().split()
+                                        if item.isascii() and item.isdecimal() and int(item) > 0)
+                        except OSError:
+                            pass
+            except (OSError, subprocess.SubprocessError):
+                pass
+    owned = run.get('owned_pids')
+    if isinstance(owned, list):
+        try:
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        except OSError:
+            boot = None
+        for entry in owned:
+            if not isinstance(entry, dict) or type(entry.get('pid')) is not int or entry['pid'] <= 0 \
+                    or not isinstance(entry.get('start'), str) or not isinstance(entry.get('boot'), str) \
+                    or boot is None or entry['boot'] != boot:
+                continue
+            try:
+                raw = Path(f"/proc/{entry['pid']}/stat").read_text().rsplit(')', 1)[1].split()
+                if raw[0] != 'Z' and raw[19] == entry['start']:
+                    pids.add(entry['pid'])
+            except (OSError, IndexError):
+                pass
+    return pids or None
+
+
+def _udp_holder(listeners, port):
+    matching = [entry for entry in listeners or [] if entry['port'] == port]
+    return next((entry for entry in matching if entry['comm'] is not None and entry['pid'] is not None),
+                matching[0] if matching else None)
+
+
+def _udp_holder_text(holder):
+    return (f"{holder['comm']} pid {holder['pid']}"
+            if holder['comm'] is not None and holder['pid'] is not None else 'an unknown process')
+
+
+class RoomPortDisproved(RuntimeError):
+    def __init__(self, message, bound_ports, holder):
+        super().__init__(message)
+        self.bound_ports = bound_ports
+        self.holder = holder
+
+
+class RoomPortUnverified(RuntimeError):
+    def __init__(self, reason, port):
+        super().__init__(f'frontend_room: {reason}; room port {port} is not verified')
+        self.reason = reason
+
+
+def _owned_room_port(ctx, port, pid_source=None):
+    listeners = udp_listeners()
+    if listeners is None:
+        raise RoomPortUnverified("cannot read this host's UDP listeners", port)
+    pids = _instance_pids(ctx) if pid_source is None else pid_source()
+    if pids is None:
+        raise RoomPortUnverified('cannot tell which processes belong to this Eden', port)
+    bound_ports = sorted({entry['port'] for entry in listeners if entry['pid'] in pids})
+    if int(port) not in bound_ports:
+        message = (f'frontend_room: the room is connected but this Eden listens on UDP {bound_ports}, '
+                   f'not the requested {port}')
+        foreign = _udp_holder([entry for entry in listeners if entry['pid'] is not None and entry['pid'] not in pids],
+                              int(port))
+        if foreign:
+            message += f'; UDP {port} is held by {_udp_holder_text(foreign)}'
+        holder = {key: foreign[key] for key in ('comm', 'pid')} if foreign else None
+        raise RoomPortDisproved(message, bound_ports, holder)
+    return bound_ports
+
+
+def _write_room_handoff(path, value):
+    fd, name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(json.dumps(value, indent=1) + '\n')
+        os.replace(name, path)
+    finally:
+        try:
+            Path(name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _frontend_host_wait(ctx, match, cap, port, members=None, confirmation=None, room_name=None):
+    try:
+        return _frontend_wait(ctx, match, cap, members, confirmation=confirmation, room_name=room_name)
+    except RuntimeError as error:
+        if 'Eden showed "Creating a room failed. Please retry. Restarting Eden might be necessary."' not in str(error):
+            raise
+        listeners = udp_listeners()
+        requested = _udp_holder(listeners, int(port))
+        default = _udp_holder(listeners, 24872)
+        message = f'frontend_room: Eden could not open the room on UDP port {port}'
+        if requested:
+            message += f"; port {port} is held by {_udp_holder_text(requested)}"
+        elif default:
+            message += f"; port 24872 (Eden's default) is held by {_udp_holder_text(default)}"
+        else:
+            message += f'; no holder of {port} or 24872 found'
+        raise RuntimeError(message) from error
+
+
 def _frontend_title(node):
     title = node.get('title')
     if title in (None, ''):
@@ -984,13 +1159,17 @@ def _frontend_dismiss(ctx, tree, cap, ok_pattern='^OK$'):
     raise RuntimeError(f'frontend_room: message box "{text}" did not close after OK')
 
 
-def _frontend_dialog_value(ctx, tree, anchor_name, field_name):
+def _frontend_dialog_fields(ctx, tree, anchor_name, field_name):
     anchors = [n for n in tree if ctx.runner.ui_matches(n, {'class': 'QLineEdit', 'name': anchor_name})]
     if len(anchors) != 1 or not anchors[0].get('window'):
         return None
-    fields = [n for n in tree if n.get('window') == anchors[0]['window']
-              and ctx.runner.ui_matches(n, {'class': 'QLineEdit', 'name': field_name})]
-    return _frontend_text(fields[0]) if len(fields) == 1 else None
+    return [n for n in tree if n.get('window') == anchors[0]['window']
+            and ctx.runner.ui_matches(n, {'class': 'QLineEdit', 'name': field_name})]
+
+
+def _frontend_dialog_value(ctx, tree, anchor_name, field_name):
+    fields = _frontend_dialog_fields(ctx, tree, anchor_name, field_name)
+    return _frontend_text(fields[0]) if fields is not None and len(fields) == 1 else None
 
 
 def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip='127.0.0.1', members=1, cap=30):
@@ -1008,6 +1187,87 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     requested_name = room_name
     requested_port = port
 
+    def saved_join_port():
+        saved_port = saved.get('port')
+        if saved_port is not None and saved.get('port_verified') is not True:
+            disproved = saved.get('disproved')
+            if saved.get('port_verified') is False and isinstance(disproved, dict) and disproved.get('utc'):
+                raise RuntimeError(f'frontend_room: join refuses the saved room port {saved_port}: '
+                                   f"the host route found this Eden no longer listening on it at {disproved['utc']}")
+            raise RuntimeError(f'frontend_room: join refuses the saved room port {saved_port}: '
+                               'frontend-room.json does not say it was verified')
+        if saved_port is None:
+            return None
+        host = saved.get('instance')
+        host_name = host if isinstance(host, str) and host else '<unknown>'
+        instances = getattr(ctx.runner, 'instances', {})
+        prefix = f'frontend_room: join cannot confirm that {host_name} still hosts the saved room port {saved_port}'
+        suffix = '; pass the port in the row to join without the saved handoff'
+        if not isinstance(host, str) or not host:
+            raise RuntimeError(f'{prefix} (saved handoff has no instance){suffix}')
+        if not isinstance(instances, dict) or host not in instances:
+            raise RuntimeError(f'{prefix} (instance is not in this run){suffix}')
+        if (type(saved_port) is not int and not (isinstance(saved_port, str)
+                and saved_port.isascii() and saved_port.isdecimal())) or not 1 <= int(saved_port) <= 65535:
+            raise RuntimeError(f'{prefix} (saved port is invalid){suffix}')
+        try:
+            _owned_room_port(ctx, saved_port, lambda: _instance_record_pids(instances[host]))
+        except RoomPortUnverified as error:
+            raise RuntimeError(f'{prefix} ({error.reason}){suffix}') from error
+        except RoomPortDisproved as error:
+            message = f'frontend_room: join refuses the saved room port {saved_port}: {host} listens on UDP {error.bound_ports}'
+            if error.holder:
+                message += f'; UDP {saved_port} is held by {_udp_holder_text(error.holder)}'
+            disproof = RoomPortDisproved(message, error.bound_ports, error.holder)
+            try:
+                invalidate_handoff(disproof)
+            except OSError:
+                pass
+            raise disproof from error
+        return saved_port
+
+    def same_saved_port(port):
+        return (saved.get('instance') == ctx.on and saved.get('port') is not None
+                and str(saved['port']) == str(port))
+
+    def saved_history():
+        history = saved.get('history')
+        history = list(history) if isinstance(history, list) else []
+        if isinstance(saved.get('disproved'), dict):
+            history.append(saved['disproved'])
+        return history[-5:]
+
+    def publish_host_port(port, room_name):
+        handoff = {'port': port, 'port_verified': True, 'room_name': room_name, 'instance': ctx.on}
+        history = saved_history() if same_saved_port(port) else []
+        if history:
+            handoff['history'] = history
+        _write_room_handoff(room_file, handoff)
+
+    def invalidate_handoff(error):
+        invalid = {**saved, 'port_verified': False,
+                   'disproved': {'utc': datetime.now(timezone.utc).isoformat(),
+                                 'bound_ports': error.bound_ports, 'holder': error.holder,
+                                 'reason': str(error)}}
+        history = saved_history()
+        if history:
+            invalid['history'] = history
+        _write_room_handoff(room_file, invalid)
+
+    def verify_host_port(port):
+        try:
+            return _owned_room_port(ctx, port)
+        except RoomPortDisproved as error:
+            if same_saved_port(port):
+                try:
+                    invalidate_handoff(error)
+                except OSError as write_error:
+                    message = f'{error}; the saved handoff could not be invalidated: {write_error}'
+                    raise RoomPortDisproved(message, error.bound_ports, error.holder) from error
+            raise
+
+    verified_saved_port = saved_join_port() if role == 'join' and requested_port is None else None
+
     def reuse(connected, dismissed):
         widget, title, count = connected
         if expected_name is None:
@@ -1019,12 +1279,26 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
                          if head is not None and head.find(' - ') != head.rfind(' - ') else '')
             raise RuntimeError(f'frontend_room: this Eden is connected to another room: expected "{expected_name}", '
                                f'saw "{title}"{ambiguous}')
-        return _save(ctx, 'routes-frontend-room', {
-            'role': role, 'port': requested_port if requested_port is not None else saved.get('port'),
+        saved_port = verified_saved_port if role == 'join' and requested_port is None else saved.get('port')
+        if role == 'host' and requested_port is not None and saved_port is not None \
+                and str(requested_port) != str(saved_port):
+            raise RuntimeError(f"frontend_room: this Eden's room was saved with port {saved_port}, "
+                               f'not the requested {requested_port}')
+        port = requested_port if requested_port is not None else saved_port
+        bound_ports, verified = None, None
+        if role == 'host' and port is not None:
+            bound_ports = verify_host_port(port)
+            verified = True
+            publish_host_port(port, expected_name)
+        result = {
+            'role': role, 'port': port,
             'nickname': nickname, 'room_name': expected_name, 'ip': ip,
             'evidence': {'frontend_connected': widget}, 'window_title': title, 'member_count': count,
             'already_connected': True, 'reused_dialog': False, 'dismissed': dismissed, 'game_running': game_running,
-            'confirmed_running_game': None, 'room_matched': True})
+            'confirmed_running_game': None, 'room_matched': True, 'port_verified': verified}
+        if role == 'host':
+            result.update(bound_ports=bound_ports, port_marked_edited=None)
+        return _save(ctx, 'routes-frontend-room', result)
 
     tree = ctx.call('ui.tree', {}) or []
     confirmation = {'game_running': game_running, 'text': None}
@@ -1035,21 +1309,50 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     connected = _frontend_connected(ctx, tree, members)
     if connected and not warning:
         return reuse(connected, None)
+    if role == 'host' and requested_port is not None and not warning:
+        try:
+            numeric_port = int(requested_port)
+        except (TypeError, ValueError):
+            numeric_port = None
+        holder = _udp_holder(udp_listeners(), numeric_port)
+        if holder:
+            raise RuntimeError(f'frontend_room: UDP port {requested_port} is already in use on this host by '
+                               f'{_udp_holder_text(holder)}; pass another port or omit it')
     if warning:
         anchor = 'username' if role == 'host' else 'nickname'
         actual_port = _frontend_dialog_value(ctx, tree, anchor, 'port')
-        port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
+        try:
+            port = int(actual_port) if actual_port and actual_port.isascii() and actual_port.isdecimal() else None
+        except ValueError:
+            if role != 'join' or requested_port is not None or verified_saved_port is None:
+                raise
+            port = None
+        if role == 'join' and requested_port is None and verified_saved_port is not None and port is None:
+            fields = _frontend_dialog_fields(ctx, tree, anchor, 'port')
+            if fields is None:
+                read = 'no port field or ambiguous dialog'
+            elif not fields:
+                read = 'no port field'
+            elif len(fields) > 1:
+                read = 'ambiguous port fields'
+            else:
+                read = repr(actual_port)
+            raise RuntimeError(f"frontend_room: the open Direct Connect dialog's port cannot be read ({read}); "
+                               f'join will not confirm it against the saved room port {verified_saved_port}')
         dialog_name = _frontend_dialog_value(ctx, tree, anchor, 'room_name') if role == 'host' else None
-        comparable_port = (int(requested_port) if isinstance(requested_port, str) and requested_port.isascii()
-                           and requested_port.isdecimal() else requested_port)
+        comparison_port = requested_port if requested_port is not None else verified_saved_port
+        comparable_port = (int(comparison_port) if isinstance(comparison_port, str) and comparison_port.isascii()
+                           and comparison_port.isdecimal() else comparison_port)
         if ((role == 'host' and requested_name is not None and dialog_name is not None
              and requested_name != dialog_name)
-                or (requested_port is not None and port is not None and comparable_port != port)):
+                or (comparison_port is not None and port is not None and comparable_port != port)):
             if role == 'join':
                 raise RuntimeError(f'frontend_room: the open Direct Connect dialog is on port {port}, '
-                                   f'not the requested port {requested_port}')
+                                   f'not the requested port {comparison_port}')
             raise RuntimeError(f'frontend_room: the open Create Room dialog is for room "{dialog_name}" on port '
                                f'{port}, not the requested room "{requested_name}" on port {requested_port}')
+        if role == 'host' and port is None and requested_port is not None:
+            port = requested_port
         nickname = _frontend_dialog_value(ctx, tree, anchor, anchor) or nickname
         _frontend_name('nickname', nickname)
         if role == 'host':
@@ -1067,7 +1370,7 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         dismissed = None
     else:
         if port is None:
-            port = free_udp_port() if role == 'host' else saved.get('port')
+            port = free_udp_port() if role == 'host' else verified_saved_port
         if port is None:
             raise RuntimeError('frontend_room: join needs a port or the frontend-room.json of this run')
         if role == 'host' and room_name is None:
@@ -1082,8 +1385,8 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
     connected = _frontend_connected(ctx, tree, members)
     if connected and not warning:
         return reuse(connected, dismissed)
-
     evidence = {}
+    port_marked_edited = None
     dialog = {'class': 'QLineEdit', 'name': 'username' if role == 'host' else 'nickname'}
     reused_dialog = any(ctx.runner.ui_matches(n, dialog) for n in tree)
     if not warning and role == 'host':
@@ -1095,11 +1398,21 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
         for name, value in (('username', nickname), ('room_name', room_name), ('port', str(port))):
             ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
                                    'property': 'text', 'value': value})
+        try:
+            ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': 'port'},
+                                   'property': 'modified', 'value': True})
+            port_marked_edited = True
+        except Exception as error:
+            ctx.check_stop()
+            if str(port) != '24872':
+                raise RuntimeError(f'frontend_room: this Eden refused to mark the port field as edited ({error}); '
+                                   f'it would host on its default port 24872, not {port}') from error
+            port_marked_edited = False
         ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QComboBox', 'name': 'host_type'},
                                'property': 'currentIndex', 'value': 1})
         ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'host'}})
-        evidence['frontend_leave'] = _frontend_wait(
-            ctx, {'class': 'QPushButton', 'name': 'disconnect', 'text': '^Leave Room$'}, cap,
+        evidence['frontend_leave'] = _frontend_host_wait(
+            ctx, {'class': 'QPushButton', 'name': 'disconnect', 'text': '^Leave Room$'}, cap, port,
             confirmation=confirmation)
     elif not warning:
         action = {'class': 'QAction', 'name': 'action_Connect_To_Room'}
@@ -1111,18 +1424,27 @@ def frontend_room(ctx, role='host', port=None, nickname=None, room_name=None, ip
             ctx.runner.ui(ctx.on, {'ui': 'set', 'target': {'class': 'QLineEdit', 'name': name},
                                    'property': 'text', 'value': value})
         ctx.runner.ui(ctx.on, {'ui': 'click', 'target': {'class': 'QPushButton', 'name': 'connect'}})
-    evidence['frontend_connected'], title, count = _frontend_wait(
-        ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, members,
+    wait = _frontend_host_wait if role == 'host' and port is not None else _frontend_wait
+    wait_args = (port, members) if wait is _frontend_host_wait else (members,)
+    evidence['frontend_connected'], title, count = wait(
+        ctx, {'class': 'ClientRoomWindow', 'title': r'\(\d+/\d+ members\).*connected'}, cap, *wait_args,
         confirmation=confirmation, room_name=room_name)
-    if role == 'host' and port is not None and room_name is not None:
-        room_file.write_text(json.dumps({'port': port, 'room_name': room_name, 'instance': ctx.on}, indent=1) + '\n')
-    return _save(ctx, 'routes-frontend-room', {'role': role, 'port': port, 'nickname': nickname,
-                                               'room_name': room_name, 'ip': ip, 'evidence': evidence,
-                                               'window_title': title, 'member_count': count,
-                                               'already_connected': False, 'reused_dialog': reused_dialog,
-                                               'dismissed': dismissed, 'game_running': game_running,
-                                               'confirmed_running_game': confirmation['text'],
-                                               'room_matched': True if room_name is not None else None})
+    bound_ports, port_verified = None, None
+    if role == 'host':
+        if port is None:
+            raise RuntimeError("frontend_room: cannot determine this Eden's room port; room port is not verified")
+        bound_ports = verify_host_port(port)
+        port_verified = True
+        if room_name is not None:
+            publish_host_port(port, room_name)
+    result = {'role': role, 'port': port, 'nickname': nickname, 'room_name': room_name, 'ip': ip,
+              'evidence': evidence, 'window_title': title, 'member_count': count,
+              'already_connected': False, 'reused_dialog': reused_dialog, 'dismissed': dismissed,
+              'game_running': game_running, 'confirmed_running_game': confirmation['text'],
+              'room_matched': True if room_name is not None else None}
+    if role == 'host':
+        result.update(bound_ports=bound_ports, port_verified=port_verified, port_marked_edited=port_marked_edited)
+    return _save(ctx, 'routes-frontend-room', result)
 
 
 def _wireless_read(ctx, io, provider, cap, screens, *, on_sample=None):
@@ -3227,17 +3549,77 @@ def place_cpu(ctx, fighter, must_move=False):
     })
 
 
-def expect_fighters(ctx, p1=None, cpu=None):
-    """Confirm the requested Training fighters against roster and live bodies."""
-    started = time.monotonic()
-    io = BridgePickerIO(ctx)
-    ui = native_picker.wait_sample(io, native_picker.UI, started + 6)
-    if not _fields_match(ui, TRAINING_SCREEN):
-        raise RuntimeError('expect_fighters needs Training with native input')
-    state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
-    bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent)
-    roster = state.get('roster', {})
-    for seat, name in ((0, p1), (1, cpu)):
+def _effect_boot(lines, boot):
+    if not lines or '[Bridge] hello ' not in lines[0]:
+        raise RuntimeError('the bridge greeting is missing from the judged lines')
+    match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', lines[0])
+    if match is None:
+        raise RuntimeError('the bridge greeting has no boot id')
+    current = match[1]
+    if boot is not None and current != boot:
+        raise RuntimeError(f'the bridge greeting is from boot {current}, not this boot {boot}')
+    for line in lines[1:]:
+        if state_gate.BOUNDARY.search(line):
+            raise RuntimeError('the bridge connection changed during the read')
+        if (other := re.search(r'\bboot=(0x[0-9a-f]{16})\b', line)) and other[1] != current:
+            raise RuntimeError(f'the bridge record is from boot {other[1]}, not this boot {current}')
+    return current
+
+
+def _effect_partial(lines, reply_pattern, key):
+    reply = None
+    start = 0
+    for index, line in enumerate(lines):
+        if match := reply_pattern.search(line):
+            reply, start = int(match['frame']), index + 1
+    if reply is None:
+        return {}
+    fresh = [line for line in lines[start:]
+             if (tail := switch_hw.SUFFIX.search(line)) and int(tail[1]) >= reply]
+    return switch_hw.parse_bridge_state(fresh)[key]
+
+
+def _effect_roster(lines, names, *, require_both=False):
+    roster = switch_hw.roster_response(lines, entries=(0, 1))
+    if roster is None:
+        pattern = re.compile(r'\[Bridge\] req roster result=ok(?: entries=0x[0-9a-f]+)? '
+                             r'frame=(?P<frame>\d+) wall=')
+        partial = _effect_partial(lines, pattern, 'roster')
+        for seat, name in names:
+            if name is not None and seat not in partial:
+                raise RuntimeError(f'entry {seat} wanted {name}: no roster entry')
+        if require_both and 1 not in partial:
+            raise RuntimeError('entry 1: no roster entry')
+        raise RuntimeError('bridge roster: no complete answer')
+    for seat, name in names:
+        if name is not None and seat not in roster:
+            raise RuntimeError(f'entry {seat} wanted {name}: no roster entry')
+    if require_both and 1 not in roster:
+        raise RuntimeError('entry 1: no roster entry')
+    return roster
+
+
+def _effect_bodies(lines, names):
+    bodies = switch_hw.fighters_response(lines)
+    if bodies is None:
+        pattern = re.compile(r'\[Bridge\] req fighters result=ok frame=(?P<frame>\d+)(?: |$)')
+        partial = _effect_partial(lines, pattern, 'fighters')
+        for seat, name in names:
+            if name is not None and seat not in partial:
+                raise RuntimeError(f'entry {seat} wanted {name}: no live body')
+        raise RuntimeError('bridge fighters: no complete answer')
+    for seat, name in names:
+        if name is not None and seat not in bodies:
+            raise RuntimeError(f'entry {seat} wanted {name}: no live body')
+    return bodies
+
+
+def judge_expect_fighters(lines, p1=None, cpu=None, boot=None):
+    _effect_boot(lines, boot)
+    names = ((0, p1), (1, cpu))
+    roster = _effect_roster(lines, names)
+    bodies = _effect_bodies(lines, names)
+    for seat, name in names:
         if name is not None:
             wanted = fighter_entry(name)['kind']
             roster_kind = roster.get(seat, {}).get('kind')
@@ -3245,10 +3627,100 @@ def expect_fighters(ctx, p1=None, cpu=None):
             if roster_kind != wanted or body_kind != wanted:
                 raise RuntimeError(f'entry {seat} wanted {name} kind {wanted}: '
                                    f'roster kind {roster_kind}, body kind {body_kind}')
+    return {'roster': {seat: value.get('kind') for seat, value in roster.items()},
+            'bodies': {seat: value.get('kind') for seat, value in bodies.items()}}
+
+
+def judge_reach_training(lines, p1, cpu=None, stage='Final Destination', form='normal', boot=None):
+    _effect_boot(lines, boot)
+    stage_id = switch_hw.parse_bridge_state(lines).get('stage')
+    if stage_id is None:
+        raise RuntimeError('no stage observation in this bridge connection')
+    roster = _effect_roster(lines, ((0, p1), (1, cpu)), require_both=True)
+    wanted_stage = stage_entry(stage)['id']
+    wanted_p1 = fighter_entry(p1)['kind']
+    wanted_cpu = fighter_entry(cpu)['kind'] if cpu is not None else None
+    if (stage_id != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
+            or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
+        raise RuntimeError(f'live Training state does not match the requested setup: '
+                           f"{{'stage': {stage_id!r}, 'roster': {roster!r}}}")
+    return {'stage_id': stage_id, 'roster': roster}
+
+
+def _effect_capture_start(ctx):
+    log = instance_path(ctx, 'bridge_log')
+    with log.open('rb') as stream:
+        text = stream.read()
+        stat = os.fstat(stream.fileno())
+    connection = _bridge_on_latest_connection(text.decode(errors='replace'), require_install=False)
+    if connection is None:
+        raise RuntimeError('the bridge has no current greeting for the read')
+    hello = connection[0]
+    boot = _effect_boot([hello], None)
+    return log, len(text), hello, boot, (stat.st_dev, stat.st_ino), connection[2]
+
+
+def _effect_capture_stages(capture):
+    log, start, hello, boot, identity, greeting_index = capture
+    with log.open('rb') as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino) != identity or stat.st_size < start:
+            raise RuntimeError('the bridge log rotated or truncated during the read')
+        text = stream.read(start).decode(errors='replace')
+    connection = _bridge_on_latest_connection(text, require_install=False)
+    if connection is None or connection[0] != hello or connection[2] != greeting_index:
+        raise RuntimeError('the bridge connection changed during the read')
+    return [line for line in text.splitlines()[greeting_index + 1:] if switch_hw.STAGE.search(line)]
+
+
+def _effect_capture_lines(capture):
+    log, start, hello, boot, identity = capture[:5]
+    with log.open('rb') as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino) != identity or stat.st_size < start:
+            raise RuntimeError('the bridge log rotated or truncated during the read')
+        stream.seek(start)
+        lines = stream.read().decode(errors='replace').splitlines()
+    return [hello, *lines]
+
+
+def _effect_compare_live(lines, boot, live, hook, judged=None):
+    _effect_boot(lines, boot)
+    roster = switch_hw.roster_response(lines, entries=(0, 1))
+    if hook == 'expect_fighters':
+        bodies = switch_hw.fighters_response(lines)
+        judged = {
+            'roster': None if roster is None else {seat: value.get('kind') for seat, value in roster.items()},
+            'bodies': None if bodies is None else {seat: value.get('kind') for seat, value in bodies.items()},
+        }
+    elif judged is None:
+        judged = {'stage_id': switch_hw.parse_bridge_state(lines).get('stage'), 'roster': roster}
+    if judged != live:
+        raise RuntimeError(f'{hook}: the judged lines and the live read disagree: judged={judged!r} live={live!r}')
+
+
+def expect_fighters(ctx, p1=None, cpu=None):
+    """Confirm the requested Training fighters against roster and live bodies."""
+    started = time.monotonic()
+    io = BridgePickerIO(ctx)
+    ui = native_picker.wait_sample(io, native_picker.UI, started + 6)
+    if not _fields_match(ui, TRAINING_SCREEN):
+        raise RuntimeError('expect_fighters needs Training with native input')
+    capture = _effect_capture_start(ctx)
+    state = native_state(ctx, fresh=('roster',), roster_entries=(0, 1))
+    bodies = _switch_hw().fighters_now(instance_path(ctx, 'bridge_log').parent)
+    roster = state.get('roster', {})
+    lines = _effect_capture_lines(capture)
+    live = {'roster': {seat: value.get('kind') for seat, value in roster.items()},
+            'bodies': {seat: value.get('kind') for seat, value in bodies.items()}}
+    _effect_compare_live(lines, capture[3], live, 'expect_fighters')
+    verified = judge_expect_fighters(lines, p1=p1, cpu=cpu, boot=capture[3])
+    if verified != live:
+        raise RuntimeError(f'expect_fighters: the judged lines and the live read disagree: '
+                           f'judged={verified!r} live={live!r}')
     return _save(ctx, 'routes-expect-fighters', {
         'block': 'expect_fighters', 'args': {'p1': p1, 'cpu': cpu},
-        'verified': {'roster': {seat: value.get('kind') for seat, value in roster.items()},
-                     'bodies': {seat: value.get('kind') for seat, value in bodies.items()}},
+        'verified': verified,
         'inputs': 0, 'ms': {'total': round((time.monotonic() - started) * 1000)},
     })
 
@@ -3830,7 +4302,7 @@ def _bridge_on_owned_listener(ctx, port):
     return listener
 
 
-def _bridge_on_latest_connection(text):
+def _bridge_on_latest_connection(text, *, require_install=True):
     hello = install = None
     start = None
     for index, line in enumerate(text.splitlines()):
@@ -3840,7 +4312,7 @@ def _bridge_on_latest_connection(text):
             start = index if hello is not None else None
         elif hello is not None and install is None and 'plugin=ssbu-hw-bridge/' in line and 'result=' in line:
             install = line
-    return (hello, install, start) if hello is not None and install is not None else None
+    return (hello, install, start) if hello is not None and (install is not None or not require_install) else None
 
 
 def _bridge_on_connection_changed(line):
@@ -6059,6 +6531,8 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                     if ui.values.get('input.owner') != 'native':
                         stop('locate', 'reach_training needs native Training input ownership')
                     try:
+                        capture = _effect_capture_start(ctx)
+                        stage_lines = _effect_capture_stages(capture)
                         final = native_state(ctx, fresh=('roster',), cap=max(.01, until - time.monotonic()),
                                              roster_entries=(0, 1))
                     except RuntimeError as error:
@@ -6098,10 +6572,21 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
                     stop('locate', str(error))
                 if not _fields_match(final_ui, TRAINING_SCREEN):
                     stop('locate', 'final Training screen is not owned by native input')
-                roster = final.get('roster', {})
-                if (final.get('stage') != wanted_stage or roster.get(0, {}).get('kind') != wanted_p1
-                        or 1 not in roster or (wanted_cpu is not None and roster[1].get('kind') != wanted_cpu)):
-                    stop('locate', f'live Training state does not match the requested setup: {final}')
+                lines = _effect_capture_lines(capture)
+                lines[1:1] = stage_lines
+                live = {'stage_id': final.get('stage'), 'roster': final.get('roster', {})}
+                try:
+                    verified = judge_reach_training(lines, p1=p1, cpu=cpu, stage=stage, form=form,
+                                                    boot=capture[3])
+                except RuntimeError as error:
+                    if str(error).startswith('live Training state does not match the requested setup:'):
+                        _effect_compare_live(lines, capture[3], live, 'reach_training')
+                        stop('locate', f'live Training state does not match the requested setup: {final}')
+                    stop('locate', str(error))
+                _effect_compare_live(lines, capture[3], live, 'reach_training', judged=verified)
+                if verified != live:
+                    raise RuntimeError(f'reach_training: the judged lines and the live read disagree: '
+                                       f'judged={verified!r} live={live!r}')
                 break
             next_phase = name
             try:
@@ -6139,7 +6624,7 @@ def reach_training(ctx, p1, cpu=None, stage='Final Destination', form='normal', 
     combined_stalls = all_stalls()
     return _save(ctx, 'routes-reach-training', {
         'block': 'reach_training', 'args': {'p1': p1, 'cpu': cpu, 'stage': stage, 'form': form},
-        'verified': {'stage_id': wanted_stage, 'roster': final['roster']}, **metric_fields(),
+        'verified': verified, **metric_fields(),
         'phases': receipts, 'ms': {**timings, 'total': round((time.monotonic() - started) * 1000)}, 'skipped': skipped,
         'starts': starts, 'recovered': recovered, 'retries': phase_retries(),
         'stalls': combined_stalls, 'result': _stall_result(True, combined_stalls),
