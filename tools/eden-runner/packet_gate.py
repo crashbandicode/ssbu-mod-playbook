@@ -530,12 +530,39 @@ def _hooks(plan, base, errors):
     return modules
 
 
-def _reads(plan, repos, errors):
+def _providers(plan, errors, warnings):
     declared = plan['target'].get('providers', {})
     if not isinstance(declared, dict):
         errors.append('G2 target: providers must be an object')
         declared = {}
-    providers = {**PROVIDERS, **declared}
+    providers = dict(PROVIDERS)
+    for name, source in declared.items():
+        if name not in PROVIDERS:
+            providers[name] = source
+            continue
+        builtin = PROVIDERS[name]
+        differences = []
+        if not isinstance(source, dict) or source.get('repo') != builtin['repo']:
+            differences.append('repo')
+        files = source.get('files') if isinstance(source, dict) else None
+        if (not isinstance(files, list) or not all(isinstance(path, str) for path in files)
+                or sorted(files) != sorted(builtin['files'])):
+            differences.append('files')
+        for field in ('block', 'helpers', 'whole_literals'):
+            if isinstance(source, dict) and field in source:
+                expected = builtin.get(field)
+                if type(source[field]) is not type(expected) or source[field] != expected:
+                    differences.append(field)
+        if differences:
+            errors.append(f'G2 target: providers.{name} redefines a built-in provider '
+                          f'({", ".join(differences)}); remove the entry or give the provider another name')
+        else:
+            warnings.append(f'G2 target: providers.{name} repeats a built-in provider; '
+                            'the built-in extraction is used (remove the entry)')
+    return providers
+
+
+def _reads(plan, repos, errors, providers):
     extra = plan['target'].get('repos', {})
     repo_names = {'plugin', 'bridge'} | ({name for name in extra if isinstance(name, str)}
                                          if isinstance(extra, dict) else set())
@@ -679,7 +706,7 @@ def _paths(plan, base, raw, modules, errors):
                 check_path(node.value, module, False)
 
 
-def _hook_checks(plan, base, modules, repos, errors, warnings):
+def _hook_checks(plan, base, modules, repos, errors, warnings, providers):
     import routes
 
     segment_names = set(plan.get('segments', {}))
@@ -696,8 +723,6 @@ def _hook_checks(plan, base, modules, repos, errors, warnings):
             continue
     if not sources:
         return
-    declared = plan['target'].get('providers', {})
-    providers = {**PROVIDERS, **(declared if isinstance(declared, dict) else {})}
     written = set()
     for source in providers.values():
         if not isinstance(source, dict) or not isinstance(source.get('repo'), str) or source['repo'] not in repos:
@@ -997,9 +1022,10 @@ def check(plan, base, raw):
     repos, settings = _target(plan, base, errors)
     modules = _hooks(plan, base, errors)
     if isinstance(plan['target'], dict):
-        report['emitted'] = _reads(plan, repos, errors)
+        providers = _providers(plan, errors, report['warnings'])
+        report['emitted'] = _reads(plan, repos, errors, providers)
         _bindings(plan, base, settings, errors, report['warnings'])
-        _hook_checks(plan, base, modules, repos, errors, report['warnings'])
+        _hook_checks(plan, base, modules, repos, errors, report['warnings'], providers)
     _paths(plan, base, raw, modules, errors)
     report['rows'] = _needs(plan, errors)
     _effects(plan, errors)

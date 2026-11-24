@@ -392,7 +392,10 @@ The rules:
 `bridge.commit`, `settings`, and `providers`. `target.repos` can name additional
 repositories as `{"name": {"tree": "/absolute/path", "commit": "<40 hex>"}}`;
 `plugin` and `bridge` are reserved names. `target.providers` may use these
-names in its `repo` field. The trees are absolute Git
+names in its `repo` field, but may not redefine a built-in provider. A legacy
+entry with the same repository and files (in any order), and matching optional
+extraction settings, is ignored with a warning and uses the built-in instead.
+The trees are absolute Git
 directories and the commits are full commit IDs. Provider source files are read
 from the named commit, never from the working tree; the settings fixture is
 read from the rows folder.
