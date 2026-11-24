@@ -38,6 +38,12 @@ class StillFreshTests(unittest.TestCase):
         path.write_text('[Bridge] boot=0xabc\n[Bridge] no frame here\n')
         self.assertIsNone(self.fresh.game_frame(path))
 
+    def test_game_frame_boot_is_limited_to_the_tail(self):
+        path = self.root / 'bridge.log'
+        path.write_bytes(b'[Bridge] boot=0xabc\n' + b'x' * (65 * 1024) +
+                         b'\n[Bridge] state screen=sss frame=42 wall=99\n')
+        self.assertEqual(self.fresh.game_frame(path), {'boot': None, 'frame': 42, 'wall': 99})
+
     def test_a_changed_picture_is_fresh(self):
         first = self.record(self.frame(1000))
         second = self.record(self.frame(1400), data=b'changed picture')
@@ -88,6 +94,13 @@ class StillFreshTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'game frame went backwards')
         self.assertFalse(self.fresh.refused(result))
 
+    def test_a_backwards_frame_is_unverified_even_when_the_image_changed(self):
+        self.record(self.frame(1000))
+        result = self.record(self.frame(999), data=b'changed picture')
+        self.assertEqual(result['status'], 'unverified')
+        self.assertEqual(result['reason'], 'game frame went backwards')
+        self.assertFalse(self.fresh.refused(result))
+
     def test_every_still_is_appended_to_stills_jsonl(self):
         reply = {'backend': 'window', 'uniform': False, 'warning': 'sample warning'}
         one = self.record(self.frame(1000), reply=reply)
@@ -112,6 +125,20 @@ class StillFreshTests(unittest.TestCase):
         refused_a = self.record(self.frame(1200), on='a')
         self.assertEqual((first_a['status'], first_b['status'], refused_a['status']), ('fresh', 'fresh', 'refused'))
         self.assertEqual(refused_a['first_identical'], first_a['file'])
+
+    def test_an_unknown_boot_does_not_authorise_a_refusal(self):
+        first = self.record(self.frame(1000, boot=None))
+        second = self.record(self.frame(1300, boot=None))
+        self.assertEqual((first['status'], second['status']), ('unverified', 'unverified'))
+        self.assertEqual(second['reason'], 'no game boot source')
+        self.assertFalse(self.fresh.refused(second))
+
+    def test_a_known_frame_after_missing_provenance_starts_a_new_witness(self):
+        self.record(None)
+        first_known = self.record(self.frame(1000))
+        later = self.record(self.frame(1180))
+        self.assertEqual((first_known['status'], later['status']), ('unverified', 'refused'))
+        self.assertEqual(later['first_identical'], first_known['file'])
 
 
 if __name__ == '__main__':

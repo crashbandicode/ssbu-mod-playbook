@@ -1176,6 +1176,64 @@ class RunnerTests(unittest.TestCase):
         path = run.check_gate_spec('a', self.plan['gates']['red'], 'red')
         self.assertEqual(run.still_records[path]['status'], 'fresh')
 
+    def test_a_change_gate_does_not_pass_on_a_refused_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1200])
+        eden.colour = RED
+        run = self.make(eden)
+        before = self.dir / 'before.png'
+        Image.new('RGB', (64, 36), BLUE).save(before)
+        run.marks = {('a', 'before'): before}
+        run.shot('a', 'anchor')
+        gate = {'kind': 'change', 'mark': 'before', 'roi': [0, 0, 64, 36], 'stable': False,
+                'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence'):
+            run.check_gate_spec('a', gate, 'change')
+
+    def test_acquire_never_writes_a_reference_from_a_refused_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1200])
+        eden.colour = RED
+        run = self.make(eden)
+        run.acquired = []
+        run.shot('a', 'anchor')
+        gate = {'kind': 'image', 'reference': 'refs/acquired.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': .15, 'interval': .03}
+        with self.assertRaisesRegex(RuntimeError, 'still refused as evidence'):
+            run.check_gate_spec('a', gate, 'acquired')
+        self.assertFalse((self.dir / gate['reference']).exists())
+        self.assertEqual(run.acquired, [])
+
+    def test_acquire_writes_a_reference_from_a_fresh_still(self):
+        bridge = self.dir / 'bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+
+        class NewBootEden(FreshEden):
+            def __init__(self):
+                super().__init__(bridge, [1000, 1200])
+                self.colour = RED
+                self.shots = 0
+
+            def request(self, method, params):
+                result = super().request(method, params)
+                if method == 'ui.screenshot':
+                    self.shots += 1
+                    if self.shots >= 2:
+                        with bridge.open('a') as stream:
+                            stream.write('[Bridge] boot=0xdef frame=1200 wall=20400\n')
+                return result
+
+        run = self.make(NewBootEden())
+        run.acquired = []
+        gate = {'kind': 'image', 'reference': 'refs/acquired.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': 1, 'interval': .03}
+        result = run.check_gate_spec('a', gate, 'acquired')
+        self.assertEqual(result, str(self.dir / gate['reference']))
+        self.assertEqual(run.still_records[run.acquired[0]['shot']]['status'], 'fresh')
+        self.assertTrue(Path(result).is_file())
+
     def test_shot_without_a_bridge_log_behaves_as_before(self):
         eden = FreshEden(None, [1000])
         eden.colour = RED

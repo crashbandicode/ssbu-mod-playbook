@@ -115,6 +115,7 @@ source timer, but cannot authorise input; at the deadline one grace read may wit
 Training settle reads also have a 2-second floor and may finish up to 2 seconds after their settle cap.
 The Create form is refused by default until the bridge publishes active `ldn.create`;
 `unpublished_create='allow'` is an explicit, recorded exception.
+
 A step's sends are counted for the whole route run, so a bounce cannot restart its budget.
 Training phases re-locate after each phase; a failed phase retries only after two consecutive fresh reads of a
 recognised native-owned screen, with at most three starts per phase per call. Continuity errors and unreadable
@@ -148,6 +149,14 @@ skip remains a separate single-shot recovery within the navigation deadline.
 `pick_stage` and `pick_fighters` step the tile cursor ([TILE-CURSOR](TILE-CURSOR.md)) with the `tile-*` macros,
 never a plain D-pad. Each step must log `step … to=N`, then `settled … at=N`. Row widths come from the log, not
 from a constant.
+
+### Fresh stills
+
+`stills.jsonl` records each capture's file, hash, size, Eden reply and same-boot bridge frame and wall time.
+An unchanged image across 180 game frames (3 seconds) is refused; set `"still_freshness": {"frames": N}`
+in the plan to change that threshold. Image gates cannot pass on a refused still. A genuinely static screen is
+refused too: use a state source instead. Without a bridge log or boot identity, stills are `unverified`.
+This check follows seven identical stills over 24 seconds in `rc15-a1-trace-2ddba1f-xps-2` (2026-11-24).
 
 ### The CPU's coin: not proven
 
