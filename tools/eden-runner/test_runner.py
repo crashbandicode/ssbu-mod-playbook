@@ -1857,7 +1857,7 @@ class RunnerTests(unittest.TestCase):
 
                 class Receipts(list):
                     def append(self, value):
-                        if phase == 'receipt':
+                        if phase == 'receipt' and not entered.is_set():
                             block()
                         super().append(value)
 
@@ -1870,6 +1870,13 @@ class RunnerTests(unittest.TestCase):
                         self.assertTrue(entered.is_set())
                         report = runner.dry_run(self.manifest)
                         self.assertIn(name, report['references_to_acquire'])
+                        probe = subprocess.run(
+                            [sys.executable, '-B', '-c',
+                             'import json,sys; import runner; '
+                             'print(json.dumps(runner.dry_run(__import__("pathlib").Path(sys.argv[1]))'
+                             '["references_to_acquire"]))', str(self.manifest)],
+                            cwd=Path(runner.__file__).parent, text=True, capture_output=True, timeout=2, check=True)
+                        self.assertIn(name, json.loads(probe.stdout))
                         release.set()
                         workers[0].join(1)
                         self.assertFalse(workers[0].is_alive())
@@ -1964,6 +1971,41 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(run.acquired, [])
         self.assertEqual(run.plan['gates']['error'], gate)
 
+    def test_failed_acquisition_rollback_keeps_intent_and_backups(self):
+        bridge = self.dir / 'rollback-error-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        reference = self.dir / 'refs' / 'rollback-error.png'
+        Image.new('RGB', (64, 36), BLUE).save(reference)
+        old = reference.read_bytes()
+        gate = {'kind': 'image', 'reference': 'refs/rollback-error.png', 'acquire': True,
+                'sha256': sha(reference), 'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.plan['gates']['rollback-error'] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(eden)
+        run.acquired = []
+        replace = Path.replace
+        replaced = []
+
+        def replacement(path, target):
+            if Path(target) == reference:
+                if replaced:
+                    raise OSError('reference restore failed')
+                replaced.append(True)
+            if Path(target) == self.manifest:
+                raise OSError('manifest replacement failed')
+            return replace(path, target)
+
+        with mock.patch.object(Path, 'replace', new=replacement):
+            with self.assertRaisesRegex(RuntimeError, 'acquisition rollback failed; the reference remains unapproved'):
+                run.acquire('a', 'rollback-error', run.plan['gates']['rollback-error'], time.monotonic() + 2)
+        self.assertTrue(runner.acquisition_intent(reference).exists())
+        self.assertFalse(runner.reference_approved(self.dir, gate))
+        self.assertEqual(run.acquired, [])
+        backups = [path for path in reference.parent.iterdir() if path.is_file() and path.read_bytes() == old]
+        self.assertEqual(len(backups), 1)
+
     def test_legacy_hashed_acquisition_reference_remains_usable(self):
         eden = FakeEden({})
         eden.colour = RED
@@ -1975,6 +2017,171 @@ class RunnerTests(unittest.TestCase):
         run.check_gate('a', 'legacy')
         self.assertEqual(run.acquired, [])
         self.assertTrue(run.last_gate_outcome['passed'])
+
+    def test_pending_intent_rejects_even_a_matching_legacy_hash_and_can_be_reacquired(self):
+        bridge = self.dir / 'pending-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        gate = dict(self.plan['gates']['red'], acquire=True, interval=.01)
+        self.plan['gates']['legacy'] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        reference = self.dir / gate['reference']
+        intent = runner.acquisition_intent(reference)
+        intent.touch()
+        run = self.make(eden)
+        run.acquired = []
+        self.assertIn('legacy', runner.dry_run(self.manifest)['references_to_acquire'])
+        self.assertTrue(runner.harness.gate_inputs_missing(run, 'a', {**gate, 'acquire': False}))
+        with mock.patch.object(run, 'compare_region', side_effect=AssertionError('unapproved reference was used')):
+            run.check_gate('a', 'legacy')
+        self.assertFalse(intent.exists())
+        self.assertTrue(json.loads(self.manifest.read_text())['gates']['legacy']['acquired'])
+        self.assertEqual(len(run.acquired), 1)
+
+    def test_abandoned_caller_wins_before_acquisition_claim(self):
+        bridge = self.dir / 'abandoned-claim-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        name = 'abandoned-claim'
+        gate = {'kind': 'image', 'reference': 'refs/abandoned-claim.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.plan['gates'][name] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        before = self.manifest.read_bytes()
+        run = self.make(eden)
+        run.acquired = []
+        entered, release = threading.Event(), threading.Event()
+        workers, claims = [], []
+        claim = runner.macro_gate.claim
+
+        def delayed_claim():
+            workers.append(threading.current_thread())
+            entered.set()
+            release.wait(1)
+            claims.append(claim())
+            return claims[-1]
+
+        try:
+            with mock.patch.object(runner.macro_gate, 'claim', side_effect=delayed_claim):
+                answered = runner.macro_gate.bounded_call(lambda _: run.check_gate('a', name), 'gate', .22)
+                self.assertEqual(answered, (False, None))
+                self.assertTrue(entered.is_set())
+                report = runner.dry_run(self.manifest)
+                self.assertIn(name, report['references_to_acquire'])
+                release.set()
+                workers[0].join(1)
+                self.assertFalse(workers[0].is_alive())
+            self.assertEqual(claims, [False])
+            self.assertEqual(self.manifest.read_bytes(), before)
+            self.assertFalse((self.dir / gate['reference']).exists())
+            self.assertEqual(run.acquired, [])
+            actions = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
+            self.assertFalse(any(action.get('acquired') for action in actions))
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+
+    def test_claimed_acquisition_rolls_back_if_its_approving_write_fails(self):
+        bridge = self.dir / 'claimed-error-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        name = 'claimed-error'
+        gate = {'kind': 'image', 'reference': 'refs/claimed-error.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.plan['gates'][name] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        before = self.manifest.read_bytes()
+        run = self.make(eden)
+        run.acquired = []
+        intent = runner.acquisition_intent(self.dir / gate['reference'])
+        unlink = Path.unlink
+        failed = []
+
+        def fail_once(path, *args, **kwargs):
+            if path == intent and not failed:
+                failed.append(True)
+                raise OSError('approval write failed')
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'unlink', new=fail_once):
+            answered, error = runner.macro_gate.bounded_call(lambda _: run.check_gate('a', name), 'gate', .5)
+        self.assertFalse(answered)
+        self.assertIsInstance(error, OSError)
+        self.assertEqual(str(error), 'approval write failed')
+        self.assertEqual(self.manifest.read_bytes(), before)
+        self.assertFalse((self.dir / gate['reference']).exists())
+        self.assertEqual(run.acquired, [])
+
+    def test_claimed_acquisition_completes_even_if_the_caller_deadline_passes_at_unlock(self):
+        bridge = self.dir / 'unlock-bridge.log'
+        self.instances['a']['bridge_log'] = str(bridge)
+        eden = FreshEden(bridge, [1000, 1001])
+        eden.colour = RED
+        name = 'unlock'
+        gate = {'kind': 'image', 'reference': 'refs/unlock.png', 'acquire': True,
+                'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01}
+        self.plan['gates'][name] = gate
+        self.manifest.write_text(json.dumps(self.plan))
+        run = self.make(eden)
+        run.acquired = []
+        entered, release, deadline = threading.Event(), threading.Event(), threading.Event()
+        workers, answers, errors = [], [], []
+        abandon = runner.macro_gate._Outcome.abandon
+
+        class PausedLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def acquire(self, *args, **kwargs):
+                return self.lock.acquire(*args, **kwargs)
+
+            def release(self):
+                self.lock.release()
+                context = getattr(run._gate_context, 'gate', None)
+                if context is not None and context.get('acquisition_completed') and not entered.is_set():
+                    workers.append(threading.current_thread())
+                    entered.set()
+                    release.wait(1)
+
+        def abandon_at_deadline(outcome):
+            abandoned = abandon(outcome)
+            if not abandoned:
+                deadline.set()
+            return abandoned
+
+        def call():
+            try:
+                answers.append(runner.macro_gate.bounded_call(lambda _: run.check_gate('a', name), 'gate', .22))
+            except BaseException as error:
+                errors.append(error)
+
+        run._gate_lock = PausedLock()
+        caller = threading.Thread(target=call)
+        try:
+            with mock.patch.object(runner.macro_gate._Outcome, 'abandon', new=abandon_at_deadline):
+                caller.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(deadline.wait(1))
+                self.assertTrue(caller.is_alive())
+                self.assertNotIn(name, runner.dry_run(self.manifest)['references_to_acquire'])
+                release.set()
+                caller.join(1)
+                self.assertFalse(caller.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(answers, [(True, str(self.dir / gate['reference']))])
+            self.assertTrue(run.last_gate_outcome['passed'])
+            self.assertEqual(len(run.acquired), 1)
+        finally:
+            release.set()
+            caller.join(1)
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
 
     def test_acquisition_receipt_publication_cannot_outlive_the_gate_cap(self):
         bridge = self.dir / 'bridge.log'

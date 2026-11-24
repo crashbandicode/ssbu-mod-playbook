@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harvest  # noqa: E402
@@ -79,6 +80,33 @@ class HarvestTests(unittest.TestCase):
         self.assertEqual((result['segments'], result['gates']), (['s1'], ['g1']))
         self.assertEqual((self.index.read_bytes(), self.index.stat().st_mtime_ns), before)
         self.assertFalse((self.library / 'segments/s1.edenmacro.json').exists())
+
+    def test_pending_reference_is_not_harvested_even_if_its_legacy_hash_matches(self):
+        reference = self.base / 'reference.png'
+        reference.write_bytes(b'old reference')
+        plan = json.loads(self.manifest.read_text())
+        plan['gates']['g1'] = {'kind': 'image', 'reference': reference.name, 'acquire': True,
+                               'sha256': hashlib.sha256(reference.read_bytes()).hexdigest(), 'cap': 1}
+        self.manifest.write_text(json.dumps(plan))
+        self.receipt('PASS')
+        (self.base / 'reference.png.acquiring').touch()
+        with self.assertRaisesRegex(RuntimeError, 'reference is not approved'):
+            harvest.harvest(self.manifest, self.out, 'test', self.library)
+        self.assertFalse(self.index.exists())
+
+    def test_reference_that_becomes_pending_during_read_is_not_harvested(self):
+        reference = self.base / 'reference.png'
+        reference.write_bytes(b'old reference')
+        plan = json.loads(self.manifest.read_text())
+        plan['gates']['g1'] = {'kind': 'image', 'reference': reference.name, 'acquire': True,
+                               'sha256': hashlib.sha256(reference.read_bytes()).hexdigest(), 'cap': 1}
+        self.manifest.write_text(json.dumps(plan))
+        self.receipt('PASS')
+        with mock.patch.object(harvest.runner, 'reference_approved', side_effect=[True, False]):
+            with self.assertRaisesRegex(RuntimeError, 'reference is not approved'):
+                harvest.harvest(self.manifest, self.out, 'test', self.library)
+        self.assertFalse(self.index.exists())
+        self.assertFalse((self.library / 'refs/g1.png').exists())
 
 
 if __name__ == '__main__':

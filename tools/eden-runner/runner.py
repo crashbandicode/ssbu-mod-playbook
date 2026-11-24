@@ -214,6 +214,28 @@ def digest(path):
     return h.hexdigest()
 
 
+def acquisition_intent(reference):
+    reference = Path(reference)
+    return reference.with_name(reference.name + '.acquiring')
+
+
+def reference_approved(base, gate, manifest=None, name=None):
+    reference = Path(base) / gate['reference']
+    intent = acquisition_intent(reference)
+    try:
+        if intent.exists() or not reference.is_file() or not gate.get('sha256'):
+            return False
+        if manifest is not None and name is not None and (gate.get('acquire') or gate.get('acquired')):
+            raw = json.loads(Path(manifest).read_text())
+            recorded = expand_library(raw).get('gates', {}).get(name)
+            if (not recorded or (Path(base) / recorded['reference']).resolve() != reference.resolve()
+                    or recorded.get('sha256') != gate['sha256']):
+                return False
+        return digest(reference) == gate['sha256'] and not intent.exists()
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def dotted(document, key):
     value = document
     for part in key.split('.'):
@@ -900,10 +922,10 @@ def dry_run(manifest_path):
                     errors.append(f'gate {name}: frame must be [width, height]')
                 elif gate.get('reference_is_roi') and scale == 'fit' and frame is None:
                     errors.append(f'gate {name}: an ROI reference with scale "fit" needs "frame": [width, height]')
-                ref = base / gate['reference']
-                if not ref.is_file() and gate.get('acquire'):
+                approved = reference_approved(base, gate)
+                if not approved and gate.get('acquire'):
                     to_acquire.append(name)  # captured the first time the run reaches the screen
-                elif digest(ref) != gate.get('sha256'):
+                elif not approved:
                     errors.append(f'gate {name}: reference sha256 mismatch')
                 if len(gate['roi']) != 4:
                     errors.append(f'gate {name}: roi needs 4 numbers')
@@ -1541,7 +1563,8 @@ class Runner:
     def _gate_valid(self):
         token = getattr(self._gate_context, 'token', None)
         gate = getattr(self._gate_context, 'gate', None)
-        return (not macro_gate.abandoned() and (gate is None or time.monotonic() < gate['deadline'])
+        return (not macro_gate.abandoned()
+                and (gate is None or macro_gate.claimed() or time.monotonic() < gate['deadline'])
                 and (token is None or self._gate_owner is token))
 
     @contextmanager
@@ -2130,7 +2153,10 @@ class Runner:
             raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
         result_slot = {'sequence': next(self._gate_sequence), 'value': None}
         self._gate_results.append(result_slot)
+        context['result_slot'] = result_slot
+        context['role'] = harness.assertion_role(gate)
         self._gate_context.gate = context
+        previous_claim_limit = macro_gate.set_claim_limit(deadline)
         registered = False
         missing = False
         try:
@@ -2151,6 +2177,8 @@ class Runner:
                     f'gate {name} on {on} did not pass within {cap} s: '
                     'gate evidence was still being written by an earlier check')
             result = self.check_gate_spec(on, {**gate, 'cap': remaining}, name)
+            if context.get('acquisition_completed'):
+                return result
             with self._gate_publication():
                 if not self._gate_valid():
                     raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
@@ -2186,7 +2214,7 @@ class Runner:
             raise
         finally:
             remaining = max(0.0, deadline - time.monotonic())
-            if registered and self._gate_lock.acquire(timeout=remaining):
+            if registered and not context.get('acquisition_completed') and self._gate_lock.acquire(timeout=remaining):
                 try:
                     if self._gate_owner is token and not macro_gate.abandoned():
                         self._arm_frames = False
@@ -2195,6 +2223,7 @@ class Runner:
                     self._gate_lock.release()
             self._gate_context.token = previous
             self._gate_context.gate = previous_gate
+            macro_gate.set_claim_limit(previous_claim_limit)
 
     def check_gate_spec(self, on, gate, name):
         kind, until = gate['kind'], time.monotonic() + gate['cap']
@@ -2360,10 +2389,13 @@ class Runner:
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
                 pause(.25)
-        elif kind == 'image' and gate.get('acquire') and not (self.base / gate['reference']).is_file():
+        elif (kind == 'image' and gate.get('acquire')
+              and not reference_approved(self.base, gate, self.manifest_path, name)):
             return self.acquire(on, name, gate, until)
         else:
             hook = load_hook(self.base, gate) if kind == 'hook' else None
+            if kind == 'image' and not reference_approved(self.base, gate, self.manifest_path, name):
+                raise RuntimeError(f'gate {name}: reference is not approved or its sha256 does not match')
             scale = None if hook is not None else self.image_scale(gate)
             while time.monotonic() < until:
                 path = self.shot(on, 'gate-' + name)
@@ -2394,11 +2426,15 @@ class Runner:
                             raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
                         self._gate_evidence = hook_evidence is not None
                 else:
+                    if not reference_approved(self.base, gate, self.manifest_path, name):
+                        raise RuntimeError(f'gate {name}: reference is not approved or its sha256 does not match')
                     diff, note = self.compare_region(
                         path, self.base / gate['reference'], gate['roi'], gate.get('reference_is_roi'), scale,
                         gate.get('frame'), gate.get('tolerance', DEFAULT_TOLERANCE))
                     if not self._gate_valid():
                         raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                    if not reference_approved(self.base, gate, self.manifest_path, name):
+                        raise RuntimeError(f'gate {name}: reference is not approved or its sha256 does not match')
                     passed = diff <= gate.get('tolerance', DEFAULT_TOLERANCE)
                 if passed:
                     record = {'gate': name, 'on': on, 'pass': True, 'shot': str(path)}
@@ -2480,12 +2516,16 @@ class Runner:
                     raise RuntimeError(f'gate {name}: acquisition screenshot changed while reading')
                 acquired = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                 plan = copy.deepcopy(self.plan)
-                context = getattr(self._gate_context, 'gate', None)
-                named_gate = (gate is self.plan['gates'].get(name)
-                              or (context is not None and context['name'] == name))
-                if named_gate:
-                    plan['gates'][name].update(sha256=sha256, acquired=acquired)
+                plan['gates'].setdefault(name, copy.deepcopy(gate)).update(sha256=sha256, acquired=acquired)
                 staged = []
+                deferred = False
+                preserve_staged = [False]
+
+                def cleanup():
+                    if not preserve_staged[0]:
+                        for temporary in staged:
+                            temporary.unlink(missing_ok=True)
+
                 try:
                     for target, contents in ((reference, data),
                                              (self.manifest_path, (json.dumps(plan, indent=2) + '\n').encode())):
@@ -2495,18 +2535,102 @@ class Runner:
                         if target.exists():
                             os.chmod(staged[-1], target.stat().st_mode & 0o777)
                     with self._gate_publication():
-                        if not self._gate_valid():
-                            raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
-                        staged[0].replace(reference)
-                        staged[1].replace(self.manifest_path)
-                        gate.update(sha256=sha256, acquired=acquired)
-                        if named_gate:
-                            self.plan['gates'][name].update(sha256=sha256, acquired=acquired)
-                        self.acquired.append({'gate': name, 'reference': str(reference), 'shot': str(path)})
+                        def current():
+                            if not self._gate_valid():
+                                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+
+                        current()
+                        backups = {}
+                        for target in (reference, self.manifest_path):
+                            if target.exists():
+                                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+                                    backup = Path(stream.name)
+                                    staged.append(backup)
+                                    stream.write(target.read_bytes())
+                                os.chmod(backup, target.stat().st_mode & 0o777)
+                                backups[target] = backup
+                        intent = acquisition_intent(reference)
+                        had_intent = intent.exists()
+                        old_gate = copy.deepcopy(gate)
+                        old_entry = copy.deepcopy(self.plan['gates'].get(name))
+                        receipt = {'gate': name, 'reference': str(reference), 'shot': str(path)}
+                        changed_state = False
+                        intent_ready = had_intent
+                        try:
+                            current()
+                            if not had_intent:
+                                intent.touch(exist_ok=False)
+                                intent_ready = True
+                            current()
+                            staged[0].replace(reference)
+                            current()
+                            self.acquired.append(receipt)
+                            current()
+                            staged[1].replace(self.manifest_path)
+                            current()
+                            changed_state = True
+                            gate.update(sha256=sha256, acquired=acquired)
+                            if name in self.plan['gates']:
+                                self.plan['gates'][name].update(sha256=sha256, acquired=acquired)
+                            else:
+                                self.plan['gates'][name] = copy.deepcopy(gate)
+                            current()
+                            self.log({'gate': name, 'on': on, 'acquisition_pending': str(reference), 'sha256': sha256})
+                            current()
+                            deferred = macro_gate.defer_cleanup(cleanup)
+                            if not macro_gate.claim():
+                                raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                            intent.unlink()
+                            current()
+                            context = getattr(self._gate_context, 'gate', None)
+                            if context is not None:
+                                if context['role'] == 'screen':
+                                    self.screen_reached = True
+                                self._gate_result(context['result_slot'], {
+                                    'gate': name, 'passed': True, 'role': context['role'],
+                                    'screen_reached': self.screen_reached,
+                                })
+                                self.gate_saw_evidence.append(self._gate_evidence)
+                                self._arm_frames = False
+                                self._gate_owner = None
+                                context['acquisition_completed'] = True
+                        except BaseException:
+                            if not intent_ready:
+                                raise
+                            try:
+                                self.acquired[:] = [item for item in self.acquired if item is not receipt]
+                                if changed_state:
+                                    gate.clear()
+                                    gate.update(old_gate)
+                                    if old_entry is None:
+                                        self.plan['gates'].pop(name, None)
+                                    else:
+                                        self.plan['gates'][name].clear()
+                                        self.plan['gates'][name].update(old_entry)
+                                if not intent.exists():
+                                    intent.touch(exist_ok=False)
+                                if not staged[0].exists():
+                                    if reference in backups:
+                                        backups[reference].replace(reference)
+                                    else:
+                                        reference.unlink(missing_ok=True)
+                                if not staged[1].exists():
+                                    if self.manifest_path in backups:
+                                        backups[self.manifest_path].replace(self.manifest_path)
+                                    else:
+                                        self.manifest_path.unlink(missing_ok=True)
+                                if not had_intent:
+                                    intent.unlink()
+                            except BaseException as error:
+                                preserve_staged[0] = True
+                                state = ('the reference remains unapproved' if intent.exists()
+                                         else 'the approval state is indeterminate')
+                                raise RuntimeError(f'gate {name}: acquisition rollback failed; '
+                                                   f'{state}') from error
+                            raise
                 finally:
-                    for temporary in staged:
-                        temporary.unlink(missing_ok=True)
-                self.log({'gate': name, 'on': on, 'acquired': str(reference), 'sha256': gate['sha256']})
+                    if not deferred:
+                        cleanup()
                 return str(reference)
             if previous is not None:
                 previous.unlink(missing_ok=True)

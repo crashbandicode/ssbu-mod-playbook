@@ -132,7 +132,8 @@ def gate_inputs_missing(runner, on, gate):
         if kind == 'text':
             return not runner.trace_source(on).is_file()
         if kind == 'image' and not gate.get('acquire'):
-            return not (runner.base / gate['reference']).is_file()
+            from runner import reference_approved
+            return not reference_approved(runner.base, gate)
         if kind == 'hook':
             return not (runner.base / gate['module']).is_file()
     except Exception:  # noqa: BLE001 - a source that cannot be named is missing evidence

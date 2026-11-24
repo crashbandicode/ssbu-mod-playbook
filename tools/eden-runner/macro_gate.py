@@ -6,14 +6,85 @@ import closed_loop
 
 
 IDLE_CAP = 15.0
+CLAIMED_WAIT_CAP = 2.0
 BLIND = object()
 _worker = threading.local()
 
 
+class ClaimedCommitTimeout(RuntimeError):
+    pass
+
+
+class _Outcome:
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.state = 'pending'
+        self.claimed_at = None
+        self.lock = threading.Lock()
+
+    def claim(self, limit=None):
+        with self.lock:
+            if self.state == 'claimed':
+                return True
+            now = time.monotonic()
+            if self.state != 'pending' or now >= min(self.deadline, limit if limit is not None else self.deadline):
+                return False
+            self.state = 'claimed'
+            self.claimed_at = now
+            return True
+
+    def abandon(self):
+        with self.lock:
+            if self.state != 'pending':
+                return False
+            self.state = 'abandoned'
+            return True
+
+    def is_abandoned(self):
+        with self.lock:
+            return self.state == 'abandoned' or (self.state == 'pending' and time.monotonic() >= self.deadline)
+
+    def is_claimed(self):
+        with self.lock:
+            return self.state == 'claimed'
+
+
+def claim():
+    outcome = getattr(_worker, 'outcome', None)
+    return True if outcome is None else outcome.claim(getattr(_worker, 'claim_limit', None))
+
+
+def claimed():
+    outcome = getattr(_worker, 'outcome', None)
+    return outcome is not None and outcome.is_claimed()
+
+
+def set_claim_limit(deadline):
+    previous = getattr(_worker, 'claim_limit', None)
+    if getattr(_worker, 'outcome', None) is not None:
+        _worker.claim_limit = deadline
+    return previous
+
+
+def defer_cleanup(callback):
+    cleanups = getattr(_worker, 'cleanups', None)
+    if cleanups is None:
+        return False
+    ready = threading.Event()
+
+    def cleanup():
+        ready.wait()
+        callback()
+
+    cleaner = threading.Thread(target=cleanup, daemon=True)
+    cleaner.start()
+    cleanups.append(ready)
+    return True
+
+
 def abandoned():
-    flag = getattr(_worker, 'abandoned', None)
-    deadline = getattr(_worker, 'deadline', None)
-    return flag is not None and (flag.is_set() or time.monotonic() >= deadline)
+    outcome = getattr(_worker, 'outcome', None)
+    return outcome is not None and outcome.is_abandoned()
 
 
 def stop(error, check=None):
@@ -30,22 +101,25 @@ def stop(error, check=None):
 
 def bounded_call(call, method, cap, check=None, until=None, with_completion=False):
     result = []
-    cancelled = threading.Event()
     deadline = time.monotonic() + cap
     if until is not None:
         deadline = min(deadline, until)
     if deadline <= time.monotonic():
         return (False, None, None) if with_completion else (False, None)
+    outcome = _Outcome(deadline)
 
     def invoke():
-        _worker.abandoned = cancelled
-        _worker.deadline = deadline
+        _worker.outcome = outcome
+        _worker.cleanups = []
         try:
             value = call(method)
         except BaseException as error:
-            result.append((False, error, time.monotonic()))
+            result.append((False, error, outcome.claimed_at if outcome.is_claimed() else time.monotonic()))
         else:
-            result.append((True, value, time.monotonic()))
+            result.append((True, value, outcome.claimed_at if outcome.is_claimed() else time.monotonic()))
+        finally:
+            for ready in _worker.cleanups:
+                ready.set()
 
     worker = threading.Thread(target=invoke, daemon=True)
     worker.start()
@@ -62,11 +136,23 @@ def bounded_call(call, method, cap, check=None, until=None, with_completion=Fals
             check()
         if not worker.is_alive():
             return result[0] if with_completion else result[0][:2]
-        cancelled.set()
-        return (False, None, None) if with_completion else (False, None)
+        if outcome.abandon():
+            return (False, None, None) if with_completion else (False, None)
+        worker.join(CLAIMED_WAIT_CAP)
+        if worker.is_alive():
+            raise ClaimedCommitTimeout('the acquisition commit was claimed but did not finish')
+        return result[0] if with_completion else result[0][:2]
+    except ClaimedCommitTimeout:
+        raise
+    except BaseException:
+        if outcome.is_claimed():
+            worker.join(CLAIMED_WAIT_CAP)
+            if worker.is_alive():
+                raise ClaimedCommitTimeout('the acquisition commit was claimed but did not finish')
+        raise
     finally:
         if worker.is_alive():
-            cancelled.set()
+            outcome.abandon()
 
 
 def busy(call, remaining, note=None, check=None, is_stop=None):

@@ -10,6 +10,7 @@ alone unless --replace is given (a changed route needs a new name, or a delibera
 """
 import argparse
 import hashlib
+import io
 import json
 import shutil
 import sys
@@ -62,9 +63,16 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                 gate = dict(plan['gates'][gate_name])
                 if gate.get('library') or (gate_name in index['gates'] and not replace):
                     continue
+                if gate.get('kind') == 'image' and not runner.reference_approved(base, gate):
+                    raise RuntimeError(f'gate {gate_name}: reference is not approved or its sha256 does not match')
                 for field, folder in (('reference', 'refs'), ('module', 'checks')):
                     if field in gate:
                         src = Path(gate[field]) if Path(gate[field]).is_absolute() else base / gate[field]
+                        image = field == 'reference' and gate.get('kind') == 'image'
+                        contents = src.read_bytes() if image else None
+                        if (image and (hashlib.sha256(contents).hexdigest() != gate.get('sha256')
+                                       or not runner.reference_approved(base, gate))):
+                            raise RuntimeError(f'gate {gate_name}: reference is not approved or its sha256 does not match')
                         dest = Path(folder) / f'{gate_name}{src.suffix}'
                         gate[field] = str(dest)
                         if dry:
@@ -73,7 +81,7 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                         if field == 'reference' and gate.get('kind') in ('image', 'change') and 'roi' in gate:
                             # Keep only the compared region: a full screenshot is ~600 KB, the region a few KB.
                             from PIL import Image
-                            with Image.open(src) as im:
+                            with Image.open(io.BytesIO(contents) if image else src) as im:
                                 full = im.convert('RGB')
                                 full.crop(tuple(gate['roi'])).save(library / dest)
                                 # ROI coordinates belong to this frame. compare_region needs it for scale "fit".
@@ -81,9 +89,12 @@ def harvest(manifest, out, label, library, replace=False, dry=False):
                             gate['reference_is_roi'] = True
                             gate['sha256'] = digest(library / dest)
                         else:
-                            shutil.copyfile(src, library / dest)
+                            if image:
+                                (library / dest).write_bytes(contents)
+                            else:
+                                shutil.copyfile(src, library / dest)
                             if field == 'reference':
-                                gate['sha256'] = digest(src)
+                                gate['sha256'] = hashlib.sha256(contents).hexdigest() if image else digest(src)
                 gate.pop('acquire', None)
                 gate['from_run'] = label
                 index['gates'][gate_name] = gate
