@@ -3230,11 +3230,40 @@ def _bridge_on_control_journal(ctx):
             'requests_after_load': len(after), 'inputs_after_load': 0}
 
 
+def _bridge_on_qualified_receipt(ctx, event):
+    candidates = []
+    for path in Path(ctx.row_dir).parent.glob('*/routes-bridge-on*.json'):
+        try:
+            candidates.append((path.stat().st_mtime_ns, str(path), path))
+        except OSError:
+            continue
+    for _, _, path in sorted(candidates, reverse=True):
+        try:
+            receipt = json.loads(path.read_text())
+            chord = receipt['chord']
+            witness = receipt['witness']
+            if not isinstance(chord, dict) or chord.get('event') != event:
+                continue
+            title = receipt.get('title')
+            if witness == 'trace':
+                title = None
+            elif not (witness == 'stub-on' and chord.get('chord') == 'pad'
+                      and isinstance(chord.get('pre_chord'), dict)
+                      and isinstance(title, dict) and title.get('matched') == 'prompt'):
+                continue
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            continue
+        return {'chord': 'already on', 'event': event,
+                'qualified_by': {'receipt': str(path), 'witness': witness, 'title': title}}
+    raise RuntimeError(f'bridge_on (stub on): the bridge is already On ({event}) but this run has no qualified '
+                       'bridge_on receipt for that On event: cannot show how it was enabled')
+
+
 def _bridge_on_stub_enable(ctx):
     before = _bridge_on_events(ctx)
     existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
     if existing is not None:
-        return {'chord': 'already on', 'event': existing}
+        return _bridge_on_qualified_receipt(ctx, existing)
     until = time.monotonic() + 54
     missing = []
     while time.monotonic() < until:
@@ -3242,7 +3271,7 @@ def _bridge_on_stub_enable(ctx):
         before = _bridge_on_events(ctx)
         existing = next((line for line in reversed(before) if '[Bridge] toggle phase=on ' in line), None)
         if existing is not None:
-            return {'chord': 'already on', 'event': existing}
+            return _bridge_on_qualified_receipt(ctx, existing)
         _bridge_on_control_journal(ctx)
         install = next((line for line in reversed(before) if 'toggle=off reason=boot_default' in line), None)
         ready = next((line for line in reversed(before) if re.fullmatch(r'\d+ \[Bridge\] chord ready', line)), None)
@@ -3290,11 +3319,21 @@ def _bridge_on_ui_blocks_since_hello(text, hello):
         raise RuntimeError('bridge_on (stub on): bridge greeting disappeared from capture log') from None
     segment = []
     for line in lines[start:]:
-        if segment and state_gate.BOUNDARY.search(line):
-            yield from state_gate.blocks('\n'.join(segment), native_picker.UI)
+        if state_gate.BOUNDARY.search(line):
             segment = []
-        segment.append(line)
-    yield from state_gate.blocks('\n'.join(segment), native_picker.UI)
+        elif state_gate.BEGIN.search(line):
+            segment = [line]
+        elif segment:
+            segment.append(line)
+            if state_gate.END.search(line):
+                blocks = state_gate.blocks('\n'.join(segment), native_picker.UI)
+                if blocks:
+                    clock = re.search(r' frame=(\d+) wall=(\d+)$', segment[0])
+                    if clock is None:
+                        raise RuntimeError('bridge_on (stub on): state begin lacks frame or wall')
+                    blocks[0].update(frame=int(clock[1]), wall=int(clock[2]))
+                    yield blocks[0]
+                segment = []
 
 
 def _bridge_on_stub_title(ctx, hello):
@@ -3303,8 +3342,15 @@ def _bridge_on_stub_title(ctx, hello):
         raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
     boot = match[1]
     log = instance_path(ctx, 'bridge_log')
-    until = time.monotonic() + 10
+    started = time.monotonic()
+    until = started + 10
+    allowed = 10
     next_request = 0
+    seen = 0
+    last = None
+    opening = False
+    not_yet = []
+    identities = set()
     timeout = 'bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting'
     while (remaining := until - time.monotonic()) > 0:
         ctx.check_stop()
@@ -3312,22 +3358,40 @@ def _bridge_on_stub_title(ctx, hello):
         if now >= next_request:
             bridge_v2(ctx, 'providers', 'state ssbu.ui')
             next_request = now + .1
-        for block in _bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello):
+        blocks = list(_bridge_on_ui_blocks_since_hello(log.read_text(errors='replace'), hello))
+        if len(blocks) < seen:
+            raise RuntimeError('bridge_on (stub on): bridge observation history changed')
+        for block in blocks[seen:]:
+            seen += 1
             values = block['values']
             if block['boot'] != boot or values.get('observation.active') != 'yes':
                 continue
             sample = native_picker.Sample(block, 0)
-            matched = next((name for name, criteria in (
-                ('prompt', TITLE_PROMPT), ('opening', TITLE_OPENING), ('title', _TITLE_WITHOUT_PROMPT),
-            ) if _fields_match(sample, criteria)), None)
-            if matched is None:
+            if _fields_match(sample, TITLE_PROMPT):
+                native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+                return {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'], 'boot': block['boot'],
+                        **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
+                        'matched': 'prompt', 'not_yet': not_yet, 'waited_s': round(time.monotonic() - started, 3)}
+            is_opening = _fields_match(sample, TITLE_OPENING)
+            if not is_opening and not _fields_match(sample, _TITLE_WITHOUT_PROMPT):
                 raise RuntimeError(f"bridge_on (stub on): the bridge is On but the first screen it reports is "
                                    f"{values.get('screen')}/{values.get('focus')}, not the Title")
             native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
-            return {'rev': block['rev'], 'boot': block['boot'],
-                    **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
-                    'matched': matched}
+            last = {'rev': block['rev'], 'frame': block['frame'],
+                    **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
+            identity = (last['screen'], last['screen.context'], last['focus'])
+            if identity not in identities:
+                identities.add(identity)
+                not_yet.append(last)
+            if is_opening:
+                until, allowed = started + TITLE_OPENING_READY_S, TITLE_OPENING_READY_S
+            elif opening:
+                until, allowed = now + 10, 10
+            opening = is_opening
         time.sleep(min(.05, max(0, until - time.monotonic())))
+    if last is not None:
+        raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within {allowed} s of the greeting; "
+                           f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
     raise RuntimeError(timeout)
 
 
@@ -3440,6 +3504,8 @@ def bridge_on(ctx, port=None, cap=60):
     if trace is None:
         title = ({'checked': False, 'reason': 'bridge already On before this call'}
                  if chord['chord'] == 'already on' else _bridge_on_stub_title(ctx, hello))
+        if chord['chord'] == 'already on':
+            title['qualified_by'] = chord['qualified_by']
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:
@@ -3457,7 +3523,13 @@ def bridge_on(ctx, port=None, cap=60):
     }
     if trace is None:
         receipt.update(listener=listener, title=title)
-    return _save(ctx, 'routes-bridge-on', receipt)
+    name = 'routes-bridge-on'
+    if trace is None:
+        suffix = 2
+        while (Path(ctx.row_dir) / f'{name}.json').exists():
+            name = f'routes-bridge-on-{suffix}'
+            suffix += 1
+    return _save(ctx, name, receipt)
 
 
 def _apply_settings(ctx, data, cap=30):
