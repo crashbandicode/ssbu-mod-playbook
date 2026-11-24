@@ -2627,16 +2627,44 @@ class RunnerTests(unittest.TestCase):
         run.plan['segments']['to-red']['start_gate'] = 'red'
         run.plan['gates']['red']['cap'] = 40
         caps = []
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+        bounded_call = runner.macro_gate.bounded_call
 
         def check(on, gate, name):
             caps.append(gate['cap'])
             if len(caps) == 2:
-                now[0] += 15
+                workers.append(threading.current_thread())
+                entered.set()
+                release.wait(2)
             return True
 
-        with mock.patch.object(run, 'check_gate_spec', side_effect=check):
-            with self.assertRaises(routes.closed_loop.DispatchRejected):
-                run.play('a', 'to-red')
+        def bounded(call, method, cap, **kwargs):
+            if kwargs.get('with_completion'):
+                join = threading.Thread.join
+
+                def ordered_join(worker, timeout=None):
+                    self.assertTrue(entered.wait(1))
+                    self.assertIs(worker, workers[0])
+                    now[0] += method + .1
+                    release.set()
+                    join(worker, 1)
+                    self.assertFalse(worker.is_alive())
+
+                with mock.patch.object(threading.Thread, 'join', new=ordered_join):
+                    return bounded_call(call, method, cap, **kwargs)
+            return bounded_call(call, method, cap, **kwargs)
+
+        try:
+            with mock.patch.object(run, 'check_gate_spec', side_effect=check), \
+                    mock.patch.object(runner.macro_gate, 'bounded_call', side_effect=bounded):
+                with self.assertRaises(routes.closed_loop.DispatchRejected):
+                    run.play('a', 'to-red')
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
         self.assertEqual(len(caps), 2)
         self.assertLess(caps[1], 15)
         self.assertEqual(run.plan['gates']['red']['cap'], 40)

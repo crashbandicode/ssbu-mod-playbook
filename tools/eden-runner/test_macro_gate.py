@@ -411,37 +411,74 @@ class MacroGateTests(unittest.TestCase):
         self.assertGreater(seen[0], 0)
         self.assertEqual(self.events[0]['outcome'], 'requalified, accepted')
 
+    def assert_requalification_after_bound(self, *, until=None, completed, error=None):
+        entered, release = threading.Event(), threading.Event()
+        workers, seen = [], []
+        bounded_call = macro_gate.bounded_call
+
+        def witness(remaining):
+            workers.append(threading.current_thread())
+            seen.append(remaining)
+            entered.set()
+            release.wait(2)
+            if error is not None:
+                raise error
+            return True
+
+        def bounded(call, method, cap, **kwargs):
+            if kwargs.get('with_completion'):
+                join = threading.Thread.join
+
+                def ordered_join(worker, timeout=None):
+                    self.assertTrue(entered.wait(1))
+                    self.assertIs(worker, workers[0])
+                    self.now += method + .1
+                    if completed:
+                        release.set()
+                        join(worker, 1)
+                        self.assertFalse(worker.is_alive())
+                    else:
+                        join(worker, 0)
+
+                with mock.patch.object(threading.Thread, 'join', new=ordered_join):
+                    return bounded_call(call, method, cap, **kwargs)
+            return bounded_call(call, method, cap, **kwargs)
+
+        try:
+            with mock.patch.object(macro_gate, 'bounded_call', side_effect=bounded):
+                with self.assertRaises(closed_loop.DispatchRejected):
+                    self.dispatch(requalify=witness, until=until)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(self.sent, [])
+            self.assertEqual(len(self.events), 1)
+            expected = ('not sent: the bound passed during requalification' if completed
+                        else 'not sent: requalification did not answer within the bound')
+            self.assertEqual(self.events[0]['outcome'], expected)
+            if not completed:
+                self.assertTrue(workers[0].is_alive())
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+
     def test_requalification_that_outlasts_the_bound_never_sends(self):
         for until in (None, 4.0):
             with self.subTest(until=until):
                 self.now, self.polls, self.sent, self.events = 0.0, [], [], []
-                seen = []
+                self.assert_requalification_after_bound(until=until, completed=True)
 
-                def witness(remaining):
-                    seen.append(remaining)
-                    self.now += remaining + .1
-                    return True
-
-                with self.assertRaises(closed_loop.DispatchRejected):
-                    self.dispatch(requalify=witness, until=until)
-                self.assertEqual(len(seen), 1)
-                self.assertEqual(self.sent, [])
-                self.assertEqual(len(self.events), 1)
-                self.assertEqual(self.events[0]['outcome'], 'not sent: the bound passed during requalification')
+    def test_a_requalification_unanswered_at_the_bound_never_sends(self):
+        for until in (None, 4.0):
+            with self.subTest(until=until):
+                self.now, self.polls, self.sent, self.events = 0.0, [], [], []
+                self.assert_requalification_after_bound(until=until, completed=False)
 
     def test_a_stop_raised_after_the_requalification_bound_is_discarded(self):
         class StopRun(Exception):
             pass
 
-        def witness(remaining):
-            self.now += remaining + .1
-            raise StopRun('late STOP')
-
-        with self.assertRaises(closed_loop.DispatchRejected):
-            self.dispatch(requalify=witness)
-        self.assertEqual(self.sent, [])
-        self.assertEqual([event['outcome'] for event in self.events],
-                         ['not sent: the bound passed during requalification'])
+        self.assert_requalification_after_bound(completed=True, error=StopRun('late STOP'))
 
     def test_an_exception_raised_in_time_propagates_even_if_the_waiter_is_delayed(self):
         def witness(remaining):
