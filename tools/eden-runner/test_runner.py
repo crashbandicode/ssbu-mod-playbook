@@ -1571,6 +1571,65 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(old.is_alive())
             self.assertFalse(successor.is_alive())
 
+    def test_action_log_publication_and_gate_supersession_are_serialized(self):
+        eden = FakeEden({})
+        run = self.make(eden)
+        for name in ('old', 'new'):
+            run.plan['gates'][name] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
+        entered, release, started = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        original_open, original_log = Path.open, run.log
+
+        def open_file(path, *args, **kwargs):
+            if path == run.out / 'actions.jsonl' and threading.current_thread() is old:
+                entered.set()
+                release.wait(2)
+            return original_open(path, *args, **kwargs)
+
+        def tagged(record):
+            record['owner'] = threading.current_thread().name
+            return original_log(record)
+
+        def gate(name):
+            try:
+                if name == 'new':
+                    started.set()
+                run.check_gate('a', name)
+            except Exception as error:
+                errors.append(error)
+
+        eden.request = lambda method, params: {'ok': True, 'result': {'running': True}}
+        run.log = tagged
+        old = threading.Thread(target=gate, args=('old',), name='old')
+        successor = threading.Thread(target=gate, args=('new',), name='successor')
+        try:
+            with mock.patch.object(Path, 'open', new=open_file):
+                old.start()
+                self.assertTrue(entered.wait(1))
+                successor.start()
+                self.assertTrue(started.wait(1))
+                successor.join(.1)
+                waited = successor.is_alive()
+                release.set()
+                old.join(1)
+                successor.join(1)
+            self.assertFalse(old.is_alive())
+            self.assertFalse(successor.is_alive())
+            self.assertTrue(waited)
+            rows = [json.loads(line) for line in (run.out / 'actions.jsonl').read_text().splitlines()]
+            owners = [row['owner'] for row in rows]
+            successor_at = owners.index('successor')
+            self.assertTrue(successor_at > 0)
+            self.assertTrue(all(owner == 'old' for owner in owners[:successor_at]))
+            self.assertTrue(all(owner == 'successor' for owner in owners[successor_at:]))
+            self.assertTrue(all(isinstance(error, routes.closed_loop.DispatchRejected) for error in errors))
+        finally:
+            release.set()
+            old.join(1)
+            successor.join(1)
+            self.assertFalse(old.is_alive())
+            self.assertFalse(successor.is_alive())
+
     def test_a_superseded_hook_cannot_change_gate_evidence(self):
         eden = FakeEden({})
         run = self.make(eden)
@@ -1624,6 +1683,7 @@ class RunnerTests(unittest.TestCase):
                                        'roi': [0, 0, 64, 36], 'cap': 2, 'interval': .01, 'acquire': True}
         run.plan['gates']['status'] = {'kind': 'status', 'cap': 2, 'expect': {'running': True}}
         run.acquired = []
+        manifest_before = self.manifest.read_bytes()
         entered, release = threading.Event(), threading.Event()
         errors = []
         original = eden.request
@@ -1662,6 +1722,8 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn('sha256', run.plan['gates']['acquire'])
             self.assertNotIn('acquired', run.plan['gates']['acquire'])
             self.assertEqual(run.acquired, [])
+            self.assertFalse((self.dir / 'refs' / 'acquired.png').exists())
+            self.assertEqual(self.manifest.read_bytes(), manifest_before)
             self.assertEqual(run.last_gate_outcome['gate'], 'status')
         finally:
             release.set()
@@ -2548,12 +2610,14 @@ class RunnerTests(unittest.TestCase):
 
         run = self.make(NewBootEden())
         run.acquired = []
+        manifest_mode = self.manifest.stat().st_mode & 0o777
         gate = {'kind': 'image', 'reference': 'refs/acquired.png', 'acquire': True,
                 'roi': [0, 0, 64, 36], 'cap': 1, 'interval': .03}
         result = run.check_gate_spec('a', gate, 'acquired')
         self.assertEqual(result, str(self.dir / gate['reference']))
         self.assertEqual(run.still_records[run.acquired[0]['shot']]['status'], 'fresh')
         self.assertTrue(Path(result).is_file())
+        self.assertEqual(self.manifest.stat().st_mode & 0o777, manifest_mode)
 
     def test_shot_without_a_bridge_log_behaves_as_before(self):
         eden = FreshEden(None, [1000])

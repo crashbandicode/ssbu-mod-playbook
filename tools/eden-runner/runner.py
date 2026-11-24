@@ -137,6 +137,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1522,11 +1523,12 @@ class Runner:
         return not macro_gate.abandoned() and (token is None or self._gate_owner is token)
 
     def log(self, record):
-        if not self._gate_valid():
-            return
-        record['time'] = time.time()
-        with (self.out / 'actions.jsonl').open('a') as f:
-            f.write(json.dumps(record) + '\n')
+        with self._gate_lock:
+            if not self._gate_valid():
+                return
+            record['time'] = time.time()
+            with (self.out / 'actions.jsonl').open('a') as f:
+                f.write(json.dumps(record) + '\n')
 
     def check_stop(self):
         for name in ('STOP', 'STOP-INPUT'):
@@ -1600,28 +1602,23 @@ class Runner:
             frame = source.read()
             if not self._gate_valid():
                 raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
-            if token is None:
-                record = self.stills.record(on, path, reply, frame)
-            else:
-                def commit(record, run):
+            item = None
+
+            def commit(record, run):
+                nonlocal item
+                # Hold the publication lock only for the ownership check and local append, never for I/O to Eden.
+                with self._gate_lock:
                     if not self._gate_valid():
                         raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
                     self.stills.append(record)
-                    with self._gate_lock:
-                        if not self._gate_valid():
-                            raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
-                        self._frame_sources[on] = source
-                        self.stills.runs[on] = run
+                    self._frame_sources[on] = source
+                    self.stills.runs[on] = run
+                    self.still_records[str(path)] = record
+                    if still_fresh.refused(record):
+                        item = {'file': record['file'], 'reason': record['reason']}
+                        self.row_stills_refused.append(item)
 
-                record = self.stills.record(on, path, reply, frame, commit=commit)
-            with self._gate_lock:
-                if not self._gate_valid():
-                    raise closed_loop.DispatchRejected('screenshot requalification was abandoned')
-                self.still_records[str(path)] = record
-                item = None
-                if still_fresh.refused(record):
-                    item = {'file': record['file'], 'reason': record['reason']}
-                    self.row_stills_refused.append(item)
+            record = self.stills.record(on, path, reply, frame, commit=commit)
             if item is not None:
                 self.log({'still_refused': item})
         except Exception as error:  # noqa: BLE001 - freshness must not break a screenshot
@@ -2339,20 +2336,32 @@ class Runner:
                     raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
                 reference = self.base / gate['reference']
                 reference.parent.mkdir(parents=True, exist_ok=True)
-                reference.write_bytes(path.read_bytes())
-                sha256 = digest(reference)
-                with self._gate_lock:
-                    if not self._gate_valid():
-                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
-                    gate['sha256'] = sha256
-                    gate['acquired'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                if not self._gate_valid():
-                    raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
-                self.manifest_path.write_text(json.dumps(self.plan, indent=2) + '\n')
-                with self._gate_lock:
-                    if not self._gate_valid():
-                        raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
-                    self.acquired.append({'gate': name, 'reference': str(reference), 'shot': str(path)})
+                data, sha256 = path.read_bytes(), digest(path)
+                if hashlib.sha256(data).hexdigest() != sha256:
+                    raise RuntimeError(f'gate {name}: acquisition screenshot changed while reading')
+                acquired = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                plan = copy.deepcopy(self.plan)
+                if gate is self.plan['gates'].get(name):
+                    plan['gates'][name].update(sha256=sha256, acquired=acquired)
+                staged = []
+                try:
+                    for target, contents in ((reference, data),
+                                             (self.manifest_path, (json.dumps(plan, indent=2) + '\n').encode())):
+                        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+                            staged.append(Path(stream.name))
+                            stream.write(contents)
+                        if target.exists():
+                            os.chmod(staged[-1], target.stat().st_mode & 0o777)
+                    with self._gate_lock:
+                        if not self._gate_valid():
+                            raise closed_loop.DispatchRejected(f'gate {name} requalification was abandoned')
+                        staged[0].replace(reference)
+                        staged[1].replace(self.manifest_path)
+                        gate.update(sha256=sha256, acquired=acquired)
+                        self.acquired.append({'gate': name, 'reference': str(reference), 'shot': str(path)})
+                finally:
+                    for temporary in staged:
+                        temporary.unlink(missing_ok=True)
                 self.log({'gate': name, 'on': on, 'acquired': str(reference), 'sha256': gate['sha256']})
                 return str(reference)
             if previous is not None:

@@ -1867,7 +1867,7 @@ def wireless_room(ctx, ready_cap=60, unpublished_create='refuse', idle_cap=15.0)
 
     ready_wait_cap = max(ready_cap + 10, 45)
     steps = [
-        *_wireless_dashboard_steps('wireless_room', available, active),
+        *_wireless_dashboard_steps('wireless_room', available, active, ready_cap=min(ready_cap, 20.0)),
         closed_loop.Step('open-create', lambda o: (not state['form_settling'] and active(o, 'ldn.room_list')
                                                    and _wireless_ready(o['ui'])
                                                    and o['ui'].get('focus.id') == 'ldn.create_room'

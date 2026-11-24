@@ -6320,6 +6320,12 @@ class DashboardRouteTests(unittest.TestCase):
         self.assertIn('the room list did not appear', caught.exception.reason)
         self.assertEqual(self.io.actions, ['lobby-a'])
 
+    def test_host_starting_at_the_waiting_room_still_passes_without_input(self):
+        self.io.phase = 'waiting'
+        result = self.run_route(guest=False)
+        self.assertEqual(result['result'], 'PASS')
+        self.assertEqual(self.io.actions, [])
+
     def test_dashboard_idle_poll_cannot_outlive_the_send_window(self):
         for guest in (False, True):
             for delay in (0, .8):

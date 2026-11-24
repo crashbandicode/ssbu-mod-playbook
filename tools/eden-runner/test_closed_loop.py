@@ -144,6 +144,22 @@ class ClosedLoopTests(unittest.TestCase):
         self.assertEqual(fake.sends, [('a', 0)])
         self.assertEqual(fake.finishes, 0)
 
+    def test_initial_final_destination_still_completes_without_a_send(self):
+        fake = Script(lambda f: 'final')
+        latched = Step('latched', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
+                       'a', cap=5, latch=True)
+        result = fake.run([latched, step('last', 'elsewhere', 'final')])
+        self.assertEqual(result['entered_at'], 'done')
+        self.assertEqual(fake.sends, [])
+
+    def test_final_destination_still_completes_a_non_latched_step(self):
+        fake = Script(lambda f: 'final' if f.sends else 'source')
+        first = Step('first', lambda obs: obs == 'source', lambda obs: obs == 'intermediate',
+                     'a', cap=5)
+        fake.run([first, step('last', 'elsewhere', 'final')])
+        self.assertEqual(fake.sends, [('a', 0)])
+        self.assertEqual(fake.finishes, 1)
+
     def test_idle_poll_cannot_outlive_a_first_send_window(self):
         for delay in (.2, .8):
             with self.subTest(delay=delay):
@@ -204,6 +220,23 @@ class ClosedLoopTests(unittest.TestCase):
                     self.assertEqual(len(sent), 2)
                     self.assertLess(sent[1][1], 3.5)
                 self.assertAlmostEqual(caps[-1], .5)
+
+    def test_each_busy_status_poll_uses_the_remaining_send_window(self):
+        now, polls, sent = [0.0], [], []
+
+        def idle(cap):
+            polls.append((now[0], cap))
+            return 'macro playing'
+
+        item = Step('press', lambda obs: True, lambda obs: False, 'a', cap=5, ready_cap=1)
+        with self.assertRaises(RouteStopped) as caught:
+            run('fixture', [item], lambda: 'source', sent.append, lambda: None,
+                clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+                poll=.3, idle=idle)
+        self.assertIn('the send window closed while the input channel was polled', caught.exception.reason)
+        self.assertEqual(sent, [])
+        self.assertGreater(len(polls), 1)
+        self.assertTrue(all(0 < cap <= 1 - start + 1e-9 for start, cap in polls), polls)
 
     def test_a_latched_step_does_not_confirm_an_unanswered_or_late_read(self):
         for late in (False, True):

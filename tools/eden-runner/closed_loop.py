@@ -241,15 +241,26 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
             if elapsed >= idle_cap or idle_cap - elapsed < min_remaining:
                 stop_idle_budget('nothing was sent')
 
-    def wait_idle(step, record, obs, *, rejected=False, rejection_reason=None):
+    def stop_send_window(step, record, obs, retry):
+        record['ms'] += round((clock() - active_started) * 1000)
+        record['skipped'] = False
+        reason = 'no transition within cap' if retry is not None else 'not ready'
+        stop(step.name, f'{reason}: last read {obs!r}; '
+             'the send window closed while the input channel was polled')
+
+    def wait_idle(step, record, obs, send_deadline, retry, *, rejected=False, rejection_reason=None):
+        if clock() >= send_deadline:
+            stop_send_window(step, record, obs, retry)
         check_idle_budget(min_remaining=0.05 if idle is not None else 0.0)
         if idle is None:
             if rejected:
                 begin_idle_budget(active_index, clock(), rejection_reason)
                 started_wait = clock()
-                remaining = idle_cap - (started_wait - idle_budget['started'])
+                remaining = min(idle_cap - (started_wait - idle_budget['started']), send_deadline - started_wait)
                 sleep(min(poll, max(0.0, remaining)))
                 note_idle_wait(rejection_reason)
+                if clock() >= send_deadline:
+                    stop_send_window(step, record, obs, retry)
                 check_idle_budget()
                 return True
             return False
@@ -257,8 +268,13 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
         remaining = idle_cap if idle_budget is None else idle_cap - (clock() - idle_budget['started'])
         if idle_budget is not None and remaining < 0.05:
             stop_idle_budget('nothing was sent')
+        remaining = min(remaining, send_deadline - clock())
+        if remaining <= 0:
+            stop_send_window(step, record, obs, retry)
         why = idle(remaining) if idle_with_cap else idle()
         duration = clock() - started_wait
+        if clock() >= send_deadline:
+            stop_send_window(step, record, obs, retry)
         if idle_budget is None and (why is not None or duration > 1.0):
             begin_idle_budget(active_index, started_wait,
                               why if why is not None else 'macro.status slow', measure_started=started_wait)
@@ -269,7 +285,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 return True
             check_idle_budget()
             return False
-        deadline = idle_budget['started'] + idle_cap
+        deadline = min(idle_budget['started'] + idle_cap, send_deadline)
         current = why
         while current is not None and clock() < deadline:
             sleep(min(poll, max(0.0, deadline - clock())))
@@ -278,11 +294,18 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
             remaining = deadline - clock()
             if remaining < 0.05:
                 note_idle_wait(why)
+                if send_deadline <= idle_budget['started'] + idle_cap:
+                    sleep(max(0.0, send_deadline - clock()))
+                    stop_send_window(step, record, obs, retry)
                 stop_idle_budget('nothing was sent')
             current = idle(remaining) if idle_with_cap else idle()
+            if clock() >= send_deadline:
+                stop_send_window(step, record, obs, retry)
             if current is not None:
                 why = current
         note_idle_wait(why)
+        if clock() >= send_deadline:
+            stop_send_window(step, record, obs, retry)
         check_idle_budget()
         return True
 
@@ -422,7 +445,8 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                 if record['sends'] >= step.sends:
                     record['ms'] += round((clock() - started) * 1000)
                     stop(step.name, f'no transition after {record["sends"]} sends')
-                if wait_idle(step, record, obs):
+                send_deadline = retry['deadline'] if retry is not None else ready_deadline
+                if wait_idle(step, record, obs, send_deadline, retry):
                     obs = read(index, min(ready_deadline, retry['deadline'])
                                if retry is not None else ready_deadline)
                     continue
@@ -448,10 +472,18 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                     if callable(rollback):
                         rollback()
                     check_idle_budget()
+                if clock() >= send_deadline:
+                    if callable(rollback):
+                        rollback()
+                    stop_send_window(step, record, obs, retry)
                 witness = target(step, obs)
+                dispatch_started = clock()
+                if dispatch_started >= send_deadline:
+                    if callable(rollback):
+                        rollback()
+                    stop_send_window(step, record, obs, retry)
                 record['sends'] += 1
                 record['skipped'] = False
-                dispatch_started = clock()
                 try:
                     send(macro)
                 except DispatchRejected as error:
@@ -468,7 +500,8 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         record['input_channel'] = str(error)
                         record['ms'] += round((clock() - started) * 1000)
                         stop(step.name, 'dispatch rejected as busy twice; nothing was delivered')
-                    wait_idle(step, record, obs, rejected=True, rejection_reason=str(error))
+                    wait_idle(step, record, obs, send_deadline, retry,
+                              rejected=True, rejection_reason=str(error))
                     obs = read(index, min(ready_deadline, retry['deadline'])
                                if retry is not None else ready_deadline)
                     continue
@@ -523,7 +556,7 @@ def run(route, steps, observe, send, finish, *, clock=time.monotonic, sleep=time
                         if index < len(steps):
                             obs = next_read
                         break
-                    if done(steps[-1], obs):
+                    if not step.latch and done(steps[-1], obs):
                         finish()
                         record['ms'] += round((clock() - started) * 1000)
                         return receipt()

@@ -126,6 +126,7 @@ Dashboard Down and A also require what an open, input-taking dashboard publishes
 dashboard is a contradiction and gets no press.
 Dashboard A is sent at most once per run, even if the route leaves and later returns to that step.
 After dashboard A, the route only observes until a ready room list appears or the step stops by name.
+After a latched step sends, only its own destination can complete it.
 A repeated step after a jump back is recorded as a stall; a retry within one visit is not counted twice.
 The shared `macro_gate.dispatch` idle gate handles `routes.play`, `Runner.play`, gate recovery and `play_library`,
 with one 15-second budget or the caller's earlier deadline, including requalification.
@@ -143,7 +144,8 @@ wait; any other or unreadable status is treated as busy.
 In the wireless engine, one 15-second budget per pending input spans re-reads and rejected dispatches, and a slow status reply requires
 a fresh read. Each `macro.status` poll is limited to the remaining budget; its control-client timeout cannot
 extend that budget, and an unanswered poll counts as busy. Stall diagnostic `status` reads are capped at one
-second and skipped on idle and stop paths. Only a refusal of the `macro.play` call itself (`input_busy`) is
+second. A status poll never extends the step's send window.
+Stall diagnostics are skipped on idle and stop paths. Only a refusal of the `macro.play` call itself (`input_busy`) is
 retried once after idle; a failure after the macro was accepted stops as delivery unknown. Accumulated waits over
 one second and dispatch rejections
 are stall events, carrying `kind`, `step`, `seconds`, `why`, `last_bridge_line`, and `utc`; idle waits also carry
