@@ -468,6 +468,39 @@ diagnostic literals and whole dotted values are not keys. `ssbu.ui` reads its
 block writer and the pause helper when available; values of `screen` and
 `focus.source` are not keys. Without `block`, dotted string literals are keys
 unless a provider sets `whole_literals: false`, as the `bridge` provider does.
+
+Without `block`, a key the source builds in a format string, such as
+`writeln!(out, "cpu.{entry}.ai_thinks={count}")`, is accepted for the values the
+gate can read from the loop that binds each `{name}`:
+
+- a range, `for lane in 2..=3`;
+- a list written out in the loop header, `for (key, value) in [("step", a),
+  ("score", b)]`: the strings at that place;
+- the index of `.enumerate()`, after an optional `.skip(n)`, over such a list
+  or over an array the function declares with its length, `thinks: [u64;
+  CPU_ENTRIES]`.
+
+A number is one written out or the one integer `const` of that name in the
+file. So with `CPU_ENTRIES = 8` and `.skip(1)` the gate accepts `cpu.1.ai_thinks`
+to `cpu.7.ai_thinks` and refuses `cpu.0`, `cpu.8` and `cpu.04`. Placeholders
+bound by the same loop are taken together, pass by pass: a loop over
+`[("player", "left"), ("partner", "right")]` writing `{group}.{kind}` gives
+`player.left` and `partner.right` only. Placeholders of different loops combine.
+
+A template writes no key when the gate cannot show which values reach the
+write:
+
+- a placeholder bound any other way (a function parameter, a slice, another
+  iterator adapter);
+- a `mut` binding;
+- a loop with a `break`, `continue` or `return` in it;
+- the name used inside its loop before the key is written (a condition on it,
+  arithmetic, a new binding).
+
+The G2 error for a read of that shape names the template, its line and the
+reason. A `{name:…}` format or a positional `{}` in a key is not read as a
+template. The gate does not follow which branch runs otherwise: a key written
+under a condition on something else counts as written.
 The packet gate has host tests; it has not been proven in a runtime acceptance.
 
 #### What PASS means

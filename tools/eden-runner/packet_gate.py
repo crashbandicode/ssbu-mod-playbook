@@ -162,6 +162,366 @@ def inputs_identity(base, plan):
     return result.hexdigest()
 
 
+_TEMPLATE_LIMIT = 512
+_TEMPLATE_KEY = r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*'
+_TEMPLATE_NAME = r'[A-Za-z_][A-Za-z0-9_]*'
+_TEMPLATE_INT = r'[iu](?:8|16|32|64|128|size)'
+_TEMPLATE_RAW = re.compile(r'b?r(#*)"')
+_TEMPLATE_CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'")
+_TEMPLATE_MACRO = re.compile(r'\b(write|writeln|format|format_args)!\s*$')
+_TEMPLATE_CHAIN = {'iter': 1, 'into_iter': 1, 'iter_mut': 1, 'copied': 2, 'cloned': 2, 'enumerate': 3, 'skip': 4}
+_TEMPLATE_SHAPE = 'its loop is not over a range, a written-out list or a named array'
+
+
+def _template_lex(text):
+    """Rust source with comments and the insides of string and char literals blanked, offsets kept, and the plain
+    string literals: the offset of the opening quote gives (the offset after the closing quote, the content)."""
+    code = list(text)
+    strings = {}
+    size = len(text)
+    pos = 0
+
+    def blank(start, end):
+        for index in range(start, min(end, size)):
+            if code[index] != '\n':
+                code[index] = ' '
+
+    while pos < size:
+        char = text[pos]
+        word = pos > 0 and (text[pos - 1].isalnum() or text[pos - 1] == '_')
+        raw = _TEMPLATE_RAW.match(text, pos) if char in 'br' and not word else None
+        if text.startswith('//', pos):
+            end = text.find('\n', pos)
+            end = size if end < 0 else end
+            blank(pos, end)
+            pos = end
+        elif text.startswith('/*', pos):
+            depth, end = 1, pos + 2
+            while end < size and depth:
+                if text.startswith('/*', end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith('*/', end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            blank(pos, end)
+            pos = end
+        elif raw:
+            end = text.find('"' + raw.group(1), raw.end())
+            end = size if end < 0 else end
+            blank(raw.end(), end)
+            pos = end + 1 + len(raw.group(1))
+        elif char == '"' or (char == 'b' and not word and text.startswith('b"', pos)):
+            quote = pos + (char == 'b')
+            end = quote + 1
+            while end < size and text[end] != '"':
+                end += 2 if text[end] == '\\' else 1
+            if end >= size:
+                blank(quote + 1, size)
+                break
+            if char == '"':
+                strings[quote] = (end + 1, text[quote + 1:end])
+            blank(quote + 1, end)
+            pos = end + 1
+        elif char == "'":
+            literal = _TEMPLATE_CHAR.match(text, pos)
+            if literal:
+                blank(pos + 1, literal.end() - 1)
+                pos = literal.end()
+            else:
+                pos += 1
+        else:
+            pos += 1
+    return ''.join(code), strings
+
+
+def _template_pairs(code):
+    """The offset of the closing bracket of every opening bracket."""
+    close, stack = {}, []
+    for pos, char in enumerate(code):
+        if char in '([{':
+            stack.append(pos)
+        elif char in ')]}' and stack:
+            close[stack.pop()] = pos
+    return close
+
+
+def _template_parts(code, start, end):
+    """The spans of the comma-separated parts of code[start:end], outside any bracket."""
+    parts, depth, last = [], 0, start
+    for pos in range(start, end):
+        char = code[pos]
+        if char in '([{':
+            depth += 1
+        elif char in ')]}':
+            depth -= 1
+        elif char == ',' and depth == 0:
+            parts.append((last, pos))
+            last = pos + 1
+    if code[last:end].strip():
+        parts.append((last, end))
+    return parts
+
+
+def _template_number(token, code):
+    """An integer written out, or the one integer constant of that name in this file; None otherwise."""
+    token = re.sub(r'\s+as\s+' + _TEMPLATE_INT + r'\s*$', '', token.strip())
+    if re.fullmatch(r'[0-9][0-9_]*(?:' + _TEMPLATE_INT + r')?', token):
+        return int(re.match(r'[0-9_]+', token).group(0).replace('_', ''))
+    if not re.fullmatch(_TEMPLATE_NAME, token):
+        return None
+    if len(re.findall(r'\b(?:const|static|let)\s+(?:mut\s+)?' + token + r'\b', code)) != 1:
+        return None
+    constant = re.search(r'\bconst\s+' + token + r'\s*:\s*' + _TEMPLATE_INT
+                         + r'\s*=\s*([0-9][0-9_]*)(?:' + _TEMPLATE_INT + r')?\s*;', code)
+    return int(constant.group(1).replace('_', '')) if constant else None
+
+
+def _template_loops(code, close):
+    """Every `for <pattern> in <expression> { body }` of the blanked code."""
+    loops = []
+    for match in re.finditer(r'\bfor\b', code):
+        pos = match.end()
+        word = None
+        while pos < len(code) and code[pos] not in '{;':
+            if code[pos] in '([' and pos in close:
+                pos = close[pos]
+            elif re.match(r'in\b', code[pos:pos + 3]) and not (code[pos - 1].isalnum() or code[pos - 1] == '_'):
+                word = pos
+                break
+            pos += 1
+        if word is None:
+            continue
+        pos = word + 2
+        while pos < len(code) and code[pos] not in '{;':
+            if code[pos] in '([' and pos in close:
+                pos = close[pos]
+            pos += 1
+        if pos < len(code) and code[pos] == '{' and pos in close:
+            loops.append({'start': match.start(), 'pattern': code[match.end():word], 'expr': (word + 2, pos),
+                          'open': pos, 'close': close[pos]})
+    return loops
+
+
+def _template_path(pattern, name):
+    """Where a loop pattern binds `name`: [] for the name itself, else (index, tuple size) per tuple level; None if
+    the pattern is not that name or a tuple of names holding it."""
+    pattern = pattern.strip()
+    plain = re.fullmatch(r'(?:&\s*)?(?:mut\s+)?(' + _TEMPLATE_NAME + r')', pattern)
+    if plain:
+        return [] if plain.group(1) == name else None
+    if pattern.startswith('(') and _template_pairs(pattern).get(0) == len(pattern) - 1:
+        parts = _template_parts(pattern, 1, len(pattern) - 1)
+        for index, (start, end) in enumerate(parts):
+            path = _template_path(pattern[start:end], name)
+            if path is not None:
+                return [(index, len(parts))] + path
+    return None
+
+
+def _template_string(code, close, strings, start, end, path):
+    """The string written out at `path` of the item code[start:end]; None when that is not a written-out string or
+    the item is not a tuple of the pattern's size."""
+    while start < end and code[start].isspace():
+        start += 1
+    while end > start and code[end - 1].isspace():
+        end -= 1
+    if not path:
+        return strings[start][1] if start in strings and strings[start][0] == end else None
+    if start >= end or code[start] != '(' or close.get(start) != end - 1:
+        return None
+    parts = _template_parts(code, start + 1, end - 1)
+    index, size = path[0]
+    if len(parts) != size:
+        return None
+    return _template_string(code, close, strings, *parts[index], path[1:])
+
+
+def _template_length(base, code, before):
+    """The length of the array `base` as the enclosing function declares it (`base: [T; LEN]`); None otherwise."""
+    start = max((match.start() for match in re.finditer(r'\bfn\b', code[:before])), default=None)
+    if start is None:
+        return None
+    span = code[start:before]
+    if len(re.findall(r'\b' + base + r'\s*:', span)) != 1 or re.search(r'\blet\s+(?:mut\s+)?' + base + r'\b', span):
+        return None
+    declared = re.search(r'\b' + base + r'\s*:\s*(?:&\s*(?:mut\s+)?)?\[[^\[\];]*;([^\[\];]*)\]', span)
+    return _template_number(declared.group(1), code) if declared else None
+
+
+def _template_loop_values(loop, path, name, code, close, strings):
+    """What the loop gives `name`: (values, how to say them) or (None, why they cannot be told)."""
+    start, end = loop['expr']
+    if not path:
+        span = re.fullmatch(r'\s*\(?\s*([A-Za-z0-9_ ]+?)\s*\.\.(=?)\s*([A-Za-z0-9_ ]+?)\s*\)?\s*', code[start:end])
+        if span:
+            low, high = _template_number(span.group(1), code), _template_number(span.group(3), code)
+            if low is None or high is None:
+                return None, 'a bound of its range is not a number or an integer constant of this file'
+            high += 1 if span.group(2) else 0
+            if high - low > _TEMPLATE_LIMIT:
+                return None, f'its range has more than {_TEMPLATE_LIMIT} values'
+            return [str(value) for value in range(low, high)], f'{name} = {low} to {high - 1}'
+    pos = start
+    while pos < end and code[pos].isspace():
+        pos += 1
+    items = base = None
+    if pos < end and code[pos] == '[' and close.get(pos, end) < end:
+        items = _template_parts(code, pos + 1, close[pos])
+        pos = close[pos] + 1
+    else:
+        word = re.compile(_TEMPLATE_NAME).match(code, pos, end)
+        if not word:
+            return None, _TEMPLATE_SHAPE
+        base, pos = word.group(0), word.end()
+    skip, enumerated, stage = 0, False, 0
+    while True:
+        call = re.compile(r'\s*\.\s*([a-z_]+)\s*\(').match(code, pos, end)
+        if not call:
+            break
+        opening = call.end() - 1
+        if close.get(opening, end) >= end:
+            return None, _TEMPLATE_SHAPE
+        method, argument = call.group(1), code[opening + 1:close[opening]]
+        pos = close[opening] + 1
+        order = _TEMPLATE_CHAIN.get(method)
+        if order is None or order <= stage or (method != 'skip' and argument.strip()):
+            return None, f'its loop goes through .{method}() where the gate does not follow it'
+        stage = order
+        if method == 'enumerate':
+            enumerated = True
+        elif method == 'skip':
+            skip = _template_number(argument, code)
+            if skip is None:
+                return None, 'its skip is not a number or an integer constant of this file'
+    if code[pos:end].strip():
+        return None, _TEMPLATE_SHAPE
+    if enumerated:
+        if not path or path[0][1] != 2:
+            return None, f'{name} is not the index or the item of its enumerate'
+        if path[0][0] == 0:
+            if len(path) != 1:
+                return None, f'{name} is not the index or the item of its enumerate'
+            count = len(items) if items is not None else _template_length(base, code, loop['start'])
+            if count is None:
+                return None, f'the length of {base} is not written as an array length in this function'
+            if count - skip > _TEMPLATE_LIMIT:
+                return None, f'its index has more than {_TEMPLATE_LIMIT} values'
+            return [str(value) for value in range(skip, count)], f'{name} = {skip} to {count - 1}'
+        path = path[1:]
+    if items is None:
+        return None, f'the items of {base} are not written out in the loop'
+    values = [_template_string(code, close, strings, *item, path) for item in items[skip:]]
+    if any(value is None for value in values):
+        return None, 'an item of its list is not a written-out string'
+    return values, f'{name} = one of ' + ', '.join(values[:6]) + (', …' if len(values) > 6 else '')
+
+
+def _template_values(name, at, arguments, code, close, strings, loops):
+    """What `name` can hold in a format string at `at`, one value per pass of the loop that binds it: (values, how
+    to say them, that loop) or (None, why they cannot be told, None). Anything that could make the written values
+    differ from the loop's own is refused: the gate does not follow arithmetic, conditions or early exits."""
+    if re.search(r'\b' + name + r'\s*=(?!=)', arguments):
+        return None, f'{name} is a named argument of the macro', None
+    for loop in sorted((loop for loop in loops if loop['open'] < at < loop['close']), key=lambda loop: -loop['open']):
+        if not re.search(r'\b' + name + r'\b', loop['pattern']):
+            continue
+        if re.search(r'\bmut\s+' + name + r'\b', loop['pattern']):
+            return None, f'{name} is a mutable binding', None
+        path = _template_path(loop['pattern'], name)
+        if path is None:
+            return None, f'the loop pattern that binds {name} is not a name or a tuple of names', None
+        if re.search(r'\b(?:break|continue|return)\b', code[loop['open']:loop['close']]):
+            return None, 'its loop can stop or skip a pass (break, continue or return)', None
+        if re.search(r'\b' + name + r'\b', code[loop['open']:at]):
+            return None, f'{name} is used inside its loop before the key is written', None
+        values, said = _template_loop_values(loop, path, name, code, close, strings)
+        return values, said, loop if values is not None else None
+    return None, f'no loop around the key binds {name}', None
+
+
+def _template_keys(text):
+    """Keys a source writes through a format string, such as `cpu.{entry}.ai_thinks`: the keys of every template
+    whose placeholders are bound by a loop the gate can read, and a note per template (the template, its line, what
+    its placeholders hold, or why that cannot be told). A placeholder the gate cannot follow writes no key."""
+    code, strings = _template_lex(text)
+    close = _template_pairs(code)
+    loops = _template_loops(code, close)
+    keys, notes = set(), []
+    for start, (end, content) in sorted(strings.items()):
+        if '{' not in content or '=' not in content:
+            continue
+        opening = max((pos for pos, closing in close.items() if pos < start < closing), default=None)
+        if opening is None or code[opening] != '(':
+            continue
+        macro = _TEMPLATE_MACRO.search(code, max(0, opening - 40), opening)
+        if not macro:
+            continue
+        # The literal must be the format string: the first argument, or the second of write! and writeln!.
+        before = _template_parts(code, opening + 1, start)
+        gap = code[before[-1][1] + 1:start] if before else code[opening + 1:start]
+        if len(before) != (1 if macro.group(1) in ('write', 'writeln') else 0) or gap.strip():
+            continue
+        arguments = code[end:close[opening]]
+        event = re.match(r'^(?:\[[A-Za-z]+\] )?(' + _TEMPLATE_KEY + r') ', content)
+        for match in re.finditer(r'(?:^|\\n| )((?:[a-z0-9_.]|\{' + _TEMPLATE_NAME + r'\})+)=', content):
+            template = match.group(1)
+            names = list(dict.fromkeys(re.findall(r'\{(' + _TEMPLATE_NAME + r')\}', template)))
+            if not names:
+                continue
+            bound, reason = {}, None
+            for name in names:
+                values, detail, loop = _template_values(name, start, arguments, code, close, strings, loops)
+                if values is None:
+                    reason = detail
+                    break
+                bound.setdefault(loop['open'], []).append((name, values, detail))
+            # Placeholders of one loop belong together, pass by pass; only different loops combine.
+            combos, said = [{}], []
+            for group in bound.values() if reason is None else ():
+                if len({len(values) for _, values, _ in group}) != 1:
+                    reason = 'placeholders of one loop give lists of different lengths'
+                    break
+                passes = [{name: values[index] for name, values, _ in group} for index in range(len(group[0][1]))]
+                if len(combos) * len(passes) > _TEMPLATE_LIMIT:
+                    reason = f'it would write more than {_TEMPLATE_LIMIT} keys'
+                    break
+                combos = [{**combo, **one} for combo in combos for one in passes]
+                details = ' and '.join(detail for _, _, detail in group)
+                said.append(details + (', pass by pass' if len(group) > 1 else ''))
+            notes.append((template, text.count('\n', 0, start) + 1, ', '.join(said), reason))
+            if reason is not None:
+                continue
+            for combo in combos:
+                key = re.sub(r'\{(' + _TEMPLATE_NAME + r')\}', lambda found: combo[found.group(1)], template)
+                if re.fullmatch(_TEMPLATE_KEY, key):
+                    keys.add(key)
+                    if event:
+                        keys.add(f'{event.group(1)} {key}')
+    return keys, notes
+
+
+def _template_hint(tree, commit, files, key):
+    """For a refused read: the format-string key it has the shape of, and what that template writes; '' if none."""
+    for path in files:
+        try:
+            text = _git(tree, 'show', f'{commit}:{path}').stdout.decode('utf-8')
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            continue
+        text = re.split(r'(?m)^\s*#\[cfg\(test\)\]\s*$', text, maxsplit=1)[0]
+        for template, line, said, reason in _template_keys(text)[1]:
+            pieces = re.split(r'(\{[^{}]*\})', template)
+            if not any(re.search(r'[a-z0-9_]', piece) for piece in pieces if not piece.startswith('{')):
+                continue
+            shape = ''.join(r'[^.=\s]+' if piece.startswith('{') else re.escape(piece) for piece in pieces)
+            if not re.fullmatch(shape, key):
+                continue
+            if reason is not None:
+                return f'; {path}:{line} writes {template}, but the gate cannot tell its values: {reason}'
+            return f'; {path}:{line} writes {template} with {said}'
+    return ''
+
+
 def _git(tree, *args):
     return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, timeout=20, check=True)
 
@@ -184,6 +544,7 @@ def emitted_keys(tree, commit, files, whole_literals=True):
             if whole_literals and re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+', literal):
                 keys.add(literal)
         keys.update(re.findall(r'\bpush_str\s*\(\s*out\s*,\s*"((?:\\.|[^"\\])*)"', text))
+        keys.update(_template_keys(text)[0])
     keys.discard('schema')
     return keys
 
@@ -594,8 +955,9 @@ def _reads(plan, repos, errors, providers):
                     failed.add(provider)
             if provider in emitted and key not in emitted[provider]:
                 files = ', '.join(source['files'])
+                hint = '' if source.get('block') else _template_hint(repo['tree'], repo['commit'], source['files'], key)
                 errors.append(f'G2 row {row_id}: {read} is not written by {source["repo"]} '
-                              f'{repo["commit"][:8]} ({files})')
+                              f'{repo["commit"][:8]} ({files}){hint}')
     return {provider: sorted(keys) for provider, keys in emitted.items()}
 
 

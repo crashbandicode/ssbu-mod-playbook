@@ -15,6 +15,51 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import packet_gate  # noqa: E402
 
+PRACTICE_STATE = r'''
+writeln!(out, "phase={phase}");
+("wizard.step", fields.wizard_step);
+writeln!(out, "wizard.x={x}\nwizard.y={y}");
+pub const CPU_ENTRIES: usize = 8;
+pub fn snapshot(game: Option<Game>, fields: Fields, thinks: [u64; CPU_ENTRIES], out: &mut String) {
+    for (key, value) in [
+        ("step", fields.step),
+        ("wizard.selection", fields.wizard_selection),
+    ] {
+        if !value.is_empty() {
+            let _ = writeln!(out, "{key}={value}");
+        }
+    }
+    for (key, value) in [("score", fields.score), ("attempt.frames", fields.attempt_frames)] {
+        if let Some(value) = value {
+            let _ = writeln!(out, "{key}={value}");
+        }
+    }
+    for (entry, count) in thinks.into_iter().enumerate().skip(1) {
+        let _ = writeln!(out, "cpu.{entry}.ai_thinks={count}");
+    }
+}
+pub fn lanes(slots: &[u64], name: &str, out: &mut String) {
+    for (slot, value) in slots.iter().enumerate() {
+        let _ = writeln!(out, "slot.{slot}.value={value}");
+    }
+    let _ = writeln!(out, "named.{name}.value=1");
+    for lane in 2..=3 {
+        let _ = writeln!(out, "lane.{lane}.frames={}", 0);
+    }
+    for (group, kind) in [("player", "left"), ("partner", "right")] {
+        let _ = writeln!(out, "{group}.{kind}=1");
+    }
+    for half in ["top", "bottom"] {
+        for edge in ["in", "out"] {
+            let _ = writeln!(out, "{half}.{edge}=1");
+        }
+    }
+    for (rank, medal) in ["gold", "silver"].into_iter().enumerate() {
+        let _ = writeln!(out, "medal.{rank}.{medal}=1");
+    }
+}
+'''
+
 
 class PacketGateTests(unittest.TestCase):
     def setUp(self):
@@ -35,17 +80,16 @@ write!(out, "rows={rows}");
 writeln!(out, "test.only={}", n);
 ''',
             'src/model/record_place.rs': 'writeln!(out, "recording.page.role={}", role);\n',
-            'src/model/practice_state.rs': r'''
-writeln!(out, "phase={phase}");
-("wizard.step", fields.wizard_step);
-writeln!(out, "wizard.x={x}\nwizard.y={y}");
-''',
+            'src/model/practice_state.rs': PRACTICE_STATE,
             'src/model/bridge_events.rs': r'''
 write!(text, "fed p1={} cpu={} run.p1={} run.cpu={} preview={} hides={}", a, b, c, d, e, f);
 write!(text, "hold dir={dir} polls={polls} fires={fires} jump={}");
 write!(text, "room.panel row={row} index={index}");
 write!(text, "room.panel applied partners={partners} behavior={behavior}");
 write!(text, "clip ctx={} total={} in={} out={}");
+for side in ["p1", "cpu"] {
+    write!(text, "seat owner.{side}={}", 1);
+}
 ''',
             'src/proto2.rs': ('writeln!(out, "screen={}", screen);\n'
                               'writeln!(out, "ui.focus={}", focus);\n'),
@@ -73,6 +117,19 @@ write!(text, "clip ctx={} total={} in={} out={}");
 
     def errors(self):
         return packet_gate.check(self.plan, self.base, self.plan)['errors']
+
+    def practice(self, old, new):
+        self.assertIn(old, PRACTICE_STATE)
+        (self.tree / 'src/model/practice_state.rs').write_text(PRACTICE_STATE.replace(old, new))
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', 'practice state')
+        self.plan['target']['plugin']['commit'] = self.git('rev-parse', 'HEAD').stdout.strip()
+
+    def refused(self, read):
+        self.plan['rows'][0]['reads'] = [read]
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn(f'{read} is not written by plugin', errors[0])
+        return errors[0]
 
     def test_inputs_identity_covers_files_and_excludes_runner_writebacks(self):
         identity = getattr(packet_gate, 'inputs_identity', None)
@@ -456,6 +513,138 @@ write!(text, "clip ctx={} total={} in={} out={}");
         self.assertIn('tr.menu:test.only is not written', self.errors()[0])
         self.plan['target']['plugin']['commit'] = '0' * 40
         self.assertTrue(any('commit' in error for error in self.errors()), self.errors())
+
+    def test_a_key_written_through_a_format_string_is_recognised(self):
+        reads = self.plan['rows'][0]
+        reads['reads'] = ['tr.practice:cpu.4.ai_thinks']
+        self.assertEqual(self.errors(), [])
+        reads['reads'] = ['tr.practice:cpu.1.ai_thinks', 'tr.practice:cpu.7.ai_thinks']
+        self.assertEqual(self.errors(), [])
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/practice_state.rs'])
+        self.assertEqual({key for key in keys if key.startswith('cpu.')},
+                         {f'cpu.{entry}.ai_thinks' for entry in range(1, 8)})
+        reads['reads'] = ['tr.practice:cpu.4.ai_thinks', 'tr.practice:cpu.9.ai_thinks']
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('tr.practice:cpu.9.ai_thinks is not written by plugin', errors[0])
+
+    def test_a_format_key_the_build_cannot_write_is_refused(self):
+        for read in ('tr.practice:phaze', 'tr.practice:cpu.ai_thinks', 'tr.practice:cpu.4.ai_blinks',
+                     'tr.practice:cpu.4.ai_thinks.more', 'tr.practice:cpu.x.ai_thinks',
+                     'tr.practice:cpu.0.ai_thinks', 'tr.practice:cpu.8.ai_thinks', 'tr.practice:cpu.04.ai_thinks',
+                     'tr.practice:cpu.-1.ai_thinks', 'tr.practice:cpu.{entry}.ai_thinks'):
+            self.refused(read)
+
+    def test_the_entry_range_follows_the_source(self):
+        reads = self.plan['rows'][0]
+        self.practice('CPU_ENTRIES: usize = 8', 'CPU_ENTRIES: usize = 5')
+        reads['reads'] = ['tr.practice:cpu.1.ai_thinks', 'tr.practice:cpu.4.ai_thinks']
+        self.assertEqual(self.errors(), [])
+        self.assertIn('writes cpu.{entry}.ai_thinks with entry = 1 to 4', self.refused('tr.practice:cpu.5.ai_thinks'))
+        self.practice('.skip(1)', '.skip(3)')
+        reads['reads'] = ['tr.practice:cpu.3.ai_thinks', 'tr.practice:cpu.7.ai_thinks']
+        self.assertEqual(self.errors(), [])
+        self.assertIn('with entry = 3 to 7', self.refused('tr.practice:cpu.2.ai_thinks'))
+        self.practice('.enumerate().skip(1)', '.enumerate()')
+        reads['reads'] = ['tr.practice:cpu.0.ai_thinks', 'tr.practice:cpu.7.ai_thinks']
+        self.assertEqual(self.errors(), [])
+        self.refused('tr.practice:cpu.8.ai_thinks')
+        self.practice('thinks: [u64; CPU_ENTRIES]', 'thinks: &[u64]')
+        self.assertIn('writes cpu.{entry}.ai_thinks, but the gate cannot tell its values',
+                      self.refused('tr.practice:cpu.4.ai_thinks'))
+        self.practice('pub const CPU_ENTRIES: usize = 8;', 'pub const CPU_ENTRIES: usize = entries();')
+        self.refused('tr.practice:cpu.4.ai_thinks')
+        self.practice('for (entry, count) in thinks.into_iter()', 'for (entry, count) in thinks.into_iter().rev()')
+        self.assertIn('.rev()', self.refused('tr.practice:cpu.4.ai_thinks'))
+
+    def test_a_key_named_by_a_written_out_list_is_recognised(self):
+        self.plan['rows'][0]['reads'] = ['tr.practice:step', 'tr.practice:score', 'tr.practice:wizard.selection',
+                                         'tr.practice:attempt.frames']
+        self.assertEqual(self.errors(), [])
+        for read in ('tr.practice:hits', 'tr.practice:key', 'tr.practice:value'):
+            self.refused(read)
+        self.practice('("score", fields.score)', '(SCORE, fields.score)')
+        self.refused('tr.practice:score')
+        self.plan['rows'][0]['reads'] = ['tr.practice:step']
+        self.assertEqual(self.errors(), [])
+
+    def test_a_placeholder_the_gate_cannot_resolve_writes_no_key(self):
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/practice_state.rs'])
+        self.assertEqual({key for key in keys if key.startswith(('slot.', 'named.'))}, set())
+        line = PRACTICE_STATE.split('slot.{slot}')[0].count('\n') + 1
+        self.assertIn(f'; src/model/practice_state.rs:{line} writes slot.{{slot}}.value, '
+                      'but the gate cannot tell its values', self.refused('tr.practice:slot.1.value'))
+        self.assertIn('writes named.{name}.value, but the gate cannot tell its values: '
+                      'no loop around the key binds name', self.refused('tr.practice:named.x.value'))
+        self.plan['rows'][0]['reads'] = ['tr.practice:lane.2.frames', 'tr.practice:lane.3.frames']
+        self.assertEqual(self.errors(), [])
+        self.assertIn('writes lane.{lane}.frames with lane = 2 to 3', self.refused('tr.practice:lane.4.frames'))
+        self.refused('tr.practice:lane.1.frames')
+
+    def test_placeholders_of_one_loop_stay_together(self):
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/practice_state.rs'])
+        # One loop over pairs writes one key per pair, not every combination.
+        self.assertEqual({key for key in keys if key.startswith(('player.', 'partner.'))},
+                         {'player.left', 'partner.right'})
+        self.plan['rows'][0]['reads'] = ['tr.practice:player.left', 'tr.practice:partner.right']
+        self.assertEqual(self.errors(), [])
+        for read in ('tr.practice:player.right', 'tr.practice:partner.left'):
+            self.refused(read)
+        # An index and its item come from the same pass of the loop.
+        self.assertEqual({key for key in keys if key.startswith('medal.')}, {'medal.0.gold', 'medal.1.silver'})
+        self.refused('tr.practice:medal.0.silver')
+        # Two loops, one inside the other, do write every combination.
+        self.assertEqual({key for key in keys if key.startswith(('top.', 'bottom.'))},
+                         {'top.in', 'top.out', 'bottom.in', 'bottom.out'})
+
+    def test_a_mutable_loop_binding_writes_no_key(self):
+        self.practice('for (entry, count) in thinks.into_iter().enumerate().skip(1) {',
+                      'for (mut entry, count) in thinks.into_iter().enumerate().skip(1) {\n        entry += 1;')
+        for read in ('tr.practice:cpu.1.ai_thinks', 'tr.practice:cpu.4.ai_thinks', 'tr.practice:cpu.8.ai_thinks'):
+            self.assertIn('writes cpu.{entry}.ai_thinks, but the gate cannot tell its values: '
+                          'entry is a mutable binding', self.refused(read))
+        self.practice('for lane in 2..=3 {', 'for mut lane in 2..=3 {\n        lane *= 2;')
+        self.assertIn('lane is a mutable binding', self.refused('tr.practice:lane.2.frames'))
+        self.practice('for (key, value) in [("score", fields.score)',
+                      'for (mut key, value) in [("score", fields.score)')
+        self.refused('tr.practice:score')
+        self.plan['rows'][0]['reads'] = ['tr.practice:step', 'tr.practice:phase']
+        self.assertEqual(self.errors(), [])
+
+    def test_a_loop_that_can_stop_or_skip_writes_no_key(self):
+        write = '        let _ = writeln!(out, "lane.{lane}.frames={}", 0);\n'
+        # A pass the loop can skip: the gate cannot tell which lanes reach the write.
+        self.practice('for lane in 2..=3 {', 'for lane in 2..=3 {\n        if lane == 2 { continue; }')
+        for read in ('tr.practice:lane.2.frames', 'tr.practice:lane.3.frames'):
+            self.assertIn('its loop can stop or skip a pass', self.refused(read))
+        # A loop that can stop after a write.
+        self.practice(write, write + '        if done { break; }\n')
+        self.assertIn('its loop can stop or skip a pass', self.refused('tr.practice:lane.3.frames'))
+        # A write under a condition on the placeholder itself.
+        self.practice(write, '        if lane != 2 {\n    ' + write + '        }\n')
+        for read in ('tr.practice:lane.2.frames', 'tr.practice:lane.3.frames'):
+            self.assertIn('lane is used inside its loop before the key is written', self.refused(read))
+        # A condition on something else leaves the keys as they are (the pairs of the practice state).
+        self.plan['rows'][0]['reads'] = ['tr.practice:step', 'tr.practice:score', 'tr.practice:cpu.4.ai_thinks']
+        self.assertEqual(self.errors(), [])
+
+    def test_an_event_line_with_a_format_key_names_its_event(self):
+        self.plan['rows'][0]['reads'] = ['tr.event:seat owner.p1', 'tr.event:seat owner.cpu', 'tr.event:owner.cpu']
+        self.assertEqual(self.errors(), [])
+        keys = packet_gate.emitted_keys(self.tree, self.commit, ['src/model/bridge_events.rs'])
+        self.assertEqual({key for key in keys if 'owner' in key},
+                         {'owner.p1', 'owner.cpu', 'seat owner.p1', 'seat owner.cpu'})
+        self.plan['rows'][0]['reads'] = ['tr.event:seat owner.p2']
+        errors = self.errors()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('tr.event:seat owner.p2 is not written by plugin', errors[0])
+
+    def test_a_hook_read_of_a_format_key_is_checked_against_its_values(self):
+        (self.base / 'steps.py').write_text(
+            'def ok(ctx):\n    values = {}\n    return values["cpu.1.ai_thinks"], values.get("cpu.4.ai_thinks")\n')
+        self.assertEqual(self.errors(), [])
+        (self.base / 'steps.py').write_text('def ok(ctx):\n    values = {}\n    return values["cpu.9.ai_thinks"]\n')
+        self.assertEqual(self.errors(), ['G2 steps.py: reads "cpu.9.ai_thinks", which the target does not write'])
 
     def test_a_row_in_the_wrong_recording_view_is_refused(self):
         self.plan['setup'] = [{'gives': ['recording.role=cpu']}]
@@ -1268,6 +1457,17 @@ fn elsewhere() { write!(out, "outside=1"); }
         expected = set(witness) - {'schema'}
         print('extractor keys not in witness:', sorted(keys - expected))
         self.assertEqual(expected - keys, set())
+
+    @unittest.skipUnless(os.environ.get('PACKET_GATE_TR_TREE')
+                         and os.environ.get('PACKET_GATE_TR_COMMIT', '').startswith('e7667f26'),
+                         'TrainingRooms tree at e7667f26 not supplied')
+    def test_practice_keys_at_install_3(self):
+        keys = packet_gate.emitted_keys(Path(os.environ['PACKET_GATE_TR_TREE']), os.environ['PACKET_GATE_TR_COMMIT'],
+                                        ['src/model/practice_state.rs'])
+        self.assertEqual({key for key in keys if key.startswith('cpu.')},
+                         {f'cpu.{entry}.ai_thinks' for entry in range(1, 8)})
+        self.assertEqual({'step', 'score', 'streak', 'best', 'attempts', 'hits', 'wizard.step', 'last.outcome',
+                          'attempt.frames', 'target.count', 'wizard.value'} - keys, set())
 
     @unittest.skipUnless(os.environ.get('PACKET_GATE_TR_TREE') and os.environ.get('PACKET_GATE_FED_LOG'),
                          'recorded fed witness not supplied')
