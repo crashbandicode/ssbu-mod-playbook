@@ -1535,9 +1535,12 @@ def _wireless_observer(ctx, io, screens, state):
 
 
 def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
+    def dashboard_open(obs):
+        return active(obs, 'main_menu') and obs['ui'].get(DASHBOARD_KEY) == 'open'
+
     def dashboard(obs):
         ui = obs['ui']
-        opened = active(obs, 'main_menu') and ui.get(DASHBOARD_KEY) == 'open'
+        opened = dashboard_open(obs)
         name = ui.get('focus.id')
         if (opened and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
                 and name not in (*DASHBOARD_ABOVE_LOCAL_WIRELESS, DASHBOARD_LOCAL_WIRELESS)):
@@ -1579,7 +1582,7 @@ def _wireless_dashboard_steps(route, available, active, ready_cap=20.0):
 
         def down_done(obs, item=item):
             name = obs['ui'].get('focus.id')
-            return (dashboard(obs) and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
+            return (dashboard_open(obs) and isinstance(name, str) and name.startswith(DASHBOARD_FOCUS)
                     and name != item)
 
         steps.append(closed_loop.Step(f'dashboard-down-{item.removeprefix(DASHBOARD_FOCUS)}',

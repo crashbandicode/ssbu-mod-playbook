@@ -6322,6 +6322,7 @@ class DashboardRouteTests(unittest.TestCase):
                 self.assertEqual(caught.exception.step, 'dashboard-focus')
                 self.assertIn('dashboard.news (index 4)', caught.exception.reason)
                 self.assertEqual(self.io.actions, ['main-menu-down'])
+                self.assertIn(('finish', 'main-menu-down'), self.io.events)
 
     def test_dashboard_transition_without_focus_waits_for_a_ready_read(self):
         for guest in (False, True):
