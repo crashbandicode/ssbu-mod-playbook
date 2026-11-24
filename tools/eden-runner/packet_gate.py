@@ -1454,6 +1454,16 @@ class _PlayModule:
             elif (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                   and self.bound.get(node.targets[0].id) == 1):
                 self.constants[node.targets[0].id] = node.value
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                  and isinstance(node.value, (ast.Tuple, ast.List))
+                  and len(node.targets[0].elts) == len(node.value.elts)
+                  and all(isinstance(target, ast.Name) for target in node.targets[0].elts)
+                  and not any(isinstance(value, ast.Starred) for value in node.value.elts)):
+                # `UP, DOWN = TAP["Up"], TAP["Down"]`: one constant per name.
+                for target, value in zip(node.targets[0].elts, node.value.elts):
+                    if self.bound.get(target.id) == 1:
+                        self.constants[target.id] = value
 
 
 class _PlayReader:
