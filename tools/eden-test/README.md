@@ -25,8 +25,9 @@ Remote `go` also packs each named target commit without modifying its producer
 repository and stages a read-only checkout under the run's owned stage path.
 Hosts keep a commit-addressed cache; subsequent runs hardlink the checkout
 instead of transferring it again. The packet itself is unchanged. Once a run
-no longer needs its target trees, run `eden_test.py unstage-targets --label
-<label>` on that host; this removes the run's trees but retains the cache.
+no longer needs its target trees, run this on that host, replacing `LABEL`
+with the run label; it removes the run's trees but retains the cache:
+`/usr/bin/python3 -I -B /home/intpa/eden-runs/_eden-test/stage/LABEL/tools/eden-test/eden_test.py unstage-targets --label LABEL`.
 Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 Each run gets its own bridge port and its own X display (when the base has a display helper; otherwise the base's display is kept).
 The base names the host's network interface ("network_interface"); go refuses when that interface is missing, down, loopback or has no IPv4 address, unless --no-lobby. Override with `--network-interface <name>`.

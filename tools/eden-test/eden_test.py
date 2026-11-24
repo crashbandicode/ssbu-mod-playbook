@@ -1685,7 +1685,7 @@ def _go_target_ssh(host, mux, remote, timeout):
         raise SystemExit(f'target staging SSH failed: {error}') from error
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
-    return result.returncode, result.stdout
+    return result.returncode, result.stdout, result.stderr
 
 
 def _go_target_rsync(command):
@@ -1758,13 +1758,21 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                 started = time.monotonic()
                 helper = ['/usr/bin/python3', '-I', '-B', script, 'stage-target',
                           '--commit', commit, '--label', args.label]
-                code, _ = _go_target_ssh(host, mux, [*helper, '--probe'], 180)
-                if code not in (0, 4):
-                    raise SystemExit(f'target {label} cache probe failed ({code})')
+                code, output, stderr = _go_target_ssh(host, mux, [*helper, '--probe'], 180)
+                detail = stderr.strip()[-2000:] or 'no stderr'
+                if code:
+                    raise SystemExit(f'target {label} cache probe failed: {detail}')
+                try:
+                    probe = json.loads(output.strip().splitlines()[-1])
+                    if not isinstance(probe, dict) or probe.get('commit') != commit \
+                            or type(probe.get('cached')) is not bool:
+                        raise ValueError('invalid probe receipt')
+                except (ValueError, IndexError, TypeError) as error:
+                    raise SystemExit(f'target {label} cache probe failed: {detail}') from error
                 sent = 0
                 pack_file = None
                 try:
-                    if code == 4:
+                    if not probe['cached']:
                         try:
                             pack = pack_target(target['tree'], commit, pack_dir)
                         except (ValueError, OSError, subprocess.SubprocessError) as error:
@@ -1778,7 +1786,7 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                         if failure:
                             raise SystemExit(f'target {label} pack rsync failed ({failure}): {shlex.join(transfer)}')
                         helper.extend(('--pack', incoming))
-                    code, output = _go_target_ssh(host, mux, helper, 900)
+                    code, output, _ = _go_target_ssh(host, mux, helper, 900)
                 finally:
                     if pack_file is not None:
                         pack_file.unlink(missing_ok=True)
@@ -2023,7 +2031,8 @@ def main(argv=None):
             if args.probe:
                 _target_commit(args.commit)
                 _incoming_target(args.commit, args.label, RUNS, create=True)
-                return 0 if probe_target(args.commit, runs=RUNS) else 4
+                print(json.dumps({'commit': args.commit, 'cached': probe_target(args.commit, runs=RUNS)}))
+                return 0
             print(json.dumps(stage_target(args.commit, args.label, args.pack, runs=RUNS)))
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             raise SystemExit(f'stage-target: {error}') from error
