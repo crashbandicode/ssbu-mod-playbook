@@ -886,7 +886,9 @@ def main(argv=None):
     p.add_argument('--cap', type=float, default=6.0)
     p = sub.add_parser('capture-bridge')
     p.add_argument('run')
-    p.add_argument('--bridge-host', required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument('--bridge-host')
+    source.add_argument('--bridge-files', help="the instance's sdmc ultimate/ssbu-hw-bridge folder (file transport)")
     p.add_argument('--console', required=True)
     args = parser.parse_args(argv)
     if getattr(args, 'bridge_host', None) and ':' not in args.bridge_host:
@@ -908,10 +910,13 @@ def main(argv=None):
     elif args.cmd == 'state':
         print(json.dumps(bridge_state(args.run, [f for f in args.fresh.split(',') if f], args.cap), indent=2))
     elif args.cmd == 'capture-bridge':
-        host, _, port = args.bridge_host.rpartition(':')
         stopping = []
         signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
-        capture_bridge(args.run, host, int(port), args.console, stop=lambda: bool(stopping))
+        if args.bridge_files:
+            capture_bridge_file(args.run, args.bridge_files, args.console, stop=lambda: bool(stopping))
+        else:
+            host, _, port = args.bridge_host.rpartition(':')
+            capture_bridge(args.run, host, int(port), args.console, stop=lambda: bool(stopping))
     else:
         host, _, port = args.log_host.rpartition(':')
         stopping = []

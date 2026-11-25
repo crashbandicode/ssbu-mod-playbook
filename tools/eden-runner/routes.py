@@ -849,6 +849,9 @@ def _setting(ctx, key, value):
     return got.get('value')
 
 
+BRIDGE_FILE_TRANSPORT = 'ultimate/ssbu-hw-bridge/file-transport'
+
+
 def host_network(ctx, interface=None, lan_online=False, ldn_mitm=False):
     if (ctx.call('status') or {}).get('running'):
         raise RuntimeError('host_network runs before game.load: core.network_interface is not changeable at run time')
@@ -871,8 +874,17 @@ def host_network(ctx, interface=None, lan_online=False, ldn_mitm=False):
         readback['core.ldn_mitm'] = 'absent'
     else:
         readback['core.ldn_mitm'] = _setting(ctx, 'core.ldn_mitm', ldn_mitm)
-    return _save(ctx, 'routes-host-network', {'block': 'host_network', 'interface': interface,
-                                              'lan_online': lan_online, 'ldn_mitm': ldn_mitm, 'readback': readback})
+    receipt = {'block': 'host_network', 'interface': interface,
+               'lan_online': lan_online, 'ldn_mitm': ldn_mitm, 'readback': readback}
+    profile = (getattr(ctx, 'instance', None) or {}).get('profile')
+    if lan_online and profile:
+        # Eden refuses every guest listen() under LAN Online, so the bridge is reached through its file transport,
+        # which it selects only when this marker is on the SD card at toggle-on (bridge_on).
+        marker = Path(profile) / 'user' / 'sdmc' / BRIDGE_FILE_TRANSPORT
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        receipt['bridge_file_transport'] = str(marker)
+    return _save(ctx, 'routes-host-network', receipt)
 
 
 def udp_listeners(run=subprocess.run):
@@ -4621,7 +4633,23 @@ def bridge_on(ctx, port=None, cap=60):
     elif str((ctx.call('settings.get', {'key': 'core.use_gdbstub'}) or {}).get('value')).lower() != 'true':
         raise RuntimeError('bridge_on needs a trace run (GDB stub off) or a stub-on run '
                            '(core.use_gdbstub true); this instance is neither')
-    if port is None:
+    # Eden refuses every guest listen() while LAN Online is on (its bsd.cpp ListenImpl), so there the bridge is
+    # reached through its file transport: the marker on the SD card, stream.log out, requests.txt in.
+    files = None
+    if str((ctx.call('settings.get', {'key': 'core.lan_online'}) or {}).get('value')).lower() == 'true':
+        try:
+            marker = instance_path(ctx, 'sdmc:' + BRIDGE_FILE_TRANSPORT)
+        except KeyError:
+            marker = None
+        if marker is None or not marker.is_file():
+            raise RuntimeError('bridge_on: LAN Online is on (core.lan_online true), and Eden refuses every guest '
+                               'listen() there, so the bridge is reachable only through its file transport. The '
+                               f'marker {BRIDGE_FILE_TRANSPORT} is not on this instance\'s SD card: pin it before '
+                               'game.load (host_network with lan_online does it, or a config "files" entry) and '
+                               'boot again. Nothing was pressed.')
+        files = marker.parent
+        port = None
+    elif port is None:
         try:
             port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())
         except (KeyError, OSError, ValueError):
@@ -4629,22 +4657,37 @@ def bridge_on(ctx, port=None, cap=60):
     chord = _bridge_on_cold_enable(ctx, trace) if trace is not None else _bridge_on_stub_enable(ctx, port)
     until = time.monotonic() + 5
     listening = last_listen = None
-    pattern = re.compile(r'\[Bridge\] listening port=' + re.escape(str(port)) + r'\b')
+    pattern = re.compile(r'\[Bridge\] transport=file\b' if files is not None else
+                         r'\[Bridge\] listening port=' + re.escape(str(port)) + r'\b')
     while time.monotonic() < until:
         ctx.check_stop()
         events = _bridge_on_events(ctx)
-        last_listen = next((line for line in reversed(events) if '[Bridge] listen' in line), None)
+        last_listen = next((line for line in reversed(events)
+                            if '[Bridge] listen' in line or '[Bridge] transport=' in line), None)
         listening = next((line for line in reversed(events) if pattern.search(line)), None)
         if listening is not None:
             break
         time.sleep(0.05)
+    if listening is None and files is not None:
+        raise RuntimeError('bridge_on: LAN Online is on and the file-transport marker is pinned, but this Eden\'s '
+                           'bridge did not select its file transport; expected "[Bridge] transport=file" in its own '
+                           f'events log, saw: {last_listen or "no transport line"}. No capture was started.')
+    if listening is None and last_listen and re.search(r'\bcall=listen errno=22\b', last_listen):
+        raise RuntimeError(f'bridge_on: this Eden\'s bridge is not listening on port {port}; '
+                           f'expected "[Bridge] listening port={port}" in its own events log, '
+                           f'saw: {last_listen}. Eden refused the listen call itself, which it does for every guest '
+                           'listener while LAN Online is on, although core.lan_online reads false now: boot with '
+                           f'LAN Online set before game.load and the marker {BRIDGE_FILE_TRANSPORT} pinned, so the '
+                           'bridge uses its file transport. No capture was started.')
     if listening is None:
         raise RuntimeError(f'bridge_on: this Eden\'s bridge is not listening on port {port}; '
                            f'expected "[Bridge] listening port={port}" in its own events log, '
                            f'saw: {last_listen or "no listen line"}. Another process holds the port: '
                            'give the run its own free port (port.txt) and boot again. No capture was started.')
-    listener = _bridge_on_owned_listener(ctx, port) if trace is None else None
-    run = Path(ctx.row_dir).parent / 'bridge-run'
+    listener = _bridge_on_owned_listener(ctx, port) if trace is None and files is None else None
+    # One capture folder per instance on the file transport, so two Edens of one run each have their own.
+    run = Path(ctx.row_dir).parent / ('bridge-run' if files is None else
+                                      'bridge-run-' + re.sub(r'[^A-Za-z0-9_.-]', '_', str(ctx.on)))
     (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
     log = run / 'bridge.log'
     log.touch()
@@ -4664,12 +4707,14 @@ def bridge_on(ctx, port=None, cap=60):
         pid = capture.get('pid')
     else:
         with (run / 'capture.stderr.log').open('ab') as stderr:
+            source = ['--bridge-host', f'127.0.0.1:{port}'] if files is None else ['--bridge-files', str(files)]
             process = subprocess.Popen(
                 [sys.executable, '-I', str(HERE / 'switch_hw.py'), 'capture-bridge', str(run),
-                 '--bridge-host', f'127.0.0.1:{port}', '--console', str(run / 'bridge-console.log')],
+                 *source, '--console', str(run / 'bridge-console.log')],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr, start_new_session=True)
         pid = process.pid
-        capture_path.write_text(json.dumps({'pid': pid, 'port': port, 'instance': ctx.on,
+        capture_path.write_text(json.dumps({'pid': pid, 'port': port,
+                                            'transport': 'socket' if files is None else 'file', 'instance': ctx.on,
                                             'bridge_log': str(log), 'started': time.time()}) + '\n')
     ctx.runner.instances.setdefault(ctx.on, {})['bridge_log'] = str(log)
     text = ''
@@ -4730,6 +4775,7 @@ def bridge_on(ctx, port=None, cap=60):
         'backup_open': bool(backup and re.search(r'\[Bridge\] req backup result=ok(?: |$)', backup)),
         'capture': {'pid': pid, 'port': port, 'bridge_log': str(log)}, 'reused': reused,
         'witness': 'stub-on' if trace is None else 'trace',
+        'transport': 'socket' if files is None else 'file',
     }
     if trace is None:
         receipt.update(listener=listener, title=title)

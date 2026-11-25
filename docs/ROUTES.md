@@ -53,7 +53,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 
 | Block | Starts on | Guarantees on exit |
 | --- | --- | --- |
-| `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them |
+| `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them. With `lan_online` it also pins the bridge's file-transport marker on the instance's SD card |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
 | `wireless_room_list` `{ready_cap}` | Main Menu or Local Wireless room list | reads before each dashboard press and reaches a positively ready room list; stops before ZR when the bridge does not publish `dashboard` |
 | `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; uses the same read-before-press dashboard steps, stops before ZR without `dashboard`, and otherwise resends a lost input at most 3 times or stops on a named step |
@@ -78,7 +78,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release after the fence when tracing |
 | `drill_stop` `{game, cap}` | Guard the Edge running without its wizard | running state changed to 0 and menu closed |
 | `drill_observe` `{attempts, cap, game, perfect, allow_stopped, count}` | named practice game with an armed attempt tracepoint | matching markers, CPU kinds, sequence/frame bounds, and running state |
-| `bridge_on` `{port, cap}` | title-screen trace, stub-on no-input boot, or bridge already on | own listening event before detached capture, greeting and backup reply; stub-on also checks listener ownership and the first active Title prompt when it sends the chord; backup refusal is recorded, not a block failure |
+| `bridge_on` `{port, cap}` | title-screen trace, stub-on no-input boot, or bridge already on | own listening event before detached capture, greeting and backup reply; stub-on also checks listener ownership and the first active Title prompt when it sends the chord; backup refusal is recorded, not a block failure. With LAN Online on it waits for `transport=file` instead and captures the bridge's files (below) |
 | `tr_settings` `{values, file, cap, verify_roster}` | bridge available | set reply, writer and fresh settings readback checked; optional live roster verification |
 | `setup_state` | bridge available | read-only screen, owner, fighters, stage and settings hash |
 | `reach_training` `{p1, cpu, stage, form, cap}` | title, main, Training selects or Training | native-owned Training with the requested stage and fighters; skipped phases and nested receipts recorded; cap defaults to 240 seconds |
@@ -200,6 +200,22 @@ The `lobby-a` press stays 9 frames (commit 2537dd5). Its stated reason, that a 4
 misreading of the early press: both lengths are lost when sent before the picker takes input, and a 4-frame tap sent
 late did reach the fighter select (proof-lobby-17060a5e-3). 9 frames is kept only because it is the length flown in
 every later successful transition; it is not evidence against the 4-frame tap.
+
+**`bridge_on` under LAN Online (2026-11-25).** Eden refuses every guest `listen()` while LAN Online is on
+(`BSD_USA::ListenImpl`, "Automatic mode exposes no guest TCP listeners"), so the bridge's socket cannot exist there:
+its events log reads `[Bridge] listen failed … call=listen errno=22`. The bridge has a file transport for this.
+
+- **The marker** `sdmc:ultimate/ssbu-hw-bridge/file-transport` must be on the instance's SD card before `game.load`.
+  `host_network` with `lan_online` pins it; a packet that sets LAN Online through a pinned qt-config pins it with a
+  config `files` entry.
+- **`bridge_on` reads `core.lan_online`.** When it is true it needs no port, refuses before any input if the marker
+  is missing, waits for `[Bridge] transport=file` in the bridge's own events log, asks `ss` nothing (there is no
+  listener), and starts `switch_hw.py capture-bridge <run> --bridge-files <sd folder>`.
+- **One capture per instance:** the folder is `out/bridge-run-<instance>`, so two Edens of one run each have their
+  own `bridge.log`. The socket transport keeps `out/bridge-run`. Down stops every `out/bridge-run*` capture.
+- The receipt and `capture.json` name the `transport` (`file` or `socket`); `capture.port` is null for files.
+- Requests reach the bridge through `requests.txt`, one batch at a time, and it polls every 20 ms; lines come back
+  through `stream.log`, which Eden flushes when the bridge asks the file's size.
 
 `bridge_on` accepts a trace witness or, on Linux Eden hosts with the stub on, checks boot-default chord readiness,
 running and loading status, no input since `game.load`, and listener ownership before capture. With the stub on, the

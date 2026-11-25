@@ -1473,8 +1473,8 @@ class Runner:
         self._frame_sources = {}
         self.still_records = {}
         self.row_stills_refused = []
-        capture_path = self.out / 'bridge-run' / 'capture.json'
-        if capture_path.is_file():
+        # bridge_on's captures: out/bridge-run (socket), out/bridge-run-<instance> (file transport, one each).
+        for capture_path in sorted(self.out.glob('bridge-run*/capture.json')):
             capture = json.loads(capture_path.read_text())
             instance = capture.get('instance')
             if instance in self.instances and capture.get('bridge_log') and not self.instances[instance].get('bridge_log'):

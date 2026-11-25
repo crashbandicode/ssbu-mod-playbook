@@ -2186,9 +2186,16 @@ def cmd_go(args):
     return code
 
 
-def stop_capture(run):
+def stop_captures(run):
+    """End every detached bridge capture of this run: out/bridge-run (socket) and out/bridge-run-<instance> (the file
+    transport, one per instance)."""
+    results = (stop_capture(run, path.parent) for path in sorted((run / 'out').glob('bridge-run*/capture.json')))
+    return [result for result in results if result]
+
+
+def stop_capture(run, folder=None):
     """End the detached bridge capture `routes:bridge_on` started for this run (out/bridge-run/capture.json)."""
-    folder = run / 'out' / 'bridge-run'
+    folder = folder or run / 'out' / 'bridge-run'
     if not (folder / 'capture.json').is_file():
         return None
     pid = json.loads((folder / 'capture.json').read_text()).get('pid')
@@ -2223,8 +2230,7 @@ def restore_up_config(run):
 def cmd_down(run, keep_state=False):
     restore_up_config(run)
     config = json.loads((run / 'config.json').read_text())
-    capture = stop_capture(run)  # before Eden stops: the capture would otherwise keep reconnecting to a dead port
-    if capture:
+    for capture in stop_captures(run):  # before Eden stops: a capture would otherwise keep reconnecting to a dead port
         print('bridge capture: ' + json.dumps(capture))
     stamp(run, 'down_start')
     # A clean Down copies the files the run wrote to out/post-run-<key>/, then prunes work/ and the state snapshots.
