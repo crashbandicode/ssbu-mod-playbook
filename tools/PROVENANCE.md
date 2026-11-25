@@ -98,7 +98,10 @@ no budget. TrainingRooms rc.8's by-reference change was reported as two new refu
 `Refusals` (four new cases).
 
 On 2026-11-25 `check/compliance.py` accepts an HTTPS forge media blob URL for a
-committed regular MP4 under `docs/media/` and keeps relative sources valid.
+committed regular MP4 under `docs/media/` and keeps relative sources valid. It
+now requires a resolving committed source, checks blob URLs against the
+repository's own origin and reports missing attributes and encoding as
+advisory notes.
 Tests: `test_compliance.py` `PublicationMedia`.
 
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills

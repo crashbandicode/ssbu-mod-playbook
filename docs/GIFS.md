@@ -2,16 +2,19 @@
 
 ## Documentation and tutorial MP4s
 
-Capture at 1920×1080 and keep the whole screen readable. Use one short MP4
-per behavior. Trim it to the action and keep it loop-friendly and at most
-10 seconds. For a plugin that removes something, record the same route
-with and without the plugin so the clips show the before and after.
+A clip is legible and shows the effect. Use one short MP4 per behavior,
+trimmed to the action, loop-friendly and about 10 seconds at most. Main
+clips are about 1280×720. Name a close-up that makes a small detail readable
+`<name>-zoom.mp4` and use whatever size makes the detail readable. For a
+plugin that removes something, record the same route with and without the
+plugin so the clips show the before and after.
 
-Encode from the original video with H.264 (`libx264`, `yuv420p`), scaling to
-1280×720 with Lanczos. Keep the source frame rate, including 60 fps when
-gameplay was recorded at 60 fps. Use CRF 23–24, the `slow` preset,
-`+faststart` and no audio track. Adjust the in-point and duration in this
-example to the action.
+Capture at 1920×1080 when possible, keeping the whole screen readable. For
+a main clip, the recommended encode uses H.264 (`libx264`, `yuv420p`),
+scaling to 1280×720 with Lanczos. Keep the source frame rate, including
+60 fps when gameplay was recorded at 60 fps. Use CRF 23–24, the `slow`
+preset, `+faststart` and no audio track. Adjust the in-point and duration
+in this example to the action.
 
 ```powershell
 ffmpeg -ss 2 -i /path/to/capture.mp4 -t 6 -map 0:v:0 -vf 'scale=1280:720:flags=lanczos' -fps_mode passthrough -c:v libx264 -pix_fmt yuv420p -crf 23 -preset slow -movflags +faststart -an /path/to/repo/docs/media/demo.mp4
@@ -20,16 +23,18 @@ ffmpeg -ss 2 -i /path/to/capture.mp4 -t 6 -map 0:v:0 -vf 'scale=1280:720:flags=l
 Save the clip under `docs/media/` and embed it with a one-line caption
 that gives the date and build. Forgejo does not play a `<video>` whose
 `src` is a relative path: it serves the file page instead of the video.
-Use the forge's media URL of the committed clip's blob as `src`:
+Use this repository's forge media URL of the committed clip's blob as `src`:
 `https://<forge>/<owner>/<repo>/media/blob/<blob id>`. Get the id with
 `git ls-tree HEAD docs/media/demo.mp4` after committing the clip. The id
-changes when the clip's bytes change, so update the `src` with the clip.
+changes when the clip's bytes change, so update the `src` with the clip. A
+relative `src` to a committed clip also resolves for renderers that support it.
 
 Forgejo's sanitizer strips `muted`, `loop` and `playsinline`. Keep all five
-attributes for other renderers; `controls` is what a reader on the forge
-gets. Add a relative "Open the clip" link under the caption; adjust its
-path for other pages. The compliance check still accepts a relative `src`
-for renderers that resolve it.
+attributes for other renderers; `controls` lets a viewer press play when
+autoplay is blocked. Add a relative "Open the clip" link under the caption;
+adjust its path for other pages. The video check fails only when a `<video>`
+does not resolve. Missing attributes, size, frame rate, codec, fast start,
+audio and length are reported as notes.
 
 ```html
 <video src="https://git.example.com/owner/repo/media/blob/<blob id>" autoplay muted loop playsinline controls></video>

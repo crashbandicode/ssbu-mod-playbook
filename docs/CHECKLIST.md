@@ -202,16 +202,19 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
 
 ## Evidence and docs
 
-- **M** The README has one paragraph, a captioned full-screen demo, the
-  install path, the build commands, a license line and the AI-assistance
-  disclaimer. Give the date and build in the caption. Use MP4 for docs and
-  tutorials with H.264 (`libx264`, `yuv420p`), 1280×720 Lanczos-downscaled
-  from 1080p, source frame rate (60 fps for gameplay captured at 60 fps),
-  CRF 23–24, `slow`, `+faststart`, no audio and at most 10 s. Embed with
-  `<video src="https://<forge>/<owner>/<repo>/media/blob/<blob id>" autoplay
-  muted loop playsinline controls>` (the id of the committed clip; Forgejo
-  does not play a relative `src`) and add a relative "Open the clip" link;
-  see [GIFS](GIFS.md).
+- **M** The README has one paragraph, a captioned full-screen demo (a
+  resolving demo video or a committed preview image), the install path,
+  the build commands, a license line and the AI-assistance disclaimer.
+  Give the date and build in the caption. Docs and tutorial clips are MP4,
+  legible and show the effect. Each `<video>` must resolve: use this
+  repository's forge media blob URL of the committed clip and add a relative
+  "Open the clip" link; Forgejo does not play a relative `src`. Keep
+  `autoplay`, `muted`, `loop`, `playsinline` and `controls`; `controls` lets
+  a viewer press play when autoplay is blocked. Missing attributes are
+  notes. Guidance, reported as notes rather than failures: H.264 `yuv420p`,
+  main clips about 1280×720 from 1080p, close-ups (`-zoom.mp4`) at the size
+  that makes the detail readable, source frame rate, CRF 23–24, `slow`,
+  `+faststart`, no audio and about 10 s at most; see [GIFS](GIFS.md).
   Use GIF only where an image is required. Keep README GIF previews 1280
   pixels wide and under 10 s, with at least 12 fps for gameplay and 10 fps
   for menus, or the actual source rate if lower. Never use keyframe-only
