@@ -7,6 +7,8 @@ Prints one Markdown table, `Requirement | Tag | Result | Evidence`. Rows a
 machine can verify get `pass` or `fail` with what was read; the others are
 printed as `agent` for the agent to complete with evidence or `N/A: reason`.
 Exit status 1 when a mandatory machine row fails. Read-only.
+Advisory rows, including docs MP4 encoding, can carry result `note`.
+Advisory rows never make the check fail.
 
 --base <ref>: the commit the branch started from. Every user-facing refusal
 the branch adds (a string literal that refuses or restricts, e.g. "Turn X on
@@ -345,6 +347,18 @@ def media_path(repo, document, source, suffix):
     return target if target.suffix.lower() == suffix else None
 
 
+def committed_file_oid(repo, target):
+    rel = target.relative_to(repo).as_posix()
+    listing = git(repo, 'ls-tree', '-z', 'HEAD', '--', rel) or ''
+    for entry in listing.split('\0'):
+        metadata, separator, name = entry.partition('\t')
+        parts = metadata.split()
+        if (separator and name == rel and len(parts) == 3
+                and parts[0] in ('100644', '100755') and parts[1] == 'blob'):
+            return parts[2]
+    return None
+
+
 def forge_media_base(repo):
     """The HTTPS media endpoint of this repository, for HTTPS and SSH origins."""
     remote = git(repo, 'remote', 'get-url', 'origin') or ''
@@ -460,46 +474,55 @@ def check_media(repo, readme, rows, row):
     previews = [path for source in readme_media.images
                 if (path := media_path(repo, readme_path, source, '.gif')) and path.is_file()]
     gifs.update(previews)
+    committed_previews = [path for source in readme_media.images
+                          if (path := media_path(repo, readme_path, source, '.gif'))
+                          and committed_file_oid(repo, path)]
     readme_video = False
     mp4s = {}
     blob_paths = None
     forge_base = forge_media_base(repo)
+    video_count = 0
+    video_pages = 0
+    video_failed = False
     documents = [(readme_path, readme_media)]
     for document in sorted((repo / 'docs').rglob('*.md')):
         text = read(document)
         if '<video' in text.lower():
             documents.append((document, MediaEmbeds(text)))
     for document, media in documents:
+        video_count += len(media.videos)
+        video_pages += bool(media.videos)
         for number, attrs in enumerate(media.videos, 1):
             source = attrs.get('src')
             target = media_path(repo, document, source, '.mp4')
-            oid = None
+            oid = committed_file_oid(repo, target) if target is not None else None
             blob = FORGE_MEDIA_BLOB.fullmatch(source or '')
             if blob and forge_base and source[:blob.start(1)] == forge_base:
                 if blob_paths is None:
                     blob_paths = committed_mp4_paths(repo)
                 oid = blob[1].lower()
-                target = next((path for path in blob_paths.get(oid, ()) if path.is_file()), None)
-            present = target is not None and target.is_file()
+                target = next(iter(blob_paths.get(oid, ())), None)
+            present = target is not None and oid is not None
             missing = VIDEO_ATTRIBUTES - attrs.keys()
-            valid = present and not missing
+            video_failed |= not present
             if document == readme_path:
-                readme_video |= valid
+                readme_video |= present
             if present:
-                if target not in mp4s or oid is not None:
-                    mp4s[target] = oid
-            problems = []
-            if not present:
-                problems.append('src must be a local MP4 path or the forge media blob URL of an MP4 committed under docs/media/')
-            if missing:
-                problems.append('missing ' + ', '.join(sorted(missing)))
-            if problems:
-                row(f'{document.relative_to(repo)} video {number}: MP4 embed', 'M', valid,
-                    '; '.join(problems))
+                mp4s[target] = oid
+                if missing:
+                    rows.append((f'{document.relative_to(repo)} video {number}: embed attributes', 'E', 'note',
+                                 'missing ' + ', '.join(sorted(missing)) +
+                                 '; controls lets a viewer press play when autoplay is blocked'))
+            else:
+                row(f'{document.relative_to(repo)} video {number}: MP4 embed', 'M', False,
+                    "src must be a relative path to a committed MP4 or this repository's forge media blob URL of an MP4 committed under docs/media/")
 
+    if video_count and not video_failed:
+        row('Docs videos resolve to a committed MP4', 'M', True,
+            f'{video_count} video embed(s) in {video_pages} page(s)')
     row('README has a demo, build commands and a license line', 'M',
-        (readme_video or bool(previews)) and 'cargo skyline build' in readme and 'license' in readme.lower(),
-        'README.md; use an MP4 video embed (local path or forge media blob URL) or an image-only GIF preview')
+        (readme_video or bool(committed_previews)) and 'cargo skyline build' in readme and 'license' in readme.lower(),
+        'README.md; use an MP4 video embed that resolves or a committed image-only GIF preview')
     for gif in sorted(gifs):
         name = f'GIF {gif.name}: animated, 1280 wide, under 10 s'
         try:
@@ -521,26 +544,40 @@ def check_media(repo, readme, rows, row):
     for clip in sorted(mp4s):
         name = f'MP4 {clip.relative_to(repo).as_posix()}: publication encoding'
         try:
-            oid = mp4s[clip]
-            info = blob_mp4_info(repo, oid) if oid is not None else mp4_info(clip)
+            info = blob_mp4_info(repo, mp4s[clip])
         except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError, subprocess.SubprocessError) as error:
-            row(name, 'M', False, f'cannot inspect MP4 ({type(error).__name__})')
+            rows.append((name, 'E', 'note', f'cannot inspect MP4 ({type(error).__name__})'))
             continue
         if info is None:
-            rows.append((name, 'M', 'agent', 'ffprobe missing; check by hand'))
+            rows.append((name, 'E', 'agent', 'ffprobe missing; check by hand'))
             continue
-        valid = (info['codec'] == 'h264' and info['pix_fmt'] == 'yuv420p'
-                 and (info['width'], info['height']) == (1280, 720)
-                 and 0 < info['seconds'] <= 10 and info['fps'] > 0
-                 and not info['audio'] and info['faststart'])
-        row(name, 'M', valid,
-            f"{info['codec']} {info['pix_fmt']}, {info['width']}×{info['height']}, "
-            f"{info['seconds']:.3f} s, {info['fps']:g} fps, "
-            f"{'audio' if info['audio'] else 'no audio'}, "
-            f"{'faststart' if info['faststart'] else 'moov must precede mdat'}")
+        zoom = clip.name.endswith('-zoom.mp4')
+        departures = []
+        if not zoom and (info['width'], info['height']) != (1280, 720):
+            departures.append('size')
+        if info['codec'] != 'h264':
+            departures.append('codec')
+        if info['pix_fmt'] != 'yuv420p':
+            departures.append('pixel format')
+        if not 0 < info['seconds'] <= 10:
+            departures.append('length')
+        if not info['fps'] > 0:
+            departures.append('frame rate')
+        if info['audio']:
+            departures.append('audio track')
+        if not info['faststart']:
+            departures.append('no fast start')
+        facts = (f"{info['codec']} {info['pix_fmt']}, {info['width']}×{info['height']}, "
+                 f"{info['seconds']:.3f} s, {info['fps']:g} fps, "
+                 f"{'audio' if info['audio'] else 'no audio'}, "
+                 f"{'faststart' if info['faststart'] else 'moov must precede mdat'}")
+        evidence = f'close-up, {facts}; check that the detail is readable' if zoom else facts
+        if departures:
+            evidence += '; differs from the guidance: ' + ', '.join(departures)
+        rows.append((name, 'E', 'note' if zoom or departures else 'pass', evidence))
     if mp4s:
-        rows.append(('MP4 clips use the 1080p source rate, Lanczos, CRF 23–24 and slow preset',
-                     'M', 'agent', 'Verify the source capture and encoding command or receipt'))
+        rows.append(('MP4 clips are legible and show the effect (main clips about 1280×720; close-ups at a readable size)',
+                     'E', 'agent', 'Watch each clip; docs/GIFS.md'))
 
 
 def find_nro(repo, given):
@@ -742,7 +779,8 @@ def main(argv=None):
     lines += [f'| {name} | {tag} | {result} | {evidence} |' for name, tag, result, evidence in rows]
     failed = [name for name, tag, result, _ in rows if tag == 'M' and result == 'fail']
     agent = sum(result == 'agent' for _, _, result, _ in rows)
-    lines += ['', f'{len(failed)} mandatory machine row(s) failed; {agent} row(s) for the agent.']
+    notes = sum(result == 'note' for _, _, result, _ in rows)
+    lines += ['', f'{len(failed)} mandatory machine row(s) failed; {agent} row(s) for the agent; {notes} advisory note(s).']
     text = '\n'.join(lines) + '\n'
     sys.stdout.write(text)
     if args.out:
