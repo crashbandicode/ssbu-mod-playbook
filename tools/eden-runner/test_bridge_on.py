@@ -1386,6 +1386,21 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(json.loads(prior.read_text()), first)
         self.assertFalse((self.out / 'bridge-run').exists())
 
+    def test_bridge_on_with_the_marker_but_lan_online_off_refuses_before_any_input(self):
+        # The bridge selects its file transport by the marker alone; with LAN Online off this call drives the socket.
+        self.configure_stub()
+        marker = Path(self.instance['profile']) / MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        with self.assertRaises(RuntimeError) as error:
+            self.invoke(port=6980)
+        text = str(error.exception)
+        self.assertIn('file-transport', text)
+        self.assertIn('core.lan_online', text)
+        self.assertNotIn('Another process holds the port', text)
+        self.assertFalse(any(name == 'input.button' for name, _ in self.calls))
+        self.assertEqual(self.popen, [])
+
     def test_bridge_on_refuses_listening_on_another_port_before_reuse(self):
         other = '382602979 [Bridge] listening port=6978 rebinds=0'
         self.events.write_text('\n'.join((FAIL_BOOT, FAIL_READY, other, FAIL_ON)) + '\n')
