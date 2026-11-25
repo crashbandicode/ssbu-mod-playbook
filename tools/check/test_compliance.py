@@ -372,6 +372,19 @@ class PublicationMedia(unittest.TestCase):
             'commit', '-q', '-m', 'fixture preview')
         self.assertEqual(self.rows(repo)[demo][0], 'pass')
 
+    def test_a_local_alias_does_not_publish_an_mp4_or_preview(self):
+        for suffix in ('mp4', 'gif'):
+            with self.subTest(suffix=suffix):
+                url = f'docs/media/alias.{suffix}'
+                repo = self.repo(self.video(url) if suffix == 'mp4' else f'![Preview]({url})')
+                self.committed_asset(repo, f'docs/media/published.{suffix}')
+                (repo / url).symlink_to(f'published.{suffix}')
+                with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+                    rows = self.rows(repo)
+                self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'fail')
+                if suffix == 'mp4':
+                    self.assertEqual(rows['README.md video 1: MP4 embed'][0], 'fail')
+
     def test_committed_clip_resolves_after_worktree_deletion_in_both_forms(self):
         repo = self.repo('')
         original = b'committed clip'
