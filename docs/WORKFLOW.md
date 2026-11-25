@@ -258,7 +258,8 @@ freed about 106 GB.
   below 60 GB (`disk_floor_bytes`).
 - **Standing cleanup rule** (proposed 2026-11-16, after the Yoga and XPS sweep; operator: "we shouldn't be out of
   space if we've been cleaning up properly"):
-  - **Run folders** (`/home/intpa/eden-runs/<label>`): once Down has pruned the copies, the folder still holds
+  - **Run folders** (`/home/intpa/eden-runs/<label>`): once Down has pruned the copies and removed the run's
+    stage copy and bound raw recordings ([EDEN](EDEN.md), "Down"; 2026-11-25), the folder still holds
     `out/`, the receipts and `post-run-*`. Delete it when **all** of these hold:
     - its release is proven (RESULTS `released=True`, or a ledger RELEASED for its lifecycle token);
     - it is at least 6 h old;

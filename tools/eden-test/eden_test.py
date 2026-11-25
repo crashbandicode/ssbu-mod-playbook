@@ -1425,6 +1425,7 @@ def results_md(run, config):
     lines += [one_line(f'- Down: cleanup_failures={journal.get("cleanup_failures")}, released={journal.get("released")}{pending}; '
                        + '; '.join(unit_results(run)), 240),
               one_line(f'- Prune: {prune_summary(run, journal)}', 240),
+              *([_cleanup_line(run)] if (run / 'out' / CLEANUP_RECEIPT).is_file() else []),  # written by down
               f'- Harvest: {harvest_summary(run)}',
               f'- Timing: up {up_seconds:.0f} s, rows {rows_seconds:.0f} s over '
               f'{max(len(runs), 1)} run call(s), down {down_seconds:.0f} s; '
@@ -2227,6 +2228,300 @@ def restore_up_config(run):
     return aside
 
 
+CLEANUP_RECEIPT = 'down-cleanup.json'
+_PATH_NAME_CHAR = r'[A-Za-z0-9._+-]'
+_HIDDEN_PROCESSES = ('sshd-session', 'ssh-agent', '(sd-pam)')
+_USER_MANAGERS = ('systemd', '/usr/lib/systemd/systemd', '/lib/systemd/systemd')
+
+
+def _names_path(text, path):
+    """True when text names `path` itself or something under it (not a longer name that only starts the same)."""
+    return re.search(re.escape(str(path)) + rf'(?!{_PATH_NAME_CHAR})', text) is not None
+
+
+def _json_strings(node):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _json_strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _json_strings(value)
+
+
+def _present(path):
+    """True when the path is there, False when it is not; an entry that cannot be examined raises OSError."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+def _pinning_files(run, runs):
+    """The files through which another run can need a path: every other run's configs and Up-time journal, the host's
+    shared base, and the bases other labels keep in their stage folders. A folder that cannot be listed raises."""
+    for name in sorted(os.listdir(runs)):
+        entry = runs / name
+        if name == '_eden-test' or entry.is_symlink() or not entry.is_dir() or entry == run:
+            continue
+        yield entry / 'config.json'
+        yield from (entry / other for other in sorted(os.listdir(entry))
+                    if other.startswith('config.after-up.') and other.endswith('.json'))
+        yield entry / 'state' / 'lifecycle.json'
+    yield runs / '_eden-test' / 'base.json'
+    stage = runs / '_eden-test' / 'stage'
+    if _present(stage):
+        for label in sorted(os.listdir(stage)):
+            other = stage / label
+            if label != run.name and other.is_dir() and not other.is_symlink():
+                yield from (other / name for name in sorted(os.listdir(other)) if name.endswith('.json'))
+
+
+def _process_reason(paths, proc=Path('/proc')):
+    """Why a live process of this user, other than this Down and its ancestors, keeps one of `paths`: it names one in
+    its command line, sits in one, or has a file open in one; or it cannot be inspected and is not one of the
+    processes the kernel hides (the rule of remote-gate.ps1 -Action Done). None when no process keeps them."""
+    skip, pid = set(), os.getpid()
+    while pid > 1 and pid not in skip:
+        skip.add(pid)
+        try:
+            status = (proc / str(pid) / 'status').read_text()
+            pid = int(re.search(r'^PPid:\s+(\d+)', status, re.M).group(1))
+        except (OSError, AttributeError, ValueError):
+            break
+    uid, foreign_children, managers = os.getuid(), set(), []
+    for entry in sorted(proc.iterdir(), key=lambda item: item.name):
+        if not entry.name.isdigit() or int(entry.name) in skip:
+            continue
+        try:
+            mine = entry.stat().st_uid == uid
+            status = (entry / 'status').read_text()
+        except OSError:
+            if entry.is_dir():
+                return f'process {entry.name} cannot be read'
+            continue
+        name = (re.search(r'^Name:\s+(.*)$', status, re.M) or [None, ''])[1].strip()
+        parent = (re.search(r'^PPid:\s+(\d+)', status, re.M) or [None, ''])[1]
+        if not mine:
+            foreign_children.add(parent)
+            continue
+        states, targets = {}, []
+        for link in ('cwd', 'exe'):
+            try:
+                targets.append(os.readlink(entry / link))
+                states[link] = 'read'
+            except PermissionError:
+                states[link] = 'hidden'
+            except (FileNotFoundError, ProcessLookupError):
+                states[link] = 'absent'
+            except OSError:
+                states[link] = 'unknown'
+        fd_states = set()
+        try:
+            for fd in os.listdir(entry / 'fd'):
+                try:
+                    targets.append(os.readlink(entry / 'fd' / fd))
+                    fd_states.add('read')
+                except PermissionError:
+                    fd_states.add('hidden')
+                except (FileNotFoundError, ProcessLookupError):
+                    fd_states.add('absent')
+                except OSError:
+                    fd_states.add('unknown')
+        except OSError:
+            fd_states.add('unlisted')
+        try:
+            raw = (entry / 'cmdline').read_bytes().decode('utf-8', errors='surrogateescape')
+            argv = (raw[:-1] if raw.endswith('\0') else raw).split('\0')
+        except OSError:
+            argv = None
+        if not entry.is_dir():
+            continue  # it ended while it was read
+        for path in paths:
+            text = str(path)
+            if any(target == text or target.startswith(text + '/') for target in targets) \
+                    or (argv is not None and _names_path(' '.join(argv), path)):
+                return f'process {entry.name} ({name}) uses {path}'
+        if states['cwd'] == states['exe'] == 'read' and fd_states <= {'read', 'absent'} and argv is not None:
+            continue
+        zombie = re.search(r'^State:\s+Z', status, re.M) is not None
+        try:
+            fd_owner = (entry / 'fd').stat().st_uid
+        except OSError:
+            fd_owner = -1
+        manager = (name == 'systemd' and argv is not None and len(argv) in (2, 3) and argv[0] in _USER_MANAGERS
+                   and argv[1] == '--user' and (len(argv) == 2 or re.fullmatch(r'--deserialize=[0-9]+', argv[2]))
+                   and parent == '1' and states['cwd'] == states['exe'] == 'hidden' and fd_states == {'hidden'})
+        if manager:
+            managers.append(entry.name)
+        elif argv is None or not (zombie or (name in _HIDDEN_PROCESSES and fd_owner == 0)):
+            return f'process {entry.name} ({name}) cannot be inspected'
+    for manager in managers:
+        if manager in foreign_children:
+            return f'a child of the service manager {manager} belongs to another user and cannot be inspected'
+    return None
+
+
+class _DownGuard:
+    """What must stay after a Down because another run may need it. Anything that cannot be read keeps everything."""
+
+    def __init__(self, run, runs, claims, own_token=None, proc=Path('/proc')):
+        self.run, self.runs, self.proc, self.blocked, self.files, self.keep = run, runs, proc, None, [], []
+        self.claims, tokens, labels = [], set(), set()
+        current = runs
+        try:
+            for current in _pinning_files(run, runs):
+                if _present(current):
+                    data = json.loads(current.read_text())
+                    self.files.append((current, list(_json_strings(data))))
+                    if current.name == 'lifecycle.json' and isinstance(data, dict) and isinstance(data.get('token'), str):
+                        tokens.add(data['token'])
+                    if current.name == 'config.json':
+                        labels.add(current.parent.name)
+            current = runs / '.keep'
+            if _present(current):
+                self.keep = [line.strip() for line in current.read_text().splitlines()
+                             if line.strip() and not line.lstrip().startswith('#')]
+        except (OSError, ValueError) as error:
+            self.blocked = f'cannot read {getattr(error, "filename", None) or current}: {type(error).__name__}'
+        if isinstance(claims, str):
+            self.blocked = self.blocked or claims
+            return
+        # An open claim is a run that may be using anything here. It is covered when its run was read above (by its
+        # lifecycle token, or by its label with a readable config); any other open claim keeps everything.
+        for line in claims:
+            token = re.search(r'\blifecycle=([A-Za-z0-9_-]+)', line)
+            if token and token[1] == own_token:
+                continue
+            named = [found[1] for found in (re.search(r'CLAIMED:\s*\S+\s+\S+/([A-Za-z0-9][\w.-]*)', line),
+                                            re.search(r'\brun\s+([A-Za-z0-9][\w.-]*)', line)) if found]
+            if not ((token and token[1] in tokens) or any(name in labels for name in named)):
+                self.blocked = self.blocked or f'an open ledger claim is not matched to a run here: {one_line(line, 150)}'
+
+    def reason(self, path):
+        """Why `path` is kept, or None when nothing found needs it."""
+        if self.blocked:
+            return self.blocked
+        text = str(path)
+        for name in self.keep:
+            if name == self.run.name or (name.startswith('/') and (_names_path(name, path)
+                                                                   or text.startswith(name.rstrip('/') + '/'))):
+                return f'{self.runs / ".keep"} lists {name}'
+        for source, strings in self.files:
+            for value in strings:
+                above = len(value) > 1 and value.startswith('/') and text.startswith(value.rstrip('/') + '/')
+                if _names_path(value, path) or above:
+                    return f'{source} names {value if len(value) <= 120 else value[:117] + "..."}'
+        try:
+            return _process_reason([path], self.proc)
+        except OSError as error:
+            return f'cannot read the processes: {type(error).__name__}'
+
+
+def _gif_receipts(node):
+    if isinstance(node, dict):
+        if isinstance(node.get('gif'), dict):
+            yield node['gif']
+        for value in node.values():
+            yield from _gif_receipts(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _gif_receipts(value)
+
+
+def raw_captures(run):
+    """(raw capture, None) for each Eden recording out/<row>/*.capture.gif that the receipt of its own row binds to a
+    published clip which is there with the recorded sha256; (raw capture, why it is kept) for every other one."""
+    out, bound = run / 'out', {}
+    for receipt in sorted(out.glob('*.json')):
+        row = out / receipt.stem
+        if receipt.is_symlink() or row.is_symlink() or not row.is_dir():
+            continue
+        try:
+            data = json.loads(receipt.read_text())
+        except (OSError, ValueError):
+            continue
+        for info in _gif_receipts(data):
+            name = info.get('capture')
+            if isinstance(name, str) and name and Path(name).name == name:
+                bound.setdefault(row / name, []).append(info)
+    for raw in sorted(out.glob('*/*.capture.gif')):
+        if raw.is_symlink() or not raw.is_file() or os.path.realpath(raw) != str(raw):
+            yield raw, 'not a plain file in a plain row folder'
+            continue
+        reason = 'no receipt of its own row binds it to a published clip'
+        for info in bound.get(raw, []):
+            clip = Path(str(info.get('path') or ''))
+            try:
+                verified = (clip.is_absolute() and not clip.is_symlink() and clip.is_file() and clip != raw
+                            and os.path.realpath(clip) == str(clip) and sha256(clip) == info.get('sha256'))
+            except OSError:
+                verified = False
+            if verified:
+                reason = None
+                break
+            reason = f'its published clip {clip} is missing or differs from the recorded sha256'
+        yield raw, reason
+
+
+def _open_claims(run, config):
+    """The ledger's open claim lines for this host, read (never written) through the lifecycle's own reader."""
+    info = _lifecycle_module.Ledger(config['ledger'], config['host'], config['owner'], '0' * 32,
+                                    config.get('ledger_ssh'), state_dir=run / 'state').inspect()
+    lines = info.get('open') if isinstance(info, dict) else None
+    if not isinstance(lines, list):
+        raise ValueError('the ledger read returned no claim list')
+    return [str(line) for line in lines]
+
+
+def _unclean_down(journal, claims=()):
+    """Why this Down is not a clean one (nothing is then removed), or None."""
+    if not journal or journal.get('phase') != 'down':
+        return 'the lifecycle journal does not say down'
+    if journal.get('release_pending'):
+        return 'the ledger release is pending'
+    if not journal.get('released') and journal.get('claimed') is not False:
+        return 'the claim is not released'
+    if journal.get('cleanup_failures'):
+        return 'the lifecycle reported cleanup failures'
+    token = journal.get('token')
+    if isinstance(claims, (list, tuple)) and token and any(f'lifecycle={token}' in line for line in claims):
+        return 'the ledger still shows this run\'s claim open'
+    return None
+
+
+def cleanup_summary(run):
+    """RESULTS.md's Cleanup line, from out/down-cleanup.json."""
+    path = run / 'out' / CLEANUP_RECEIPT
+    if not path.is_file():
+        return 'not run'
+    record = json.loads(path.read_text())
+    if record.get('skipped'):
+        return f'not run: {record["skipped"]}'
+    size = sum(item['bytes'] for item in record['removed'])
+    removed = ', '.join(item['what'] for item in record['removed']) or 'nothing'
+    kept = '; '.join(f'{item["what"]} ({item["reason"]})' for item in record['kept'])
+    return f'removed {removed} ({size / 10 ** 9:.1f} GB)' + (f'; KEPT {kept}' if kept else '') \
+        + f'; receipt out/{CLEANUP_RECEIPT}'
+
+
+def _cleanup_line(run):
+    return one_line(f'- Cleanup: {cleanup_summary(run)}', 240)
+
+
+def _save_cleanup(run, record):
+    (run / 'out').mkdir(parents=True, exist_ok=True)
+    record['disk_free'] = shutil.disk_usage(run).free
+    (run / 'out' / CLEANUP_RECEIPT).write_text(json.dumps(record, indent=2) + '\n')
+
+
+def _path_bytes(path):
+    return path.lstat().st_size if path.is_symlink() or not path.is_dir() else _target_size(path)[1]
+
+
 def cmd_down(run, keep_state=False):
     restore_up_config(run)
     config = json.loads((run / 'config.json').read_text())
@@ -2234,7 +2529,56 @@ def cmd_down(run, keep_state=False):
         print('bridge capture: ' + json.dumps(capture))
     stamp(run, 'down_start')
     # A clean Down copies the files the run wrote to out/post-run-<key>/, then prunes work/ and the state snapshots.
-    code = lifecycle(run, 'down', '--evidence-dir', str(run / 'out'), *(['--keep-state'] if keep_state else []))
+    # The first call stops Eden and releases the claim with the lifecycle's own --keep-state, so nothing is pruned
+    # before the check for what another run needs; the second call lets the lifecycle prune.
+    evidence = ('--evidence-dir', str(run / 'out'))
+    code = lifecycle(run, 'down', *evidence, '--keep-state')
+    journal_path = run / 'state' / 'lifecycle.json'
+    read_journal = lambda: json.loads(journal_path.read_text()) if journal_path.is_file() else {}
+    record = {'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'label': config.get('label'), 'skipped': None,
+              'removed': [], 'kept': []}
+    guard, pruned = None, False
+    keep = lambda what, path, reason: record['kept'].append({'what': what, 'path': str(path), 'reason': reason})
+    if keep_state:
+        record['skipped'] = '--keep-state'
+    elif code != 0:
+        record['skipped'] = f'lifecycle down failed ({code})'
+    else:
+        try:
+            claims = _open_claims(run, config)
+        except Exception as error:  # noqa: BLE001 - whatever stops the read, the answer is the same: keep
+            claims = f'cannot read the ledger: {type(error).__name__}'
+        record['skipped'] = _unclean_down(read_journal(), claims)
+    if not record['skipped']:
+        new_guard = lambda: _DownGuard(run, RUNS, claims, read_journal().get('token'))
+        guard = new_guard()
+        copies = [path for path in (run / 'work', *sorted((run / 'state').glob('snapshot-*')),
+                                    *sorted((run / 'state').glob('post-run-*'))) if path.is_symlink() or path.exists()]
+        held = [(path, reason) for path in copies if (reason := guard.reason(path))]
+        for path, reason in held:
+            keep(f'{path.relative_to(run)}/', path, reason)
+        if not held:
+            sizes = [(path, _path_bytes(path)) for path in copies]
+            prune_code = lifecycle(run, 'down', *evidence)
+            done = (read_journal().get('prune') or {}).get('done')
+            pruned = prune_code == 0 and bool(done)
+            for path, size in sizes:
+                if not pruned:
+                    keep(f'{path.relative_to(run)}/', path, f'the lifecycle did not prune (exit {prune_code}); see RESULTS')
+                elif not path.exists():
+                    record['removed'].append({'what': f'{path.relative_to(run)}/', 'path': str(path), 'bytes': size})
+        # Nothing more goes unless the lifecycle's own prune ran and finished: a held copy or a failed prune means
+        # Down has to run again, from the same folders.
+        stop = None if pruned else ('a copy of this run is kept' if held else f'the lifecycle did not prune (exit {prune_code})')
+        for raw, reason in raw_captures(run):
+            reason = stop or reason or guard.reason(raw)
+            what = f'raw capture {raw.relative_to(run / "out")}'
+            if reason:
+                keep(what, raw, reason)
+            else:
+                size = raw.stat().st_size
+                raw.unlink()
+                record['removed'].append({'what': what, 'path': str(raw), 'bytes': size})
     stamp(run, 'down_done')
     done = subprocess.run([sys.executable, '-B', '-I', str(HARVEST), str(run / 'rows' / 'rows.json'),
                            '--label', config['label'], '--out', str(run / 'out')], capture_output=True, text=True)
@@ -2243,11 +2587,35 @@ def cmd_down(run, keep_state=False):
     timing = json.loads(timing_path.read_text())
     timing['split'] = time_split(run)
     timing_path.write_text(json.dumps(timing, indent=2) + '\n')
+    _save_cleanup(run, record)
     results_md(run, config)
     (run / 'REPORT.md').write_text(report_md(run))
     if code != 0:
         raise SystemExit(f'lifecycle down failed ({code}); the claim stays held; see {run / "lifecycle-down.log"}')
-    journal_path = run / 'state' / 'lifecycle.json'
+    if guard:
+        # Last, because a remote Down runs from this folder: the stage copy, with whatever was put into it.
+        try:
+            stage = None
+            if _present(RUNS / '_eden-test' / 'stage' / str(config['label'])):
+                _target_label(config['label'])
+                stage = _owned_target_directory(RUNS, ('_eden-test', 'stage', config['label']))
+            if stage is not None:
+                reason = None if pruned else f'Down has to run again from it: {stop}'
+                reason = reason or new_guard().reason(stage)  # read again: time has passed since the prune
+                if reason:
+                    keep('stage copy', stage, reason)
+                else:
+                    size = _path_bytes(stage)
+                    _remove_target_tree(stage)
+                    record['removed'].append({'what': 'stage copy', 'path': str(stage), 'bytes': size})
+                _save_cleanup(run, record)
+                results = run / 'RESULTS.md'
+                results.write_text(''.join(_cleanup_line(run) + '\n' if line.startswith('- Cleanup: ') else line
+                                           for line in results.read_text().splitlines(keepends=True)))
+        except (ValueError, OSError) as error:
+            keep('stage copy', RUNS / '_eden-test' / 'stage' / str(config.get('label')), f'not removed: {error}')
+            _save_cleanup(run, record)
+        print(f'Cleanup: {cleanup_summary(run)}')
     if journal_path.is_file():
         journal = json.loads(journal_path.read_text())
         if journal.get('release_pending'):

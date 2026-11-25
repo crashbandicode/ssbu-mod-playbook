@@ -84,6 +84,11 @@ Rows continue after a failure; a row whose recovery fails is FAILED without runn
 Rerun one row: `eden_test.py run /home/intpa/eden-runs/my-run --rows r02a`.
 Refresh the report: `eden_test.py report /home/intpa/eden-runs/my-run`.
 Down: `eden_test.py down /home/intpa/eden-runs/my-run` (also printed in the report).
+A clean Down removes the run's `work/`, state snapshots, its stage copy `_eden-test/stage/<label>/` and the raw
+recordings its own row receipts bind to a verified published clip. It keeps `out/`, the pruned `state/` and
+anything another run may need, and lists what it kept, with the reason, in `out/down-cleanup.json` and the
+`Cleanup:` line of RESULTS.md ([EDEN](../../docs/EDEN.md), "Down"). After it, the staged copy of this tool is
+gone: run `report` and later commands from a playbook clone.
 If local cleanup succeeds while the ledger is unreachable, Down succeeds and
 reports the pending receipt's last line and the settle unit, if started. The claim stays open until
 settlement; running Down again completes settlement when the ledger returns.

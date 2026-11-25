@@ -374,6 +374,26 @@ repeat Down on the Ally. Pending releases are not pruned.
 `work/`, `state/snapshot-*` and `state/post-run-*` are deleted, with the bytes in RESULTS.md's `Prune:` line;
 `--keep-state` keeps them, only when asked. Up refuses below 60 GB free (`disk_floor_bytes`; it was 40 GB).
 
+**`eden_test.py down` also cleans up what the run no longer needs** (2026-11-25), unless another run may need it:
+
+- **What goes:** `work/` and the state snapshots (the lifecycle's prune, as above), the run's stage copy
+  `_eden-test/stage/<label>/` with whatever was put into it, and each raw recording `out/<row>/*.capture.gif`
+  whose own row receipt names it and a published clip that is there with the recorded sha256.
+- **What stays:** `out/`, the pruned `state/` (journal, logs, `run.json`, `memory.peak`), `inputs/`, `rows/`, the
+  reports, and everything outside the run: shared `_` packages, the host's `base.json`, the target cache,
+  `eden-assets`, the games.
+- **Checked before anything is pruned:** Down first stops Eden and releases the claim with the lifecycle's own
+  `--keep-state`. A copy is then kept when another run's `config.json`, `config.after-up.*.json` or
+  `state/lifecycle.json`, the shared base, or a base in another label's stage folder names it, something under
+  it or a folder above it; when `~/eden-runs/.keep` lists the label or the path; when a process uses it; or when
+  the ledger has an open claim that is not matched to a run folder on this host. A file, folder, ledger or
+  process that cannot be read keeps everything. Only when nothing is kept does a second lifecycle Down prune.
+- **After a kept copy or a failed prune** nothing else is removed: Down has to run again, from the same folders.
+- **The stage copy goes last,** because a remote Down runs from `stage/<label>/tools`.
+- **The receipt** is `out/down-cleanup.json` (each path removed with its bytes, each path kept with its reason),
+  with one `Cleanup:` line in RESULTS.md. Films made another way (OBS, `ffmpeg`) are not the runner's: delete them
+  by hand. Proof: host tests only (`test_eden_test.py`); no live Down has run this yet.
+
 **AppImage backing processes must outlive Eden's main process.** lr-09's
 group-wide SIGTERM removed its FUSE mount while Eden still ran, producing
 main-process SIGBUS and a LAN helper Go fault. Shared lifecycle guest units

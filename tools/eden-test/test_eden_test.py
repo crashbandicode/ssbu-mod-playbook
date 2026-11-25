@@ -1163,10 +1163,47 @@ class EdenTestTests(unittest.TestCase):
         interface_check = mock.patch.object(eden_test, 'host_interface_problem', return_value=None, create=True)
         self.interface_check = interface_check.start()
         self.addCleanup(interface_check.stop)
+        # Down's cleanup reads the ledger and this machine's processes; these fixtures have neither.
+        self.open_claims = []
+        claims = mock.patch.object(eden_test, '_open_claims', side_effect=lambda run, config: list(self.open_claims), create=True)
+        claims.start()
+        self.addCleanup(claims.stop)
+        self.process_reason = None
+        processes = mock.patch.object(eden_test, '_process_reason', side_effect=lambda paths, proc=None: self.process_reason, create=True)
+        processes.start()
+        self.addCleanup(processes.stop)
 
     def tearDown(self):
         eden_test.LIFECYCLE, eden_test.RUNNER, eden_test.HARVEST, eden_test.RUNS = self.saved
+        subprocess.run(['chmod', '-R', 'u+rwx', str(self.dir)], check=False)
         shutil.rmtree(self.dir)
+
+    def pruning_lifecycle(self, fail_prune=False):
+        """A lifecycle whose Up makes the run's copies and whose Down removes them unless told --keep-state."""
+        source = FAKE_LIFECYCLE.replace(
+            "    (state / 'instances.json')",
+            "    work = Path(config['work_root']) / 'profiles' / 'profile-a'; work.mkdir(parents=True, exist_ok=True)\n"
+            "    (work / 'save.bin').write_text('profile'); (state / 'snapshot-a').mkdir(exist_ok=True)\n"
+            "    (state / 'snapshot-a' / 'f').write_text('snapshot')\n"
+            "    (state / 'instances.json')")
+        source = source.replace(
+            "    elif '--evidence-dir' in sys.argv:\n",
+            "    elif '--evidence-dir' in sys.argv:\n"
+            "        import shutil\n"
+            + ("        (state / 'lifecycle.json').write_text(json.dumps(j)); sys.exit(7)\n" if fail_prune else '')
+            + "        shutil.rmtree(config['work_root'], ignore_errors=True); shutil.rmtree(state / 'snapshot-a', ignore_errors=True)\n")
+        self.assertIn('snapshot-a', source)
+        self.assertIn('shutil.rmtree', source)
+        eden_test.LIFECYCLE.write_text(source)
+
+    def up_run(self, label='lr-14'):
+        eden_test.main(['new', '--from', str(self.previous), '--label', label, '--rows', str(self.rows)])
+        run = self.dir / 'runs' / label
+        eden_test.main(['up', str(run)])
+        return run
+
+    def cleanup(self, run):
+        return json.loads((run / 'out' / 'down-cleanup.json').read_text())
 
     def args(self, *extra):
         return ['--from', str(self.previous), '--label', 'lr-14', '--rows', str(self.rows), *extra]
@@ -3334,6 +3371,413 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(json.loads((run / 'config.json').read_text()), up_config)
         self.assertEqual(json.loads(aside.read_text())['owner'], 'edited after Up')
         self.assertIsNone(eden_test.restore_up_config(run))  # nothing to do the second time
+
+    # --- Down cleanup: the run's own copies go, anything another run may need stays and is listed -------------------
+
+    def stage_copy(self, label='lr-14'):
+        stage = eden_test.RUNS / '_eden-test' / 'stage' / label
+        (stage / 'tools' / 'eden-test').mkdir(parents=True)
+        (stage / 'tools' / 'eden-test' / 'eden_test.py').write_text('staged tool')
+        (stage / 'base.probe.json').write_text('{}')  # a file a lane put there by hand
+        return stage
+
+    def test_down_removes_work_and_the_stage_copy_and_keeps_out_and_state(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        other_stage = self.stage_copy('other-label')
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())
+        self.assertFalse((run / 'state/snapshot-a').exists())
+        self.assertFalse(stage.exists())
+        self.assertTrue(other_stage.is_dir())
+        self.assertTrue((eden_test.RUNS / '_eden-test/base.json').is_file())
+        # The receipts stay where they are: the journal in state/, the run's files in out/.
+        self.assertTrue(json.loads((run / 'state/lifecycle.json').read_text())['released'])
+        self.assertEqual((run / 'out/post-run-a/run.log').read_text(), 'run bytes')
+        log = (run / 'lifecycle-down.log').read_text()
+        self.assertEqual(log.count('$ '), 2)
+        self.assertLess(log.index('--keep-state'), log.rindex('$ '))  # the first call prunes nothing
+        self.assertNotIn('--keep-state', log[log.rindex('$ '):])
+        record = self.cleanup(run)
+        self.assertIsNone(record['skipped'])
+        self.assertEqual(record['kept'], [])
+        self.assertEqual([item['what'] for item in record['removed']], ['work/', 'state/snapshot-a/', 'stage copy'])
+        self.assertTrue(all(item['bytes'] > 0 for item in record['removed']))
+        results = (run / 'RESULTS.md').read_text()
+        self.assertIn('- Cleanup: removed work/, state/snapshot-a/, stage copy (0.0 GB); receipt out/down-cleanup.json', results)
+        self.assertIn('- Prune: 2.0 GB freed', results)
+        self.assertLessEqual(len(results.splitlines()), 20)
+        eden_test.main(['down', str(run)])  # a repeated Down finds its journal and removes nothing new
+        self.assertEqual(self.cleanup(run)['removed'], [])
+        eden_test.main(['report', str(run)])
+
+    def test_down_does_not_prune_work_that_another_run_pins(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        pinned = run / 'work/profiles/profile-a/save.bin'
+        second = json.loads(self.previous.read_text())
+        second['instances'][0]['files'] = [{'path': str(pinned), 'sha256': sha(pinned), 'to': 'user/save.bin'}]
+        other = eden_test.RUNS / 'second-run'
+        other.mkdir()
+        (other / 'config.json').write_text(json.dumps(second))
+        eden_test.main(['down', str(run)])
+        self.assertEqual(pinned.read_text(), 'profile')  # never pruned: the check ran before the lifecycle's prune
+        self.assertTrue((run / 'state/snapshot-a/f').is_file())
+        self.assertTrue(stage.is_dir())
+        self.assertEqual((run / 'lifecycle-down.log').read_text().count('$ '), 1)
+        self.assertTrue(json.loads((run / 'state/lifecycle.json').read_text())['released'])
+        record = self.cleanup(run)
+        self.assertEqual(record['removed'], [])
+        kept = {item['what']: item['reason'] for item in record['kept']}
+        self.assertIn(f'{other / "config.json"} names {pinned}', kept['work/'])
+        self.assertIn('Down has to run again from it', kept['stage copy'])
+        self.assertIn('KEPT work/', (run / 'RESULTS.md').read_text())
+        # The pin is gone: the next Down prunes and removes the stage copy.
+        (other / 'config.json').unlink()
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())
+        self.assertFalse(stage.exists())
+
+    def test_down_keeps_a_copy_under_a_folder_another_run_names(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        other = eden_test.RUNS / 'second-run'
+        other.mkdir()
+        (other / 'config.json').write_text(json.dumps({'source': str(run)}))  # an ancestor of every copy
+        eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work/profiles/profile-a/save.bin').is_file())
+        self.assertIn('names ' + str(run), self.cleanup(run)['kept'][0]['reason'])
+        (other / 'config.json').write_text(json.dumps({'source': str(run) + '-2/work'}))  # another run's name: no pin
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())
+
+    def test_down_leaves_a_shared_input_package_of_a_second_run(self):
+        self.pruning_lifecycle()
+        package = eden_test.RUNS / '_shared-inputs'
+        package.mkdir()
+        shared = package / 'plugin.nro'
+        shared.write_bytes(b'shared nro')
+        base = json.loads(self.previous.read_text())
+        base['instances'][0]['plugins'] = [{'path': str(shared), 'sha256': sha(shared)}]
+        self.previous.write_text(json.dumps(base))
+        first, second = self.up_run('first-run'), self.up_run('second-run')
+        stage = self.stage_copy('first-run')
+        eden_test.main(['down', str(first)])
+        self.assertFalse((first / 'work').exists())
+        self.assertFalse(stage.exists())
+        self.assertEqual(shared.read_bytes(), b'shared nro')
+        self.assertTrue((second / 'work/profiles/profile-a/save.bin').is_file())  # the second run is still Up
+        self.assertTrue((second / 'state/snapshot-a/f').is_file())
+        self.assertEqual(self.cleanup(first)['kept'], [])
+        self.assertFalse(any('_shared-inputs' in item['path'] for item in self.cleanup(first)['removed']))
+        eden_test.main(['check', str(second), '--skip-setup-plan'])  # its pins still verify
+
+    def test_down_keeps_a_stage_copy_another_run_pins_and_lists_it(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        other = eden_test.RUNS / 'second-run'
+        other.mkdir()
+        (other / 'config.json').write_text(json.dumps({'from': str(stage / 'base.probe.json')}))
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())  # nothing names the run's own copies
+        self.assertTrue((stage / 'base.probe.json').is_file())
+        self.assertTrue((stage / 'tools/eden-test/eden_test.py').is_file())
+        kept = self.cleanup(run)['kept']
+        self.assertEqual([item['what'] for item in kept], ['stage copy'])
+        self.assertIn(str(other / 'config.json'), kept[0]['reason'])
+        self.assertIn('KEPT stage copy', (run / 'RESULTS.md').read_text())
+
+    def test_down_keeps_everything_when_it_cannot_read_another_runs_config(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        other = eden_test.RUNS / 'second-run'
+        other.mkdir()
+        for broken in ('not json', None):
+            with self.subTest(broken=broken):
+                if broken is None:
+                    (other / 'config.json').unlink()
+                    (other / 'config.json').symlink_to(other / 'missing.json')  # present, but it cannot be read
+                else:
+                    (other / 'config.json').write_text(broken)
+                eden_test.main(['down', str(run)])
+                self.assertTrue((run / 'work/profiles/profile-a/save.bin').is_file())
+                self.assertTrue(stage.is_dir())
+                record = self.cleanup(run)
+                self.assertEqual(record['removed'], [])
+                self.assertIn(f'cannot read {other / "config.json"}', record['kept'][0]['reason'])
+        (other / 'config.json').unlink()
+        os.chmod(other, 0)  # a run folder that cannot be listed
+        try:
+            eden_test.main(['down', str(run)])
+            self.assertTrue((run / 'work').is_dir())
+            self.assertIn('cannot read', self.cleanup(run)['kept'][0]['reason'])
+        finally:
+            os.chmod(other, 0o755)
+
+    def test_down_keeps_paths_named_in_keep_file_or_used_by_a_process(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        keep = eden_test.RUNS / '.keep'
+        keep.write_text('# kept for the review\nlr-14\n')
+        eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work').is_dir())
+        self.assertIn(f'{keep} lists lr-14', self.cleanup(run)['kept'][0]['reason'])
+        keep.unlink()
+        keep.mkdir()  # present, but not a readable list
+        eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work').is_dir())
+        self.assertIn(f'cannot read {keep}', self.cleanup(run)['kept'][0]['reason'])
+        keep.rmdir()
+        self.process_reason = 'process 4242 (sleep) uses the path'
+        eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work').is_dir())
+        self.assertTrue(stage.is_dir())
+        self.assertEqual(self.cleanup(run)['kept'][0]['reason'], 'process 4242 (sleep) uses the path')
+        self.process_reason = None
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())
+        self.assertFalse(stage.exists())
+
+    def test_down_keeps_everything_for_an_unmatched_or_unreadable_ledger(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        journal = json.loads((run / 'state/lifecycle.json').read_text())
+        journal['token'] = 'a' * 32
+        (run / 'state/lifecycle.json').write_text(json.dumps(journal))
+        own = f'2026-11-25T22:00:00+00:00 CLAIMED: OpenCode x/y host=yoga lifecycle={"a" * 32} Eden lifecycle admitted'
+        foreign = '2026-11-25T22:01:00+00:00 CLAIMED: Claude other/elsewhere-01 host=yoga lifecycle=' + 'b' * 32
+        self.open_claims = [own]  # the ledger still shows this run: not a clean Down
+        eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work').is_dir())
+        self.assertIn("still shows this run's claim open", self.cleanup(run)['skipped'])
+        self.open_claims = [foreign]  # a run whose folder is not here: nothing is known of what it uses
+        eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work').is_dir())
+        self.assertTrue(stage.is_dir())
+        self.assertIn('an open ledger claim is not matched to a run here', self.cleanup(run)['kept'][0]['reason'])
+        other = eden_test.RUNS / 'elsewhere-01'  # the same claim, with its run readable here and not naming us
+        other.mkdir()
+        (other / 'config.json').write_text(json.dumps({'label': 'elsewhere-01'}))
+        with mock.patch.object(eden_test, '_open_claims', side_effect=OSError('ledger unreachable')):
+            eden_test.main(['down', str(run)])
+            self.assertTrue((run / 'work').is_dir())
+            self.assertIn('cannot read the ledger', self.cleanup(run)['kept'][0]['reason'])
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())
+        self.assertFalse(stage.exists())
+
+    def test_down_removes_nothing_more_after_a_failed_prune(self):
+        for copies in (True, False):
+            with self.subTest(copies=copies):
+                label = 'with-copies' if copies else 'no-copies'
+                self.pruning_lifecycle()
+                run = self.up_run(label)
+                stage = self.stage_copy(label)
+                if not copies:  # a run with nothing left to prune still needs the lifecycle's own word
+                    shutil.rmtree(run / 'work')
+                    shutil.rmtree(run / 'state/snapshot-a')
+                raw = run / 'out/r1/hit.1.capture.gif'
+                raw.parent.mkdir(parents=True)
+                raw.write_bytes(b'raw')
+                clip = run / 'out/r1/hit.gif'
+                clip.write_bytes(b'clip')
+                (run / 'out/r1.json').write_text(json.dumps({'status': 'PASS', 'steps': [
+                    {'gif': {'capture': raw.name, 'path': str(clip), 'sha256': sha(clip)}}]}))
+                self.pruning_lifecycle(fail_prune=True)
+                eden_test.main(['down', str(run)])
+                self.assertTrue(raw.is_file())
+                self.assertTrue(stage.is_dir())
+                self.assertEqual((run / 'work').is_dir(), copies)
+                record = self.cleanup(run)
+                self.assertEqual(record['removed'], [])
+                reasons = {item['what']: item['reason'] for item in record['kept']}
+                self.assertIn('the lifecycle did not prune (exit 7)', reasons['raw capture r1/hit.1.capture.gif'])
+                self.assertIn('the lifecycle did not prune (exit 7)', reasons['stage copy'])
+
+    def test_down_removes_a_raw_capture_only_when_its_own_row_binds_it_to_a_verified_clip(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        out = run / 'out'
+        outside = self.dir / 'repo/docs/media'
+        outside.mkdir(parents=True)
+
+        def capture(row, name, clip=None, digest=None, receipt=True):
+            raw = out / row / f'{name}.123.capture.gif'
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_bytes(b'raw ' + name.encode())
+            if receipt:
+                info = {'capture': raw.name, 'path': str(clip), 'sha256': digest or (sha(clip) if clip.is_file() else '0' * 64)}
+                rows = json.loads((out / f'{row}.json').read_text()) if (out / f'{row}.json').exists() else {'steps': []}
+                rows['steps'].append({'gif': info})
+                (out / f'{row}.json').write_text(json.dumps(rows))
+            return raw
+
+        published = outside / 'hit.gif'
+        published.write_bytes(b'published')
+        bound = capture('r1', 'hit', published)
+        row_clip = out / 'r1/menu.gif'
+        row_clip.write_bytes(b'menu clip')
+        bound_in_row = capture('r1', 'menu', row_clip)
+        missing = capture('r2', 'gone', outside / 'gone.gif')
+        changed = capture('r2', 'changed', published, digest='1' * 64)
+        unbound = capture('r3', 'unbound', receipt=False)
+        (out / 'r3.json').write_text(json.dumps({'steps': [{'gif': {'path': str(published), 'sha256': sha(published)}}]}))
+        # Row r4's receipt names the capture file of row r5: another row's good clip proves nothing.
+        other_row = capture('r5', 'other', receipt=False)
+        (out / 'r4').mkdir()
+        (out / 'r4.json').write_text(json.dumps({'steps': [
+            {'gif': {'capture': other_row.name, 'path': str(published), 'sha256': sha(published)}}]}))
+        linked_clip_dir = self.dir / 'repo/linked'
+        linked_clip_dir.symlink_to(outside)
+        via_link = capture('r6', 'vialink', linked_clip_dir / 'hit.gif')
+        real_row = self.dir / 'elsewhere-row'
+        real_row.mkdir()
+        (real_row / 'x.123.capture.gif').write_bytes(b'raw x')
+        (out / 'r7').symlink_to(real_row)  # a row folder that is a link
+        (out / 'r7.json').write_text(json.dumps({'steps': [
+            {'gif': {'capture': 'x.123.capture.gif', 'path': str(published), 'sha256': sha(published)}}]}))
+        eden_test.main(['down', str(run)])
+        self.assertFalse(bound.exists())
+        self.assertFalse(bound_in_row.exists())
+        self.assertEqual(published.read_bytes(), b'published')
+        self.assertEqual(row_clip.read_bytes(), b'menu clip')
+        for raw in (missing, changed, unbound, other_row, via_link, real_row / 'x.123.capture.gif'):
+            self.assertTrue(raw.is_file(), raw)
+        record = self.cleanup(run)
+        removed = [item['what'] for item in record['removed']]
+        self.assertIn('raw capture r1/hit.123.capture.gif', removed)
+        self.assertIn('raw capture r1/menu.123.capture.gif', removed)
+        reasons = {item['what']: item['reason'] for item in record['kept']}
+        self.assertIn('missing or differs', reasons['raw capture r2/gone.123.capture.gif'])
+        self.assertIn('missing or differs', reasons['raw capture r2/changed.123.capture.gif'])
+        self.assertIn('no receipt of its own row', reasons['raw capture r3/unbound.123.capture.gif'])
+        self.assertIn('no receipt of its own row', reasons['raw capture r5/other.123.capture.gif'])
+        self.assertIn('missing or differs', reasons['raw capture r6/vialink.123.capture.gif'])
+        self.assertIn('not a plain file in a plain row folder', reasons['raw capture r7/x.123.capture.gif'])
+
+    def test_down_cleanup_opens_read_only_stage_trees_without_following_links(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        outside = self.dir / 'outside-cache'
+        outside.mkdir()
+        (outside / 'kept.txt').write_text('cache')
+        target = stage / 'targets' / ('a' * 40)
+        (target / 'src').mkdir(parents=True)
+        (target / 'src/lib.rs').write_text('fn main() {}')
+        (target / 'cache-link').symlink_to(outside)
+        os.chmod(target / 'src/lib.rs', 0o444)
+        os.chmod(target / 'src', 0o555)
+        os.chmod(target, 0o555)
+        os.chmod(outside, 0o555)
+        eden_test.main(['down', str(run)])
+        self.assertFalse(stage.exists())
+        self.assertEqual((outside / 'kept.txt').read_text(), 'cache')
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o555)  # nothing was changed through the link
+        os.chmod(outside, 0o755)
+        # A stage folder that is itself a link is not this run's folder.
+        run2 = self.up_run('linked-stage')
+        real = self.dir / 'real-stage'
+        real.mkdir()
+        (real / 'f').write_text('x')
+        (eden_test.RUNS / '_eden-test/stage').mkdir(exist_ok=True)
+        (eden_test.RUNS / '_eden-test/stage/linked-stage').symlink_to(real)
+        eden_test.main(['down', str(run2)])
+        self.assertEqual((real / 'f').read_text(), 'x')
+        self.assertIn('not removed: symlink in target directory', self.cleanup(run2)['kept'][-1]['reason'])
+
+    def test_down_keep_state_and_pending_release_clean_nothing(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        eden_test.main(['down', str(run), '--keep-state'])
+        self.assertTrue((run / 'work/profiles/profile-a/save.bin').is_file())
+        self.assertTrue(stage.is_dir())
+        self.assertEqual(self.cleanup(run)['skipped'], '--keep-state')
+        self.assertEqual((run / 'lifecycle-down.log').read_text().count('$ '), 1)
+        self.assertIn('- Cleanup: not run: --keep-state', (run / 'RESULTS.md').read_text())
+        journal = json.loads((run / 'state/lifecycle.json').read_text())
+        for change, why in (({'released': False, 'release_pending': True}, 'the ledger release is pending'),
+                            ({'cleanup_failures': [{'key': 'a'}]}, 'cleanup failures'),
+                            ({'released': False, 'claimed': True}, 'the claim is not released')):
+            with self.subTest(change=change):
+                self.assertIn(why, eden_test._unclean_down({**journal, **change}))
+        self.assertIsNone(eden_test._unclean_down(journal))
+        self.assertIn('does not say down', eden_test._unclean_down({**journal, 'phase': 'up'}))
+        with mock.patch.object(eden_test, 'lifecycle', return_value=1):
+            with self.assertRaisesRegex(SystemExit, 'the claim stays held'):
+                eden_test.main(['down', str(run)])
+        self.assertTrue((run / 'work').is_dir())
+        self.assertTrue(stage.is_dir())
+        self.assertEqual(self.cleanup(run)['skipped'], 'lifecycle down failed (1)')
+
+
+class DownProcessTests(unittest.TestCase):
+    """_process_reason on a modelled /proc: which processes keep a path at Down."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix='eden-down-proc-'))
+        self.proc = self.dir / 'proc'
+        self.path = self.dir / 'runs/lr-14/work'
+        self.path.mkdir(parents=True)
+        self.addCleanup(lambda: (subprocess.run(['chmod', '-R', 'u+rwx', str(self.dir)], check=False),
+                                 shutil.rmtree(self.dir)))
+
+    def process(self, pid, name='worker', cmdline='worker\0--flag\0', cwd='/tmp', exe='/usr/bin/sleep', fds=('/dev/null',),
+                state='S (sleeping)', parent=1):
+        folder = self.proc / str(pid)
+        (folder / 'fd').mkdir(parents=True)
+        (folder / 'status').write_text(f'Name:\t{name}\nState:\t{state}\nPPid:\t{parent}\n')
+        if cmdline is not None:
+            (folder / 'cmdline').write_text(cmdline)
+        if cwd:
+            (folder / 'cwd').symlink_to(cwd)
+        if exe:
+            (folder / 'exe').symlink_to(exe)
+        for number, target in enumerate(fds):
+            (folder / 'fd' / str(number)).symlink_to(target)
+        return folder
+
+    def reason(self):
+        return eden_test._process_reason([self.path], self.proc)
+
+    def test_readable_processes_elsewhere_keep_nothing(self):
+        self.process(101)
+        self.process(102, state='Z (zombie)', cmdline='', cwd=None, exe=None, fds=())
+        self.assertIsNone(self.reason())
+
+    def test_a_process_in_the_path_keeps_it(self):
+        for change in ({'cwd': str(self.path)}, {'fds': ('/dev/null', str(self.path / 'profiles/save.bin'))},
+                       {'cmdline': f'tail\0-f\0{self.path}/log\0'}):
+            with self.subTest(change=change):
+                folder = self.process(110, **change)
+                self.assertIn('process 110 (worker) uses', self.reason())
+                shutil.rmtree(folder)
+        self.process(111, cmdline=f'tail\0{self.path}-2/log\0')  # another folder whose name starts the same
+        self.assertIsNone(self.reason())
+
+    def test_a_process_that_cannot_be_inspected_keeps_it(self):
+        folder = self.process(120)
+        os.chmod(folder / 'fd', 0)
+        self.assertEqual(self.reason(), 'process 120 (worker) cannot be inspected')
+        os.chmod(folder / 'fd', 0o755)
+        (folder / 'cmdline').unlink()  # its links are readable, its command line is not
+        self.assertEqual(self.reason(), 'process 120 (worker) cannot be inspected')
+        shutil.rmtree(folder)
+        folder = self.process(121, name='ssh-agent', cmdline='/usr/bin/ssh-agent\0-D\0', cwd=None, exe=None, fds=())
+        os.chmod(folder / 'fd', 0)  # a listed name, but its fd folder is not root-owned here
+        self.assertEqual(self.reason(), 'process 121 (ssh-agent) cannot be inspected')
+
+    def test_this_down_and_its_ancestors_are_not_counted(self):
+        self.process(os.getpid(), cwd=str(self.path), parent=os.getppid())
+        self.process(os.getppid(), cwd=str(self.path), parent=1)
+        self.assertIsNone(self.reason())
 
 
 FLOWN = Path('/home/intpa/smash-training-lobby/artifacts/phase23/test-setup-speed/blocks')

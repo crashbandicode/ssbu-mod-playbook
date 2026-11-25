@@ -327,3 +327,10 @@ ordering in the host test is modelled, not a recorded skip. Host tests only; no 
 
 2026-11-24: `eden-runner/runner.py` and `judge_queue.py` consume captured still
 freshness for visual reads and async verdicts. Host tests only; no runtime acceptance.
+
+2026-11-25: `eden-test/eden_test.py` `down` removes the run's stage copy and the raw recordings its own row
+receipts bind to a verified clip, after checking, before the lifecycle's prune, that no other run's config or journal,
+the shared base, `.keep`, an open ledger claim or a process needs them; what it keeps is listed in
+`out/down-cleanup.json`. `eden-runner/runner.py` names the raw recording in the gif receipt (`capture`). The
+process rule follows `remote-gate.ps1 -Action Done` (smash-training-lobby `primary-tools`, 2026-11-25). Host tests
+only; no runtime acceptance.
