@@ -186,7 +186,9 @@ class PublicationMedia(unittest.TestCase):
                   'fps': 60.0, 'seconds': 10.0, 'audio': False, 'faststart': True}
 
     def repo(self, readme):
-        return repo_with({'README.md': 'Demo\n\ncargo skyline build\n\nMIT License\n\n' + readme}, {})[0]
+        repo = repo_with({'README.md': 'Demo\n\ncargo skyline build\n\nMIT License\n\n' + readme}, {})[0]
+        git(repo, 'remote', 'add', 'origin', 'https://git.example.invalid/owner/repo.git')
+        return repo
 
     def asset(self, repo, name, content=b'media fixture'):
         path = repo / 'docs' / 'media' / name
@@ -274,6 +276,28 @@ class PublicationMedia(unittest.TestCase):
         self.assertIn('MP4 docs/media/clip.mp4: publication encoding', rows)
         self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
         self.assertFalse(any(name.endswith('MP4 embed') for name in rows))
+
+    def test_blob_source_points_to_the_checked_repository(self):
+        repo = self.repo('')
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4')
+        for segment in ('git.example.invalid', 'owner', 'repo/'):
+            with self.subTest(segment=segment):
+                source = self.blob_url(blob).replace(segment, 'other-' + segment)
+                (repo / 'README.md').write_text(self.video(source))
+                with patch('compliance.mp4_info', return_value=self.VIDEO_INFO) as probe:
+                    rows = self.rows(repo)
+                self.assertEqual(rows.get('README.md video 1: MP4 embed', ('pass',))[0], 'fail')
+                probe.assert_not_called()
+
+    def test_blob_source_does_not_grade_a_local_replacement(self):
+        repo = self.repo('')
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4')
+        (repo / 'README.md').write_text(self.video(self.blob_url(blob)))
+        self.asset(repo, 'clip.mp4', b'another encoding')
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO) as probe:
+            rows = self.rows(repo)
+        self.assertEqual(rows.get('README.md video 1: MP4 embed', ('pass',))[0], 'fail')
+        probe.assert_not_called()
 
     def test_readme_embedded_mp4_needs_no_gif(self):
         repo = self.repo(self.VALID_VIDEO)
