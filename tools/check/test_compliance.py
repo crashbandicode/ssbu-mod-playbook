@@ -1,3 +1,5 @@
+import contextlib
+import io
 import subprocess
 import tempfile
 import unittest
@@ -5,6 +7,7 @@ from unittest.mock import patch
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import compliance
 from compliance import guard_size, new_refusals, approved_restrictions, trace_tables, defined_tests, rows_for
 
 
@@ -215,6 +218,9 @@ class PublicationMedia(unittest.TestCase):
     def rows(self, repo):
         return {name: (result, evidence) for name, _, result, evidence in rows_for(repo, None)}
 
+    def tagged_rows(self, repo):
+        return {name: (tag, result, evidence) for name, tag, result, evidence in rows_for(repo, None)}
+
     def test_forge_blob_url_of_a_committed_clip_is_an_embed(self):
         repo = self.repo('')
         blob = self.committed_asset(repo, 'docs/media/clip.mp4')
@@ -250,12 +256,9 @@ class PublicationMedia(unittest.TestCase):
             'wrong path': url.replace('/media/blob/', '/raw/blob/'),
             'query': url + '?x=1',
             'fragment': url + '#clip',
-            'deleted': url,
         }
         for case, source in cases.items():
             with self.subTest(case=case):
-                if case == 'deleted':
-                    (repo / 'docs' / 'media' / 'clip.mp4').unlink()
                 (repo / 'README.md').write_text('cargo skyline build\nMIT License\n' + self.video(source))
                 with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
                     rows = self.rows(repo)
@@ -307,7 +310,7 @@ class PublicationMedia(unittest.TestCase):
 
     def test_readme_embedded_mp4_needs_no_gif(self):
         repo = self.repo(self.VALID_VIDEO)
-        self.asset(repo, 'clip.mp4')
+        self.committed_asset(repo, 'docs/media/clip.mp4')
         with patch('compliance.mp4_info', create=True, return_value=self.VIDEO_INFO):
             rows = self.rows(repo)
         self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
@@ -316,7 +319,7 @@ class PublicationMedia(unittest.TestCase):
 
     def test_docs_video_is_checked_and_code_example_is_ignored(self):
         repo = self.repo('See docs.')
-        self.asset(repo, 'clip.mp4')
+        self.committed_asset(repo, 'docs/media/clip.mp4')
         (repo / 'docs' / 'guide.md').write_text(
             self.VALID_VIDEO.replace('docs/media/', 'media/') + '\n\n```html\n'
             + self.VALID_VIDEO.replace('clip.mp4', 'example.mp4') + '\n```\n')
@@ -325,16 +328,111 @@ class PublicationMedia(unittest.TestCase):
         self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
         self.assertFalse(any('example.mp4' in name for name in rows))
 
-    def test_incomplete_video_embed_and_wrong_encoding_fail(self):
+    def test_incomplete_video_embed_fails_and_wrong_encoding_is_a_note(self):
         repo = self.repo(self.VALID_VIDEO.replace(' playsinline', ''))
-        self.asset(repo, 'clip.mp4')
+        self.committed_asset(repo, 'docs/media/clip.mp4')
         bad = self.VIDEO_INFO | {'height': 1080, 'audio': True, 'seconds': 10.1, 'faststart': False}
         with patch('compliance.mp4_info', create=True, return_value=bad):
+            rows = self.tagged_rows(repo)
+        self.assertEqual(rows['README has a demo, build commands and a license line'][1], 'fail')
+        self.assertEqual(rows['README.md video 1: MP4 embed'][1], 'fail')
+        self.assertIn('playsinline', rows['README.md video 1: MP4 embed'][2])
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][:2], ('E', 'note'))
+
+    def test_committed_clip_resolves_after_worktree_deletion_in_both_forms(self):
+        repo = self.repo('')
+        original = b'committed clip'
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4', original)
+        (repo / 'docs' / 'media' / 'clip.mp4').unlink()
+        for source in ('docs/media/clip.mp4', self.blob_url(blob)):
+            with self.subTest(source=source):
+                (repo / 'README.md').write_text('cargo skyline build\nMIT License\n' + self.video(source))
+
+                def inspect(path):
+                    self.assertEqual(path.read_bytes(), original)
+                    return self.VIDEO_INFO
+
+                with patch('compliance.mp4_info', side_effect=inspect) as probe:
+                    rows = self.rows(repo)
+                self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
+                self.assertFalse(any(name.endswith('MP4 embed') for name in rows))
+                self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
+                probe.assert_called_once()
+
+    def test_a_relative_src_must_be_committed(self):
+        repo = self.repo(self.VALID_VIDEO)
+        self.asset(repo, 'clip.mp4')
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO) as probe:
             rows = self.rows(repo)
+        self.assertEqual(rows.get('README.md video 1: MP4 embed', ('missing',))[0], 'fail')
         self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'fail')
-        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'fail')
-        self.assertTrue(any('playsinline' in evidence for result, evidence in rows.values()
-                            if result == 'fail'))
+        probe.assert_not_called()
+
+    def test_encoding_departures_are_notes_and_never_fail(self):
+        repo = self.repo(self.VALID_VIDEO)
+        self.committed_asset(repo, 'docs/media/clip.mp4')
+        bad = self.VIDEO_INFO | {'height': 1080, 'audio': True, 'seconds': 10.1, 'faststart': False}
+        with patch('compliance.mp4_info', return_value=bad):
+            rows = self.tagged_rows(repo)
+        encoding = rows['MP4 docs/media/clip.mp4: publication encoding']
+        self.assertEqual(encoding[:2], ('E', 'note'))
+        for departure in ('size', 'audio track', 'length', 'no fast start'):
+            self.assertIn(departure, encoding[2])
+        self.assertFalse(any(tag == 'M' and result == 'fail' and
+                             (name.startswith('MP4 ') or name.endswith('MP4 embed'))
+                             for name, (tag, result, _) in rows.items()))
+        self.assertEqual(rows.get('Docs videos resolve to a committed MP4', ('missing', 'missing'))[:2], ('M', 'pass'))
+        self.assertEqual(rows['README has a demo, build commands and a license line'][1], 'pass')
+
+    def test_a_zoom_close_up_is_a_note_at_any_size(self):
+        repo = self.repo(self.video('docs/media/clip-zoom.mp4') + '\n' + self.VALID_VIDEO)
+        self.committed_asset(repo, 'docs/media/clip-zoom.mp4', b'zoom clip')
+        self.committed_asset(repo, 'docs/media/clip.mp4', b'main clip')
+
+        def inspect(path):
+            return self.VIDEO_INFO | ({'width': 1080, 'height': 330} if path.read_bytes() == b'zoom clip' else {})
+
+        with patch('compliance.mp4_info', side_effect=inspect):
+            rows = self.tagged_rows(repo)
+        zoom = rows['MP4 docs/media/clip-zoom.mp4: publication encoding']
+        self.assertEqual(zoom[:2], ('E', 'note'))
+        self.assertTrue(zoom[2].startswith('close-up'))
+        self.assertNotIn('differs', zoom[2])
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][:2], ('E', 'pass'))
+
+    def test_the_resolve_row_counts_embeds_and_is_absent_when_one_fails(self):
+        repo = self.repo(self.VALID_VIDEO + '\n' + self.VALID_VIDEO)
+        self.committed_asset(repo, 'docs/media/clip.mp4')
+        page = repo / 'docs' / 'guide.md'
+        page.write_text(self.video('media/clip.mp4'))
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+            rows = self.tagged_rows(repo)
+        self.assertEqual(rows.get('Docs videos resolve to a committed MP4'),
+                         ('M', 'pass', '3 video embed(s) in 2 page(s)'))
+        page.write_text(self.video('media/clip.mp4') + '\n' + self.video('media/missing.mp4'))
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+            rows = self.tagged_rows(repo)
+        self.assertNotIn('Docs videos resolve to a committed MP4', rows)
+        self.assertEqual(rows['docs/guide.md video 2: MP4 embed'][1], 'fail')
+
+    def test_the_summary_counts_advisory_notes(self):
+        repo = self.repo(self.video('docs/media/clip-zoom.mp4'))
+        self.committed_asset(repo, 'docs/media/clip-zoom.mp4')
+        output = io.StringIO()
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO), contextlib.redirect_stdout(output):
+            compliance.main([str(repo)])
+        self.assertIn('1 advisory note(s)', output.getvalue().splitlines()[-1])
+
+    def test_probe_errors_and_missing_ffprobe_are_advisory(self):
+        repo = self.repo(self.VALID_VIDEO)
+        self.committed_asset(repo, 'docs/media/clip.mp4')
+        name = 'MP4 docs/media/clip.mp4: publication encoding'
+        with patch('compliance.mp4_info', side_effect=ValueError):
+            rows = self.tagged_rows(repo)
+        self.assertEqual(rows[name], ('E', 'note', 'cannot inspect MP4 (ValueError)'))
+        with patch('compliance.mp4_info', return_value=None):
+            rows = self.tagged_rows(repo)
+        self.assertEqual(rows[name], ('E', 'agent', 'ffprobe missing; check by hand'))
 
     def test_mp4_path_must_exist_and_a_hyperlink_is_not_an_embed(self):
         repo = self.repo('[video](docs/media/clip.mp4)')
