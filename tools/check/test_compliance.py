@@ -194,8 +194,86 @@ class PublicationMedia(unittest.TestCase):
         path.write_bytes(content)
         return path
 
+    def committed_asset(self, repo, name, content=b'media fixture'):
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        git(repo, 'add', '--', name)
+        git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+            'commit', '-q', '-m', 'fixture asset')
+        return subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD:' + name], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def blob_url(self, blob):
+        return 'https://git.example.invalid/owner/repo/media/blob/' + blob
+
+    def video(self, source):
+        return self.VALID_VIDEO.replace('docs/media/clip.mp4', source)
+
     def rows(self, repo):
         return {name: (result, evidence) for name, _, result, evidence in rows_for(repo, None)}
+
+    def test_forge_blob_url_of_a_committed_clip_is_an_embed(self):
+        repo = self.repo('')
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4')
+        (repo / 'README.md').write_text('cargo skyline build\nMIT License\n' + self.video(self.blob_url(blob)))
+        (repo / 'docs' / 'guide.md').write_text(self.video(self.blob_url(blob.upper())))
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+            rows = self.rows(repo)
+        self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
+        self.assertFalse(any(name.endswith('MP4 embed') for name in rows))
+
+    def test_forge_blob_url_must_name_an_mp4_committed_under_docs_media(self):
+        repo = self.repo('')
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4', b'committed clip')
+        outside = self.committed_asset(repo, 'assets/clip.mp4', b'outside clip')
+        gif = self.committed_asset(repo, 'docs/media/clip.gif', b'gif file')
+        draft = self.asset(repo, 'draft.mp4', b'untracked clip')
+        staged = self.asset(repo, 'staged.mp4', b'staged clip')
+        git(repo, 'add', '--', 'docs/media/staged.mp4')
+
+        def hash_file(path):
+            return subprocess.run(['git', '-C', str(repo), 'hash-object', str(path)], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        url = self.blob_url(blob)
+        cases = {
+            'unknown': self.blob_url('0' * 40),
+            'untracked': self.blob_url(hash_file(draft)),
+            'staged': self.blob_url(hash_file(staged)),
+            'outside': self.blob_url(outside),
+            'gif': self.blob_url(gif),
+            'http': url.replace('https://', 'http://'),
+            'wrong path': url.replace('/media/blob/', '/raw/blob/'),
+            'query': url + '?x=1',
+            'fragment': url + '#clip',
+            'deleted': url,
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                if case == 'deleted':
+                    (repo / 'docs' / 'media' / 'clip.mp4').unlink()
+                (repo / 'README.md').write_text('cargo skyline build\nMIT License\n' + self.video(source))
+                with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+                    rows = self.rows(repo)
+                self.assertEqual(rows['README.md video 1: MP4 embed'][0], 'fail')
+                self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'fail')
+
+    def test_a_relative_mp4_src_stays_valid_beside_a_blob_url(self):
+        repo = self.repo('')
+        self.committed_asset(repo, 'docs/media/relative.mp4', b'relative clip')
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4', b'blob clip')
+        relative = self.VALID_VIDEO.replace('clip.mp4', 'relative.mp4')
+        (repo / 'README.md').write_text('cargo skyline build\nMIT License\n' +
+                                       relative + '\n' + self.video(self.blob_url(blob)))
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+            rows = self.rows(repo)
+        self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
+        self.assertEqual(rows['MP4 docs/media/relative.mp4: publication encoding'][0], 'pass')
+        self.assertIn('MP4 docs/media/clip.mp4: publication encoding', rows)
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
+        self.assertFalse(any(name.endswith('MP4 embed') for name in rows))
 
     def test_readme_embedded_mp4_needs_no_gif(self):
         repo = self.repo(self.VALID_VIDEO)
