@@ -3572,6 +3572,40 @@ class EdenTestTests(unittest.TestCase):
         self.assertFalse((run / 'work').exists())
         self.assertFalse(stage.exists())
 
+    def test_claim_or_raw_pin_appearing_during_prune_keeps_remaining_files(self):
+        self.pruning_lifecycle()
+        for label in ('late-claim', 'late-pin'):
+            with self.subTest(label=label):
+                self.open_claims.clear()
+                run = self.up_run(label)
+                stage = self.stage_copy(label)
+                raw = run / 'out/r1/hit.1.capture.gif'
+                raw.parent.mkdir(parents=True)
+                raw.write_bytes(b'raw')
+                clip = raw.with_name('hit.gif')
+                clip.write_bytes(b'published')
+                (run / 'out/r1.json').write_text(json.dumps({'gif': {
+                    'capture': raw.name, 'path': str(clip), 'sha256': sha(clip)}}))
+                real_lifecycle = eden_test.lifecycle
+
+                def finish_prune(*args):
+                    code = real_lifecycle(*args)
+                    if '--keep-state' not in args:
+                        if label == 'late-claim':
+                            self.open_claims.append('now CLAIMED: Claude new/upcoming host=yoga lifecycle=new')
+                        else:
+                            other = eden_test.RUNS / 'next-consumer'
+                            other.mkdir()
+                            (other / 'config.json').write_text(json.dumps({'input': str(raw)}))
+                    return code
+
+                with mock.patch.object(eden_test, 'lifecycle', side_effect=finish_prune):
+                    eden_test.main(['down', str(run)])
+                self.assertFalse((run / 'work').exists(), 'the earlier prune legitimately finished')
+                self.assertTrue(raw.is_file(), 'capture removed using pre-prune claim/config data')
+                self.assertEqual(stage.is_dir(), label == 'late-claim')
+                self.assertTrue(any(item['path'] == str(raw) for item in self.cleanup(run)['kept']))
+
     def test_down_removes_nothing_more_after_a_failed_prune(self):
         for copies in (True, False):
             with self.subTest(copies=copies):
