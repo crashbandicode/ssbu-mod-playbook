@@ -25,6 +25,10 @@ BOOT = ('379690490 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=inst
 READY = '379729902 [Bridge] chord ready'
 LISTENING = '379738760 [Bridge] listening port=6979 rebinds=0'
 ON = '379738765 [Bridge] toggle phase=on gen=1 reason=pad_chord source=pad_chord fixture=closed indicator=on'
+TRANSPORT = ('474261175 [Bridge] transport=file stream=sd:/ultimate/ssbu-hw-bridge/stream.log '
+             'requests=sd:/ultimate/ssbu-hw-bridge/requests.txt')
+LISTEN_EINVAL = '585593349 [Bridge] listen failed port=6979 call=listen errno=22 retry_ms=250'
+MARKER = 'user/sdmc/ultimate/ssbu-hw-bridge/file-transport'
 FAIL_BOOT = ('382550829 plugin=ssbu-hw-bridge/0.1.0 h1=installed h2=installed h3=installed indicator=hooked '
              'native_ui=installed chord=deferred toggle=off reason=boot_default fixture=closed deluxe=absent '
              'heap_register=1 guards=0x7fffff tr_export=available server=started result=installed '
@@ -74,6 +78,8 @@ class BridgeOnTests(unittest.TestCase):
         self.popen = []
         self.backup = BACKUP
         self.stub = False
+        self.lan_online = False
+        self.owner_calls = []
         self.status = {'running': True, 'loading_complete': True}
         self.listener = 'LISTEN users:(("eden",pid=712,fd=42))'
         self.stub_samples = []
@@ -102,6 +108,8 @@ class BridgeOnTests(unittest.TestCase):
             self.trace.write_text(json.dumps(row) + '\n')
             return {'id': '3'}
         if name == 'settings.get':
+            if args['key'] == 'core.lan_online':
+                return {'value': 'true' if self.lan_online else 'false'}
             return {'value': 'true' if self.stub else 'false'}
         if name == 'status':
             return self.status
@@ -121,13 +129,15 @@ class BridgeOnTests(unittest.TestCase):
         if (self.toggle_enabled and self.chord_started is not None and self.seconds - self.chord_started >= 3.1
                 and len([c for c in self.calls if c[0] == 'input.button']) >= 4):
             listening, on = STUB_EVENTS[2:] if self.stub else (LISTENING, ON)
+            if (Path(self.instance['profile']) / MARKER).exists():
+                listening = TRANSPORT
             if on not in self.events.read_text():
                 with self.events.open('a') as stream:
                     stream.write(listening + '\n' + on + '\n')
 
     def spawn(self, argv, **kwargs):
         self.popen.append((argv, kwargs))
-        run = self.out / 'bridge-run'
+        run = Path(argv[4])
         (run / 'bridge.log').write_text(self.stub_preamble if self.stub else
                                        '[Adapter] bridge connected boot=0x46024760bd126949\n'
                                        + HELLO + '\n' + INSTALL + '\n' + self.backup + '\n')
@@ -159,7 +169,7 @@ class BridgeOnTests(unittest.TestCase):
             self.recorded_open_seen += 1
             if self.recorded_open_seen > 2:
                 return
-        with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
+        with Path(self.instance['bridge_log']).open('a') as stream:
             stream.write(sample)
 
     def sample(self, *, active='yes', boot=STUB_BOOT, screen='title', fields=None):
@@ -219,9 +229,21 @@ class BridgeOnTests(unittest.TestCase):
              patch('time.time', side_effect=lambda: self.now_ns() / 1_000_000_000), \
              patch('time.sleep', side_effect=self.sleep), \
              patch('subprocess.Popen', side_effect=self.spawn), \
-             patch.object(routes, '_bridge_on_listener_owner', return_value=self.listener, create=True), \
+             patch.object(routes, '_bridge_on_listener_owner', side_effect=self.owner, create=True), \
              patch.object(routes, 'bridge_v2', side_effect=self.spool):
             return routes.bridge_on(self.ctx, **kwargs)
+
+    def owner(self, port):
+        self.owner_calls.append(port)
+        return self.listener
+
+    def configure_lan(self):
+        self.configure_stub()
+        self.lan_online = True
+        marker = Path(self.instance['profile']) / MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return marker
 
     def cold_stub_receipt(self):
         self.configure_stub()
@@ -1272,6 +1294,70 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(self.popen, [])
         self.assertFalse((self.out / 'bridge-run' / 'capture.json').exists())
         self.assertNotIn('bridge_log', self.ctx.runner.instances['offline'])
+
+    def test_bridge_on_under_lan_online_uses_the_file_transport(self):
+        marker = self.configure_lan()
+        receipt = self.invoke()
+        run = self.out / 'bridge-run-offline'
+        self.assertEqual((receipt['transport'], receipt['listening'], receipt['listener']), ('file', TRANSPORT, None))
+        self.assertEqual(self.owner_calls, [])  # no listener exists, so ss is not asked
+        argv, _ = self.popen[0]
+        self.assertEqual(argv, [sys.executable, '-I', str(Path(routes.__file__).resolve().parent / 'switch_hw.py'),
+                                'capture-bridge', str(run), '--bridge-files', str(marker.parent),
+                                '--console', str(run / 'bridge-console.log')])
+        self.assertEqual(receipt['capture'], {'pid': 4321, 'port': None, 'bridge_log': str(run / 'bridge.log')})
+        saved = json.loads((run / 'capture.json').read_text())
+        self.assertEqual((saved['instance'], saved['transport'], saved['bridge_log']),
+                         ('offline', 'file', str(run / 'bridge.log')))
+        self.assertEqual(self.instance['bridge_log'], str(run / 'bridge.log'))
+        self.assertEqual(receipt['title']['matched'], 'prompt')
+        self.assertFalse((self.out / 'bridge-run').exists())
+
+    def test_bridge_on_under_lan_online_without_the_marker_refuses_before_any_input(self):
+        self.configure_stub()
+        self.lan_online = True
+        with self.assertRaisesRegex(RuntimeError, r'LAN Online.*file-transport.*before game\.load'):
+            self.invoke(port=6980)
+        self.assertFalse(any(name == 'input.button' for name, _ in self.calls))
+        self.assertEqual(self.popen, [])
+
+    def test_two_lan_online_instances_get_two_captures_and_two_logs(self):
+        first_marker = self.configure_lan()
+        first = self.invoke()
+        first_instance = self.instance
+        root = self.root / 'second'
+        root.mkdir()
+        self.events = root / 'events.log'
+        self.instance = {'bridge_events': str(self.events), 'profile': str(root)}
+        self.ctx.runner.instances['b'] = self.instance
+        self.ctx.on, self.ctx.instance = 'b', self.instance
+        self.stub = False
+        self.instance['trace_jsonl'] = str(self.trace)
+        second_marker = self.configure_lan()
+        (root / 'control.jsonl').write_text(self.journal.read_text())
+        self.instance['control_log'] = str(root / 'control.jsonl')
+        self.calls, self.chord_started, self.seconds = [], None, 0.0
+        second = self.invoke()
+        runs = [self.out / 'bridge-run-offline', self.out / 'bridge-run-b']
+        self.assertEqual([call[0][4] for call in self.popen], [str(run) for run in runs])
+        self.assertEqual([call[0][6] for call in self.popen], [str(first_marker.parent), str(second_marker.parent)])
+        self.assertEqual([first['capture']['bridge_log'], second['capture']['bridge_log']],
+                         [str(run / 'bridge.log') for run in runs])
+        self.assertEqual([first_instance['bridge_log'], self.instance['bridge_log']],
+                         [str(run / 'bridge.log') for run in runs])
+        self.assertEqual([json.loads((run / 'capture.json').read_text())['instance'] for run in runs], ['offline', 'b'])
+        self.assertFalse(second['reused'])
+
+    def test_bridge_on_listen_einval_names_lan_online_not_a_busy_port(self):
+        self.events.write_text('\n'.join((FAIL_BOOT, FAIL_READY, LISTEN_EINVAL, FAIL_ON)) + '\n')
+        with self.assertRaises(RuntimeError) as error:
+            self.invoke(port=6979)
+        text = str(error.exception)
+        self.assertIn(LISTEN_EINVAL, text)
+        self.assertIn('LAN Online', text)
+        self.assertIn('file-transport', text)
+        self.assertNotIn('Another process holds the port', text)
+        self.assertEqual(self.popen, [])
 
     def test_bridge_on_refuses_listening_on_another_port_before_reuse(self):
         other = '382602979 [Bridge] listening port=6978 rebinds=0'

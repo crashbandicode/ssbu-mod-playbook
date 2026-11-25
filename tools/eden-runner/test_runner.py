@@ -4295,6 +4295,19 @@ run.check_gate('a', 'red')
         self.make(FakeEden({}))
         self.assertEqual(self.instances['a']['bridge_log'], 'existing.log')
 
+    def test_fresh_runner_restores_each_instances_captured_bridge_log(self):
+        self.instances['b'] = {'socket': 'fake', 'console_log': str(self.log)}
+        for name in ('a', 'b'):
+            run = self.dir / 'out' / f'bridge-run-{name}'
+            run.mkdir(parents=True)
+            (run / 'capture.json').write_text(json.dumps({
+                'pid': 123, 'port': None, 'transport': 'file', 'instance': name,
+                'bridge_log': str(run / 'bridge.log'), 'started': 1,
+            }))
+        self.make(FakeEden({}))
+        self.assertEqual([self.instances[name]['bridge_log'] for name in ('a', 'b')],
+                         [str(self.dir / 'out' / f'bridge-run-{name}' / 'bridge.log') for name in ('a', 'b')])
+
     def test_dry_run_accepts_disabled_early_stop(self):
         self.plan['early_stop'] = False
         self.manifest.write_text(json.dumps(self.plan))

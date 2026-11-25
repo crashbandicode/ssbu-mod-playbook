@@ -3,6 +3,8 @@
 
 Run: python3 -I test_routes.py
 """
+import contextlib
+import io
 import json
 import os
 import socket
@@ -821,6 +823,22 @@ class HostNetworkTests(unittest.TestCase):
         self.assertEqual(result['interface'], 'ethernet0')
         self.assertEqual(result['readback'], {
             'core.network_interface': 'ethernet0', 'core.lan_online': True, 'core.ldn_mitm': False})
+
+    def test_lan_online_pins_the_bridge_file_transport_marker_before_load(self):
+        profile = self.run / 'profile'
+        self.ctx.instance = {'profile': str(profile)}
+        marker = profile / 'user/sdmc/ultimate/ssbu-hw-bridge/file-transport'
+        result = routes.host_network(self.ctx, lan_online=True)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(result['bridge_file_transport'], str(marker))
+        self.assertEqual(json.loads((self.row / 'routes-host-network.json').read_text()), result)
+
+    def test_lan_online_off_pins_no_marker(self):
+        profile = self.run / 'profile'
+        self.ctx.instance = {'profile': str(profile)}
+        result = routes.host_network(self.ctx)
+        self.assertFalse((profile / 'user/sdmc/ultimate/ssbu-hw-bridge/file-transport').exists())
+        self.assertNotIn('bridge_file_transport', result)
 
     def test_absent_ldn_mitm_is_recorded_but_other_errors_propagate(self):
         self.ldn_error = "settings.get on a: {'ok': False, 'error': {'code': 'unknown_setting'}}"
@@ -2650,6 +2668,21 @@ class TrainingInkGateTests(unittest.TestCase):
 
 
 class SwitchHwTests(unittest.TestCase):
+    def test_capture_bridge_command_takes_a_socket_or_the_bridge_files(self):
+        import switch_hw
+        with mock.patch.object(switch_hw, 'capture_bridge_file') as files, \
+                mock.patch.object(switch_hw, 'capture_bridge') as sock, mock.patch('signal.signal'):
+            switch_hw.main(['capture-bridge', 'run', '--bridge-files', 'sd', '--console', 'console.log'])
+            self.assertEqual(files.call_args[0], ('run', 'sd', 'console.log'))
+            self.assertTrue(callable(files.call_args[1]['stop']))
+            sock.assert_not_called()
+            switch_hw.main(['capture-bridge', 'run', '--bridge-host', '127.0.0.1:6979', '--console', 'console.log'])
+            self.assertEqual(sock.call_args[0], ('run', '127.0.0.1', 6979, 'console.log'))
+            for argv in (['capture-bridge', 'run', '--console', 'c'],
+                         ['capture-bridge', 'run', '--bridge-host', 'h:1', '--bridge-files', 'sd', '--console', 'c']):
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                    switch_hw.main(argv)
+
     BRIDGE_LINES = [
         '[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=v1 port=6970 guards=0x7f frame=0 wall=10',
         '[TrainingRooms] cpu_ids FIGHTER_STATUS_KIND_WAIT=0 FIGHTER_STATUS_KIND_CAPTURE_PULLED=63 frame=1 wall=11',

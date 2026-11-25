@@ -3884,5 +3884,23 @@ class RerunTests(unittest.TestCase):
         time.sleep(0.1)
         self.assertFalse(eden_test.stop_capture(self.run)['stopped'])  # already gone
 
+    def test_down_stops_every_instances_bridge_capture(self):
+        import subprocess
+        script = self.run / 'fake_capture.py'
+        script.write_text('import time\ntime.sleep(60)\n')
+        captures = []
+        for name in ('bridge-run-a', 'bridge-run-b'):
+            folder = self.run / 'out' / name
+            folder.mkdir()
+            process = subprocess.Popen([sys.executable, str(script), 'capture-bridge', str(folder)])
+            self.addCleanup(lambda p=process: p.poll() is None and p.kill())
+            (folder / 'capture.json').write_text(json.dumps({'pid': process.pid}))
+            captures.append(process)
+        results = eden_test.stop_captures(self.run)
+        self.assertEqual([(r['pid'], r['stopped']) for r in results], [(p.pid, True) for p in captures])
+        for process in captures:
+            process.wait(timeout=10)
+        self.assertEqual(eden_test.stop_captures(self.run / 'nowhere'), [])
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
