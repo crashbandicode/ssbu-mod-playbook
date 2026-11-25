@@ -208,7 +208,10 @@ runs, not after every run. A single run only writes its short `RESULTS.md`
   tutorials with H.264 (`libx264`, `yuv420p`), 1280×720 Lanczos-downscaled
   from 1080p, source frame rate (60 fps for gameplay captured at 60 fps),
   CRF 23–24, `slow`, `+faststart`, no audio and at most 10 s. Embed with
-  `<video src="..." autoplay muted loop playsinline controls>`.
+  `<video src="https://<forge>/<owner>/<repo>/media/blob/<blob id>" autoplay
+  muted loop playsinline controls>` (the id of the committed clip; Forgejo
+  does not play a relative `src`) and add a relative "Open the clip" link;
+  see [GIFS](GIFS.md).
   Use GIF only where an image is required. Keep README GIF previews 1280
   pixels wide and under 10 s, with at least 12 fps for gameplay and 10 fps
   for menus, or the actual source rate if lower. Never use keyframe-only

@@ -97,6 +97,10 @@ still counts, and so does a refusal offset only by a removed comment or assertio
 no budget. TrainingRooms rc.8's by-reference change was reported as two new refusals. Tests: `test_compliance.py`
 `Refusals` (four new cases).
 
+On 2026-11-25 `check/compliance.py` accepts an HTTPS forge media blob URL for a
+committed regular MP4 under `docs/media/` and keeps relative sources valid.
+Tests: `test_compliance.py` `PublicationMedia`.
+
 Written for this repo on 2026-10-31, not copies: `check/compliance.py` (fills
 the machine rows of `docs/CHECKLIST.md`), `skill/install.py` (links the skill
 into the four agent tools and writes the pointer blocks) and

@@ -18,11 +18,23 @@ ffmpeg -ss 2 -i /path/to/capture.mp4 -t 6 -map 0:v:0 -vf 'scale=1280:720:flags=l
 ```
 
 Save the clip under `docs/media/` and embed it with a one-line caption
-that gives the date and build. This form assumes the page is at the repo
-root. Adjust the relative path for other pages.
+that gives the date and build. Forgejo does not play a `<video>` whose
+`src` is a relative path: it serves the file page instead of the video.
+Use the forge's media URL of the committed clip's blob as `src`:
+`https://<forge>/<owner>/<repo>/media/blob/<blob id>`. Get the id with
+`git ls-tree HEAD docs/media/demo.mp4` after committing the clip. The id
+changes when the clip's bytes change, so update the `src` with the clip.
+
+Forgejo's sanitizer strips `muted`, `loop` and `playsinline`. Keep all five
+attributes for other renderers; `controls` is what a reader on the forge
+gets. Add a relative "Open the clip" link under the caption; adjust its
+path for other pages. The compliance check still accepts a relative `src`
+for renderers that resolve it.
 
 ```html
-<video src="docs/media/demo.mp4" autoplay muted loop playsinline controls></video>
+<video src="https://git.example.com/owner/repo/media/blob/<blob id>" autoplay muted loop playsinline controls></video>
+
+*Action. Eden, YYYY-MM-DD, build `commit`.* [Open the clip](docs/media/demo.mp4)
 ```
 
 ## Test evidence
