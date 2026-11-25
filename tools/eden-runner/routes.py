@@ -4636,11 +4636,11 @@ def bridge_on(ctx, port=None, cap=60):
     # Eden refuses every guest listen() while LAN Online is on (its bsd.cpp ListenImpl), so there the bridge is
     # reached through its file transport: the marker on the SD card, stream.log out, requests.txt in.
     files = None
+    try:
+        marker = instance_path(ctx, 'sdmc:' + BRIDGE_FILE_TRANSPORT)
+    except KeyError:
+        marker = None
     if str((ctx.call('settings.get', {'key': 'core.lan_online'}) or {}).get('value')).lower() == 'true':
-        try:
-            marker = instance_path(ctx, 'sdmc:' + BRIDGE_FILE_TRANSPORT)
-        except KeyError:
-            marker = None
         if marker is None or not marker.is_file():
             raise RuntimeError('bridge_on: LAN Online is on (core.lan_online true), and Eden refuses every guest '
                                'listen() there, so the bridge is reachable only through its file transport. The '
@@ -4649,6 +4649,13 @@ def bridge_on(ctx, port=None, cap=60):
                                'boot again. Nothing was pressed.')
         files = marker.parent
         port = None
+    elif marker is not None and marker.is_file():
+        # The bridge selects its file transport by the marker alone, so it would never listen for this call.
+        raise RuntimeError(f'bridge_on: the marker {BRIDGE_FILE_TRANSPORT} is on this instance\'s SD card, so the '
+                           'bridge selects its file transport when it is turned on, but LAN Online is off '
+                           '(core.lan_online false) and this call drives the socket. Boot without the marker, or '
+                           'with LAN Online set before game.load (host_network with lan_online), so both agree. '
+                           'Nothing was pressed.')
     elif port is None:
         try:
             port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())

@@ -211,6 +211,8 @@ its events log reads `[Bridge] listen failed … call=listen errno=22`. The brid
 - **`bridge_on` reads `core.lan_online`.** When it is true it needs no port, refuses before any input if the marker
   is missing, waits for `[Bridge] transport=file` in the bridge's own events log, asks `ss` nothing (there is no
   listener), and starts `switch_hw.py capture-bridge <run> --bridge-files <sd folder>`.
+- **The marker with LAN Online off is refused before any input.** The bridge selects its file transport by the
+  marker alone, so it would never listen for the socket this call then drives.
 - **One capture per instance:** the folder is `out/bridge-run-<instance>`, so two Edens of one run each have their
   own `bridge.log`. The socket transport keeps `out/bridge-run`. Down stops every `out/bridge-run*` capture.
 - The receipt and `capture.json` name the `transport` (`file` or `socket`); `capture.port` is null for files.
