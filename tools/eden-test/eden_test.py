@@ -2395,6 +2395,7 @@ class _DownGuard:
         for line in claims:
             token = re.search(r'\blifecycle=([A-Za-z0-9_-]+)', line)
             if token and token[1] == own_token:
+                self.blocked = self.blocked or "the ledger still shows this run's claim open"
                 continue
             named = [found[1] for found in (re.search(r'CLAIMED:\s*\S+\s+\S+/([A-Za-z0-9][\w.-]*)', line),
                                             re.search(r'\brun\s+([A-Za-z0-9][\w.-]*)', line)) if found]
@@ -2477,6 +2478,13 @@ def _open_claims(run, config):
     return [str(line) for line in lines]
 
 
+def _cleanup_claims(run, config):
+    try:
+        return _open_claims(run, config)
+    except Exception as error:  # An unavailable ledger is not an empty ledger.
+        return f'cannot read the ledger: {type(error).__name__}'
+
+
 def _unclean_down(journal, claims=()):
     """Why this Down is not a clean one (nothing is then removed), or None."""
     if not journal or journal.get('phase') != 'down':
@@ -2544,14 +2552,15 @@ def cmd_down(run, keep_state=False):
     elif code != 0:
         record['skipped'] = f'lifecycle down failed ({code})'
     else:
-        try:
-            claims = _open_claims(run, config)
-        except Exception as error:  # noqa: BLE001 - whatever stops the read, the answer is the same: keep
-            claims = f'cannot read the ledger: {type(error).__name__}'
+        claims = _cleanup_claims(run, config)
         record['skipped'] = _unclean_down(read_journal(), claims)
     if not record['skipped']:
-        new_guard = lambda: _DownGuard(run, RUNS, claims, read_journal().get('token'))
-        guard = new_guard()
+        token = read_journal().get('token')
+        guard = _DownGuard(run, RUNS, claims, token)
+
+        def current_reason(path):
+            return _DownGuard(run, RUNS, _cleanup_claims(run, config), token).reason(path)
+
         copies = [path for path in (run / 'work', *sorted((run / 'state').glob('snapshot-*')),
                                     *sorted((run / 'state').glob('post-run-*'))) if path.is_symlink() or path.exists()]
         held = [(path, reason) for path in copies if (reason := guard.reason(path))]
@@ -2571,7 +2580,7 @@ def cmd_down(run, keep_state=False):
         # Down has to run again, from the same folders.
         stop = None if pruned else ('a copy of this run is kept' if held else f'the lifecycle did not prune (exit {prune_code})')
         for raw, reason in raw_captures(run):
-            reason = stop or reason or guard.reason(raw)
+            reason = stop or reason or current_reason(raw)
             what = f'raw capture {raw.relative_to(run / "out")}'
             if reason:
                 keep(what, raw, reason)
@@ -2601,7 +2610,7 @@ def cmd_down(run, keep_state=False):
                 stage = _owned_target_directory(RUNS, ('_eden-test', 'stage', config['label']))
             if stage is not None:
                 reason = None if pruned else f'Down has to run again from it: {stop}'
-                reason = reason or new_guard().reason(stage)  # read again: time has passed since the prune
+                reason = reason or current_reason(stage)
                 if reason:
                     keep('stage copy', stage, reason)
                 else:
