@@ -5657,6 +5657,11 @@ run.check_gate('a', 'red')
                          {'frames', 'duration', 'size', 'sha256', 'path'})
         self.assertLessEqual(info['duration'], 10)
         self.assertEqual(info['sha256'], sha(info['path']))
+        # The receipt names Eden's raw recording, which stays in the row folder beside the published clip.
+        self.assertEqual(info['capture'], Path(started['path']).name)
+        self.assertTrue(info['capture'].endswith('.capture.gif'))
+        self.assertTrue((self.dir / 'out' / 'g1' / info['capture']).is_file())
+        self.assertNotEqual(Path(info['path']).name, info['capture'])
         with Image.open(info['path']) as frame:
             self.assertEqual(frame.size[0], 1280)
 

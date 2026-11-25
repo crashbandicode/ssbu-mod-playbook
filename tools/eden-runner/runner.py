@@ -3517,6 +3517,7 @@ class Runner:
             if source_after is not None and source_after < minimum:
                 source_fps = max(source_before, source_after)
         info = publish_gif(raw, dest, spec, source_fps)
+        info['capture'] = raw.name  # Eden's raw recording in this row's folder; Down removes it once `path` is verified
         info['steps'] = nested
         info['preset'] = spec['preset']
         if spec.get('reason'):
