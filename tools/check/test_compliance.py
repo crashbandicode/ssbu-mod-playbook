@@ -291,13 +291,19 @@ class PublicationMedia(unittest.TestCase):
 
     def test_blob_source_does_not_grade_a_local_replacement(self):
         repo = self.repo('')
-        blob = self.committed_asset(repo, 'docs/media/clip.mp4')
+        original = b'committed encoding'
+        blob = self.committed_asset(repo, 'docs/media/clip.mp4', original)
         (repo / 'README.md').write_text(self.video(self.blob_url(blob)))
         self.asset(repo, 'clip.mp4', b'another encoding')
-        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO) as probe:
+
+        def inspect(path):
+            self.assertEqual(path.read_bytes(), original)
+            return self.VIDEO_INFO
+
+        with patch('compliance.mp4_info', side_effect=inspect) as probe:
             rows = self.rows(repo)
-        self.assertEqual(rows.get('README.md video 1: MP4 embed', ('pass',))[0], 'fail')
-        probe.assert_not_called()
+        self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
+        probe.assert_called_once()
 
     def test_readme_embedded_mp4_needs_no_gif(self):
         repo = self.repo(self.VALID_VIDEO)

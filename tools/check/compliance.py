@@ -23,6 +23,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -344,6 +345,41 @@ def media_path(repo, document, source, suffix):
     return target if target.suffix.lower() == suffix else None
 
 
+def forge_media_base(repo):
+    """The HTTPS media endpoint of this repository, for HTTPS and SSH origins."""
+    remote = git(repo, 'remote', 'get-url', 'origin') or ''
+    if '://' not in remote:
+        scp = re.fullmatch(r'(?:[^@/:]+@)?([^/:]+):(.+)', remote)
+        if not scp:
+            return None
+        remote = f'ssh://{scp[1]}/{scp[2]}'
+    try:
+        url = urlsplit(remote)
+        if url.scheme not in ('https', 'ssh') or not url.hostname or url.query or url.fragment:
+            return None
+        host = url.hostname
+        if ':' in host:
+            host = f'[{host}]'
+        if url.scheme == 'https' and url.port not in (None, 443):
+            host += f':{url.port}'
+    except ValueError:
+        return None
+    path = url.path.rstrip('/').removesuffix('.git')
+    return f'https://{host}{path}/media/blob/' if re.fullmatch(r'/[^/]+/[^/]+', path) else None
+
+
+def committed_mp4_paths(repo):
+    paths = {}
+    listing = git(repo, 'ls-tree', '-r', '-z', 'HEAD', '--', 'docs/media/') or ''
+    for entry in listing.split('\0'):
+        metadata, separator, name = entry.partition('\t')
+        parts = metadata.split()
+        if (separator and len(parts) == 3 and parts[0] in ('100644', '100755')
+                and parts[1] == 'blob' and name.startswith('docs/media/') and name.endswith('.mp4')):
+            paths.setdefault(parts[2], []).append(repo / name)
+    return paths
+
+
 def gif_info(path):
     try:
         from PIL import Image
@@ -408,6 +444,15 @@ def mp4_info(path):
             'faststart': mp4_faststart(path)}
 
 
+def blob_mp4_info(repo, oid):
+    with tempfile.TemporaryDirectory() as tmp:
+        clip = Path(tmp) / 'clip.mp4'
+        with clip.open('wb') as stream:
+            subprocess.run(['git', '-C', str(repo), 'cat-file', 'blob', oid], stdout=stream,
+                           stderr=subprocess.PIPE, check=True, timeout=30)
+        return mp4_info(clip)
+
+
 def check_media(repo, readme, rows, row):
     readme_path = repo / 'README.md'
     readme_media = MediaEmbeds(readme)
@@ -416,8 +461,9 @@ def check_media(repo, readme, rows, row):
                 if (path := media_path(repo, readme_path, source, '.gif')) and path.is_file()]
     gifs.update(previews)
     readme_video = False
-    mp4s = set()
+    mp4s = {}
     blob_paths = None
+    forge_base = forge_media_base(repo)
     documents = [(readme_path, readme_media)]
     for document in sorted((repo / 'docs').rglob('*.md')):
         text = read(document)
@@ -427,31 +473,21 @@ def check_media(repo, readme, rows, row):
         for number, attrs in enumerate(media.videos, 1):
             source = attrs.get('src')
             target = media_path(repo, document, source, '.mp4')
+            oid = None
             blob = FORGE_MEDIA_BLOB.fullmatch(source or '')
-            if blob:
-                try:
-                    host = urlsplit(source).hostname
-                except ValueError:
-                    host = None
-                if host:
-                    if blob_paths is None:
-                        blob_paths = {}
-                        tree = git(repo, 'ls-tree', '-r', '-z', 'HEAD', '--', 'docs/media/') or ''
-                        for entry in tree.split('\0'):
-                            metadata, separator, path = entry.partition('\t')
-                            parts = metadata.split()
-                            if (separator and len(parts) == 3 and parts[0] in ('100644', '100755')
-                                    and parts[1] == 'blob' and path.startswith('docs/media/')
-                                    and path.endswith('.mp4')):
-                                blob_paths.setdefault(parts[2].lower(), []).append(repo / path)
-                    target = next((path for path in blob_paths.get(blob[1].lower(), ()) if path.is_file()), None)
+            if blob and forge_base and source[:blob.start(1)] == forge_base:
+                if blob_paths is None:
+                    blob_paths = committed_mp4_paths(repo)
+                oid = blob[1].lower()
+                target = next((path for path in blob_paths.get(oid, ()) if path.is_file()), None)
             present = target is not None and target.is_file()
             missing = VIDEO_ATTRIBUTES - attrs.keys()
             valid = present and not missing
             if document == readme_path:
                 readme_video |= valid
             if present:
-                mp4s.add(target)
+                if target not in mp4s or oid is not None:
+                    mp4s[target] = oid
             problems = []
             if not present:
                 problems.append('src must be a local MP4 path or the forge media blob URL of an MP4 committed under docs/media/')
@@ -485,7 +521,8 @@ def check_media(repo, readme, rows, row):
     for clip in sorted(mp4s):
         name = f'MP4 {clip.relative_to(repo).as_posix()}: publication encoding'
         try:
-            info = mp4_info(clip)
+            oid = mp4s[clip]
+            info = blob_mp4_info(repo, oid) if oid is not None else mp4_info(clip)
         except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError, subprocess.SubprocessError) as error:
             row(name, 'M', False, f'cannot inspect MP4 ({type(error).__name__})')
             continue
