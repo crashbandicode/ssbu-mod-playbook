@@ -299,6 +299,7 @@ def defined_tests(repo):
 
 
 VIDEO_ATTRIBUTES = {'autoplay', 'muted', 'loop', 'playsinline', 'controls'}
+FORGE_MEDIA_BLOB = re.compile(r'https://[^/?#@\s]+/[^/?#\s]+/[^/?#\s]+/media/blob/([0-9a-fA-F]{40})')
 MARKDOWN_DEST = r'(?:<([^>\n]+)>|([^\s)]+))'
 
 
@@ -416,6 +417,7 @@ def check_media(repo, readme, rows, row):
     gifs.update(previews)
     readme_video = False
     mp4s = set()
+    blob_paths = None
     documents = [(readme_path, readme_media)]
     for document in sorted((repo / 'docs').rglob('*.md')):
         text = read(document)
@@ -423,7 +425,26 @@ def check_media(repo, readme, rows, row):
             documents.append((document, MediaEmbeds(text)))
     for document, media in documents:
         for number, attrs in enumerate(media.videos, 1):
-            target = media_path(repo, document, attrs.get('src'), '.mp4')
+            source = attrs.get('src')
+            target = media_path(repo, document, source, '.mp4')
+            blob = FORGE_MEDIA_BLOB.fullmatch(source or '')
+            if blob:
+                try:
+                    host = urlsplit(source).hostname
+                except ValueError:
+                    host = None
+                if host:
+                    if blob_paths is None:
+                        blob_paths = {}
+                        tree = git(repo, 'ls-tree', '-r', '-z', 'HEAD', '--', 'docs/media/') or ''
+                        for entry in tree.split('\0'):
+                            metadata, separator, path = entry.partition('\t')
+                            parts = metadata.split()
+                            if (separator and len(parts) == 3 and parts[0] in ('100644', '100755')
+                                    and parts[1] == 'blob' and path.startswith('docs/media/')
+                                    and path.endswith('.mp4')):
+                                blob_paths.setdefault(parts[2].lower(), []).append(repo / path)
+                    target = next((path for path in blob_paths.get(blob[1].lower(), ()) if path.is_file()), None)
             present = target is not None and target.is_file()
             missing = VIDEO_ATTRIBUTES - attrs.keys()
             valid = present and not missing
@@ -433,7 +454,7 @@ def check_media(repo, readme, rows, row):
                 mp4s.add(target)
             problems = []
             if not present:
-                problems.append('src must reference an existing local MP4')
+                problems.append('src must be a local MP4 path or the forge media blob URL of an MP4 committed under docs/media/')
             if missing:
                 problems.append('missing ' + ', '.join(sorted(missing)))
             if problems:
@@ -442,7 +463,7 @@ def check_media(repo, readme, rows, row):
 
     row('README has a demo, build commands and a license line', 'M',
         (readme_video or bool(previews)) and 'cargo skyline build' in readme and 'license' in readme.lower(),
-        'README.md; use a local MP4 video embed or an image-only GIF preview')
+        'README.md; use an MP4 video embed (local path or forge media blob URL) or an image-only GIF preview')
     for gif in sorted(gifs):
         name = f'GIF {gif.name}: animated, 1280 wide, under 10 s'
         try:
