@@ -328,16 +328,49 @@ class PublicationMedia(unittest.TestCase):
         self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][0], 'pass')
         self.assertFalse(any('example.mp4' in name for name in rows))
 
-    def test_incomplete_video_embed_fails_and_wrong_encoding_is_a_note(self):
+    def test_incomplete_video_embed_and_wrong_encoding_are_notes(self):
         repo = self.repo(self.VALID_VIDEO.replace(' playsinline', ''))
         self.committed_asset(repo, 'docs/media/clip.mp4')
         bad = self.VIDEO_INFO | {'height': 1080, 'audio': True, 'seconds': 10.1, 'faststart': False}
         with patch('compliance.mp4_info', create=True, return_value=bad):
             rows = self.tagged_rows(repo)
-        self.assertEqual(rows['README has a demo, build commands and a license line'][1], 'fail')
-        self.assertEqual(rows['README.md video 1: MP4 embed'][1], 'fail')
-        self.assertIn('playsinline', rows['README.md video 1: MP4 embed'][2])
+        self.assertEqual(rows['README has a demo, build commands and a license line'][1], 'pass')
+        self.assertNotIn('README.md video 1: MP4 embed', rows)
+        self.assertEqual(rows.get('README.md video 1: embed attributes', ('missing', 'missing'))[:2], ('E', 'note'))
+        self.assertIn('playsinline', rows['README.md video 1: embed attributes'][2])
+        self.assertEqual(rows.get('Docs videos resolve to a committed MP4', ('missing', 'missing'))[:2], ('M', 'pass'))
         self.assertEqual(rows['MP4 docs/media/clip.mp4: publication encoding'][:2], ('E', 'note'))
+
+    def test_a_missing_attribute_is_a_note_when_the_src_resolves(self):
+        repo = self.repo(self.VALID_VIDEO.replace(' playsinline', ''))
+        self.committed_asset(repo, 'docs/media/clip.mp4')
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+            rows = self.tagged_rows(repo)
+        self.assertFalse(any(name.endswith('MP4 embed') for name in rows))
+        self.assertEqual(rows['README has a demo, build commands and a license line'][1], 'pass')
+        self.assertEqual(rows.get('README.md video 1: embed attributes', ('missing', 'missing'))[:2], ('E', 'note'))
+        self.assertIn('playsinline', rows['README.md video 1: embed attributes'][2])
+        self.assertEqual(rows.get('Docs videos resolve to a committed MP4', ('missing', 'missing'))[:2], ('M', 'pass'))
+
+    def test_a_video_without_src_fails(self):
+        repo = self.repo('<video autoplay muted loop playsinline controls></video>')
+        with patch('compliance.mp4_info', return_value=self.VIDEO_INFO):
+            rows = self.tagged_rows(repo)
+        self.assertEqual(rows['README.md video 1: MP4 embed'][:2], ('M', 'fail'))
+        self.assertEqual(rows['README has a demo, build commands and a license line'][1], 'fail')
+        self.assertNotIn('README.md video 1: embed attributes', rows)
+        self.assertNotIn('Docs videos resolve to a committed MP4', rows)
+
+    def test_a_readme_preview_must_be_committed(self):
+        repo = self.repo('![Preview](docs/media/menu.gif)')
+        self.asset(repo, 'menu.gif', b'GIF fixture')
+        demo = 'README has a demo, build commands and a license line'
+        self.assertEqual(self.rows(repo)[demo][0], 'fail')
+        git(repo, 'add', '--', 'docs/media/menu.gif')
+        self.assertEqual(self.rows(repo)[demo][0], 'fail')
+        git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+            'commit', '-q', '-m', 'fixture preview')
+        self.assertEqual(self.rows(repo)[demo][0], 'pass')
 
     def test_committed_clip_resolves_after_worktree_deletion_in_both_forms(self):
         repo = self.repo('')
@@ -451,6 +484,7 @@ class PublicationMedia(unittest.TestCase):
         path = self.asset(repo, 'menu.gif')
         frames = [Image.new('RGB', (1280, 8), color) for color in ('red', 'blue')]
         frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        self.committed_asset(repo, 'docs/media/menu.gif', path.read_bytes())
         rows = self.rows(repo)
         self.assertEqual(rows['README has a demo, build commands and a license line'][0], 'pass')
         self.assertEqual(rows['GIF menu.gif: animated, 1280 wide, under 10 s'][0], 'pass')
