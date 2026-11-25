@@ -21,6 +21,7 @@ from fractions import Fraction
 import hashlib
 from html.parser import HTMLParser
 import json
+import os
 import re
 import struct
 import subprocess
@@ -334,12 +335,17 @@ class MediaEmbeds(HTMLParser):
             self.images.append(attributes['src'])
 
 
-def media_path(repo, document, source, suffix):
+def media_path(repo, document, source, suffix, *, committed=False):
     if not source:
         return None
     try:
         url = urlsplit(source)
-        target = (document.parent / unquote(url.path)).resolve()
+        path = unquote(url.path)
+        if '\0' in path:
+            return None
+        joined = document.parent / path
+        # Git looks up the URL's path in HEAD, not the destination of a worktree symlink.
+        target = Path(os.path.abspath(joined)) if committed else joined.resolve()
     except (ValueError, OSError, RuntimeError):
         return None
     if url.scheme or url.netloc or url.path.startswith('/') or not target.is_relative_to(repo):
@@ -475,7 +481,7 @@ def check_media(repo, readme, rows, row):
                 if (path := media_path(repo, readme_path, source, '.gif')) and path.is_file()]
     gifs.update(previews)
     committed_previews = [path for source in readme_media.images
-                          if (path := media_path(repo, readme_path, source, '.gif'))
+                          if (path := media_path(repo, readme_path, source, '.gif', committed=True))
                           and committed_file_oid(repo, path)]
     readme_video = False
     mp4s = {}
@@ -494,7 +500,7 @@ def check_media(repo, readme, rows, row):
         video_pages += bool(media.videos)
         for number, attrs in enumerate(media.videos, 1):
             source = attrs.get('src')
-            target = media_path(repo, document, source, '.mp4')
+            target = media_path(repo, document, source, '.mp4', committed=True)
             oid = committed_file_oid(repo, target) if target is not None else None
             blob = FORGE_MEDIA_BLOB.fullmatch(source or '')
             if blob and forge_base and source[:blob.start(1)] == forge_base:
