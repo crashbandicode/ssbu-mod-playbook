@@ -1359,6 +1359,33 @@ class BridgeOnTests(unittest.TestCase):
         self.assertNotIn('Another process holds the port', text)
         self.assertEqual(self.popen, [])
 
+    def test_bridge_on_under_lan_online_already_on_reuses_the_file_capture(self):
+        # A retried row calls bridge_on again from a new runner process: the bridge is already On, its capture runs.
+        self.configure_lan()
+        first = self.invoke()
+        prior = self.row / 'routes-bridge-on.json'
+        self.assertEqual(json.loads(prior.read_text()), first)
+        run = self.out / 'bridge-run-offline'
+        requests = list(self.bridge_requests)
+        buttons = [call for call in self.calls if call[0] == 'input.button']
+        del self.instance['bridge_log']
+        with (run / 'bridge.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            second = self.invoke()
+        self.assertTrue(second['reused'])
+        self.assertEqual((second['transport'], second['listening'], second['listener']), ('file', TRANSPORT, None))
+        self.assertEqual(second['chord']['chord'], 'already on')
+        self.assertEqual(second['title']['qualified_by']['receipt'], str(prior))
+        self.assertFalse(second['title']['checked'])
+        self.assertEqual(second['capture'], first['capture'])
+        self.assertEqual(self.instance['bridge_log'], str(run / 'bridge.log'))
+        self.assertEqual(len(self.popen), 1)  # no second capture
+        self.assertEqual([call for call in self.calls if call[0] == 'input.button'], buttons)  # no second chord
+        self.assertEqual(self.bridge_requests, requests)
+        self.assertEqual(self.owner_calls, [])
+        self.assertEqual(json.loads(prior.read_text()), first)
+        self.assertFalse((self.out / 'bridge-run').exists())
+
     def test_bridge_on_refuses_listening_on_another_port_before_reuse(self):
         other = '382602979 [Bridge] listening port=6978 rebinds=0'
         self.events.write_text('\n'.join((FAIL_BOOT, FAIL_READY, other, FAIL_ON)) + '\n')
