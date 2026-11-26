@@ -27,6 +27,7 @@ fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 """
 import argparse
 import copy
+import errno
 import hashlib
 import heapq
 import importlib.util
@@ -39,6 +40,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -2265,7 +2267,12 @@ def _pinning_files(run, runs):
     shared base, and the bases other labels keep in their stage folders. A folder that cannot be listed raises."""
     for name in sorted(os.listdir(runs)):
         entry = runs / name
-        if name == '_eden-test' or entry.is_symlink() or not entry.is_dir() or entry == run:
+        if name == '_eden-test' or entry == run:
+            continue
+        mode = entry.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            raise OSError(errno.ELOOP, 'linked peer not inspected; its pins are unknown', entry)
+        if not stat.S_ISDIR(mode):
             continue
         yield entry / 'config.json'
         yield from (entry / other for other in sorted(os.listdir(entry))
@@ -2386,7 +2393,8 @@ class _DownGuard:
                 self.keep = [line.strip() for line in current.read_text().splitlines()
                              if line.strip() and not line.lstrip().startswith('#')]
         except (OSError, ValueError) as error:
-            self.blocked = f'cannot read {getattr(error, "filename", None) or current}: {type(error).__name__}'
+            why = getattr(error, 'strerror', None) or type(error).__name__
+            self.blocked = f'cannot read {getattr(error, "filename", None) or current}: {why}'
         if isinstance(claims, str):
             self.blocked = self.blocked or claims
             return
@@ -2566,11 +2574,15 @@ def cmd_down(run, keep_state=False):
         held = [(path, reason) for path in copies if (reason := guard.reason(path))]
         for path, reason in held:
             keep(f'{path.relative_to(run)}/', path, reason)
-        if not held:
+        # An unknown peer vetoes the prune itself, even when no copy is visible to this scan.
+        stop = guard.blocked or ('a copy of this run is kept' if held else None)
+        if not stop:
             sizes = [(path, _path_bytes(path)) for path in copies]
             prune_code = lifecycle(run, 'down', *evidence)
             done = (read_journal().get('prune') or {}).get('done')
             pruned = prune_code == 0 and bool(done)
+            if not pruned:
+                stop = f'the lifecycle did not prune (exit {prune_code})'
             for path, size in sizes:
                 if not pruned:
                     keep(f'{path.relative_to(run)}/', path, f'the lifecycle did not prune (exit {prune_code}); see RESULTS')
@@ -2578,7 +2590,6 @@ def cmd_down(run, keep_state=False):
                     record['removed'].append({'what': f'{path.relative_to(run)}/', 'path': str(path), 'bytes': size})
         # Nothing more goes unless the lifecycle's own prune ran and finished: a held copy or a failed prune means
         # Down has to run again, from the same folders.
-        stop = None if pruned else ('a copy of this run is kept' if held else f'the lifecycle did not prune (exit {prune_code})')
         for raw, reason in raw_captures(run):
             reason = stop or reason or current_reason(raw)
             what = f'raw capture {raw.relative_to(run / "out")}'
