@@ -6840,6 +6840,59 @@ class DashboardRouteTests(unittest.TestCase):
         self.assertEqual(self.io.stage_count, 1)
 
 
+class ToMainEarlyMainObservationTests(unittest.TestCase):
+    def setUp(self):
+        import test_bridge_navigation as fixtures
+
+        self.fixtures = fixtures
+        self.bridge = fixtures.BridgeNavigationTests()
+        self.addCleanup(self.bridge.doCleanups)
+        self.bridge.setUp()
+
+    def run_through_early_main(self, source, through_unowned=False):
+        fixtures, bridge = self.fixtures, self.bridge
+        early = fixtures.ui('main_menu', owner='unknown', dialog='unknown')
+        bridge.scene = source
+        bridge.transition_samples['attract-cancel'] = early
+        destination = fixtures.UNOWNED_MAIN if through_unowned else fixtures.MAIN
+        bridge.edges = [(source, ('attract-cancel',), destination)]
+
+        def reply(ctx, fence, request):
+            bridge.reply(ctx, fence, request)
+            if request == 'state ssbu.ui' and bridge.last_ui is fixtures.UNOWNED_MAIN:
+                bridge.scene = fixtures.MAIN
+
+        with mock.patch.object(routes, 'bridge_v2', side_effect=reply):
+            result = routes.to_main(bridge.ctx, tries=1, look_s=.2)
+        self.assertEqual(bridge.actions, ['attract-cancel'])
+        self.assertEqual(result['start_presses'], 1)
+        self.assertEqual(result['focus'], 'main_menu.top.smash')
+        self.assertEqual(bridge.last_ui, fixtures.MAIN)
+        bridge.assert_no_images()
+
+    def test_to_main_passes_through_main_menu_before_its_layer_is_known(self):
+        self.run_through_early_main(self.fixtures.IDLE_TITLE, through_unowned=True)
+
+    def test_to_main_goes_from_the_early_main_menu_state_straight_to_the_top_tab(self):
+        self.run_through_early_main(self.fixtures.IDLE_TITLE)
+
+    def test_to_main_how_to_play_passes_through_the_early_main_menu_state(self):
+        self.run_through_early_main(self.fixtures.HOW_TO_PLAY)
+
+    def test_to_main_still_rejects_a_main_menu_state_with_an_unexpected_layer(self):
+        fixtures, bridge = self.fixtures, self.bridge
+        early = fixtures.ui('main_menu', owner='unknown', dialog='unknown', layer='submenu')
+        early['focus'] = 'main_menu'
+        bridge.scene = fixtures.IDLE_TITLE
+        bridge.transition_samples['attract-cancel'] = early
+        bridge.edges = [(fixtures.IDLE_TITLE, ('attract-cancel',), fixtures.MAIN)]
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected Title focus 'main_menu'"):
+            routes.to_main(bridge.ctx, tries=1, look_s=.2)
+        self.assertEqual(bridge.actions, ['attract-cancel'])
+        bridge.assert_no_images()
+
+
 class OnlineTests(unittest.TestCase):
     A1 = ('[auto] broker started title=01006A800016E000 lan=192.168.0.222 local_only=false\n'
           '[coord] leading epoch=137 tcp=192.168.0.222:35095\n'
