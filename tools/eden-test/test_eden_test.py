@@ -3623,6 +3623,33 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual((run / 'lifecycle-down.log').read_text().count('$ '), 1)
         self.assertIn(str(peer), self.cleanup(run)['kept'][0]['reason'])
 
+    def test_other_stage_base_pins_work_and_an_uninspected_stage_keeps_it(self):
+        self.pruning_lifecycle()
+        for kind in ('plain', 'linked', 'dangling'):
+            with self.subTest(kind=kind):
+                run = self.up_run(kind)
+                own_stage = self.stage_copy(kind)
+                pinned = run / 'work/profiles/profile-a/save.bin'
+                peer = own_stage.parent / f'peer-{kind}'
+                other = peer if kind == 'plain' else self.dir / f'archived-{kind}'
+                if kind != 'dangling':
+                    other.mkdir()
+                    (other / 'base.json').write_text(json.dumps({'input': str(pinned)}))
+                if kind != 'plain':
+                    peer.symlink_to(other, target_is_directory=True)
+                try:
+                    eden_test.main(['down', str(run)])
+                    self.assertTrue(pinned.is_file(), f'{kind} peer stage did not protect work')
+                    self.assertTrue(own_stage.is_dir())
+                    self.assertEqual((run / 'lifecycle-down.log').read_text().count('$ '), 1)
+                    reason = self.cleanup(run)['kept'][0]['reason']
+                    self.assertIn(str(peer / 'base.json' if kind == 'plain' else peer), reason)
+                    if kind != 'plain':
+                        self.assertIn('unknown', reason)
+                finally:
+                    if peer.is_symlink():
+                        peer.unlink()
+
     def test_dangling_peer_blocks_prune_even_without_visible_copies(self):
         self.pruning_lifecycle()
         run = self.up_run()
