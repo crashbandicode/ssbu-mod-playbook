@@ -2257,6 +2257,8 @@ _TITLE_WITHOUT_PROMPT = {**_UNOWNED_FOCUS, 'screen': 'title', 'focus': 'title',
                          'screen.context': 'unknown'}
 _HOW_TO_PLAY_WITHOUT_PROMPT = {**_UNOWNED_FOCUS, 'screen': 'attract', 'focus': 'attract',
                                'screen.context': 'how_to_play'}
+_MAIN_WITHOUT_LAYER = {**_UNOWNED_FOCUS, 'screen': 'main_menu', 'screen.tab': 'unknown', 'screen.layer': 'unknown',
+                       'focus': 'main_menu', 'screen.context': 'unknown'}
 _MAIN_WITHOUT_FOCUS = {**_UNOWNED_FOCUS, 'screen': 'main_menu', 'screen.layer': 'top',
                        'focus': 'main_menu.top', 'screen.context': 'unknown'}
 TRAINING_OWNER = {**NATIVE_INPUT, 'screen.context': 'training'}
@@ -2349,8 +2351,9 @@ def to_main(ctx, tries=8, look_s=6, *, cap=None):
 
     for source, route, destinations, pending in (
         (TITLE_PROMPT, 'Title', (*main_targets, HOW_TO_PLAY_SKIP),
-         (_TITLE_WITHOUT_PROMPT, _HOW_TO_PLAY_WITHOUT_PROMPT, _MAIN_WITHOUT_FOCUS)),
-        (HOW_TO_PLAY_SKIP, 'How to Play', main_targets, (_HOW_TO_PLAY_WITHOUT_PROMPT, _MAIN_WITHOUT_FOCUS)),
+         (_TITLE_WITHOUT_PROMPT, _HOW_TO_PLAY_WITHOUT_PROMPT, _MAIN_WITHOUT_LAYER, _MAIN_WITHOUT_FOCUS)),
+        (HOW_TO_PLAY_SKIP, 'How to Play', main_targets,
+         (_HOW_TO_PLAY_WITHOUT_PROMPT, _MAIN_WITHOUT_LAYER, _MAIN_WITHOUT_FOCUS)),
     ):
         if not _fields_match(state, source):
             continue
