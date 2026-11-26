@@ -387,8 +387,9 @@ repeat Down on the Ally. Pending releases are not pruned.
   `state/lifecycle.json`, the shared base, or a base in another label's stage folder names it, something under
   it or a folder above it; when `~/eden-runs/.keep` lists the label or the path; when a process uses it; or when
   the ledger has an open claim that is not matched to a run folder on this host. A file, folder, ledger or
-  process that cannot be read keeps everything. Down does not follow a linked sibling run: its pins are
-  unknown, so it blocks pruning. Down checks again before removing each raw capture and the stage copy.
+  process that cannot be read keeps everything. Down does not follow a linked sibling run or another
+  label's linked stage folder: its pins are unknown, so it blocks pruning. Down checks again before
+  removing each raw capture and the stage copy.
   Only when nothing is kept does a second lifecycle Down prune.
 - **After a kept copy or a failed prune** nothing else is removed: Down has to run again, from the same folders.
 - **The stage copy goes last,** because a remote Down runs from `stage/<label>/tools`.

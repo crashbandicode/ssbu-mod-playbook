@@ -2262,17 +2262,19 @@ def _present(path):
     return True
 
 
+def _peer_directory(path):
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        raise OSError(errno.ELOOP, 'linked peer not inspected; its pins are unknown', path)
+    return stat.S_ISDIR(mode)
+
+
 def _pinning_files(run, runs):
     """The files through which another run can need a path: every other run's configs and Up-time journal, the host's
     shared base, and the bases other labels keep in their stage folders. A folder that cannot be listed raises."""
     for name in sorted(os.listdir(runs)):
         entry = runs / name
-        if name == '_eden-test' or entry == run:
-            continue
-        mode = entry.lstat().st_mode
-        if stat.S_ISLNK(mode):
-            raise OSError(errno.ELOOP, 'linked peer not inspected; its pins are unknown', entry)
-        if not stat.S_ISDIR(mode):
+        if name == '_eden-test' or entry == run or not _peer_directory(entry):
             continue
         yield entry / 'config.json'
         yield from (entry / other for other in sorted(os.listdir(entry))
@@ -2283,7 +2285,7 @@ def _pinning_files(run, runs):
     if _present(stage):
         for label in sorted(os.listdir(stage)):
             other = stage / label
-            if label != run.name and other.is_dir() and not other.is_symlink():
+            if label != run.name and _peer_directory(other):
                 yield from (other / name for name in sorted(os.listdir(other)) if name.endswith('.json'))
 
 
