@@ -3606,6 +3606,74 @@ class EdenTestTests(unittest.TestCase):
                 self.assertEqual(stage.is_dir(), label == 'late-claim')
                 self.assertTrue(any(item['path'] == str(raw) for item in self.cleanup(run)['kept']))
 
+    def test_linked_peer_keeps_work_before_prune(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        pinned = run / 'work/profiles/profile-a/save.bin'
+        archived = self.dir / 'archived-peer'
+        archived.mkdir()
+        (archived / 'config.json').write_text(json.dumps({'input': str(pinned)}))
+        peer = eden_test.RUNS / 'peer'
+        peer.symlink_to(archived, target_is_directory=True)
+
+        eden_test.main(['down', str(run)])
+        self.assertTrue(pinned.is_file(), 'the linked peer still needs the work input')
+        self.assertTrue(stage.is_dir())
+        self.assertEqual((run / 'lifecycle-down.log').read_text().count('$ '), 1)
+        self.assertIn(str(peer), self.cleanup(run)['kept'][0]['reason'])
+
+    def test_dangling_peer_blocks_prune_even_without_visible_copies(self):
+        self.pruning_lifecycle()
+        run = self.up_run()
+        stage = self.stage_copy()
+        shutil.rmtree(run / 'work')
+        shutil.rmtree(run / 'state/snapshot-a')
+        peer = eden_test.RUNS / 'peer'
+        peer.symlink_to(self.dir / 'missing-peer', target_is_directory=True)
+        eden_test.main(['down', str(run)])
+        self.assertEqual((run / 'lifecycle-down.log').read_text().count('$ '), 1)
+        self.assertTrue(stage.is_dir())
+        self.assertIn(str(peer), self.cleanup(run)['kept'][0]['reason'])
+
+    def test_peer_appearing_between_removals_keeps_remaining_raw_or_stage(self):
+        self.pruning_lifecycle()
+        for when in ('second-raw', 'stage'):
+            with self.subTest(when=when):
+                run = self.up_run(when)
+                stage = self.stage_copy(when)
+                row = run / 'out/r1'
+                row.mkdir(parents=True)
+                clip = row / 'published.gif'
+                clip.write_bytes(b'published')
+                raws = [row / f'{n}.capture.gif' for n in (1, 2)]
+                for raw in raws:
+                    raw.write_bytes(b'raw')
+                (run / 'out/r1.json').write_text(json.dumps({'steps': [
+                    {'gif': {'capture': raw.name, 'path': str(clip), 'sha256': sha(clip)}} for raw in raws]}))
+                archived = self.dir / f'archived-{when}'
+                archived.mkdir()
+                (archived / 'config.json').write_text('{}')  # even a readable target is not inspected
+                peer = eden_test.RUNS / f'peer-{when}'
+                captures = eden_test.raw_captures
+
+                def publish_peer(run):
+                    for raw, reason in captures(run):
+                        if raw == raws[1] and when == 'second-raw':
+                            peer.symlink_to(archived, target_is_directory=True)
+                        yield raw, reason
+                    if when == 'stage':
+                        peer.symlink_to(archived, target_is_directory=True)
+
+                with mock.patch.object(eden_test, 'raw_captures', side_effect=publish_peer):
+                    eden_test.main(['down', str(run)])
+                self.assertFalse((run / 'work').exists())
+                self.assertFalse(raws[0].exists(), 'the first removal predates the link')
+                self.assertEqual(raws[1].is_file(), when == 'second-raw')
+                self.assertTrue(stage.is_dir())
+                self.assertTrue(all(str(peer) in item['reason'] for item in self.cleanup(run)['kept']))
+                peer.unlink()
+
     def test_down_removes_nothing_more_after_a_failed_prune(self):
         for copies in (True, False):
             with self.subTest(copies=copies):
