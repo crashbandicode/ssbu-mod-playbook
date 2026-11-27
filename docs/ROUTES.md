@@ -59,7 +59,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; uses the same read-before-press dashboard steps, stops before ZR without `dashboard`, and otherwise resends a lost input at most 3 times or stops on a named step |
 | `bridge_alive` `{cap}` | bridge running | proves the bridge answers after room connection: advancing `ssbu.ui` and two fenced `tr.menu` replies, whose revisions may be equal |
 | `configure_boot` `{gdb_port}` | frontend, no game (lifecycle `defer_load`) | volume 0, `memory_layout_mode` 0 and (with `gdb_port`) the GDB stub on, each set, read back and saved |
-| `load_game` `{gdb_port}` | the same | the game loaded: no-hold kick (`?`, `c`, close without a detach) **before** any wait; then `loading_complete`, no shaders building, at least 30 FPS |
+| `load_game` `{gdb_port}` | the same | the game loaded: one delivered no-hold kick (`?`, `c`, close without a detach) **before** any wait, tried again only if the stub did not take it; then `loading_complete`, no shaders building, at least 30 FPS, within 900 s of the load with the stub on or off |
 | `wait_lines` `{lines: [[source, regex]]}` | any | each boot line is present, for example TrainingRooms' `result=installed`. Use it instead of a fixed post-load sleep. A source may be `sdmc:<path>` |
 | `to_main` | qualified Title opening, Title prompt, How to Play skip prompt, or Main | a fresh bridge observation of native Main Menu top-tab focus |
 | `main_to_stage` | anywhere `to_main` handles | Training's stage select (`stage` gate) |

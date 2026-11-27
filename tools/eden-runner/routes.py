@@ -11,7 +11,7 @@ Blocks (docs/ROUTES.md has what each guarantees on exit):
   wireless_room    create a Local Wireless room and reach its waiting room as host
   bridge_alive     verify bridge replies after the frontend room connects
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
-  load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
+  load_game        game.load, one delivered no-hold GDB kick before any wait, then status loading_complete and drawing
   wait_lines       the boot lines the plugins print (instead of a fixed post-load sleep)
   to_main          Title or How to Play -> Main Menu (native ownership gate, capped)
   main_to_stage    main menu -> Training's stage select
@@ -2153,24 +2153,16 @@ def _kick(port, cap):
     return {'error': error}
 
 
-def _drawing(ctx, cap):
-    until = time.monotonic() + cap
-    status = {}
-    while time.monotonic() < until:
-        ctx.check_stop()
-        status = ctx.call('status') or {}
-        if (status.get('game_fps') or 0) > 1:
-            return True, status
-        if status.get('running') is False and status.get('loading_complete') is not None:
-            break
-        time.sleep(1.0)
-    return False, status
-
-
 def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
     """game.load, then (stub on) the no-hold kick BEFORE any wait, then the game's own state: loading_complete, no
-    shaders building, game_fps at least min_fps. Fails closed: a guest that never draws after three kicks, or Eden
-    that stops running, raises with the polls it saw."""
+    shaders building, game_fps at least min_fps, within cap seconds of game.load with the stub on or off.
+
+    One delivered kick releases the guest: Eden resumes it when the client leaves, and it runs from then on (film-x1
+    filmx1-b1-surface-1, 2026-11-27: first service calls 0.3 s after the kick). A boot can take longer to draw than
+    any fixed schedule of further kicks, and each further connection only pauses a running guest and reports the
+    process's first thread where it waits, so a delivered kick is never repeated. A kick the stub did not take (it
+    was not listening yet) left the guest held, so that one is tried again. Fails closed: a stub that takes no
+    continue within cap, a game still loading at cap, or Eden that stops running, raises with what it saw."""
     out = {}
     runner_out = getattr(getattr(ctx, 'runner', None), 'out', None)
     config_path = Path(runner_out).parent / 'config.json' if runner_out is not None else None
@@ -2185,19 +2177,17 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
             out['network_interface'] = live
     t0 = time.monotonic()
     ctx.call('game.load', {'path': ctx.instance['game']}, job_cap=240)
+    until = t0 + cap
     if gdb_port:
         out['kick'] = [_kick(int(gdb_port), 60.0)]
-        drawing, status = _drawing(ctx, 90.0)
-        for _ in range(3):
-            if drawing:
-                break
-            out['kick'].append(_kick(int(gdb_port), 15.0))
-            drawing, status = _drawing(ctx, 60.0)
-        if not drawing:
-            _save(ctx, 'routes-load', out)
-            raise RuntimeError(f'the guest did not draw after the direct continue: {out}')
+        while 'first' not in out['kick'][-1]:
+            ctx.check_stop()
+            left = until - time.monotonic()
+            if left <= 0:
+                _save(ctx, 'routes-load', out)
+                raise RuntimeError(f'the GDB stub took no continue within {cap} s; the guest is still held: {out}')
+            out['kick'].append(_kick(int(gdb_port), min(60.0, left)))
     polls = []
-    until = t0 + cap
     while True:
         ctx.check_stop()
         status = ctx.call('status') or {}

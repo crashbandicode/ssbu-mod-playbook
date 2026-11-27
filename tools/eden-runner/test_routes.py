@@ -986,7 +986,7 @@ class LoadGameStubOnTests(unittest.TestCase):
         self.assertEqual(json.loads((self.row / 'routes-load.json').read_text()), result)
 
     def test_a_kick_the_stub_refused_is_tried_again_until_one_is_delivered(self):
-        self.stub_up_at, self.draws_at = 42.5 + 61, 42.5 + 400
+        self.stub_up_at, self.draws_at = 42.5 + 60, 42.5 + 400
         result = routes.load_game(self.ctx, gdb_port=6811)
         self.assertEqual(self.kicks, [42.5, 102.5], 'the refused kick, then the delivered one, and no third')
         self.assertEqual([sorted(kick) for kick in result['kick']], [['error'], ['first']])
