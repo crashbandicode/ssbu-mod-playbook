@@ -929,6 +929,86 @@ class LoadGameNetworkTests(unittest.TestCase):
                 self.assertNotIn('network_interface', result)
 
 
+class LoadGameStubOnTests(unittest.TestCase):
+    """A stub-on boot gets one delivered kick and then the stub-off path's wait (TrainingRooms phase 23, 2026-11-27).
+
+    Receipts: film-x1 `filmx1-b1-surface-1` (kick 1 at 43.5 s on Eden's clock, the guest's first service calls 0.3 s
+    later, NotifyRunning at 327.2 s; the route raised at about 318 s) and docs boot 10 attempt 1 `tut-dc5302f1-xps-10`
+    (the stub refused connections for the first kick's 60 s; the second kick found the guest at its entry point).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = Path(self.tmp.name) / 'out'
+        self.row = self.out / 'r00'
+        self.row.mkdir(parents=True)
+        self.clock = 42.5       # Eden's clock when game.load returns
+        self.draws_at = None    # the first frame, on that clock
+        self.stub_up_at = 0.0   # the stub accepts connections from here on
+        self.dies_at = None     # Eden stops running
+        self.kicks = []
+        self.ctx = types.SimpleNamespace(
+            runner=types.SimpleNamespace(out=self.out), row_dir=self.row, instance={'game': '/fake/game.xci'},
+            call=self.call, check_stop=lambda: None)
+        for patch in (mock.patch.object(routes.time, 'monotonic', lambda: self.clock),
+                      mock.patch.object(routes.time, 'sleep', self.sleep),
+                      mock.patch.object(routes, '_kick', self.kick)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def sleep(self, seconds):
+        self.clock += seconds
+
+    def kick(self, port, cap):
+        self.kicks.append(self.clock)
+        if self.clock < self.stub_up_at:
+            self.clock += cap
+            return {'error': "ConnectionRefusedError(111, 'Connection refused')"}
+        self.clock += 1.0
+        return {'first': 'S05'}
+
+    def call(self, method, params=None, job_cap=15):
+        if method != 'status':
+            return {}
+        drawn = self.draws_at is not None and self.clock >= self.draws_at
+        return {'running': self.dies_at is None or self.clock < self.dies_at, 'loading_complete': drawn,
+                'shaders_building': 0, 'game_fps': 60 if drawn else 0}
+
+    def test_a_slow_boot_gets_one_kick_and_is_waited_for_like_a_stub_off_boot(self):
+        self.draws_at = 327.2
+        result = routes.load_game(self.ctx, gdb_port=6811)
+        self.assertEqual(self.kicks, [42.5], 'a delivered kick is not repeated')
+        self.assertEqual(result['kick'], [{'first': 'S05'}])
+        self.assertEqual(result['last'], {'running': True, 'loading_complete': True, 'shaders_building': 0,
+                                          'game_fps': 60})
+        self.assertGreater(result['seconds'], 274, 'this boot drew after the old deadline')
+        self.assertEqual(json.loads((self.row / 'routes-load.json').read_text()), result)
+
+    def test_a_kick_the_stub_refused_is_tried_again_until_one_is_delivered(self):
+        self.stub_up_at, self.draws_at = 42.5 + 61, 42.5 + 400
+        result = routes.load_game(self.ctx, gdb_port=6811)
+        self.assertEqual(self.kicks, [42.5, 102.5], 'the refused kick, then the delivered one, and no third')
+        self.assertEqual([sorted(kick) for kick in result['kick']], [['error'], ['first']])
+        self.assertEqual(result['last']['game_fps'], 60)
+
+    def test_it_fails_closed_as_the_stub_off_path_does(self):
+        with self.assertRaisesRegex(RuntimeError, r'^still loading after 900 s: '):
+            routes.load_game(self.ctx, gdb_port=6811)
+        self.assertEqual(self.kicks, [42.5])
+        self.clock, self.kicks, self.dies_at = 42.5, [], 100.0
+        with self.assertRaisesRegex(RuntimeError, r'^Eden stopped running while loading: '):
+            routes.load_game(self.ctx, gdb_port=6811)
+        self.assertEqual(self.kicks, [42.5])
+
+    def test_a_stub_that_never_takes_the_continue_fails_at_the_same_cap(self):
+        self.stub_up_at = float('inf')
+        with self.assertRaisesRegex(RuntimeError, r'^the GDB stub took no continue within 900 s'):
+            routes.load_game(self.ctx, gdb_port=6811)
+        self.assertEqual(len(self.kicks), 15, 'sixty seconds a try, inside the cap')
+        self.assertEqual(sorted(json.loads((self.row / 'routes-load.json').read_text())), ['kick'])
+
+
 class FrontendRoomTests(unittest.TestCase):
     DYNAMIC_ROOM = object()
     # p00-rooms.json in phase23/1f-save-hold/ldn-pair/rc15-ldn-xps-2/out.
