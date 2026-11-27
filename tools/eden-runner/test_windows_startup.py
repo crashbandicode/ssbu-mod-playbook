@@ -18,14 +18,18 @@ class WindowsStartupTest(TestCase):
         # The Linux test host has no msvcrt. Substitute the module without
         # altering os.name or exercising unrelated Windows platform branches.
         with mock.patch.dict(sys.modules, {"fcntl": None, "msvcrt": types.ModuleType("msvcrt")}):
-            for name in ("judge_queue", "switch_hw", "portable_lock"):
+            for name in ("judge_queue", "switch_hw", "portable_lock", "routes", "runner"):
                 sys.modules.pop(name, None)
             with mock.patch.object(sys, "argv", ["runner.py", "--help"]), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit) as result:
                     runpy.run_path(str(Path(__file__).with_name("runner.py")), run_name="__main__")
             self.assertEqual(result.exception.code, 0)
             import switch_hw  # Imports the bridge capture locking path.
+            import routes
+            import runner
             self.assertTrue(callable(switch_hw.capture_bridge))
+            self.assertTrue(callable(routes.bridge_on))
+            self.assertTrue(callable(runner.main))
 
 
 
@@ -81,4 +85,3 @@ with open(sys.argv[2], "a+b") as lock:
 
 if __name__ == "__main__":
     main()
-
