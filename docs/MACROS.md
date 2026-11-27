@@ -637,6 +637,9 @@ The still's own recorded path selects its capture; otherwise use
 exactly one capture. An ambiguous hash is refused.
 A judge, when configured, decides those rows instead.
 
+2026-11-27: shared hook modules include `routes:` ([ROUTES](ROUTES.md)),
+`fixtures:` and `film:` ([GIFS](GIFS.md#film-a-1080p60-take-2026-11-27)).
+
 #### Fixtures
 
 The shared `fixtures:recording_role` hook checks the Recording page or popup

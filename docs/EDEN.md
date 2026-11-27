@@ -91,6 +91,44 @@ screen in the same boot (for a stage: the native stage select) before judging
 the plugin's view of it. Without the pin the run shows stock assets and the
 check proves nothing (2026-11-04, TrainingRooms RC10).
 
+## Hosts are interchangeable (2026-11-27)
+
+The same commands, rows and receipts run on the Surface, the Yoga, the XPS
+(Linux) and the Ally (Windows); what differs is in this table and nowhere else.
+
+| What | Linux hosts | The Ally (Windows) | Where it lives |
+| --- | --- | --- | --- |
+| Control endpoint | Unix socket `run-<key>/control.sock` | named pipe `\\.\pipe\eden-life-<token>-<key>` | `runner.py` `default_client_factory` (`PipeClient`) |
+| Eden launch and stop | a `systemd --user` unit, main PID first | a scheduled task in the interactive session, inside a kill-on-close Job | `lifecycle.py` `Host` / `WindowsHost` |
+| Screen | a private X display per run | the panel of interactive session 1; one Eden; stills use `screenshot_target: "screen"` | lifecycle config; `routes.frame` |
+| Where the lifecycle runs | on the host | on the host, asked for by the Linux controller; the ledger stays on Linux | `lifecycle.py` `forward_windows`; `eden_test.py` relay |
+| Listener owner (bridge) | `ss -ltnp` | `netstat -ano -p TCP`, matched against the Job's `eden.exe` | `host_os.tcp_listeners`; `routes._bridge_on_owned_listener` |
+| Detached capture | `start_new_session` | `DETACHED_PROCESS`, new process group, break away from the SSH job | `host_os.detached` |
+| File locks | `flock` | `msvcrt.locking` | `portable_lock.py` |
+| Film capture | ffmpeg `x11grab` of the run's display | ffmpeg `ddagrab`, started by an interactive scheduled task | `film.py` |
+| Child Python | `python3 -B -I` | `python.exe -B -X utf8` (no `-I`: Pillow is in the user site) | `eden_test._python`, `host_os.python_flags` |
+| Runs root | `/home/intpa/eden-runs` | `C:/home/intpa/eden-runs` | `host_os.RUNS_ROOT` |
+| Staging from the controller | rsync | one tarball over scp, unpacked with `tar.exe` | `eden_test._go_remote_with_mux` |
+| Follow-up commands | on the host, or `eden_test.py remote …` | `eden_test.py remote …` from the controller only | `eden_test.cmd_remote` |
+| Admission beside a compile | allowed when every compiler is niced and memory covers the reserve | refused beside any compiler or a running WSL | [lifecycle README, "Compiles beside an Up"](../tools/eden-lifecycle/README.md#compiles-beside-an-up-2026-11-10) |
+| Lobby rows | supported | not yet: the interface check is Linux-only and the lifecycle adds an inbound Block rule; pass `--no-lobby` | `eden_test.host_interface_problem` |
+
+**The commands:**
+
+- `go --host <h>`: stage, new, Up, rows, report.
+- `go --prepare`: everything before Up, claims nothing; then `remote --host <h> --label <l> fly [--down]`.
+- `go --down`: Down after the rows, pass or fail.
+- `--detach` on `go`/`remote`: the controller runs as user unit `eden-go-<label>`; `peek --label <l>` shows status and log tail; `stop --host <h> --label <l>` writes the runner's `STOP` file so a `fly --down` reports and Downs.
+- `collect --host <h> --label <l> --to <dir> [--films]`: copy the evidence, with films if asked.
+- `--eden-setting core.resolution_setup=<n>`: set the Eden resolution.
+
+Each host needs `<runs root>/_eden-test/base.json`; the Ally's was written on
+2026-11-27 with Windows pins `windows_job`, `windows_control`, `windows_python`,
+`interactive_session` and `allow_inbound_block`, and no display.
+
+The Ally's WSL is also a gate host; look with `wsl.exe -l --running` (it does
+not start the VM), and never run a command inside the distro to probe.
+
 ## Up
 
 ```text
@@ -423,7 +461,8 @@ repeat Down on the Ally. Pending releases are not pruned.
 - **The stage copy goes last,** because a remote Down runs from `stage/<label>/tools`.
 - **The receipt** is `out/down-cleanup.json` (each path removed with its bytes, each path kept with its reason),
   with one `Cleanup:` line in RESULTS.md. Films made another way (OBS, `ffmpeg`) are not the runner's: delete them
-  by hand. Proof: host tests only (`test_eden_test.py`); no live Down has run this yet.
+  by hand. `film.py` films are row files (`<name>-1080p-capture.mkv`) and are large; `collect --films` copies them.
+  Proof: host tests only (`test_eden_test.py`); no live Down has run this yet.
 
 **AppImage backing processes must outlive Eden's main process.** lr-09's
 group-wide SIGTERM removed its FUSE mount while Eden still ran, producing

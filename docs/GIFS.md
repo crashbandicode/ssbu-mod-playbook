@@ -47,6 +47,54 @@ audio and length are reported as notes.
 Keep the 1080p evidence clip and a 2–3× zoom crop that shows the relevant
 detail. MP4 is suitable for both. Keep the original recordings out of git.
 
+## Film a 1080p60 take (2026-11-27)
+
+One recorder for every host: `tools/eden-runner/film.py`. In a hook use
+`with film.take(ctx, name, cap) as cue:`: `ctx` is the row context, `name`
+names the take and `cap` is its time cap in seconds. Optional arguments are
+`before=0.8`, `after=1.5`, `stop_after_body=False`, `fps=60` and
+`on_started=None`. The row gets `<name>-1080p-capture.mkv`,
+`<name>-1080p-capture.log` and `<name>-take.json`.
+The receipt keeps `display`, `size`, `fps`, `source`, `cues_after_first_bytes`,
+`capture_status` and `cap_s`, plus `backend`, `host_os`, `recorder`,
+`film_probe` and `length_vs_cap`.
+
+As row steps:
+
+```json
+[
+  {"run": "film:fullscreen"},
+  {"run": "film:record", "args": {"name": "...", "seconds": 10, "play": "<routes macro>"}}
+]
+```
+
+`film_probe` (also `python3 film.py probe <film>…`) uses `ffmpeg -f framemd5`,
+not ffprobe. It reports `duration`, `size`, `frames`, `width`, `height`,
+`captured_fps`, `distinct_per_second` (frames whose hash differs from the one
+before, per film second), `distinct_fps_min` and `distinct_fps_median`.
+Repeated frames mean the screen had not changed; a still menu legitimately
+repeats frames, so judge seconds of live gameplay.
+
+The film lanes' published-clip numbers (2026-11-27) are at least 55 distinct
+frames in each gameplay second and a file length equal to the take length.
+The tool reports; it does not gate.
+
+ffmpeg is found in order at `$EDEN_FFMPEG`, on `PATH`,
+`~/eden-runs/_eden-test/ffmpeg`, then on Windows
+`%USERPROFILE%\.local\bin\ffmpeg.exe`. On 2026-11-27 the Surface and Yoga had
+none on `PATH`.
+
+Check a host before a film run:
+`python3 film.py smoke --out <dir> --seconds 3 [--display :N]`. Linux needs
+the display; Windows refuses one. On 2026-11-27 the Ally's 3 s smoke used
+`ddagrab` at 1920x1080: 179 frames, 59.67 captured frames/s. `gdigrab`
+measured 47–55 frames/s there and is not offered. An Ally film run needs the
+interactive session: the recorder starts through a one-shot scheduled task
+with `pythonw.exe`.
+
+Linux `x11grab` is host tests only; no boot has filmed through it yet. The
+film lanes' own GStreamer capture remains what was flown.
+
 ## GIFs for image previews
 
 Use a GIF only where an image is required, such as a README preview.

@@ -219,8 +219,9 @@ its events log reads `[Bridge] listen failed … call=listen errno=22`. The brid
 - Requests reach the bridge through `requests.txt`, one batch at a time, and it polls every 20 ms; lines come back
   through `stream.log`, which Eden flushes when the bridge asks the file's size.
 
-`bridge_on` accepts a trace witness or, on Linux Eden hosts with the stub on, checks boot-default chord readiness,
-running and loading status, no input since `game.load`, and listener ownership before capture. With the stub on, the
+`bridge_on` accepts a trace witness or, on Linux and Windows Eden hosts with the stub on, checks boot-default chord
+readiness, running and loading status, no input since `game.load`, and listener ownership before capture. On Windows
+the listener must belong to the run's `eden.exe` (2026-11-27; host tests only until the proof boot). With the stub on, the
 Title prompt is named by the bridge only after it is On. Before the chord the
 evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
 the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.

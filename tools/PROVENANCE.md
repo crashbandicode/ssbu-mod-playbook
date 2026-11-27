@@ -334,3 +334,15 @@ the shared base, `.keep`, an open ledger claim or a process needs them; what it 
 `out/down-cleanup.json`. `eden-runner/runner.py` names the raw recording in the gif receipt (`capture`). The
 process rule follows `remote-gate.ps1 -Action Done` (smash-training-lobby `primary-tools`, 2026-11-25). Host tests
 only; no runtime acceptance.
+
+2026-11-27, runner-xplat: `eden-runner/portable_lock.py` and `test_windows_startup.py` were cherry-picked
+from `a5e106d` (ally-slot-sol, 2026-11-20, "ALLY SLOT READY"), which had never landed.
+`eden-runner/host_os.py`, `test_host_os.py` and `test_xplat.py` were written here.
+`eden-runner/film.py` and `test_film.py` were written here; the take contract, file names and receipt keys
+follow `smash-training-lobby/artifacts/phase23/refilm/film-1/packet/rows/docs_take.py` and `cap-video.sh`.
+The probe replaces `dark_replay.py:_film_probe` (ffprobe) and `refilm/film-2/host/fps-buckets.sh`.
+The Windows-host relay and controller commands in `eden-test/eden_test.py` follow
+`phase23/ledge-trap/eden/out/{launch_owned,run_owned,prepare_remote}.py`.
+Proof so far: host tests on Linux and the Ally's Python, the Ally `film.py smoke`, and the Ally
+`go --prepare` (`xplat-ally-2`): tar+scp and target staging, `go_new` from the shared base, packet gate OK,
+runner READY and lifecycle preflight ok through the relay. No runtime acceptance of a full boot yet.

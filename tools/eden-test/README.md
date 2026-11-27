@@ -3,6 +3,26 @@
 From another box, use `/home/intpa/eden-runs/_eden-test/hosts.json` or add `--ssh`:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
 
+## A Windows host (the Ally)
+
+2026-11-27. Use the same `go` command with `--host ally --ssh intpa@dreamland-ally
+--no-lobby`. Its base is `C:\home\intpa\eden-runs\_eden-test\base.json`.
+Follow-ups go through `eden_test.py remote --host ally --label <label>
+run|report|down|fly` from the controller. See
+[Hosts are interchangeable](../../docs/EDEN.md#hosts-are-interchangeable-2026-11-27).
+
+## Prepared and detached runs
+
+2026-11-27:
+
+- `--prepare`: stage and check without Up.
+- `fly`: continue a prepared run.
+- `--down`: Down after the rows, pass or fail.
+- `--detach`: run the controller as a user unit.
+- `peek`: show its status and log tail.
+- `stop`: request the runner stop.
+- `collect`: copy the run's evidence, optionally with films.
+
 Use `tr-yoga` for the Yoga SSH host and `ledger_ssh`. Yoga DNS returns its
 Wi-Fi address first; that path lost up to 36% of packets on 2026-11-24 and
 logins stalled before authentication. Yoga Wi-Fi was switched off at 02:57Z
@@ -37,7 +57,7 @@ stages in seconds. Once a run
 no longer needs its target trees, run this on that host, replacing `LABEL`
 with the run label; it removes the run's trees but retains the cache:
 `/usr/bin/python3 -I -B /home/intpa/eden-runs/_eden-test/stage/LABEL/tools/eden-test/eden_test.py unstage-targets --label LABEL`.
-Each host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
+Each Linux host needs `/home/intpa/eden-runs/_eden-test/base.json`; Yoga and XPS have one.
 A remote go uses that shared base unless `--from` names another one. `--from` is then a path on the host, a `.json`
 file directly in the run's own stage folder `/home/intpa/eden-runs/_eden-test/stage/<label>/`; it is forwarded, and a
 local file is never copied there. The host refuses a base that is missing, is for another host, is a symlink, or

@@ -11,6 +11,9 @@
   down through the Job fallback, restore, separate verify and release (below).
   Graceful `game.stop`, pairs, native error 1312 and transport loss aren't
   qualified there yet. Since 2026-11-04 the Ally admits one Eden, so a pair can't run there.
+  Since 2026-11-27 `eden_test.py` drives the Ally through the relay (prepare
+  proven; proof boot pending). An Up through that path was refused at admission
+  because a gate ran in the Ally's WSL.
 
 Companion to `../eden-runner/runner.py`; the lifecycle sends no input except a watchdog
 `park` sequence the config declares, and never plays macros or implements project rows.
@@ -447,6 +450,11 @@ the configured authoritative ledger; no ledger copy or Windows SSH credential
 is needed. Keep that controller running until Up/Down returns. If transport is
 lost, use Down with the same config: its Windows journal and scheduled Job
 remain recoverable, with a separate hard lifetime bound.
+
+2026-11-27: standalone copies (`lifecycle-backend.py`, `lifecycle-watchdog.py` and
+`lifecycle-settle.py`) are written with `standalone_source()`: its first line
+carries the portable-lock helper because no `eden-runner` folder sits beside
+them. Host test: `test_standalone_copy_runs_from_an_empty_folder`.
 
 Windows config differences:
 
