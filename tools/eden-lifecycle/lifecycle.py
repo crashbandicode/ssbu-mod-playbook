@@ -95,6 +95,14 @@ else:
 def portable_lock_source():
     return (_PORTABLE_LOCK_SOURCE or
             (Path(__file__).resolve().parents[1] / 'eden-runner' / 'portable_lock.py').read_text(encoding='utf-8'))
+
+
+def standalone_source():
+    """Return lifecycle source that can run from a copied standalone file."""
+    source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(encoding='utf-8')
+    return '_FORWARDED_PORTABLE_LOCK_SOURCE = ' + repr(portable_lock_source()) + '\n' + source
+
+
 # Linux comm names that count as a compiler (the same set resources() lists).
 COMPILER_NAMES = ('cargo', 'rustc', 'cc', 'c++', 'gcc', 'g++', 'clang', 'clang++', 'cc1', 'cc1plus', 'ninja', 'cmake')
 # Down copies the files a run wrote to the evidence folder before it prunes the run's copies, except the caches Eden
@@ -1379,7 +1387,7 @@ class WindowsHost(Host):
                   "}; @{program=$exe;rules=@($rules.Name);created=$created;utc=[DateTimeOffset]::UtcNow.ToString('o')}|ConvertTo-Json -Compress")
         save(run / 'firewall.json', json.loads(self.ps(script)))
         backend = run / 'lifecycle-backend.py'
-        backend.write_text(globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(), encoding='utf-8')
+        backend.write_text(standalone_source(), encoding='utf-8')
         save(run / 'launch.json', {'config': config, 'item': item})
         from xml.sax.saxutils import escape
         sid = self.ps('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value').strip()
@@ -2412,7 +2420,7 @@ class Lifecycle:
         spec = self.c.get('watchdog')
         if not isinstance(spec, dict) or spec.get('auto', True) is not True:
             return None
-        source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(encoding='utf-8')
+        source = standalone_source()
         script = self.directory / 'lifecycle-watchdog.py'
         script.write_text(source, encoding='utf-8')
         config_path = self.directory / 'lifecycle-config.json'
@@ -2794,8 +2802,7 @@ class Lifecycle:
                 self.host.stop_settle(previous)
                 self.state['settle_unit'] = None
             script = self.directory / 'lifecycle-settle.py'
-            script.write_text(globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text(encoding='utf-8'),
-                              encoding='utf-8')
+            script.write_text(standalone_source(), encoding='utf-8')
             config_path = self.directory / 'lifecycle-settle-config.json'
             command = ['/usr/bin/python3', '-I', '-B', str(script), 'settle', str(config_path), '--execute']
             self.host.start_settle(unit, command, self.directory, 30 * 60)

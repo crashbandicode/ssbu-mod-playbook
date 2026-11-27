@@ -4402,6 +4402,17 @@ class SshLoopbackTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_standalone_lifecycle_copy_runs_outside_tools_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / 'run-offline'
+            run.mkdir()
+            script = run / 'lifecycle-backend.py'
+            script.write_text(life.standalone_source(), encoding='utf-8')
+            result = subprocess.run([sys.executable, '-I', '-B', str(script), '--help'],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('--execute', result.stdout)
+
     def test_lifecycle_release_closes_claim_line_with_ports_field(self):
         owner = 'Claude devin-replay-mem/replay-mem-C-texture-xps-1'
         token = '37dac379ad67450095a730d3dab097d7'
