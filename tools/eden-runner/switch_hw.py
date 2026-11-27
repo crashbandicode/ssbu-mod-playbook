@@ -222,9 +222,16 @@ class BridgeMirror:
     def __init__(self, run, logs):
         self.run, self.logs, self.parts, self.wanted = Path(run), logs, {}, []
         self.recovered = False
+        # The bridge boot the latest hello named, and the boot in which the bridge opened a backup for this capture.
+        self.boot = self.backup_boot = None
 
     def line(self, raw):
         raw = raw.rstrip(b'\r')
+        hello = HELLO_BOOT.search(raw)
+        if hello:
+            self.boot = hello[1]
+        elif raw.startswith(b'[Bridge] req backup result=ok'):
+            self.backup_boot = self.boot
         data = self.FILE_DATA.match(raw)
         if data:
             try:
@@ -247,10 +254,17 @@ class BridgeMirror:
         if raw.startswith(SETTINGS_WRITTEN):
             self.wanted.append(b'file settings.json')
         if raw.startswith(b'[Bridge] req backup result=refused reason=backup_open') and not self.recovered:
-            # A session that never restored: put the player's files back first, then open a fresh backup. Once per
-            # connection: a restore that can't complete yet must not loop.
-            self.recovered = True
-            self.wanted.extend([b'restore', b'backup'])
+            if self.backup_boot is not None and self.backup_boot == self.boot:
+                # This capture's own backup, opened earlier in this bridge boot: the capture reconnected (a bridge
+                # Off -> On, a dropped socket) and asked again. Restoring here would put the boot-time files back in
+                # the middle of the run (TrainingRooms docs boots 6 to 8, 2026-11-27: the CPU fighter changed and the
+                # run's saves were removed). `down` restores at the end of the run.
+                pass
+            else:
+                # A session that never restored: put the player's files back first, then open a fresh backup. Once
+                # per connection: a restore that can't complete yet must not loop.
+                self.recovered = True
+                self.wanted.extend([b'restore', b'backup'])
         for log in self.logs:
             log.write(raw + b'\n')
             log.flush()
