@@ -53,7 +53,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 
 | Block | Starts on | Guarantees on exit |
 | --- | --- | --- |
-| `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings; `configure_boot` saves them. With `lan_online` it also pins the bridge's file-transport marker on the instance's SD card |
+| `host_network` `{interface, lan_online, ldn_mitm}` | frontend, no game | selects and reads back a non-loopback host interface and LAN settings, with airplane mode off; `configure_boot` saves them. With `lan_online` it also pins the bridge's file-transport marker on the instance's SD card |
 | `frontend_room` `{role, port, nickname, room_name, ip, members, cap}` | frontend, with or without a loaded game | hosts or joins an Eden frontend room and verifies the connected member count |
 | `wireless_room_list` `{ready_cap}` | Main Menu or Local Wireless room list | reads before each dashboard press and reaches a positively ready room list; stops before ZR when the bridge does not publish `dashboard` |
 | `wireless_room` `{ready_cap, unpublished_create}` | Main Menu, the room list, the Create form, Stage Select, CSS or the waiting room (Local Wireless) | native `ldn.waiting` as host; uses the same read-before-press dashboard steps, stops before ZR without `dashboard`, and otherwise resends a lost input at most 3 times or stops on a named step |

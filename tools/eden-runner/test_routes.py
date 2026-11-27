@@ -785,11 +785,12 @@ class HostNetworkTests(unittest.TestCase):
         self.row.mkdir(parents=True)
         self.config = self.run / 'config.json'
         self.config.write_text(json.dumps({'network_interface': 'wifi0'}))
-        self.values = {}
+        self.values = {'core.airplane_mode': True}
         self.calls = []
         self.running = False
         self.wrong_readback = False
         self.ldn_error = None
+        self.airplane_error = None
         self.ctx = types.SimpleNamespace(runner=types.SimpleNamespace(out=self.out),
                                          row_dir=self.row, call=self.call)
 
@@ -802,6 +803,8 @@ class HostNetworkTests(unittest.TestCase):
         if method == 'settings.get':
             if params['key'] == 'core.ldn_mitm' and self.ldn_error:
                 raise RuntimeError(self.ldn_error)
+            if params['key'] == 'core.airplane_mode' and self.airplane_error:
+                raise RuntimeError(self.airplane_error)
             if params['key'] == 'core.ldn_mitm' and params['key'] not in self.values:
                 return {'value': True}
             value = self.values[params['key']]
@@ -812,17 +815,20 @@ class HostNetworkTests(unittest.TestCase):
         result = routes.host_network(self.ctx)
         self.assertEqual(result, {
             'block': 'host_network', 'interface': 'wifi0', 'lan_online': False, 'ldn_mitm': False,
-            'readback': {'core.network_interface': 'wifi0', 'core.lan_online': False, 'core.ldn_mitm': False}})
+            'readback': {'core.network_interface': 'wifi0', 'core.lan_online': False, 'core.ldn_mitm': False,
+                         'core.airplane_mode': False}})
         self.assertEqual(json.loads((self.row / 'routes-host-network.json').read_text()), result)
         self.assertEqual([name for name, _ in self.calls],
                          ['status', 'settings.set', 'settings.get', 'settings.set', 'settings.get',
+                          'settings.get', 'settings.set', 'settings.get',
                           'settings.get', 'settings.set', 'settings.get'])
 
     def test_argument_overrides_config_and_lan_online(self):
         result = routes.host_network(self.ctx, interface='ethernet0', lan_online=True)
         self.assertEqual(result['interface'], 'ethernet0')
         self.assertEqual(result['readback'], {
-            'core.network_interface': 'ethernet0', 'core.lan_online': True, 'core.ldn_mitm': False})
+            'core.network_interface': 'ethernet0', 'core.lan_online': True, 'core.ldn_mitm': False,
+            'core.airplane_mode': False})
 
     def test_lan_online_pins_the_bridge_file_transport_marker_before_load(self):
         profile = self.run / 'profile'
@@ -854,6 +860,28 @@ class HostNetworkTests(unittest.TestCase):
         self.assertTrue(result['ldn_mitm'])
         self.assertTrue(result['readback']['core.ldn_mitm'])
         self.assertTrue(self.values['core.ldn_mitm'])
+
+    def test_airplane_mode_is_disabled_and_read_back(self):
+        self.assertTrue(self.values['core.airplane_mode'])
+        result = routes.host_network(self.ctx)
+        self.assertIs(result['readback']['core.airplane_mode'], False)
+        self.assertIs(self.values['core.airplane_mode'], False)
+        self.assertEqual([(method, params) for method, params in self.calls
+                          if params and params.get('key') == 'core.airplane_mode'],
+                         [('settings.get', {'key': 'core.airplane_mode'}),
+                          ('settings.set', {'key': 'core.airplane_mode', 'value': False}),
+                          ('settings.get', {'key': 'core.airplane_mode'})])
+
+    def test_airplane_mode_unknown_setting_is_recorded_as_absent(self):
+        self.airplane_error = "settings.get: {'error': {'code': 'unknown_setting'}}"
+        result = routes.host_network(self.ctx)
+        self.assertEqual(result['readback']['core.airplane_mode'], 'absent')
+        self.assertTrue(self.values['core.airplane_mode'])
+
+    def test_airplane_mode_other_errors_propagate(self):
+        self.airplane_error = 'settings.get: connection lost'
+        with self.assertRaisesRegex(RuntimeError, 'connection lost'):
+            routes.host_network(self.ctx)
 
     def test_rejects_loopback_missing_interface_and_running_game_before_setting(self):
         for interface, running, expected in (

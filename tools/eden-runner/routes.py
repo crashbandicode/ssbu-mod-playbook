@@ -887,6 +887,14 @@ def host_network(ctx, interface=None, lan_online=False, ldn_mitm=False):
         readback['core.ldn_mitm'] = 'absent'
     else:
         readback['core.ldn_mitm'] = _setting(ctx, 'core.ldn_mitm', ldn_mitm)
+    try:
+        ctx.call('settings.get', {'key': 'core.airplane_mode'})
+    except RuntimeError as error:
+        if not re.search(r"""['"]code['"]:\s*['"]unknown_setting['"]""", str(error)):
+            raise
+        readback['core.airplane_mode'] = 'absent'
+    else:
+        readback['core.airplane_mode'] = _setting(ctx, 'core.airplane_mode', False)
     receipt = {'block': 'host_network', 'interface': interface,
                'lan_online': lan_online, 'ldn_mitm': ldn_mitm, 'readback': readback}
     profile = (getattr(ctx, 'instance', None) or {}).get('profile')
