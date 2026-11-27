@@ -1009,6 +1009,43 @@ class LoadGameStubOnTests(unittest.TestCase):
         self.assertEqual(sorted(json.loads((self.row / 'routes-load.json').read_text())), ['kick'])
 
 
+class LoadGameKickBudgetTests(unittest.TestCase):
+    def test_load_and_refused_connections_use_one_budget(self):
+        for load_seconds in (65, 70):
+            with self.subTest(load_seconds=load_seconds), tempfile.TemporaryDirectory() as tmp:
+                now = [0.]
+                def sleep(seconds):
+                    now[0] += seconds
+                def load(method, *args, **kwargs):
+                    self.assertEqual(method, 'game.load')
+                    sleep(load_seconds)
+                ctx = types.SimpleNamespace(instance={'game': '/fake/game.xci'}, row_dir=Path(tmp),
+                                            call=load, check_stop=lambda: None)
+                with mock.patch.object(routes.time, 'monotonic', lambda: now[0]), \
+                        mock.patch.object(routes.time, 'sleep', sleep), \
+                        mock.patch.object(socket, 'create_connection', side_effect=ConnectionRefusedError) as connect:
+                    with self.assertRaisesRegex(RuntimeError, 'took no continue within 70 s'):
+                        routes.load_game(ctx, gdb_port=6811, cap=70)
+                self.assertEqual((now[0], connect.called), (70, load_seconds < 70))
+
+    def test_a_connected_stub_cannot_borrow_more_time_for_its_reply(self):
+        now = [0.]
+        def sleep(seconds):
+            now[0] += seconds
+        sock = mock.Mock()
+        def no_reply(_):
+            sleep(sock.settimeout.call_args.args[0])
+            raise TimeoutError('no reply')
+        sock.recv.side_effect = no_reply
+        with mock.patch.object(routes.time, 'monotonic', lambda: now[0]), \
+                mock.patch.object(routes.time, 'sleep', sleep), \
+                mock.patch.object(socket, 'create_connection', return_value=sock):
+            result = routes._kick(6811, 2.5)
+        self.assertIn('error', result)
+        self.assertEqual(now[0], 2.5)
+        sock.close.assert_called_once()
+
+
 class FrontendRoomTests(unittest.TestCase):
     DYNAMIC_ROOM = object()
     # p00-rooms.json in phase23/1f-save-hold/ldn-pair/rc15-ldn-xps-2/out.
