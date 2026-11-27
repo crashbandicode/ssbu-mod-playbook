@@ -156,7 +156,9 @@ class CtxSshTests(unittest.TestCase):
             spec.assert_not_called()
             first = runner._ssh_lifecycle()
             self.assertIs(runner._ssh_lifecycle(), first)
-            spec.assert_called_once()
+            loaded = [call.args[0] for call in spec.call_args_list]
+            self.assertEqual(loaded.count('eden_runner_ssh_lifecycle'), 1)
+            self.assertEqual(loaded.count('_eden_lifecycle_portable_lock'), 1)
 
     def test_success_sends_one_rider_and_logs_argv_not_output(self):
         result = subprocess.CompletedProcess([], 0, 'private stdout', 'private stderr')

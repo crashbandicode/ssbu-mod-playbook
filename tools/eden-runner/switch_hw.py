@@ -45,7 +45,6 @@ It never powers, sleeps or reboots the console; HOME → X → A (`switch.termin
 """
 import argparse
 import base64
-import fcntl
 import hashlib
 import json
 import os
@@ -58,6 +57,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import host_os  # noqa: E402
+from portable_lock import lock_exclusive  # noqa: E402
 CLAIM = Path.home() / '.cache' / 'switch-pad.claim'
 DEFAULT_DEVICE = '/dev/ttyACM0'
 DEFAULT_LOG = '192.168.0.224:6969'
@@ -271,16 +275,17 @@ class BridgeMirror:
 
 
 def capture_bridge(run, host, port, console, stop=None, connect=socket.create_connection, retry_s=0.5,
-                   heartbeat_s=2.0, idle_s=6.0, max_backoff_s=5.0):
+                   heartbeat_s=2.0, idle_s=6.0, max_backoff_s=5.0, owner_pid=None, expected_boot=None,
+                   run_token=None):
     """Hold the bridge's socket (reconnecting): its lines to bridge.log and the console log, the spool's requests out."""
     run = Path(run)
     spool = run / 'bridge'
     spool.mkdir(parents=True, exist_ok=True)
     # One capture per run: the bridge serves one client, so a second capture would wait unaccepted and take the spool's
     # requests (seen in Eden bridge-proof-yoga-7).
-    lock = (run / 'bridge.lock').open('w')
+    lock = (run / 'bridge.lock').open('a+b')
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_exclusive(lock, blocking=False)
     except BlockingIOError:
         lock.close()
         raise SystemExit(f'refused: another capture-bridge holds {run / "bridge.lock"}') from None
@@ -302,6 +307,60 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
             sock.settimeout(0.1)
             pending = b''
             link['connects'] += 1
+            first_data = None
+            if owner_pid is not None or expected_boot is not None or run_token is not None:
+                if owner_pid is None or (expected_boot is None and run_token is None):
+                    sock.close()
+                    raise RuntimeError('capture-bridge: owner pid and a run boot or token are required')
+                try:
+                    rows = host_os.tcp_listeners(int(port))
+                    listener = '\n'.join(row['line'] for row in rows)
+                except RuntimeError as error:
+                    sock.close()
+                    raise RuntimeError(f'capture-bridge: cannot verify listener owner for port {port}: {error}') from error
+                owns = (bool(rows) and all(row['pid'] == int(owner_pid) for row in rows)) if host_os.WINDOWS else \
+                    f'pid={int(owner_pid)},' in listener
+                if not owns:
+                    sock.close()
+                    raise RuntimeError(f'capture-bridge: port {port} listener is not this run Eden pid {owner_pid}: '
+                                       f'{listener.strip() or "no listener"}')
+                greeting = bytearray()
+                deadline = time.monotonic() + 3
+                while b'[Bridge] hello ' not in greeting and time.monotonic() < deadline:
+                    try:
+                        chunk = sock.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    greeting.extend(chunk)
+                match = HELLO_BOOT.search(bytes(greeting))
+                if match is None:
+                    sock.close()
+                    raise RuntimeError(f'capture-bridge: listener pid {owner_pid} did not greet this run before '
+                                       'the first request')
+                boot = match[1].decode()
+                if expected_boot is not None and boot != str(expected_boot):
+                    sock.close()
+                    raise RuntimeError(f'capture-bridge: foreign bridge boot {boot} on run port {port}; '
+                                       f'expected this run boot {expected_boot}; no request was sent')
+                if run_token is not None:
+                    identity_path = run / 'bridge-identity.json'
+                    if identity_path.is_file():
+                        try:
+                            identity = json.loads(identity_path.read_text())
+                        except (OSError, ValueError, TypeError):
+                            sock.close()
+                            raise RuntimeError('capture-bridge: this run bridge identity is unreadable; no request was sent')
+                        if (identity.get('run_token') != run_token or identity.get('owner_pid') != int(owner_pid)
+                                or identity.get('port') != int(port) or identity.get('boot') != boot):
+                            sock.close()
+                            raise RuntimeError(f'capture-bridge: bridge boot {boot} does not match this run identity '
+                                               f'(token={run_token}, pid={owner_pid}, port={port}); no request was sent')
+                    else:
+                        identity_path.write_text(json.dumps({'run_token': run_token, 'owner_pid': int(owner_pid),
+                                                             'port': int(port), 'boot': boot}, indent=2) + '\n')
+                first_data = bytes(greeting)
             # A connection that delivers nothing is dead even without an EOF (a dropped network or a peer that closed
             # without a FIN reaching us: Eden after the bridge replaced this client): a heartbeat request after
             # `heartbeat_s` of silence, a reconnect after `idle_s`.
@@ -317,7 +376,10 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                         sent.flush()
                     mirror.wanted.clear()
                     try:
-                        data = sock.recv(65536)
+                        if first_data is not None:
+                            data, first_data = first_data, None
+                        else:
+                            data = sock.recv(65536)
                     except socket.timeout:
                         quiet = time.monotonic() - last_rx
                         if quiet > idle_s:
@@ -392,9 +454,9 @@ def capture_bridge_file(run, sd_dir, console, stop=None, poll_s=0.05):
     run, sd_dir = Path(run), Path(sd_dir)
     spool = run / 'bridge'
     spool.mkdir(parents=True, exist_ok=True)
-    lock = (run / 'bridge.lock').open('w')
+    lock = (run / 'bridge.lock').open('a+b')
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_exclusive(lock, blocking=False)
     except BlockingIOError:
         lock.close()
         raise SystemExit(f'refused: another capture-bridge holds {run / "bridge.lock"}') from None
@@ -904,6 +966,9 @@ def main(argv=None):
     source.add_argument('--bridge-host')
     source.add_argument('--bridge-files', help="the instance's sdmc ultimate/ssbu-hw-bridge folder (file transport)")
     p.add_argument('--console', required=True)
+    p.add_argument('--owner-pid', type=int)
+    p.add_argument('--expected-boot')
+    p.add_argument('--run-token')
     args = parser.parse_args(argv)
     if getattr(args, 'bridge_host', None) and ':' not in args.bridge_host:
         args.bridge_host = f'{args.bridge_host}:{BRIDGE_PORT}'
@@ -930,7 +995,8 @@ def main(argv=None):
             capture_bridge_file(args.run, args.bridge_files, args.console, stop=lambda: bool(stopping))
         else:
             host, _, port = args.bridge_host.rpartition(':')
-            capture_bridge(args.run, host, int(port), args.console, stop=lambda: bool(stopping))
+            capture_bridge(args.run, host, int(port), args.console, stop=lambda: bool(stopping),
+                           owner_pid=args.owner_pid, expected_boot=args.expected_boot, run_token=args.run_token)
     else:
         host, _, port = args.log_host.rpartition(':')
         stopping = []

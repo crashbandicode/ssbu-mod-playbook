@@ -126,6 +126,30 @@ Human lines go to stderr. One JSON
 receipt goes to stdout. Exit 1 when `ok` is false. It does not claim, stage,
 or write the ledger.
 
+### Host-locked port reservations
+
+Up takes a host-level port lock before claim admission. Under that lock it
+checks each other run folder's `port.txt`, lifecycle allocation, config and row
+pins, plus live TCP listeners. It selects distinct GDB and bridge ports and
+checks existing X lock/socket paths before selecting a display. A requested
+GDB or bridge pin that is already bound is refused. The lifecycle writes the
+bridge port back to the run's pinned `inputs/port.txt`, records the per-instance
+GDB, bridge and display assignment in `state/port-allocation.json`, and appends
+the allocation beside the ledger claim. The same allocation is exposed through
+`instances.json` for the runner. Down releases it after owned processes stop
+and the claim releases; failed cleanup retains the reservation.
+
+Socket bridge capture checks the connected listener PID against the run's
+`run.json`, then binds the received hello boot to that run's lifecycle token
+before sending the initial backup or any other request. It checks that saved
+identity on reconnect and fails closed on a foreign listener or boot. The
+hello is learned only after connecting because the bridge sends it to clients,
+not to the event log. For bridge On, the runner requires `status.running`,
+`status.loading_complete`, and the bridge's chord-ready signal before sending
+the chord. A later call can qualify a same-boot On event against a fresh Title
+observation without sending a second chord. This does not change
+BridgeMirror's backup/restore policy.
+
 Feature Up requires the pinned runner's `up_check`; it refuses a target NRO
 that is not a plugin pin of the run or does not carry the named commit. The
 explicit `lifecycle_only` no-input mode is separate.

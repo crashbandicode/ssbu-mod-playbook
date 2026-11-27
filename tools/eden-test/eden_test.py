@@ -60,6 +60,9 @@ _lifecycle_spec = importlib.util.spec_from_file_location('_eden_test_lifecycle',
 _lifecycle_module = importlib.util.module_from_spec(_lifecycle_spec)
 _lifecycle_spec.loader.exec_module(_lifecycle_module)
 SshMux = _lifecycle_module.SshMux
+_host_os_spec = importlib.util.spec_from_file_location('_eden_test_host_os', PLAYBOOK / 'tools/eden-runner/host_os.py')
+host_os = importlib.util.module_from_spec(_host_os_spec)
+_host_os_spec.loader.exec_module(host_os)
 RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
 RUNS = Path('/home/intpa/eden-runs')
@@ -659,19 +662,15 @@ def go_new(args):
     for item in config['instances']:
         if 'display' in item:
             original = item['display']
-            if config.get('display_helper'):
-                chosen = free_display(original, taken=[choice['chosen'] for choice in choices])
-                reason = 'free display chosen (helper provisions it)'
-            else:
-                chosen = original
-                reason = 'kept: the base has no display_helper'
+            chosen = original
+            reason = 'allocated under the host claim lock by eden-lifecycle'
             choices.append({'key': item['key'], 'base': original, 'chosen': chosen, 'reason': reason})
             item['display'] = chosen
     config['display_choice'] = choices
     run = RUNS / args.label
     if run.exists():
         raise SystemExit(f'{run} exists; pick a new label')
-    config.update(label=args.label, owner=args.owner,
+    config.update(label=args.label, owner=args.owner, ports_root=str(RUNS),
                   state_dir=str(run / 'state'), work_root=str(run / 'work'), defer_load=True)
     for key in ('rows', 'runner', 'authorization'):
         config.pop(key, None)
@@ -764,18 +763,12 @@ def go_new(args):
     port_pins = [pin for item in config['instances'] for pin in item.get('files', [])
                  if pin.get('to', '').endswith('ultimate/ssbu-hw-bridge/port.txt')]
     if port_pins:
-        sys.path.insert(0, str(RUNNER.parent))
-        try:
-            import routes
-            port = routes.free_port()
-        finally:
-            sys.path.pop(0)
         port_path = inputs / 'port.txt'
-        port_path.write_text(f'{port}\n')
+        port_path.write_text('0\n')
         digest = sha256(port_path)
         for pin in port_pins:
             pin.update(path=str(port_path), sha256=digest)
-        config['bridge_port'] = port
+        config['bridge_port'] = 'allocated atomically at lifecycle claim'
     return _finish_new(run, config, Path(args.rows))
 
 
@@ -2202,11 +2195,10 @@ def stop_capture(run, folder=None):
     if not (folder / 'capture.json').is_file():
         return None
     pid = json.loads((folder / 'capture.json').read_text()).get('pid')
-    try:
-        command = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
-    except OSError:
+    match = host_os.argv_has(pid, 'capture-bridge', str(folder))
+    if match is None:
         return {'pid': pid, 'stopped': False, 'why': 'not running'}
-    if b'capture-bridge' not in command or str(folder).encode() not in command:
+    if not match:
         return {'pid': pid, 'stopped': False, 'why': 'that pid is not this run\'s capture'}
     os.kill(pid, signal.SIGTERM)
     return {'pid': pid, 'stopped': True}

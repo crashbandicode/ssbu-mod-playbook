@@ -150,6 +150,79 @@ class LinkTests(unittest.TestCase):
         import switch_hw
         self.assertTrue({'state', 'state_watch', 'providers', 'since', 'events'} <= switch_hw.V2_VERBS)
 
+    def test_capture_refuses_foreign_bridge_owner_or_boot_before_first_request(self):
+        import socket
+        import tempfile
+        from unittest import mock
+        import switch_hw
+
+        foreign = (b'[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0 port=6980 '
+                   b'boot=0x1111111111111111 uptime_ms=1 reconnects=0 event_latest=0\n')
+
+        class Greeting:
+            def settimeout(self, _):
+                pass
+            def recv(self, _):
+                return foreign
+            def sendall(self, data):
+                sent.append(data)
+            def close(self):
+                pass
+
+        for owner, listener, expected in ((999, 'LISTEN users:(("eden",pid=999,fd=2))', '0xa1e80deccd2a9a15'),
+                                          (712, 'LISTEN users:(("eden",pid=712,fd=2))', '0xa1e80deccd2a9a15')):
+            with self.subTest(listener=listener):
+                sent = []
+                with tempfile.TemporaryDirectory() as directory:
+                    with mock.patch.object(switch_hw.host_os, 'tcp_listeners',
+                                           return_value=[{'pid': owner, 'line': listener}]):
+                        with self.assertRaisesRegex(RuntimeError, 'not this run Eden|foreign bridge boot'):
+                            switch_hw.capture_bridge(directory, '127.0.0.1', 6980,
+                                Path(directory) / 'console.log', stop=lambda: False,
+                                connect=lambda *_a, **_k: Greeting(), owner_pid=712, expected_boot=expected)
+                self.assertFalse(sent, 'a foreign listener or greeting must be rejected before backup/request bytes')
+
+    def test_capture_rejects_a_different_boot_on_reconnect_before_request(self):
+        import json
+        import tempfile
+        from unittest import mock
+        import switch_hw
+
+        def hello(boot):
+            return (f'[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 tr=0.2.0 port=6980 '
+                    f'boot={boot} uptime_ms=1 reconnects=0 event_latest=0\n').encode()
+
+        class Peer:
+            def __init__(self, greeting):
+                self.greeting = greeting
+                self.sent = []
+            def settimeout(self, _):
+                pass
+            def recv(self, _):
+                if self.greeting is None:
+                    return b''
+                greeting, self.greeting = self.greeting, None
+                return greeting
+            def sendall(self, data):
+                self.sent.append(data)
+            def close(self):
+                pass
+
+        first_peer, second_peer = Peer(hello('0xa1e80deccd2a9a15')), Peer(hello('0x1111111111111111'))
+        peers = [first_peer, second_peer]
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(switch_hw.host_os, 'tcp_listeners',
+                                   return_value=[{'pid': 712, 'line': 'LISTEN users:("eden",pid=712,fd=2)'}]):
+                with self.assertRaisesRegex(RuntimeError, 'does not match this run identity'):
+                    switch_hw.capture_bridge(directory, '127.0.0.1', 6980,
+                        Path(directory) / 'console.log', stop=lambda: len(peers) == 0,
+                        connect=lambda *_a, **_k: peers.pop(0), retry_s=0, owner_pid=712,
+                        run_token='a' * 32)
+            identity = json.loads((Path(directory) / 'bridge-identity.json').read_text())
+            self.assertEqual(identity['boot'], '0xa1e80deccd2a9a15')
+            self.assertTrue(first_peer.sent, 'the first verified bridge gets the initial request')
+            self.assertFalse(second_peer.sent, 'the mismatched reconnect gets no request')
+
 
 class ReviewNegativeTests(unittest.TestCase):
     """tr-review-astra-3 18:10Z findings 1-3, through the production parser, matcher and capture handshake."""

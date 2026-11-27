@@ -142,9 +142,11 @@ class FakeLedger:
         self.claimed = self.released = False
         self.refuse = False
         self.open_text = ''
+        self.claim_admissions = []
 
     def claim(self, stale_claim_hours=None, admission=None):
         self.order.append('claim')
+        self.claim_admissions.append(deepcopy(admission))
         if self.refuse:
             raise life.Refused('foreign claim')
         policy = life.claim_admission(self.open_text, 'surface', 'OpenCode test-session/test-stream',
@@ -409,6 +411,96 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.ledger.released)
         self.assertEqual(life.inventory(self.source), self.before_source)
         self.assertNotIn('core.resolution_setup', [params.get('key') for _, _, params, _ in self.host.calls])
+
+    def test_concurrent_host_claims_reserve_distinct_gdb_bridge_and_display_ports(self):
+        runs = self.base / 'runs'
+        runs.mkdir()
+        helper = self.base / 'display-helper.ps1'
+        helper.write_text('# fixture helper')
+        pin = lambda path: {'path': str(path), 'sha256': life.digest(path)}
+        ledgers, controllers = [], []
+        barrier = threading.Barrier(2)
+        for label in ('port-a', 'port-b'):
+            config = deepcopy(self.config)
+            config.update(label=label, ports_root=str(runs), state_dir=str(runs / label / 'state'),
+                          work_root=str(runs / label / 'work'), display_helper=pin(helper))
+            item = config['instances'][0]
+            item['display'] = ':101'
+            item['gdb_port'] = 0
+            port_file = runs / label / 'inputs' / 'port.txt'
+            port_file.parent.mkdir(parents=True)
+            port_file.write_text('0\n')
+            item['files'].append({**pin(port_file), 'to': 'user/sdmc/ultimate/ssbu-hw-bridge/port.txt'})
+            ledger = FakeLedger(self.order)
+            ledgers.append(ledger)
+            controllers.append(life.Lifecycle(config, self.host, ledger))
+
+        errors = []
+        def start(controller):
+            try:
+                barrier.wait()
+                controller.up()
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=start, args=(controller,)) for controller in controllers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        allocations = [controller.state['port_allocation']['instances']['a'] for controller in controllers]
+        for field in ('gdb', 'bridge', 'display'):
+            with self.subTest(port=field):
+                self.assertEqual(len({allocation[field] for allocation in allocations}), 2)
+        for ledger in ledgers:
+            self.assertEqual(len(ledger.claim_admissions), 1)
+            self.assertIn('port_allocation', ledger.claim_admissions[0])
+        for controller in controllers:
+            controller.down()
+            self.assertTrue(json.loads((controller.directory / 'port-allocation.json').read_text())['released'])
+
+    def test_claim_refuses_a_packet_pinned_gdb_port_that_is_already_bound(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        port = None
+        for candidate in range(6793, 6894):
+            try:
+                listener.bind(('127.0.0.1', candidate))
+                port = candidate
+                break
+            except OSError:
+                continue
+        self.assertIsNotNone(port, 'test needs a bindable port in the GDB allocation range')
+        config = deepcopy(self.config)
+        config['ports_root'] = str(self.base / 'runs')
+        config['instances'][0]['gdb_port'] = port
+        ledger = FakeLedger(self.order)
+        with self.assertRaisesRegex(life.Refused, rf'GDB port {port}.*already bound'):
+            life.Lifecycle(config, self.host, ledger).up()
+        self.assertFalse(ledger.claimed)
+        self.assertEqual(ledger.claim_admissions, [])
+        self.assertFalse(any(method == 'game.load' for _, method, _, _ in self.host.calls))
+
+    def test_display_claim_skips_other_run_pin_and_live_x_socket(self):
+        runs = self.base / 'runs'
+        runs.mkdir()
+        previous = runs / 'replay-mem-C'
+        previous.mkdir()
+        (previous / 'config.json').write_text(json.dumps({'instances': [{'key': 'a', 'display': ':298'}]}))
+        sockets = self.base / 'x-sockets'
+        sockets.mkdir()
+        (sockets / '.X299-lock').write_text('pid fixture')
+        config = deepcopy(self.config)
+        config.update(ports_root=str(runs), state_dir=str(runs / 'ledge-trap' / 'state'),
+                      work_root=str(runs / 'ledge-trap' / 'work'))
+        config['instances'][0]['display'] = ':298'
+        with patch.object(life, 'X_SOCKET_ROOT', sockets):
+            controller = life.Lifecycle(config, self.host, self.ledger)
+            controller.up()
+            allocated = controller.state['port_allocation']['instances']['a']['display']
+            self.assertEqual(allocated, ':300')
+            controller.down()
 
     def resolution_sets_before_load(self, calls):
         load = next(i for i, (_, method, _, _) in enumerate(calls) if method == 'game.load')

@@ -127,6 +127,30 @@ base, optional update version, optional playbook commit, memory, disk,
 compilers, ledger claims and a declared display. It writes nothing. `up` runs
 the same pin and game checks before it creates state.
 
+### Per-run ports and bridge qualification
+
+`eden_test.py go` leaves display and bridge choices for lifecycle admission.
+While holding the host port-claim lock, Up scans other run folders' port and
+display pins, live TCP listeners, and live X display sockets. It allocates a
+GDB stub port, bridge port, and display per instance, writes the selected bridge
+port into the run's `inputs/port.txt`, records all three in
+`state/port-allocation.json` and the claim receipt, then launches Eden. A packet
+that pins a GDB or bridge port already bound on the host is refused with the
+port and conflict in the error. Down marks the reservation released only after
+the owned Eden and display have stopped and the lifecycle claim is released.
+
+The shared runner reads GDB port assignments from `instances.json`, so fixed
+packet defaults cannot make two runs share the same stub. Before the first
+bridge request, capture verifies that the connected listener belongs to this
+run's Eden PID, then binds the received hello boot to this run's lifecycle token
+and checks that identity on reconnect; a foreign PID or boot is a hard error
+and receives no request. The hello is learned from the connection because the
+bridge sends it only to a connected client. `bridge_on` waits
+for the game's `running` and `loading_complete` status signals and bridge
+chord-ready state before it sends the On chord. If a same-boot rerun finds an
+On event without a receipt, it requalifies the current Title state without
+sending a second toggle. Backup and restore handling is unchanged.
+
 **Compiles beside an Up** (operator 2026-11-10; [WORKFLOW](WORKFLOW.md) "Running agent workers without churn", rule 8):
 
 - While compilers run, `up` is admitted only when every compiler process runs at nice 10 or higher, and MemAvailable

@@ -1596,7 +1596,7 @@ class EdenTestTests(unittest.TestCase):
         ssh = next(c for c in commands if c[0] == 'ssh')
         self.assertEqual(ssh[ssh.index('--no-card-lineup') + 1], "'test without the card lineup'")
 
-    def test_go_allocates_and_records_distinct_displays(self):
+    def test_go_defers_display_allocation_until_lifecycle_claim(self):
         base = json.loads(self.previous.read_text())
         base['display_helper'] = {'path': '/helper', 'sha256': '0' * 64}
         base['instances'][0]['display'] = ':60'
@@ -1612,10 +1612,10 @@ class EdenTestTests(unittest.TestCase):
              mock.patch.object(eden_test, 'cmd_run', return_value=0):
             self.assertEqual(eden_test.main(self.go_args()), 0)
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
-        self.assertEqual([item['display'] for item in config['instances']], [':62', ':63'])
+        self.assertEqual([item['display'] for item in config['instances']], [':60', ':60'])
         self.assertEqual(config['display_choice'], [
-            {'key': 'a', 'base': ':60', 'chosen': ':62', 'reason': 'free display chosen (helper provisions it)'},
-            {'key': 'b', 'base': ':60', 'chosen': ':63', 'reason': 'free display chosen (helper provisions it)'}])
+            {'key': 'a', 'base': ':60', 'chosen': ':60', 'reason': 'allocated under the host claim lock by eden-lifecycle'},
+            {'key': 'b', 'base': ':60', 'chosen': ':60', 'reason': 'allocated under the host claim lock by eden-lifecycle'}])
 
     def test_go_without_display_helper_preserves_existing_display_and_lifecycle_readiness(self):
         base = json.loads(self.previous.read_text())
@@ -1640,7 +1640,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertTrue(selected['ready'], selected['detail'])
         self.assertEqual(config['instances'][0]['display'], ':200')
         self.assertEqual(config['display_choice'], [
-            {'key': 'a', 'base': ':200', 'chosen': ':200', 'reason': 'kept: the base has no display_helper'}])
+            {'key': 'a', 'base': ':200', 'chosen': ':200', 'reason': 'allocated under the host claim lock by eden-lifecycle'}])
 
     def test_go_does_not_add_display_to_an_instance_without_one(self):
         with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0):
@@ -1649,7 +1649,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertNotIn('display', config['instances'][0])
         self.assertEqual(config['display_choice'], [])
 
-    def test_go_display_exhaustion_refuses_before_any_copy_or_up(self):
+    def test_go_defers_display_conflict_resolution_until_lifecycle_claim(self):
         base = json.loads(self.previous.read_text())
         base['display_helper'] = {'path': '/helper', 'sha256': '0' * 64}
         base['instances'][0]['display'] = ':200'
@@ -1659,18 +1659,12 @@ class EdenTestTests(unittest.TestCase):
         for number in range(200, 240):
             (sockets / f'X{number}').touch()
         with mock.patch.object(eden_test, 'X11_SOCKET_DIR', sockets, create=True), \
-             mock.patch.object(eden_test.shutil, 'copy2') as copy, \
-             mock.patch.object(eden_test, 'sh') as sh, \
-             mock.patch.object(eden_test, 'lifecycle') as lifecycle, \
-             mock.patch.object(eden_test, 'cmd_up') as up:
-            with self.assertRaises(SystemExit) as caught:
-                eden_test.main(self.go_args())
-            self.assertEqual(str(caught.exception), 'no free X display from :200 upward (40 tried)')
-            copy.assert_not_called()
-            sh.assert_not_called()
-            lifecycle.assert_not_called()
-            up.assert_not_called()
-            self.assertFalse((eden_test.RUNS / 'go-1').exists())
+             mock.patch.object(eden_test, 'cmd_up') as up, \
+             mock.patch.object(eden_test, 'cmd_run', return_value=0):
+            self.assertEqual(eden_test.main(self.go_args()), 0)
+        up.assert_called_once()
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertEqual(config['instances'][0]['display'], ':200')
 
     def test_go_refuses_missing_down_and_loopback_before_staging(self):
         for index, (interface, problem, description) in enumerate((
@@ -1883,10 +1877,10 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(config['plugin_swaps'], [{'from': str(self.dir / 'plugin.nro'),
                                                    'from_sha256': sha(self.dir / 'plugin.nro'),
                                                    'to': str(run / 'inputs/plugin.nro')}])
-        self.assertEqual((run / 'inputs/port.txt').read_text(), '6987\n')
+        self.assertEqual((run / 'inputs/port.txt').read_text(), '0\n')
         pin = config['instances'][0]['files'][0]
         self.assertEqual((pin['path'], pin['sha256']), (str(run / 'inputs/port.txt'), sha(run / 'inputs/port.txt')))
-        self.assertEqual(config['bridge_port'], 6987)
+        self.assertEqual(config['bridge_port'], 'allocated atomically at lifecycle claim')
         self.assertIn('GDB stub off', config['stub_rule'])
         self.assertEqual(config['instances'][0]['trace']['symbols'],
                          [{'module': 'plugin.nro', 'elf': str(run / 'inputs/plugin.so')}])
@@ -1947,14 +1941,15 @@ class EdenTestTests(unittest.TestCase):
              mock.patch.object(eden_test, 'cmd_run', return_value=0):
             self.assertEqual(eden_test.main(argv), 0)
         up.assert_called_once_with(self.dir / 'runs/go-1', skip_setup_plan=True, allow_volatile_pins=True)
-        free.assert_called_once_with()
+        free.assert_not_called()
         config = json.loads((self.dir / 'runs/go-1/config.json').read_text())
         self.assertEqual(config['notify'], notify)
         self.assertEqual(len(config['plugin_swaps']), 2)
         for item in config['instances']:
             self.assertEqual(item['plugins'][0]['path'], str(self.dir / 'runs/go-1/inputs/plugin.nro'))
             self.assertEqual(item['files'][0]['path'], str(self.dir / 'runs/go-1/inputs/port.txt'))
-        self.assertEqual(config['bridge_port'], 6991)
+        self.assertEqual((self.dir / 'runs/go-1/inputs/port.txt').read_text(), '0\n')
+        self.assertEqual(config['bridge_port'], 'allocated atomically at lifecycle claim')
 
     def test_go_row_failure_and_not_run_return_three(self):
         for label, spec, expected in (
