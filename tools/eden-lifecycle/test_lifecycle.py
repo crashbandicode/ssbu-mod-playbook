@@ -355,6 +355,12 @@ class LifecycleTests(unittest.TestCase):
     def state(self):
         return json.loads((Path(self.config['state_dir']) / 'lifecycle.json').read_text())
 
+    def test_load_cap_defaults_by_host_and_explicit_value_wins(self):
+        for host, expected in (('xps', 300), ('surface', 180), ('yoga', 180), ('ally', 180)):
+            with self.subTest(host=host):
+                self.assertEqual(life.load_cap({'host': host}), expected)
+        self.assertEqual(life.load_cap({'host': 'xps', 'load_cap': 47}), 47)
+
     def pair(self):
         self.config['pair_authorized'] = True
         self.host.max_eden = 2
@@ -4322,6 +4328,25 @@ class SshLoopbackTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_lifecycle_release_closes_claim_line_with_ports_field(self):
+        owner = 'Claude devin-replay-mem/replay-mem-C-texture-xps-1'
+        token = '37dac379ad67450095a730d3dab097d7'
+        claim = (f'2026-11-27T21:27:44.850091+00:00 CLAIMED: {owner} '
+                 'ports=offline:bridge=6982,offline:display=:298,offline:gdb=6793 '
+                 f'host=xps lifecycle={token} Eden lifecycle admitted\n')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ledger.txt'
+            path.write_text(claim)
+            ledger = life.Ledger(path, 'xps', owner, token)
+            ownership = ledger.inspect()
+            self.assertTrue(ownership['owned_claim'])
+            released = ledger.release()
+            self.assertIn('RELEASED:', released['line'])
+            after = ledger.inspect()
+            self.assertFalse(after['owned_claim'])
+            self.assertTrue(after['owned_release'])
+            self.assertFalse(life.active_claims(path.read_text(), 'xps'))
+
     def test_stale_policy_fails_closed_on_missing_process_evidence_or_ambiguous_claims(self):
         now = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
         owner = 'OpenCode test/owner'
@@ -4486,6 +4511,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(packet['mode'], 'status')
         self.assertFalse(packet['execute'])
         self.assertIn('class Lifecycle', packet['source'])
+        self.assertIn('def lock_exclusive', packet['portable_lock_source'])
+        self.assertIn('"__file__":"lifecycle.py"', script)
         self.assertGreater(captured['timeout'], 0)
         life.forward('memento-claw-yoga-ubuntu', 'down', {'fake': 'config'}, True, run=run, keep_state=True,
                      evidence_dir='/home/intpa/eden-runs/x/out')

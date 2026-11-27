@@ -81,10 +81,20 @@ LEDGER_ATTEMPT_SECONDS = 10
 SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
 X_SOCKET_ROOT = Path(tempfile.gettempdir())
-_PORTABLE_LOCK_SPEC = importlib.util.spec_from_file_location(
-    '_eden_lifecycle_portable_lock', Path(__file__).resolve().parents[1] / 'eden-runner' / 'portable_lock.py')
-_PORTABLE_LOCK = importlib.util.module_from_spec(_PORTABLE_LOCK_SPEC)
-_PORTABLE_LOCK_SPEC.loader.exec_module(_PORTABLE_LOCK)
+_PORTABLE_LOCK_SOURCE = globals().get('_FORWARDED_PORTABLE_LOCK_SOURCE')
+if _PORTABLE_LOCK_SOURCE:
+    _PORTABLE_LOCK = type(sys)('_eden_lifecycle_portable_lock')
+    exec(compile(_PORTABLE_LOCK_SOURCE, 'portable_lock.py', 'exec'), _PORTABLE_LOCK.__dict__)
+else:
+    _PORTABLE_LOCK_SPEC = importlib.util.spec_from_file_location(
+        '_eden_lifecycle_portable_lock', Path(__file__).resolve().parents[1] / 'eden-runner' / 'portable_lock.py')
+    _PORTABLE_LOCK = importlib.util.module_from_spec(_PORTABLE_LOCK_SPEC)
+    _PORTABLE_LOCK_SPEC.loader.exec_module(_PORTABLE_LOCK)
+
+
+def portable_lock_source():
+    return (_PORTABLE_LOCK_SOURCE or
+            (Path(__file__).resolve().parents[1] / 'eden-runner' / 'portable_lock.py').read_text(encoding='utf-8'))
 # Linux comm names that count as a compiler (the same set resources() lists).
 COMPILER_NAMES = ('cargo', 'rustc', 'cc', 'c++', 'gcc', 'g++', 'clang', 'clang++', 'cc1', 'cc1plus', 'ninja', 'cmake')
 # Down copies the files a run wrote to the evidence folder before it prunes the run's copies, except the caches Eden
@@ -418,6 +428,19 @@ def active_claims(text, host):
             if scope in (host.lower(), 'unknown')]
 
 
+def claim_line_matches(line, suffix):
+    """Match our exact claim suffix when an older claim includes its inline ports field."""
+    if line.endswith(suffix):
+        return True
+    normalized = re.sub(r'\s+ports=\S+(?=\s)', '', line, count=1)
+    return normalized.endswith(suffix)
+
+
+def load_cap(config):
+    """Return the configured game-load cap, with the approved XPS default."""
+    return config.get('load_cap', 300 if config.get('host') == 'xps' else 180)
+
+
 def validate_stale_claim_hours(value):
     require(type(value) in (int, float) and 0 < value < math.inf,
             'stale_claim_hours must be a finite positive number')
@@ -568,8 +591,9 @@ class Ledger:
             if operation == 'read':
                 opened = active_claims(text, self.host)
                 return {'open': opened, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
-                        'owned_claim': any(line.endswith(claim_suffix) or
-                                           line.endswith(claim_suffix + EXCLUSIVE_HOST_MARKER) for line in opened),
+                        'owned_claim': any(claim_line_matches(line, claim_suffix) or
+                                           claim_line_matches(line, claim_suffix + EXCLUSIVE_HOST_MARKER)
+                                           for line in opened),
                         'owned_release': any(line.endswith(release_suffix) for line in text.splitlines())}
             require(operation in ('claim', 'release', 'reserve'), 'Unknown ledger operation')
             now = datetime.now(timezone.utc)
@@ -613,7 +637,8 @@ class Ledger:
             reservation = None
             if operation == 'claim':
                 own = [line for line in opened
-                       if line.endswith(claim_suffix) or line.endswith(claim_suffix + EXCLUSIVE_HOST_MARKER)]
+                       if claim_line_matches(line, claim_suffix)
+                       or claim_line_matches(line, claim_suffix + EXCLUSIVE_HOST_MARKER)]
                 if own:
                     # A resent claim must not append twice: release requires exactly one open claim.
                     require(len(own) == 1, 'Ambiguous owned lifecycle claim')
@@ -800,7 +825,8 @@ def validate(config):
             validate_sources(item['sources'])
         if 'eden_settings' in item:
             validate_eden_settings(item['eden_settings'], 'instance ' + item['key'])
-    for key, default in (('socket_cap', 90), ('load_cap', 180), ('stop_cap', 30), ('force_cap', 30), ('runtime', 5400)):
+    for key, default in (('socket_cap', 90), ('load_cap', load_cap(config)), ('stop_cap', 30),
+                         ('force_cap', 30), ('runtime', 5400)):
         value = config.get(key, default)
         require(isinstance(value, (int, float)) and math.isfinite(value) and 0 < value <= (10800 if key == 'runtime' else 300),
                 'Invalid bounded ' + key)
@@ -2604,8 +2630,8 @@ class Lifecycle:
                         # then load the game with a runner {"call": "game.load"} step.
                         run_state.update(state='frontend-ready', game_load='deferred to the rows')
                     else:
-                        self.rpc(item, 'game.load', {'path': item['game']}, self.c.get('load_cap', 180))
-                        self.poll(lambda: self.ready(item), self.c.get('load_cap', 180), 'game loading complete')
+                        self.rpc(item, 'game.load', {'path': item['game']}, load_cap(self.c))
+                        self.poll(lambda: self.ready(item), load_cap(self.c), 'game loading complete')
                         run_state.update(state='running', game_loaded=stamp())
                     if self.c['host'] == 'ally':
                         run_state['loaded_status'] = self.rpc(item, 'status')
@@ -3765,12 +3791,16 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
     if config.get('host') == 'ally' and not mode.startswith('ledger-'):
         return forward_windows(host, mode, config, execute, watchdog_rounds=watchdog_rounds, watchdog_pause=watchdog_pause,
                                keep_state=keep_state, evidence_dir=evidence_dir)
-    bootstrap = 'import json,sys; p=json.load(sys.stdin); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
+    bootstrap = ('import json,sys; p=json.load(sys.stdin); '
+                 'n={"__name__":"eden_lifecycle_remote","__file__":"lifecycle.py",'
+                 '"_FORWARDED_PORTABLE_LOCK_SOURCE":p["portable_lock_source"]}; '
+                 'exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)')
     script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 900 "
               "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
     encoded = base64.b64encode(script.encode('utf-16-le')).decode()
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
     packet = {'mode': mode, 'config': config, 'execute': execute, 'source': source,
+              'portable_lock_source': portable_lock_source(),
               'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause,
               'keep_state': keep_state, 'evidence_dir': evidence_dir}
     with SshMux(host, run=run, evidence_dir=config.get('state_dir'), receipt_dir=config.get('state_dir')) as mux:
@@ -3798,12 +3828,16 @@ def forward(host, mode, config, execute, run=subprocess.run, watchdog_rounds=Non
 def ledger_forward(host, operation, config, run=subprocess.run):
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
     require(operation in ('read', 'claim', 'release', 'reserve'), 'Unknown ledger operation')
-    bootstrap = 'import json,sys; p=json.load(sys.stdin); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
+    bootstrap = ('import json,sys; p=json.load(sys.stdin); '
+                 'n={"__name__":"eden_lifecycle_remote","__file__":"lifecycle.py",'
+                 '"_FORWARDED_PORTABLE_LOCK_SOURCE":p["portable_lock_source"]}; '
+                 'exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)')
     script = ("& /usr/bin/systemd-run --user --scope -p MemoryMax=256M /usr/bin/timeout 6 "
               "/usr/bin/python3 -I -B -c '" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
     encoded = base64.b64encode(script.encode('utf-16-le')).decode()
     source = globals().get('_FORWARDED_SOURCE') or Path(__file__).read_text()
-    packet = {'mode': 'ledger-' + operation, 'config': config, 'execute': True, 'source': source}
+    packet = {'mode': 'ledger-' + operation, 'config': config, 'execute': True, 'source': source,
+              'portable_lock_source': portable_lock_source()}
     started = time.monotonic()
     with SshMux(host, run=run, evidence_dir=config.get('state_dir'), receipt_dir=config.get('state_dir')) as mux:
         deadline = mux.attempt_deadline or started + LEDGER_ATTEMPT_SECONDS
@@ -3918,7 +3952,10 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
     """
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host), 'Unsafe SSH host')
     require(mode in ('status', 'preflight') or execute, 'Windows up/down require --execute')
-    bootstrap = 'import json,sys; p=json.loads(sys.stdin.readline()); n={"__name__":"eden_lifecycle_remote"}; exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)'
+    bootstrap = ('import json,sys; p=json.loads(sys.stdin.readline()); '
+                 'n={"__name__":"eden_lifecycle_remote","__file__":"lifecycle.py",'
+                 '"_FORWARDED_PORTABLE_LOCK_SOURCE":p["portable_lock_source"]}; '
+                 'exec(compile(p["source"],"lifecycle.py","exec"),n); n["remote_main"](p)')
     script = ('& "C:\\Program Files\\Python312\\python.exe" -I -B -X utf8 -c ' +
               "'" + bootstrap.replace("'", "''") + "'; exit $LASTEXITCODE")
     encoded = base64.b64encode(script.encode('utf-16-le')).decode()
@@ -3954,7 +3991,9 @@ def _forward_windows_once(host, mode, config, execute, popen=subprocess.Popen, l
         return error
     try:
         process.stdin.write(json.dumps({'mode': mode, 'config': config, 'execute': execute,
-                                       'source': source, 'ledger_bridge': True,
+                                       'source': source,
+                                       'portable_lock_source': portable_lock_source(),
+                                       'ledger_bridge': True,
                                        'watchdog_rounds': watchdog_rounds, 'watchdog_pause': watchdog_pause,
                                        'keep_state': keep_state, 'evidence_dir': evidence_dir}) + '\n')
         process.stdin.flush()
