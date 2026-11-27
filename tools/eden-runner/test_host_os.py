@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,26 @@ def result(text='', rc=0, error=''):
 
 
 class HostOsTests(unittest.TestCase):
+    def test_runs_root_per_os(self):
+        self.assertEqual(host_os._runs_root(False), Path('/home/intpa/eden-runs'))
+        self.assertEqual(host_os._runs_root(True), Path('C:/home/intpa/eden-runs'))
+
+    def test_windows_processes_parsing(self):
+        one = {'ProcessId': 12, 'ParentProcessId': 3, 'Name': 'eden.exe',
+               'CommandLine': None, 'ExecutablePath': r'C:\Eden\eden.exe'}
+        two = {'ProcessId': 13, 'ParentProcessId': 12, 'Name': 'other.exe',
+               'CommandLine': 'other', 'ExecutablePath': None}
+        run = mock.Mock(return_value=result(json.dumps(one)))
+        self.assertEqual(host_os.windows_processes(run), [{'pid': 12, 'ppid': 3, 'name': 'eden.exe',
+                                                            'command': None, 'exe': r'C:\Eden\eden.exe'}])
+        run.return_value = result(json.dumps([one, two]))
+        self.assertEqual([p['pid'] for p in host_os.windows_processes(run)], [12, 13])
+        self.assertEqual(run.call_args.args[0][0], host_os._POWERSHELL)
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
+        run.return_value = result(rc=1, error='access failed')
+        with self.assertRaisesRegex(OSError, 'access failed'):
+            host_os.windows_processes(run)
+
     def test_linux_listeners_parse_ss(self):
         run = mock.Mock(return_value=result(
             'LISTEN 0 4096 0.0.0.0:7041 0.0.0.0:* users:(("eden",pid=4242,fd=99),("x",pid=42,fd=1))\n'

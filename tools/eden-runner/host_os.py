@@ -2,6 +2,7 @@
 
 import csv
 import io
+import json
 import os
 import re
 import subprocess
@@ -9,6 +10,11 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 WINDOWS = os.name == 'nt'
+def _runs_root(windows):
+    return Path('C:/home/intpa/eden-runs' if windows else '/home/intpa/eden-runs')
+
+
+RUNS_ROOT = _runs_root(WINDOWS)
 _TASK_NAME = re.compile(r'Eden[A-Za-z]+-[0-9a-f]{12}')
 _POWERSHELL = r'C:\Program Files\PowerShell\7\pwsh.exe'
 
@@ -72,6 +78,23 @@ def argv_has(pid, *needles, run=subprocess.run):
     except OSError:
         return None
     return all(os.fsencode(needle) in parts for needle in needles)
+
+
+def windows_processes(run=subprocess.run):
+    command = ('Get-CimInstance Win32_Process | '
+               'Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath | '
+               'ConvertTo-Json -Compress')
+    try:
+        text = _run([_POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], run)
+        values = json.loads(text)
+        if isinstance(values, dict):
+            values = [values]
+        if not isinstance(values, list):
+            raise ValueError('expected process list')
+        return [{'pid': int(p['ProcessId']), 'ppid': int(p['ParentProcessId']), 'name': p['Name'],
+                 'command': p['CommandLine'], 'exe': p['ExecutablePath']} for p in values]
+    except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+        raise OSError(f'cannot read Windows processes: {exc}') from exc
 
 
 def _task_name(name):

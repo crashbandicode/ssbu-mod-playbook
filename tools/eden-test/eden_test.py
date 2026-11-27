@@ -65,10 +65,12 @@ host_os = importlib.util.module_from_spec(_host_os_spec)
 _host_os_spec.loader.exec_module(host_os)
 RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
-RUNS = Path('/home/intpa/eden-runs')
+RUNS = host_os.RUNS_ROOT
 CARD_LINEUPS = Path('/home/intpa/smash-training-lobby/artifacts/phase23/card-lineup')
 NET_SYSFS = Path('/sys/class/net')
 X11_SOCKET_DIR = Path('/tmp/.X11-unix')
+WINDOWS_HOSTS = ('ally',)
+RELAY_PREFIX = '@@eden-test-relay@@ '
 
 
 def sha256(path):
@@ -772,11 +774,40 @@ def go_new(args):
     return _finish_new(run, config, Path(args.rows))
 
 
+def _python():
+    return [sys.executable, '-B', '-X', 'utf8'] if host_os.WINDOWS else [sys.executable, '-B', '-I']
+
+
+def _relay(request):
+    if os.environ.get('EDEN_TEST_RELAY') != '1':
+        raise SystemExit('on a Windows host the lifecycle and the ledger are served by the Linux controller: '
+                         'start this through `eden_test.py go` or `eden_test.py remote` on the controller')
+    request = {**request, 'id': uuid.uuid4().hex}
+    print(RELAY_PREFIX + json.dumps(request), flush=True)
+    try:
+        reply = json.loads(sys.stdin.readline())
+        if not isinstance(reply, dict) or reply.get('id') != request['id']:
+            raise ValueError('invalid id')
+    except (ValueError, TypeError):
+        raise SystemExit('relay: invalid reply') from None
+    return reply
+
+
 def lifecycle(run, mode, *extra):
     config = json.loads((run / 'config.json').read_text())
     if config.get('host') not in ('surface', 'yoga', 'xps', 'ally'):
         raise SystemExit('config host must be surface, yoga, xps or ally')
-    argv = [sys.executable, '-B', '-I', str(LIFECYCLE), mode, str(run / 'config.json'), '--execute', *extra]
+    if host_os.WINDOWS:
+        evidence = extra[extra.index('--evidence-dir') + 1] if '--evidence-dir' in extra else None
+        reply = _relay({'kind': 'lifecycle', 'mode': mode, 'config': config, 'keep_state': '--keep-state' in extra,
+                        'evidence_dir': evidence})
+        text = json.dumps(reply, indent=2)
+        with (run / f'lifecycle-{mode}.log').open('a', encoding='utf-8') as log:
+            log.write(f'$ relay lifecycle {mode}\n{text}\n')
+        print(text)
+        ok = reply.get('ok') and (mode != 'preflight' or (reply.get('result') or {}).get('ok'))
+        return _ExitCode(0 if ok else 1, reply.get('error') or '')
+    argv = [*_python(), str(LIFECYCLE), mode, str(run / 'config.json'), '--execute', *extra]
     return sh(argv, run / f'lifecycle-{mode}.log')
 
 
@@ -1008,7 +1039,7 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
     if problems:
         raise SystemExit('; '.join(problems))
     rows = run / 'rows' / 'rows.json'
-    if sh([sys.executable, '-B', '-I', str(RUNNER), 'up-check', str(rows), '--out', str(run / 'out')],
+    if sh([*_python(), str(RUNNER), 'up-check', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
     stamp(run, 'up_start')
@@ -1035,7 +1066,7 @@ def set_aside(run, rows):
 
 
 def cmd_run(run, retry=False, rows=None):
-    code = sh([sys.executable, '-B', '-I', str(RUNNER), 'up-check', str(run / 'rows' / 'rows.json'),
+    code = sh([*_python(), str(RUNNER), 'up-check', str(run / 'rows' / 'rows.json'),
                '--out', str(run / 'out')], run / 'dry-run.log')
     if code:
         return code
@@ -1045,7 +1076,7 @@ def cmd_run(run, retry=False, rows=None):
     if rows:
         set_aside(run, rows.split(','))
     stamp(run, 'run_start')
-    code = sh([sys.executable, '-B', '-I', str(RUNNER), 'run', str(run / 'rows' / 'rows.json'),
+    code = sh([*_python(), str(RUNNER), 'run', str(run / 'rows' / 'rows.json'),
                '--instances', str(run / 'state' / 'instances.json'), '--out', str(run / 'out'),
                *(['--rows', rows] if rows else [])], run / 'runner.log')
     stamp(run, 'run_end')
@@ -1144,6 +1175,19 @@ def unit_results(run):
     journal = json.loads(journal_path.read_text())
     results = []
     for item in journal.get('instances', []):
+        if host_os.WINDOWS:
+            key = item.get('key')
+            try:
+                record = json.loads((run / 'state' / f'run-{key}' / 'run.json').read_text()).get('owned_pids_stopped')
+            except (OSError, ValueError):
+                record = None
+            if not isinstance(record, dict) or 'job_terminated' not in record:
+                results.append(f'{key}: no stop record')
+            elif record['job_terminated']:
+                results.append(f'{key}: Windows Job terminated by Down')
+            else:
+                results.append(f'{key}: the Job was already gone at Down')
+            continue
         unit = item.get('unit')
         if not unit:
             continue
@@ -2285,6 +2329,22 @@ def _process_reason(paths, proc=Path('/proc')):
     """Why a live process of this user, other than this Down and its ancestors, keeps one of `paths`: it names one in
     its command line, sits in one, or has a file open in one; or it cannot be inspected and is not one of the
     processes the kernel hides (the rule of remote-gate.ps1 -Action Done). None when no process keeps them."""
+    if host_os.WINDOWS:
+        processes = host_os.windows_processes()
+        parents = {p['pid']: p['ppid'] for p in processes}
+        skip, pid = set(), os.getpid()
+        while pid and pid not in skip:
+            skip.add(pid)
+            pid = parents.get(pid, 0)
+        for process in processes:
+            if process['pid'] in skip or (process['command'] is None and process['exe'] is None):
+                continue
+            texts = [(s or '').replace('\\', '/').lower() for s in (process['command'], process['exe'])]
+            for path in paths:
+                target = str(path).replace('\\', '/').lower().rstrip('/')
+                if any(_names_path(text, target) for text in texts):
+                    return f'process {process["pid"]} ({process["name"]}) uses {path}'
+        return None
     skip, pid = set(), os.getpid()
     while pid > 1 and pid not in skip:
         skip.add(pid)
@@ -2472,6 +2532,14 @@ def raw_captures(run):
 
 def _open_claims(run, config):
     """The ledger's open claim lines for this host, read (never written) through the lifecycle's own reader."""
+    if host_os.WINDOWS:
+        reply = _relay({'kind': 'claims', 'config': config})
+        if not reply.get('ok'):
+            raise ValueError(reply.get('error'))
+        lines = reply.get('result')
+        if not isinstance(lines, list):
+            raise ValueError('the ledger read returned no claim list')
+        return [str(line) for line in lines]
     info = _lifecycle_module.Ledger(config['ledger'], config['host'], config['owner'], '0' * 32,
                                     config.get('ledger_ssh'), state_dir=run / 'state').inspect()
     lines = info.get('open') if isinstance(info, dict) else None
@@ -2594,7 +2662,7 @@ def cmd_down(run, keep_state=False):
                 raw.unlink()
                 record['removed'].append({'what': what, 'path': str(raw), 'bytes': size})
     stamp(run, 'down_done')
-    done = subprocess.run([sys.executable, '-B', '-I', str(HARVEST), str(run / 'rows' / 'rows.json'),
+    done = subprocess.run([*_python(), str(HARVEST), str(run / 'rows' / 'rows.json'),
                            '--label', config['label'], '--out', str(run / 'out')], capture_output=True, text=True)
     (run / 'harvest.json').write_text(done.stdout.strip() + '\n')
     timing_path = run / 'timing.json'

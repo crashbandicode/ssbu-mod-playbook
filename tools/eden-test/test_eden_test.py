@@ -4487,5 +4487,103 @@ class RerunTests(unittest.TestCase):
             process.wait(timeout=10)
         self.assertEqual(eden_test.stop_captures(self.run / 'nowhere'), [])
 
+class WindowsHostTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = Path(self.tmp.name)
+        (self.run / 'config.json').write_text(json.dumps({'host': 'ally', 'label': 'demo'}))
+
+    def test_python_per_os(self):
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', False):
+            self.assertEqual(eden_test._python(), [sys.executable, '-B', '-I'])
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True):
+            self.assertEqual(eden_test._python(), [sys.executable, '-B', '-X', 'utf8'])
+
+    def test_relay_requires_opt_in_and_checks_reply_id(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'served by the Linux controller'):
+                eden_test._relay({'kind': 'claims'})
+        with mock.patch.dict(os.environ, {'EDEN_TEST_RELAY': '1'}), \
+                mock.patch.object(eden_test.uuid, 'uuid4', return_value=types.SimpleNamespace(hex='one')):
+            for text, valid in (('{"id":"one","ok":true}\n', True), ('{"id":"other"}\n', False),
+                                ('[]\n', False), ('not json\n', False), ('', False)):
+                out = io.StringIO()
+                with mock.patch.object(sys, 'stdin', io.StringIO(text)), redirect_stdout(out):
+                    if valid:
+                        self.assertTrue(eden_test._relay({'kind': 'claims'})['ok'])
+                    else:
+                        with self.assertRaisesRegex(SystemExit, '^relay: invalid reply$'):
+                            eden_test._relay({'kind': 'claims'})
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith(eden_test.RELAY_PREFIX))
+                self.assertEqual(json.loads(lines[0][len(eden_test.RELAY_PREFIX):]), {'kind': 'claims', 'id': 'one'})
+
+    def test_lifecycle_relay(self):
+        config = {'host': 'ally', 'label': 'demo'}
+        cases = [('up', (), {'ok': True, 'result': {}}, 0),
+                 ('up', (), {'ok': False, 'error': 'refused'}, 1),
+                 ('preflight', (), {'ok': True, 'result': {'ok': False}}, 1),
+                 ('down', ('--keep-state', '--evidence-dir', 'evidence'), {'ok': True, 'result': {}}, 0)]
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test, '_relay') as relay, redirect_stdout(io.StringIO()):
+            for mode, extra, reply, code in cases:
+                relay.return_value = reply
+                result = eden_test.lifecycle(self.run, mode, *extra)
+                self.assertEqual(result, code)
+                if reply.get('error'):
+                    self.assertEqual(result.stderr, reply['error'])
+                relay.assert_called_with({'kind': 'lifecycle', 'mode': mode, 'config': config,
+                                          'keep_state': '--keep-state' in extra,
+                                          'evidence_dir': 'evidence' if mode == 'down' else None})
+                log = (self.run / f'lifecycle-{mode}.log').read_text()
+                self.assertIn(f'$ relay lifecycle {mode}\n{json.dumps(reply, indent=2)}\n', log)
+
+    def test_open_claims_relay(self):
+        config = {'host': 'ally'}
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test, '_relay', return_value={'ok': True, 'result': ['one']}) as relay:
+            self.assertEqual(eden_test._open_claims(self.run, config), ['one'])
+            relay.assert_called_once_with({'kind': 'claims', 'config': config})
+            relay.return_value = {'ok': False, 'error': 'unavailable'}
+            with self.assertRaisesRegex(ValueError, 'unavailable'):
+                eden_test._open_claims(self.run, config)
+
+    def test_windows_unit_results(self):
+        state = self.run / 'state'
+        state.mkdir()
+        (state / 'lifecycle.json').write_text(json.dumps({'instances': [{'key': x} for x in ('a', 'b', 'c')]}))
+        for key, value in (('a', True), ('b', False)):
+            folder = state / f'run-{key}'
+            folder.mkdir()
+            (folder / 'run.json').write_text(json.dumps({'owned_pids_stopped': {'job_terminated': value}}))
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True):
+            self.assertEqual(eden_test.unit_results(self.run), ['a: Windows Job terminated by Down',
+                'b: the Job was already gone at Down', 'c: no stop record'])
+
+    def test_windows_process_reason(self):
+        path = Path('C:/home/intpa/eden-runs/r1/work')
+        processes = [
+            {'pid': 50, 'ppid': 49, 'name': 'me', 'command': str(path), 'exe': None},
+            {'pid': 49, 'ppid': 1, 'name': 'parent', 'command': str(path), 'exe': None},
+            {'pid': 40, 'ppid': 1, 'name': 'other', 'command': r'C:\home\intpa\eden-runs\r10\work', 'exe': None},
+            {'pid': 41, 'ppid': 1, 'name': 'hidden', 'command': None, 'exe': None},
+        ]
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test.os, 'getpid', return_value=50), \
+                mock.patch.object(eden_test.host_os, 'windows_processes', return_value=processes) as get:
+            self.assertIsNone(eden_test._process_reason([path]))
+            processes.append({'pid': 42, 'ppid': 1, 'name': 'owner',
+                              'command': r'OPEN C:\HOME\INTPA\EDEN-RUNS\R1\WORK\x', 'exe': None})
+            self.assertEqual(eden_test._process_reason([path]), f'process 42 (owner) uses {path}')
+            processes[-1]['command'] = None
+            processes[-1]['exe'] = r'C:\home\intpa\eden-runs\r1\work\eden.exe'
+            self.assertEqual(eden_test._process_reason([path]), f'process 42 (owner) uses {path}')
+            get.side_effect = OSError('process list unavailable')
+            with self.assertRaisesRegex(OSError, 'process list unavailable'):
+                eden_test._process_reason([path])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

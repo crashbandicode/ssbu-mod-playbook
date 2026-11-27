@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 
+import host_os
 import recipe_macro
 
 PROVIDERS = {
@@ -24,7 +25,7 @@ BUTTONS = (
     ('Up', 8192), ('Down', 32768), ('Left', 4096), ('Right', 16384), ('Plus', 1024), ('Minus', 2048),
     ('L-stick', 16), ('R-stick', 32),
 )
-RUNS = Path('/home/intpa/eden-runs')
+RUNS = host_os.RUNS_ROOT
 SHARED_DIR = Path(__file__).resolve().parent
 
 
