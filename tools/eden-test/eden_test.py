@@ -28,6 +28,7 @@ fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 import argparse
 import base64
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 import errno
 import hashlib
 import heapq
@@ -48,6 +49,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -103,15 +105,28 @@ class _ExitCode(int):
         return result
 
 
+_GO_LOG = None
+
+
 def sh(argv, log=None):
     """Run a tool, echo its output, keep a copy in the run folder; returns the exit code."""
-    done = subprocess.run(argv, capture_output=True, text=True)
-    out = done.stdout + done.stderr
-    sys.stdout.write(out)
+    if _GO_LOG is not None:
+        _GO_LOG.flush()
+        offset = os.fstat(_GO_LOG.fileno()).st_size
+        done = subprocess.run(argv, stdout=_GO_LOG, stderr=subprocess.STDOUT, text=True)
+        with open(_GO_LOG.name, 'rb') as stream:
+            stream.seek(offset)
+            out = stream.read().decode('utf-8', errors='replace')
+        stderr = out if done.returncode else ''
+    else:
+        done = subprocess.run(argv, capture_output=True, text=True)
+        out = done.stdout + done.stderr
+        sys.stdout.write(out)
+        stderr = done.stderr or ''
     if log:
         with open(log, 'a') as f:
             f.write(f'$ {" ".join(map(str, argv))}\n{out}\n')
-    return _ExitCode(done.returncode, done.stderr or '')
+    return _ExitCode(done.returncode, stderr)
 
 
 def _target_commit(commit):
@@ -631,6 +646,9 @@ def go_new(args):
         raise SystemExit(str(error)) from error
     base = Path(args.from_config) if args.from_config else RUNS / '_eden-test' / 'base.json'
     config = copy.deepcopy(json.loads(base.read_text()))
+    settings = getattr(args, 'eden_setting', None) or []
+    if settings:
+        config.setdefault('eden_settings', {}).update(dict(settings))
     config.pop('staged_targets', None)
     if staged_targets:
         config['staged_targets'] = sorted(set(staged_targets))
@@ -2241,6 +2259,12 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         remote.extend(('--network-interface', args.network_interface))
     if args.no_lobby:
         remote.append('--no-lobby')
+    if getattr(args, 'prepare', False):
+        remote.append('--prepare')
+    if getattr(args, 'down', False):
+        remote.append('--down')
+    for key, value in getattr(args, 'eden_setting', None) or []:
+        remote.extend(('--eden-setting', f'{key}={value}'))
     for commit in sorted(staged_commits):
         remote.extend(('--staged-target', commit))
     remote.extend(('--owner', args.owner))
@@ -2253,6 +2277,11 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         diagnosis = _go_diagnosis(mux, 'ssh', _ExitCode(255, getattr(ssh_code, 'stderr', '')), 'remote go')
         raise SystemExit(f'remote go failed (ssh exit {ssh_code}); the remote go may be running; '
                          f'check the host before starting another{_go_suffix(diagnosis)}')
+    if getattr(args, 'prepare', False):
+        if not ssh_code:
+            print(f'Continue: eden_test.py remote --host {args.host} --label {args.label} fly'
+                  f'{" --down" if getattr(args, "down", False) else ""}')
+        return ssh_code
     run = f'{kind["root"]}/{args.label}'
     prefix = (f'eden_test.py remote --host {args.host} --label {args.label}' if windows else
               f'on {host}: /usr/bin/python3 -I -B {script}')
@@ -2265,7 +2294,7 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         try:
             result = json.loads(result_file.read_text()) if not result_error else {}
             code = result['code']
-            if (result.get('token') != token or type(code) is not int or code not in (0, 3)
+            if (result.get('token') != token or type(code) is not int or code not in (0, 1, 3)
                     or not isinstance(result['counts'], dict)):
                 raise ValueError('invalid or mismatched result')
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -2302,6 +2331,236 @@ def cmd_remote(args):
         mux.ensure()
         remote = _remote_command(host, mux, command, kind['windows'])
         return _relay_run(remote, host, args) if kind['windows'] else _go_sh(remote)
+
+
+def _unit(label):
+    try:
+        _target_label(label)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    return f'eden-go-{label}'
+
+
+def _detach(args, argv):
+    if host_os.WINDOWS:
+        raise SystemExit('--detach requires a Linux controller')
+    unit = _unit(args.label)
+    active = subprocess.run(['systemctl', '--user', 'is-active', unit], capture_output=True, text=True)
+    if active.returncode == 0 and active.stdout.strip() == 'active':
+        raise SystemExit(f'{unit} is already active')
+    folder = RUNS / '_eden-test' / 'go' / args.label
+    folder.mkdir(parents=True, exist_ok=True)
+    log = folder / 'go.log'
+    forwarded = list(argv)
+    forwarded.remove('--detach')
+    command = ['systemd-run', '--user', '--unit', unit, '--quiet', '--collect', '--expand-environment=no',
+               '-p', 'MemoryMax=2G', '-p', 'TasksMax=512', '-p', 'RuntimeMaxSec=14400', '-p', 'KillMode=mixed',
+               '-p', 'TimeoutStopSec=600', f'--working-directory={Path.cwd()}', '/usr/bin/python3', '-I', '-B',
+               str(Path(__file__).resolve()), *forwarded, '--go-log', str(log)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise SystemExit(f'{unit} launch failed: {result.stderr or result.stdout}')
+    print(f'Unit: {unit}\nLog: {log}')
+    print(f'eden_test.py peek --label {args.label}')
+    ssh = f' --ssh {shlex.quote(args.ssh)}' if getattr(args, 'ssh', None) else ''
+    print(f'eden_test.py stop --host {args.host}{ssh} --label {args.label}')
+    return 0
+
+
+def _logged(args, argv):
+    global _GO_LOG
+    path = Path(args.go_log)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    status_path = path.parent / 'status.json'
+    status = {'label': args.label, 'host': args.host, 'argv': argv, 'started': time.time(), 'phase': 'running'}
+    status_path.write_text(json.dumps(status, indent=2) + '\n')
+    code = 1
+    with path.open('a', encoding='utf-8', buffering=1) as stream:
+        previous = _GO_LOG
+        _GO_LOG = stream
+        try:
+            with redirect_stdout(stream), redirect_stderr(stream):
+                try:
+                    code = _dispatch(args) or 0
+                except SystemExit as exc:
+                    code = exc.code if type(exc.code) is int else 1
+                    if exc.code is not None and type(exc.code) is not int:
+                        print(exc.code, file=sys.stderr)
+                    raise
+                except Exception:
+                    traceback.print_exc()
+                    raise
+        finally:
+            _GO_LOG = previous
+            status.update(phase='ended', ended=time.time(), exit=int(code))
+            status_path.write_text(json.dumps(status, indent=2) + '\n')
+    return code
+
+
+def cmd_peek(args):
+    unit = _unit(args.label)
+    folder = RUNS / '_eden-test' / 'go' / args.label
+    status = folder / 'status.json'
+    log = folder / 'go.log'
+    print(status.read_text() if status.is_file() else f'no status: {status}', end='\n')
+    result = subprocess.run(['systemctl', '--user', 'show', unit, '-p', 'ActiveState', '-p', 'SubState', '-p',
+                             'Result'], capture_output=True, text=True)
+    print(result.stdout, end='')
+    if result.stderr:
+        print(result.stderr, end='', file=sys.stderr)
+    if log.is_file():
+        print('\n'.join(log.read_text(errors='replace').splitlines()[-40:]))
+    return 0
+
+
+def _remote_mux(args):
+    _unit(args.label)
+    host = _go_route(args)
+    if not host or host.startswith('-'):
+        raise SystemExit(f'no valid SSH host for {args.host!r}; use --ssh or add it to hosts.json')
+    windows = args.host in WINDOWS_HOSTS
+    options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if windows else ()
+    receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
+    return host, SshMux(host, ssh_options=options, windows=windows, evidence_dir=receipt_dir, receipt_dir=receipt_dir)
+
+
+def cmd_stop(args):
+    host, context = _remote_mux(args)
+    kind = _remote_kind(args.host)
+    stop = f'{kind["root"]}/{args.label}/out/STOP'
+    with context as mux:
+        mux.ensure()
+        if kind['windows']:
+            script = f'New-Item -ItemType File -Force -Path {_pwsh_arg(stop)} | Out-Null'
+            command = _windows_ssh(host, mux, script)
+        else:
+            command = _remote_command(host, mux, ['/usr/bin/touch', stop], False)
+        if code := _go_sh(command):
+            raise SystemExit(f'stop failed ({code}){_go_suffix(_go_diagnosis(mux, "ssh", code, "stop"))}')
+    print(f'Stop requested: {host}:{stop}')
+    return 0
+
+
+_COLLECT_NAMES = ('config.json', 'lifecycle-*.log', 'runner.log', 'dry-run.log', 'RESULTS.md', 'REPORT.md',
+                  'timing.json', 'go-result.json', 'harvest.json', 'out/', 'state/')
+_FILM_EXCLUDES = ('*.mkv', '*.capture.gif')
+
+
+def _extract_collect(archive, dest):
+    root = Path(dest).resolve()
+    with tarfile.open(archive, 'r:gz') as tar:
+        for member in tar.getmembers():
+            name = member.name.replace('\\', '/')
+            target = (root / name).resolve()
+            if (name.startswith('/') or '..' in name.split('/') or re.match(r'^[A-Za-z]:', name)
+                    or not target.is_relative_to(root)):
+                raise ValueError(f'unsafe collect member: {member.name}')
+            if member.issym() or member.islnk():
+                link = member.linkname.replace('\\', '/')
+                base = target.parent if member.issym() else root
+                if link.startswith('/') or re.match(r'^[A-Za-z]:', link) or not (base / link).resolve().is_relative_to(root):
+                    raise ValueError(f'unsafe collect link: {member.name}')
+        tar.extractall(root, filter='data')
+
+
+def cmd_collect(args):
+    host, context = _remote_mux(args)
+    kind = _remote_kind(args.host)
+    run = f'{kind["root"]}/{args.label}'
+    dest = Path(args.to) / args.label
+    if dest.exists():
+        raise SystemExit(f'collect destination already exists: {dest}')
+    dest.mkdir(parents=True)
+    with context as mux:
+        mux.ensure()
+        if not kind['windows']:
+            excludes = [] if args.films else [f'--exclude={pattern}' for pattern in _FILM_EXCLUDES]
+            for name in _COLLECT_NAMES:
+                target = str(dest / name) if name.endswith('/') else str(dest) + '/'
+                transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--mkpath',
+                            '--ignore-missing-args', *excludes, f'{host}:{run}/{name}', target]
+                if code := _go_sh(transfer):
+                    raise SystemExit(f'collect failed ({code}): {name}')
+        else:
+            names = ','.join("'" + name.rstrip('/').replace("'", "''") + "'" for name in _COLLECT_NAMES)
+            excludes = '' if args.films else ' --exclude=' + ' --exclude='.join(_pwsh_arg(p) for p in _FILM_EXCLUDES)
+            archive = f'{run}/collect.tar.gz'
+            script = (f'$run={_pwsh_arg(run)}; $names=@({names}); '
+                      '$files=@(foreach($n in $names) { Get-ChildItem -LiteralPath $run -Filter $n '
+                      '-ErrorAction SilentlyContinue | ForEach-Object { $_.Name } }); '
+                      f'& tar.exe -czf {_pwsh_arg(archive)} -C $run{excludes} @files; exit $LASTEXITCODE')
+            if code := _go_sh(_windows_ssh(host, mux, script)):
+                raise SystemExit(f'collect archive failed ({code})')
+            try:
+                with tempfile.TemporaryDirectory(prefix='eden-collect-') as temp:
+                    local = Path(temp) / 'collect.tar.gz'
+                    if code := _go_sh(['scp', *mux.rider_args, f'{host}:{archive}', str(local)]):
+                        raise SystemExit(f'collect transfer failed ({code})')
+                    _extract_collect(local, dest)
+            finally:
+                remove = f'Remove-Item -LiteralPath {_pwsh_arg(archive)}'
+                if code := _go_sh(_windows_ssh(host, mux, remove)):
+                    print(f'collect: remote archive removal failed ({code})', file=sys.stderr)
+    print(f'Collected: {dest}')
+    return 0
+
+
+def _eden_setting(value):
+    key, separator, raw = value.partition('=')
+    if not separator or '.' not in key or not key or not re.fullmatch(r'[+-]?\d+', raw):
+        raise argparse.ArgumentTypeError('eden setting must be KEY=INTEGER with a dot in KEY')
+    return key, int(raw)
+
+
+def _prepare(run):
+    problems = check_run(run, skip_setup_plan=True, allow_volatile_pins=True)
+    for problem in problems:
+        print(problem)
+    dry = sh([*_python(), str(RUNNER), 'up-check', str(run / 'rows' / 'rows.json'),
+              '--out', str(run / 'out')], run / 'dry-run.log')
+    preflight = lifecycle(run, 'preflight')
+    print(f'Prepared: {run}')
+    return 0 if not problems and not dry and not preflight else 1
+
+
+def cmd_fly(run, down=False, token=None):
+    try:
+        cmd_up(run, skip_setup_plan=True, allow_volatile_pins=True)
+    except BaseException:
+        timing = run / 'timing.json'
+        if timing.is_file() and 'up_start' in json.loads(timing.read_text()):
+            print(f'Down: /usr/bin/python3 -I -B {Path(__file__).resolve()} down {run}')
+        raise
+    code, error, down_error = 3, None, None
+    try:
+        try:
+            code = cmd_run(run)
+        except (Exception, SystemExit) as exc:
+            print(f'run failed: {exc}')
+        finally:
+            cmd_report(run)
+            print(f'Report: {run / "REPORT.md"}')
+        counts = report_counts(run)
+        code = 0 if code == 0 and not counts['FAIL'] and not counts['NOT RUN'] else 3
+        (run / 'go-result.json').write_text(json.dumps({'token': token, 'code': code, 'counts': counts}, indent=2) + '\n')
+    except BaseException as exc:
+        error = exc
+    finally:
+        if down:
+            try:
+                cmd_down(run)
+            except (Exception, SystemExit) as exc:
+                down_error = exc
+                print(f'down failed: {exc}')
+    if down_error is not None:
+        if (run / 'go-result.json').is_file():
+            result = json.loads((run / 'go-result.json').read_text())
+            result['code'] = 1
+            (run / 'go-result.json').write_text(json.dumps(result, indent=2) + '\n')
+        return 1
+    if error is not None:
+        raise error
+    return code
 
 
 def cmd_go(args):
@@ -2349,25 +2608,9 @@ def cmd_go(args):
         else:
             detail = f'card lineup NOT STAGED, reason: {lineup["reason"]}'
         print(f'Staged plugins [{key}]: {len(entries)} — {detail}')
-    try:
-        cmd_up(run, skip_setup_plan=True, allow_volatile_pins=True)
-    except BaseException:
-        timing = run / 'timing.json'
-        if timing.is_file() and 'up_start' in json.loads(timing.read_text()):
-            print(f'Down: /usr/bin/python3 -I -B {Path(__file__).resolve()} down {run}')
-        raise
-    code = 3
-    try:
-        code = cmd_run(run)
-    except (Exception, SystemExit) as error:
-        print(f'run failed: {error}')
-    finally:
-        cmd_report(run)
-        print(f'Report: {run / "REPORT.md"}')
-    counts = report_counts(run)
-    code = 0 if code == 0 and not counts['FAIL'] and not counts['NOT RUN'] else 3
-    (run / 'go-result.json').write_text(json.dumps({'token': args.token, 'code': code, 'counts': counts}, indent=2) + '\n')
-    return code
+    if getattr(args, 'prepare', False):
+        return _prepare(run)
+    return cmd_fly(run, down=getattr(args, 'down', False), token=args.token)
 
 
 def stop_captures(run):
@@ -2892,12 +3135,33 @@ def main(argv=None):
     p.add_argument('--ssh')
     p.add_argument('--token', help=argparse.SUPPRESS)
     p.add_argument('--staged-target', action='append', type=_staged_target_arg, default=[], help=argparse.SUPPRESS)
+    p.add_argument('--prepare', action='store_true')
+    p.add_argument('--down', action='store_true')
+    p.add_argument('--eden-setting', action='append', type=_eden_setting, default=[])
+    p.add_argument('--detach', action='store_true')
+    p.add_argument('--go-log', help=argparse.SUPPRESS)
     p = sub.add_parser('remote', help='run a follow-up command on a remote host')
     p.add_argument('--host', required=True)
     p.add_argument('--ssh')
     p.add_argument('--label', required=True)
+    p.add_argument('--detach', action='store_true')
+    p.add_argument('--go-log', help=argparse.SUPPRESS)
     p.add_argument('remote_mode', choices=('check', 'up', 'run', 'report', 'pace', 'down', 'fly'))
     p.add_argument('remote_args', nargs=argparse.REMAINDER)
+    p = sub.add_parser('fly', help='Up, run and report an existing staged run')
+    p.add_argument('run', type=Path)
+    p.add_argument('--down', action='store_true')
+    p.add_argument('--token', help=argparse.SUPPRESS)
+    p = sub.add_parser('peek')
+    p.add_argument('--label', required=True)
+    for name in ('stop', 'collect'):
+        p = sub.add_parser(name)
+        p.add_argument('--host', required=True)
+        p.add_argument('--ssh')
+        p.add_argument('--label', required=True)
+        if name == 'collect':
+            p.add_argument('--to', required=True)
+            p.add_argument('--films', action='store_true')
     p = sub.add_parser('stage-target', help='build or reuse a target cache and stage it for a run')
     p.add_argument('--commit', required=True)
     p.add_argument('--label', required=True)
@@ -2923,11 +3187,35 @@ def main(argv=None):
     p.add_argument('--retry', action='store_true')
     p.add_argument('--rows', help='comma-separated row ids to run again in this boot, passed or failed; the earlier '
                                   'receipt is kept as out/<id>.rerun-<n>.json')
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    tail_log = raw[-1] if len(raw) >= 2 and raw[-2] == '--go-log' else None
+    args = parser.parse_args(raw[:-2] if tail_log is not None else raw)
+    if args.mode in ('go', 'remote'):
+        if tail_log is not None:
+            args.go_log = tail_log
+        if args.mode == 'remote' and '--detach' in args.remote_args:
+            args.remote_args.remove('--detach')
+            args.detach = True
+        if args.detach:
+            return _detach(args, raw)
+        if args.go_log:
+            return _logged(args, raw)
+    return _dispatch(args)
+
+
+def _dispatch(args):
     if args.mode == 'go':
         return cmd_go(args)
     if args.mode == 'remote':
         return cmd_remote(args)
+    if args.mode == 'fly':
+        return cmd_fly(args.run.resolve(), down=args.down, token=args.token)
+    if args.mode == 'peek':
+        return cmd_peek(args)
+    if args.mode == 'stop':
+        return cmd_stop(args)
+    if args.mode == 'collect':
+        return cmd_collect(args)
     if args.mode == 'stage-target':
         try:
             _target_label(args.label)

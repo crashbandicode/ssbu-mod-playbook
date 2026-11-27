@@ -1246,6 +1246,37 @@ class EdenTestTests(unittest.TestCase):
             result = eden_test.main(args)
         return result, output.getvalue(), up
 
+    def test_go_eden_settings_and_invalid_inputs(self):
+        result, _, _ = self.run_go_without_up(self.go_args() +
+                                               ['--eden-setting', 'core.resolution_setup=3',
+                                                '--eden-setting', 'core.volume=-1'])
+        self.assertEqual(result, 0)
+        config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
+        self.assertEqual(config['eden_settings']['core.resolution_setup'], 3)
+        self.assertEqual(config['eden_settings']['core.volume'], -1)
+        for value in ('bad=3', 'core.volume=x', 'core.volume=1.5'):
+            with mock.patch.object(eden_test, 'go_new') as new, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    eden_test.main(self.go_args(label='invalid') + ['--eden-setting', value])
+                new.assert_not_called()
+
+    def test_go_prepare_runs_checks_without_up(self):
+        for label, problems, dry, preflight, expected in (
+                ('prepared', [], 0, 0, 0), ('bad-check', ['bad pin'], 0, 0, 1),
+                ('bad-dry', [], 1, 0, 1), ('bad-preflight', [], 0, 1, 1)):
+            output = io.StringIO()
+            with mock.patch.object(eden_test, 'check_run', return_value=problems) as check, \
+                    mock.patch.object(eden_test, 'sh', return_value=dry) as sh, \
+                    mock.patch.object(eden_test, 'lifecycle', return_value=preflight) as life, \
+                    mock.patch.object(eden_test, 'cmd_up') as up, redirect_stdout(output):
+                self.assertEqual(eden_test.main(self.go_args(label=label) + ['--prepare']), expected)
+            run = eden_test.RUNS / label
+            check.assert_called_once_with(run, skip_setup_plan=True, allow_volatile_pins=True)
+            self.assertIn('up-check', sh.call_args.args[0])
+            life.assert_called_once_with(run, 'preflight')
+            up.assert_not_called()
+            self.assertIn(f'Prepared: {run}', output.getvalue())
+
     def test_go_records_sorted_unique_staged_targets_in_run_config(self):
         first, second = 'a' * 40, 'b' * 40
         args = self.go_args() + ['--staged-target', second, '--staged-target', first,
@@ -4489,6 +4520,186 @@ class RerunTests(unittest.TestCase):
             process.wait(timeout=10)
         self.assertEqual(eden_test.stop_captures(self.run / 'nowhere'), [])
 
+class LaneControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.run = self.root / 'run'
+        self.run.mkdir()
+        self.runs_patch = mock.patch.object(eden_test, 'RUNS', self.root)
+        self.runs_patch.start()
+        self.addCleanup(self.runs_patch.stop)
+
+    def test_fly_down_only_after_successful_up(self):
+        counts = {'PASS': 1, 'FAIL': 0, 'NOT RUN': 0}
+        for run_result, down, expected in ((0, False, 0), (0, True, 0), (3, True, 3),
+                                           (RuntimeError('row failed'), True, 3)):
+            with mock.patch.object(eden_test, 'cmd_up') as up, \
+                    mock.patch.object(eden_test, 'cmd_run', side_effect=run_result if isinstance(run_result, Exception) else None,
+                                      return_value=run_result), \
+                    mock.patch.object(eden_test, 'cmd_report') as report, \
+                    mock.patch.object(eden_test, 'report_counts', return_value=counts), \
+                    mock.patch.object(eden_test, 'cmd_down') as finish, redirect_stdout(io.StringIO()):
+                self.assertEqual(eden_test.cmd_fly(self.run, down=down), expected)
+                up.assert_called_once_with(self.run, skip_setup_plan=True, allow_volatile_pins=True)
+                report.assert_called_once_with(self.run)
+                self.assertEqual(finish.call_count, int(down))
+        with mock.patch.object(eden_test, 'cmd_up', side_effect=SystemExit('up failed')), \
+                mock.patch.object(eden_test, 'cmd_down') as finish:
+            with self.assertRaisesRegex(SystemExit, 'up failed'):
+                eden_test.cmd_fly(self.run, down=True)
+            finish.assert_not_called()
+        with mock.patch.object(eden_test, 'cmd_up'), mock.patch.object(eden_test, 'cmd_run', return_value=0), \
+                mock.patch.object(eden_test, 'cmd_report'), mock.patch.object(eden_test, 'report_counts', return_value=counts), \
+                mock.patch.object(eden_test, 'cmd_down', side_effect=RuntimeError('down failed')), redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test.cmd_fly(self.run, down=True, token='token'), 1)
+        self.assertEqual(json.loads((self.run / 'go-result.json').read_text())['code'], 1)
+
+    def test_detach_argv_and_active_refusal(self):
+        argv = ['remote', '--host', 'xps', '--ssh', 'peer', '--label', 'demo', '--detach', 'fly', '--down']
+        inactive = subprocess.CompletedProcess([], 3, 'inactive\n', '')
+        launched = subprocess.CompletedProcess([], 0, '', '')
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', False), \
+                mock.patch.object(eden_test.subprocess, 'run', side_effect=[inactive, launched]) as run, \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(eden_test.main(argv), 0)
+        command = run.call_args_list[1].args[0]
+        log = self.root / '_eden-test/go/demo/go.log'
+        self.assertEqual(command, ['systemd-run', '--user', '--unit', 'eden-go-demo', '--quiet', '--collect',
+            '--expand-environment=no', '-p', 'MemoryMax=2G', '-p', 'TasksMax=512', '-p', 'RuntimeMaxSec=14400',
+            '-p', 'KillMode=mixed', '-p', 'TimeoutStopSec=600', f'--working-directory={Path.cwd()}',
+            '/usr/bin/python3', '-I', '-B', str(Path(eden_test.__file__).resolve()),
+            'remote', '--host', 'xps', '--ssh', 'peer', '--label', 'demo', 'fly', '--down', '--go-log', str(log)])
+        self.assertIn('eden_test.py peek --label demo', output.getvalue())
+        self.assertIn('eden_test.py stop --host xps --ssh peer --label demo', output.getvalue())
+        with mock.patch.object(eden_test.subprocess, 'run',
+                               return_value=subprocess.CompletedProcess([], 0, 'active\n', '')) as run:
+            with self.assertRaisesRegex(SystemExit, 'already active'):
+                eden_test.main(argv)
+            self.assertEqual(run.call_count, 1)
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True):
+            with self.assertRaisesRegex(SystemExit, 'Linux controller'):
+                eden_test.main(argv)
+
+    def test_go_log_records_running_and_ended(self):
+        log = self.root / 'go/go.log'
+        seen = []
+        def remote(args):
+            seen.append(json.loads((log.parent / 'status.json').read_text()))
+            print('running command')
+            return 3
+        with mock.patch.object(eden_test, 'cmd_remote', side_effect=remote):
+            self.assertEqual(eden_test.main(['remote', '--host', 'xps', '--label', 'demo',
+                                             'fly', '--down', '--go-log', str(log)]), 3)
+        self.assertEqual(seen[0]['phase'], 'running')
+        self.assertEqual((seen[0]['label'], seen[0]['host']), ('demo', 'xps'))
+        status = json.loads((log.parent / 'status.json').read_text())
+        self.assertEqual((status['phase'], status['exit']), ('ended', 3))
+        self.assertIn('ended', status)
+        self.assertIn('running command', log.read_text())
+
+    def test_go_log_passes_log_file_to_child(self):
+        log = self.root / 'go/go.log'
+        def child(argv, **kwargs):
+            self.assertEqual(kwargs['stdout'].name, str(log))
+            self.assertEqual(kwargs['stderr'], subprocess.STDOUT)
+            kwargs['stdout'].write('child output\n')
+            kwargs['stdout'].flush()
+            return subprocess.CompletedProcess(argv, 0)
+        def remote(args):
+            return eden_test.sh(['child'], self.root / 'runner.log')
+        with mock.patch.object(eden_test, 'cmd_remote', side_effect=remote), \
+                mock.patch.object(eden_test.subprocess, 'run', side_effect=child):
+            self.assertEqual(eden_test.main(['remote', '--host', 'xps', '--label', 'demo',
+                                             'report', '--go-log', str(log)]), 0)
+        self.assertIn('child output', log.read_text())
+        self.assertIn('child output', (self.root / 'runner.log').read_text())
+
+    def test_go_log_records_failure_status(self):
+        log = self.root / 'go-fail/go.log'
+        with mock.patch.object(eden_test, 'cmd_remote', side_effect=SystemExit('remote refused')):
+            with self.assertRaisesRegex(SystemExit, 'remote refused'):
+                eden_test.main(['remote', '--host', 'xps', '--label', 'demo',
+                                'report', '--go-log', str(log)])
+        self.assertEqual(json.loads((log.parent / 'status.json').read_text())['exit'], 1)
+        self.assertIn('remote refused', log.read_text())
+        with mock.patch.object(eden_test, 'cmd_remote', side_effect=RuntimeError('unexpected failure')):
+            with self.assertRaisesRegex(RuntimeError, 'unexpected failure'):
+                eden_test.main(['remote', '--host', 'xps', '--label', 'demo',
+                                'report', '--go-log', str(log)])
+        self.assertIn('RuntimeError: unexpected failure', log.read_text())
+
+    def test_peek_reads_status_and_last_40_lines(self):
+        folder = self.root / '_eden-test/go/demo'
+        folder.mkdir(parents=True)
+        (folder / 'status.json').write_text('{"phase":"running"}')
+        (folder / 'go.log').write_text(''.join(f'line-{i}\n' for i in range(45)))
+        done = subprocess.CompletedProcess([], 0, 'ActiveState=active\nSubState=running\nResult=success\n', '')
+        with mock.patch.object(eden_test.subprocess, 'run', return_value=done) as run, redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(eden_test.main(['peek', '--label', 'demo']), 0)
+        self.assertEqual(run.call_args.args[0], ['systemctl', '--user', 'show', 'eden-go-demo', '-p',
+                                                 'ActiveState', '-p', 'SubState', '-p', 'Result'])
+        self.assertIn('line-5\n', out.getvalue())
+        self.assertNotIn('line-4\n', out.getvalue())
+        self.assertIn('ActiveState=active', out.getvalue())
+
+    def test_stop_per_host(self):
+        for host in ('xps', 'ally'):
+            with mock.patch.object(eden_test, '_go_sh', return_value=0) as sh, redirect_stdout(io.StringIO()):
+                self.assertEqual(eden_test.main(['stop', '--host', host, '--ssh', 'peer', '--label', 'demo']), 0)
+            command = sh.call_args.args[0]
+            if host == 'xps':
+                self.assertEqual(command[-2:], ['/usr/bin/touch', '/home/intpa/eden-runs/demo/out/STOP'])
+            else:
+                script = base64.b64decode(command[-1].rsplit(' ', 1)[-1]).decode('utf-16le')
+                self.assertEqual(script, 'New-Item -ItemType File -Force -Path '
+                                         'C:/home/intpa/eden-runs/demo/out/STOP | Out-Null')
+
+    def test_collect_linux_and_windows_and_reject_escape(self):
+        output = self.root / 'dest'
+        with mock.patch.object(eden_test, '_go_sh', return_value=0) as sh, redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test.main(['collect', '--host', 'xps', '--ssh', 'peer', '--label', 'linux',
+                                             '--to', str(output)]), 0)
+        self.assertEqual(len(sh.call_args_list), len(eden_test._COLLECT_NAMES))
+        self.assertTrue(all('--exclude=*.mkv' in c.args[0] and '--exclude=*.capture.gif' in c.args[0]
+                            for c in sh.call_args_list))
+        calls = []
+        def remote(command):
+            calls.append(command)
+            if command[0] == 'scp':
+                with tarfile.open(command[-1], 'w:gz') as tar:
+                    data = b'config'
+                    info = tarfile.TarInfo('config.json')
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            return 0
+        with mock.patch.object(eden_test, '_go_sh', side_effect=remote), redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test.main(['collect', '--host', 'ally', '--ssh', 'peer', '--label', 'win',
+                                             '--to', str(output)]), 0)
+        self.assertEqual((output / 'win/config.json').read_bytes(), b'config')
+        self.assertEqual([c[0] for c in calls], ['ssh', 'scp', 'ssh'])
+        script = base64.b64decode(calls[0][-1].rsplit(' ', 1)[-1]).decode('utf-16le')
+        self.assertIn("--exclude='*.mkv'", script)
+        self.assertIn("--exclude='*.capture.gif'", script)
+        self.assertIn("'config.json','lifecycle-*.log'", script)
+        calls.clear()
+        with mock.patch.object(eden_test, '_go_sh', side_effect=remote), redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test.main(['collect', '--host', 'ally', '--ssh', 'peer', '--label', 'films',
+                                             '--to', str(output), '--films']), 0)
+        script = base64.b64decode(calls[0][-1].rsplit(' ', 1)[-1]).decode('utf-16le')
+        self.assertNotIn('--exclude=', script)
+        bad = self.root / 'bad.tar.gz'
+        with tarfile.open(bad, 'w:gz') as tar:
+            item = tarfile.TarInfo('../escape')
+            item.size = 1
+            tar.addfile(item, io.BytesIO(b'x'))
+        with self.assertRaisesRegex(ValueError, 'unsafe collect member'):
+            eden_test._extract_collect(bad, output / 'win')
+        with self.assertRaisesRegex(SystemExit, 'destination already exists'):
+            eden_test.main(['collect', '--host', 'ally', '--ssh', 'peer', '--label', 'win', '--to', str(output)])
+
+
 class WindowsControllerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -4643,6 +4854,22 @@ class WindowsControllerTests(unittest.TestCase):
         self.assertEqual(pack_scp[0][-1], f'ally-machine:{stage}/targets/.incoming/{commit}.pack')
         self.assertTrue(any(c[0] == 'ssh' and '/targets/.incoming' in self.decode(c) for c in commands))
 
+    def test_remote_prepare_forwards_options_without_fetching_report(self):
+        self.args.prepare = True
+        self.args.down = True
+        self.args.eden_setting = [('core.volume', 0), ('core.resolution_setup', 3)]
+        with mock.patch.object(eden_test, 'PLAYBOOK', self.dir), \
+                mock.patch.object(eden_test, '_go_sh', return_value=0) as sh, \
+                mock.patch.object(eden_test, '_relay_run', return_value=0) as relay, \
+                mock.patch.object(eden_test._lifecycle_module, 'ssh_master_dead', return_value=False), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(eden_test._go_remote_with_mux(self.args, None, 'ally-machine',
+                                                           self.mux, [], self.dir), 0)
+        self.assertEqual([c.args[0][0] for c in sh.call_args_list], ['ssh', 'scp', 'ssh'])
+        script = self.decode(relay.call_args.args[0])
+        self.assertIn('--prepare --down --eden-setting core.volume=0 --eden-setting core.resolution_setup=3', script)
+        self.assertIn('eden_test.py remote --host ally --label demo fly --down', out.getvalue())
+
     def test_windows_remote_base(self):
         self.args.from_config = 'C:/home/intpa/eden-runs/_eden-test/stage/demo/base.json'
         self.assertEqual(eden_test._go_remote_base(self.args), self.args.from_config)
@@ -4679,6 +4906,15 @@ class WindowsHostTests(unittest.TestCase):
             self.assertEqual(eden_test._python(), [sys.executable, '-B', '-I'])
         with mock.patch.object(eden_test.host_os, 'WINDOWS', True):
             self.assertEqual(eden_test._python(), [sys.executable, '-B', '-X', 'utf8'])
+
+    def test_report_uses_controller_follow_up_commands(self):
+        with mock.patch.object(eden_test, 'report_rows_with_stalls', return_value=[]), \
+                mock.patch.object(eden_test, 'time_split', return_value={'setup': 0, 'test': 0}), \
+                mock.patch.object(eden_test, 'card_lineup_report', return_value='lineup'), \
+                mock.patch.object(eden_test, 'nro_lines', return_value=[]):
+            report = eden_test.report_md(self.run)
+        self.assertIn('eden_test.py remote --host ally --label demo down', report)
+        self.assertIn('eden_test.py remote --host ally --label demo run --rows <id>', report)
 
     def test_relay_requires_opt_in_and_checks_reply_id(self):
         with mock.patch.dict(os.environ, {}, clear=True):
