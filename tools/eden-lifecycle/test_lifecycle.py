@@ -356,10 +356,10 @@ class LifecycleTests(unittest.TestCase):
         return json.loads((Path(self.config['state_dir']) / 'lifecycle.json').read_text())
 
     def test_load_cap_defaults_by_host_and_explicit_value_wins(self):
-        for host, expected in (('xps', 300), ('surface', 180), ('yoga', 180), ('ally', 180)):
+        for host in ('xps', 'surface', 'yoga', 'ally', 'future-host'):
             with self.subTest(host=host):
-                self.assertEqual(life.load_cap({'host': host}), expected)
-        self.assertEqual(life.load_cap({'host': 'xps', 'load_cap': 47}), 47)
+                self.assertEqual(life.load_cap({'host': host}), 300)
+                self.assertEqual(life.load_cap({'host': host, 'load_cap': 47}), 47)
 
     def test_pair_gets_separate_staged_pins_and_one_tcp_namespace(self):
         self.pair()

@@ -452,8 +452,8 @@ def active_port_records(text, host, opened):
 
 
 def load_cap(config):
-    """Return the configured game-load cap, with the approved XPS default."""
-    return config.get('load_cap', 300 if config.get('host') == 'xps' else 180)
+    """Return the configured game-load cap, defaulting to 300 seconds on every host."""
+    return config.get('load_cap', 300)
 
 
 def helper_display(display, reserved=()):

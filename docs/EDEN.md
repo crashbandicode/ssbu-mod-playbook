@@ -152,7 +152,7 @@ for the game's `running` and `loading_complete` status signals and bridge
 chord-ready state before it sends the On chord. If a same-boot rerun finds an
 On event without a receipt, it requalifies the current Title state without
 sending a second toggle. When `load_cap` is omitted, Up allows 300 seconds on
-the XPS and 180 seconds on every other host; an explicit run-config value wins.
+every host; an explicit run-config value wins.
 Backup and restore handling is unchanged.
 
 **Compiles beside an Up** (operator 2026-11-10; [WORKFLOW](WORKFLOW.md) "Running agent workers without churn", rule 8):

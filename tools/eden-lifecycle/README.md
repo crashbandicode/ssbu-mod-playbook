@@ -141,8 +141,8 @@ the allocation beside the ledger claim. The same allocation is exposed through
 `instances.json` for the runner. Down releases it after owned processes stop
 and the claim releases; failed cleanup retains the reservation.
 
-When omitted from run config, `load_cap` defaults to 300 seconds on XPS and 180
-seconds on every other host. An explicit `load_cap` always takes precedence.
+When omitted from run config, `load_cap` defaults to 300 seconds on every host.
+An explicit `load_cap` always takes precedence.
 
 Socket bridge capture checks the connected listener PID against the run's
 `run.json`, then binds the received hello boot to that run's lifecycle token
