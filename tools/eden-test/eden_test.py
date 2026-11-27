@@ -554,6 +554,19 @@ def _go_card_lineup(args):
 
 
 def host_interface_problem(name):
+    if host_os.WINDOWS:
+        if not isinstance(name, str) or not name or '\0' in name:
+            return 'no such interface'
+        interface = next((item for item in host_os.windows_interfaces() if item['name'] == name), None)
+        if interface is None:
+            return 'no such interface'
+        if interface['loopback']:
+            return 'is loopback'
+        if not interface['up']:
+            return 'is down'
+        if not interface['ipv4']:
+            return 'has no IPv4 address'
+        return None
     if not isinstance(name, str) or not name or name in ('.', '..') or '/' in name or '\0' in name:
         return 'no such interface'
     encoded = os.fsencode(name)
@@ -581,6 +594,9 @@ def host_interface_problem(name):
 
 
 def usable_interfaces():
+    if host_os.WINDOWS:
+        return sorted(item['name'] for item in host_os.windows_interfaces()
+                      if item['up'] and not item['loopback'] and item['ipv4'])
     try:
         names = sorted(item.name for item in NET_SYSFS.iterdir())
     except OSError:

@@ -97,6 +97,26 @@ def windows_processes(run=subprocess.run):
         raise OSError(f'cannot read Windows processes: {exc}') from exc
 
 
+def windows_interfaces(run=subprocess.run):
+    command = ('$ErrorActionPreference="Stop"; $ips=@(Get-NetIPAddress -AddressFamily IPv4); '
+               '$rows=@(Get-NetAdapter -IncludeHidden | ForEach-Object { '
+               '$adapter=$_; $name=[string]$adapter.InterfaceAlias; '
+               '[pscustomobject]@{name=$name; up=($adapter.Status -eq "Up"); '
+               'loopback=$name.StartsWith("Loopback",[StringComparison]::OrdinalIgnoreCase); '
+               'ipv4=[bool]@($ips | Where-Object { $_.InterfaceIndex -eq $adapter.InterfaceIndex }).Count} }); '
+               'ConvertTo-Json -InputObject $rows -Compress')
+    try:
+        text = _run([_POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], run)
+        rows = json.loads(text)
+        if not isinstance(rows, list) or any(
+                not isinstance(row, dict) or not isinstance(row.get('name'), str) or not row['name']
+                or any(type(row.get(key)) is not bool for key in ('up', 'loopback', 'ipv4')) for row in rows):
+            raise ValueError('expected an interface list with a name and boolean flags')
+        return [{key: row[key] for key in ('name', 'up', 'loopback', 'ipv4')} for row in rows]
+    except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+        raise OSError(f'cannot read Windows interfaces: {exc}') from exc
+
+
 def _task_name(name):
     if not _TASK_NAME.fullmatch(name):
         raise ValueError(f'invalid task name: {name}')

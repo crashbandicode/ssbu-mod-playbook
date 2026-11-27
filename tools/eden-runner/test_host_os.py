@@ -38,6 +38,30 @@ class HostOsTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, 'access failed'):
             host_os.windows_processes(run)
 
+    def test_windows_interfaces_parsing_and_failures(self):
+        interfaces = [
+            {'name': 'Wi-Fi', 'up': True, 'loopback': False, 'ipv4': True},
+            {'name': 'Loopback Pseudo-Interface 1', 'up': True, 'loopback': True, 'ipv4': True},
+            {'name': 'Ethernet 2', 'up': False, 'loopback': False, 'ipv4': False},
+        ]
+        run = mock.Mock(return_value=result(json.dumps(interfaces)))
+        self.assertEqual(host_os.windows_interfaces(run), interfaces)
+        self.assertEqual(run.call_count, 1)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:5], [host_os._POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command'])
+        self.assertIn('Get-NetAdapter -IncludeHidden', argv[-1])
+        self.assertIn('Get-NetIPAddress -AddressFamily IPv4', argv[-1])
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
+        run.return_value = result('[]')
+        self.assertEqual(host_os.windows_interfaces(run), [])
+        for malformed in ('{}', '[{"name":"Wi-Fi","up":1,"loopback":false,"ipv4":true}]', 'not json'):
+            run.return_value = result(malformed)
+            with self.subTest(malformed=malformed), self.assertRaises(OSError):
+                host_os.windows_interfaces(run)
+        run.return_value = result(rc=1, error='access failed')
+        with self.assertRaisesRegex(OSError, 'access failed'):
+            host_os.windows_interfaces(run)
+
     def test_linux_listeners_parse_ss(self):
         run = mock.Mock(return_value=result(
             'LISTEN 0 4096 0.0.0.0:7041 0.0.0.0:* users:(("eden",pid=4242,fd=99),("x",pid=42,fd=1))\n'

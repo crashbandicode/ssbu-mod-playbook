@@ -1107,6 +1107,30 @@ class FreeDisplayTests(unittest.TestCase):
 
 
 class HostInterfaceTests(unittest.TestCase):
+    def test_windows_interfaces_and_refusals(self):
+        interfaces = [
+            {'name': 'Loopback Pseudo-Interface 1', 'up': True, 'loopback': True, 'ipv4': True},
+            {'name': 'Ethernet down', 'up': False, 'loopback': False, 'ipv4': True},
+            {'name': 'No IPv4', 'up': True, 'loopback': False, 'ipv4': False},
+            {'name': 'Very long Wi-Fi interface name', 'up': True, 'loopback': False, 'ipv4': True},
+            {'name': 'Ethernet', 'up': True, 'loopback': False, 'ipv4': True},
+        ]
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test.host_os, 'windows_interfaces', return_value=interfaces) as query:
+            for name, expected in ((None, 'no such interface'), ('', 'no such interface'),
+                                   ('missing', 'no such interface'),
+                                   ('Loopback Pseudo-Interface 1', 'is loopback'),
+                                   ('Ethernet down', 'is down'), ('No IPv4', 'has no IPv4 address'),
+                                   ('Very long Wi-Fi interface name', None)):
+                with self.subTest(name=name):
+                    self.assertEqual(eden_test.host_interface_problem(name), expected)
+            self.assertEqual(eden_test.usable_interfaces(), ['Ethernet', 'Very long Wi-Fi interface name'])
+            query.side_effect = OSError('adapter query failed')
+            with self.assertRaisesRegex(OSError, 'adapter query failed'):
+                eden_test.host_interface_problem('Ethernet')
+            with self.assertRaisesRegex(OSError, 'adapter query failed'):
+                eden_test.usable_interfaces()
+
     def test_flags_address_and_usable_interface_listing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
