@@ -4732,6 +4732,7 @@ class LaneControllerTests(unittest.TestCase):
         self.assertEqual((output / 'win/config.json').read_bytes(), b'config')
         self.assertEqual([c[0] for c in calls], ['ssh', 'scp', 'ssh'])
         script = base64.b64decode(calls[0][-1].rsplit(' ', 1)[-1]).decode('utf-16le')
+        self.assertIn("$run='C:/home/intpa/eden-runs/win';", script)
         self.assertIn("--exclude='*.mkv'", script)
         self.assertIn("--exclude='*.capture.gif'", script)
         self.assertIn("'config.json','lifecycle-*.log'", script)
@@ -4740,6 +4741,7 @@ class LaneControllerTests(unittest.TestCase):
             self.assertEqual(eden_test.main(['collect', '--host', 'ally', '--ssh', 'peer', '--label', 'films',
                                              '--to', str(output), '--films']), 0)
         script = base64.b64decode(calls[0][-1].rsplit(' ', 1)[-1]).decode('utf-16le')
+        self.assertIn("$run='C:/home/intpa/eden-runs/films';", script)
         self.assertNotIn('--exclude=', script)
         bad = self.root / 'bad.tar.gz'
         with tarfile.open(bad, 'w:gz') as tar:

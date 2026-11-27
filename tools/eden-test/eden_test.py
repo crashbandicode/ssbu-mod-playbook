@@ -2503,7 +2503,8 @@ def cmd_collect(args):
             names = ','.join("'" + name.rstrip('/').replace("'", "''") + "'" for name in _COLLECT_NAMES)
             excludes = '' if args.films else ' --exclude=' + ' --exclude='.join(_pwsh_arg(p) for p in _FILM_EXCLUDES)
             archive = f'{run}/collect.tar.gz'
-            script = (f'$run={_pwsh_arg(run)}; $names=@({names}); '
+            run_literal = "'" + run.replace("'", "''") + "'"
+            script = (f'$run={run_literal}; $names=@({names}); '
                       '$files=@(foreach($n in $names) { Get-ChildItem -LiteralPath $run -Filter $n '
                       '-ErrorAction SilentlyContinue | ForEach-Object { $_.Name } }); '
                       f'& tar.exe -czf {_pwsh_arg(archive)} -C $run{excludes} @files; exit $LASTEXITCODE')
