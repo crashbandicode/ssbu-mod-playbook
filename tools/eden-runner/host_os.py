@@ -1,12 +1,14 @@
 """Host-specific process, listener and interactive-task operations."""
 
 import csv
+import ctypes
 import io
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
+from ctypes import wintypes
 from xml.sax.saxutils import escape
 
 WINDOWS = os.name == 'nt'
@@ -115,6 +117,30 @@ def windows_interfaces(run=subprocess.run):
         return [{key: row[key] for key in ('name', 'up', 'loopback', 'ipv4')} for row in rows]
     except (RuntimeError, ValueError, TypeError, KeyError) as exc:
         raise OSError(f'cannot read Windows interfaces: {exc}') from exc
+
+
+def remove_file(path):
+    if not WINDOWS:
+        os.unlink(path)
+        return
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(str(path), 0x10000, 0x1 | 0x2 | 0x4, None, 3, 0x00200000 | 0x02000000, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        flags = wintypes.DWORD(0x1 | 0x2 | 0x10)
+        if not kernel.SetFileInformationByHandle(handle, 21, ctypes.byref(flags), ctypes.sizeof(flags)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if not kernel.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _task_name(name):

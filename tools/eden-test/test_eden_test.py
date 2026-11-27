@@ -229,6 +229,34 @@ class TargetStageTests(unittest.TestCase):
         self.assertTrue(eden_test.probe_target(self.commit, runs=self.runs))
         self.assertEqual(eden_test.stage_target(self.commit, 'run-01', runs=self.runs)['cache'], 'reused')
 
+    def test_windows_remove_target_files_without_chmod(self):
+        root = self.root / 'stage'
+        root.mkdir()
+        cache = self.root / 'cache'
+        cache.write_text('cache contents')
+        linked = root / 'linked'
+        os.link(cache, linked)
+        cache.chmod(0o444)
+        (root / 'plain').write_text('other')
+        symlink = root / 'link'
+        symlink.symlink_to(cache)
+        removed = []
+        chmod = Path.chmod
+        def checked_chmod(path, *args, **kwargs):
+            self.assertTrue(path.is_dir(), f'file chmod: {path}')
+            return chmod(path, *args, **kwargs)
+        def remove(path):
+            removed.append(Path(path).name)
+            os.unlink(path)
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test.host_os, 'remove_file', side_effect=remove), \
+                mock.patch.object(Path, 'chmod', checked_chmod):
+            eden_test._remove_target_tree(root)
+        self.assertCountEqual(removed, ['linked', 'plain', 'link'])
+        self.assertFalse(root.exists())
+        self.assertEqual(cache.read_text(), 'cache contents')
+        self.assertEqual(cache.stat().st_mode & 0o222, 0)
+
     def test_tampered_cache_is_rejected_and_rebuilt(self):
         packed = eden_test.pack_target(self.repo, self.commit, self.root / 'packs')
         eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=self.runs)

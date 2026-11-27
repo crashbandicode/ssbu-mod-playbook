@@ -191,10 +191,12 @@ def _remove_target_tree(root):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError(f'not an owned target directory: {root}')
-    for directory, names, _ in os.walk(root, topdown=True, followlinks=False):
+    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
         path = Path(directory)
         path.chmod(path.stat().st_mode | 0o700)
         names[:] = [name for name in names if not (path / name).is_symlink()]
+        for name in files:
+            host_os.remove_file(path / name)
     shutil.rmtree(root)
 
 

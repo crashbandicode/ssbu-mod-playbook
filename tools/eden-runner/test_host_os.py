@@ -1,6 +1,7 @@
 import os
 import json
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
@@ -61,6 +62,56 @@ class HostOsTests(unittest.TestCase):
         run.return_value = result(rc=1, error='access failed')
         with self.assertRaisesRegex(OSError, 'access failed'):
             host_os.windows_interfaces(run)
+
+    def test_windows_remove_file_flags_and_failures(self):
+        kernel = mock.Mock()
+        kernel.CreateFileW.return_value = 123
+        kernel.SetFileInformationByHandle.return_value = True
+        kernel.CloseHandle.return_value = True
+        with mock.patch.object(host_os, 'WINDOWS', True), \
+                mock.patch.object(host_os.ctypes, 'WinDLL', return_value=kernel, create=True), \
+                mock.patch.object(host_os.ctypes, 'get_last_error', return_value=5, create=True), \
+                mock.patch.object(host_os.ctypes, 'WinError', side_effect=lambda code: OSError(code, 'denied'),
+                                  create=True):
+            host_os.remove_file('test-file')
+            self.assertEqual(kernel.CreateFileW.call_args.args,
+                             ('test-file', 0x10000, 7, None, 3, 0x02200000, None))
+            args = kernel.SetFileInformationByHandle.call_args.args
+            self.assertEqual((args[0], args[1], args[2]._obj.value), (123, 21, 0x13))
+            kernel.CloseHandle.assert_called_once_with(123)
+            kernel.CreateFileW.return_value = host_os.ctypes.c_void_p(-1).value
+            with self.assertRaisesRegex(OSError, 'denied'):
+                host_os.remove_file('test-file')
+            self.assertEqual(kernel.CloseHandle.call_count, 1)
+            kernel.CreateFileW.return_value = 123
+            kernel.SetFileInformationByHandle.return_value = False
+            with self.assertRaisesRegex(OSError, 'denied'):
+                host_os.remove_file('test-file')
+            self.assertEqual(kernel.CloseHandle.call_count, 2)
+            kernel.SetFileInformationByHandle.return_value = True
+            kernel.CloseHandle.return_value = False
+            with self.assertRaisesRegex(OSError, 'denied'):
+                host_os.remove_file('test-file')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows hard-link attributes')
+    def test_remove_readonly_hardlink_preserves_other_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / 'first'
+            other = Path(tmp) / 'other'
+            first.write_bytes(b'unchanged')
+            os.link(first, other)
+            first.chmod(stat.S_IREAD)
+            other.chmod(stat.S_IREAD)
+            try:
+                host_os.remove_file(first)
+                self.assertFalse(first.exists())
+                self.assertEqual(other.read_bytes(), b'unchanged')
+                self.assertFalse(other.stat().st_mode & stat.S_IWRITE)
+                with self.assertRaises(PermissionError):
+                    with other.open('r+b'):
+                        pass
+            finally:
+                other.chmod(stat.S_IREAD | stat.S_IWRITE)
 
     def test_linux_listeners_parse_ss(self):
         run = mock.Mock(return_value=result(
