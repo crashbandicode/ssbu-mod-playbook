@@ -1045,6 +1045,24 @@ class LoadGameKickBudgetTests(unittest.TestCase):
         self.assertEqual(now[0], 2.5)
         sock.close.assert_called_once()
 
+    def test_a_last_second_delivery_is_closed_once_not_retried(self):
+        now = [0.]
+        sock = mock.Mock()
+        def sleep(seconds):
+            now[0] += seconds
+        def reply(_):
+            sleep(2.25)
+            return b'$S05#b8'
+        sock.recv.side_effect = reply
+        with mock.patch.object(routes.time, 'monotonic', lambda: now[0]), \
+                mock.patch.object(routes.time, 'sleep', sleep), \
+                mock.patch.object(socket, 'create_connection', return_value=sock) as connect:
+            self.assertEqual(routes._kick(6811, 2.5), {'first': 'S05'})
+        self.assertEqual(now[0], 2.5)
+        self.assertEqual(sock.sendall.call_args_list, [mock.call(b'$?#3f'), mock.call(b'+'), mock.call(b'$c#63')])
+        connect.assert_called_once()
+        sock.close.assert_called_once()
+
 
 class FrontendRoomTests(unittest.TestCase):
     DYNAMIC_ROOM = object()

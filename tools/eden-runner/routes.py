@@ -805,21 +805,35 @@ def chord(ctx, name, expect=None, source=None, cap=10):
 class GdbStub:
     """Minimal GDB remote client (remaining-2 gdbdump.Stub): enough for '?' and 'c'."""
 
-    def __init__(self, port, wait_s=10.0):
+    def __init__(self, port, wait_s=10.0, *, deadline=None):
+        self.deadline = deadline
         until = time.monotonic() + wait_s
         while True:
             try:
-                self.sock = socket.create_connection(('127.0.0.1', port), timeout=5)
+                self.sock = socket.create_connection(('127.0.0.1', port), timeout=self._budget(5))
                 break
             except OSError:
                 if time.monotonic() > until:
                     raise
-                time.sleep(0.5)
+                time.sleep(self._budget(0.5))
         self.sock.settimeout(30)
         self.buf = b''
 
+    def _budget(self, maximum):
+        if self.deadline is None:
+            return maximum
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('GDB kick deadline reached')
+        return min(maximum, left)
+
+    def _bound_io(self):
+        if self.deadline is not None:
+            self.sock.settimeout(self._budget(30))
+
     def send(self, payload):
         data = payload.encode('latin-1')
+        self._bound_io()
         self.sock.sendall(b'$' + data + b'#' + ('%02x' % (sum(data) & 0xff)).encode())
 
     def ask(self, payload):
@@ -830,8 +844,10 @@ class GdbStub:
             found = re.search(rb'\$([^#]*)#([0-9a-fA-F]{2})', self.buf)
             if found:
                 self.buf = self.buf[found.end():]
+                self._bound_io()
                 self.sock.sendall(b'+')
                 return found.group(1).decode('latin-1')
+            self._bound_io()
             data = self.sock.recv(4096)
             if not data:
                 raise ConnectionError('stub closed the connection')
@@ -2140,16 +2156,20 @@ def _kick(port, cap):
     until = time.monotonic() + cap
     error = None
     while time.monotonic() < until:
+        stub = None
         try:
-            stub = GdbStub(port, 5.0)
+            stub = GdbStub(port, 5.0, deadline=until)
             first = stub.ask('?')
             stub.send('c')
-            time.sleep(1.0)
-            stub.close()
-            return {'first': first[:120]}
         except OSError as exc:
             error = repr(exc)[:160]
-            time.sleep(1.0)
+        else:
+            time.sleep(min(1.0, max(0.0, until - time.monotonic())))
+            return {'first': first[:120]}
+        finally:
+            if stub is not None:
+                stub.close()
+        time.sleep(min(1.0, max(0.0, until - time.monotonic())))
     return {'error': error}
 
 
@@ -2179,14 +2199,16 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
     ctx.call('game.load', {'path': ctx.instance['game']}, job_cap=240)
     until = t0 + cap
     if gdb_port:
-        out['kick'] = [_kick(int(gdb_port), 60.0)]
-        while 'first' not in out['kick'][-1]:
+        out['kick'] = []
+        while True:
             ctx.check_stop()
             left = until - time.monotonic()
             if left <= 0:
                 _save(ctx, 'routes-load', out)
                 raise RuntimeError(f'the GDB stub took no continue within {cap} s; the guest is still held: {out}')
             out['kick'].append(_kick(int(gdb_port), min(60.0, left)))
+            if 'first' in out['kick'][-1]:
+                break
     polls = []
     while True:
         ctx.check_stop()
