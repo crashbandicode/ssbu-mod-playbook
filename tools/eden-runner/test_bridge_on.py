@@ -240,7 +240,7 @@ class BridgeOnTests(unittest.TestCase):
 
     def owner(self, port):
         self.owner_calls.append(port)
-        return self.listener
+        return [{'pid': int(pid), 'line': self.listener} for pid in re.findall(r'pid=(\d+)', self.listener)]
 
     def configure_lan(self):
         self.configure_stub()
@@ -269,7 +269,8 @@ class BridgeOnTests(unittest.TestCase):
         run = self.out / 'bridge-run'
         run.mkdir()
         (run / 'bridge.log').write_text(text)
-        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6980}))
+        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6980, 'owner_pid': 712,
+                                                     'instance': 'offline', 'run_token': 'a' * 32}))
         return run
 
     def test_bridge_on_uses_real_witness_and_detached_capture(self):
@@ -323,7 +324,8 @@ class BridgeOnTests(unittest.TestCase):
         run = self.out / 'bridge-run'
         run.mkdir()
         (run / 'bridge.log').write_text(HELLO + '\n' + INSTALL + '\n' + BACKUP + '\n')
-        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6979}))
+        (run / 'capture.json').write_text(json.dumps({'pid': 4312, 'port': 6979, 'owner_pid': 712,
+                                                     'instance': 'offline', 'run_token': 'a' * 32}))
         with (run / 'bridge.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             receipt = self.invoke(port=6979)
@@ -1357,7 +1359,7 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(self.popen, [])
 
     def test_bridge_on_stub_on_reports_missing_ss(self):
-        with patch('subprocess.check_output', side_effect=FileNotFoundError('ss')):
+        with patch('subprocess.run', side_effect=FileNotFoundError('ss')):
             with self.assertRaisesRegex(RuntimeError, r'ss'):
                 routes._bridge_on_listener_owner(6980)
 

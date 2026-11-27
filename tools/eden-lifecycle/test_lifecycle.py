@@ -424,6 +424,16 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(c.state['instances'][0]['display'], ':101')
             c.down()
 
+    def test_bridge_on_packet_port_bound_before_launch_is_refused(self):
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+            self.rows.write_text(json.dumps({'rows': [{'steps': [{'run': 'routes:bridge_on', 'args': {'port': port}}]}]}))
+            self.config['rows']['sha256'] = life.digest(self.rows)
+            with self.assertRaisesRegex(life.Refused, rf'BRIDGE packet port {port}.*bound'):
+                self.controller().up()
+        self.assertFalse(self.ledger.claimed)
+
     def pair(self):
         self.config['pair_authorized'] = True
         self.host.max_eden = 2
@@ -562,7 +572,7 @@ class LifecycleTests(unittest.TestCase):
         (sockets / '.X299-lock').write_text('pid fixture')
         config = deepcopy(self.config)
         config.update(ports_root=str(runs), state_dir=str(runs / 'ledge-trap' / 'state'),
-                      work_root=str(runs / 'ledge-trap' / 'work'))
+                      work_root=str(runs / 'ledge-trap' / 'work'), display_helper=dict(config['runner']))
         config['instances'][0]['display'] = ':298'
         with patch.object(life, 'X_SOCKET_ROOT', sockets):
             controller = life.Lifecycle(config, self.host, self.ledger)

@@ -132,14 +132,16 @@ the same pin and game checks before it creates state.
 `eden_test.py go` leaves display and bridge choices for lifecycle admission.
 While holding the host port-claim lock, Up scans other run folders' port and
 display pins, live TCP listeners, and live X display sockets. It allocates a
-GDB stub port, bridge port, and display per instance, writes the selected bridge
-port into the run's `inputs/port.txt`, records all three in
+GDB stub port and bridge port per instance. A display helper gets a free display;
+without a helper the declared existing display stays fixed. Up writes each
+bridge port to `state/bridge-port-<instance>.txt`, records the assignments in
 `state/port-allocation.json` and the claim receipt, then launches Eden. A packet
 that pins a GDB or bridge port already bound on the host is refused with the
 port and conflict in the error. Down marks the reservation released only after
 the owned Eden and display have stopped and the lifecycle claim is released.
 
-The shared runner reads GDB port assignments from `instances.json`, so fixed
+Requesting the stub is still optional. For stub-on rows, the shared runner reads
+GDB port assignments from `instances.json`, so fixed
 packet defaults cannot make two runs share the same stub. Before the first
 bridge request, capture verifies that the connected listener belongs to this
 run's Eden PID, then binds the received hello boot to this run's lifecycle token

@@ -314,19 +314,19 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                     raise RuntimeError('capture-bridge: owner pid and a run boot or token are required')
                 try:
                     rows = host_os.tcp_listeners(int(port))
-                    listener = '\n'.join(row['line'] for row in rows)
                 except RuntimeError as error:
                     sock.close()
                     raise RuntimeError(f'capture-bridge: cannot verify listener owner for port {port}: {error}') from error
-                owns = (bool(rows) and all(row['pid'] == int(owner_pid) for row in rows)) if host_os.WINDOWS else \
-                    f'pid={int(owner_pid)},' in listener
+                owns = bool(rows) and all(row['pid'] == int(owner_pid) for row in rows)
                 if not owns:
                     sock.close()
+                    listener = '\n'.join(row['line'] for row in rows)
                     raise RuntimeError(f'capture-bridge: port {port} listener is not this run Eden pid {owner_pid}: '
                                        f'{listener.strip() or "no listener"}')
                 greeting = bytearray()
                 deadline = time.monotonic() + 3
-                while b'[Bridge] hello ' not in greeting and time.monotonic() < deadline:
+                match = None
+                while match is None and time.monotonic() < deadline:
                     try:
                         chunk = sock.recv(65536)
                     except socket.timeout:
@@ -334,7 +334,7 @@ def capture_bridge(run, host, port, console, stop=None, connect=socket.create_co
                     if not chunk:
                         break
                     greeting.extend(chunk)
-                match = HELLO_BOOT.search(bytes(greeting))
+                    match = HELLO_BOOT.search(greeting.rpartition(b'\n')[0])
                 if match is None:
                     sock.close()
                     raise RuntimeError(f'capture-bridge: listener pid {owner_pid} did not greet this run before '

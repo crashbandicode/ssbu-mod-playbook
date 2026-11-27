@@ -80,7 +80,7 @@ COMPILE_NICE_MIN = 10
 LEDGER_ATTEMPT_SECONDS = 10
 SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2']
-X_SOCKET_ROOT = Path(tempfile.gettempdir())
+X_SOCKET_ROOT = Path('/tmp')  # X11's Unix sockets do not follow TMPDIR.
 _PORTABLE_LOCK_SOURCE = globals().get('_FORWARDED_PORTABLE_LOCK_SOURCE')
 if _PORTABLE_LOCK_SOURCE:
     _PORTABLE_LOCK = type(sys)('_eden_lifecycle_portable_lock')
@@ -436,9 +436,47 @@ def claim_line_matches(line, suffix):
     return normalized.endswith(suffix)
 
 
+def active_port_records(text, host, opened):
+    tokens = {m[1] for line in opened if (m := re.search(r'\blifecycle=(\w+)\b', line))}
+    prefix = f'PORTS: host={host} lifecycle='
+    return [line for line in text.splitlines() if line.startswith(prefix)
+            and line[len(prefix):].partition(' ')[0] in tokens]
+
+
 def load_cap(config):
     """Return the configured game-load cap, with the approved XPS default."""
     return config.get('load_cap', 300 if config.get('host') == 'xps' else 180)
+
+
+def helper_display(display, reserved=()):
+    number = int(display[1:])
+    while (f':{number}' in reserved or (X_SOCKET_ROOT / f'.X{number}-lock').exists()
+           or (X_SOCKET_ROOT / '.X11-unix' / f'X{number}').exists()):
+        number += 1
+    return f':{number}'
+
+
+def packet_ports(path):
+    if not path or not Path(path).is_file():
+        return
+    stack = [json.loads(Path(path).read_text())]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            pins = [('GDB', node.get('gdb_port'))]
+            if node.get('run') == 'routes:bridge_on':
+                pins.append(('BRIDGE', (node.get('args') or {}).get('port')))
+            for kind, value in pins:
+                if value:
+                    try:
+                        port = int(value)
+                    except (TypeError, ValueError):
+                        raise Refused(f'Invalid packet {kind} port pin: {value!r}') from None
+                    require(0 < port <= 65535, f'Invalid packet {kind} port pin: {value!r}')
+                    yield kind, port
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
 
 
 def validate_stale_claim_hours(value):
@@ -590,7 +628,8 @@ class Ledger:
                               'Eden stopped; full profile restored and separately verified')
             if operation == 'read':
                 opened = active_claims(text, self.host)
-                return {'open': opened, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
+                return {'open': opened, 'port_records': active_port_records(text, self.host, opened),
+                        'sha256': hashlib.sha256(text.encode()).hexdigest(),
                         'owned_claim': any(claim_line_matches(line, claim_suffix) or
                                            claim_line_matches(line, claim_suffix + EXCLUSIVE_HOST_MARKER)
                                            for line in opened),
@@ -1683,7 +1722,7 @@ class Lifecycle:
     def host_port_lock(self):
         root = Path(self.c.get('ports_root') or Path(self.c['state_dir']).parent)
         root.mkdir(parents=True, exist_ok=True)
-        lock_root = Path(tempfile.gettempdir()) / 'eden-lifecycle' / self.c['hostname']
+        lock_root = Path(tempfile.gettempdir()) / 'eden-lifecycle' / self.c['hostname'].casefold()
         lock_root.mkdir(parents=True, exist_ok=True)
         path = lock_root / '.eden-port-claims.lock'
         with path.open('a+b') as stream:
@@ -1703,7 +1742,26 @@ class Lifecycle:
 
     def _allocate_ports(self, root):
         """Allocate and persist this run's port pins while holding the host admission lock."""
-        reserved = {'gdb': set(), 'bridge': set(), 'display': set()}
+        tcp = set()
+        reserved = {'gdb': tcp, 'bridge': tcp, 'display': set()}
+
+        def reserve(instances):
+            for item in instances:
+                for kind in reserved:
+                    if item.get(kind) is not None:
+                        reserved[kind].add(str(item[kind]) if kind == 'display' else int(item[kind]))
+
+        ledger = self.ledger_text()
+        opened = active_claims(ledger, self.c['host'])
+        for line in opened:
+            field = re.search(r'\sports=(\S+)', line)
+            if field:
+                for entry in field[1].split(','):
+                    match = re.fullmatch(r'[^,:]+:(gdb|bridge|display)=(.+)', entry)
+                    require(match, 'Invalid port pin in open lifecycle claim')
+                    reserve([{match[1]: match[2]}])
+        for line in active_port_records(ledger, self.c['host'], opened):
+            reserve(json.loads(line.partition(' allocation=')[2])['instances'].values())
         for folder in root.iterdir():
             if not folder.is_dir() or folder == self.directory or folder == self.directory.parent:
                 continue
@@ -1711,12 +1769,9 @@ class Lifecycle:
             if record.is_file():
                 try:
                     value = json.loads(record.read_text())
-                    if not value.get('released'):
-                        for instance in value.get('instances', {}).values():
-                            for kind in reserved:
-                                if instance.get(kind) is not None:
-                                    reserved[kind].add(str(instance[kind]) if kind == 'display'
-                                                       else int(instance[kind]))
+                    if value.get('released') is True:
+                        continue
+                    reserve(value['instances'].values())
                 except (OSError, ValueError, TypeError):
                     raise Refused(f'Unreadable live port reservation: {record}')
             for pin in folder.rglob('port.txt'):
@@ -1739,16 +1794,7 @@ class Lifecycle:
                         if choice.get('chosen') is not None:
                             reserved['display'].add(str(choice['chosen']))
                     rows_path = (prior.get('rows') or {}).get('path')
-                    if rows_path and Path(rows_path).is_file():
-                        stack = [json.loads(Path(rows_path).read_text())]
-                        while stack:
-                            node = stack.pop()
-                            if isinstance(node, dict):
-                                if node.get('gdb_port'):
-                                    reserved['gdb'].add(int(node['gdb_port']))
-                                stack.extend(node.values())
-                            elif isinstance(node, list):
-                                stack.extend(node)
+                    tcp.update(port for _, port in packet_ports(rows_path))
                 except (OSError, ValueError, TypeError):
                     raise Refused(f'Unreadable pinned port configuration: {config_path}')
 
@@ -1763,22 +1809,9 @@ class Lifecycle:
             raise Refused(f'No free {kind.upper()} port in {first}-{last}')
 
         rows_path = (self.c.get('rows') or {}).get('path')
-        if rows_path and Path(rows_path).is_file():
-            stack = [json.loads(Path(rows_path).read_text())]
-            while stack:
-                node = stack.pop()
-                if isinstance(node, dict):
-                    value = node.get('gdb_port')
-                    if value:
-                        try:
-                            pinned = int(value)
-                        except (TypeError, ValueError):
-                            raise Refused(f'Invalid packet GDB port pin: {value!r}') from None
-                        if self._port_bound(pinned):
-                            raise Refused(f'GDB packet port {pinned} is already bound on this host')
-                    stack.extend(node.values())
-                elif isinstance(node, list):
-                    stack.extend(node)
+        for kind, port in packet_ports(rows_path):
+            if self._port_bound(port):
+                raise Refused(f'{kind} packet port {port} is already bound on this host')
 
         allocated = {}
         for original in self.c['instances']:
@@ -1796,15 +1829,10 @@ class Lifecycle:
                     bridge_requested = None
             bridge = choose('bridge', bridge_requested, 6980, 7079) if bridge_file else None
             display = original.get('display')
+            if display is not None and self.c.get('display_helper'):
+                display = helper_display(display, reserved['display'])
             if display is not None:
-                base = int(str(display).lstrip(':'))
-                candidate = base
-                while (':' + str(candidate)) in reserved['display'] or \
-                        (self.c['host'] != 'ally' and
-                         ((X_SOCKET_ROOT / f'.X{candidate}-lock').exists()
-                          or (X_SOCKET_ROOT / '.X11-unix' / f'X{candidate}').exists())):
-                    candidate += 1
-                display = ':' + str(candidate)
+                require(display not in reserved['display'], 'Existing display already claimed: ' + display)
                 reserved['display'].add(display)
             item = {'gdb': gdb, 'bridge': bridge, 'display': display}
             allocated[key] = item
@@ -1812,9 +1840,9 @@ class Lifecycle:
             if display is not None:
                 original['display'] = display
             if bridge_file:
-                target = Path(bridge_file['path'])
+                target = self.directory / ('bridge-port-' + key + '.txt')
                 target.write_text(f'{bridge}\n')
-                bridge_file['sha256'] = digest(target)
+                bridge_file.update(path=str(target), sha256=digest(target))
         allocation = {'schema': 1, 'host': self.c['hostname'], 'token': self.state['token'],
                       'instances': allocated, 'released': False, 'claimed': stamp()}
         save(self.directory / 'port-allocation.json', allocation)
@@ -1828,15 +1856,9 @@ class Lifecycle:
 
     def claim_with_ports(self, admission):
         with self.host_port_lock() as root:
-            allocation = self._allocate_ports(root)
-            admission['port_allocation'] = allocation
-            try:
-                return self.ledger().claim(stale_claim_hours=self.c.get('stale_claim_hours'), admission=admission)
-            except BaseException:
-                allocation['released'] = True
-                allocation['released_at'] = stamp()
-                save(self.directory / 'port-allocation.json', allocation)
-                raise
+            admission['port_allocation'] = self._allocate_ports(root)
+            # A lost reply can follow a committed claim. Down reconciles ownership before releasing the pins.
+            return self.ledger().claim(stale_claim_hours=self.c.get('stale_claim_hours'), admission=admission)
 
     def check_state(self):
         """Never trust a journal's arbitrary unit/path as permission to stop it."""
@@ -2020,7 +2042,7 @@ class Lifecycle:
                           self.c.get('ledger_ssh'), state_dir=self.directory).inspect()
             if info.get('ssh_retry'):
                 self.record('claim-readback', info)
-            return '\n'.join(info.get('open') or [])
+            return '\n'.join([*(info.get('open') or []), *(info.get('port_records') or [])])
         path = safe_absolute(self.c['ledger'])
         require(path.is_file(), 'Authoritative ledger must already exist')
         with path.open('r', encoding='utf-8') as stream:
@@ -2158,6 +2180,8 @@ class Lifecycle:
             checks.append({'name': 'display', 'ok': True, 'detail': 'no display probe on this host'})
         else:
             for item in self.c['instances']:
+                if self.c.get('display_helper') and self.c['host'] != 'ally' and item.get('display'):
+                    item = {**item, 'display': helper_display(item['display'])}
                 result = probe(item, self.c)
                 detail = result.get('detail') or ''
                 if result.get('ready'):
@@ -2734,6 +2758,10 @@ class Lifecycle:
             self.host.stop_settle(unit)
             self.state['settle_unit'] = None
         self.state['release_pending'] = False
+        allocation = self.state.get('port_allocation')
+        if allocation and not allocation.get('released'):
+            allocation.update(released=True, released_at=stamp())
+            save(self.directory / 'port-allocation.json', allocation)
         self.write()
         path = self._pending_path()
         if path.exists():
@@ -2796,11 +2824,6 @@ class Lifecycle:
                     failures.append({'stage': 'pending-record', 'error': repr(pending_error)})
             except Exception as error:
                 failures.append({'stage': 'release', 'error': repr(error)})
-        if not failures and not self.state.get('release_pending') and self.state.get('port_allocation'):
-            allocation = self.state['port_allocation']
-            allocation['released'] = True
-            allocation['released_at'] = stamp()
-            save(self.directory / 'port-allocation.json', allocation)
         self.state['cleanup_failures'] = failures
         self.state['phase'] = 'cleanup-failed' if failures else 'down'
         self.write()

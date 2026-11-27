@@ -43,7 +43,7 @@ import time
 import unicodedata
 from collections import deque
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import closed_loop
 import macro_gate
@@ -2125,8 +2125,8 @@ def configure_boot(ctx, gdb_port=None, volume=0, memory_layout_mode=0):
         raise RuntimeError('configure_boot runs before game.load; the game is already running')
     out = {'core.volume': _setting(ctx, 'core.volume', volume),
            'core.memory_layout_mode': _setting(ctx, 'core.memory_layout_mode', memory_layout_mode)}
-    gdb_port = ctx.instance.get('gdb_port') or gdb_port
     if gdb_port:
+        gdb_port = ctx.instance.get('gdb_port') or gdb_port
         out['core.gdbstub_port'] = _setting(ctx, 'core.gdbstub_port', int(gdb_port))
         out['core.use_gdbstub'] = _setting(ctx, 'core.use_gdbstub', True)
     ctx.call('settings.save', {})
@@ -2183,8 +2183,8 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
             out['network_interface'] = live
     t0 = time.monotonic()
     ctx.call('game.load', {'path': ctx.instance['game']}, job_cap=240)
-    gdb_port = ctx.instance.get('gdb_port') or gdb_port
     if gdb_port:
+        gdb_port = ctx.instance.get('gdb_port') or gdb_port
         out['kick'] = [_kick(int(gdb_port), 60.0)]
         drawing, status = _drawing(ctx, 90.0)
         for _ in range(3):
@@ -4064,16 +4064,9 @@ def _bridge_on_events(ctx):
 
 def _bridge_on_listener_owner(port):
     """Read the socket owner using the executor platform's listener tool."""
-    if not host_os.WINDOWS:
-        try:
-            return subprocess.check_output(['ss', '-ltnp', f'sport = :{port}'], text=True, timeout=4)
-        except FileNotFoundError:
-            raise RuntimeError('bridge_on (stub on): ss is not available') from None
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f'bridge_on (stub on): ss failed: {exc}') from exc
     try:
-        return '\n'.join(row['line'] for row in host_os.tcp_listeners(port))
-    except RuntimeError as exc:
+        return host_os.tcp_listeners(port, run=lambda argv, **kw: subprocess.run(argv, timeout=4, **kw))
+    except (RuntimeError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f'bridge_on (stub on): listener query failed: {exc}') from exc
 
 
@@ -4357,9 +4350,8 @@ def _bridge_on_owned_listener(ctx, port):
         path = instance_path(ctx, 'control_log').parent / 'run.json'
         owned = json.loads(path.read_text())['owned_pids']
         if host_os.WINDOWS:
-            from pathlib import PureWindowsPath
             pids = {item['pid'] for item in owned
-                    if PureWindowsPath(item.get('image', '')).name.lower() == 'eden.exe'
+                    if isinstance(item, dict) and PureWindowsPath(item.get('image', '')).name.lower() == 'eden.exe'
                     and isinstance(item.get('pid'), int) and not isinstance(item.get('pid'), bool)
                     and item['pid'] > 0}
         else:
@@ -4368,17 +4360,14 @@ def _bridge_on_owned_listener(ctx, port):
             raise ValueError('invalid owned pid')
     except (KeyError, IndexError, TypeError, ValueError, OSError, UnicodeError) as exc:
         raise RuntimeError(f'bridge_on (stub on): cannot read owned Eden pid from run.json: {exc}') from exc
-    listener = _bridge_on_listener_owner(port)
-    if host_os.WINDOWS:
-        rows = host_os.tcp_listeners(port)
-        owns = bool(rows) and all(row['pid'] in pids for row in rows)
-    else:
-        owns = any(f'pid={pid},' in listener for pid in pids)
-    if not owns:
+    rows = _bridge_on_listener_owner(port)
+    owners = {row['pid'] for row in rows}
+    if len(owners) != 1 or not owners <= pids:
         pid_label = sorted(pids)[0] if len(pids) == 1 else sorted(pids)
+        listener = '\n'.join(row['line'] for row in rows)
         raise RuntimeError(f"bridge_on (stub on): port {port} is not bound by the owned Eden (pid {pid_label}): "
                            f"{listener.strip() or 'no listener'}")
-    return sorted(pids)[0]
+    return owners.pop()
 
 
 def _bridge_on_run_token(ctx):
@@ -4684,7 +4673,7 @@ def free_udp_port(first=24872, last=24971):
     raise RuntimeError(f'no free UDP port on 0.0.0.0 in range {first}-{last}')
 
 
-def bridge_on(ctx, port=None, cap=300):
+def bridge_on(ctx, port=None, cap=60):
     """Turn the bridge on at the title screen and start its detached playbook capture."""
     trace = None
     if ctx.instance.get('trace_jsonl'):
@@ -4719,6 +4708,8 @@ def bridge_on(ctx, port=None, cap=300):
                            '(core.lan_online false) and this call drives the socket. Boot without the marker, or '
                            'with LAN Online set before game.load (host_network with lan_online), so both agree. '
                            'Nothing was pressed.')
+    elif ctx.instance.get('bridge_port'):
+        port = ctx.instance['bridge_port']
     elif port is None:
         try:
             port = int(instance_path(ctx, 'sdmc:ultimate/ssbu-hw-bridge/port.txt').read_text().strip())
@@ -4756,8 +4747,8 @@ def bridge_on(ctx, port=None, cap=300):
                            'give the run its own free port (port.txt) and boot again. No capture was started.')
     listener_pid = _bridge_on_owned_listener(ctx, port) if files is None else None
     run_token = _bridge_on_run_token(ctx) if files is None else None
-    # One capture folder per instance on the file transport, so two Edens of one run each have their own.
-    run = Path(ctx.row_dir).parent / ('bridge-run' if files is None else
+    # Keep the single-instance socket path compatible with existing packets.
+    run = Path(ctx.row_dir).parent / ('bridge-run' if files is None and len(ctx.runner.instances) == 1 else
                                       'bridge-run-' + re.sub(r'[^A-Za-z0-9_.-]', '_', str(ctx.on)))
     (run / 'bridge' / 'files').mkdir(parents=True, exist_ok=True)
     log = run / 'bridge.log'
@@ -4772,6 +4763,9 @@ def bridge_on(ctx, port=None, cap=300):
     capture_path = run / 'capture.json'
     if reused:
         capture = json.loads(capture_path.read_text()) if capture_path.is_file() else {}
+        if files is None and (capture.get('owner_pid'), capture.get('run_token'), capture.get('port'),
+                              capture.get('instance')) != (listener_pid, run_token, port, ctx.on):
+            raise RuntimeError('bridge_on: locked capture identity does not match this instance')
         pid = capture.get('pid')
     else:
         with (run / 'capture.stderr.log').open('ab') as stderr:

@@ -131,9 +131,11 @@ or write the ledger.
 Up takes a host-level port lock before claim admission. Under that lock it
 checks each other run folder's `port.txt`, lifecycle allocation, config and row
 pins, plus live TCP listeners. It selects distinct GDB and bridge ports and
-checks existing X lock/socket paths before selecting a display. A requested
+checks existing X lock/socket paths before selecting a helper-managed display.
+Without a helper, the existing display is not relocated. A requested
 GDB or bridge pin that is already bound is refused. The lifecycle writes the
-bridge port back to the run's pinned `inputs/port.txt`, records the per-instance
+bridge port to a private per-instance `state/bridge-port-<key>.txt` rather than
+overwriting the input pin, records the per-instance
 GDB, bridge and display assignment in `state/port-allocation.json`, and appends
 the allocation beside the ledger claim. The same allocation is exposed through
 `instances.json` for the runner. Down releases it after owned processes stop
