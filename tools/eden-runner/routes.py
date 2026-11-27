@@ -11,7 +11,7 @@ Blocks (docs/ROUTES.md has what each guarantees on exit):
   wireless_room    create a Local Wireless room and reach its waiting room as host
   bridge_alive     verify bridge replies after the frontend room connects
   configure_boot   mute, memory_layout_mode 0, optional GDB stub on, saved and read back, before game.load
-  load_game        game.load, the no-hold GDB kick before any wait, then status loading_complete and drawing
+  load_game        game.load, one delivered no-hold GDB kick before any wait, then status loading_complete and drawing
   wait_lines       the boot lines the plugins print (instead of a fixed post-load sleep)
   to_main          Title or How to Play -> Main Menu (native ownership gate, capped)
   main_to_stage    main menu -> Training's stage select
@@ -802,21 +802,35 @@ def chord(ctx, name, expect=None, source=None, cap=10):
 class GdbStub:
     """Minimal GDB remote client (remaining-2 gdbdump.Stub): enough for '?' and 'c'."""
 
-    def __init__(self, port, wait_s=10.0):
+    def __init__(self, port, wait_s=10.0, *, deadline=None):
+        self.deadline = deadline
         until = time.monotonic() + wait_s
         while True:
             try:
-                self.sock = socket.create_connection(('127.0.0.1', port), timeout=5)
+                self.sock = socket.create_connection(('127.0.0.1', port), timeout=self._budget(5))
                 break
             except OSError:
                 if time.monotonic() > until:
                     raise
-                time.sleep(0.5)
+                time.sleep(self._budget(0.5))
         self.sock.settimeout(30)
         self.buf = b''
 
+    def _budget(self, maximum):
+        if self.deadline is None:
+            return maximum
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('GDB kick deadline reached')
+        return min(maximum, left)
+
+    def _bound_io(self):
+        if self.deadline is not None:
+            self.sock.settimeout(self._budget(30))
+
     def send(self, payload):
         data = payload.encode('latin-1')
+        self._bound_io()
         self.sock.sendall(b'$' + data + b'#' + ('%02x' % (sum(data) & 0xff)).encode())
 
     def ask(self, payload):
@@ -827,8 +841,10 @@ class GdbStub:
             found = re.search(rb'\$([^#]*)#([0-9a-fA-F]{2})', self.buf)
             if found:
                 self.buf = self.buf[found.end():]
+                self._bound_io()
                 self.sock.sendall(b'+')
                 return found.group(1).decode('latin-1')
+            self._bound_io()
             data = self.sock.recv(4096)
             if not data:
                 raise ConnectionError('stub closed the connection')
@@ -2138,37 +2154,33 @@ def _kick(port, cap):
     until = time.monotonic() + cap
     error = None
     while time.monotonic() < until:
+        stub = None
         try:
-            stub = GdbStub(port, 5.0)
+            stub = GdbStub(port, 5.0, deadline=until)
             first = stub.ask('?')
             stub.send('c')
-            time.sleep(1.0)
-            stub.close()
-            return {'first': first[:120]}
         except OSError as exc:
             error = repr(exc)[:160]
-            time.sleep(1.0)
+        else:
+            time.sleep(min(1.0, max(0.0, until - time.monotonic())))
+            return {'first': first[:120]}
+        finally:
+            if stub is not None:
+                stub.close()
+        time.sleep(min(1.0, max(0.0, until - time.monotonic())))
     return {'error': error}
-
-
-def _drawing(ctx, cap):
-    until = time.monotonic() + cap
-    status = {}
-    while time.monotonic() < until:
-        ctx.check_stop()
-        status = ctx.call('status') or {}
-        if (status.get('game_fps') or 0) > 1:
-            return True, status
-        if status.get('running') is False and status.get('loading_complete') is not None:
-            break
-        time.sleep(1.0)
-    return False, status
 
 
 def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
     """game.load, then (stub on) the no-hold kick BEFORE any wait, then the game's own state: loading_complete, no
-    shaders building, game_fps at least min_fps. Fails closed: a guest that never draws after three kicks, or Eden
-    that stops running, raises with the polls it saw."""
+    shaders building, game_fps at least min_fps, within cap seconds of game.load with the stub on or off.
+
+    One delivered kick releases the guest: Eden resumes it when the client leaves, and it runs from then on (film-x1
+    filmx1-b1-surface-1, 2026-11-27: first service calls 0.3 s after the kick). A boot can take longer to draw than
+    any fixed schedule of further kicks, and each further connection only pauses a running guest and reports the
+    process's first thread where it waits, so a delivered kick is never repeated. A kick the stub did not take (it
+    was not listening yet) left the guest held, so that one is tried again. Fails closed: a stub that takes no
+    continue within cap, a game still loading at cap, or Eden that stops running, raises with what it saw."""
     out = {}
     runner_out = getattr(getattr(ctx, 'runner', None), 'out', None)
     config_path = Path(runner_out).parent / 'config.json' if runner_out is not None else None
@@ -2183,20 +2195,20 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
             out['network_interface'] = live
     t0 = time.monotonic()
     ctx.call('game.load', {'path': ctx.instance['game']}, job_cap=240)
+    until = t0 + cap
     if gdb_port:
         gdb_port = ctx.instance.get('gdb_port') or gdb_port
-        out['kick'] = [_kick(int(gdb_port), 60.0)]
-        drawing, status = _drawing(ctx, 90.0)
-        for _ in range(3):
-            if drawing:
+        out['kick'] = []
+        while True:
+            ctx.check_stop()
+            left = until - time.monotonic()
+            if left <= 0:
+                _save(ctx, 'routes-load', out)
+                raise RuntimeError(f'the GDB stub took no continue within {cap} s; the guest is still held: {out}')
+            out['kick'].append(_kick(int(gdb_port), min(60.0, left)))
+            if 'first' in out['kick'][-1]:
                 break
-            out['kick'].append(_kick(int(gdb_port), 15.0))
-            drawing, status = _drawing(ctx, 60.0)
-        if not drawing:
-            _save(ctx, 'routes-load', out)
-            raise RuntimeError(f'the guest did not draw after the direct continue: {out}')
     polls = []
-    until = t0 + cap
     while True:
         ctx.check_stop()
         status = ctx.call('status') or {}
