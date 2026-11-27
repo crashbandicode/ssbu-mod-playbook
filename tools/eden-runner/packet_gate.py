@@ -1023,7 +1023,7 @@ def _steps(steps):
 
 
 def _hooks(plan, base, errors):
-    from runner import load_hook, load_step
+    from runner import SHARED_HOOKS, load_hook, load_step
 
     gates_checked = set()
     modules = set()
@@ -1034,7 +1034,7 @@ def _hooks(plan, base, errors):
         if not isinstance(spec, str):
             return
         path = spec.partition(':')[0]
-        if path not in ('routes', 'routes_online', 'fixtures'):
+        if path not in SHARED_HOOKS:
             modules.add(path)
         try:
             fn = load_step(base, spec)
