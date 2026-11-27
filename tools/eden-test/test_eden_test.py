@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -4451,6 +4452,22 @@ class RerunTests(unittest.TestCase):
         mine.wait(timeout=10)
         time.sleep(0.1)
         self.assertFalse(eden_test.stop_capture(self.run)['stopped'])  # already gone
+
+    def test_stop_capture_windows_identity(self):
+        folder = self.run / 'out/bridge-run'
+        folder.mkdir()
+        (folder / 'capture.json').write_text(json.dumps({'pid': 42}))
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test.host_os, 'argv_has') as has, \
+                mock.patch.object(eden_test.os, 'kill') as kill:
+            for value, expected in (
+                    (None, {'pid': 42, 'stopped': False, 'why': 'not running'}),
+                    (False, {'pid': 42, 'stopped': False, 'why': "that pid is not this run's capture"}),
+                    (True, {'pid': 42, 'stopped': True})):
+                has.return_value = value
+                self.assertEqual(eden_test.stop_capture(self.run), expected)
+                has.assert_called_with(42, 'capture-bridge', str(folder))
+            kill.assert_called_once_with(42, signal.SIGTERM)
 
     def test_down_stops_every_instances_bridge_capture(self):
         import subprocess
