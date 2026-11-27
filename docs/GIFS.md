@@ -204,7 +204,8 @@ frame count, duration). View the PNGs. Then check:
 
 ## Caption the README demo
 
-Include one line below the embedded MP4 or GIF preview. Describe what
+Include one line below the embedded MP4 preview. Describe what
 happens, then give the platform, date and build. For example, *The cursor
-moves to the requested tile. Eden, 2026-10-29, build `15d3f31`.* For a
-GIF preview, save the image as `docs/media/<name>.gif`.
+moves to the requested tile. Eden, 2026-10-29, build `15d3f31`.* Save the silent H.264 preview as
+`docs/media/<name>.mp4`. Embed its Forgejo media blob in a video player and
+add a relative “Open the clip” link below it.
