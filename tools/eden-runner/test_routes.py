@@ -909,6 +909,21 @@ class LoadGameNetworkTests(unittest.TestCase):
                          'a step changed it after host_network. No game was loaded.')
         self.assertEqual([name for name, _ in self.calls], ['settings.get'])
 
+    def test_allocating_a_port_does_not_opt_a_packet_into_debugging(self):
+        self.ctx.instance.update(gdb_port=6794, trace_jsonl='fake.trace')
+        with mock.patch.object(routes, '_setting', side_effect=lambda _, key, value: value) as settings, \
+                mock.patch.object(routes, '_kick', return_value={'first': 'S05'}) as kick:
+            orig = self.ctx.call
+            self.ctx.call = lambda method, *a, **kw: {} if method == 'status' else orig(method, *a, **kw)
+            routes.configure_boot(self.ctx)
+            self.assertNotIn('core.use_gdbstub', [c.args[1] for c in settings.call_args_list])
+            self.ctx.call = orig
+            self.assertNotIn('kick', routes.load_game(self.ctx))
+            kick.assert_not_called()
+            del self.ctx.instance['trace_jsonl']
+            self.assertIn('kick', routes.load_game(self.ctx, gdb_port=6803))
+            self.assertEqual(kick.call_args_list[0].args[0], 6794)
+
     def test_matching_interface_is_checked_and_recorded_before_load(self):
         self.config.write_text(json.dumps({'network_check': {'interface': 'wifi0', 'no_lobby': False}}))
         result = routes.load_game(self.ctx)

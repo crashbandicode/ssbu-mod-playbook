@@ -361,6 +361,69 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(life.load_cap({'host': host}), expected)
         self.assertEqual(life.load_cap({'host': 'xps', 'load_cap': 47}), 47)
 
+    def test_pair_gets_separate_staged_pins_and_one_tcp_namespace(self):
+        self.pair()
+        shared = self.base / 'port.txt'
+        shared.write_text('6793\n')
+        for item in self.config['instances']:
+            item['files'].append({'path': str(shared), 'sha256': life.digest(shared),
+                                  'to': 'user/sdmc/ultimate/ssbu-hw-bridge/port.txt'})
+        c = self.controller()
+        c.up()
+        allocation = c.state['port_allocation']['instances']
+        self.assertEqual(len({v[k] for v in allocation.values() for k in ('gdb', 'bridge')}), 4)
+        for item in c.state['instances']:
+            path = Path(item['profile']) / item['files'][-1]['to']
+            self.assertEqual(int(path.read_text()), allocation[item['key']]['bridge'])
+        self.assertEqual(shared.read_text(), '6793\n', 'do not overwrite a config input shared with another run')
+        c.down()
+
+    def test_closed_run_does_not_keep_its_ports_through_retained_evidence(self):
+        runs = self.base / 'runs'
+        old = runs / 'old'
+        (old / 'state').mkdir(parents=True)
+        life.save(old / 'state' / 'port-allocation.json', {'released': True})
+        life.save(old / 'config.json', {'instances': [{'gdb_port': 6793, 'display': ':298'}]})
+        (old / 'port.txt').write_text('6980\n')
+        self.config.update(ports_root=str(runs))
+        self.config['instances'][0].update(gdb_port=6793, display=':298')
+        c = self.controller()
+        with patch.object(c, '_port_bound', return_value=False), patch.object(life, 'X_SOCKET_ROOT', self.base):
+            c.up()
+        self.assertEqual((c.state['instances'][0]['gdb_port'], c.state['instances'][0]['display']), (6793, ':298'))
+        c.down()
+
+    def test_a_host_claim_in_another_runs_root_reserves_its_tcp_and_display(self):
+        for index in (1, 2):
+            config = deepcopy(self.config)
+            root = self.base / str(index)
+            config.update(ports_root=str(root), state_dir=str(root / 'r' / 'state'),
+                          work_root=str(root / 'r' / 'work'), owner=f'Claude test/run-{index}')
+            config['display_helper'] = dict(config['runner'])
+            root.mkdir()
+            c = life.Lifecycle(config, self.host)
+            c.directory.mkdir(parents=True)
+            c.state = {'token': str(index) * 32, 'config': config}
+            with patch.object(c, '_port_bound', return_value=False):
+                c.claim_with_ports({'foreign_processes': []} if index == 1 else
+                                   {'max_eden': 2})
+            row = c.state['port_allocation']['instances']['a']
+            if index == 1:
+                first = row
+            else:
+                self.assertNotEqual(first['gdb'], row['gdb'])
+                self.assertNotEqual(first['display'], row['display'])
+
+    def test_preexisting_display_without_helper_stays_on_its_live_socket(self):
+        d = self.base / 'x-sockets'
+        (d / '.X11-unix').mkdir(parents=True)
+        (d / '.X11-unix' / 'X101').touch()
+        with patch.object(life, 'X_SOCKET_ROOT', d):
+            c = self.controller()
+            c.up()
+            self.assertEqual(c.state['instances'][0]['display'], ':101')
+            c.down()
+
     def pair(self):
         self.config['pair_authorized'] = True
         self.host.max_eden = 2
@@ -1741,6 +1804,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(value['released'])
         self.assertFalse(path.exists())
         self.assertNotIn('prune', c.state)
+        self.assertTrue(json.loads((c.directory / 'port-allocation.json').read_text())['released'])
         self.assertTrue(c.down()['prune']['done'])
 
     def test_settle_stops_at_deadline_and_cli_reports_pending(self):

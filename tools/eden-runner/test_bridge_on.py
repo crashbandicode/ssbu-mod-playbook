@@ -300,6 +300,24 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(self.ctx.runner.instances['offline']['bridge_log'], str(run / 'bridge.log'))
         json.dumps(receipt)
 
+    def test_default_greeting_timeout_is_still_sixty_seconds(self):
+        self.configure_stub()
+        self.stub_preamble = ''
+        with self.assertRaisesRegex(RuntimeError, 'no bridge greeting within 60 s'):
+            self.invoke(port=6980)
+
+    def test_reused_socket_capture_must_match_this_run(self):
+        self.cold_stub_receipt()
+        run = self.out / 'bridge-run'
+        path = run / 'capture.json'
+        capture = json.loads(path.read_text())
+        capture['run_token'] = 'b' * 32
+        path.write_text(json.dumps(capture))
+        with (run / 'bridge.lock').open('a+b') as lock:
+            routes.portable_lock.lock_exclusive(lock, blocking=False)
+            with self.assertRaisesRegex(RuntimeError, 'capture identity'):
+                self.invoke(port=6980)
+
     def test_bridge_on_reuses_locked_capture_and_skips_existing_on(self):
         self.events.write_text(BOOT + '\n' + READY + '\n' + LISTENING + '\n' + ON + '\n')
         run = self.out / 'bridge-run'

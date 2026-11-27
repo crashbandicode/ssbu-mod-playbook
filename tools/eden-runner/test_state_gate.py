@@ -194,15 +194,12 @@ class LinkTests(unittest.TestCase):
 
         class Peer:
             def __init__(self, greeting):
-                self.greeting = greeting
+                self.chunks = [greeting[:18], greeting[18:]]
                 self.sent = []
             def settimeout(self, _):
                 pass
             def recv(self, _):
-                if self.greeting is None:
-                    return b''
-                greeting, self.greeting = self.greeting, None
-                return greeting
+                return self.chunks.pop(0) if self.chunks else b''
             def sendall(self, data):
                 self.sent.append(data)
             def close(self):
