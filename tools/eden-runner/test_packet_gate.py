@@ -173,6 +173,29 @@ for side in ["p1", "cpu"] {
         self.plan['rows'][0]['unrelated_path'] = missing
         self.assertIn(f'G4 rows.json: missing file {missing}', self.errors())
 
+    def test_staged_targets_accept_absolute_producer_paths_from_another_host(self):
+        runs = self.target_run_layout()
+        packed = eden_test.pack_target(self.tree, self.commit, Path(self.tmp.name) / 'packs')
+        eden_test.stage_target(self.commit, 'run-01', packed['pack_file'], runs=runs)
+        config = self.base.parent / 'config.json'
+        local_is_absolute = Path.is_absolute
+        for producer in ('/home/controller/project', r'C:\controller\project'):
+            with self.subTest(producer=producer):
+                self.plan['target']['plugin']['tree'] = producer
+                self.plan['target']['bridge']['tree'] = producer
+                def host_is_absolute(path):
+                    return False if str(path) == producer else local_is_absolute(path)
+                with mock.patch.object(Path, 'is_absolute', host_is_absolute):
+                    config.write_text(json.dumps({'staged_targets': [self.commit]}))
+                    result = packet_gate.check(self.plan, self.base, self.plan)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual(result['target']['plugin']['tree'], producer)
+                    config.write_text('{}')
+                    self.assertIn('G2 target: plugin.tree must be an existing absolute directory', self.errors())
+        self.plan['target']['plugin']['tree'] = 'relative/project'
+        config.write_text(json.dumps({'staged_targets': [self.commit]}))
+        self.assertIn('G2 target: plugin.tree must be an existing absolute directory', self.errors())
+
     def test_staged_head_mismatch_refuses_even_when_requested_object_exists(self):
         runs = self.target_run_layout()
         original = self.commit

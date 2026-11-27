@@ -3,7 +3,7 @@ import ast
 import hashlib
 import inspect
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import sys
@@ -947,11 +947,16 @@ def _target(plan, base, errors):
             errors.append(f'G2 target: {label} must be an object')
             continue
         tree, commit = spec.get('tree'), spec.get('commit')
-        if not isinstance(tree, str) or not Path(tree).is_absolute():
+        if not isinstance(tree, str):
             errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
             continue
         if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
             errors.append(f'G2 target: {label}.commit must be 40 lower-case hex characters')
+            continue
+        foreign_staged = (base.name == 'rows' and commit in required
+                          and (PurePosixPath(tree).is_absolute() or PureWindowsPath(tree).is_absolute()))
+        if not Path(tree).is_absolute() and not foreign_staged:
+            errors.append(f'G2 target: {label}.tree must be an existing absolute directory')
             continue
         staged = base.parent.parent / '_eden-test' / 'stage' / base.parent.name / 'targets' / commit
         if required and commit not in required:
