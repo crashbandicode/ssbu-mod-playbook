@@ -3222,6 +3222,72 @@ class SwitchHwTests(unittest.TestCase):
         mirror.line(b'[Bridge] req backup result=refused reason=backup_open frame=0 wall=2')
         self.assertEqual(mirror.wanted, [b'restore', b'backup'], 'once per connection, never a loop')
 
+    HELLO = b'[Bridge] hello plugin=ssbu-hw-bridge/0.1.0 abi=1 port=6980 boot=%s uptime_ms=1 reconnects=%d frame=0 wall=1'
+    BACKUP_OK = b'[Bridge] req backup result=ok files=4 bytes=45720 frame=9 wall=2'
+    BACKUP_OPEN = b'[Bridge] req backup result=refused reason=backup_open frame=11953 wall=3'
+
+    def test_a_reconnect_within_the_run_keeps_its_own_backup(self):
+        # TrainingRooms docs boots 6, 7 and 8 (2026-11-27): a bridge Off -> On makes the capture reconnect; the
+        # bridge refuses the second `backup` because this capture's own backup is open. Restoring then put the
+        # boot-time TR files back mid-run: the CPU fighter changed and the run's saves were removed.
+        import io
+        import switch_hw
+        mirror = switch_hw.BridgeMirror(Path(tempfile.mkdtemp()), [io.BytesIO()])
+        mirror.line(self.HELLO % (b'0x7f10f0f1afa062eb', 0))
+        mirror.line(self.BACKUP_OK)
+        mirror.line(self.HELLO % (b'0x7f10f0f1afa062eb', 1))
+        mirror.line(self.BACKUP_OPEN)
+        self.assertEqual(mirror.wanted, [], 'the open backup is this run\'s own: nothing to put back')
+        mirror.line(self.HELLO % (b'0x7f10f0f1afa062eb', 2))
+        mirror.line(self.BACKUP_OPEN)
+        self.assertEqual(mirror.wanted, [])
+
+    def test_a_backup_left_open_by_an_earlier_boot_is_still_restored(self):
+        import io
+        import switch_hw
+        mirror = switch_hw.BridgeMirror(Path(tempfile.mkdtemp()), [io.BytesIO()])
+        mirror.line(self.HELLO % (b'0xaaaa', 0))
+        mirror.line(self.BACKUP_OK)
+        mirror.line(self.HELLO % (b'0xbbbb', 0))  # the console restarted: the backup on the card is not this boot's
+        mirror.line(self.BACKUP_OPEN)
+        self.assertEqual(mirror.wanted, [b'restore', b'backup'])
+
+    def test_capture_bridge_does_not_restore_on_a_same_boot_reconnect(self):
+        import switch_hw
+        run = Path(tempfile.mkdtemp())
+        console = run / 'skyline.log'
+        sent, calls = [], []
+        boot = b'0x7f10f0f1afa062eb'
+        chunks = [[self.HELLO % (boot, 0) + b'\n' + self.BACKUP_OK + b'\n'],
+                  [self.HELLO % (boot, 1) + b'\n' + self.BACKUP_OPEN + b'\n']]
+
+        class Sock:
+            def __init__(self, data):
+                self.data = list(data)
+
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, b):
+                sent.append(b)
+
+            def recv(self, n):
+                return self.data.pop(0) if self.data else b''
+
+            def close(self):
+                pass
+
+        def connect(addr, timeout):
+            calls.append(addr)
+            if not chunks:
+                raise OSError('refused')
+            return Sock(chunks.pop(0))
+        switch_hw.capture_bridge(run, 'h', 6980, console, stop=lambda: len(calls) >= 3, connect=connect, retry_s=0)
+        self.assertEqual(sent.count(b'backup\nfile settings.json\n'), 2, 'each connection asks for the backup')
+        self.assertNotIn(b'restore\n', sent)
+        self.assertNotIn('"request": "restore"', (run / 'bridge.requests.jsonl').read_text())
+        self.assertIn('reconnect same_boot=1', (run / 'bridge.log').read_text())
+
     def test_down_restores_the_fixture_and_keeps_a_receipt(self):
         import switch_hw
         run = Path(tempfile.mkdtemp())
