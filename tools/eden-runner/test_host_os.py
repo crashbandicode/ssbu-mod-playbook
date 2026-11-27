@@ -49,6 +49,13 @@ class HostOsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'ss failed: bad'):
                 host_os.tcp_listeners(1, mock.Mock(return_value=result(rc=1, error='bad')))
 
+    def test_command_timeout(self):
+        run = mock.Mock(side_effect=subprocess.TimeoutExpired('ss', 20))
+        with mock.patch.object(host_os, 'WINDOWS', False):
+            with self.assertRaisesRegex(RuntimeError, '^ss failed: timed out$'):
+                host_os.tcp_listeners(7041, run)
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
+
     def test_detached_per_os(self):
         with mock.patch.object(host_os, 'WINDOWS', False):
             self.assertEqual(host_os.detached(), {'start_new_session': True})

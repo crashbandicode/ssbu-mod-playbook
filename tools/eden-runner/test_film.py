@@ -156,6 +156,15 @@ while time.monotonic() < end:
             with film.take(ctx, 'refused', 3):
                 pass
 
+    def test_take_refuses_missing_display(self):
+        ctx = self.context()
+        with mock.patch.object(host_os, 'WINDOWS', False):
+            for instances in ([], [{'key': 'offline'}]):
+                (self.root / 'config.json').write_text(json.dumps({'instances': instances}))
+                with self.assertRaisesRegex(RuntimeError, '^capture requires the instance display in config.json$'):
+                    with film.take(ctx, 'refused', 3):
+                        pass
+
     @unittest.skipIf(os.name == 'nt', 'POSIX fake ffmpeg executable')
     def test_take_reports_a_recorder_that_never_starts(self):
         ctx = self.context()
@@ -202,16 +211,29 @@ while time.monotonic() < end:
 
     def test_fullscreen_hook(self):
         class Ctx:
-            checked = False
+            def __init__(self, checked=False):
+                self.checked = checked
+                self.calls = []
             def call(self, method, params):
+                self.calls.append((method, params))
                 if method == 'ui.tree':
-                    return [{'name': 'action_Fullscreen', 'checked': self.checked}]
-                self.asserted = (method, params)
+                    return [{'name': 'action_Fullscreen', 'properties': {'checked': {'value': self.checked}}}]
                 self.checked = True
         ctx = Ctx()
         self.assertEqual(film.fullscreen(ctx), {'fullscreen': True, 'was': False})
-        self.assertEqual(ctx.asserted, ('ui.trigger', {'target': 'action_Fullscreen'}))
+        self.assertEqual(ctx.calls, [('ui.tree', {'target': 'action_Fullscreen'}),
+                                     ('ui.trigger', {'target': 'action_Fullscreen'}),
+                                     ('ui.tree', {'target': 'action_Fullscreen'})])
+        ctx.calls.clear()
         self.assertEqual(film.fullscreen(ctx), {'fullscreen': True, 'was': True})
+        self.assertEqual(ctx.calls, [('ui.tree', {'target': 'action_Fullscreen'}),
+                                     ('ui.tree', {'target': 'action_Fullscreen'})])
+        missing = SimpleNamespace(call=lambda method, params: [])
+        with self.assertRaisesRegex(RuntimeError, '^fullscreen action is not readable$'):
+            film.fullscreen(missing)
+        stuck = SimpleNamespace(call=lambda method, params: [{'properties': {'checked': {'value': False}}}])
+        with self.assertRaisesRegex(RuntimeError, '^fullscreen did not stay on$'):
+            film.fullscreen(stuck)
 
     def test_shared_hook_registration(self):
         self.assertIn('film', runner.SHARED_HOOKS)

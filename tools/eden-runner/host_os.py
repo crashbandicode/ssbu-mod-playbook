@@ -15,9 +15,11 @@ _POWERSHELL = r'C:\Program Files\PowerShell\7\pwsh.exe'
 
 def _run(argv, run):
     try:
-        result = run(argv, capture_output=True, text=True)
+        result = run(argv, capture_output=True, text=True, timeout=20)
     except FileNotFoundError as error:
         raise RuntimeError(f'{argv[0]} is not available') from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f'{argv[0]} failed: timed out') from error
     except OSError as error:
         raise RuntimeError(f'{argv[0]} failed: {error}') from error
     if result.returncode:

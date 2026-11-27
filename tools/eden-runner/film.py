@@ -21,7 +21,6 @@ if str(HERE) not in sys.path:
 import host_os
 
 FILM_SIZE = (1920, 1080)
-_POLL = threading.Event()
 
 
 def ffmpeg_path():
@@ -85,7 +84,7 @@ def _record(spec_path):
                     except (BrokenPipeError, OSError):
                         pass
                     break
-                _POLL.wait(0.05)
+                time.sleep(0.05)
             try:
                 rc = process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -154,7 +153,7 @@ class Recorder:
                 return self
             if not self.running():
                 break
-            _POLL.wait(0.05)
+            time.sleep(0.05)
         self.kill()
         raise RuntimeError(f'1080p capture did not start: {self.output}')
 
@@ -184,7 +183,7 @@ class Recorder:
                     if self.process:
                         self.process.wait(timeout=10)
                     return status
-                _POLL.wait(0.05)
+                time.sleep(0.05)
             raise RuntimeError(f'1080p capture exceeded its limit: {self.output}')
         finally:
             self.kill()
@@ -245,7 +244,10 @@ def take(ctx, name, cap, before=0.8, after=1.5, stop_after_body=False, fps=60, o
     display = None
     if not host_os.WINDOWS:
         config = json.loads((run / 'config.json').read_text())
-        display = next(item['display'] for item in config['instances'] if item['key'] == ctx.on)
+        instance = next((item for item in config.get('instances', []) if item.get('key') == ctx.on), None)
+        display = instance.get('display') if instance is not None else None
+        if not display:
+            raise RuntimeError('capture requires the instance display in config.json')
     output = Path(ctx.row_dir) / f'{name}-1080p-capture.mkv'
     recorder = Recorder(output, cap, fps, display)
     recorder.start()
@@ -287,11 +289,11 @@ def take(ctx, name, cap, before=0.8, after=1.5, stop_after_body=False, fps=60, o
 
 def fullscreen(ctx):
     def read():
-        nodes = ctx.call('ui.tree', {}) or []
-        actions = [node for node in nodes if node.get('name') == 'action_Fullscreen']
-        if len(actions) != 1 or not isinstance(actions[0].get('checked'), bool):
+        nodes = ctx.call('ui.tree', {'target': 'action_Fullscreen'}) or []
+        action = next((node for node in nodes if 'checked' in node.get('properties', {})), None)
+        if action is None:
             raise RuntimeError('fullscreen action is not readable')
-        return actions[0]['checked']
+        return action['properties']['checked']['value'] is True
     was = read()
     if not was:
         ctx.call('ui.trigger', {'target': 'action_Fullscreen'})

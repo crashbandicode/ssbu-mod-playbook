@@ -33,9 +33,17 @@ class CrossPlatformTests(unittest.TestCase):
         line = 'TCP 0.0.0.0:7041 0.0.0.0:0 LISTENING 20'
         self.assertEqual(self.listener([{'pid': 20, 'line': line}]), line)
 
+    def test_owned_listener_windows_skips_non_dict_entries(self):
+        line = 'TCP 0.0.0.0:7041 0.0.0.0:0 LISTENING 20'
+        self.assertEqual(self.listener([{'pid': 20, 'line': line}],
+                                       [None, {'pid': 20, 'image': r'C:\Eden\x\eden.exe'}]), line)
+
     def test_owned_listener_windows_refuses_a_foreign_listener(self):
-        with self.assertRaisesRegex(RuntimeError, r'port 7041.*pid \[20\].*FOREIGN'):
+        with self.assertRaises(RuntimeError) as error:
             self.listener([{'pid': 20, 'line': 'OWNED'}, {'pid': 30, 'line': 'FOREIGN'}])
+        self.assertIn('port 7041 is not bound by the owned Eden (pid [20]): ', str(error.exception))
+        self.assertIn('OWNED', str(error.exception))
+        self.assertIn('FOREIGN', str(error.exception))
 
     def test_owned_listener_windows_refuses_no_listener(self):
         with self.assertRaisesRegex(RuntimeError, r'port 7041.*pid \[20\].*no listener'):
