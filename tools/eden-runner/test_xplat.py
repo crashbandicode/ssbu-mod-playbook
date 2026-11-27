@@ -77,18 +77,22 @@ class CrossPlatformTests(unittest.TestCase):
                 mock.patch.object(routes.portable_lock, 'lock_exclusive'):
             for windows, flags, detached in ((False, [], {'start_new_session': True}),
                                              (True, ['-X', 'utf8'], {'creationflags': 0x1000208})):
-                with mock.patch.object(host_os, 'WINDOWS', windows), self.assertRaises(Spawned):
-                    routes.bridge_on(ctx, port=7041)
-                run = self.root / 'bridge-run'
-                self.assertEqual(popen.call_args.args[0],
-                                 [sys.executable, *flags, '-I', str(HERE / 'switch_hw.py'), 'capture-bridge',
-                                  str(run), '--bridge-host', '127.0.0.1:7041', '--owner-pid', '20',
-                                  '--run-token', token, '--console', str(run / 'bridge-console.log')])
-                stderr = popen.call_args.kwargs['stderr']
-                self.assertEqual(Path(stderr.name), run / 'capture.stderr.log')
-                self.assertEqual(popen.call_args.kwargs,
-                                 {'stdin': routes.subprocess.DEVNULL, 'stdout': routes.subprocess.DEVNULL,
-                                  'stderr': stderr, **detached})
+                for keys, folder in ((('offline',), 'bridge-run'),
+                                     (('offline', 'online'), 'bridge-run-offline')):
+                    ctx.runner.instances = StopAfterSpawn({key: {} for key in keys})
+                    with self.subTest(windows=windows, instances=keys), \
+                            mock.patch.object(host_os, 'WINDOWS', windows), self.assertRaises(Spawned):
+                        routes.bridge_on(ctx, port=7041)
+                    run = self.root / folder
+                    self.assertEqual(popen.call_args.args[0],
+                                     [sys.executable, *flags, '-I', str(HERE / 'switch_hw.py'), 'capture-bridge',
+                                      str(run), '--bridge-host', '127.0.0.1:7041', '--owner-pid', '20',
+                                      '--run-token', token, '--console', str(run / 'bridge-console.log')])
+                    stderr = popen.call_args.kwargs['stderr']
+                    self.assertEqual(Path(stderr.name), run / 'capture.stderr.log')
+                    self.assertEqual(popen.call_args.kwargs,
+                                     {'stdin': routes.subprocess.DEVNULL, 'stdout': routes.subprocess.DEVNULL,
+                                      'stderr': stderr, **detached})
 
 
 if __name__ == '__main__':

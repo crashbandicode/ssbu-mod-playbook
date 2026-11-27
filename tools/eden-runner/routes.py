@@ -4077,7 +4077,7 @@ def _bridge_on_events(ctx):
 def _bridge_on_listener_owner(port):
     """Read the socket owner using the executor platform's listener tool."""
     try:
-        return host_os.tcp_listeners(port, run=lambda argv, **kw: subprocess.run(argv, timeout=4, **kw))
+        return host_os.tcp_listeners(port, run=lambda argv, **kw: subprocess.run(argv, **{**kw, 'timeout': 4}))
     except (RuntimeError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f'bridge_on (stub on): listener query failed: {exc}') from exc
 

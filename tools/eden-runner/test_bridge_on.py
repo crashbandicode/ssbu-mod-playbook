@@ -1363,6 +1363,16 @@ class BridgeOnTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, r'ss'):
                 routes._bridge_on_listener_owner(6980)
 
+    def test_bridge_on_listener_query_keeps_four_second_cap(self):
+        for windows, output, pid in (
+                (False, 'LISTEN 0 128 0.0.0.0:6980 0.0.0.0:* users:(("eden",pid=20,fd=9))', 20),
+                (True, 'TCP 0.0.0.0:6980 0.0.0.0:0 LISTENING 20', 20)):
+            result = subprocess.CompletedProcess([], 0, stdout=output, stderr='')
+            with self.subTest(windows=windows), patch.object(routes.host_os, 'WINDOWS', windows), \
+                    patch('subprocess.run', return_value=result) as run:
+                self.assertEqual([row['pid'] for row in routes._bridge_on_listener_owner(6980)], [pid])
+                self.assertEqual(run.call_args.kwargs['timeout'], 4)
+
     def test_bridge_on_requires_port_argument_or_profile_file(self):
         with self.assertRaisesRegex(RuntimeError, r'port.*port.txt'):
             self.invoke()
