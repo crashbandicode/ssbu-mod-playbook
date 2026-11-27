@@ -26,6 +26,7 @@ can configure boot tracing before game.load. Same-boot fixing (MACROS rule 8): a
 fix rows.json or a hook, then `run --retry`; `down` when the batch is done.
 """
 import argparse
+import base64
 import copy
 import errno
 import hashlib
@@ -44,6 +45,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -1738,6 +1740,8 @@ def report_md(run):
         return time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(timing[key])) if key in timing else '?'
 
     host, me = config.get('host', '?'), f'/usr/bin/python3 -I -B {Path(__file__).resolve()}'
+    if host in WINDOWS_HOSTS:
+        me = f'eden_test.py remote --host {host} --label {config.get("label", run.name)}'
     if 'down_done' in timing:
         journal_path = run / 'state' / 'lifecycle.json'
         journal = json.loads(journal_path.read_text()) if journal_path.exists() else {}
@@ -1783,8 +1787,9 @@ def report_md(run):
              f'{len(timing.get("runs", [])) or 1} runner call(s); setup rows {split["setup"]:.0f} s, test rows '
              f'{split["test"]:.0f} s']
     if 'down_done' not in timing:
-        lines += [f'- Re-run rows in this boot: `{me} run {run} --rows <id>[,<id>]` then `{me} report {run}`',
-                  f'- Down: `{me} down {run}`']
+        suffix = '' if host in WINDOWS_HOSTS else f' {run}'
+        lines += [f'- Re-run rows in this boot: `{me} run{suffix} --rows <id>[,<id>]` then `{me} report{suffix}`',
+                  f'- Down: `{me} down{suffix}`']
     return '\n'.join(lines) + '\n'
 
 
@@ -1817,6 +1822,91 @@ def _pwsh_arg(value):
     if re.fullmatch(r'[A-Za-z0-9_./:@!=+-]+', value):
         return value
     return "'" + value.replace("'", "''") + "'"
+
+
+def _remote_kind(host_name):
+    if host_name in WINDOWS_HOSTS:
+        return {'windows': True, 'root': 'C:/home/intpa/eden-runs',
+                'python': [r'C:\Program Files\Python312\python.exe', '-u', '-X', 'utf8', '-B']}
+    return {'windows': False, 'root': '/home/intpa/eden-runs', 'python': ['/usr/bin/python3', '-I', '-B']}
+
+
+def _windows_ssh(host, mux, script):
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    word = f'"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}'
+    if len(word) > 7800:
+        raise SystemExit(f'remote command too long for the Windows host: {len(word)} characters')
+    return ['ssh', '-T', *mux.rider_args, host, word]
+
+
+def _remote_command(host, mux, remote, windows):
+    if windows:
+        script = "$env:EDEN_TEST_RELAY='1'; & " + ' '.join(_pwsh_arg(x) for x in remote) + '; exit $LASTEXITCODE'
+        return _windows_ssh(host, mux, script)
+    return ['ssh', *mux.rider_args, host, *(_pwsh_arg(x) for x in remote)]
+
+
+def _stage_tar(args, lineup, path):
+    with tarfile.open(path, 'w:gz') as archive:
+        archive.add(PLAYBOOK / 'tools', arcname='tools')
+        if lineup:
+            archive.add(lineup['dir'], arcname='card-lineup')
+        for nro in args.nro:
+            archive.add(nro, arcname=f'nro/{Path(nro).name}')
+        if args.elf:
+            archive.add(args.elf, arcname=f'elf/{Path(args.elf).name}')
+        rows = Path(args.rows)
+        archive.add(rows, arcname='rows' if rows.is_dir() else 'rows/rows.json')
+
+
+def _relay_claims(config):
+    info = _lifecycle_module.Ledger(config['ledger'], config['host'], config['owner'], '0' * 32,
+                                    config.get('ledger_ssh'), state_dir=None).inspect()
+    lines = info.get('open') if isinstance(info, dict) else None
+    if not isinstance(lines, list):
+        raise ValueError('the ledger read returned no claim list')
+    return [str(line) for line in lines]
+
+
+def _relay_run(command, host, args, popen=subprocess.Popen, forward=None, claims=None):
+    process = popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding='utf-8', errors='replace')
+    for line in process.stdout:
+        if not line.startswith(RELAY_PREFIX):
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            continue
+        request = {}
+        try:
+            request = json.loads(line[len(RELAY_PREFIX):])
+            if not isinstance(request, dict):
+                raise ValueError('relay: invalid request')
+            config = request.get('config')
+            if not isinstance(config, dict) or config.get('host') != args.host or config.get('label') != args.label:
+                raise ValueError('relay: foreign run')
+            kind = request.get('kind')
+            if kind == 'lifecycle':
+                mode = request.get('mode')
+                if mode not in ('up', 'down', 'preflight', 'status'):
+                    raise ValueError('relay: invalid lifecycle mode')
+                result = (forward or _lifecycle_module.forward_windows)(
+                    host, mode, config, mode not in ('status', 'preflight'),
+                    keep_state=bool(request.get('keep_state')), evidence_dir=request.get('evidence_dir'))
+            elif kind == 'claims':
+                result = (claims or _relay_claims)(config)
+            else:
+                raise ValueError('relay: unknown request')
+            reply = {'id': request.get('id'), 'ok': True, 'result': result}
+        except Exception as exc:
+            reply = {'id': request.get('id') if isinstance(request, dict) else None, 'ok': False, 'error': str(exc)}
+        if not isinstance(request, dict):
+            request = {}
+        operation = ('lifecycle ' + str(request.get('mode')) if request.get('kind') == 'lifecycle'
+                     else str(request.get('kind')))
+        print(f'relay: {operation} -> {"ok" if reply["ok"] else reply["error"]}', flush=True)
+        process.stdin.write(json.dumps(reply) + '\n')
+        process.stdin.flush()
+    return _ExitCode(process.wait(), '')
 
 
 def _go_targets(rows):
@@ -1856,9 +1946,9 @@ def _go_targets(rows):
     return found
 
 
-def _go_target_ssh(host, mux, remote, timeout):
+def _go_target_ssh(host, mux, remote, timeout, windows=False):
     mux.ensure()
-    command = ['ssh', *mux.rider_args, host, *(_pwsh_arg(arg) for arg in remote)]
+    command = _remote_command(host, mux, remote, windows)
     print('$ ' + shlex.join(command), flush=True)
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
@@ -1935,7 +2025,7 @@ def _go_remote_base(args):
     value = getattr(args, 'from_config', None)
     if not value:
         return None
-    stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
+    stage = f'{_remote_kind(args.host)["root"]}/_eden-test/stage/{args.label}'
     name = value[len(stage) + 1:] if value.startswith(stage + '/') else ''
     if not re.fullmatch(_GO_BASE_NAME, name):
         raise SystemExit(
@@ -1970,7 +2060,8 @@ def _go_received_base(args):
     stage = RUNS / '_eden-test' / 'stage' / args.label
     try:
         _target_label(args.label)
-        name = args.from_config[len(str(stage)) + 1:] if args.from_config.startswith(f'{stage}/') else ''
+        stage_text = stage.as_posix()
+        name = args.from_config[len(stage_text) + 1:] if args.from_config.startswith(f'{stage_text}/') else ''
         if not re.fullmatch(_GO_BASE_NAME, name):
             raise ValueError('not a .json file directly in that folder')
         if _owned_target_directory(RUNS, ('_eden-test', 'stage', args.label)) is None:
@@ -2003,9 +2094,9 @@ def _go_remote(args, lineup):
         raise SystemExit(str(error)) from error
     _go_remote_base(args)
     targets = _go_targets(args.rows)
-    options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host == 'ally' else ()
+    options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if args.host in WINDOWS_HOSTS else ()
     receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
-    with SshMux(host, ssh_options=options, windows=args.host == 'ally', evidence_dir=receipt_dir,
+    with SshMux(host, ssh_options=options, windows=args.host in WINDOWS_HOSTS, evidence_dir=receipt_dir,
                 receipt_dir=receipt_dir) as mux:
         return _go_remote_with_mux(args, lineup, host, mux, targets)
 
@@ -2022,38 +2113,55 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         with tempfile.TemporaryDirectory(prefix='eden-target-packs-') as directory:
             return _go_remote_with_mux(args, lineup, host, mux, targets, directory)
     mux.receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
-    stage = f'/home/intpa/eden-runs/_eden-test/stage/{args.label}'
-    commands = [
-        ['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/'],
-    ]
-    if lineup:
-        commands.append(['rsync', '-a', '--delete', '--mkpath', lineup['dir'] + '/', f'{host}:{stage}/card-lineup/'])
-    commands.extend([['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro])
-    if args.elf:
-        commands.append(['rsync', '-a', '--mkpath', str(args.elf), f'{host}:{stage}/elf/'])
-    rows = Path(args.rows)
-    if rows.is_dir():
-        commands.append(['rsync', '-a', '--mkpath', str(rows) + '/', f'{host}:{stage}/rows/'])
+    kind = _remote_kind(args.host)
+    windows = kind['windows']
+    stage = f'{kind["root"]}/_eden-test/stage/{args.label}'
+    archive = None
+    if windows:
+        archive = Path(pack_dir) / 'stage.tar.gz'
+        _stage_tar(args, lineup, archive)
+        mkdir = f'New-Item -ItemType Directory -Force -Path {_pwsh_arg(stage)} | Out-Null'
+        unpack = (f'tar.exe -xzf {_pwsh_arg(stage + "/stage.tar.gz")} -C {_pwsh_arg(stage)}; '
+                  f'if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; '
+                  f'Remove-Item -LiteralPath {_pwsh_arg(stage + "/stage.tar.gz")}')
+        commands = [_windows_ssh(host, mux, mkdir),
+                    ['scp', *mux.rider_args, str(archive), f'{host}:{stage}/stage.tar.gz'],
+                    _windows_ssh(host, mux, unpack)]
     else:
-        commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
+        commands = [['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/']]
+        if lineup:
+            commands.append(['rsync', '-a', '--delete', '--mkpath', lineup['dir'] + '/', f'{host}:{stage}/card-lineup/'])
+        commands.extend([['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro])
+        if args.elf:
+            commands.append(['rsync', '-a', '--mkpath', str(args.elf), f'{host}:{stage}/elf/'])
+        rows = Path(args.rows)
+        if rows.is_dir():
+            commands.append(['rsync', '-a', '--mkpath', str(rows) + '/', f'{host}:{stage}/rows/'])
+        else:
+            commands.append(['rsync', '-a', '--mkpath', str(rows), f'{host}:{stage}/rows/rows.json'])
     script = f'{stage}/tools/eden-test/eden_test.py'
     staged_commits = {}
     for index, command in enumerate(commands):
         mux.ensure()
-        command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
+        if not windows:
+            command[1:1] = ['-e', shlex.join(['ssh', *mux.rider_args])]
         if code := _go_sh(command):
-            diagnosis = _go_diagnosis(mux, 'rsync', code, 'go staging')
+            diagnosis = _go_diagnosis(mux, ('scp' if command[0] == 'scp' else 'ssh') if windows else 'rsync',
+                                      code, 'go staging')
             raise SystemExit(f'go staging failed ({code}): {shlex.join(command)}{_go_suffix(diagnosis)}')
-        if index == 0:
+        if index == (2 if windows else 0):
+            if archive is not None:
+                archive.unlink()
             for target in targets:
                 commit, label = target['commit'], target['label']
                 if commit in staged_commits:
                     print(f'target {label} {commit[:12]}: cache reused, 0 bytes shipped in 0.0 s')
                     continue
                 started = time.monotonic()
-                helper = ['/usr/bin/python3', '-I', '-B', script, 'stage-target',
+                helper = [*kind['python'], script, 'stage-target',
                           '--commit', commit, '--label', args.label]
-                code, output, stderr = _go_target_ssh(host, mux, [*helper, '--probe'], 180)
+                code, output, stderr = (_go_target_ssh(host, mux, [*helper, '--probe'], 180, windows=True)
+                                        if windows else _go_target_ssh(host, mux, [*helper, '--probe'], 180))
                 detail = stderr.strip()[-2000:] or 'no stderr'
                 if code:
                     raise SystemExit(f'target {label} cache probe failed: {detail}'
@@ -2075,19 +2183,31 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                             raise SystemExit(f'target {label}: {error}') from error
                         pack_file = Path(pack['pack_file'])
                         incoming = f'{stage}/targets/.incoming/{commit}.pack'
-                        transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--partial', '--stats',
-                                    '--mkpath', str(pack_file), f'{host}:{incoming}']
-                        mux.ensure()
-                        failure, sent = _go_target_rsync(transfer)
+                        if windows:
+                            folder = f'{stage}/targets/.incoming'
+                            mkdir = _windows_ssh(host, mux,
+                                                 f'New-Item -ItemType Directory -Force -Path {_pwsh_arg(folder)} | Out-Null')
+                            if failure := _go_sh(mkdir):
+                                diagnosis = _go_diagnosis(mux, 'ssh', failure, f'target {label} pack')
+                                raise SystemExit(f'target {label} pack mkdir failed ({failure}){_go_suffix(diagnosis)}')
+                            transfer = ['scp', *mux.rider_args, str(pack_file), f'{host}:{incoming}']
+                            mux.ensure()
+                            failure, sent = _go_sh(transfer), pack_file.stat().st_size
+                        else:
+                            transfer = ['rsync', '-e', shlex.join(['ssh', *mux.rider_args]), '-a', '--partial', '--stats',
+                                        '--mkpath', str(pack_file), f'{host}:{incoming}']
+                            mux.ensure()
+                            failure, sent = _go_target_rsync(transfer)
                         if failure:
-                            diagnosis = _go_diagnosis(mux, 'rsync', failure, f'target {label} pack',
+                            diagnosis = _go_diagnosis(mux, 'scp' if windows else 'rsync', failure, f'target {label} pack',
                                                      timed_out=getattr(failure, 'timed_out', False))
                             if getattr(failure, 'timed_out', False):
                                 raise SystemExit(f'target pack rsync failed: {failure.stderr}{_go_suffix(diagnosis)}')
                             raise SystemExit(f'target {label} pack rsync failed ({failure}): '
                                              f'{shlex.join(transfer)}{_go_suffix(diagnosis)}')
                         helper.extend(('--pack', incoming))
-                    code, output, _ = _go_target_ssh(host, mux, helper, 900)
+                    code, output, _ = (_go_target_ssh(host, mux, helper, 900, windows=True)
+                                       if windows else _go_target_ssh(host, mux, helper, 900))
                 finally:
                     if pack_file is not None:
                         pack_file.unlink(missing_ok=True)
@@ -2103,7 +2223,7 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
                 staged_commits[commit] = result
                 print(f'target {label} {commit[:12]}: cache {result["cache"]}, '
                       f'{sent if sent is not None else "unknown"} bytes shipped in {time.monotonic() - started:.1f} s')
-    remote = ['/usr/bin/python3', '-I', '-B', script, 'go', '--host', args.host, '--label', args.label]
+    remote = [*kind['python'], script, 'go', '--host', args.host, '--label', args.label]
     if base:
         remote.extend(('--from', base))
     for nro in args.nro:
@@ -2127,13 +2247,16 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
     mux.ensure()
-    ssh_code = _go_sh(['ssh', *mux.rider_args, host, *(_pwsh_arg(arg) for arg in remote)])
+    command = _remote_command(host, mux, remote, windows)
+    ssh_code = _relay_run(command, host, args) if windows else _go_sh(command)
     if ssh_code == 255 or _lifecycle_module.ssh_master_dead(mux):
         diagnosis = _go_diagnosis(mux, 'ssh', _ExitCode(255, getattr(ssh_code, 'stderr', '')), 'remote go')
         raise SystemExit(f'remote go failed (ssh exit {ssh_code}); the remote go may be running; '
                          f'check the host before starting another{_go_suffix(diagnosis)}')
-    run = f'/home/intpa/eden-runs/{args.label}'
-    prefix = f'on {host}: /usr/bin/python3 -I -B {script}'
+    run = f'{kind["root"]}/{args.label}'
+    prefix = (f'eden_test.py remote --host {args.host} --label {args.label}' if windows else
+              f'on {host}: /usr/bin/python3 -I -B {script}')
+    suffix = '' if windows else f' {run}'
     with tempfile.TemporaryDirectory(prefix='eden-go-') as directory:
         result_file = Path(directory) / 'go-result.json'
         mux.ensure()
@@ -2152,12 +2275,33 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     mux.ensure()
     if report_error := _go_sh(['scp', *mux.rider_args, f'{host}:{run}/REPORT.md', report]):
         diagnosis = _go_diagnosis(mux, 'scp', report_error, 'report transfer')
-        print(f'Down: {prefix} down {run}')
+        print(f'Down: {prefix} down{suffix}')
         raise SystemExit(f'copying remote report failed ({report_error}){_go_suffix(diagnosis)}')
     print(f'Report: {Path(report).resolve()}')
-    print(f'Re-run: {prefix} run {run} --rows <id>; then {prefix} report {run}')
-    print(f'Down: {prefix} down {run}')
+    print(f'Re-run: {prefix} run{suffix} --rows <id>; then {prefix} report{suffix}')
+    print(f'Down: {prefix} down{suffix}')
     return code
+
+
+def cmd_remote(args):
+    host = _go_route(args)
+    if not host or host.startswith('-'):
+        raise SystemExit(f'no valid SSH host for {args.host!r}; use --ssh or add it to hosts.json')
+    try:
+        _target_label(args.label)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    kind = _remote_kind(args.host)
+    stage = f'{kind["root"]}/_eden-test/stage/{args.label}'
+    run = f'{kind["root"]}/{args.label}'
+    command = [*kind['python'], f'{stage}/tools/eden-test/eden_test.py', args.remote_mode, run, *args.remote_args]
+    options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if kind['windows'] else ()
+    receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
+    with SshMux(host, ssh_options=options, windows=kind['windows'], evidence_dir=receipt_dir,
+                receipt_dir=receipt_dir) as mux:
+        mux.ensure()
+        remote = _remote_command(host, mux, command, kind['windows'])
+        return _relay_run(remote, host, args) if kind['windows'] else _go_sh(remote)
 
 
 def cmd_go(args):
@@ -2748,6 +2892,12 @@ def main(argv=None):
     p.add_argument('--ssh')
     p.add_argument('--token', help=argparse.SUPPRESS)
     p.add_argument('--staged-target', action='append', type=_staged_target_arg, default=[], help=argparse.SUPPRESS)
+    p = sub.add_parser('remote', help='run a follow-up command on a remote host')
+    p.add_argument('--host', required=True)
+    p.add_argument('--ssh')
+    p.add_argument('--label', required=True)
+    p.add_argument('remote_mode', choices=('check', 'up', 'run', 'report', 'pace', 'down', 'fly'))
+    p.add_argument('remote_args', nargs=argparse.REMAINDER)
     p = sub.add_parser('stage-target', help='build or reuse a target cache and stage it for a run')
     p.add_argument('--commit', required=True)
     p.add_argument('--label', required=True)
@@ -2776,6 +2926,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.mode == 'go':
         return cmd_go(args)
+    if args.mode == 'remote':
+        return cmd_remote(args)
     if args.mode == 'stage-target':
         try:
             _target_label(args.label)

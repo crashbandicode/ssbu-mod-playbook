@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline tests for eden_test.py: fake lifecycle/runner/harvest scripts, temp run folders, no Eden."""
+import base64
 import hashlib
 import importlib.util
 import inspect
@@ -11,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import types
 import unittest
@@ -4486,6 +4488,184 @@ class RerunTests(unittest.TestCase):
         for process in captures:
             process.wait(timeout=10)
         self.assertEqual(eden_test.stop_captures(self.run / 'nowhere'), [])
+
+class WindowsControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.tools = self.dir / 'tools'
+        self.tools.mkdir()
+        (self.tools / 'tool.py').write_text('tool')
+        self.rows = self.dir / 'rows'
+        self.rows.mkdir()
+        (self.rows / 'rows.json').write_text('{}')
+        (self.rows / 'hook.py').write_text('hook')
+        self.lineup = self.dir / 'lineup'
+        self.lineup.mkdir()
+        (self.lineup / 'card.nro').write_text('card')
+        self.nro = self.dir / 'plugin.nro'
+        self.nro.write_text('nro')
+        self.elf = self.dir / 'plugin.so'
+        self.elf.write_text('elf')
+        self.args = types.SimpleNamespace(host='ally', label='demo', from_config=None, nro=[str(self.nro)],
+            elf=str(self.elf), rows=str(self.rows), no_card_lineup='reason', trace_point=[],
+            network_interface=None, no_lobby=False, owner='Claude devin/demo', ssh='ally-machine')
+        self.mux = FakeMux('ally-machine')
+
+    def decode(self, command):
+        return base64.b64decode(command[-1].rsplit(' ', 1)[-1]).decode('utf-16le')
+
+    def test_windows_remote_command_and_length(self):
+        python = r'C:\Program Files\Python312\python.exe'
+        command = eden_test._remote_command('host', self.mux, [python, '-u', 'a b', "it's"], True)
+        self.assertEqual(command[:2], ['ssh', '-T'])
+        self.assertEqual(self.decode(command),
+                         "$env:EDEN_TEST_RELAY='1'; & 'C:\\Program Files\\Python312\\python.exe' -u "
+                         "'a b' 'it''s'; exit $LASTEXITCODE")
+        self.assertIn('-NoLogo -NoProfile -NonInteractive -EncodedCommand', command[-1])
+        with self.assertRaisesRegex(SystemExit, r'remote command too long for the Windows host: \d+ characters'):
+            eden_test._remote_command('host', self.mux, [python, 'x' * 6000], True)
+
+    def test_windows_tar_layout(self):
+        archive = self.dir / 'stage.tar.gz'
+        with mock.patch.object(eden_test, 'PLAYBOOK', self.dir):
+            eden_test._stage_tar(self.args, {'dir': str(self.lineup)}, archive)
+        with tarfile.open(archive) as tar:
+            self.assertTrue({'tools/tool.py', 'card-lineup/card.nro', 'nro/plugin.nro',
+                             'elf/plugin.so', 'rows/rows.json', 'rows/hook.py'} <= set(tar.getnames()))
+        self.args.rows = str(self.rows / 'rows.json')
+        with mock.patch.object(eden_test, 'PLAYBOOK', self.dir):
+            eden_test._stage_tar(self.args, None, archive)
+        with tarfile.open(archive) as tar:
+            self.assertIn('rows/rows.json', tar.getnames())
+            self.assertNotIn('rows/hook.py', tar.getnames())
+
+    def test_relay_dispatch_and_refusal(self):
+        config = {'host': 'ally', 'label': 'demo'}
+        requests = [
+            {'id': 'a', 'kind': 'lifecycle', 'mode': 'up', 'config': config},
+            {'id': 'b', 'kind': 'claims', 'config': config},
+            {'id': 'c', 'kind': 'lifecycle', 'mode': 'down', 'config': {**config, 'label': 'other'}},
+            {'id': 'd', 'kind': 'lifecycle', 'mode': 'status', 'config': config},
+        ]
+        process = types.SimpleNamespace(stdout=io.StringIO('ordinary\n' + ''.join(
+            eden_test.RELAY_PREFIX + json.dumps(r) + '\n' for r in requests)), stdin=io.StringIO(),
+            wait=lambda: 7)
+        forward = mock.Mock(side_effect=[{'ok': True}, RuntimeError('backend refused')])
+        claims = mock.Mock(return_value=['line'])
+        popen = mock.Mock(return_value=process)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = eden_test._relay_run(['ssh', 'host'], 'host', self.args, popen, forward, claims)
+        self.assertEqual(result, 7)
+        self.assertTrue(output.getvalue().startswith('ordinary\n'))
+        replies = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+        self.assertEqual(replies, [{'id': 'a', 'ok': True, 'result': {'ok': True}},
+                                   {'id': 'b', 'ok': True, 'result': ['line']},
+                                   {'id': 'c', 'ok': False, 'error': 'relay: foreign run'},
+                                   {'id': 'd', 'ok': False, 'error': 'backend refused'}])
+        forward.assert_any_call('host', 'up', config, True, keep_state=False, evidence_dir=None)
+        forward.assert_any_call('host', 'status', config, False, keep_state=False, evidence_dir=None)
+        claims.assert_called_once_with(config)
+        self.assertEqual(popen.call_args.kwargs, {'stdin': subprocess.PIPE, 'stdout': subprocess.PIPE,
+            'stderr': subprocess.STDOUT, 'text': True, 'encoding': 'utf-8', 'errors': 'replace'})
+
+    def test_windows_staging_and_fetch_commands(self):
+        token = 'd' * 32
+        commands = []
+        relay_commands = []
+        root = 'C:/home/intpa/eden-runs'
+        stage = root + '/_eden-test/stage/demo'
+        def sh(command):
+            commands.append(command)
+            if command[0] == 'scp' and command[-1].endswith('/stage.tar.gz'):
+                with tarfile.open(command[-2]) as tar:
+                    self.assertIn('tools/tool.py', tar.getnames())
+                    self.assertIn('rows/hook.py', tar.getnames())
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps({'token': token, 'code': 0, 'counts': {}}))
+            return 0
+        def relay(command, host, args):
+            relay_commands.append(command)
+            return 0
+        with chdir(self.dir), mock.patch.object(eden_test, 'PLAYBOOK', self.dir), \
+                mock.patch.object(eden_test, '_go_sh', side_effect=sh), \
+                mock.patch.object(eden_test, '_relay_run', side_effect=relay), \
+                mock.patch.object(eden_test.uuid, 'uuid4', return_value=types.SimpleNamespace(hex=token)), \
+                mock.patch.object(eden_test._lifecycle_module, 'ssh_master_dead', return_value=False), \
+                redirect_stdout(io.StringIO()):
+            code = eden_test._go_remote_with_mux(self.args, None, 'ally-machine', self.mux, [], self.dir)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[0] for c in commands], ['ssh', 'scp', 'ssh', 'scp', 'scp'])
+        self.assertEqual(self.decode(commands[0]),
+                         f'New-Item -ItemType Directory -Force -Path {stage} | Out-Null')
+        self.assertIn(f'tar.exe -xzf {stage}/stage.tar.gz -C {stage}', self.decode(commands[2]))
+        self.assertEqual(commands[1][-1], f'ally-machine:{stage}/stage.tar.gz')
+        self.assertEqual(commands[3][-2], f'ally-machine:{root}/demo/go-result.json')
+        self.assertEqual(commands[4][-2], f'ally-machine:{root}/demo/REPORT.md')
+        self.assertIn(f"{stage}/tools/eden-test/eden_test.py go --host ally --label demo", self.decode(relay_commands[0]))
+
+    def test_windows_target_pack_uses_scp_and_windows_helper(self):
+        commit, token = 'a' * 40, 'b' * 32
+        stage = 'C:/home/intpa/eden-runs/_eden-test/stage/demo'
+        commands = []
+        def sh(command):
+            commands.append(command)
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps({'token': token, 'code': 0, 'counts': {}}))
+            return 0
+        def remote(host, mux, argv, timeout, windows=False):
+            self.assertTrue(windows)
+            self.assertEqual(argv[:5], [r'C:\Program Files\Python312\python.exe', '-u', '-X', 'utf8', '-B'])
+            receipt = {'commit': commit, 'cached': False} if '--probe' in argv else {'commit': commit, 'cache': 'built'}
+            if '--probe' not in argv:
+                self.assertEqual(argv[-2:], ['--pack', f'{stage}/targets/.incoming/{commit}.pack'])
+            return 0, json.dumps(receipt), ''
+        def pack(tree, wanted, folder):
+            path = Path(folder) / 'fixture.pack'
+            path.write_bytes(b'pack')
+            return {'pack_file': str(path)}
+        targets = [{'tree': str(self.dir), 'commit': commit, 'label': 'plugin'}]
+        with chdir(self.dir), mock.patch.object(eden_test, 'PLAYBOOK', self.dir), \
+                mock.patch.object(eden_test, '_go_sh', side_effect=sh), \
+                mock.patch.object(eden_test, '_relay_run', return_value=0), \
+                mock.patch.object(eden_test, '_go_target_ssh', side_effect=remote) as helper, \
+                mock.patch.object(eden_test, 'pack_target', side_effect=pack), \
+                mock.patch.object(eden_test.uuid, 'uuid4', return_value=types.SimpleNamespace(hex=token)), \
+                mock.patch.object(eden_test._lifecycle_module, 'ssh_master_dead', return_value=False), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(eden_test._go_remote_with_mux(self.args, None, 'ally-machine',
+                                                           self.mux, targets, self.dir), 0)
+        self.assertEqual(helper.call_count, 2)
+        pack_scp = [c for c in commands if c[0] == 'scp' and c[-1].endswith('.pack')]
+        self.assertEqual(len(pack_scp), 1)
+        self.assertEqual(pack_scp[0][-1], f'ally-machine:{stage}/targets/.incoming/{commit}.pack')
+        self.assertTrue(any(c[0] == 'ssh' and '/targets/.incoming' in self.decode(c) for c in commands))
+
+    def test_windows_remote_base(self):
+        self.args.from_config = 'C:/home/intpa/eden-runs/_eden-test/stage/demo/base.json'
+        self.assertEqual(eden_test._go_remote_base(self.args), self.args.from_config)
+        self.args.from_config = '/home/intpa/eden-runs/_eden-test/stage/demo/base.json'
+        with self.assertRaises(SystemExit):
+            eden_test._go_remote_base(self.args)
+
+    def test_remote_command_per_host(self):
+        for host in ('ally', 'xps'):
+            args = types.SimpleNamespace(host=host, label='demo', ssh='target', remote_mode='run',
+                                         remote_args=['--rows', 'r1'])
+            with mock.patch.object(eden_test, '_go_sh', return_value=7) as sh, \
+                    mock.patch.object(eden_test, '_relay_run', return_value=8) as relay:
+                self.assertEqual(eden_test.cmd_remote(args), 8 if host == 'ally' else 7)
+            if host == 'ally':
+                script = self.decode(relay.call_args.args[0])
+                self.assertIn('C:/home/intpa/eden-runs/demo --rows r1', script)
+            else:
+                command = sh.call_args.args[0]
+                self.assertEqual(command[-8:], ['/usr/bin/python3', '-I', '-B',
+                    '/home/intpa/eden-runs/_eden-test/stage/demo/tools/eden-test/eden_test.py',
+                    'run', '/home/intpa/eden-runs/demo', '--rows', 'r1'])
+
 
 class WindowsHostTests(unittest.TestCase):
     def setUp(self):
