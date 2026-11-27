@@ -28,6 +28,32 @@ real_ssh_mux = life.SshMux
 real_ssh_diagnosis = life.ssh_diagnosis
 
 
+class StandaloneSourceTests(unittest.TestCase):
+    def test_standalone_copy_runs_from_an_empty_folder(self):
+        with tempfile.TemporaryDirectory(prefix='lifecycle-copy-') as temporary:
+            folder = Path(temporary) / 'state' / 'run-a'
+            folder.mkdir(parents=True)
+            path = folder / 'lifecycle-backend.py'
+            path.write_text(life.standalone_source(), encoding='utf-8')
+            result = subprocess.run([sys.executable, '-I', '-B', str(path), '--help'],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('usage:', result.stdout)
+            self.assertEqual(list(folder.iterdir()), [path])
+
+    def test_standalone_source_can_rebundle_a_forwarded_copy(self):
+        first = life.standalone_source()
+        with patch.object(life, '_FORWARDED_SOURCE', first, create=True):
+            second = life.standalone_source()
+        with tempfile.TemporaryDirectory(prefix='lifecycle-rebundle-') as temporary:
+            path = Path(temporary) / 'lifecycle-watchdog.py'
+            path.write_text(second, encoding='utf-8')
+            result = subprocess.run([sys.executable, '-I', '-B', str(path), '--help'],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('usage:', result.stdout)
+
+
 class FakeMux:
     def __init__(self, host, ssh_options=(), **kwargs):
         self.host = host
@@ -2472,6 +2498,23 @@ print(json.dumps(c.down()))
         self.assertFalse(self.controller().status()['watchdog_running'])
         self.assertTrue(self.ledger.released)
 
+    def test_watchdog_writer_uses_standalone_source(self):
+        self.config['watchdog'] = {'idle_s': 300, 'poll_s': 2}
+        with patch.object(life, 'standalone_source', return_value='watchdog marker') as source:
+            self.controller().up()
+        source.assert_called_once_with()
+        self.assertEqual((Path(self.config['state_dir']) / 'lifecycle-watchdog.py').read_text(encoding='utf-8'),
+                         'watchdog marker')
+
+    def test_settle_writer_uses_standalone_source(self):
+        controller = self.controller()
+        controller.up()
+        with patch.object(self.ledger, 'release', side_effect=transport('ssh diag fake: release unavailable')), \
+                patch.object(life, 'standalone_source', return_value='settle marker') as source:
+            controller.down()
+        source.assert_called_once_with()
+        self.assertEqual((controller.directory / 'lifecycle-settle.py').read_text(encoding='utf-8'), 'settle marker')
+
     def test_watchdog_auto_false_does_not_start_a_sidecar(self):
         self.config['watchdog'] = {'idle_s': 300, 'auto': False}
         value = self.controller().up()
@@ -4904,6 +4947,21 @@ class WindowsTests(unittest.TestCase):
         self.assertIn('rules=@($rules.Name)', scripts[0])
         self.assertIn('created=$created', scripts[0])
         self.assertNotIn('New-NetFirewallRule', scripts[0])  # no silent permission to create a rule
+
+    def test_windows_backend_writer_uses_standalone_source(self):
+        c = self.controller()
+        c.up()
+        item = c.state['instances'][0]
+        run = Path(item['run'])
+        life.save(run / 'launcher.json', {'session': 1, 'limits': {'JobMemoryLimit': 8 * life.GIB,
+            'KillOnJobClose': True, 'ActiveProcessLimit': 256}, 'owned_pids': [{'pid': 123, 'start': 'fake'}]})
+        host = life.WindowsHost(self.config, job_api=object())
+        host.run = lambda argv, cap=30: ''
+        host.ps = lambda script, **kwargs: 'S-1-5-21-1-2-3-1001' if 'WindowsIdentity' in script else '{}'
+        with patch.object(life, 'standalone_source', return_value='backend marker') as source:
+            host.launch(item, self.config)
+        source.assert_called_once_with()
+        self.assertEqual((run / 'lifecycle-backend.py').read_text(encoding='utf-8'), 'backend marker')
 
     def test_windows_control_uses_pinned_async_client_and_forbids_input(self):
         host = life.WindowsHost(self.config, job_api=object())
