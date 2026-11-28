@@ -200,8 +200,10 @@ snapshot at `artifacts/phase23/card-lineup/<YYYYMMDD-HHMMZ>/`. Run it only after
 the operator mounts the card; it reads the card and never writes there. Each
 stamp contains the plugin NROs and `plugins/SHA256SUMS.txt`, every regular file
 under `ultimate/mods/`, `ultimate/arcropolis/config/` (including extensionless
-workspace and preset fields), ARCropolis TOMLs outside logs and cache, and regular
-files under `ultimate/arcropolis/resources/` outside logs and cache. This includes
+workspace and preset fields), ARCropolis TOMLs outside logs, cache and
+`resources/`, and regular files under `ultimate/arcropolis/resources/` outside
+its logs and cache. The `resources/` subtree is classified only as resources,
+never as ARCropolis configuration. This includes
 required resources such as `config.json`, Arcadia menu layouts, and the menu
 message table. Logs and generated caches are excluded. `CARD-SHA256SUMS.txt`
 covers the assets. Each stamp's `README.md` records its source root, including
@@ -211,13 +213,17 @@ files already present in earlier stamps.
 `eden_test.py go` selects the newest full stamp by default, verifies it, and
 records the stamp, hashes, file counts (including ARCropolis resources), and payload bytes in `config.json` and
 `REPORT.md`. It hard-links staged inputs through the host's content-addressed
-cache, shared by later runs. Lifecycle hard-links plugins and mod assets into
-each private SD. ARCropolis config, TrainingRooms settings/saves, logs and
-caches remain private. NTFS supports same-volume hard links; a cross-volume or
-unsupported link uses a verified copy. Windows sources carrying the read-only
-attribute use a copy if needed for safe deletion; shared attributes are never cleared.
-Each prepared instance records actual linked and copied pin bytes in its lifecycle
-journal; the report totals them. A plugins-only stamp is not a full lineup.
+cache, shared by later runs. The stamp and cache stay read-only. Lifecycle
+hard-links plugin NROs into each private SD, but copies every pinned file under
+`user/sdmc/ultimate/` into a writable, run-private file. Eden opens SD files
+read-write, so mods, ARCropolis config and resources cannot share an inode with
+the stamp or another run. TrainingRooms settings/saves, logs and caches remain
+private too. NTFS supports same-volume hard links for plugin NROs; a
+cross-volume or unsupported link uses a verified copy. Windows sources carrying
+the read-only attribute use a copy if needed for safe deletion; shared attributes
+are never cleared. Each prepared instance records actual linked and copied pin
+bytes in its lifecycle journal; the report totals them. A plugins-only stamp is
+not a full lineup.
 
 **Temporary first-mount mode:** until the first full snapshot exists, an owner
 may explicitly pass `--plugins-only-interim` to `eden_test.py go` to use the

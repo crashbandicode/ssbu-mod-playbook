@@ -387,17 +387,23 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(life.load_cap({'host': host}), 300)
                 self.assertEqual(life.load_cap({'host': host, 'load_cap': 47}), 47)
 
-    def test_paired_mod_payload_is_shared_but_plugin_settings_are_private(self):
+    def test_card_ultimate_payloads_are_private_writable_but_plugins_stay_shared(self):
         mod = self.base / 'card-mod.pak'
         arc_config = self.base / 'card-arcropolis.toml'
+        resource = self.base / 'card-resource.toml'
         mod.write_bytes(b'mod data')
-        if os.name != 'nt':
-            mod.chmod(0o444)
         arc_config.write_text('enabled = true\n')
+        resource.write_text('theme = "arcadia"\n')
+        original = {path: path.read_bytes() for path in (mod, arc_config, resource)}
+        for path in original:
+            path.chmod(0o444)
+            self.addCleanup(lambda path=path: path.chmod(0o600))
         self.config['instances'][0]['files'].extend([
             {'path': str(mod), 'sha256': life.digest(mod), 'to': 'user/sdmc/ultimate/mods/sample/mod.pak'},
             {'path': str(arc_config), 'sha256': life.digest(arc_config),
-             'to': 'user/sdmc/ultimate/arcropolis/config.toml'}])
+             'to': 'user/sdmc/ultimate/arcropolis/config.toml'},
+            {'path': str(resource), 'sha256': life.digest(resource),
+             'to': 'user/sdmc/ultimate/arcropolis/resources/ui/theme.toml'}])
         self.config['card_lineup'] = {'asset_sums_sha256': 'f' * 64}
         stale = self.source / life.MODS / 'not-on-card/file'
         stale.parent.mkdir(parents=True)
@@ -407,18 +413,28 @@ class LifecycleTests(unittest.TestCase):
         c.up()
         a, b = [Path(item['profile']) for item in c.state['instances']]
         for profile in (a, b):
-            self.assertTrue((profile / 'user/sdmc/ultimate/mods/sample/mod.pak').samefile(mod))
+            for source, rel in ((mod, 'user/sdmc/ultimate/mods/sample/mod.pak'),
+                                (arc_config, 'user/sdmc/ultimate/arcropolis/config.toml'),
+                                (resource, 'user/sdmc/ultimate/arcropolis/resources/ui/theme.toml')):
+                staged = profile / rel
+                self.assertFalse(staged.samefile(source), f'{rel} must be private to this run')
+                self.assertTrue(staged.stat().st_mode & 0o200, f'{rel} must be writable by the run')
             self.assertFalse((profile / stale.relative_to(self.source)).exists())
             self.assertTrue((profile / life.PLUGINS / self.plugin.name).samefile(self.plugin))
         for item in c.state['instances']:
             self.assertEqual(item['profile_pin_storage'],
-                             {'linked_bytes': mod.stat().st_size + self.plugin.stat().st_size,
-                              'copied_bytes': arc_config.stat().st_size + self.settings.stat().st_size})
-        for source, rel in ((arc_config, 'user/sdmc/ultimate/arcropolis/config.toml'),
-                            (self.settings, 'user/sdmc/ultimate/TrainingRooms/settings.json')):
-            (a / rel).write_bytes(b'changed')
-            self.assertEqual((b / rel).read_bytes(), source.read_bytes())
-            self.assertNotEqual(source.read_bytes(), b'changed')
+                             {'linked_bytes': self.plugin.stat().st_size,
+                              'copied_bytes': mod.stat().st_size + arc_config.stat().st_size +
+                                              resource.stat().st_size + self.settings.stat().st_size})
+        for source, rel in ((mod, 'user/sdmc/ultimate/mods/sample/mod.pak'),
+                            (arc_config, 'user/sdmc/ultimate/arcropolis/config.toml'),
+                            (resource, 'user/sdmc/ultimate/arcropolis/resources/ui/theme.toml')):
+            with (a / rel).open('r+b') as staged:
+                staged.seek(0)
+                staged.write(b'run-local change')
+            self.assertEqual(source.read_bytes(), original[source])
+            self.assertEqual((b / rel).read_bytes(), original[source])
+            self.assertFalse(source.stat().st_mode & 0o222, 'the card stamp must stay read-only')
         c.down()
         self.assertEqual(stale.read_bytes(), b'not from this stamp')
 

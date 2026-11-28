@@ -36,8 +36,10 @@ On the Eden host, run the same command with its local host name:
 By default, `go` stages the newest complete stamped lineup. It contains
 `plugins/` with `SHA256SUMS.txt`, every regular file under `ultimate/mods/`,
 the entire `ultimate/arcropolis/config/` store (including extensionless fields),
-and ARCropolis TOMLs outside logs and cache. Generated cache and logs are not
-staged. `CARD-SHA256SUMS.txt` verifies the recursive mods and configs. The
+ARCropolis TOMLs outside logs, cache and `resources/`, and regular files under
+`ultimate/arcropolis/resources/` outside its logs and cache. The `resources/`
+subtree belongs only to the resource rule. Generated cache and logs are not
+staged. `CARD-SHA256SUMS.txt` verifies the assets. The
 read-only snapshot command for the next card mount is:
 
 ```text
@@ -50,11 +52,14 @@ The newest stamp is the default. Each `--nro` replaces the card plugin of the
 same name; a new name is added. Base plugins not on the card, including the
 bridge, are added; card plugins supersede matching base pins. The run's
 `inputs/card-lineup/` links identical files through a host-local content cache
-shared across runs. Lifecycle hard-links mod assets and plugins into each
-private SD; cross-volume/unsupported links use a verified copy. ARCropolis config
-fields, TR settings/saves, logs and caches stay private. `config.json` records
-the stamp, manifest hashes, verified counts and payload size; `REPORT.md` also
-reports actual linked/copied pin bytes from the prepared profiles.
+shared across runs. The stamp and cache stay read-only. Lifecycle hard-links
+plugin NROs into each private SD, but copies all pinned files under
+`user/sdmc/ultimate/` into writable, run-private files because Eden opens SD
+files read-write. This includes mods, ARCropolis config and resources.
+Cross-volume or unsupported plugin links use a verified copy. TR settings/saves,
+logs and caches also stay private. `config.json` records the stamp, manifest
+hashes, verified counts and payload size; `REPORT.md` also reports actual
+linked/copied pin bytes from the prepared profiles.
 
 Use `--card-lineup <dir>` for another full stamped lineup. Until the first full
 snapshot is created at the next operator card mount, an explicit

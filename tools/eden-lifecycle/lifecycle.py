@@ -2613,7 +2613,9 @@ class Lifecycle:
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 target.unlink()  # break any link before writing
-            stage(pin, target, Path(MODS) in relative(pin['to']).parents)
+            # Eden opens SD files read-write. Only plugin NRO inputs are immutable shared content;
+            # every pinned SD file, including the complete ultimate/ card lineup, is run-private.
+            stage(pin, target, False)
         private_config(profile)
         item['profile_pin_storage'] = storage
         self.record('prepared', {'key': item['key'], 'snapshot_entries': len(expected), 'persisted_volume': 0,

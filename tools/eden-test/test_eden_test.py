@@ -4285,15 +4285,40 @@ class CardLineupSnapshotTests(unittest.TestCase):
 
     def test_snapshot_includes_workspace_fields_not_log_or_cache_tomls(self):
         arc = self.card / 'ultimate/arcropolis'
-        for rel in ('config/01006a800016e000/presets', 'cache/13/offsets.toml', 'logs/debug.toml'):
+        for rel in ('config/01006a800016e000/presets', 'cache/13/offsets.toml', 'logs/debug.toml',
+                    'resources/cache/generated.toml', 'resources/logs/session.toml'):
             path = arc / rel
-            path.parent.mkdir(parents=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'field')
         stamp = card_lineup_snapshot.snapshot(self.card, self.output, '20261127-0300Z')
         assets = eden_test.read_card_lineup(stamp)['assets']
         self.assertEqual([x['path'] for x in assets if '/arcropolis/' in x['path']],
                          ['ultimate/arcropolis/config.toml', 'ultimate/arcropolis/config/01006a800016e000/presets',
                           'ultimate/arcropolis/resources/ui/message/msg_menu.xmsbt'])
+
+    def test_resource_toml_is_snapshotted_once_and_validates_as_a_resource(self):
+        theme = self.card / 'ultimate/arcropolis/resources/ui/theme.toml'
+        theme.parent.mkdir(parents=True, exist_ok=True)
+        theme.write_bytes(b'theme = "arcadia"\n')
+        stamp = card_lineup_snapshot.snapshot(self.card, self.output, '20261127-0400Z')
+        relative = 'ultimate/arcropolis/resources/ui/theme.toml'
+        manifest_lines = (stamp / 'CARD-SHA256SUMS.txt').read_text().splitlines()
+        self.assertEqual([line for line in manifest_lines if line.endswith(relative)],
+                         [f'{sha(theme)}  {relative}'])
+        self.assertEqual((stamp / relative).read_bytes(), theme.read_bytes())
+        assets = eden_test.read_card_lineup(stamp)['assets']
+        self.assertEqual([asset['path'] for asset in assets].count(relative), 1)
+
+    def test_validator_rejects_manifest_listing_excluded_resource_toml(self):
+        stamp = card_lineup_snapshot.snapshot(self.card, self.output, '20261127-0500Z')
+        excluded = stamp / 'ultimate/arcropolis/resources/cache/generated.toml'
+        excluded.parent.mkdir(parents=True, exist_ok=True)
+        excluded.write_bytes(b'generated')
+        manifest = stamp / 'CARD-SHA256SUMS.txt'
+        relative = excluded.relative_to(stamp).as_posix()
+        manifest.write_text(manifest.read_text() + f'{sha(excluded)}  {relative}\n')
+        with self.assertRaisesRegex(SystemExit, 'invalid card asset path'):
+            eden_test.read_card_lineup(stamp)
 
 
 class DownProcessTests(unittest.TestCase):

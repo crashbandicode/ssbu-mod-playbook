@@ -45,7 +45,8 @@ def _regular_files(root, *, suffix=None):
 
 def arc_config(relative):
     parts = Path(relative).parts
-    return bool(parts and parts[0].lower() not in ('cache', 'logs') and not parts[-1].lower().endswith('.log')
+    return bool(parts and parts[0].lower() not in ('cache', 'logs', 'resources')
+                and not parts[-1].lower().endswith('.log')
                 and (parts[0].lower() == 'config' or parts[-1].lower().endswith('.toml')))
 
 
