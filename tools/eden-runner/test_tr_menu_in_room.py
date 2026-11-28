@@ -26,6 +26,7 @@ def room(base):
         def __init__(self, ctx, **kwargs):
             super().__init__(ctx, **kwargs)
             self.menu['scene'] = 'lobby'
+            self.menu['recording.popup.open'] = '0'
 
         def read(self, provider, cap):
             if provider != 'tr.menu':
@@ -106,6 +107,26 @@ class RoomMenuTests(unittest.TestCase):
                 io = room(blocks.MenuIO)(self.ctx, opened=True, fault=fault)
                 with self.assertRaises(RuntimeError):
                     self.invoke('tr_menu_in_room', io, page='saves', cap=.05)
+
+    def test_no_resend_when_the_unacked_tap_loses_its_source(self):
+        for change in ({'scene': 'training'}, {'keyboard': '1'}, {'open': '0'},
+                       {'focus': 'different-row'}, {'recording.popup.open': '1'}):
+            with self.subTest(change=change):
+                io = room(blocks.MenuIO)(self.ctx, opened=True)
+                def send(segment, until=None):
+                    io.actions.append(segment)
+                    io.menu.update(change)
+                io.send = send
+                with self.assertRaises(RuntimeError):
+                    self.invoke('tr_menu_in_room', io, page='saves', cap=5)
+                self.assertEqual(io.actions, ['room-tap-r'])
+
+    def test_recording_popup_does_not_own_a_room_menu_input(self):
+        io = room(blocks.MenuIO)(self.ctx)
+        io.menu['recording.popup.open'] = '1'
+        with self.assertRaisesRegex(RuntimeError, 'popup'):
+            self.invoke('tr_menu_in_room', io)
+        self.assertEqual(io.actions, [])
 
     def test_the_training_routes_still_refuse_the_room(self):
         io = blocks.MenuIO(self.ctx)
