@@ -20,6 +20,27 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   `ssbu.ui: incomplete, inactive or wrong-schema observation`, before sending input.
   The same rows passed in `xplat-ally-9`, whose first `tr_set` failed with the same error before input;
   film did not run.
+- **Bridge upkeep boots** (2026-11-28 UTC): with bridge `b5f9d9f` (NRO SHA-256
+  `cd16ac8d08292c7d1802bda06755e2596b8e5aaa66510ca35fe2eb24e6c43b90`),
+  `xplat-ally-10` passed boot, bridge, training-route, toggle and film. Crouch
+  read back `[0, 1]` → `[1, 0]` → `[0, 1]`. `xplat-yoga-2` passed boot, bridge
+  and training-route and read back Crouch `[0, 1]` → `[1, 0]`; the second
+  `tr_set` failed on an inactive read 0.09 s before a fighter-loading notice.
+  Its film row was omitted because Yoga had no ffmpeg. The upkeep change has
+  green gates and unit tests, but no boot shows it was necessary; it is not
+  deployed to a shared input. At the time, `tr_set` took one inactive read as final.
+- **Training read boot** (2026-11-28 UTC): with the deployed bridge
+  `5917e54f…`, `xplat-yoga-3` passed boot, bridge and the diagnostic watch row,
+  but its diagnostic scene-watch row overran the bridge's event ring. The
+  `since 1290` reply was `gap` (oldest 1633, latest 1888), and training-route
+  correctly refused at `enter_training`; this was not a Training read-fix
+  regression. Toggle did not run and there was no film row.
+- **Plain Training read boot** (2026-11-28 UTC): `xplat-yoga-4` passed boot,
+  bridge, training-route and toggle with the deployed bridge; there was no film
+  row. Crouch read and stored `[0, 1]` → `[1, 0]`, then `[1, 0]` → `[0, 1]`.
+  Neither `tr_set` received an inactive `ssbu.ui` reply, so neither waited
+  through one. The reason for earlier inactive reads remains open; raw
+  observations are in the lane's files.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
@@ -239,7 +260,6 @@ The press needs an opening read that arrived after a state request of this call,
 before the press; that read must begin after the request and after that request's providers reply. An opening block
 already in the capture is not enough.
 One `ssbu.ui` read is in flight at a time; an unanswered read is asked again after 2 s.
-An inactive `ssbu.ui` read following a mirrored file transfer is read again for up to 2 s.
 With the stub on, the greeting, the install line and the Title read come from the latest complete connection in the capture log; a connection change after that greeting stops the step.
 If the bridge is already On, the route sends no chord and requires this run's qualified receipt for that On event,
 the same port and the same boot: a stub-on receipt with its pre-On evidence and its Title prompt read, or a trace
@@ -706,6 +726,9 @@ with a handled ACK, because the outer cursor does not move there. A repeated ide
 not read or establish the focused row's stored value.
 
 `routes:tr_set(page, path, kind, value, cap=45)` accepts `list`, `toggle`, `checklist`, or `practice_cpu`.
+An inactive `ssbu.ui` read during the owner wait is not yet; the route reads again until its cap and then fails closed.
+After recovery, a route that uses `tr.menu` reads it again before deciding or pressing. The original deadline covers
+both reads. If the final UI reply times out, the failure includes the last inactive revision and the missing reply.
 It closes the menu, reads `settings.json` through the bridge, navigates to the row, changes it as needed,
 closes the menu and compares a fresh file read. Changed values require a fresh writer line; already-stored
 values skip both the change and writer and must match again on the final read. Source-pinned row kinds

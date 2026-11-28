@@ -989,6 +989,167 @@ class SetTests(OpenCloseTests):
         json.dumps(result)
         return result, waited.call_count, cursor.call_count, reads
 
+    def training_ui_reads(self, io, inactive, *, malformed=False):
+        events = []
+        read, send = io.read, io.send
+        self.ctx.runner.setup_metrics = None
+        io.rev = 568
+
+        def observed(provider, cap):
+            if provider == 'ssbu.ui' and inactive[0]:
+                io.rev = max(io.rev, 575)
+            deadline = self.clock.monotonic() + cap
+            sample = read(provider, cap)
+            if provider == 'ssbu.ui' and inactive[0]:
+                inactive[0] -= 1
+                sample.values.update({key: 'unknown' for key in routes.native_picker.UI_FOCUS_FIELDS})
+                sample.values.update({'observation.active': 'no', 'ack': '0', 'ack.result': 'unsupported'})
+                if malformed:
+                    sample.block['schema'] = 'ssbu.ui/2'
+                self.clock.spend(min(max(0, deadline - self.clock.monotonic()), .1))
+            events.append(('read', provider, sample.block['rev'], sample.values.get('observation.active')))
+            return sample
+
+        def sent(segment, until=None):
+            events.append(('send', segment))
+            return send(segment, until=until)
+
+        io.read, io.send = observed, sent
+        return events
+
+    def test_tr_set_waits_through_an_inactive_ui_read(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        inactive = [0]
+        events = self.training_ui_reads(io, inactive)
+        io.read('ssbu.ui', 1)
+        io.read('tr.menu', 1)
+        inactive[0] = 1
+        try:
+            result, _, _, _ = self.run_set(io, 'toggle', [0, 1])
+        except RuntimeError as error:
+            self.fail(f'tr_set rejected a transient inactive read: {error}')
+        self.assertTrue(result['ok'])
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-set.json').read_text())
+        self.assertTrue(receipt['ok'])
+        self.assertEqual(events[:5], [('read', 'ssbu.ui', 569, 'yes'),
+                                      ('read', 'tr.menu', 570, '1'),
+                                      ('read', 'tr.menu', 571, '1'),
+                                      ('read', 'tr.menu', 572, '1'),
+                                      ('read', 'ssbu.ui', 576, 'no')])
+        active = next(index for index, event in enumerate(events[5:], 5)
+                      if event[0:2] == ('read', 'ssbu.ui') and event[3] == 'yes')
+        self.assertFalse(any(event[0] == 'send' for event in events[4:active]))
+
+    def test_tr_set_fails_closed_when_ui_stays_inactive(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [100])
+        start = self.clock.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap'):
+            self.run_set(io, 'toggle', [0, 1])
+        self.assertAlmostEqual(self.clock.monotonic() - start, 1)
+        self.assertEqual(io.actions, [])
+        self.assertFalse(any(event[0] == 'send' for event in events))
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-set.json').read_text())
+        self.assertFalse(receipt['ok'])
+
+    def test_an_active_ui_read_costs_no_extra_request(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [0])
+        result, _, _, _ = self.run_set(io, 'toggle', [0, 1])
+        self.assertTrue(result['ok'])
+        self.assertEqual(sum(event[0] == 'read' for event in events), 13)
+        self.assertEqual(result['bridge_requests'], 13)
+
+    def test_tr_set_rejects_a_malformed_inactive_ui_read_immediately(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [1], malformed=True)
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
+            self.run_set(io, 'toggle', [0, 1])
+        self.assertEqual(io.actions, [])
+        self.assertEqual(sum(event[0:2] == ('read', 'ssbu.ui') for event in events), 1)
+
+    def test_tr_idle_waits_through_inactive_ui_before_closing(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        io.menu.update({'open': '1', 'game.running': '0', 'notice.header': ''})
+        events = self.training_ui_reads(io, [1])
+        result = self.invoke('tr_idle', io, cap=1)
+        self.assertTrue(result['ok'])
+        active = next(index for index, event in enumerate(events)
+                      if event[0:2] == ('read', 'ssbu.ui') and event[3] == 'yes')
+        self.assertFalse(any(event[0] == 'send' for event in events[:active]))
+        self.assertIn('tap-b1', io.actions)
+
+    def test_tr_idle_fails_closed_without_an_active_ui(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        io.menu.update({'open': '1', 'game.running': '0', 'notice.header': ''})
+        self.training_ui_reads(io, [100])
+        with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap'):
+            self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(io.actions, [])
+
+    def test_training_routes_recheck_keyboard_after_inactive_ui(self):
+        for route in ('tr_idle', 'tr_close'):
+            with self.subTest(route=route):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+                io.menu.update({'game.running': '0', 'notice.header': ''})
+                self.training_ui_reads(io, [1])
+                read = io.read
+
+                def keyboard_opens(provider, cap):
+                    state = read(provider, cap)
+                    if provider == 'ssbu.ui' and state.values['observation.active'] == 'no':
+                        io.menu['keyboard'] = '1'
+                    return state
+
+                io.read = keyboard_opens
+                with self.assertRaisesRegex(RuntimeError, 'keyboard'):
+                    self.invoke(route, io, cap=1)
+                self.assertEqual(io.actions, [])
+
+    def test_last_ui_read_cannot_qualify_after_cap_or_hide_last_inactive(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+                io.menu.update({'game.running': '0', 'notice.header': ''})
+                self.training_ui_reads(io, [1])
+                read = io.read
+
+                def late_reply(provider, cap):
+                    if provider == 'ssbu.ui' and io.rev >= 576:
+                        self.clock.spend(cap)
+                        if missing:
+                            raise RuntimeError('no fenced bridge reply for state ssbu.ui')
+                    return read(provider, cap)
+
+                io.read = late_reply
+                with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap.*rev=576'):
+                    self.invoke('tr_idle', io, cap=1)
+                self.assertEqual(io.actions, [])
+
+    def test_tr_settings_waits_through_inactive_ui_before_applying(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [1])
+        settings = json.dumps({'menu': io.stored}).encode()
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings', return_value=settings),
+              patch.object(routes, '_apply_settings', return_value=('ok', 'ok')) as apply,
+              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value)):
+            result = routes.tr_settings(self.ctx, values={'lra_reset': [1, 0]}, cap=1)
+        self.assertEqual(result['verified']['values'], {'lra_reset': [1, 0]})
+        self.assertEqual([event[3] for event in events if event[0:2] == ('read', 'ssbu.ui')], ['no', 'yes'])
+        apply.assert_called_once()
+
+    def test_tr_settings_fails_closed_without_an_active_ui(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        self.training_ui_reads(io, [100])
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings') as fetch,
+              patch.object(routes, '_apply_settings') as apply):
+            with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap'):
+                routes.tr_settings(self.ctx, values={'lra_reset': [1, 0]}, cap=1)
+        fetch.assert_not_called()
+        apply.assert_not_called()
+
     def test_oversized_sdi_settings_cannot_certify_product_index(self):
         io = SetIO(self.ctx, 'list', 'sdi_strength', [0] * 8 + [1])
         data = json.dumps({'menu': io.stored}).encode()
