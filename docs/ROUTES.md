@@ -90,7 +90,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `wait_lines` `{lines: [[source, regex]]}` | any | each boot line is present, for example TrainingRooms' `result=installed`. Use it instead of a fixed post-load sleep. A source may be `sdmc:<path>` |
 | `to_main` | qualified Title opening, Title prompt, How to Play skip prompt, or Main | a fresh bridge observation of native Main Menu top-tab focus |
 | `main_to_stage` | anywhere `to_main` handles | Training's stage select (`stage` gate) |
-| `pick_stage` `{stage, allow_derived}` | stage select | the named stage's tile settled (`at` equals `to`), A pressed, the character select (`css` gate). An unproven tile needs `allow_derived` and the stage-id check after the load |
+| `pick_stage` `{stage, allow_derived, topology}` | stage select | the named stage's tile settled (`at` equals `to`), A pressed, the character select (`css` gate). An unproven tile needs `allow_derived` and the stage-id check after the load |
 | `pick_fighters` `{p1, cpu, take_back}` | character select | P1 placed; when `cpu` is supplied, the CPU coin is placed too. `take_back` defaults to false for P1-only callers |
 | `pick_cpu` `{fighter, topology, form}` | Training character select, P1 placed | the CPU coin placed on the target; P1's original medal unchanged |
 | `enter_training` `{cap, stage_ids, fighters}` | both placed | Training and the verified stage; fresh roster entries 0 and 1, checked against remembered or supplied fighters where known |
@@ -98,6 +98,8 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `set_player` `{fighter, cap}` | Training character select or Training | P1 selected; in Training, settings, roster and live body verified |
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
+
+`pick_stage` uses the hash-pinned `sss-training` topology when `topology` is omitted. The picker still requires the live layout fingerprint to match that pin before it moves; a different or unknown layout is refused. Pass an explicit, independently qualified topology pin for another layout.
 | `tr_idle` `{cap}` | Training | back out of the wizard, close the menu or stop Guard the Edge; verify plain idle Training |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
 | `tr_menu_in_room` `{page, path, then, cap}` | the local-wireless waiting room (after `wireless_room`), TR menu open or closed | the TR menu on `page` with the `path` row focused; `then: "press"` presses it once, `then: "close"` closes the menu. Gated on `tr.menu` `scene=lobby` alone |
@@ -256,6 +258,9 @@ the attract loop. The Title read requires `title.press_any`, and records the fra
 With the stub on, if the first active read is the opening movie, the route presses Plus once on that read and waits
 up to 10 seconds for the Title prompt. It never presses twice and never presses on another screen. The press is in
 the receipt with the read it was sent on.
+The passive Title witness uses the remaining absolute deadline recorded by `routes:load_game`; the GDB kick, game
+load and first Title observation share that route's one cap (900 seconds by default, or the row's explicit `cap`).
+This lets a slow host finish its Title transition without starting a fresh fixed 10-second timer.
 The press needs an opening read that arrived after a state request of this call, confirmed by a second fresh read just
 before the press; that read must begin after the request and after that request's providers reply. An opening block
 already in the capture is not enough.

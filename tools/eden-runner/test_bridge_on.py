@@ -149,6 +149,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def configure_stub(self):
         self.stub = True
+        self.instance['_routes_load_deadline'] = self.seconds + 10
+        self.instance['_routes_load_cap'] = 10
         del self.instance['trace_jsonl']
         own_hello = HELLO.replace('0x46024760bd126949', STUB_BOOT).replace('port=6979', 'port=6980')
         self.events.write_text(own_hello + '\n' + '\n'.join(STUB_EVENTS[:2]) + '\n')
@@ -505,6 +507,23 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(receipt['chord']['pre_chord']['status'], self.status)
         self.assertEqual(receipt['chord']['pre_chord']['journal']['inputs_after_load'], 0)
 
+    def test_stub_title_waits_under_the_shared_game_load_deadline_for_a_slow_title_prompt(self):
+        self.configure_stub()
+        self.instance['_routes_load_deadline'] = self.seconds + 90
+        self.instance['_routes_load_cap'] = 90
+        self.stub_default = self.title_without_prompt()
+
+        def finish_title_load(_):
+            if self.seconds >= 10.1:
+                self.seconds = 70  # model the observed Title at 70 s without 1,400 fake-clock polls
+                self.stub_default = self.sample()
+
+        self.sleep_hook = finish_title_load
+        title = self.invoke(port=6980)["title"]
+        self.assertEqual(title["matched"], "prompt")
+        self.assertGreater(title["waited_s"], 60)
+        self.assertLessEqual(title["waited_s"], 90)
+
     def test_stub_title_keeps_one_request_in_flight(self):
         overlaps = self.slow_title_bridge(lambda _: self.sample())
         title = self.invoke(port=6980)['title']
@@ -789,7 +808,7 @@ class BridgeOnTests(unittest.TestCase):
             self.invoke(port=6980)
         self.assertEqual(self.macro_attempts(), [])
         self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
-        self.assertAlmostEqual(self.seconds - self.request_times[0], 10)
+        self.assertAlmostEqual(self.seconds, self.instance['_routes_load_deadline'])
 
     def test_bridge_on_stub_on_recheck_accepts_a_delayed_reply(self):
         self.recorded_opening()

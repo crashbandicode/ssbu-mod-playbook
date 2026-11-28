@@ -187,7 +187,9 @@ and checks that identity on reconnect; a foreign PID or boot is a hard error
 and receives no request. The hello is learned from the connection because the
 bridge sends it only to a connected client. `bridge_on` waits
 for the game's `running` and `loading_complete` status signals and bridge
-chord-ready state before it sends the On chord. If a same-boot rerun finds an
+chord-ready state before it sends the On chord. The stub-on Title witness shares
+the absolute deadline recorded by `routes:load_game`, so its GDB kick, load wait
+and first Title observation use one cap. If a same-boot rerun finds an
 On event without a receipt, it requalifies the current Title state without
 sending a second toggle. When `load_cap` is omitted, Up allows 300 seconds on
 every host; an explicit run-config value wins.

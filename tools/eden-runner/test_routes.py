@@ -1028,6 +1028,13 @@ class LoadGameStubOnTests(unittest.TestCase):
         self.assertGreater(result['seconds'], 274, 'this boot drew after the old deadline')
         self.assertEqual(json.loads((self.row / 'routes-load.json').read_text()), result)
 
+    def test_load_game_publishes_its_deadline_for_the_following_bridge_title_wait(self):
+        self.draws_at = 45.5
+        result = routes.load_game(self.ctx, gdb_port=6811, cap=70)
+        self.assertEqual(result['load_cap_s'], 70)
+        self.assertEqual(self.ctx.instance['_routes_load_cap'], 70)
+        self.assertEqual(self.ctx.instance['_routes_load_deadline'], 42.5 + 70)
+
     def test_a_kick_the_stub_refused_is_tried_again_until_one_is_delivered(self):
         self.stub_up_at, self.draws_at = 42.5 + 60, 42.5 + 400
         result = routes.load_game(self.ctx, gdb_port=6811)
@@ -2736,6 +2743,26 @@ class TileWalkerTests(unittest.TestCase):
 
 
 class StageTransitionTests(unittest.TestCase):
+    def test_pick_stage_defaults_to_the_pinned_training_sss_topology(self):
+        from unittest.mock import Mock, patch
+        ctx = Mock()
+        io = Mock()
+        prepared = Mock()
+        topology = Mock()
+        pin = {'path': 'sss-training-topology.json', 'sha256': 'pinned'}
+        with patch.object(routes, 'BridgePickerIO', return_value=io), \
+                patch.object(routes, 'library_topology', return_value=pin) as library_topology, \
+                patch.object(routes, '_tile_topology', return_value=topology) as decode_topology, \
+                patch.object(routes.native_picker, 'hover', return_value=prepared) as hover, \
+                patch.object(routes, '_finish_native_pick', return_value={'stage': 'Final Destination'}):
+            result = routes.pick_stage(ctx, 'Final Destination')
+        self.assertEqual(result, {'stage': 'Final Destination'})
+        library_topology.assert_called_once_with('sss-training')
+        decode_topology.assert_called_once_with(pin)
+        hover.assert_called_once_with(
+            io, 'sss', routes._native_target(routes.stage_entry('Final Destination'), 'normal'),
+            topology, expected_context='training')
+
     def test_generic_stage_finish_rejects_a_different_destination_context(self):
         pending = picker_fixtures.recorded_smash_ui(847)
         pending.values['screen.context'] = 'training'

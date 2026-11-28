@@ -2204,6 +2204,10 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
     t0 = time.monotonic()
     ctx.call('game.load', {'path': ctx.instance['game']}, job_cap=240)
     until = t0 + cap
+    # bridge_on's stub-on Title witness shares this deadline: the GDB kick, game load, and
+    # first Title observation all belong to one bounded boot, even when the Title appears late.
+    ctx.instance['_routes_load_deadline'] = until
+    ctx.instance['_routes_load_cap'] = cap
     if gdb_port:
         gdb_port = ctx.instance.get('gdb_port') or gdb_port
         out['kick'] = []
@@ -2229,7 +2233,7 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
         if time.monotonic() > until:
             raise RuntimeError(f'still loading after {cap} s: {polls[-3:]}')
         time.sleep(1.0)
-    out.update(seconds=round(time.monotonic() - t0, 1), polls=len(polls), last=polls[-1])
+    out.update(load_cap_s=cap, seconds=round(time.monotonic() - t0, 1), polls=len(polls), last=polls[-1])
     return _save(ctx, 'routes-load', out)
 
 
@@ -2563,6 +2567,8 @@ def pick_stage(ctx, stage, allow_derived=False, transition_cap=60, *, topology=N
     """Select the typed native stage and verify the expected CSS transition."""
     entry = stage_entry(stage)
     io = BridgePickerIO(ctx)
+    if topology is None:
+        topology = library_topology('sss-training')
     prepared = native_picker.hover(io, 'sss', _native_target(entry, form), _tile_topology(topology),
                                    expected_context=_stage_pick_context(next_screen))
     return _finish_native_pick(ctx, io, 'sss', prepared, entry, next_screen, transition_cap)
@@ -4577,7 +4583,8 @@ def _bridge_on_stub_title(ctx, hello, start):
     boot = match[1]
     log = instance_path(ctx, 'bridge_log')
     started = time.monotonic()
-    until = started + 10
+    load_cap = ctx.instance.get('_routes_load_cap', 900)
+    until = ctx.instance.get('_routes_load_deadline', started + load_cap)
     next_request = 0
     seen = 0
     last = None
@@ -4715,9 +4722,11 @@ def _bridge_on_stub_title(ctx, hello, start):
         raise RuntimeError('bridge_on (stub on): the opening was seen but no fresh ssbu.ui reply confirmed it; '
                            'nothing was sent')
     if last is not None:
-        raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within 10 s of the greeting; "
+        raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within {load_cap} s "
+                           f"of the game-load cap; "
                            f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
-    raise RuntimeError('bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting')
+    raise RuntimeError(f'bridge_on (stub on): no active ssbu.ui observation of this boot within {load_cap} s '
+                       'game-load cap')
 
 
 def free_port(first=6980, last=7079, host='0.0.0.0'):
