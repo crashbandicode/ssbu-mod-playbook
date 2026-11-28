@@ -209,6 +209,20 @@ class BridgeOnTests(unittest.TestCase):
                                    'focus.index': 'unknown', 'focus.label': 'unknown',
                                    'input.owner': 'unknown', 'dialog': 'unknown'})
 
+    def frame_timeline(self, select):
+        self.configure_stub()
+        spool = self.spool
+        first = []
+        def feed(ctx, *requests):
+            if not first:
+                first.append(self.seconds)
+            elapsed = self.seconds - first[0]
+            frame, sample = select(elapsed)
+            self.stub_default = re.sub(r' frame=\d+ wall=\d+', f' frame={frame} wall={int(elapsed * 1000)}', sample)
+            spool(ctx, *requests)
+        self.spool = feed
+        return first
+
     def recorded_opening(self, *, prompt_after_skip=True):
         self.configure_stub()
         self.stub_preamble = RUN1_PREAMBLE
@@ -1339,6 +1353,55 @@ class BridgeOnTests(unittest.TestCase):
         self.stub_default = self.sample(active='no')
         with self.assertRaisesRegex(RuntimeError, r'no active ssbu.ui observation of this boot within 10 s'):
             self.invoke(port=6980)
+
+    def test_stub_title_frozen_counter_waits_until_cap_without_input(self):
+        inactive = self.sample(active='no', screen='unknown')
+        first = self.frame_timeline(lambda elapsed: (95, inactive))
+        with self.assertRaisesRegex(RuntimeError, r"the game stood still after the greeting: the bridge's frame "
+                                    r"counter stayed at 95 for [\d.]+ s \(cap 15 s\); nothing was pressed"):
+            self.invoke(port=6980, cap=15)
+        self.assertGreaterEqual(self.seconds - first[0], 14.9)
+        self.assertEqual(self.macro_attempts(), [])
+
+    def test_stub_title_waits_through_freeze_then_accepts_prompt(self):
+        inactive, prompt = self.sample(active='no', screen='unknown'), self.sample()
+        first = self.frame_timeline(lambda elapsed: (
+            95 if elapsed < 8 else 96 + int((elapsed - 8) * 60),
+            inactive if elapsed < 11 else prompt))
+        title = self.invoke(port=6980, cap=20)['title']
+        self.assertGreaterEqual(self.seconds - first[0], 11)
+        self.assertEqual((title['matched'], title['still_frame']), ('prompt', 95))
+        self.assertAlmostEqual(title['still_s'], 8, delta=.3)
+        self.assertEqual(self.macro_attempts(), [])
+
+    def test_stub_title_opening_press_waits_for_frame_advance(self):
+        inactive, opening, prompt = self.sample(active='no', screen='unknown'), self.opening(), self.sample()
+        first_opening = []
+        def select(elapsed):
+            if elapsed < 8:
+                self.assertEqual(self.macro_attempts(), [])
+                return 95, inactive
+            if self.macro_attempts():
+                return 99, prompt
+            frame = 96 if elapsed < 8.4 else 97 + int((elapsed - 8.4) * 60)
+            if not first_opening:
+                first_opening.append(frame)
+            if frame == first_opening[0]:
+                self.assertEqual(self.macro_attempts(), [])
+            return frame, opening
+        self.frame_timeline(select)
+        title = self.invoke(port=6980, cap=20)['title']
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assertGreater(title['skip']['sent_on']['frame'], first_opening[0])
+        self.assertEqual(title['still_frame'], 95)
+
+    def test_stub_title_advancing_without_active_observation_keeps_timeout(self):
+        inactive = self.sample(active='no', screen='unknown')
+        first = self.frame_timeline(lambda elapsed: (95 + int(elapsed * 60), inactive))
+        with self.assertRaisesRegex(RuntimeError, r'no active ssbu.ui observation of this boot within 10 s'):
+            self.invoke(port=6980, cap=20)
+        self.assertAlmostEqual(self.seconds - first[0], 10, delta=.4)
+        self.assertEqual(self.macro_attempts(), [])
 
     def test_bridge_on_stub_on_readiness_timeout_names_false_conditions(self):
         self.configure_stub()
