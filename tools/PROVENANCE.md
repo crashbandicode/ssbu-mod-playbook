@@ -353,21 +353,37 @@ window without an active UI observation; the two `-6` same-boot retries were ref
 input-since-load guard on base `236a5bb`. `-7` failed under a superseded interpretation of the
 bridge's publication frame. The Title read had asked every 100 ms without waiting for a reply;
 on the Ally a reply took about 200 ms, at 3.1–3.5 ms a line against about 0.25 ms on Linux.
-Why the per-line timing differs is not established. The bridge fell behind and reported `unknown`.
-The route now keeps one read in flight and retries an unanswered read after 2 s. In `-8`, the boot,
+Why the per-line timing differs is not established. The route now keeps one Title read in flight and retries an
+unanswered read after 2 s; this Title fix passed in four boots. In `-8`, the boot,
 bridge and training-route rows passed; toggle failed before input with
-`ssbu.ui: incomplete, inactive or wrong-schema observation` and film did not run. A mirrored
-`settings.json` kept the bridge busy about 1 s; the next `ssbu.ui` block was inactive.
+`ssbu.ui: incomplete, inactive or wrong-schema observation` and film did not run.
 In `-9`, boot, bridge and training-route passed; toggle failed before input with
 `ssbu.ui: incomplete, inactive or wrong-schema observation`, and film did not run.
 
 2026-11-28, bridge upkeep: `ssbu-hw-bridge` commit `b5f9d9f` refreshes the native-UI
 mapping and polls its publisher between reply lines and during settle, with a separate
-clock deadline for between-line publication. Its release NRO SHA-256 is
+clock deadline for between-line publication. Its gates and unit tests passed, but no boot
+shows it was necessary and it is not deployed to any shared input. Its release NRO SHA-256 is
 `cd16ac8d08292c7d1802bda06755e2596b8e5aaa66510ca35fe2eb24e6c43b90`.
 With that NRO, `xplat-ally-10` passed boot, bridge, training-route, toggle and film.
 The Crouch toggle stored `[1, 0]` from `[0, 1]`, then `[0, 1]` from `[1, 0]`.
+Its 10 s take had 568 frames, captured 56.8 fps and distinct-frame rates of 25 minimum
+and 36 median per second, below the film lanes' 55-per-second publication bar.
 `xplat-yoga-2` passed boot, bridge and training-route; its first Crouch change
 stored `[1, 0]` from `[0, 1]`, but the second failed with
-`ssbu.ui: incomplete, inactive or wrong-schema observation`. Film was omitted there:
-Yoga had no ffmpeg on PATH or in its staged location.
+`ssbu.ui: incomplete, inactive or wrong-schema observation` 0.09 s before a fighter-loading
+notice. Film was omitted there: Yoga had no ffmpeg on PATH or in its staged location.
+
+In Training, inactive `ssbu.ui` blocks occurred with both bridge builds on both hosts:
+1 of 11 in Ally-8, 2 of 11 in Ally-9, 2 of 17 in Ally-10, and 2 of 17 in Yoga-2.
+The inactive reads that failed `tr_set` preceded a TrainingRooms `Fighters: Loading 8/10 ·
+Ready Fighters …` notice by 0.49 s, 0.67 s and 0.09 s in Ally-8, Ally-9 and Yoga-2
+respectively, while TrainingRooms was loading fighters in the background. Other inactive
+blocks occurred 0.6–1.7 s after `CPU Character: CPU fighter applied` or in the first seconds
+of Training (`Loading 4/9`). The Training observer ran at 19.1/s, 19.4/s and 21.1/s on
+Ally-8, -9 and -10 respectively, and 28.8/s on Yoga-2 (32 ms sampling allows 31.2/s).
+Ally-8 and -9 used bridge `5917e54f…`; Ally-10 and Yoga-2 used `cd16ac8d…`.
+The previous settings-file and `tr.menu` attributions are withdrawn; why a read is inactive
+is not established. `tr_set` currently treats one inactive read as final. Whether to wait for
+loading or confirm an inactive read is undecided. The file-transfer re-read was reverted;
+it never acted in a boot because each route step creates a fresh `BridgePickerIO`.

@@ -26,6 +26,8 @@
   `xplat-ally-10` passed boot, bridge, training-route, toggle and film with bridge
   `b5f9d9f` (NRO SHA-256
   `cd16ac8d08292c7d1802bda06755e2596b8e5aaa66510ca35fe2eb24e6c43b90`).
+  The failed toggle reads in Ally-8 and -9 preceded a fighter-loading notice by
+  0.49 s and 0.67 s; why they were inactive is not established.
   Down released the claim and used the Job fallback. Its first cleanup kept the
   stage with `cannot read the processes: OSError`; a later Down removed it.
 

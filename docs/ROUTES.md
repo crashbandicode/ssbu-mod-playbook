@@ -20,14 +20,16 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   `ssbu.ui: incomplete, inactive or wrong-schema observation`, before sending input.
   The same rows passed in `xplat-ally-9`, whose first `tr_set` failed with the same error before input;
   film did not run.
-- **Bridge upkeep proof** (2026-11-28 UTC): with bridge `b5f9d9f` (NRO SHA-256
+- **Bridge upkeep boots** (2026-11-28 UTC): with bridge `b5f9d9f` (NRO SHA-256
   `cd16ac8d08292c7d1802bda06755e2596b8e5aaa66510ca35fe2eb24e6c43b90`),
   `xplat-ally-10` passed boot, bridge, training-route, toggle and film. Crouch
   read back `[0, 1]` → `[1, 0]` → `[0, 1]`. `xplat-yoga-2` passed boot, bridge
   and training-route and read back Crouch `[0, 1]` → `[1, 0]`; the second
-  `tr_set` failed with `ssbu.ui: incomplete, inactive or wrong-schema observation`.
-  Its film row was omitted because Yoga had no ffmpeg. This does not prove the
-  second toggle on Linux.
+  `tr_set` failed on an inactive read 0.09 s before a fighter-loading notice.
+  Its film row was omitted because Yoga had no ffmpeg. The upkeep change has
+  green gates and unit tests, but no boot shows it was necessary; it is not
+  deployed to a shared input. `tr_set` takes one inactive read as final; whether
+  to wait for background fighter loading or confirm that read is undecided.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
