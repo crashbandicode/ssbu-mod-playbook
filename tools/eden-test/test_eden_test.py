@@ -242,12 +242,15 @@ class TargetStageTests(unittest.TestCase):
         symlink.symlink_to(cache)
         removed = []
         chmod = Path.chmod
+        real_remove = eden_test.host_os.remove_file
+        native_windows = eden_test.host_os.WINDOWS
         def checked_chmod(path, *args, **kwargs):
             self.assertTrue(path.is_dir(), f'file chmod: {path}')
             return chmod(path, *args, **kwargs)
         def remove(path):
             removed.append(Path(path).name)
-            os.unlink(path)
+            with mock.patch.object(eden_test.host_os, 'WINDOWS', native_windows):
+                real_remove(path)
         with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
                 mock.patch.object(eden_test.host_os, 'remove_file', side_effect=remove), \
                 mock.patch.object(Path, 'chmod', checked_chmod):
