@@ -1087,6 +1087,45 @@ class SetTests(OpenCloseTests):
             self.invoke('tr_idle', io, cap=1)
         self.assertEqual(io.actions, [])
 
+    def test_training_routes_recheck_keyboard_after_inactive_ui(self):
+        for route in ('tr_idle', 'tr_close'):
+            with self.subTest(route=route):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+                io.menu.update({'game.running': '0', 'notice.header': ''})
+                self.training_ui_reads(io, [1])
+                read = io.read
+
+                def keyboard_opens(provider, cap):
+                    state = read(provider, cap)
+                    if provider == 'ssbu.ui' and state.values['observation.active'] == 'no':
+                        io.menu['keyboard'] = '1'
+                    return state
+
+                io.read = keyboard_opens
+                with self.assertRaisesRegex(RuntimeError, 'keyboard'):
+                    self.invoke(route, io, cap=1)
+                self.assertEqual(io.actions, [])
+
+    def test_last_ui_read_cannot_qualify_after_cap_or_hide_last_inactive(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+                io.menu.update({'game.running': '0', 'notice.header': ''})
+                self.training_ui_reads(io, [1])
+                read = io.read
+
+                def late_reply(provider, cap):
+                    if provider == 'ssbu.ui' and io.rev >= 576:
+                        self.clock.spend(cap)
+                        if missing:
+                            raise RuntimeError('no fenced bridge reply for state ssbu.ui')
+                    return read(provider, cap)
+
+                io.read = late_reply
+                with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap.*rev=576'):
+                    self.invoke('tr_idle', io, cap=1)
+                self.assertEqual(io.actions, [])
+
     def test_tr_settings_waits_through_inactive_ui_before_applying(self):
         io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
         events = self.training_ui_reads(io, [1])
