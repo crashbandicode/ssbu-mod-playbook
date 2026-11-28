@@ -989,6 +989,82 @@ class SetTests(OpenCloseTests):
         json.dumps(result)
         return result, waited.call_count, cursor.call_count, reads
 
+    def training_ui_reads(self, io, inactive, *, malformed=False):
+        events = []
+        read, send = io.read, io.send
+        self.ctx.runner.setup_metrics = None
+        io.rev = 568
+
+        def observed(provider, cap):
+            if provider == 'ssbu.ui' and inactive[0]:
+                io.rev = max(io.rev, 575)
+            sample = read(provider, cap)
+            if provider == 'ssbu.ui' and inactive[0]:
+                inactive[0] -= 1
+                sample.values.update({key: 'unknown' for key in routes.native_picker.UI_FOCUS_FIELDS})
+                sample.values.update({'observation.active': 'no', 'ack': '0', 'ack.result': 'unsupported'})
+                if malformed:
+                    sample.block['schema'] = 'ssbu.ui/2'
+                self.clock.spend(min(cap, .1))
+            events.append(('read', provider, sample.block['rev'], sample.values.get('observation.active')))
+            return sample
+
+        def sent(segment, until=None):
+            events.append(('send', segment))
+            return send(segment, until=until)
+
+        io.read, io.send = observed, sent
+        return events
+
+    def test_tr_set_waits_through_an_inactive_ui_read(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        inactive = [0]
+        events = self.training_ui_reads(io, inactive)
+        io.read('ssbu.ui', 1)
+        io.read('tr.menu', 1)
+        inactive[0] = 1
+        try:
+            result, _, _, _ = self.run_set(io, 'toggle', [0, 1])
+        except RuntimeError as error:
+            self.fail(f'tr_set rejected a transient inactive read: {error}')
+        self.assertTrue(result['ok'])
+        self.assertEqual(events[:5], [('read', 'ssbu.ui', 569, 'yes'),
+                                      ('read', 'tr.menu', 570, '1'),
+                                      ('read', 'tr.menu', 571, '1'),
+                                      ('read', 'tr.menu', 572, '1'),
+                                      ('read', 'ssbu.ui', 576, 'no')])
+        active = next(index for index, event in enumerate(events[5:], 5)
+                      if event[0:2] == ('read', 'ssbu.ui') and event[3] == 'yes')
+        self.assertFalse(any(event[0] == 'send' for event in events[4:active]))
+
+    def test_tr_set_fails_closed_when_ui_stays_inactive(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [100])
+        start = self.clock.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap'):
+            self.run_set(io, 'toggle', [0, 1])
+        self.assertAlmostEqual(self.clock.monotonic() - start, 1)
+        self.assertEqual(io.actions, [])
+        self.assertFalse(any(event[0] == 'send' for event in events))
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-set.json').read_text())
+        self.assertFalse(receipt['ok'])
+
+    def test_an_active_ui_read_costs_no_extra_request(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [0])
+        result, _, _, _ = self.run_set(io, 'toggle', [0, 1])
+        self.assertTrue(result['ok'])
+        self.assertEqual(sum(event[0] == 'read' for event in events), 13)
+        self.assertEqual(result['bridge_requests'], 13)
+
+    def test_tr_set_rejects_a_malformed_inactive_ui_read_immediately(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [1], malformed=True)
+        with self.assertRaisesRegex(RuntimeError, 'incomplete, inactive or wrong-schema observation'):
+            self.run_set(io, 'toggle', [0, 1])
+        self.assertEqual(io.actions, [])
+        self.assertEqual(sum(event[0:2] == ('read', 'ssbu.ui') for event in events), 1)
+
     def test_oversized_sdi_settings_cannot_certify_product_index(self):
         io = SetIO(self.ctx, 'list', 'sdi_strength', [0] * 8 + [1])
         data = json.dumps({'menu': io.stored}).encode()
