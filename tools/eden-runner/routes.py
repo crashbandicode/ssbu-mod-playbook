@@ -4515,6 +4515,11 @@ def _bridge_on_skip_opening(ctx, block, state):
     native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
     io = BridgePickerIO(ctx)
     first = True
+    deadline = state.get('deadline')
+    cap = min(10.0, deadline - time.monotonic()) if deadline is not None else 10.0
+    if cap <= 0:
+        raise state['load_timeout']() if state.get('load_timeout') else RuntimeError(
+            'bridge_on (stub on): game-load deadline expired before the opening skip')
 
     def observe():
         nonlocal first, block, values
@@ -4543,11 +4548,17 @@ def _bridge_on_skip_opening(ctx, block, state):
             raise RuntimeError('opening skip was not confirmed')
         block, state['fresh'] = confirmed
         values = block['values']
+        if deadline is not None and time.monotonic() >= deadline:
+            state['not_dispatched'] = True
+            raise state['load_timeout']()
         try:
             state['check_current'](block)
         except RuntimeError as error:
             state['poll_error'] = error
             raise
+        if deadline is not None and time.monotonic() >= deadline:
+            state['not_dispatched'] = True
+            raise state['load_timeout']()
         state['sent'] = True
         state['sent_at'] = time.monotonic()
         state['sent_on'] = {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'],
@@ -4560,7 +4571,7 @@ def _bridge_on_skip_opening(ctx, block, state):
 
     step = closed_loop.Step('opening skip', lambda obs: obs['kind'] == 'opening',
                             lambda obs: obs['kind'] == 'prompt', 'attract-cancel',
-                            cap=10, ready_cap=10, lost_after=10, sends=1)
+                            cap=cap, ready_cap=cap, lost_after=cap, sends=1)
     try:
         closed_loop.run('bridge_on (stub on)', [step], observe, send, io.finish,
                         clock=time.monotonic, sleep=time.sleep, poll=.05,
@@ -4591,10 +4602,25 @@ def _bridge_on_stub_title(ctx, hello, start):
     not_yet = []
     identities = set()
     state = {'boot': boot, 'sent': False, 'prompt': None, 'opening_seen': False, 'fresh_non_opening': False}
+
+    def load_timeout(block=None):
+        if block is not None:
+            detail = f"{block['values'].get('screen')}/{block['values'].get('focus')} " \
+                     f"rev={block['rev']} frame={block.get('frame')}"
+        elif last is not None:
+            detail = f"{last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}"
+        else:
+            detail = 'no qualified Title state'
+        return RuntimeError(f'bridge_on (stub on): game-load deadline ({load_cap} s) expired; '
+                            f'Title prompt not accepted; last Title state: {detail}')
+
+    state.update(deadline=until, load_timeout=load_timeout)
     asked = []
     pending = None  # (mark, sent) of the newest request whose reply block is not yet in the capture log
 
     def timeout():
+        if time.monotonic() >= until:
+            return load_timeout()
         sent_on = state['sent_on']
         return RuntimeError(f"bridge_on (stub on): the opening was skipped with one press on "
                             f"rev={sent_on['rev']} frame={sent_on['frame']}, but the Title prompt was not "
@@ -4647,6 +4673,8 @@ def _bridge_on_stub_title(ctx, hello, start):
             sample = native_picker.Sample(block, 0)
             if _fields_match(sample, TITLE_PROMPT):
                 native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+                if time.monotonic() >= until:
+                    raise load_timeout(block)
                 if state['sent'] and time.monotonic() >= state['sent_at'] + 10:
                     raise timeout()
                 state['prompt'] = block
@@ -4672,6 +4700,8 @@ def _bridge_on_stub_title(ctx, hello, start):
         return observation
 
     def poll():
+        if time.monotonic() >= until:
+            raise load_timeout()
         if state['sent'] and time.monotonic() >= state['sent_at'] + 10:
             raise timeout()
         ctx.check_stop()

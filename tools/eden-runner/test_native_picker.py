@@ -1143,6 +1143,19 @@ class PickerTests(unittest.TestCase):
                     self.run_pick(replay)
                 self.assertEqual(replay.actions, [])
 
+    def test_already_highlighted_target_still_requires_the_active_layout_pin(self):
+        target = picker.Target('308', 'Final Destination', 'normal')
+        current = tile(1, at='16', target=target, seat='0', token='none')
+        current.values.update({'screen': 'sss', 'layout': 'stage-layout-live',
+                               'focus': 'sss/16', 'at': '16', 'hovered': '16'})
+        foreign_pin = picker.Topology(layout='different-stage-layout', neighbors={}, targets={'16': target})
+        ui = native(1, screen='stage_select', **{'screen.context': 'training', 'focus': 'stage_select'})
+        replay = Replay([current], [ui])
+        with self.assertRaisesRegex(RuntimeError, 'active layout has no validated topology for this target'):
+            picker.pick(replay, 'sss', target, topology=foreign_pin, next_screen='training',
+                        cap=.01, expected_context='training')
+        self.assertEqual(replay.actions, [])
+
     def test_training_context_is_required_for_a_pinned_training_picker(self):
         for screen, context in (('css.training', 'unknown'), ('css.smash', 'training')):
             with self.subTest(screen=screen, context=context):

@@ -99,7 +99,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_open` `{page, cap}` | Training, native or TR menu owner | TR menu open and owned; optional page reached at depth 0 |
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 
-`pick_stage` uses the hash-pinned `sss-training` topology when `topology` is omitted. The picker still requires the live layout fingerprint to match that pin before it moves; a different or unknown layout is refused. Pass an explicit, independently qualified topology pin for another layout.
+`pick_stage` uses the hash-pinned `sss-training` topology when `topology` is omitted. The picker requires the live layout fingerprint to match that pin before it moves or confirms an already-highlighted target; a different or unknown layout is refused. Pass an explicit, independently qualified topology pin for another layout.
 | `tr_idle` `{cap}` | Training | back out of the wizard, close the menu or stop Guard the Edge; verify plain idle Training |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
 | `tr_menu_in_room` `{page, path, then, cap}` | the local-wireless waiting room (after `wireless_room`), TR menu open or closed | the TR menu on `page` with the `path` row focused; `then: "press"` presses it once, `then: "close"` closes the menu. Gated on `tr.menu` `scene=lobby` alone |
@@ -256,8 +256,9 @@ Title prompt is named by the bridge only after it is On. Before the chord the
 evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
 the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.
 With the stub on, if the first active read is the opening movie, the route presses Plus once on that read and waits
-up to 10 seconds for the Title prompt. It never presses twice and never presses on another screen. The press is in
-the receipt with the read it was sent on.
+for the Title prompt for at most 10 seconds after Plus, bounded by the same absolute game-load deadline. A prompt
+after that load deadline is refused, even when the post-Plus 10-second window has time left. It never presses twice
+and never presses on another screen. The press is in the receipt with the read it was sent on.
 The passive Title witness uses the remaining absolute deadline recorded by `routes:load_game`; the GDB kick, game
 load and first Title observation share that route's one cap (900 seconds by default, or the row's explicit `cap`).
 This lets a slow host finish its Title transition without starting a fresh fixed 10-second timer.

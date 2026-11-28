@@ -353,11 +353,15 @@ def move(io, screen, before, ui, at, direction, dest, expected_tile, cap, *, exp
 def hover(io, screen, target, topology=None, cap=4, *, expected_context=None):
     current, ui = baseline(io, screen, cap=cap, expected_context=expected_context)
     at = settled(current)
-    if target is None or (at != 'none' and Target.read(current) == target):
+    if target is None:
         if at == 'none':
             raise RuntimeError('selecting the current tile requires actual settled native hover')
         return current, ui, Target.read(current)
-    if topology is None or topology.layout != current.values['layout']:
+    if topology is not None and topology.layout != current.values['layout']:
+        raise RuntimeError('active layout has no validated topology for this target')
+    if at != 'none' and Target.read(current) == target:
+        return current, ui, Target.read(current)
+    if topology is None:
         raise RuntimeError('active layout has no validated topology for this target')
     matches = [tile for tile, identity in topology.targets.items() if identity == target]
     if len(matches) != 1:

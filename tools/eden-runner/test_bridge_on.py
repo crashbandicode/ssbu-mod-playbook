@@ -524,6 +524,21 @@ class BridgeOnTests(unittest.TestCase):
         self.assertGreater(title["waited_s"], 60)
         self.assertLessEqual(title["waited_s"], 90)
 
+    def test_stub_title_plus_skip_cannot_accept_a_prompt_after_the_load_deadline(self):
+        self.recorded_opening()
+        self.instance['_routes_load_deadline'] = 10
+
+        def arrive_after_load_deadline(_):
+            if self.macro_attempts() and self.seconds < 11.655:
+                self.seconds = 11.655
+
+        self.sleep_hook = arrive_after_load_deadline
+        with self.assertRaisesRegex(RuntimeError, 'game-load deadline'):
+            self.invoke(port=6980)
+        self.assertGreaterEqual(self.seconds, 11.655)
+        self.assertEqual(len(self.macro_attempts()), 1)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+
     def test_stub_title_keeps_one_request_in_flight(self):
         overlaps = self.slow_title_bridge(lambda _: self.sample())
         title = self.invoke(port=6980)['title']
@@ -584,6 +599,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_does_not_accept_the_opening_playback(self):
         self.configure_stub()
+        self.instance['_routes_load_deadline'] = self.seconds + 90
+        self.instance['_routes_load_cap'] = 90
         self.stub_samples, self.stub_default = [self.opening(), self.opening()], ''
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=4 frame=31.*within 10 s.*title/title.opening_playback'):
             self.invoke(port=6980)
@@ -593,6 +610,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_waits_through_the_opening_for_the_prompt(self):
         self.configure_stub()
+        self.instance['_routes_load_deadline'] = self.seconds + 90
+        self.instance['_routes_load_cap'] = 90
         self.stub_samples = [self.opening(), self.opening()] + [''] * 4 + [STUB_UI]
         self.stub_default = ''
         receipt = self.invoke(port=6980)
@@ -605,6 +624,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_resets_prompt_deadline_after_opening_handoff(self):
         self.configure_stub()
+        self.instance['_routes_load_deadline'] = self.seconds + 90
+        self.instance['_routes_load_cap'] = 90
         self.stub_samples = [self.opening(), self.opening()] + [''] * 4 + [self.title_without_prompt()]
         self.stub_default = ''
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press.*within 10 s.*title/title'):
@@ -633,6 +654,8 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_never_presses_twice(self):
         self.recorded_opening(prompt_after_skip=False)
+        self.instance['_routes_load_deadline'] = self.seconds + 90
+        self.instance['_routes_load_cap'] = 90
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=12 frame=72.*within 10 s'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
@@ -910,7 +933,7 @@ class BridgeOnTests(unittest.TestCase):
     def test_bridge_on_stub_on_stops_at_deadline_even_if_macro_completion_is_slow(self):
         self.recorded_opening()
         self.ctx.runner.wait_macro = lambda *_: self.sleep(11)
-        with self.assertRaisesRegex(RuntimeError, 'opening was skipped with one press.*within 10 s'):
+        with self.assertRaisesRegex(RuntimeError, 'game-load deadline'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
 
