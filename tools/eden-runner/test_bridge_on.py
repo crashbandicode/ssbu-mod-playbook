@@ -209,6 +209,29 @@ class BridgeOnTests(unittest.TestCase):
                                    'focus.index': 'unknown', 'focus.label': 'unknown',
                                    'input.owner': 'unknown', 'dialog': 'unknown'})
 
+    def slow_title_bridge(self, response):
+        self.configure_stub()
+        pending, overlaps = [], []
+
+        def request(ctx, *requests):
+            self.assertIs(ctx, self.ctx)
+            self.assertEqual(requests, ('providers', 'state ssbu.ui'))
+            self.bridge_requests.append(requests)
+            self.request_times.append(self.seconds)
+            if pending:
+                overlaps.append(self.seconds)
+            pending.append(self.seconds)
+
+        def deliver(_):
+            while pending and self.seconds - pending[0] >= .25 - 1e-9:
+                pending.pop(0)
+                with Path(self.instance['bridge_log']).open('a') as stream:
+                    stream.write(response(bool(pending)))
+
+        self.spool = request
+        self.sleep_hook = deliver
+        return overlaps
+
     def recorded_opening(self, *, prompt_after_skip=True):
         self.configure_stub()
         self.stub_preamble = RUN1_PREAMBLE
@@ -481,6 +504,36 @@ class BridgeOnTests(unittest.TestCase):
         self.assertIsInstance(title.get('wall'), int)
         self.assertEqual(receipt['chord']['pre_chord']['status'], self.status)
         self.assertEqual(receipt['chord']['pre_chord']['journal']['inputs_after_load'], 0)
+
+    def test_stub_title_keeps_one_request_in_flight(self):
+        overlaps = self.slow_title_bridge(lambda _: self.sample())
+        title = self.invoke(port=6980)['title']
+        self.assertEqual(title['matched'], 'prompt')
+        self.assertEqual(overlaps, [])
+
+    def test_stub_title_passes_on_a_slow_bridge(self):
+        title_seen = []
+
+        def response(queued):
+            if queued:
+                return self.sample(active='no', screen='unknown')
+            if self.macro_attempts():
+                return self.sample()
+            if not title_seen:
+                title_seen.append(True)
+                return self.title_without_prompt()
+            return self.opening()
+
+        overlaps = self.slow_title_bridge(response)
+        try:
+            title = self.invoke(port=6980)['title']
+        except RuntimeError as error:
+            self.fail(f'slow bridge did not reach the prompt: {error}')
+        self.assertEqual(overlaps, [])
+        self.assertEqual([row['focus'] for row in title['not_yet']], ['title', 'title.opening_playback'])
+        self.assertEqual(title['matched'], 'prompt')
+        self.assertEqual(title['skip']['button'], 'plus')
+        self.assertEqual(len(self.macro_attempts()), 1)
 
     def test_bridge_on_stub_on_does_not_accept_the_title_without_its_prompt(self):
         self.configure_stub()
