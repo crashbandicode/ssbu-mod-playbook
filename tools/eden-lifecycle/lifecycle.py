@@ -6,6 +6,7 @@
   lifecycle.py settle    config.json --execute [--minutes N]
   lifecycle.py status    config.json           [--ssh tr-yoga]
   lifecycle.py reserve   config.json --approver NAME --execute
+  lifecycle.py cancel    config.json --reservation-token TOKEN --execute
   lifecycle.py preflight config.json           [--ssh tr-yoga]
   lifecycle.py watchdog  config.json --execute [--ssh tr-yoga] [--rounds N] [--pause S]
 
@@ -651,10 +652,10 @@ class Ledger:
             expired = [record for record in reservations if reservation_expired(record, now)]
             if operation == 'cancel':
                 require(self.exclusive_host, 'Only exclusive_host reservations can be cancelled')
-                own_reservations = [record for line in active_claims(text, self.host)
-                                    if (record := RESERVATION.fullmatch(line))
-                                    and (record['owner'], record['host'], record['label'], bool(record['exclusive']))
-                                    == (self.owner, self.host, self.label, self.exclusive_host)]
+                own_reservations = [record for record in reservations
+                                    if (record['token'], record['owner'], record['host'], record['label'])
+                                    == (self.token, self.owner, self.host, self.label)
+                                    and record['exclusive'] and reservation_expired(record, now) is False]
                 require(len(own_reservations) == 1, 'Exact owned reservation not found; cancellation refused')
                 line = reservation_release(own_reservations[0], 'cancelled by owner')
                 append_ledger(stream, [line])
@@ -673,7 +674,8 @@ class Ledger:
                     if reservation_expired(record, now) is False:
                         age = (now - datetime.fromisoformat(record['at'])).total_seconds()
                         remaining = max(1, int(RESERVATION_TTL_MINUTES * 60 - age))
-                        return {'line': record[0], 'expires_in_seconds': remaining, 'already_reserved': True}
+                        return {'line': record[0], 'reservation_token': self.token,
+                                'expires_in_seconds': remaining, 'already_reserved': True}
                 line = (f'{now.isoformat()} CLAIMED: {self.owner} host={self.host} lifecycle={self.token} '
                         f'Eden reservation run {self.label} approver={approver}')
                 if self.exclusive_host:
@@ -689,7 +691,7 @@ class Ledger:
                     require(isinstance(admission, dict) and isinstance(admission.get('foreign_processes'), list)
                             and not foreign_edens(admission), 'Exclusive host reservation requires no running Eden')
                 append_ledger(stream, [*(reservation_release(old, 'expired') for old in expired), line])
-                return {'line': line, 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60}
+                return {'line': line, 'reservation_token': self.token, 'expires_in_seconds': RESERVATION_TTL_MINUTES * 60}
             skipped = []
             reservation = None
             if operation == 'claim':
@@ -1926,8 +1928,10 @@ class Lifecycle:
             self.record('reserve', result)
         return result
 
-    def cancel_reservation(self):
-        result = self.ledger(uuid.uuid4().hex).operate('cancel')
+    def cancel_reservation(self, token):
+        require(isinstance(token, str) and re.fullmatch(r'[0-9a-f]{32}', token),
+                'cancel requires --reservation-token from the reserve receipt')
+        result = self.ledger(token).operate('cancel')
         if result.get('ssh_retry'):
             self.record('cancel-reservation', result)
         return result
@@ -3934,7 +3938,7 @@ def dispatch(mode, config, execute=False, watchdog_rounds=None, watchdog_pause=N
         approver = config.pop('reservation_approver')
         return Lifecycle(config).reserve_exclusive(approver)
     if mode == 'cancel-reservation':
-        return Lifecycle(config).cancel_reservation()
+        return Lifecycle(config).cancel_reservation(config.get('reservation_token'))
     tool = Lifecycle(config)
     if mode == 'watchdog':
         return tool.watchdog(rounds=watchdog_rounds, pause=watchdog_pause)
@@ -4133,6 +4137,7 @@ def main(argv=None):
     parser.add_argument('--evidence-dir', help='down: where the files the run wrote are copied before the prune '
                         '(default <state_dir>/evidence; eden_test.py passes the run\'s out/)')
     parser.add_argument('--approver', help='reserve: name of the person who approved this reservation')
+    parser.add_argument('--reservation-token', help='cancel: reservation_token from the reserve receipt')
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text())
@@ -4140,6 +4145,7 @@ def main(argv=None):
         require(args.mode == 'down' or not (args.keep_state or args.evidence_dir),
                 '--keep-state and --evidence-dir are down options')
         require(args.mode == 'reserve' or args.approver is None, '--approver is a reserve option')
+        require(args.mode == 'cancel' or args.reservation_token is None, '--reservation-token is a cancel option')
         require(args.mode == 'settle' or args.minutes is None, '--minutes is a settle option')
         if args.mode == 'reserve':
             require(args.approver, 'reserve requires --approver')
@@ -4159,6 +4165,8 @@ def main(argv=None):
             return 0
         if args.mode == 'cancel':
             validate(config)
+            require(args.reservation_token, 'cancel requires --reservation-token from the reserve receipt')
+            config = dict(config, reservation_token=args.reservation_token)
             receipt = (forward(args.ssh, 'cancel-reservation', config, True) if args.ssh else
                        dispatch('cancel-reservation', config, True))
             if receipt.get('ssh_retry'):

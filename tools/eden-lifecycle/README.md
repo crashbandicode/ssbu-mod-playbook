@@ -46,12 +46,14 @@ If a pre-Up check fails, the owner of an exclusive-host reservation can free
 the slot immediately:
 
 ```text
-python3 -B -I lifecycle.py cancel config.json --execute
+python3 -B -I lifecycle.py cancel config.json --reservation-token TOKEN --execute
 ```
 
-Run it on the same executor (or pass `--ssh <executor>`). Cancellation matches
-the active reservation's owner, host, label and `exclusive_host=true` under
-the ledger lock; it does not require a lifecycle claim or wait for the TTL.
+Use `reservation_token` from the reserve receipt (`lifecycle=...` in an older
+receipt's claim line). Run it on the same executor (or pass `--ssh <executor>`).
+Cancellation matches the unexpired reservation's token, owner, host, label and
+`exclusive_host=true` under the ledger lock. A reused label is not enough;
+once Up converts the reservation, only normal Down releases the live claim.
 Another run can reserve the host as soon as the cancellation is recorded.
 
 Use the same `host`, `owner` and `label` for preflight and Up. The command

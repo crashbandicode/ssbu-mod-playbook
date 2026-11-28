@@ -2224,6 +2224,7 @@ print(json.dumps(c.down()))
         self.assertTrue(reserved['line'].endswith('exclusive_host=true'))
 
         token = life.RESERVATION.fullmatch(reserved['line'])['token']
+        self.assertEqual(reserved['reservation_token'], token)
         before = self.ledger_path.read_bytes()
         with patch('sys.stderr', new_callable=io.StringIO):
             self.assertNotEqual(life.main(['cancel', str(config_path), '--execute']), 0)
@@ -2361,7 +2362,7 @@ print(json.dumps(c.down()))
             self.assertTrue(reserved['line'].endswith('exclusive_host=true'))
             stdout.seek(0)
             stdout.truncate()
-            token = life.RESERVATION.fullmatch(reserved['line'])['token']
+            token = reserved['reservation_token']
             self.assertEqual(life.main(['cancel', str(config_path), '--ssh', 'executor',
                                         '--reservation-token', token, '--execute']), 0)
             cancelled = json.loads(stdout.getvalue())
