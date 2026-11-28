@@ -245,6 +245,38 @@
    "frames": 19,
    "what": "ZL+Up in one frame: TrainingRooms load-state chord (default button_config.ini)",
    "source": "byte copy of smash-training-lobby/artifacts/rc15-integration/runtime-plan/remaining-2/segments/chord-load.edenmacro.json (remaining-2 PASS)"
+  },
+  "room-tap-a": {
+   "file": "macros/room-tap-a.edenmacro.json",
+   "sha256": "512f4c6a67b1057ddd311d360ba8b8e98b2654953685d76bb2600c6bd0490745",
+   "cap": 20,
+   "frames": 19,
+   "what": "One A tap for the TrainingRooms menu inside the local-wireless waiting room (routes:tr_menu_in_room)",
+   "source": "byte copy of the TrainingRooms smoke packet segment rm-tap-a (smash-training-lobby/artifacts/phase23/int-next/smoke/packet/rows/segments), flown in the waiting room on intnext-a24cdbef-yoga-1 (2026-11-28) and tmr-f9301d71-yoga-4 (2026-11-27)"
+  },
+  "room-tap-b": {
+   "file": "macros/room-tap-b.edenmacro.json",
+   "sha256": "86bb27b8d9a496936ec2bc2d555af823c59ca7208466ec5f541d2251b9d70562",
+   "cap": 20,
+   "frames": 19,
+   "what": "One B tap for the TrainingRooms menu inside the local-wireless waiting room (routes:tr_menu_in_room)",
+   "source": "byte copy of the TrainingRooms smoke packet segment rm-tap-b (smash-training-lobby/artifacts/phase23/int-next/smoke/packet/rows/segments), flown in the waiting room on intnext-a24cdbef-yoga-1 (2026-11-28) and tmr-f9301d71-yoga-4 (2026-11-27)"
+  },
+  "room-tap-r": {
+   "file": "macros/room-tap-r.edenmacro.json",
+   "sha256": "8f8deacb981dee944157e975017303d705b987e9981a8228e10e1857394904fb",
+   "cap": 20,
+   "frames": 19,
+   "what": "One R tap for the TrainingRooms menu inside the local-wireless waiting room (routes:tr_menu_in_room)",
+   "source": "byte copy of the TrainingRooms smoke packet segment rm-tap-r (smash-training-lobby/artifacts/phase23/int-next/smoke/packet/rows/segments), flown in the waiting room on intnext-a24cdbef-yoga-1 (2026-11-28) and tmr-f9301d71-yoga-4 (2026-11-27)"
+  },
+  "room-tap-down": {
+   "file": "macros/room-tap-down.edenmacro.json",
+   "sha256": "73431237047eb127383d59a9bbda24baf0a3f143169120b9f5fab8b3f6b12103",
+   "cap": 20,
+   "frames": 19,
+   "what": "One D-pad Down tap for the TrainingRooms menu inside the local-wireless waiting room (routes:tr_menu_in_room)",
+   "source": "byte copy of the TrainingRooms smoke packet segment rm-tap-down (smash-training-lobby/artifacts/phase23/int-next/smoke/packet/rows/segments), flown in the waiting room on intnext-a24cdbef-yoga-1 (2026-11-28) and tmr-f9301d71-yoga-4 (2026-11-27)"
   }
  }
 }
