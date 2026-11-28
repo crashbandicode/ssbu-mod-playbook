@@ -2234,10 +2234,13 @@ def _names_path(text, path):
 
 
 def _json_strings(node):
+    """Yield run references, excluding ports_root: it bounds allocation scans, not an owned run's data."""
     if isinstance(node, str):
         yield node
     elif isinstance(node, dict):
         for key, value in node.items():
+            if key == 'ports_root':
+                continue
             yield key
             yield from _json_strings(value)
     elif isinstance(node, list):

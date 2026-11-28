@@ -3435,6 +3435,24 @@ class EdenTestTests(unittest.TestCase):
         self.assertFalse((run / 'work').exists())
         self.assertFalse(stage.exists())
 
+    def test_down_ignores_peer_ports_root_when_pruning_run_copies(self):
+        self.pruning_lifecycle()
+        run = self.up_run('ports-root-a')
+        peer = self.up_run('ports-root-b')
+        peer_config_path = peer / 'config.json'
+        peer_config = json.loads(peer_config_path.read_text())
+        peer_config['ports_root'] = str(eden_test.RUNS)
+        peer_config_path.write_text(json.dumps(peer_config))
+        journal_path = peer / 'state/lifecycle.json'
+        journal = json.loads(journal_path.read_text())
+        journal['config'] = {'ports_root': str(eden_test.RUNS)}
+        journal['config_original'] = {'ports_root': str(eden_test.RUNS)}
+        journal_path.write_text(json.dumps(journal))
+        eden_test.main(['down', str(run)])
+        self.assertFalse((run / 'work').exists())
+        self.assertFalse((run / 'state/snapshot-a').exists())
+        self.assertEqual(self.cleanup(run)['kept'], [])
+
     def test_down_keeps_a_copy_under_a_folder_another_run_names(self):
         self.pruning_lifecycle()
         run = self.up_run()
