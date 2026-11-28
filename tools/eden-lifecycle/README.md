@@ -42,6 +42,18 @@ from its normal executor:
 python3 -B -I lifecycle.py reserve config.json --approver tr-primary-2 --execute
 ```
 
+If a pre-Up check fails, the owner of an exclusive-host reservation can free
+the slot immediately:
+
+```text
+python3 -B -I lifecycle.py cancel config.json --execute
+```
+
+Run it on the same executor (or pass `--ssh <executor>`). Cancellation matches
+the active reservation's owner, host, label and `exclusive_host=true` under
+the ledger lock; it does not require a lifecycle claim or wait for the TTL.
+Another run can reserve the host as soon as the cancellation is recorded.
+
 Use the same `host`, `owner` and `label` for preflight and Up. The command
 appends one reservation to the configured authoritative ledger, using
 `ledger_ssh` when present. The approver name records the approval already

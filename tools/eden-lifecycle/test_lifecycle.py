@@ -2214,6 +2214,27 @@ print(json.dumps(c.down()))
         self.assertEqual(controller.down()['phase'], 'down')
         self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'surface'), [])
 
+    def test_owner_can_cancel_exclusive_reservation_before_up_and_free_slot(self):
+        config = dict(self.config, exclusive_host=True)
+        config_path = self.base / 'exclusive-cancel.json'
+        config_path.write_text(json.dumps(config))
+        with patch.object(life, 'Host', return_value=self.host), patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.assertEqual(life.main(['reserve', str(config_path), '--approver', 'tr-primary-2', '--execute']), 0)
+            reserved = json.loads(stdout.getvalue())
+        self.assertTrue(reserved['line'].endswith('exclusive_host=true'))
+
+        with patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.assertEqual(life.main(['cancel', str(config_path), '--execute']), 0)
+            cancelled = json.loads(stdout.getvalue())
+        self.assertTrue(cancelled['cancelled'])
+        self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'surface'), [])
+
+        next_owner = life.Ledger(self.ledger_path, 'surface', 'Codex next/run', 'b' * 32,
+                                 label='next-run', exclusive_host=True)
+        next_reservation = next_owner.operate('reserve', approver='tr-primary-2',
+                                              admission={'foreign_processes': []})
+        self.assertTrue(next_reservation['line'].endswith('exclusive_host=true'))
+
     def test_reservation_rejects_multiline_owner_before_append(self):
         before = self.ledger_path.read_bytes()
         reserve = life.Ledger(self.ledger_path, 'surface', 'Codex\nmultiline', 'a' * 32, label='test-01')
@@ -2277,6 +2298,40 @@ print(json.dumps(c.down()))
         self.assertIn(('ledger-host', 'ledger-claim', True), calls)
         self.assertIn(('ledger-host', 'ledger-release', True), calls)
         self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'xps'), [])
+
+    def test_exclusive_reservation_cancels_before_up_through_executor_and_ledger(self):
+        config = dict(self.config, host='xps', exclusive_host=True, ledger_ssh='ledger-host')
+        config_path = self.base / 'exclusive-cancel-remote.json'
+        config_path.write_text(json.dumps(config))
+        calls = []
+
+        def forward(host, mode, packet, execute):
+            calls.append((host, mode, execute))
+            return life.dispatch(mode, packet, execute)
+
+        def ledger_forward(host, operation, packet, **kwargs):
+            self.assertEqual(host, 'ledger-host')
+            calls.append((host, 'ledger-' + operation, True))
+            return life.dispatch('ledger-' + operation, packet, True)
+
+        with patch.object(life, 'forward', forward), patch.object(life, 'ledger_forward', ledger_forward), \
+                patch.object(life, 'Host', return_value=self.host), patch('sys.stdout', new_callable=io.StringIO) as stdout:
+            self.assertEqual(life.main(['reserve', str(config_path), '--ssh', 'executor',
+                                        '--approver', 'tr-primary-2', '--execute']), 0)
+            reserved = json.loads(stdout.getvalue())
+            self.assertTrue(reserved['line'].endswith('exclusive_host=true'))
+            stdout.seek(0)
+            stdout.truncate()
+            self.assertEqual(life.main(['cancel', str(config_path), '--ssh', 'executor', '--execute']), 0)
+            cancelled = json.loads(stdout.getvalue())
+
+        self.assertTrue(cancelled['cancelled'])
+        self.assertIn(('executor', 'cancel-reservation', True), calls)
+        self.assertIn(('ledger-host', 'ledger-cancel', True), calls)
+        self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'xps'), [])
+        next_owner = life.Ledger(self.ledger_path, 'xps', 'Codex next/run', 'b' * 32,
+                                 label='next-run', exclusive_host=True)
+        next_owner.operate('reserve', approver='tr-primary-2', admission={'foreign_processes': []})
 
     def test_exclusive_reservation_expires_without_up(self):
         now = datetime.now(timezone.utc)
