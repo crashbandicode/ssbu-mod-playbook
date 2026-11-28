@@ -1028,6 +1028,8 @@ class SetTests(OpenCloseTests):
         except RuntimeError as error:
             self.fail(f'tr_set rejected a transient inactive read: {error}')
         self.assertTrue(result['ok'])
+        receipt = json.loads((Path(self.ctx.row_dir) / 'routes-tr-set.json').read_text())
+        self.assertTrue(receipt['ok'])
         self.assertEqual(events[:5], [('read', 'ssbu.ui', 569, 'yes'),
                                       ('read', 'tr.menu', 570, '1'),
                                       ('read', 'tr.menu', 571, '1'),
@@ -1064,6 +1066,49 @@ class SetTests(OpenCloseTests):
             self.run_set(io, 'toggle', [0, 1])
         self.assertEqual(io.actions, [])
         self.assertEqual(sum(event[0:2] == ('read', 'ssbu.ui') for event in events), 1)
+
+    def test_tr_idle_waits_through_inactive_ui_before_closing(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        io.menu.update({'open': '1', 'game.running': '0', 'notice.header': ''})
+        events = self.training_ui_reads(io, [1])
+        result = self.invoke('tr_idle', io, cap=1)
+        self.assertTrue(result['ok'])
+        active = next(index for index, event in enumerate(events)
+                      if event[0:2] == ('read', 'ssbu.ui') and event[3] == 'yes')
+        self.assertFalse(any(event[0] == 'send' for event in events[:active]))
+        self.assertIn('tap-b1', io.actions)
+
+    def test_tr_idle_fails_closed_without_an_active_ui(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        io.menu.update({'open': '1', 'game.running': '0', 'notice.header': ''})
+        self.training_ui_reads(io, [100])
+        with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap'):
+            self.invoke('tr_idle', io, cap=1)
+        self.assertEqual(io.actions, [])
+
+    def test_tr_settings_waits_through_inactive_ui_before_applying(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        events = self.training_ui_reads(io, [1])
+        settings = json.dumps({'menu': io.stored}).encode()
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings', return_value=settings),
+              patch.object(routes, '_apply_settings', return_value=('ok', 'ok')) as apply,
+              patch.object(routes, '_save', side_effect=lambda ctx, name, value: value)):
+            result = routes.tr_settings(self.ctx, values={'lra_reset': [1, 0]}, cap=1)
+        self.assertEqual(result['verified']['values'], {'lra_reset': [1, 0]})
+        self.assertEqual([event[3] for event in events if event[0:2] == ('read', 'ssbu.ui')], ['no', 'yes'])
+        apply.assert_called_once()
+
+    def test_tr_settings_fails_closed_without_an_active_ui(self):
+        io = SetIO(self.ctx, 'toggle', 'lra_reset', [0, 1])
+        self.training_ui_reads(io, [100])
+        with (patch.object(routes, 'BridgePickerIO', return_value=io),
+              patch.object(routes, '_fetch_settings') as fetch,
+              patch.object(routes, '_apply_settings') as apply):
+            with self.assertRaisesRegex(RuntimeError, 'no active ssbu.ui observation.*cap'):
+                routes.tr_settings(self.ctx, values={'lra_reset': [1, 0]}, cap=1)
+        fetch.assert_not_called()
+        apply.assert_not_called()
 
     def test_oversized_sdi_settings_cannot_certify_product_index(self):
         io = SetIO(self.ctx, 'list', 'sdi_strength', [0] * 8 + [1])

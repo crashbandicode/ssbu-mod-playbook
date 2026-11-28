@@ -715,6 +715,7 @@ with a handled ACK, because the outer cursor does not move there. A repeated ide
 not read or establish the focused row's stored value.
 
 `routes:tr_set(page, path, kind, value, cap=45)` accepts `list`, `toggle`, `checklist`, or `practice_cpu`.
+An inactive `ssbu.ui` read during the owner wait is not yet; the route reads again until its cap and then fails closed.
 It closes the menu, reads `settings.json` through the bridge, navigates to the row, changes it as needed,
 closes the menu and compares a fresh file read. Changed values require a fresh writer line; already-stored
 values skip both the change and writer and must match again on the final read. Source-pinned row kinds

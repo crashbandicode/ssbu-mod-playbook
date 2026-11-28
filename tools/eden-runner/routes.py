@@ -3902,12 +3902,25 @@ def _tr_menu_gate(ctx, cap):
     return str(Path(ctx.row_dir) / 'gate-routes.tr-menu.json')
 
 
+def _active_ui(io, until, what):
+    """A fresh, active ssbu.ui sample. An inactive block is "not yet": the bridge publishes it while it cannot
+    observe the game's UI owner (seen while TrainingRooms loads fighters: xplat-yoga-2, xplat-ally-8/-9, 2026-11-28).
+    The next read is asked until `until`; then the route fails closed."""
+    last = None
+    while (remaining := until - time.monotonic()) > 0:
+        sample = io.read(native_picker.UI, remaining)
+        if sample.values.get('observation.active') == 'yes':
+            return native_picker.check_sample(sample, native_picker.UI)
+        last = native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+    seen = f'; last inactive rev={last.block["rev"]}' if last is not None else ''
+    raise RuntimeError(f'{what}: no active ssbu.ui observation before the cap{seen}')
+
+
 def _wait_training_owner(io, menu, until, owner):
     expected = {**TRAINING_SCREEN, 'input.owner': owner}
     ui = None
     while time.monotonic() < until:
-        ui = _remember(io, native_picker.check_sample(
-            io.read(native_picker.UI, until - time.monotonic()), native_picker.UI))
+        ui = _remember(io, _active_ui(io, until, 'Training Mod owner'))
         native_picker.same_epoch(menu, ui, in_flight=True)
         if _fields_match(ui, expected):
             return ui
@@ -5268,7 +5281,7 @@ def _tr_idle(ctx, cap, metrics):
     while time.monotonic() < until:
         ctx.check_stop()
         menu = _tr_current(io, until)
-        ui = _remember(io, io.read(native_picker.UI, max(.001, until - time.monotonic())))
+        ui = _remember(io, _active_ui(io, until, 'tr_idle'))
         native_picker.same_epoch(menu, ui, in_flight=True)
         last = {'open': menu.values.get('open'), 'game.running': menu.values.get('game.running'),
                 'notice.header': menu.values.get('notice.header'), 'input.owner': ui.values.get('input.owner')}
@@ -6660,7 +6673,7 @@ def _tr_settings(ctx, values, file, cap, verify_roster, metrics):
         raise ValueError('supply exactly one of values or file')
     start = time.monotonic()
     io = BridgePickerIO(ctx)
-    native_picker.wait_sample(io, native_picker.UI, start + cap)
+    _active_ui(io, start + cap, 'Training Mod settings')
     remaining = cap - (time.monotonic() - start)
     if remaining <= 0:
         raise RuntimeError('settings deadline expired before the initial read')
