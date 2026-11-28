@@ -17,7 +17,7 @@ import tempfile
 import types
 import unittest
 from contextlib import chdir, redirect_stderr, redirect_stdout
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -4960,6 +4960,33 @@ class WindowsHostTests(unittest.TestCase):
             self.assertEqual(eden_test._python(), [sys.executable, '-B', '-I'])
         with mock.patch.object(eden_test.host_os, 'WINDOWS', True):
             self.assertEqual(eden_test._python(), [sys.executable, '-B', '-X', 'utf8'])
+
+    def test_windows_down_honors_path_pins(self):
+        root = PureWindowsPath('C:/home/intpa/eden-runs/run-one')
+        work = root / 'work'
+        peer = self.run / 'peer.json'
+        peer.write_text(json.dumps({'source': root.as_posix().upper()}))
+        with mock.patch.object(eden_test.host_os, 'WINDOWS', True), \
+                mock.patch.object(eden_test, '_pinning_files', return_value=[peer]), \
+                mock.patch.object(eden_test, '_process_reason', return_value=None):
+            guard = eden_test._DownGuard(self.run, self.run, [])
+            self.assertIn('peer.json names', guard.reason(work) or '')
+            (self.run / '.keep').write_text(work.as_posix().upper() + '\n')
+            peer.write_text(json.dumps({'source': (root.parent / 'run-one-more').as_posix()}))
+            guard = eden_test._DownGuard(self.run, self.run, [])
+            self.assertIn('.keep lists', guard.reason(work) or '')
+            self.assertIsNone(guard.reason(root / 'work-two'))
+
+    @unittest.skipUnless(os.name == 'nt', 'live Windows file sharing')
+    def test_windows_down_keeps_a_file_open_without_a_path_in_argv(self):
+        path = self.run / 'work'
+        path.mkdir()
+        leaf = path / 'profile.dat'
+        leaf.write_bytes(b'x')
+        with mock.patch.object(eden_test.host_os, 'windows_processes', return_value=[]):
+            with leaf.open('rb'):
+                self.assertIsNotNone(eden_test._process_reason([path]))
+            self.assertIsNone(eden_test._process_reason([path]))
 
     def test_report_uses_controller_follow_up_commands(self):
         with mock.patch.object(eden_test, 'report_rows_with_stalls', return_value=[]), \

@@ -1382,6 +1382,13 @@ class BridgeOnTests(unittest.TestCase):
         self.assertAlmostEqual(title['still_s'], 8, delta=.3)
         self.assertEqual(self.macro_attempts(), [])
 
+    def test_stub_title_freeze_after_plus_does_not_report_no_input(self):
+        opening = self.opening()
+        self.frame_timeline(lambda elapsed: (31 + min(30, int(elapsed * 60)), opening))
+        with self.assertRaisesRegex(RuntimeError, r'counter stayed at 61.*Plus was sent once'):
+            self.invoke(port=6980, cap=4)
+        self.assertEqual(len(self.macro_attempts()), 1)
+
     def test_stub_title_opening_press_waits_for_frame_advance(self):
         inactive, opening, prompt = self.sample(active='no', screen='unknown'), self.opening(), self.sample()
         first_opening = []
