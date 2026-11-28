@@ -4940,7 +4940,9 @@ def _send_with_retry(io, macro, until, wait):
     return result
 
 
-def _tr_input(io, before, macro, until, *, opened=True):
+def _tr_input(io, before, macro, until, *, opened=True, scene='training'):
+    """One input into the TrainingRooms menu, fenced by exactly one handled ACK of `tr.menu`. `scene` is the scene the
+    menu must stay in (`lobby`: the waiting room); `opened=None` accepts the menu open or closed afterwards."""
     old_ack = native_picker.number(before, 'ack')
     if time.monotonic() >= until:
         raise RuntimeError(f'Training Mod deadline expired before {macro}')
@@ -4964,8 +4966,11 @@ def _tr_input(io, before, macro, until, *, opened=True):
                 raise RuntimeError(f'input handled twice: expected ACK {old_ack + 1}; saw {ack}')
             if ack != old_ack + 1 or after.values.get('ack.result') != 'handled':
                 raise RuntimeError(f'expected one handled ACK {old_ack + 1}; saw {ack} {after.values.get("ack.result")}')
-            if not _fields_match(after, {'scene': 'training', 'keyboard': '0', 'open': str(int(opened))}):
-                raise RuntimeError(f'expected Training Mod open={int(opened)}; saw {after.values}')
+            wanted = {'scene': scene, 'keyboard': '0'} | ({} if opened is None else {'open': str(int(opened))})
+            if not _fields_match(after, wanted):
+                if scene == 'training':
+                    raise RuntimeError(f'expected Training Mod open={int(opened)}; saw {after.values}')
+                raise RuntimeError(f'expected the TrainingRooms menu in scene {scene} with {wanted}; saw {after.values}')
             return after
         return None
 
@@ -5091,15 +5096,18 @@ def _save_block(ctx, name, receipt):
 TR_PAGES = ('cpu', 'saves', 'recording', 'fighters_stages', 'display_controls', 'developer')
 
 
-def _tr_current(io, until):
+def _tr_current(io, until, scene='training'):
     remaining = until - time.monotonic()
     if remaining <= 0:
         raise RuntimeError('Training Mod deadline expired before the menu read')
     menu = _remember(io, io.read('tr.menu', remaining))
     if (menu.block['schema'] != 'tr.menu/1' or menu.block['rev'] <= 0 or menu.block['filtered']
-            or menu.values.get('scene') != 'training' or menu.values.get('keyboard') != '0'
+            or menu.values.get('scene') != scene or menu.values.get('keyboard') != '0'
             or menu.values.get('open') not in ('0', '1')):
-        raise RuntimeError(f'expected complete menu observation in Training without a keyboard; saw {menu.values!r}')
+        if scene == 'training':
+            raise RuntimeError(f'expected complete menu observation in Training without a keyboard; saw {menu.values!r}')
+        raise RuntimeError('expected a complete tr.menu observation in the waiting room (scene=lobby) without a '
+                           f'keyboard; saw {menu.values!r}')
     return menu
 
 
@@ -5107,10 +5115,10 @@ def _tr_depth(menu):
     return native_picker.number(menu, 'depth')
 
 
-def _tr_back_to_page(io, menu, until):
+def _tr_back_to_page(io, menu, until, *, scene='training', back='tap-b1'):
     while _tr_depth(menu) > 0:
         before = _tr_depth(menu)
-        menu = _tr_input(io, menu, 'tap-b1', until)
+        menu = _tr_input(io, menu, back, until, scene=scene)
         if _tr_depth(menu) >= before:
             raise RuntimeError('Training Mod depth did not decrease after B')
     return menu
@@ -5305,7 +5313,7 @@ def _tr_identity(menu):
     return tuple(menu.values[key] for key in fields)
 
 
-def _navigate_menu(io, menu, page, path, until):
+def _navigate_menu(io, menu, page, path, until, *, scene='training', down='main-menu-down', enter='tap-a1'):
     for index, target in enumerate(path):
         depth = _tr_depth(menu)
         group = menu.values.get('group')
@@ -5325,7 +5333,7 @@ def _navigate_menu(io, menu, page, path, until):
             if before in seen:
                 raise RuntimeError(f'Training Mod row not found before wrapping: {target!r}')
             seen.add(before)
-            after = _tr_input(io, menu, 'main-menu-down', until)
+            after = _tr_input(io, menu, down, until, scene=scene)
             if after.values.get('page') != page or _tr_depth(after) != depth:
                 raise RuntimeError('Training Mod page or depth changed while seeking row')
             if nested:
@@ -5342,7 +5350,7 @@ def _navigate_menu(io, menu, page, path, until):
                 raise RuntimeError(f'Training Mod row not found before wrapping: {target!r}')
             menu = after
         if index + 1 < len(path):
-            after = _tr_input(io, menu, 'tap-a1', until)
+            after = _tr_input(io, menu, enter, until, scene=scene)
             if after.values.get('page') != page or _tr_depth(after) != depth + 1:
                 raise RuntimeError('Training Mod page or depth did not enter the requested sub-screen')
             if not isinstance(after.values.get('group'), str) or not after.values['group'].isdigit():
@@ -5383,6 +5391,89 @@ def _tr_goto(ctx, page, path, targets, cap, metrics):
                     | {'depth': _tr_depth(menu), 'owner': owner.values['input.owner']},
         **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped,
     }
+
+
+def tr_menu_in_room(ctx, page=None, path=None, then='focus', cap=45):
+    """Drive the TrainingRooms menu inside the local-wireless waiting room (after `wireless_room`).
+
+    Opens the menu if it is closed, goes to `page`, walks `path` (as `tr_goto`: action IDs, or objects with `action`
+    and/or `row`) and leaves the target focused. `then='press'` presses A on the target once; `then='close'` (no page
+    or path) backs out and closes the menu. Every input is fenced by exactly one handled ACK of `tr.menu` with
+    `scene=lobby` and no keyboard, and nothing else is read: the dashboard reader does not observe in the room.
+    The taps are the room's own macros (`room-tap-a/b/r/down`), the ones flown there.
+    """
+    args = {'page': page, 'path': path, 'then': then, 'cap': cap}
+
+    def action(metrics):
+        if then not in ('focus', 'press', 'close'):
+            raise RuntimeError(f"tr_menu_in_room: then must be 'focus', 'press' or 'close', not {then!r}")
+        if page is not None and page not in TR_PAGES:
+            raise RuntimeError(f'unknown Training Mod page {page!r}')
+        if path is not None and page is None:
+            raise RuntimeError('tr_menu_in_room: a path needs its page')
+        targets = _tr_path(path) if path is not None else None
+        if then == 'press' and targets is None:
+            raise RuntimeError('tr_menu_in_room: press needs the path of the row to press')
+        if then == 'close' and (page is not None or path is not None):
+            raise RuntimeError('tr_menu_in_room: close takes no page or path')
+        if type(cap) not in (int, float) or not 0 < cap < float('inf'):
+            raise RuntimeError('tr_menu_in_room needs a positive cap')
+        return _tr_menu_in_room(ctx, page, targets, then, cap, metrics, args)
+
+    return _block(ctx, 'tr_menu_in_room', 'routes-tr-menu-in-room', args, action)
+
+
+def _tr_menu_in_room(ctx, page, targets, then, cap, metrics, args):
+    started = time.monotonic()
+    until = started + cap
+    io = BridgePickerIO(ctx)
+    scene = 'lobby'
+    menu = _tr_current(io, until, scene)
+    skipped = []
+    pressed = None
+    if then == 'close':
+        if menu.values['open'] == '0':
+            skipped.append('close')
+        else:
+            menu = _tr_back_to_page(io, menu, until, scene=scene, back='room-tap-b')
+            menu = _tr_input(io, menu, 'room-tap-b', until, opened=False, scene=scene)
+    else:
+        if menu.values['open'] == '1':
+            skipped.append('open')
+        else:
+            before = menu
+            menu = _send_with_retry(io, 'tr-menu-open', until, lambda deadline: _try_tr_condition(
+                io, before, deadline, lambda state: state.values.get('open') == '1', scene))
+            if menu is None:
+                raise RuntimeError('expected the TrainingRooms menu open in the waiting room; saw no new open menu')
+        if page is not None:
+            menu = _tr_back_to_page(io, menu, until, scene=scene, back='room-tap-b')
+            for _ in range(len(TR_PAGES)):
+                current = menu.values.get('page')
+                if current == page:
+                    break
+                if current not in TR_PAGES:
+                    raise RuntimeError(f'Training Mod current page is unknown: {current!r}')
+                menu = _tr_input(io, menu, 'room-tap-r', until, scene=scene)
+                if menu.values.get('page') == current or _tr_depth(menu) != 0:
+                    raise RuntimeError('Training Mod page did not change at depth 0 after R')
+            if menu.values.get('page') != page:
+                raise RuntimeError(f'Training Mod page {page!r} was not reached within the page ring')
+        if targets is not None:
+            menu = _navigate_menu(io, menu, page, targets, until, scene=scene, down='room-tap-down', enter='room-tap-a')
+            _tr_identity(menu)
+        if then == 'press':
+            pressed = {'action': menu.values.get('action'), 'row': menu.values.get('row')}
+            menu = _tr_input(io, menu, 'room-tap-a', until, opened=None, scene=scene)
+    verified = {key: menu.values.get(key) for key in ('scene', 'open', 'page', 'focus', 'action', 'row')}
+    verified |= {'depth': _tr_depth(menu), 'ack': native_picker.number(menu, 'ack')}
+    if 'game.running' in menu.values:
+        verified['game.running'] = menu.values['game.running']
+    if pressed is not None:
+        verified['pressed'] = pressed
+    elapsed = round((time.monotonic() - started) * 1000)
+    return {'block': 'tr_menu_in_room', 'args': args, 'verified': verified,
+            **metrics, 'ms': {'menu': elapsed, 'total': elapsed}, 'skipped': skipped}
 
 
 def _settings_menu(data):
@@ -5925,7 +6016,7 @@ def _wizard_place(ctx, args, targets, metrics):
     }
 
 
-def _try_tr_condition(io, before, until, predicate):
+def _try_tr_condition(io, before, until, predicate, scene='training'):
     latest = before
     while (remaining := until - time.monotonic()) > 0:
         state = _remember(io, io.read('tr.menu', remaining))
@@ -5935,8 +6026,10 @@ def _try_tr_condition(io, before, until, predicate):
         if state.block['rev'] <= latest.block['rev']:
             continue
         latest = state
-        if state.values.get('scene') != 'training' or state.values.get('keyboard') != '0':
-            raise RuntimeError(f'expected Training scene without keyboard; saw {state.values!r}')
+        if state.values.get('scene') != scene or state.values.get('keyboard') != '0':
+            if scene == 'training':
+                raise RuntimeError(f'expected Training scene without keyboard; saw {state.values!r}')
+            raise RuntimeError(f'expected tr.menu scene={scene} without a keyboard; saw {state.values!r}')
         if predicate(state):
             return state
     return None

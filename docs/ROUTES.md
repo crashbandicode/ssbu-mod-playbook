@@ -73,6 +73,7 @@ The data the blocks use is in `tools/eden-runner/library/routes/`:
 | `tr_close` `{cap}` | Training, native or TR menu owner | menu closed and native owner restored |
 | `tr_idle` `{cap}` | Training | back out of the wizard, close the menu or stop Guard the Edge; verify plain idle Training |
 | `tr_goto` `{page, path, cap}` | Training, native or TR menu owner | requested row focused without activating the final element |
+| `tr_menu_in_room` `{page, path, then, cap}` | the local-wireless waiting room (after `wireless_room`), TR menu open or closed | the TR menu on `page` with the `path` row focused; `then: "press"` presses it once, `then: "close"` closes the menu. Gated on `tr.menu` `scene=lobby` alone |
 | `tr_set` `{page, path, kind, value, cap}` | Training, settings file available through bridge | stored value reread, with a writer line for changes |
 | `wizard_place` `{game, area, cpu, p1, cap, pulse_cap, tolerance}` | Guard the Edge wizard or Training menu | shown positions checked at unconfirmed Preview |
 | `drill_start` `{game, expect, cap}` | Guard the Edge Preview, or no practice game running | wizard dismissed or game running, plus first release after the fence when tracing |
@@ -655,6 +656,30 @@ Each of these eight blocks writes `ok: true` on success. Failure receipts have `
 the last values read without a further bridge request, and any partial observations, never `verified`.
 Repeated calls in the same row retain earlier receipts with numbered suffixes. When an input has no
 observed effect for three seconds, the block retries once; receipt metrics count retries.
+
+`routes:tr_menu_in_room(page=None, path=None, then="focus", cap=45)` is the same walk inside the local-wireless
+waiting room, where `tr_open`, `tr_goto` and `tr_close` refuse (they need `scene=training` and the dashboard's
+Training input owner).
+
+- **Start:** native `ldn.waiting` reached with `frontend_room {role: host}` and `wireless_room`; the menu may be
+  open or closed. Lobby Practice must already be on: set it in Training, because the bridge refuses a settings
+  write inside the room.
+- **What it does:** opens the menu if needed, backs out to the page level, goes round the page ring to `page`,
+  and walks `path` exactly as `tr_goto` does. `then: "focus"` stops with the row focused. `then: "press"` presses
+  A on it once (start a drill, toggle a row). `then: "close"`, with no page or path, backs out and closes.
+- **Gate:** every input needs exactly one handled ACK of `tr.menu` with `scene=lobby` and no keyboard. Nothing
+  else is read: the dashboard reader does not observe in the room (`ssbu.ui` reads `screen=unknown` there).
+  Outside the room the block stops before any input.
+- **Inputs:** `tr-menu-open` and the room's own taps `room-tap-a`, `room-tap-b`, `room-tap-r`, `room-tap-down`
+  (19 frames each; the ones flown in the room).
+- **Receipt:** `routes-tr-menu-in-room.json` with `verified` `{scene, open, page, depth, focus, action, row, ack}`,
+  `pressed` after a press, and `game.running` when the menu publishes it.
+- **Not covered:** changing a value (use `tr_settings` before the room), the result of a press beyond its ACK
+  (gate the next step on what the press should cause), leaving the room, and choosing the room's fighter.
+
+```json
+{"run": "routes:tr_menu_in_room", "args": {"page": "fighters_stages", "path": ["game.6", "start.6"], "then": "press"}}
+```
 
 `routes:tr_goto(page, path, cap=30)` opens the menu and walks action IDs, or objects containing `action` and/or
 the static `row` title, into nested Rows screens. Titles match after NFKC normalization, case folding and
