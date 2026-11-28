@@ -92,7 +92,7 @@ measured 47–55 frames/s there and is not offered. An Ally film run needs the
 interactive session: the recorder starts through a one-shot scheduled task
 with `pythonw.exe`. The Ally `film.py smoke` remains the Windows capture
 evidence; no Ally boot has filmed yet (`xplat-ally-3` through `-7` stopped
-before the film row).
+before the film row, and `xplat-ally-8` failed the toggle row).
 
 Linux `x11grab` is host tests only; no boot has filmed through it yet. The
 film lanes' own GStreamer capture remains what was flown.

@@ -15,8 +15,9 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   - `pick_fighters` for P1 only;
   - `enter_training`, `chord`, `fixture`, `back_to_main`.
 - **Ally relay boots** (2026-11-27–28 UTC): `host_network`, `configure_boot` and `load_game` passed in
-  `xplat-ally-4` through `xplat-ally-7`. The bridge row failed in each of `xplat-ally-3` through `-7`;
-  these boots did not reach `to_main`, `reach_training` or `tr_set`.
+  `xplat-ally-4` through `xplat-ally-8`. The bridge row failed in each of `xplat-ally-3` through `-7`.
+  In `xplat-ally-8`, `bridge_on`, `to_main` and `reach_training` passed; the first `tr_set` failed with
+  `ssbu.ui: incomplete, inactive or wrong-schema observation`, before sending input.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
@@ -224,7 +225,7 @@ its events log reads `[Bridge] listen failed … call=listen errno=22`. The brid
 
 `bridge_on` accepts a trace witness or, on Linux and Windows Eden hosts with the stub on, checks boot-default chord
 readiness, running and loading status, no input since `game.load`, and listener ownership before capture. On Windows
-the listener must belong to the run's `eden.exe` (2026-11-27; host tests only until the proof boot). With the stub on, the
+the listener must belong to the run's `eden.exe`. With the stub on, the
 Title prompt is named by the bridge only after it is On. Before the chord the
 evidence is that the game has had no input since `game.load` and its UI loop runs, which is the opening, the Title or
 the attract loop. The Title read requires `title.press_any`, and records the frame and wall from that observation.
