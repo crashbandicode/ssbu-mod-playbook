@@ -535,6 +535,26 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(title['skip']['button'], 'plus')
         self.assertEqual(len(self.macro_attempts()), 1)
 
+    def test_stub_title_asks_again_after_the_reply_bound(self):
+        self.configure_stub()
+
+        def request(ctx, *requests):
+            self.assertIs(ctx, self.ctx)
+            self.assertEqual(requests, ('providers', 'state ssbu.ui'))
+            self.bridge_requests.append(requests)
+            self.request_times.append(self.seconds)
+            if len(self.request_times) == 2:
+                with Path(self.instance['bridge_log']).open('a') as stream:
+                    stream.write(self.sample())
+
+        self.spool = request
+        title = self.invoke(port=6980)['title']
+        self.assertEqual(title['matched'], 'prompt')
+        self.assertEqual(len(self.request_times), 2)
+        self.assertGreaterEqual(self.request_times[1] - self.request_times[0], 2)
+        self.assertLess(self.request_times[1] - self.request_times[0], 2.1)
+        self.assertEqual(self.macro_attempts(), [])
+
     def test_bridge_on_stub_on_does_not_accept_the_title_without_its_prompt(self):
         self.configure_stub()
         self.stub_samples, self.stub_default = [self.title_without_prompt()], ''
