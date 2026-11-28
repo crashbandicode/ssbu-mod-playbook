@@ -63,7 +63,10 @@ refused as soon as any stamped full-snapshot tree or `CARD-SHA256SUMS.txt`
 exists, even if an older plugin-only stamp remains. This mode records
 `card_snapshot: plugins-only (awaiting first full snapshot)` in `config.json`
 and `REPORT.md`; there is no implicit fallback. `--no-card-lineup` remains
-refused. The receipt is in `config.json` (`card_lineup`, `staged_plugins`,
+refused. Start interim runs from the workspace controller; for a remotely
+prepared run, use `remote ... up` or `remote ... fly`. The host asks the
+controller to recheck its snapshot directory at Up and refuses without a reply.
+The receipt is in `config.json` (`card_lineup`, `staged_plugins`,
 `superseded_base_pins`) and `REPORT.md`.
 `go` and `up` need a `target` in the rows; see [Packet gate](../../docs/MACROS.md#packet-gate).
 `run` checks packet admission before it moves `STOP-INPUT` or earlier row evidence aside.

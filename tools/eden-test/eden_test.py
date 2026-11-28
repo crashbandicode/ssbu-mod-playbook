@@ -78,6 +78,7 @@ NET_SYSFS = Path('/sys/class/net')
 X11_SOCKET_DIR = Path('/tmp/.X11-unix')
 WINDOWS_HOSTS = ('ally',)
 RELAY_PREFIX = '@@eden-test-relay@@ '
+INTERIM_SNAPSHOT = 'plugins-only (awaiting first full snapshot)'
 
 
 def sha256(path):
@@ -633,12 +634,22 @@ def read_card_lineup(folder, *, plugins_only=False):
             'payload_bytes': plugin_bytes + asset_bytes}
 
 
-def _full_card_lineup_candidates():
+def _require_interim_open():
     if not CARD_LINEUPS.is_dir():
-        return []
-    return sorted(path for path in CARD_LINEUPS.iterdir()
-                  if path.is_dir() and re.fullmatch(r'\d{8}-\d{4}Z', path.name)
-                  and ((path / 'ultimate').exists() or (path / 'CARD-SHA256SUMS.txt').exists()))
+        raise SystemExit('cannot verify the interim cutoff without the workspace card lineup directory')
+    for path in CARD_LINEUPS.iterdir():
+        if (re.fullmatch(r'\d{8}-\d{4}Z', path.name) and path.is_dir()
+                and ((path / 'ultimate').exists() or (path / 'CARD-SHA256SUMS.txt').exists())):
+            raise SystemExit(f'plugins-only interim mode is closed: a full card lineup snapshot exists ({path.name})')
+
+
+def _interim_admission(host, label, *, remote):
+    if not remote:
+        _require_interim_open()
+        return
+    reply = _relay({'kind': 'interim-snapshot', 'config': {'host': host, 'label': label}})
+    if not reply.get('ok') or reply.get('result') is not True:
+        raise SystemExit(reply.get('error') or 'no workspace confirmation for the interim snapshot')
 
 
 def _go_card_lineup(args):
@@ -650,11 +661,14 @@ def _go_card_lineup(args):
     if relayed_interim and (not getattr(args, 'card_lineup', None)
                             or not getattr(args, 'card_lineup_origin', None)):
         raise SystemExit('interim card-lineup relay requires a staged directory and its source stamp')
-    if interim and not relayed_interim:
-        full = _full_card_lineup_candidates()
-        if full:
-            raise SystemExit('plugins-only interim mode is closed: a full card lineup snapshot exists '
-                             f'({full[-1].name}); remove --plugins-only-interim')
+    if interim or relayed_interim:
+        received = bool(getattr(args, 'token', None))
+        if not (received and relayed_interim) or CARD_LINEUPS.is_dir():
+            _require_interim_open()
+        if relayed_interim:
+            if not received:
+                raise SystemExit('interim card-lineup relay is only for a go received from the controller')
+            _interim_admission(args.host, args.label, remote=True)
     folder = Path(args.card_lineup).resolve() if getattr(args, 'card_lineup', None) else default_card_lineup().resolve()
     if any(char in str(folder) for char in "'\r\n"):
         raise SystemExit(f'card lineup path {folder}: use a folder without apostrophes or line breaks')
@@ -667,7 +681,7 @@ def _go_card_lineup(args):
     if not lineup['stamp']:
         raise SystemExit('card lineup needs its YYYYMMDD-HHMMZ snapshot stamp')
     if interim or relayed_interim:
-        lineup['card_snapshot'] = 'plugins-only (awaiting first full snapshot)'
+        lineup['card_snapshot'] = INTERIM_SNAPSHOT
     return lineup
 
 
@@ -908,6 +922,8 @@ def go_new(args):
             config['card_lineup']['asset_manifest'] = str(asset_manifest)
         if lineup.get('card_snapshot'):
             config['card_lineup']['card_snapshot'] = lineup['card_snapshot']
+            if getattr(args, 'card_lineup_interim_relay', False):
+                config['card_lineup']['controller_staged'] = True
         config['superseded_base_pins'] = []
     else:
         config['card_lineup'] = {'staged': False, 'reason': args.no_card_lineup}
@@ -990,7 +1006,7 @@ def _python():
 
 def _relay(request):
     if os.environ.get('EDEN_TEST_RELAY') != '1':
-        raise SystemExit('on a Windows host the lifecycle and the ledger are served by the Linux controller: '
+        raise SystemExit('this request must be served by the Linux controller: '
                          'start this through `eden_test.py go` or `eden_test.py remote` on the controller')
     request = {**request, 'id': uuid.uuid4().hex}
     print(RELAY_PREFIX + json.dumps(request), flush=True)
@@ -1254,13 +1270,8 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
         raise SystemExit('dry run failed; fix rows.json before Up')
     config = json.loads((run / 'config.json').read_text())
     lineup = config.get('card_lineup') or {}
-    interim_snapshot = 'plugins-only (awaiting first full snapshot)'
-    interim = lineup.get('card_snapshot') == interim_snapshot
+    interim = lineup.get('card_snapshot') == INTERIM_SNAPSHOT
     if interim:
-        full = _full_card_lineup_candidates()
-        if full:
-            raise SystemExit('plugins-only interim mode is closed: a full card lineup snapshot exists '
-                             f'({full[-1].name}); create a new run without --plugins-only-interim')
         if (not lineup.get('staged') or not re.fullmatch(r'\d{8}-\d{4}Z', lineup.get('stamp') or '')
                 or lineup.get('asset_manifest') is not None or lineup.get('asset_sums_sha256') is not None
                 or lineup.get('mods_files') != 0 or lineup.get('arcropolis_config_files') != 0):
@@ -1281,6 +1292,9 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
             ('user/sdmc/ultimate/mods/', 'user/sdmc/ultimate/arcropolis/'))}
         if assets != expected:
             raise SystemExit(f'full card asset pins differ from the snapshot for instance {item["key"]}')
+    if interim:
+        _interim_admission(config['host'], config['label'],
+                           remote=lineup.get('controller_staged') or os.environ.get('EDEN_TEST_RELAY') == '1')
     stamp(run, 'up_start')
     code = lifecycle(run, 'up')
     stamp(run, 'up_done')
@@ -1798,14 +1812,14 @@ def card_lineup_report(config):
                 if text not in additions:
                     additions.append(text)
     stamp = f', stamp {lineup["stamp"]}' if lineup.get('stamp') else ''
-    interim = f'{lineup["card_snapshot"]}; ' if lineup.get('card_snapshot') else ''
+    interim = f'\n- card_snapshot: {INTERIM_SNAPSHOT}' if lineup.get('card_snapshot') == INTERIM_SNAPSHOT else ''
     assets = (f', {lineup["mods_files"]} mod files and '
               f'{lineup["arcropolis_config_files"]} ARCropolis configs '
               f'({lineup["asset_bytes"]} asset bytes)'
               if 'mods_files' in lineup else '; payload size not recorded by this older run')
-    return (f'- Card lineup: {interim}{lineup["origin"]}{stamp} (SHA256SUMS {lineup["sums_sha256"][:12]}…, '
+    return (f'- Card lineup: {lineup["origin"]}{stamp} (SHA256SUMS {lineup["sums_sha256"][:12]}…, '
             f'{lineup["files"]} plugins verified{assets}); replaced by --nro: {", ".join(replacements) or "none"}; '
-            f'added: {", ".join(additions) or "none"}')
+            f'added: {", ".join(additions) or "none"}{interim}')
 
 
 def row_report(run, row, history):
@@ -2133,7 +2147,12 @@ def _relay_run(command, host, args, popen=subprocess.Popen, forward=None, claims
             if not isinstance(config, dict) or config.get('host') != args.host or config.get('label') != args.label:
                 raise ValueError('relay: foreign run')
             kind = request.get('kind')
-            if kind == 'lifecycle':
+            if kind == 'interim-snapshot':
+                _require_interim_open()
+                result = True
+            elif args.host not in WINDOWS_HOSTS:
+                raise ValueError('only the interim snapshot check is relayed for a Linux host')
+            elif kind == 'lifecycle':
                 mode = request.get('mode')
                 if mode not in ('up', 'down', 'preflight', 'status'):
                     raise ValueError('relay: invalid lifecycle mode')
@@ -2145,7 +2164,7 @@ def _relay_run(command, host, args, popen=subprocess.Popen, forward=None, claims
             else:
                 raise ValueError('relay: unknown request')
             reply = {'id': request.get('id'), 'ok': True, 'result': result}
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             reply = {'id': request.get('id') if isinstance(request, dict) else None, 'ok': False, 'error': str(exc)}
         if not isinstance(request, dict):
             request = {}
@@ -2508,8 +2527,11 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
     mux.ensure()
+    interim = bool(lineup and lineup.get('card_snapshot'))
+    if interim and not windows:
+        remote = ['env', 'EDEN_TEST_RELAY=1', *remote]
     command = _remote_command(host, mux, remote, windows)
-    ssh_code = _relay_run(command, host, args) if windows else _go_sh(command)
+    ssh_code = _relay_run(command, host, args) if windows or interim else _go_sh(command)
     if ssh_code == 255 or _lifecycle_module.ssh_master_dead(mux):
         diagnosis = _go_diagnosis(mux, 'ssh', _ExitCode(255, getattr(ssh_code, 'stderr', '')), 'remote go')
         raise SystemExit(f'remote go failed (ssh exit {ssh_code}); the remote go may be running; '
@@ -2561,13 +2583,16 @@ def cmd_remote(args):
     stage = f'{kind["root"]}/_eden-test/stage/{args.label}'
     run = f'{kind["root"]}/{args.label}'
     command = [*kind['python'], f'{stage}/tools/eden-test/eden_test.py', args.remote_mode, run, *args.remote_args]
+    can_start = args.remote_mode in ('up', 'fly')
+    if can_start and not kind['windows']:
+        command = ['env', 'EDEN_TEST_RELAY=1', *command]
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if kind['windows'] else ()
     receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
     with SshMux(host, ssh_options=options, windows=kind['windows'], evidence_dir=receipt_dir,
                 receipt_dir=receipt_dir) as mux:
         mux.ensure()
         remote = _remote_command(host, mux, command, kind['windows'])
-        return _relay_run(remote, host, args) if kind['windows'] else _go_sh(remote)
+        return _relay_run(remote, host, args) if kind['windows'] or can_start else _go_sh(remote)
 
 
 def _unit(label):

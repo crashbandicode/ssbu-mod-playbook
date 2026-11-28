@@ -1644,7 +1644,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(config['card_lineup']['mods_files'], 0)
         self.assertEqual(config['card_lineup']['arcropolis_config_files'], 0)
         self.assertFalse((eden_test.RUNS / 'plugins-only-interim/inputs/card-lineup/CARD-SHA256SUMS.txt').exists())
-        self.assertIn('Card lineup: plugins-only (awaiting first full snapshot)',
+        self.assertIn('card_snapshot: plugins-only (awaiting first full snapshot)',
                       eden_test.card_lineup_report(config))
 
     def test_plugins_only_interim_closes_automatically_when_any_full_stamp_exists(self):
@@ -1693,14 +1693,16 @@ class EdenTestTests(unittest.TestCase):
             return 0
 
         with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex=token)), \
-             mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh:
+             mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh, \
+             mock.patch.object(eden_test, '_relay_run', return_value=0) as relay:
             self.assertEqual(eden_test.main(self.go_args(host='xps', lineup=True) +
                                             ['--plugins-only-interim', '--ssh', 'xps-host']), 0)
         commands = [call.args[0] for call in sh.call_args_list]
         mirror = (f'/home/intpa/eden-runs/_eden-test/card-snapshots/'
                   f'{sha(folder / "plugins/SHA256SUMS.txt")}-plugins-only/{folder.name}')
         self.assertEqual(commands[1][-2:], [str(folder.resolve()) + '/', f'xps-host:{mirror}/'])
-        ssh = next(command for command in commands if command[0] == 'ssh')
+        ssh = relay.call_args.args[0]
+        self.assertIn('EDEN_TEST_RELAY=1', ssh)
         self.assertIn('--card-lineup-interim-relay', ssh)
         self.assertIn(str(folder.resolve()), ssh)
 
@@ -1722,8 +1724,6 @@ class EdenTestTests(unittest.TestCase):
         self.make_lineup(plugin / 'plugins', {'one.nro': b'nro'})
         self.run_go_without_up(self.go_args(label='delayed', lineup=True) + ['--plugins-only-interim'])
         run = eden_test.RUNS / 'delayed'
-        self.make_full_lineup('20260101-0000Z', {'one.nro': b'full'}, {'m/a': b'mod'}, {})
-
         # The host only has the run's staged bytes. The controller alone saw the mount.
         def controller(request):
             message = {**request, 'id': 'probe'}
@@ -1739,7 +1739,39 @@ class EdenTestTests(unittest.TestCase):
                 mock.patch.object(eden_test, '_relay', side_effect=controller), \
                 mock.patch.object(eden_test, 'sh', return_value=0), \
                 mock.patch.object(eden_test, 'lifecycle', return_value=0) as life:
+            eden_test.cmd_up(run)
+            life.assert_called_once_with(run, 'up')
+            life.reset_mock()
+            self.make_full_lineup('20260101-0000Z', {'one.nro': b'full'}, {'m/a': b'mod'}, {})
             with self.assertRaisesRegex(SystemExit, 'full card lineup snapshot exists'):
+                eden_test.cmd_up(run)
+        life.assert_not_called()
+
+    def test_linux_remote_up_and_fly_keep_the_cutoff_relay_open(self):
+        for mode in ('up', 'fly'):
+            with self.subTest(mode=mode), mock.patch.object(eden_test, '_go_sh') as direct, \
+                    mock.patch.object(eden_test, '_relay_run', return_value=0) as relay:
+                eden_test.main(['remote', '--host', 'xps', '--label', 'delayed', '--ssh', 'test-host', mode])
+            self.assertIn('EDEN_TEST_RELAY=1', relay.call_args.args[0])
+            direct.assert_not_called()
+
+    def test_interim_remote_receipt_requires_a_live_controller_at_up(self):
+        plugin = self.lineups / '20261125-1352Z'
+        self.make_lineup(plugin / 'plugins', {'one.nro': b'nro'})
+        args = self.go_args(label='relayed', lineup=True)
+        args = args[:args.index('--from')] + [
+            '--card-lineup', str(plugin), '--card-lineup-origin', str(plugin), '--token', 'probe',
+            '--card-lineup-interim-relay']
+        with mock.patch.object(eden_test, '_relay', return_value={'ok': True, 'result': True}) as relay, \
+                mock.patch.object(eden_test, 'CARD_LINEUPS', self.dir / 'not-on-host'):
+            self.run_go_without_up(args)
+        relay.assert_called_once()
+        run = eden_test.RUNS / 'relayed'
+        self.assertTrue(json.loads((run / 'config.json').read_text())['card_lineup']['controller_staged'])
+        with mock.patch.dict(os.environ, {'EDEN_TEST_RELAY': '0'}), \
+                mock.patch.object(eden_test, 'sh', return_value=0), \
+                mock.patch.object(eden_test, 'lifecycle') as life:
+            with self.assertRaisesRegex(SystemExit, 'controller'):
                 eden_test.cmd_up(run)
         life.assert_not_called()
 
