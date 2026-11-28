@@ -90,7 +90,9 @@ the display; Windows refuses one. On 2026-11-27 the Ally's 3 s smoke used
 `ddagrab` at 1920x1080: 179 frames, 59.67 captured frames/s. `gdigrab`
 measured 47–55 frames/s there and is not offered. An Ally film run needs the
 interactive session: the recorder starts through a one-shot scheduled task
-with `pythonw.exe`.
+with `pythonw.exe`. The Ally `film.py smoke` remains the Windows capture
+evidence; no Ally boot has filmed yet (`xplat-ally-3` through `-7` stopped
+before the film row).
 
 Linux `x11grab` is host tests only; no boot has filmed through it yet. The
 film lanes' own GStreamer capture remains what was flown.

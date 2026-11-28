@@ -345,4 +345,10 @@ The Windows-host relay and controller commands in `eden-test/eden_test.py` follo
 `phase23/ledge-trap/eden/out/{launch_owned,run_owned,prepare_remote}.py`.
 Proof so far: host tests on Linux and the Ally's Python, the Ally `film.py smoke`, and the Ally
 `go --prepare` (`xplat-ally-2`): tar+scp and target staging, `go_new` from the shared base, packet gate OK,
-runner READY and lifecycle preflight ok through the relay. No runtime acceptance of a full boot yet.
+runner READY and lifecycle preflight ok through the relay. Boots `xplat-ally-3` through `-7`
+claimed, ran the boot row and released through the relay, but each failed the bridge row.
+`-3` selected no host interface; `-4` selected Wi-Fi while the Ally source profile had airplane
+mode enabled; both reported guest socket errno 107. `-5` and `-6` reached the stub-on Title
+window without an active UI observation; the two `-6` same-boot retries were refused by the
+input-since-load guard on base `236a5bb`. With the frame-aware window, `-7` reached the 60 s
+cap with the last frame stationary at 2451 for 4.047 s. None reached the toggle or film row.

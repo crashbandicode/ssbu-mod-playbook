@@ -11,9 +11,16 @@
   down through the Job fallback, restore, separate verify and release (below).
   Graceful `game.stop`, pairs, native error 1312 and transport loss aren't
   qualified there yet. Since 2026-11-04 the Ally admits one Eden, so a pair can't run there.
-  Since 2026-11-27 `eden_test.py` drives the Ally through the relay (prepare
-  proven; proof boot pending). An Up through that path was refused at admission
-  because a gate ran in the Ally's WSL.
+  On 2026-11-27–28 UTC `xplat-ally-3` through `xplat-ally-7` ran through
+  `eden_test.py go --host ally`: relay claim and release, Up, input through
+  the named pipe, Down through the Job fallback, restore, separate verify and
+  prune. The boot row passed in each run; `host_network`, `configure_boot` and
+  `load_game` passed in `xplat-ally-4` through `-7`, and each run sent the bridge
+  chord. The latest run, `xplat-ally-7`, failed the bridge row with
+  `bridge_on (stub on): the game stood still after the greeting: the bridge's frame counter stayed at 2451 for 4.047 s (cap 60 s); nothing was pressed`.
+  Training-route, toggle and film did not run in these boots. The first run's
+  stage copy was retained at Down with WinError 5 and removed separately after
+  the hardlink-safe removal fix; later runs removed their stage copies.
 
 Companion to `../eden-runner/runner.py`; the lifecycle sends no input except a watchdog
 `park` sequence the config declares, and never plays macros or implements project rows.

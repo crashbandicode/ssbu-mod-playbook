@@ -14,6 +14,9 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   - `main_to_stage`, `pick_stage` (by name);
   - `pick_fighters` for P1 only;
   - `enter_training`, `chord`, `fixture`, `back_to_main`.
+- **Ally relay boots** (2026-11-27–28 UTC): `host_network`, `configure_boot` and `load_game` passed in
+  `xplat-ally-4` through `xplat-ally-7`. The bridge row failed in each of `xplat-ally-3` through `-7`;
+  these boots did not reach `to_main`, `reach_training` or `tr_set`.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
