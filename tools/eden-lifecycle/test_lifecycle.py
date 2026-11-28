@@ -391,24 +391,36 @@ class LifecycleTests(unittest.TestCase):
         mod = self.base / 'card-mod.pak'
         arc_config = self.base / 'card-arcropolis.toml'
         mod.write_bytes(b'mod data')
-        mod.chmod(0o444)
+        if os.name != 'nt':
+            mod.chmod(0o444)
         arc_config.write_text('enabled = true\n')
         self.config['instances'][0]['files'].extend([
             {'path': str(mod), 'sha256': life.digest(mod), 'to': 'user/sdmc/ultimate/mods/sample/mod.pak'},
             {'path': str(arc_config), 'sha256': life.digest(arc_config),
              'to': 'user/sdmc/ultimate/arcropolis/config.toml'}])
+        self.config['card_lineup'] = {'asset_sums_sha256': 'f' * 64}
+        stale = self.source / life.MODS / 'not-on-card/file'
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b'not from this stamp')
         self.pair()
         c = self.controller()
         c.up()
         a, b = [Path(item['profile']) for item in c.state['instances']]
         for profile in (a, b):
             self.assertTrue((profile / 'user/sdmc/ultimate/mods/sample/mod.pak').samefile(mod))
+            self.assertFalse((profile / stale.relative_to(self.source)).exists())
+            self.assertTrue((profile / life.PLUGINS / self.plugin.name).samefile(self.plugin))
+        for item in c.state['instances']:
+            self.assertEqual(item['profile_pin_storage'],
+                             {'linked_bytes': mod.stat().st_size + self.plugin.stat().st_size,
+                              'copied_bytes': arc_config.stat().st_size + self.settings.stat().st_size})
         for source, rel in ((arc_config, 'user/sdmc/ultimate/arcropolis/config.toml'),
                             (self.settings, 'user/sdmc/ultimate/TrainingRooms/settings.json')):
             (a / rel).write_bytes(b'changed')
             self.assertEqual((b / rel).read_bytes(), source.read_bytes())
             self.assertNotEqual(source.read_bytes(), b'changed')
         c.down()
+        self.assertEqual(stale.read_bytes(), b'not from this stamp')
 
     def test_pair_gets_separate_staged_pins_and_one_tcp_namespace(self):
         self.pair()

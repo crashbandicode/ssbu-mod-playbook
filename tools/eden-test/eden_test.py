@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One command for an Eden test run: eden-lifecycle + eden-runner + harvest + a short RESULTS.md.
 
-  eden_test.py go --host <host> --label <label> --nro <file> --rows <rows> [--card-lineup <dir> | --no-card-lineup <reason>]  stage, Up, run, report (no Down)
+  eden_test.py go --host <host> --label <label> --nro <file> --rows <rows> [--card-lineup <dir>]  stage, Up, run, report (no Down)
   eden_test.py run <run> --rows <id>   rerun one row; eden_test.py report <run>   show the updated report
 
 Run it ON the host that runs Eden (the Surface locally; the Yoga with `ssh tr-yoga python3 ~/ssbu-mod-playbook/...`,
@@ -67,6 +67,9 @@ SshMux = _lifecycle_module.SshMux
 _host_os_spec = importlib.util.spec_from_file_location('_eden_test_host_os', PLAYBOOK / 'tools/eden-runner/host_os.py')
 host_os = importlib.util.module_from_spec(_host_os_spec)
 _host_os_spec.loader.exec_module(host_os)
+_card_spec = importlib.util.spec_from_file_location('_eden_card', Path(__file__).with_name('card_lineup_snapshot.py'))
+_card = importlib.util.module_from_spec(_card_spec)
+_card_spec.loader.exec_module(_card)
 RUNNER = PLAYBOOK / 'tools/eden-runner/runner.py'
 HARVEST = PLAYBOOK / 'tools/eden-runner/harvest.py'
 RUNS = host_os.RUNS_ROOT
@@ -474,12 +477,11 @@ def default_card_lineup():
     if not stamps:
         raise SystemExit(f'no card lineup under {CARD_LINEUPS} (no <YYYYMMDD-HHMM>Z folder; on an Eden host '
                          'that folder does not exist: run go from the workspace machine or copy a lineup and pass '
-                         '--card-lineup <dir>); or pass --no-card-lineup <reason>')
+                         '--card-lineup <dir>)')
     folder = stamps[-1]
     if not (folder / 'plugins').is_dir():
         raise SystemExit(f'newest card lineup {stamps[-1]} has no plugins folder (older stamps are not used); '
-                         'refresh a complete card lineup or pass --card-lineup <dir> / '
-                         '--no-card-lineup <reason>')
+                         'refresh a complete card lineup or pass --card-lineup <dir>')
     return folder
 
 
@@ -562,7 +564,7 @@ def read_card_lineup(folder):
                     path = Path(name)
                     if (path.is_absolute() or path.as_posix() != name or '..' in path.parts
                             or not (name.startswith('ultimate/mods/')
-                                    or name.startswith('ultimate/arcropolis/') and name.endswith('.toml'))):
+                                    or name.startswith('ultimate/arcropolis/') and _card.arc_config(Path(*path.parts[2:])))):
                         errors.append(f'invalid card asset path on line {number}: {name!r}')
                         continue
                     if name in asset_list:
@@ -588,9 +590,7 @@ def read_card_lineup(folder):
                                     if path.name not in ('mods', 'arcropolis'))
                 if unexpected:
                     errors.append(f'unexpected card lineup ultimate entries: {unexpected}')
-            for base, suffix in ((root / 'ultimate/mods', None), (root / 'ultimate/arcropolis', '.toml')):
-                if not base.exists():
-                    continue
+            for base in (root / 'ultimate/mods', root / 'ultimate/arcropolis'):
                 if base.is_symlink() or not base.is_dir():
                     errors.append(f'card asset directory is not a regular directory: {base}')
                     continue
@@ -598,24 +598,26 @@ def read_card_lineup(folder):
                     if path.is_symlink():
                         errors.append(f'symlink in card assets: {path}')
                     elif path.is_file():
-                        if suffix is None or path.name.endswith(suffix):
+                        if base.name == 'mods' or _card.arc_config(path.relative_to(base)):
                             actual_assets.add(path.relative_to(root).as_posix())
                         else:
-                            errors.append(f'non-TOML ARCropolis file in card lineup: {path}')
+                            errors.append(f'non-config ARCropolis file in card lineup: {path}')
             if actual_assets != set(asset_list):
-                errors.append('CARD-SHA256SUMS.txt does not exactly cover the mods and ARCropolis TOML files '
+                errors.append('CARD-SHA256SUMS.txt does not exactly cover the mods and ARCropolis config files '
                               f'(unlisted: {sorted(actual_assets - set(asset_list))}; missing: '
                               f'{sorted(set(asset_list) - actual_assets)})')
         allowed_root = {'plugins', 'ultimate', 'CARD-SHA256SUMS.txt'}
         for path in root.iterdir():
             if path.name not in allowed_root:
                 errors.append(f'unexpected card lineup root entry: {path.name}')
+    else:
+        errors.append('plugin-only card lineup; refresh the full mods and ARCropolis configuration snapshot')
     if errors:
         raise SystemExit('invalid card lineup:\n' + '\n'.join(errors))
     stamp = root.name if re.fullmatch(r'\d{8}-\d{4}Z', root.name) else None
     plugin_bytes = sum((plugin_dir / name).stat().st_size for name in listed)
     asset_bytes = sum(asset['size'] for asset in assets)
-    return {'dir': str(root), 'stamp': stamp, 'sums_sha256': sums_digest,
+    return {'dir': str(root), 'stamp': stamp, 'sums_sha256': sums_digest, 'asset_sums_sha256': sha256(manifest),
             'plugins': [{'name': name, 'sha256': listed[name]} for name in sorted(listed)],
             'assets': sorted(assets, key=lambda item: item['path']),
             'mods_files': sum(asset['path'].startswith('ultimate/mods/') for asset in assets),
@@ -627,68 +629,52 @@ def read_card_lineup(folder):
 def _go_card_lineup(args):
     reason = getattr(args, 'no_card_lineup', None)
     if reason is not None:
-        if not reason.strip() or any(char in reason for char in "'\r\n"):
-            raise SystemExit(f'--no-card-lineup needs a reason on one line without apostrophes; got: {reason!r}')
-        return None
+        raise SystemExit('--no-card-lineup is not allowed: every Eden run requires a full card lineup')
     folder = Path(args.card_lineup).resolve() if getattr(args, 'card_lineup', None) else default_card_lineup().resolve()
     if any(char in str(folder) for char in "'\r\n"):
         raise SystemExit(f'card lineup path {folder}: use a folder without apostrophes or line breaks')
-    return read_card_lineup(folder)
+    lineup = read_card_lineup(folder)
+    origin = getattr(args, 'card_lineup_origin', None)
+    if origin and not lineup['stamp']:
+        name = Path(origin).name
+        if re.fullmatch(r'\d{8}-\d{4}Z', name):
+            lineup['stamp'] = name
+    if not lineup['stamp']:
+        raise SystemExit('full card lineup needs its YYYYMMDD-HHMMZ snapshot stamp')
+    return lineup
 
 
-def _link_card_input(source, target, digest, link_source=True):
+def _link_card_input(source, target, digest):
     """Use a content-addressed, host-local hard link so identical lineups share storage across runs."""
     source, target = Path(source), Path(target)
     cache = RUNS / '_eden-test' / 'card-lineup-cache' / digest
     cache.parent.mkdir(parents=True, exist_ok=True)
-    if cache.exists():
-        if cache.is_symlink() or not cache.is_file() or sha256(cache) != digest:
-            raise SystemExit(f'card lineup cache entry is not the pinned file: {cache}')
-    else:
-        writable_source = source.stat().st_mode & 0o222
-        if link_source and not writable_source:
-            try:
-                os.link(source, cache)
-            except FileExistsError:
-                pass
-            except OSError as error:
-                raise SystemExit(f'cannot hard-link card lineup input into host cache {cache}: {error}') from error
-        else:
-            temporary = cache.parent / f'.{digest}.{uuid.uuid4().hex}.tmp'
-            try:
-                shutil.copyfile(source, temporary)
-                temporary.chmod(temporary.stat().st_mode & ~0o222)
+    if not cache.exists():
+        with (cache.parent / '.publish.lock').open('a+b') as lock:
+            _lifecycle_module._PORTABLE_LOCK.lock_exclusive(lock)
+            if not cache.exists():
+                temporary = cache.parent / f'.{digest}.{uuid.uuid4().hex}.tmp'
                 try:
-                    os.link(temporary, cache)
-                except FileExistsError:
-                    pass
-            except OSError as error:
-                raise SystemExit(f'cannot cache card lineup input {source} at {cache}: {error}') from error
-            finally:
-                temporary.unlink(missing_ok=True)
-        if sha256(cache) != digest:
-            raise SystemExit(f'card lineup changed while caching: {source}')
+                    # NTFS's read-only attribute is shared across links and prevents ordinary unlink.
+                    # Cache a private inode there and never mutate it once published.
+                    if os.name != 'nt' and not source.stat().st_mode & 0o222:
+                        _lifecycle_module.link_payload(source, temporary)
+                    else:
+                        shutil.copyfile(source, temporary)
+                    if sha256(temporary) != digest:
+                        raise SystemExit(f'card lineup changed while caching: {source}')
+                    if os.name != 'nt' and temporary.stat().st_mode & 0o222:
+                        temporary.chmod(0o444)
+                    temporary.replace(cache)
+                finally:
+                    temporary.unlink(missing_ok=True)
+    if cache.is_symlink() or not cache.is_file():
+        raise SystemExit(f'card lineup cache entry is not a plain file: {cache}')
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(cache, target)
-    except OSError as error:
-        raise SystemExit(f'cannot hard-link cached card lineup input into run {target}: {error}') from error
+    _lifecycle_module.link_payload(cache, target)
     actual = sha256(target)
     if actual != digest:
         raise SystemExit(f'card lineup hard link changed: {target} is {actual[:12]}…, expected {digest[:12]}…')
-
-
-def _discard_remote_lineup_stage(args):
-    """Drop this run's transfer copy after go_new linked all files into the persistent host cache."""
-    if not getattr(args, 'card_lineup_origin', None) or not getattr(args, 'card_lineup', None):
-        return
-    staged = RUNS / '_eden-test' / 'stage' / args.label / 'card-lineup'
-    supplied = Path(args.card_lineup).resolve()
-    if supplied == staged.resolve() and staged.is_dir() and not staged.is_symlink():
-        for path in staged.rglob('*'):
-            if path.is_file() and not path.is_symlink():
-                path.chmod(path.stat().st_mode | 0o200)
-        shutil.rmtree(staged)
 
 
 def host_interface_problem(name):
@@ -872,17 +858,20 @@ def go_new(args):
         plugin_dir = Path(lineup['dir']) / 'plugins'
         if not plugin_dir.is_dir():
             plugin_dir = Path(lineup['dir'])
-        link_source = not getattr(args, 'card_lineup_origin', None)
         _link_card_input(plugin_dir / 'SHA256SUMS.txt', card_inputs / 'SHA256SUMS.txt',
-                         lineup['sums_sha256'], link_source)
+                         lineup['sums_sha256'])
+        asset_manifest = card_inputs / 'CARD-SHA256SUMS.txt'
+        _link_card_input(Path(lineup['dir']) / asset_manifest.name, asset_manifest, lineup['asset_sums_sha256'])
         for pin in cards:
-            _link_card_input(plugin_dir / pin['name'], card_inputs / pin['name'], pin['sha256'], link_source)
+            _link_card_input(plugin_dir / pin['name'], card_inputs / pin['name'], pin['sha256'])
         for asset in lineup['assets']:
             source = Path(lineup['dir']) / asset['path']
-            _link_card_input(source, card_inputs / asset['path'], asset['sha256'], link_source)
+            _link_card_input(source, card_inputs / asset['path'], asset['sha256'])
         config['card_lineup'] = {'staged': True, 'dir': lineup['dir'], 'stamp': lineup['stamp'],
                                  'origin': getattr(args, 'card_lineup_origin', None) or lineup['dir'],
-                                 'sums_sha256': lineup['sums_sha256'], 'files': len(cards),
+                                 'sums_sha256': lineup['sums_sha256'], 'asset_sums_sha256': lineup['asset_sums_sha256'],
+                                 'asset_manifest': str(asset_manifest),
+                                 'files': len(cards),
                                  'mods_files': lineup['mods_files'],
                                  'arcropolis_config_files': lineup['arcropolis_config_files'],
                                  'asset_bytes': lineup['asset_bytes'], 'plugin_bytes': lineup['plugin_bytes'],
@@ -907,6 +896,9 @@ def go_new(args):
                 pins.append(pin)
                 staged.append({'name': name, 'sha256': pin['sha256'], 'source': 'base'})
         item['plugins'] = pins
+        if lineup and 'files' in item:
+            item['files'] = [pin for pin in item['files'] if not pin['to'].replace('\\', '/').startswith(
+                ('user/sdmc/ultimate/mods/', 'user/sdmc/ultimate/arcropolis/'))]
         for asset in lineup['assets'] if lineup else []:
             item.setdefault('files', []).append({'path': str(inputs / 'card-lineup' / asset['path']),
                                                  'to': 'user/sdmc/' + asset['path'],
@@ -934,16 +926,6 @@ def go_new(args):
                 staged.append({'name': original.name, 'sha256': digest, 'source': 'nro'})
     if swapped:
         config['plugin_swaps'] = swapped
-    if lineup:
-        card_plugin_bytes = 0
-        for item in config['instances']:
-            plugin_pins = {pin.get('name', Path(pin['path']).name): pin for pin in item.get('plugins', [])}
-            for entry in config['staged_plugins'][item['key']]:
-                replaced = entry.get('replaces')
-                if entry['source'] == 'card' or replaced and replaced.get('source') == 'card':
-                    card_plugin_bytes += Path(plugin_pins[entry['name']]['path']).stat().st_size
-        config['card_lineup']['profile_copy_bytes'] = (
-            card_plugin_bytes + lineup['asset_bytes'] * len(config['instances']))
     for item in config['instances']:
         for pin in [item['app'], *item.get('plugins', []), *item.get('files', [])]:
             actual = sha256(pin['path'])
@@ -1238,6 +1220,22 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
     if sh([*_python(), str(RUNNER), 'up-check', str(rows), '--out', str(run / 'out')],
           run / 'dry-run.log') != 0:
         raise SystemExit('dry run failed; fix rows.json before Up')
+    config = json.loads((run / 'config.json').read_text())
+    lineup = config.get('card_lineup') or {}
+    manifest = Path(lineup.get('asset_manifest', ''))
+    if (not lineup.get('staged') or not re.fullmatch(r'\d{8}-\d{4}Z', lineup.get('stamp') or '')
+            or not manifest.is_file() or sha256(manifest) != lineup.get('asset_sums_sha256')):
+        raise SystemExit('Up needs a verified full card lineup; create a run with go and a full stamp')
+    expected = {}
+    for line in manifest.read_text(encoding='utf-8').splitlines():
+        if line.strip():
+            value, name = re.fullmatch(r'([0-9a-f]{64}) {1,2}\*?(.+)', line).groups()
+            expected['user/sdmc/' + name] = value
+    for item in config['instances']:
+        assets = {pin['to']: pin['sha256'] for pin in item.get('files', []) if pin['to'].startswith(
+            ('user/sdmc/ultimate/mods/', 'user/sdmc/ultimate/arcropolis/'))}
+        if assets != expected:
+            raise SystemExit(f'full card asset pins differ from the snapshot for instance {item["key"]}')
     stamp(run, 'up_start')
     code = lifecycle(run, 'up')
     stamp(run, 'up_done')
@@ -1757,9 +1755,8 @@ def card_lineup_report(config):
     stamp = f', stamp {lineup["stamp"]}' if lineup.get('stamp') else ''
     assets = (f', {lineup["mods_files"]} mod files and '
               f'{lineup["arcropolis_config_files"]} ARCropolis configs '
-              f'({lineup["asset_bytes"]} bytes); hard-linked staging, '
-              f'{lineup["profile_copy_bytes"]} card payload bytes copied to private SD profiles'
-              if 'profile_copy_bytes' in lineup else '; payload size not recorded by this older run')
+              f'({lineup["asset_bytes"]} asset bytes)'
+              if 'mods_files' in lineup else '; payload size not recorded by this older run')
     return (f'- Card lineup: {lineup["origin"]}{stamp} (SHA256SUMS {lineup["sums_sha256"][:12]}…, '
             f'{lineup["files"]} plugins verified{assets}); replaced by --nro: {", ".join(replacements) or "none"}; '
             f'added: {", ".join(additions) or "none"}')
@@ -1975,10 +1972,15 @@ def report_md(run):
         if isinstance(event, dict) and 'status' in event and 'row' not in event:
             detail = event.get('error') or event.get('reason') or event.get('result') or ''
             ends.append(f'{event["status"]}' + (f' `{cell(detail, 300)}`' if detail else ''))
+    journal_path = run / 'state/lifecycle.json'
+    storage = [item['profile_pin_storage'] for item in json.loads(journal_path.read_text()).get('instances', [])
+               if 'profile_pin_storage' in item] if journal_path.is_file() else []
     lines = [f'# {config.get("label", run.name)}: test report',
              f'- State: {state}',
              f'- Runner: {len(ends)} call(s) ended: ' + ('; '.join(ends) if ends else 'no end line in runner.log'),
              card_lineup_report(config),
+             *([f'- Prepared profile pins: {sum(s["linked_bytes"] for s in storage)} bytes linked, '
+                f'{sum(s["copied_bytes"] for s in storage)} bytes copied ({len(storage)} instances).'] if storage else []),
              '- NROs:', *nro_lines(run, config),
              f'- Rows: {counts["PASS"]} PASS, {counts["FAIL"]} FAIL, {counts["NOT RUN"]} NOT RUN of {len(rows)}'
              f'{_stall_totals(rows)} (proof paths are relative to `{run}`)',
@@ -2318,6 +2320,7 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     stage = f'{kind["root"]}/_eden-test/stage/{args.label}'
     archive = None
     if windows:
+        mirror = f'{stage}/card-lineup' if lineup else None
         archive = Path(pack_dir) / 'stage.tar.gz'
         _stage_tar(args, lineup, archive)
         mkdir = f'New-Item -ItemType Directory -Force -Path {_pwsh_arg(stage)} | Out-Null'
@@ -2330,7 +2333,10 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     else:
         commands = [['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/']]
         if lineup:
-            commands.append(['rsync', '-a', '--delete', '--mkpath', lineup['dir'] + '/', f'{host}:{stage}/card-lineup/'])
+            # Each full manifest and stamp has its own mirror; rsync skips unchanged payload across runs.
+            mirror = (f'{kind["root"]}/_eden-test/card-snapshots/{lineup["sums_sha256"]}-'
+                      f'{lineup["asset_sums_sha256"]}/{lineup["stamp"]}')
+            commands.append(['rsync', '-a', '--mkpath', lineup['dir'] + '/', f'{host}:{mirror}/'])
         commands.extend([['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro])
         if args.elf:
             commands.append(['rsync', '-a', '--mkpath', str(args.elf), f'{host}:{stage}/elf/'])
@@ -2430,7 +2436,7 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
         remote.extend(('--nro', f'{stage}/nro/{Path(nro).name}'))
     remote.extend(('--rows', f'{stage}/rows'))
     if lineup:
-        remote.extend(('--card-lineup', f'{stage}/card-lineup', '--card-lineup-origin', lineup['dir']))
+        remote.extend(('--card-lineup', mirror, '--card-lineup-origin', lineup['dir']))
     else:
         remote.extend(('--no-card-lineup', args.no_card_lineup))
     if args.elf:
@@ -2779,7 +2785,6 @@ def cmd_go(args):
             lineup = _go_card_lineup(args)
             return _go_remote(args, lineup)
     run = go_new(args)
-    _discard_remote_lineup_stage(args)
     config = json.loads((run / 'config.json').read_text())
     for key, entries in config['staged_plugins'].items():
         lineup = config['card_lineup']
@@ -2790,7 +2795,7 @@ def cmd_go(args):
             detail = (f'card lineup {lineup["origin"]} ({lineup["files"]} files verified); '
                       f'stamp {lineup.get("stamp") or "custom"}, '
                       f'{lineup.get("mods_files", 0)} mod files + {lineup.get("arcropolis_config_files", 0)} '
-                      f'config files; {lineup.get("profile_copy_bytes", 0)} card payload bytes per private SD set; '
+                      f'config files; {lineup["payload_bytes"]} snapshot payload bytes; '
                       f'--nro replaced: {replaced}; added: {added}')
         else:
             detail = f'card lineup NOT STAGED, reason: {lineup["reason"]}'
@@ -3322,7 +3327,7 @@ def main(argv=None):
     p.add_argument('--nro', action='append', required=True)
     lineup = p.add_mutually_exclusive_group()
     lineup.add_argument('--card-lineup', help='stamped card-lineup folder with plugins/, ultimate/, and manifests')
-    lineup.add_argument('--no-card-lineup', metavar='REASON', help='do not stage the card lineup; record why')
+    lineup.add_argument('--no-card-lineup', metavar='REASON', help=argparse.SUPPRESS)
     p.add_argument('--card-lineup-origin', help=argparse.SUPPRESS)
     p.add_argument('--rows', required=True, help='rows.json or a folder containing rows.json')
     p.add_argument('--elf')

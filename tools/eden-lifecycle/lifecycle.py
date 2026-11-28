@@ -110,6 +110,7 @@ COMPILER_NAMES = ('cargo', 'rustc', 'cc', 'c++', 'gcc', 'g++', 'clang', 'clang++
 # 273 of the 285 MiB each instance wrote: user/cache/shader/<title>/vulkan.bin and xdg-cache/nvidia/GLCache.
 REBUILT_CACHES = ('user/cache/shader', 'user/shader', 'xdg-cache')
 READ_ONLY = ('user/nand/user/Contents', 'user/nand/system/Contents', 'user/firmware')
+MODS = 'user/sdmc/ultimate/mods'
 PLUGINS = 'user/sdmc/atmosphere/contents/01006A800016E000/romfs/skyline/plugins'
 CONFIG = 'user/config/qt-config.ini'
 RPC_METHODS = {'status', 'settings.set', 'settings.get', 'settings.save', 'game.load', 'game.stop', 'jobs.get'}
@@ -314,7 +315,23 @@ def inventory(root):
     return result
 
 
-def clone_profile(source, target, read_only=READ_ONLY):
+def link_payload(source, target):
+    """Never change a shared file's attributes. A private copy also works across volumes."""
+    if os.name == 'nt' and not Path(source).stat().st_mode & stat.S_IWRITE:
+        # A read-only NTFS link cannot be pruned with ordinary unlink; never clear the source attribute.
+        shutil.copyfile(source, target)
+        return False
+    try:
+        os.link(source, target)
+        return True
+    except FileExistsError:
+        raise
+    except OSError:
+        shutil.copyfile(source, target)
+        return False
+
+
+def clone_profile(source, target, read_only=READ_ONLY + (MODS, PLUGINS)):
     """Link only immutable game content; private-copy EVERY other file."""
     source, target = safe_absolute(source), safe_absolute(target)
     require(source.is_dir() and source.name != 'a' and target.name != 'a', 'Profile a/missing source refused')
@@ -324,8 +341,13 @@ def clone_profile(source, target, read_only=READ_ONLY):
 
     def copy(src, dst):
         rel = Path(src).relative_to(source)
-        immutable = any(rel == Path(prefix) or Path(prefix) in rel.parents for prefix in read_only)
-        return os.link(src, dst) if immutable else shutil.copy2(src, dst)
+        immutable = any(Path(prefix) in rel.parents and
+                        (not prefix.endswith('/plugins') or rel.suffix.lower() == '.nro') for prefix in read_only)
+        if immutable:
+            if not link_payload(src, dst):
+                shutil.copystat(src, dst)
+        else:
+            shutil.copy2(src, dst)
 
     shutil.copytree(source, target, copy_function=copy)
     require(inventory(target) == before, 'Clone differs from source')
@@ -1339,7 +1361,7 @@ class WindowsHost(Host):
     def clone_source(self, original, profile):
         source = safe_absolute(original['source'])
         profile.mkdir()
-        clone_profile(source, profile / 'user', tuple(p.removeprefix('user/') for p in READ_ONLY))
+        clone_profile(source, profile / 'user', tuple(p.removeprefix('user/') for p in (*READ_ONLY, MODS, PLUGINS)))
         app = safe_absolute(original['app']['path']).parent
         inventory(app)  # Reject reparse points/special files before linking read-only runtime files.
         shutil.copytree(app, profile, dirs_exist_ok=True, copy_function=os.link,
@@ -2538,24 +2560,44 @@ class Lifecycle:
         plugins.mkdir(parents=True, exist_ok=True)
         aside = profile / 'lifecycle-plugin-originals'
         aside.mkdir()
+        if self.c.get('card_lineup', {}).get('asset_sums_sha256'):
+            # The installed profile can contain mods/presets absent from this card stamp.
+            ultimate = profile / 'user/sdmc/ultimate'
+            for name in ('mods', 'arcropolis'):
+                folder = ultimate / name
+                if folder.is_dir():
+                    folder.rename(aside / name)
+                folder.mkdir(parents=True, exist_ok=True)
+        storage = {'linked_bytes': 0, 'copied_bytes': 0}
+
+        def stage(pin, target, immutable):
+            source = Path(pin['path'])
+            linked = False
+            if immutable:
+                linked = link_payload(source, target)
+            else:
+                shutil.copyfile(source, target)
+            require(digest(target) == pin['sha256'], 'Staged input differs from pin: ' + str(target))
+            storage['linked_bytes' if linked else 'copied_bytes'] += target.stat().st_size
+
         for path in plugins.glob('*.nro'):
             path.replace(aside / path.name)
         for pin in item['plugins']:
             source = Path(pin['path'])
             destination = plugins / pin.get('name', source.name)
             require(destination.parent == plugins, 'Plugin destination traversal')
-            shutil.copyfile(source, destination)
-            require(digest(destination) == pin['sha256'], 'Staged plugin changed during copy')
+            stage(pin, destination, True)
         for pin in item.get('files', []):
             target = profile / relative(pin['to'])
             safe_absolute(target)
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 target.unlink()  # break any link before writing
-            shutil.copyfile(pin['path'], target)
-            require(digest(target) == pin['sha256'], 'Staged file changed during copy')
+            stage(pin, target, Path(MODS) in relative(pin['to']).parents)
         private_config(profile)
-        self.record('prepared', {'key': item['key'], 'snapshot_entries': len(expected), 'persisted_volume': 0})
+        item['profile_pin_storage'] = storage
+        self.record('prepared', {'key': item['key'], 'snapshot_entries': len(expected), 'persisted_volume': 0,
+                                 'profile_pin_storage': storage})
 
     def up(self):
         report = self.preflight(runtime=False)

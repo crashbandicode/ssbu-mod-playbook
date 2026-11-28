@@ -2,8 +2,8 @@
 """Create an immutable, timestamped snapshot of the mounted card's Eden lineup.
 
 The card root is read only. Plugins are copied from Atmosphere, every regular file
-under ultimate/mods is copied, and only TOML files under ultimate/arcropolis are
-included. Identical payload files from earlier stamps are hard-linked.
+under ultimate/mods is included, along with ARCropolis configuration (not logs
+or caches). Identical payload files from earlier stamps are hard-linked.
 """
 import argparse
 import hashlib
@@ -43,9 +43,14 @@ def _regular_files(root, *, suffix=None):
     return files
 
 
-def _prior_content(output, digest_value):
-    if not output.is_dir():
-        return None
+def arc_config(relative):
+    parts = Path(relative).parts
+    return bool(parts and parts[0].lower() not in ('cache', 'logs') and not parts[-1].lower().endswith('.log')
+                and (parts[0].lower() == 'config' or parts[-1].lower().endswith('.toml')))
+
+
+def _prior_content(output):
+    by_digest = {}
     for stamp in sorted(output.iterdir(), reverse=True):
         if not stamp.is_dir() or not re.fullmatch(r'\d{8}-\d{4}Z', stamp.name):
             continue
@@ -58,20 +63,27 @@ def _prior_content(output, digest_value):
                     continue
                 if path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
                     continue
-                if digest(path) == digest_value:
-                    return path
-    return None
+                by_digest.setdefault(digest(path), path)
+    return by_digest
 
 
-def _stage_file(source, target, output):
+def _stage_file(source, target, by_digest):
     target.parent.mkdir(parents=True, exist_ok=True)
     value = digest(source)
-    previous = _prior_content(output, value)
+    previous = by_digest.get(value)
     if previous is not None:
-        os.link(previous, target)
-    else:
-        shutil.copyfile(source, target)
-        target.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        try:
+            os.link(previous, target)
+            return value
+        except FileExistsError:
+            raise
+        except OSError:
+            pass  # Separate volume or filesystem without hard links.
+    shutil.copyfile(source, target)
+    if digest(target) != value:
+        raise ValueError(f'card file changed during copy: {source}')
+    target.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    by_digest[value] = target
     return value
 
 
@@ -95,8 +107,9 @@ def snapshot(card_root, output_root, stamp=None):
     mods_src = card_root / 'ultimate/mods'
     arc_src = card_root / 'ultimate/arcropolis'
     mods_files = _regular_files(mods_src)
-    arc_configs = _regular_files(arc_src, suffix='.toml')
+    arc_configs = [p for p in _regular_files(arc_src) if arc_config(p.relative_to(arc_src))]
     output_root.mkdir(parents=True, exist_ok=True)
+    by_digest = _prior_content(output_root)
     destination.mkdir(parents=True)
     try:
         plugin_dir = destination / 'plugins'
@@ -106,18 +119,18 @@ def snapshot(card_root, output_root, stamp=None):
         plugin_sums, asset_sums = [], []
         for source in plugin_files:
             target = plugin_dir / source.name
-            value = _stage_file(source, target, output_root)
+            value = _stage_file(source, target, by_digest)
             plugin_sums.append(f'{value}  {target.name}\n')
         (plugin_dir / 'SHA256SUMS.txt').write_text(''.join(plugin_sums), encoding='utf-8')
         for source, base in ((path, mods_src) for path in mods_files):
             relative = Path('ultimate/mods') / source.relative_to(base)
             target = destination / relative
-            value = _stage_file(source, target, output_root)
+            value = _stage_file(source, target, by_digest)
             asset_sums.append(f'{value}  {relative.as_posix()}\n')
         for source in arc_configs:
             relative = Path('ultimate/arcropolis') / source.relative_to(arc_src)
             target = destination / relative
-            value = _stage_file(source, target, output_root)
+            value = _stage_file(source, target, by_digest)
             asset_sums.append(f'{value}  {relative.as_posix()}\n')
         (destination / 'CARD-SHA256SUMS.txt').write_text(''.join(sorted(asset_sums)), encoding='utf-8')
         return destination

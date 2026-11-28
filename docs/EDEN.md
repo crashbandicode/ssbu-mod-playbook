@@ -199,18 +199,21 @@ Backup and restore handling is unchanged.
 snapshot at `artifacts/phase23/card-lineup/<YYYYMMDD-HHMMZ>/`. Run it only after
 the operator mounts the card; it reads the card and never writes there. Each
 stamp contains the plugin NROs and `plugins/SHA256SUMS.txt`, every regular file
-under `ultimate/mods/`, and only `.toml` files under `ultimate/arcropolis/`.
-Logs are excluded. `CARD-SHA256SUMS.txt` covers the mods and TOML files. The
+under `ultimate/mods/`, `ultimate/arcropolis/config/` (including extensionless
+workspace and preset fields), and ARCropolis TOMLs outside logs and cache.
+Logs and generated caches are excluded. `CARD-SHA256SUMS.txt` covers the assets. The
 snapshotter hard-links identical files already present in earlier stamps.
 
 `eden_test.py go` selects the newest full stamp by default, verifies it, and
 records the stamp, hashes, file counts, and payload bytes in `config.json` and
 `REPORT.md`. It hard-links staged inputs through the host's content-addressed
-cache, shared by later runs. Lifecycle then copies the plugins, mods, and
-configuration files into each run's private SD profile. Those copies may be
-rewritten in place without modifying the shared snapshot or another run. The
-receipt's `profile_copy_bytes` is the total card payload copied across the
-run's instances; shared hard-linked staging adds no per-run payload bytes.
+cache, shared by later runs. Lifecycle hard-links plugins and mod assets into
+each private SD. ARCropolis config, TrainingRooms settings/saves, logs and
+caches remain private. NTFS supports same-volume hard links; a cross-volume or
+unsupported link uses a verified copy. Windows sources carrying the read-only
+attribute use a copy if needed for safe deletion; shared attributes are never cleared.
+Each prepared instance records actual linked and copied pin bytes in its lifecycle
+journal; the report totals them. A plugins-only stamp is not a full lineup.
 
 The snapshot command is:
 
