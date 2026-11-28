@@ -387,27 +387,27 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(life.load_cap({'host': host}), 300)
                 self.assertEqual(life.load_cap({'host': host, 'load_cap': 47}), 47)
 
-    def test_mods_and_arcropolis_toml_are_copied_to_private_sd_paths(self):
+    def test_paired_mod_payload_is_shared_but_plugin_settings_are_private(self):
         mod = self.base / 'card-mod.pak'
         arc_config = self.base / 'card-arcropolis.toml'
         mod.write_bytes(b'mod data')
+        mod.chmod(0o444)
         arc_config.write_text('enabled = true\n')
         self.config['instances'][0]['files'].extend([
             {'path': str(mod), 'sha256': life.digest(mod), 'to': 'user/sdmc/ultimate/mods/sample/mod.pak'},
             {'path': str(arc_config), 'sha256': life.digest(arc_config),
              'to': 'user/sdmc/ultimate/arcropolis/config.toml'}])
+        self.pair()
         c = self.controller()
         c.up()
-        profile = Path(c.state['instances'][0]['profile'])
-        for source, relative in ((mod, 'user/sdmc/ultimate/mods/sample/mod.pak'),
-                                 (arc_config, 'user/sdmc/ultimate/arcropolis/config.toml')):
-            staged = profile / relative
-            self.assertEqual(staged.read_bytes(), source.read_bytes())
-            self.assertNotEqual(staged.stat().st_ino, source.stat().st_ino)
-            staged.write_bytes(b'changed by this run')
-            self.assertNotEqual(staged.read_bytes(), source.read_bytes())
-        self.assertEqual(mod.read_bytes(), b'mod data')
-        self.assertEqual(arc_config.read_text(), 'enabled = true\n')
+        a, b = [Path(item['profile']) for item in c.state['instances']]
+        for profile in (a, b):
+            self.assertTrue((profile / 'user/sdmc/ultimate/mods/sample/mod.pak').samefile(mod))
+        for source, rel in ((arc_config, 'user/sdmc/ultimate/arcropolis/config.toml'),
+                            (self.settings, 'user/sdmc/ultimate/TrainingRooms/settings.json')):
+            (a / rel).write_bytes(b'changed')
+            self.assertEqual((b / rel).read_bytes(), source.read_bytes())
+            self.assertNotEqual(source.read_bytes(), b'changed')
         c.down()
 
     def test_pair_gets_separate_staged_pins_and_one_tcp_namespace(self):
