@@ -667,9 +667,10 @@ Training input owner).
 - **What it does:** opens the menu if needed, backs out to the page level, goes round the page ring to `page`,
   and walks `path` exactly as `tr_goto` does. `then: "focus"` stops with the row focused. `then: "press"` presses
   A on it once (start a drill, toggle a row). `then: "close"`, with no page or path, backs out and closes.
-- **Gate:** every input needs exactly one handled ACK of `tr.menu` with `scene=lobby` and no keyboard. Nothing
-  else is read: the dashboard reader does not observe in the room (`ssbu.ui` reads `screen=unknown` there).
-  Outside the room the block stops before any input.
+- **Gate:** the opening chord needs a fresh `tr.menu` transition from closed to open; it is not a menu-button ACK.
+  Each menu tap needs exactly one new `handled` ACK. The room must still own input (`scene=lobby`, `keyboard=0`,
+  `recording.popup.open=0`); a tap is not retried if the observed source row changes without its ACK.
+  No dashboard read is needed (`ssbu.ui` reads `screen=unknown` here).
 - **Inputs:** `tr-menu-open` and the room's own taps `room-tap-a`, `room-tap-b`, `room-tap-r`, `room-tap-down`
   (19 frames each; the ones flown in the room).
 - **Receipt:** `routes-tr-menu-in-room.json` with `verified` `{scene, open, page, depth, focus, action, row, ack}`,

@@ -4940,6 +4940,11 @@ def _send_with_retry(io, macro, until, wait):
     return result
 
 
+def _room_menu_owner(state):
+    if not _fields_match(state, {'scene': 'lobby', 'keyboard': '0', 'recording.popup.open': '0'}):
+        raise RuntimeError(f'expected the waiting room menu without keyboard or recording popup; saw {state.values!r}')
+
+
 def _tr_input(io, before, macro, until, *, opened=True, scene='training'):
     """One input into the TrainingRooms menu, fenced by exactly one handled ACK of `tr.menu`. `scene` is the scene the
     menu must stay in (`lobby`: the waiting room); `opened=None` accepts the menu open or closed afterwards."""
@@ -4956,11 +4961,17 @@ def _tr_input(io, before, macro, until, *, opened=True, scene='training'):
             if block['schema'] != 'tr.menu/1' or block['rev'] <= 0 or block['filtered']:
                 raise RuntimeError(f'expected complete tr.menu/1 reply; saw {block!r}')
             native_picker.same_epoch(latest, after, in_flight=True)
+            if scene == 'lobby':
+                _room_menu_owner(after)
             if block['rev'] <= latest.block['rev']:
                 continue
             latest = after
             ack = native_picker.number(after, 'ack')
             if ack == old_ack:
+                if scene == 'lobby' and any(after.values.get(key) != before.values.get(key)
+                                            for key in ('open', 'page', 'depth', 'group', 'cursor', 'focus',
+                                                        'action', 'row', 'row_id')):
+                    raise RuntimeError(f'{macro}: room menu source changed without its ACK; not retrying')
                 continue
             if ack > old_ack + 1:
                 raise RuntimeError(f'input handled twice: expected ACK {old_ack + 1}; saw {ack}')
@@ -5398,8 +5409,8 @@ def tr_menu_in_room(ctx, page=None, path=None, then='focus', cap=45):
 
     Opens the menu if it is closed, goes to `page`, walks `path` (as `tr_goto`: action IDs, or objects with `action`
     and/or `row`) and leaves the target focused. `then='press'` presses A on the target once; `then='close'` (no page
-    or path) backs out and closes the menu. Every input is fenced by exactly one handled ACK of `tr.menu` with
-    `scene=lobby` and no keyboard, and nothing else is read: the dashboard reader does not observe in the room.
+    or path) backs out and closes the menu. The opening chord needs a fresh closed-to-open transition; each menu
+    tap needs one handled ACK of `tr.menu` in the lobby. No dashboard observation is needed.
     The taps are the room's own macros (`room-tap-a/b/r/down`), the ones flown there.
     """
     args = {'page': page, 'path': path, 'then': then, 'cap': cap}
@@ -5429,6 +5440,7 @@ def _tr_menu_in_room(ctx, page, targets, then, cap, metrics, args):
     io = BridgePickerIO(ctx)
     scene = 'lobby'
     menu = _tr_current(io, until, scene)
+    _room_menu_owner(menu)
     skipped = []
     pressed = None
     if then == 'close':
@@ -6023,6 +6035,8 @@ def _try_tr_condition(io, before, until, predicate, scene='training'):
         if state.block['schema'] != 'tr.menu/1' or state.block['rev'] <= 0 or state.block['filtered']:
             raise RuntimeError(f'expected complete practice tr.menu/1 reply; saw {state.block!r}')
         native_picker.same_epoch(latest, state, in_flight=True)
+        if scene == 'lobby':
+            _room_menu_owner(state)
         if state.block['rev'] <= latest.block['rev']:
             continue
         latest = state

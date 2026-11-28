@@ -2,8 +2,8 @@
 
 Host-only, with the modelled bridge observations of test_setup_blocks. In the room the route has `tr.menu` alone
 (`scene=lobby`): the dashboard reader does not observe there (TrainingRooms rc.16 smoke, intnext-a24cdbef-yoga-1,
-2026-11-28: `ssbu.ui` read `screen=unknown`, `observation.active=no` after hosting), so every input is fenced by one
-handled ACK of `tr.menu` and nothing else is read.
+2026-11-28: `ssbu.ui` read `screen=unknown`, `observation.active=no` after hosting). The chord opens the menu;
+menu taps advance its handled ACK. Neither requires a dashboard read.
 """
 
 import hashlib
@@ -127,6 +127,19 @@ class RoomMenuTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'popup'):
             self.invoke('tr_menu_in_room', io)
         self.assertEqual(io.actions, [])
+
+    def test_dropped_room_tap_retries_only_on_the_same_source(self):
+        io = room(blocks.MenuIO)(self.ctx, opened=True)
+        send = io.send
+        def drop_first(segment, until=None):
+            if not io.actions:
+                io.actions.append(segment)
+            else:
+                send(segment, until=until)
+        io.send = drop_first
+        result = self.invoke('tr_menu_in_room', io, page='saves', cap=5)
+        self.assertEqual(io.actions, ['room-tap-r', 'room-tap-r'])
+        self.assertEqual((result['verified']['page'], result['verified']['ack'], result['retries']), ('saves', 1, 1))
 
     def test_the_training_routes_still_refuse_the_room(self):
         io = blocks.MenuIO(self.ctx)
