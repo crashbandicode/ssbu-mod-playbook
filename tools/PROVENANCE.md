@@ -390,7 +390,11 @@ it never acted in a boot because each route step creates a fresh `BridgePickerIO
 2026-11-28, Training read: the menu owner wait retries validated inactive `ssbu.ui` reads
 within its existing cap and fails closed without an active observation. The host tests passed.
 With the deployed bridge `5917e54f…`, `xplat-yoga-3` passed boot, bridge and the diagnostic
-watch row, but training-route failed at `enter_training` with `bridge connection or replay
-continuity changed while input was unconfirmed`. Toggle did not run: there are no toggle
-read-backs or inactive-wait measurement, and there was no film row. Why reads become
-inactive remains unestablished; the raw observations are in the lane's files.
+watch row, but the scene watch overran the bridge's event ring: `since 1290` returned
+`gap` with oldest 1633 and latest 1888. Training-route correctly refused at
+`enter_training`; it was not a Training read-fix regression. Toggle did not run and there
+was no film row. With the same deployed bridge and no watch row, `xplat-yoga-4` passed
+boot, bridge, training-route and toggle. Crouch read and stored `[0, 1]` → `[1, 0]`, then
+`[1, 0]` → `[0, 1]`; neither `tr_set` received an inactive `ssbu.ui` reply, so neither
+waited through one. There was no film row. Why earlier reads became inactive remains
+unestablished; the raw observations are in the lane's files.

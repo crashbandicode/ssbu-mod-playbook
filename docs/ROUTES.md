@@ -31,10 +31,16 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   deployed to a shared input. At the time, `tr_set` took one inactive read as final.
 - **Training read boot** (2026-11-28 UTC): with the deployed bridge
   `5917e54f…`, `xplat-yoga-3` passed boot, bridge and the diagnostic watch row,
-  but training-route failed at `enter_training` with `bridge connection or replay
-  continuity changed while input was unconfirmed`. Toggle did not run, so it has
-  no read-backs or inactive-wait measurement; there was no film row. The reason
-  for inactive reads remains open; the raw observations are in the lane's files.
+  but its diagnostic scene-watch row overran the bridge's event ring. The
+  `since 1290` reply was `gap` (oldest 1633, latest 1888), and training-route
+  correctly refused at `enter_training`; this was not a Training read-fix
+  regression. Toggle did not run and there was no film row.
+- **Plain Training read boot** (2026-11-28 UTC): `xplat-yoga-4` passed boot,
+  bridge, training-route and toggle with the deployed bridge; there was no film
+  row. Crouch read and stored `[0, 1]` → `[1, 0]`, then `[1, 0]` → `[0, 1]`.
+  Neither `tr_set` received an inactive `ssbu.ui` reply, so neither waited
+  through one. The reason for earlier inactive reads remains open; raw
+  observations are in the lane's files.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
