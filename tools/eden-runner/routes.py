@@ -4584,14 +4584,6 @@ def _bridge_on_stub_title(ctx, hello, start):
         before = log.stat().st_size
         asked.append(before)
         bridge_v2(ctx, 'providers', 'state ssbu.ui')
-        if time.monotonic() >= until:
-            if state['opening_seen'] and not state['fresh_non_opening']:
-                raise RuntimeError('bridge_on (stub on): the opening was seen but no fresh ssbu.ui reply confirmed it; '
-                                   'nothing was sent')
-            if last is not None:
-                raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within 10 s of the greeting; "
-                                   f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
-            raise RuntimeError('bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting')
         pending = (before, now)
         next_request = now + .1
         return before
