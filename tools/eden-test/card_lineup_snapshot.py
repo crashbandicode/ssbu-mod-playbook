@@ -49,6 +49,12 @@ def arc_config(relative):
                 and (parts[0].lower() == 'config' or parts[-1].lower().endswith('.toml')))
 
 
+def arc_resource(relative):
+    parts = Path(relative).parts
+    return bool(parts and all(part.lower() not in ('cache', 'logs') for part in parts)
+                and not parts[-1].lower().endswith('.log'))
+
+
 def _prior_content(output):
     by_digest = {}
     for stamp in sorted(output.iterdir(), reverse=True):
@@ -108,6 +114,9 @@ def snapshot(card_root, output_root, stamp=None):
     arc_src = card_root / 'ultimate/arcropolis'
     mods_files = _regular_files(mods_src)
     arc_configs = [p for p in _regular_files(arc_src) if arc_config(p.relative_to(arc_src))]
+    resources_src = arc_src / 'resources'
+    arc_resources = [p for p in _regular_files(resources_src)
+                     if arc_resource(p.relative_to(resources_src))]
     output_root.mkdir(parents=True, exist_ok=True)
     by_digest = _prior_content(output_root)
     destination.mkdir(parents=True)
@@ -132,7 +141,20 @@ def snapshot(card_root, output_root, stamp=None):
             target = destination / relative
             value = _stage_file(source, target, by_digest)
             asset_sums.append(f'{value}  {relative.as_posix()}\n')
+        for source in arc_resources:
+            relative = Path('ultimate/arcropolis/resources') / source.relative_to(resources_src)
+            target = destination / relative
+            value = _stage_file(source, target, by_digest)
+            asset_sums.append(f'{value}  {relative.as_posix()}\n')
         (destination / 'CARD-SHA256SUMS.txt').write_text(''.join(sorted(asset_sums)), encoding='utf-8')
+        (destination / 'README.md').write_text(
+            f'# Card lineup {stamp}\n\n'
+            f'Source root: `{card_root}` (read-only snapshot).\n\n'
+            'Includes card plugins, all regular `ultimate/mods/` files, ARCropolis '
+            'configuration, and `ultimate/arcropolis/resources/` files. '
+            'ARCropolis logs and cache files are excluded. '
+            '`CARD-SHA256SUMS.txt` covers all staged mods and ARCropolis files.\n',
+            encoding='utf-8')
         return destination
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)

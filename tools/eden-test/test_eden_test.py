@@ -1311,14 +1311,15 @@ class EdenTestTests(unittest.TestCase):
             f'{sha(folder / name)}  {name}\n' for name in sorted(plugins)))
         return folder
 
-    def make_full_lineup(self, stamp, plugins, mods, arc_configs):
+    def make_full_lineup(self, stamp, plugins, mods, arc_configs, arc_resources=None):
         root = self.lineups / stamp
         self.make_lineup(root / 'plugins', plugins)
         (root / 'ultimate/mods').mkdir(parents=True)
         (root / 'ultimate/arcropolis').mkdir(parents=True)
         payload = {}
         for base, files in ((root / 'ultimate/mods', mods),
-                            (root / 'ultimate/arcropolis', arc_configs)):
+                            (root / 'ultimate/arcropolis', arc_configs),
+                            (root / 'ultimate/arcropolis/resources', arc_resources or {})):
             for name, data in files.items():
                 path = base / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1429,7 +1430,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(config['card_lineup'], {
             'staged': True, 'dir': str(newest.resolve()), 'stamp': newest.name,
             'origin': str(newest.resolve()), 'sums_sha256': sha(newest / 'plugins/SHA256SUMS.txt'), 'files': 1,
-            'mods_files': 0, 'arcropolis_config_files': 0, 'asset_bytes': 0,
+            'mods_files': 0, 'arcropolis_config_files': 0, 'arcropolis_resource_files': 0, 'asset_bytes': 0,
             'plugin_bytes': 3, 'payload_bytes': 3, 'asset_sums_sha256': sha(newest / 'CARD-SHA256SUMS.txt'),
             'asset_manifest': str(eden_test.RUNS / 'go-1/inputs/card-lineup/CARD-SHA256SUMS.txt')})
         self.assertIn('Staged plugins [a]:', output)
@@ -1454,6 +1455,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(receipt['dir'], str(newest.resolve()))
         self.assertEqual(receipt['mods_files'], 2)
         self.assertEqual(receipt['arcropolis_config_files'], 2)
+        self.assertEqual(receipt['arcropolis_resource_files'], 0)
         self.assertEqual(receipt['asset_bytes'], sum(p.stat().st_size for p in
                          [newest / 'ultimate/mods/same/mod.pak', newest / 'ultimate/mods/other/mod.pak',
                           newest / 'ultimate/arcropolis/config.toml',
@@ -1479,6 +1481,31 @@ class EdenTestTests(unittest.TestCase):
             self.assertEqual(pin['sha256'], sha(staged))
         self.assertIn('20261231-2359Z', output)
         self.assertFalse(any('ignored.log' in pin['to'] for pin in file_pins))
+
+    def test_full_card_lineup_stages_arcropolis_required_resources(self):
+        required = {
+            'config.json': b'{"version":1}',
+            'ui/layout/menu/arcadia/arcadia/layout.arc': b'arcadia layout',
+            'ui/layout/menu/arcadia/arcadia_top/layout.arc': b'arcadia top layout',
+            'ui/layout/menu/arcadia/arcadia_workspace/layout.arc': b'workspace layout',
+            'ui/layout/menu/arcadia/arcadia_config/layout.arc': b'config layout',
+            'ui/layout/menu/arcadia/arcadia_loglevel/layout.arc': b'loglevel layout',
+            'ui/layout/menu/arcadia/arcadia_changelog/layout.arc': b'changelog layout',
+            'ui/message/msg_menu.xmsbt': b'menu messages',
+        }
+        card = self.make_full_lineup('20261231-2359Z', {'card.nro': b'nro'}, {}, {}, required)
+        result, _, _ = self.run_go_without_up(self.go_args(label='arcadia-resources', lineup=True))
+        self.assertEqual(result, 0)
+        config = json.loads((eden_test.RUNS / 'arcadia-resources/config.json').read_text())
+        targets = {pin['to']: pin for pin in config['instances'][0]['files']}
+        for relative, contents in required.items():
+            target = 'user/sdmc/ultimate/arcropolis/resources/' + relative
+            self.assertIn(target, targets)
+            staged = Path(targets[target]['path'])
+            self.assertEqual(staged.read_bytes(), contents)
+            self.assertEqual(targets[target]['sha256'], sha(staged))
+            self.assertEqual(staged.stat().st_ino,
+                             (card / 'ultimate/arcropolis/resources' / relative).stat().st_ino)
 
     def test_card_lineup_default_refuses_missing_newest_plugins_or_no_stamps(self):
         for label, older in (('no-stamps', False), ('missing-newest', True)):
@@ -1569,7 +1596,7 @@ class EdenTestTests(unittest.TestCase):
             'dir': str(root.resolve()), 'stamp': root.name, 'sums_sha256': sha(sums),
             'asset_sums_sha256': sha(root / 'CARD-SHA256SUMS.txt'),
             'plugins': [{'name': name, 'sha256': sha(folder / name)} for name in ('a.nro', 'z.nro')],
-            'assets': [], 'mods_files': 0, 'arcropolis_config_files': 0, 'asset_bytes': 0,
+            'assets': [], 'mods_files': 0, 'arcropolis_config_files': 0, 'arcropolis_resource_files': 0, 'asset_bytes': 0,
             'plugin_bytes': 2, 'payload_bytes': 2})
 
     def test_card_lineup_copied_file_is_rehashed_before_up(self):
@@ -4225,6 +4252,12 @@ class CardLineupSnapshotTests(unittest.TestCase):
         (self.card / 'ultimate/arcropolis').mkdir(parents=True)
         (self.card / 'ultimate/arcropolis/config.toml').write_text('enabled = true\n')
         (self.card / 'ultimate/arcropolis/arcropolis.log').write_text('not snapshot content\n')
+        (self.card / 'ultimate/arcropolis/resources/ui/message').mkdir(parents=True)
+        (self.card / 'ultimate/arcropolis/resources/ui/message/msg_menu.xmsbt').write_bytes(b'messages')
+        (self.card / 'ultimate/arcropolis/resources/cache').mkdir(parents=True)
+        (self.card / 'ultimate/arcropolis/resources/cache/generated.bin').write_bytes(b'cache')
+        (self.card / 'ultimate/arcropolis/resources/logs').mkdir(parents=True)
+        (self.card / 'ultimate/arcropolis/resources/logs/debug.log').write_bytes(b'log')
         self.output = self.directory / 'card-lineup'
 
     def test_snapshot_is_read_only_filters_logs_and_hardlinks_identical_stamps(self):
@@ -4235,11 +4268,15 @@ class CardLineupSnapshotTests(unittest.TestCase):
         self.assertEqual({path.relative_to(self.card).as_posix(): path.read_bytes()
                           for path in self.card.rglob('*') if path.is_file()}, before)
         expected = ('plugins/libsample.nro', 'ultimate/mods/a/nested/mod.pak',
-                    'ultimate/arcropolis/config.toml')
+                    'ultimate/arcropolis/config.toml',
+                    'ultimate/arcropolis/resources/ui/message/msg_menu.xmsbt')
         for relative in expected:
             self.assertEqual((first / relative).stat().st_ino, (second / relative).stat().st_ino)
         self.assertFalse((first / 'ultimate/arcropolis/arcropolis.log').exists())
-        self.assertEqual((second / 'CARD-SHA256SUMS.txt').read_text().count('\n'), 2)
+        self.assertFalse((first / 'ultimate/arcropolis/resources/cache/generated.bin').exists())
+        self.assertFalse((first / 'ultimate/arcropolis/resources/logs/debug.log').exists())
+        self.assertIn(str(self.card.resolve()), (first / 'README.md').read_text())
+        self.assertEqual((second / 'CARD-SHA256SUMS.txt').read_text().count('\n'), 3)
         self.assertEqual((second / 'plugins/SHA256SUMS.txt').read_text().count('\n'), 1)
 
     def test_snapshot_refuses_output_inside_card_root(self):
@@ -4255,7 +4292,8 @@ class CardLineupSnapshotTests(unittest.TestCase):
         stamp = card_lineup_snapshot.snapshot(self.card, self.output, '20261127-0300Z')
         assets = eden_test.read_card_lineup(stamp)['assets']
         self.assertEqual([x['path'] for x in assets if '/arcropolis/' in x['path']],
-                         ['ultimate/arcropolis/config.toml', 'ultimate/arcropolis/config/01006a800016e000/presets'])
+                         ['ultimate/arcropolis/config.toml', 'ultimate/arcropolis/config/01006a800016e000/presets',
+                          'ultimate/arcropolis/resources/ui/message/msg_menu.xmsbt'])
 
 
 class DownProcessTests(unittest.TestCase):

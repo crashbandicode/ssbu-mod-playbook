@@ -567,7 +567,10 @@ def read_card_lineup(folder, *, plugins_only=False):
                     path = Path(name)
                     if (path.is_absolute() or path.as_posix() != name or '..' in path.parts
                             or not (name.startswith('ultimate/mods/')
-                                    or name.startswith('ultimate/arcropolis/') and _card.arc_config(Path(*path.parts[2:])))):
+                            or name.startswith('ultimate/arcropolis/')
+                            and (_card.arc_config(Path(*path.parts[2:]))
+                                 or Path(*path.parts[2:]).parts[:1] == ('resources',)
+                                 and _card.arc_resource(Path(*path.parts[3:]))))):
                         errors.append(f'invalid card asset path on line {number}: {name!r}')
                         continue
                     if name in asset_list:
@@ -601,15 +604,18 @@ def read_card_lineup(folder, *, plugins_only=False):
                     if path.is_symlink():
                         errors.append(f'symlink in card assets: {path}')
                     elif path.is_file():
-                        if base.name == 'mods' or _card.arc_config(path.relative_to(base)):
+                        relative = path.relative_to(base)
+                        if (base.name == 'mods' or _card.arc_config(relative)
+                                or relative.parts[:1] == ('resources',)
+                                and _card.arc_resource(Path(*relative.parts[1:]))):
                             actual_assets.add(path.relative_to(root).as_posix())
                         else:
                             errors.append(f'non-config ARCropolis file in card lineup: {path}')
             if actual_assets != set(asset_list):
-                errors.append('CARD-SHA256SUMS.txt does not exactly cover the mods and ARCropolis config files '
+                errors.append('CARD-SHA256SUMS.txt does not exactly cover the mods and ARCropolis files '
                               f'(unlisted: {sorted(actual_assets - set(asset_list))}; missing: '
                               f'{sorted(set(asset_list) - actual_assets)})')
-        allowed_root = {'plugins', 'ultimate', 'CARD-SHA256SUMS.txt'}
+        allowed_root = {'plugins', 'ultimate', 'CARD-SHA256SUMS.txt', 'README.md'}
         for path in root.iterdir():
             if path.name not in allowed_root:
                 errors.append(f'unexpected card lineup root entry: {path.name}')
@@ -629,7 +635,11 @@ def read_card_lineup(folder, *, plugins_only=False):
             'plugins': [{'name': name, 'sha256': listed[name]} for name in sorted(listed)],
             'assets': sorted(assets, key=lambda item: item['path']),
             'mods_files': sum(asset['path'].startswith('ultimate/mods/') for asset in assets),
-            'arcropolis_config_files': sum(asset['path'].startswith('ultimate/arcropolis/') for asset in assets),
+            'arcropolis_config_files': sum(asset['path'].startswith('ultimate/arcropolis/')
+                                           and not asset['path'].startswith('ultimate/arcropolis/resources/')
+                                           for asset in assets),
+            'arcropolis_resource_files': sum(asset['path'].startswith('ultimate/arcropolis/resources/')
+                                             for asset in assets),
             'plugin_bytes': plugin_bytes, 'asset_bytes': asset_bytes,
             'payload_bytes': plugin_bytes + asset_bytes}
 
@@ -916,6 +926,7 @@ def go_new(args):
                                  'files': len(cards),
                                  'mods_files': lineup['mods_files'],
                                  'arcropolis_config_files': lineup['arcropolis_config_files'],
+                                 'arcropolis_resource_files': lineup['arcropolis_resource_files'],
                                  'asset_bytes': lineup['asset_bytes'], 'plugin_bytes': lineup['plugin_bytes'],
                                  'payload_bytes': lineup['payload_bytes']}
         if asset_manifest:
@@ -1274,7 +1285,8 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
     if interim:
         if (not lineup.get('staged') or not re.fullmatch(r'\d{8}-\d{4}Z', lineup.get('stamp') or '')
                 or lineup.get('asset_manifest') is not None or lineup.get('asset_sums_sha256') is not None
-                or lineup.get('mods_files') != 0 or lineup.get('arcropolis_config_files') != 0):
+                or lineup.get('mods_files') != 0 or lineup.get('arcropolis_config_files') != 0
+                or lineup.get('arcropolis_resource_files', 0) != 0):
             raise SystemExit('Up needs a verified plugins-only interim snapshot with no card assets')
         expected = {}
     else:
@@ -1813,8 +1825,10 @@ def card_lineup_report(config):
                     additions.append(text)
     stamp = f', stamp {lineup["stamp"]}' if lineup.get('stamp') else ''
     interim = f'\n- card_snapshot: {INTERIM_SNAPSHOT}' if lineup.get('card_snapshot') == INTERIM_SNAPSHOT else ''
-    assets = (f', {lineup["mods_files"]} mod files and '
-              f'{lineup["arcropolis_config_files"]} ARCropolis configs '
+    resource_count = lineup.get('arcropolis_resource_files', 0)
+    assets = (f', {lineup["mods_files"]} mod files, '
+              f'{lineup["arcropolis_config_files"]} ARCropolis config files and '
+              f'{resource_count} ARCropolis resource files '
               f'({lineup["asset_bytes"]} asset bytes)'
               if 'mods_files' in lineup else '; payload size not recorded by this older run')
     return (f'- Card lineup: {lineup["origin"]}{stamp} (SHA256SUMS {lineup["sums_sha256"][:12]}…, '
@@ -2869,7 +2883,8 @@ def cmd_go(args):
             detail = (f'card lineup {lineup["origin"]} ({lineup["files"]} files verified); '
                       f'stamp {lineup.get("stamp") or "custom"}, '
                       f'{lineup.get("mods_files", 0)} mod files + {lineup.get("arcropolis_config_files", 0)} '
-                      f'config files; {lineup["payload_bytes"]} snapshot payload bytes; '
+                      f'config files + {lineup.get("arcropolis_resource_files", 0)} resource files; '
+                      f'{lineup["payload_bytes"]} snapshot payload bytes; '
                       f'--nro replaced: {replaced}; added: {added}')
         else:
             detail = f'card lineup NOT STAGED, reason: {lineup["reason"]}'
