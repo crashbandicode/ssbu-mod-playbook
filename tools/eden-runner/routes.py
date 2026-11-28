@@ -80,6 +80,60 @@ def _save(ctx, name, value):
     return value
 
 
+def _load_deadlines_path(ctx):
+    out = getattr(getattr(ctx, 'runner', None), 'out', None)
+    if out is None:
+        out = Path(ctx.row_dir)
+    return Path(out) / 'routes-load-deadlines.json'
+
+
+def _publish_load_deadline(ctx, deadline, cap):
+    path = _load_deadlines_path(ctx)
+    key = str(getattr(ctx, 'on', None) or 'default')
+    try:
+        document = json.loads(path.read_text())
+    except FileNotFoundError:
+        document = {'version': 1, 'instances': {}}
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f'load_game: could not read its deadline receipt {path}: {error}') from error
+    if (not isinstance(document, dict) or document.get('version') != 1
+            or not isinstance(document.get('instances'), dict)):
+        raise RuntimeError(f'load_game: invalid deadline receipt {path}')
+    document['instances'][key] = {'load_cap_s': cap, 'deadline_monotonic': deadline}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                     prefix=path.name + '.', suffix='.tmp', delete=False) as stream:
+        temporary = Path(stream.name)
+        stream.write(json.dumps(document, indent=1) + '\n')
+    os.replace(temporary, path)
+    return path
+
+
+def _load_deadline(ctx, started):
+    cap = ctx.instance.get('_routes_load_cap', 900)
+    deadline = ctx.instance.get('_routes_load_deadline')
+    if deadline is not None:
+        return cap, deadline
+    path = _load_deadlines_path(ctx)
+    try:
+        document = json.loads(path.read_text())
+    except FileNotFoundError:
+        return cap, started + cap
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f'bridge_on (stub on): could not read the load deadline receipt {path}: {error}') from error
+    if (not isinstance(document, dict) or document.get('version') != 1
+            or not isinstance(document.get('instances'), dict)):
+        raise RuntimeError(f'bridge_on (stub on): invalid load deadline receipt {path}')
+    key = str(getattr(ctx, 'on', None) or 'default')
+    record = document['instances'].get(key)
+    if record is None:
+        return cap, started + cap
+    if (not isinstance(record, dict) or not isinstance(record.get('load_cap_s'), (int, float))
+            or not isinstance(record.get('deadline_monotonic'), (int, float))):
+        raise RuntimeError(f'bridge_on (stub on): invalid load deadline for instance {key!r} in {path}')
+    return record['load_cap_s'], record['deadline_monotonic']
+
+
 def _bridge_tail(ctx):
     try:
         with instance_path(ctx, 'bridge_log').open('rb') as stream:
@@ -2208,6 +2262,8 @@ def load_game(ctx, gdb_port=None, cap=900, min_fps=30):
     # first Title observation all belong to one bounded boot, even when the Title appears late.
     ctx.instance['_routes_load_deadline'] = until
     ctx.instance['_routes_load_cap'] = cap
+    deadline_receipt = _publish_load_deadline(ctx, until, cap)
+    out.update(load_cap_s=cap, deadline_monotonic=until, load_deadline_receipt=str(deadline_receipt))
     if gdb_port:
         gdb_port = ctx.instance.get('gdb_port') or gdb_port
         out['kick'] = []
@@ -4594,8 +4650,7 @@ def _bridge_on_stub_title(ctx, hello, start):
     boot = match[1]
     log = instance_path(ctx, 'bridge_log')
     started = time.monotonic()
-    load_cap = ctx.instance.get('_routes_load_cap', 900)
-    until = ctx.instance.get('_routes_load_deadline', started + load_cap)
+    load_cap, until = _load_deadline(ctx, started)
     next_request = 0
     seen = 0
     last = None

@@ -539,6 +539,46 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(len(self.macro_attempts()), 1)
         self.assertFalse((self.row / 'routes-bridge-on.json').exists())
 
+    def test_same_boot_retry_keeps_the_load_deadline_after_reloading_instances(self):
+        self.configure_stub()
+        self.instance['game'] = '/fake/game.xci'
+        self.status = {'running': True, 'loading_complete': True, 'shaders_building': False, 'game_fps': 60}
+        self.instance.pop('_routes_load_deadline', None)
+        self.instance.pop('_routes_load_cap', None)
+        self.ctx.runner.out = self.out
+        instances_path = self.root / 'instances.json'
+        instances_path.write_text(json.dumps({'offline': self.instance}))
+        load_row = self.out / 'load'
+        load_row.mkdir()
+        load_ctx = SimpleNamespace(
+            on='offline', runner=self.ctx.runner, row_dir=load_row, instance=self.instance,
+            call=lambda name, args=None, **kwargs: self.call(name, args), check_stop=lambda: None)
+        with patch.object(routes.time, 'monotonic', side_effect=lambda: self.seconds), \
+             patch.object(routes.time, 'sleep', side_effect=self.sleep):
+            routes.load_game(load_ctx, cap=10)
+        (self.out / 'load.json').write_text(json.dumps({'id': 'load', 'status': 'PASS'}))
+
+        # `run --retry` loads a fresh instances.json and skips this PASS row. Its process has no in-memory deadline.
+        retry_instances = json.loads(instances_path.read_text())
+        self.assertNotIn('_routes_load_deadline', retry_instances['offline'])
+        self.assertEqual(json.loads((self.out / 'load.json').read_text())['status'], 'PASS')
+        self.ctx.runner = SimpleNamespace(out=self.out, instances=retry_instances,
+                                          wait_macro=lambda *_: None)
+        self.ctx.instance = self.instance = retry_instances['offline']
+        self.row = self.out / 'title-retry'
+        self.row.mkdir()
+        self.ctx.row_dir = str(self.row)
+        self.seconds = 10.1
+        self.assertEqual(routes._load_deadline(self.ctx, self.seconds), (10, 10.0))
+        with self.events.open('a') as stream:
+            stream.write(LISTENING.replace('6979', '6980') + '\n' + ON + '\n')
+        # The first attempt already toggled this boot On, without a qualified receipt.
+
+        with self.assertRaisesRegex(RuntimeError, 'within 10 s game-load cap|game-load deadline'):
+            self.invoke(port=6980)
+        self.assertFalse((self.row / 'routes-bridge-on.json').exists())
+        self.assertEqual(self.macro_attempts(), [])
+
     def test_stub_title_keeps_one_request_in_flight(self):
         overlaps = self.slow_title_bridge(lambda _: self.sample())
         title = self.invoke(port=6980)['title']

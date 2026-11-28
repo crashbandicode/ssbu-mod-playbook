@@ -1034,6 +1034,10 @@ class LoadGameStubOnTests(unittest.TestCase):
         self.assertEqual(result['load_cap_s'], 70)
         self.assertEqual(self.ctx.instance['_routes_load_cap'], 70)
         self.assertEqual(self.ctx.instance['_routes_load_deadline'], 42.5 + 70)
+        self.assertEqual(result['deadline_monotonic'], 42.5 + 70)
+        receipt = json.loads((self.out / 'routes-load-deadlines.json').read_text())
+        self.assertEqual(receipt, {'version': 1, 'instances': {
+            'default': {'load_cap_s': 70, 'deadline_monotonic': 42.5 + 70}}})
 
     def test_a_kick_the_stub_refused_is_tried_again_until_one_is_delivered(self):
         self.stub_up_at, self.draws_at = 42.5 + 60, 42.5 + 400
@@ -1056,7 +1060,8 @@ class LoadGameStubOnTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'^the GDB stub took no continue within 900 s'):
             routes.load_game(self.ctx, gdb_port=6811)
         self.assertEqual(len(self.kicks), 15, 'sixty seconds a try, inside the cap')
-        self.assertEqual(sorted(json.loads((self.row / 'routes-load.json').read_text())), ['kick'])
+        self.assertEqual(sorted(json.loads((self.row / 'routes-load.json').read_text())),
+                         ['deadline_monotonic', 'kick', 'load_cap_s', 'load_deadline_receipt'])
 
 
 class LoadGameKickBudgetTests(unittest.TestCase):

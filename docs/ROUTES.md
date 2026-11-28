@@ -261,7 +261,10 @@ after that load deadline is refused, even when the post-Plus 10-second window ha
 and never presses on another screen. The press is in the receipt with the read it was sent on.
 The passive Title witness uses the remaining absolute deadline recorded by `routes:load_game`; the GDB kick, game
 load and first Title observation share that route's one cap (900 seconds by default, or the row's explicit `cap`).
-This lets a slow host finish its Title transition without starting a fresh fixed 10-second timer.
+`load_game` writes the cap and absolute monotonic deadline to `out/routes-load-deadlines.json`, keyed by instance, as
+well as keeping it in memory. A same-boot `run --retry` reloads that record when it skips the already-passed load row,
+so a new runner process cannot give Title a fresh budget. This lets a slow host finish its Title transition without
+starting a fresh fixed 10-second timer.
 The press needs an opening read that arrived after a state request of this call, confirmed by a second fresh read just
 before the press; that read must begin after the request and after that request's providers reply. An opening block
 already in the capture is not enough.
