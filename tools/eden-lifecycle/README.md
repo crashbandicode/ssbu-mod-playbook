@@ -11,13 +11,16 @@
   down through the Job fallback, restore, separate verify and release (below).
   Graceful `game.stop`, pairs, native error 1312 and transport loss aren't
   qualified there yet. Since 2026-11-04 the Ally admits one Eden, so a pair can't run there.
-  On 2026-11-27–28 UTC `xplat-ally-3` through `xplat-ally-8` ran through
+  On 2026-11-27–28 UTC `xplat-ally-3` through `xplat-ally-9` ran through
   `eden_test.py go --host ally`: relay claim and release, Up, input through
   the named pipe, Down through the Job fallback, restore, separate verify and
   prune. The boot row passed in each run; `host_network`, `configure_boot` and
-  `load_game` passed in `xplat-ally-4` through `-8`, and each run sent the bridge
+  `load_game` passed in `xplat-ally-4` through `-9`, and each run sent the bridge
   chord. `xplat-ally-8` passed the bridge and training-route rows; its toggle row failed with
   `RuntimeError('ssbu.ui: incomplete, inactive or wrong-schema observation; last seen: open=0 page= depth=0 focus=/-/0/row action=row row= game= game.running=0 notice.header=Fighters notice.body=Loading 7/10 · Ready Fighters 10/30: 19 stay cold editor= editor.sel=-1 input.owner=native')`.
+  Film did not run. `xplat-ally-9` also passed the bridge and training-route rows;
+  its toggle row failed with
+  `RuntimeError('ssbu.ui: incomplete, inactive or wrong-schema observation; last seen: open=0 page= depth=0 focus=/-/0/row action=row row= game= game.running=0 notice.header=CPU Character notice.body=CPU fighter applied editor= editor.sel=-1')`.
   Film did not run. The first run's stage copy was retained at Down with WinError 5
   and removed separately after the hardlink-safe removal fix; later runs removed their stage copies.
 

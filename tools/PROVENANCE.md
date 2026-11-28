@@ -345,7 +345,7 @@ The Windows-host relay and controller commands in `eden-test/eden_test.py` follo
 `phase23/ledge-trap/eden/out/{launch_owned,run_owned,prepare_remote}.py`.
 Proof so far: host tests on Linux and the Ally's Python, the Ally `film.py smoke`, and the Ally
 `go --prepare` (`xplat-ally-2`): tar+scp and target staging, `go_new` from the shared base, packet gate OK,
-runner READY and lifecycle preflight ok through the relay. Boots `xplat-ally-3` through `-8`
+runner READY and lifecycle preflight ok through the relay. Boots `xplat-ally-3` through `-9`
 claimed, ran the boot row and released through the relay. `-3` through `-7` failed the bridge row.
 `-3` selected no host interface; `-4` selected Wi-Fi while the Ally source profile had airplane
 mode enabled; both reported guest socket errno 107. `-5` and `-6` reached the stub-on Title
@@ -356,4 +356,7 @@ on the Ally a reply took about 200 ms, at 3.1–3.5 ms a line against about 0.25
 Why the per-line timing differs is not established. The bridge fell behind and reported `unknown`.
 The route now keeps one read in flight and retries an unanswered read after 2 s. In `-8`, the boot,
 bridge and training-route rows passed; toggle failed before input with
-`ssbu.ui: incomplete, inactive or wrong-schema observation` and film did not run.
+`ssbu.ui: incomplete, inactive or wrong-schema observation` and film did not run. A mirrored
+`settings.json` kept the bridge busy about 1 s; the next `ssbu.ui` block was inactive.
+In `-9`, boot, bridge and training-route passed; toggle failed before input with
+`ssbu.ui: incomplete, inactive or wrong-schema observation`, and film did not run.

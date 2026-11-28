@@ -15,9 +15,11 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   - `pick_fighters` for P1 only;
   - `enter_training`, `chord`, `fixture`, `back_to_main`.
 - **Ally relay boots** (2026-11-27–28 UTC): `host_network`, `configure_boot` and `load_game` passed in
-  `xplat-ally-4` through `xplat-ally-8`. The bridge row failed in each of `xplat-ally-3` through `-7`.
+  `xplat-ally-4` through `xplat-ally-9`. The bridge row failed in each of `xplat-ally-3` through `-7`.
   In `xplat-ally-8`, `bridge_on`, `to_main` and `reach_training` passed; the first `tr_set` failed with
   `ssbu.ui: incomplete, inactive or wrong-schema observation`, before sending input.
+  The same rows passed in `xplat-ally-9`, whose first `tr_set` failed with the same error before input;
+  film did not run.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
