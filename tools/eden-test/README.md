@@ -56,10 +56,15 @@ fields, TR settings/saves, logs and caches stay private. `config.json` records
 the stamp, manifest hashes, verified counts and payload size; `REPORT.md` also
 reports actual linked/copied pin bytes from the prepared profiles.
 
-Use `--card-lineup <dir>` for another full stamped lineup. A plugins-only
-snapshot or `--no-card-lineup` cannot start a run. The receipt is
-in `config.json` (`card_lineup`, `staged_plugins`, `superseded_base_pins`) and
-`REPORT.md`.
+Use `--card-lineup <dir>` for another full stamped lineup. Until the first full
+snapshot is created at the next operator card mount, an explicit
+`--plugins-only-interim` allows the newest stamped plugins-only snapshot. It is
+refused as soon as any stamped full-snapshot tree or `CARD-SHA256SUMS.txt`
+exists, even if an older plugin-only stamp remains. This mode records
+`card_snapshot: plugins-only (awaiting first full snapshot)` in `config.json`
+and `REPORT.md`; there is no implicit fallback. `--no-card-lineup` remains
+refused. The receipt is in `config.json` (`card_lineup`, `staged_plugins`,
+`superseded_base_pins`) and `REPORT.md`.
 `go` and `up` need a `target` in the rows; see [Packet gate](../../docs/MACROS.md#packet-gate).
 `run` checks packet admission before it moves `STOP-INPUT` or earlier row evidence aside.
 On an Eden host the workspace default folder does not exist, so `go` needs
