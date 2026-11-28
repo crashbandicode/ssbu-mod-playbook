@@ -167,6 +167,7 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(requests, ('providers', 'state ssbu.ui'))
         self.bridge_requests.append(requests)
         self.request_times.append(self.seconds)
+        from_default = not self.stub_samples
         sample = self.stub_samples.pop(0) if self.stub_samples else self.stub_default
         if self.prompt_after_skip and any(method == 'macro.play' for method, _ in self.calls):
             sample = RUN1_PROMPT
@@ -174,6 +175,8 @@ class BridgeOnTests(unittest.TestCase):
             self.recorded_open_seen += 1
             if self.recorded_open_seen > 2:
                 return
+            if from_default and self.recorded_open_seen == 1:
+                sample = self.with_frame(sample, 71)
         with Path(self.instance['bridge_log']).open('a') as stream:
             stream.write(sample)
 
@@ -208,6 +211,9 @@ class BridgeOnTests(unittest.TestCase):
         return self.sample(fields={'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
                                    'focus.index': 'unknown', 'focus.label': 'unknown',
                                    'input.owner': 'unknown', 'dialog': 'unknown'})
+
+    def with_frame(self, sample, frame):
+        return re.sub(r' frame=\d+ wall=(\d+)', lambda m: f' frame={frame} wall={m[1]}', sample)
 
     def frame_timeline(self, select):
         self.configure_stub()
@@ -505,18 +511,17 @@ class BridgeOnTests(unittest.TestCase):
         self.assertFalse((self.row / 'routes-bridge-on.json').exists())
 
     def test_bridge_on_stub_on_does_not_accept_the_opening_playback(self):
-        self.configure_stub()
-        self.stub_samples, self.stub_default = [self.opening(), self.opening()], ''
-        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=4 frame=31.*within 10 s.*title/title.opening_playback'):
+        opening = self.opening()
+        self.frame_timeline(lambda elapsed: (31 + int(elapsed * 60), opening))
+        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=4 frame=\d+.*within 10 s.*title/title.opening_playback'):
             self.invoke(port=6980)
         self.assertLess(self.seconds, 20)
         self.assertEqual(len(self.macro_attempts()), 1)
         self.assertFalse((self.row / 'routes-bridge-on.json').exists())
 
     def test_bridge_on_stub_on_waits_through_the_opening_for_the_prompt(self):
-        self.configure_stub()
-        self.stub_samples = [self.opening(), self.opening()] + [''] * 4 + [STUB_UI]
-        self.stub_default = ''
+        opening, prompt = self.opening(), self.sample()
+        self.frame_timeline(lambda elapsed: (31 + int(elapsed * 60), opening if elapsed < .5 else prompt))
         receipt = self.invoke(port=6980)
         self.assertEqual(receipt['title']['matched'], 'prompt')
         self.assertLess(receipt['title'].get('waited_s', 100), 10)
@@ -526,9 +531,8 @@ class BridgeOnTests(unittest.TestCase):
             'focus': 'title.opening_playback'}])
 
     def test_bridge_on_stub_on_resets_prompt_deadline_after_opening_handoff(self):
-        self.configure_stub()
-        self.stub_samples = [self.opening(), self.opening()] + [''] * 4 + [self.title_without_prompt()]
-        self.stub_default = ''
+        opening, passive = self.opening(), self.title_without_prompt()
+        self.frame_timeline(lambda elapsed: (31 + int(elapsed * 60), opening if elapsed < .5 else passive))
         with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press.*within 10 s.*title/title'):
             self.invoke(port=6980)
         self.assertLess(self.seconds, 20)
@@ -554,8 +558,9 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual((title['matched'], title['frame'], title['boot']), ('prompt', 7860, RUN1_BOOT))
 
     def test_bridge_on_stub_on_never_presses_twice(self):
-        self.recorded_opening(prompt_after_skip=False)
-        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=12 frame=72.*within 10 s'):
+        opening = self.opening()
+        self.frame_timeline(lambda elapsed: (31 + int(elapsed * 60), opening))
+        with self.assertRaisesRegex(RuntimeError, r'opening was skipped with one press on rev=4 frame=\d+.*within 10 s'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
 
@@ -693,7 +698,7 @@ class BridgeOnTests(unittest.TestCase):
 
     def test_bridge_on_stub_on_other_screen_at_the_recheck_sends_nothing(self):
         self.recorded_opening(prompt_after_skip=False)
-        main = self.sample(boot=RUN1_BOOT, screen='main_menu')
+        main = self.with_frame(self.sample(boot=RUN1_BOOT, screen='main_menu'), 73)
         self.stub_samples, self.stub_default = [RUN1_OPENING, main], ''
         with self.assertRaises(RuntimeError) as stopped:
             self.invoke(port=6980)
@@ -706,6 +711,7 @@ class BridgeOnTests(unittest.TestCase):
             'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
             'focus.index': 'unknown', 'focus.label': 'unknown',
             'input.owner': 'unknown', 'dialog': 'unknown'})
+        passive = self.with_frame(passive, 73)
         self.stub_samples, self.stub_default = [RUN1_OPENING, passive], ''
         with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
             self.invoke(port=6980)
@@ -717,6 +723,7 @@ class BridgeOnTests(unittest.TestCase):
             'focus': 'title', 'focus.source': 'unknown', 'focus.id': 'unknown',
             'focus.index': 'unknown', 'focus.label': 'unknown',
             'input.owner': 'unknown', 'dialog': 'unknown'})
+        passive = self.with_frame(passive, 73)
         passive = re.sub(r'^\[Bridge\] req providers result=.*\n', '', passive, flags=re.MULTILINE)
         self.stub_samples, self.stub_default = [RUN1_OPENING, passive], ''
         with self.assertRaisesRegex(RuntimeError, r'Title prompt was not observed within 10 s.*title/title'):
@@ -730,7 +737,7 @@ class BridgeOnTests(unittest.TestCase):
             self.invoke(port=6980)
         self.assertEqual(self.macro_attempts(), [])
         self.assertRegex(str(stopped.exception), 'opening was seen but no fresh ssbu.ui reply confirmed it; nothing was sent')
-        self.assertAlmostEqual(self.seconds - self.request_times[0], 10)
+        self.assertAlmostEqual(self.seconds - self.request_times[0], 60)
 
     def test_bridge_on_stub_on_recheck_accepts_a_delayed_reply(self):
         self.recorded_opening()
@@ -837,15 +844,16 @@ class BridgeOnTests(unittest.TestCase):
         self.assertEqual(len(self.macro_attempts()), 1)
 
     def test_bridge_on_stub_on_stops_if_screen_changes_after_the_skip(self):
-        self.configure_stub()
-        self.stub_samples, self.stub_default = [self.opening(), self.opening(), self.sample(screen='main')], ''
+        opening, main = self.opening(), self.sample(screen='main')
+        self.frame_timeline(lambda elapsed: (31 + int(elapsed * 60), opening if elapsed < .5 else main))
         with self.assertRaisesRegex(RuntimeError, r'first screen it reports is main/title.press_any, not the Title'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
 
     def test_bridge_on_stub_on_stops_if_connection_changes_after_the_skip(self):
-        self.configure_stub()
-        self.stub_samples, self.stub_default = [self.opening(), self.opening(), '[Adapter] connection idle\n'], ''
+        opening = self.opening()
+        self.frame_timeline(lambda elapsed: (
+            31 + int(elapsed * 60), opening if elapsed < .5 else '[Adapter] connection idle\n'))
         with self.assertRaisesRegex(RuntimeError, 'bridge connection changed after the greeting'):
             self.invoke(port=6980)
         self.assertEqual(len(self.macro_attempts()), 1)
@@ -1349,8 +1357,8 @@ class BridgeOnTests(unittest.TestCase):
         self.assertFalse(any(method == 'input.button' for method, _ in self.calls))
 
     def test_bridge_on_stub_on_times_out_without_an_active_observation(self):
-        self.configure_stub()
-        self.stub_default = self.sample(active='no')
+        inactive = self.sample(active='no')
+        self.frame_timeline(lambda elapsed: (31 + int(elapsed * 60), inactive))
         with self.assertRaisesRegex(RuntimeError, r'no active ssbu.ui observation of this boot within 10 s'):
             self.invoke(port=6980)
 
@@ -1382,7 +1390,7 @@ class BridgeOnTests(unittest.TestCase):
                 self.assertEqual(self.macro_attempts(), [])
                 return 95, inactive
             if self.macro_attempts():
-                return 99, prompt
+                return 100 + int((elapsed - 8.4) * 60), prompt
             frame = 96 if elapsed < 8.4 else 97 + int((elapsed - 8.4) * 60)
             if not first_opening:
                 first_opening.append(frame)
@@ -1393,7 +1401,7 @@ class BridgeOnTests(unittest.TestCase):
         title = self.invoke(port=6980, cap=20)['title']
         self.assertEqual(len(self.macro_attempts()), 1)
         self.assertGreater(title['skip']['sent_on']['frame'], first_opening[0])
-        self.assertEqual(title['still_frame'], 95)
+        self.assertEqual(title['still_frame'], first_opening[0])
 
     def test_stub_title_advancing_without_active_observation_keeps_timeout(self):
         inactive = self.sample(active='no', screen='unknown')
@@ -1401,6 +1409,43 @@ class BridgeOnTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'no active ssbu.ui observation of this boot within 10 s'):
             self.invoke(port=6980, cap=20)
         self.assertAlmostEqual(self.seconds - first[0], 10, delta=.4)
+        self.assertEqual(self.macro_attempts(), [])
+
+    def test_stub_title_cap_starts_at_greeting_not_late_install(self):
+        self.configure_stub()
+        self.stub_preamble = ''.join(STUB_CAPTURE[:2])
+        self.stub_default = self.sample(active='no', screen='unknown')
+        first = []
+        installed = []
+        def add_install(_):
+            if self.popen and not first:
+                first.append(self.seconds)
+            if first and not installed and self.seconds - first[0] >= 4:
+                with (self.out / 'bridge-run' / 'bridge.log').open('a') as stream:
+                    stream.write(''.join(STUB_CAPTURE[2:6]))
+                installed.append(self.seconds)
+        self.sleep_hook = add_install
+        with self.assertRaisesRegex(RuntimeError, r'the game stood still.*\(cap 6 s\)'):
+            self.invoke(port=6980, cap=6)
+        self.assertEqual(len(installed), 1)
+        self.assertLessEqual(self.seconds - first[0], 6.1)
+        self.assertEqual(self.macro_attempts(), [])
+
+    def test_stub_title_accounts_for_fresh_reads_arriving_in_one_batch(self):
+        self.configure_stub()
+        inactive, prompt = self.sample(active='no', screen='unknown'), self.sample()
+        def at(sample, frame, wall):
+            return re.sub(r' frame=\d+ wall=\d+', f' frame={frame} wall={wall}', sample)
+        def feed(ctx, *requests):
+            self.assertIs(ctx, self.ctx)
+            self.assertEqual(requests, ('providers', 'state ssbu.ui'))
+            self.seconds += 8.1
+            with Path(self.instance['bridge_log']).open('a') as stream:
+                stream.write(at(inactive, 95, 1000) + at(inactive, 95, 9000) + at(prompt, 96, 9100))
+        self.spool = feed
+        title = self.invoke(port=6980, cap=20)['title']
+        self.assertEqual((title['matched'], title['still_frame']), ('prompt', 95))
+        self.assertAlmostEqual(title['still_s'], 8, delta=.001)
         self.assertEqual(self.macro_attempts(), [])
 
     def test_bridge_on_stub_on_readiness_timeout_names_false_conditions(self):
