@@ -1318,15 +1318,17 @@ class BridgeFramingTests(unittest.TestCase):
         self.assertEqual(sent, [0])
 
     def test_ui_read_after_a_transfer_gives_up_after_the_bound(self):
-        def check(bridge, clock):
-            sample = bridge.read(picker.UI, 3)
-            self.assertEqual(sample.values['observation.active'], 'no')
-            self.assertAlmostEqual(clock.monotonic(), 2)
+        for cap, expected in ((3, 2), (1, 1)):
+            with self.subTest(cap=cap):
+                def check(bridge, clock):
+                    sample = bridge.read(picker.UI, cap)
+                    self.assertEqual(sample.values['observation.active'], 'no')
+                    self.assertAlmostEqual(clock.monotonic(), expected)
 
-        sent = self.replay_ui_exchange(check, lambda count: self.transfer_ui_reply(False, count),
-                                       initial=self.transfer_end, assert_consumed=True)
-        self.assertGreater(len(sent), 1)
-        self.assertLessEqual(sent[-1], 2)
+                sent = self.replay_ui_exchange(check, lambda count: self.transfer_ui_reply(False, count),
+                                               initial=self.transfer_end, assert_consumed=True)
+                self.assertGreater(len(sent), 1)
+                self.assertLessEqual(sent[-1], expected)
 
     def test_an_active_ui_read_clears_the_transfer_mark(self):
         def check(bridge, clock):
