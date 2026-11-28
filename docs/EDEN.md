@@ -193,6 +193,31 @@ sending a second toggle. When `load_cap` is omitted, Up allows 300 seconds on
 every host; an explicit run-config value wins.
 Backup and restore handling is unchanged.
 
+### Full card lineup on every Eden run
+
+`tools/eden-test/card_lineup_snapshot.py` creates the canonical read-only card
+snapshot at `artifacts/phase23/card-lineup/<YYYYMMDD-HHMMZ>/`. Run it only after
+the operator mounts the card; it reads the card and never writes there. Each
+stamp contains the plugin NROs and `plugins/SHA256SUMS.txt`, every regular file
+under `ultimate/mods/`, and only `.toml` files under `ultimate/arcropolis/`.
+Logs are excluded. `CARD-SHA256SUMS.txt` covers the mods and TOML files. The
+snapshotter hard-links identical files already present in earlier stamps.
+
+`eden_test.py go` selects the newest full stamp by default, verifies it, and
+records the stamp, hashes, file counts, and payload bytes in `config.json` and
+`REPORT.md`. It hard-links staged inputs through the host's content-addressed
+cache, shared by later runs. Lifecycle then copies the plugins, mods, and
+configuration files into each run's private SD profile. Those copies may be
+rewritten in place without modifying the shared snapshot or another run. The
+receipt's `profile_copy_bytes` is the total card payload copied across the
+run's instances; shared hard-linked staging adds no per-run payload bytes.
+
+The snapshot command is:
+
+```text
+/usr/bin/python3 -I -B tools/eden-test/card_lineup_snapshot.py --card-root '/run/media/intpa/SWITCH SD'
+```
+
 **Compiles beside an Up** (operator 2026-11-10; [WORKFLOW](WORKFLOW.md) "Running agent workers without churn", rule 8):
 
 - While compilers run, `up` is admitted only when every compiler process runs at nice 10 or higher, and MemAvailable

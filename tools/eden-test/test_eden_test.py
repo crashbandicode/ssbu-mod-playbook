@@ -22,6 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eden_test  # noqa: E402
+import card_lineup_snapshot  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'eden-runner'))
 import test_routes as runner_tests  # noqa: E402
 import test_setup_calls as setup_tests  # noqa: E402
@@ -1294,6 +1295,26 @@ class EdenTestTests(unittest.TestCase):
             f'{sha(folder / name)}  {name}\n' for name in sorted(plugins)))
         return folder
 
+    def make_full_lineup(self, stamp, plugins, mods, arc_configs):
+        root = self.lineups / stamp
+        self.make_lineup(root / 'plugins', plugins)
+        (root / 'ultimate/mods').mkdir(parents=True)
+        (root / 'ultimate/arcropolis').mkdir(parents=True)
+        payload = {}
+        for base, files in ((root / 'ultimate/mods', mods),
+                            (root / 'ultimate/arcropolis', arc_configs)):
+            for name, data in files.items():
+                path = base / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                payload[path.relative_to(root).as_posix()] = sha(path)
+        (root / 'CARD-SHA256SUMS.txt').write_text(''.join(
+            f'{digest}  {name}\n' for name, digest in sorted(payload.items())))
+        for path in root.rglob('*'):
+            if path.is_file() and not path.name.endswith('SUMS.txt'):
+                path.chmod(path.stat().st_mode & ~0o222)
+        return root
+
     def run_go_without_up(self, args):
         output = io.StringIO()
         with mock.patch.object(eden_test, 'cmd_up') as up, \
@@ -1381,8 +1402,8 @@ class EdenTestTests(unittest.TestCase):
         return str(caught.exception)
 
     def test_card_lineup_default_uses_newest_stamp_only(self):
-        self.make_lineup(self.lineups / '20260101-1000Z/plugins', {'old.nro': b'old'})
-        newest = self.make_lineup(self.lineups / '20261231-2359Z/plugins', {'new.nro': b'new'})
+        self.make_full_lineup('20260101-1000Z', {'old.nro': b'old'}, {}, {})
+        newest = self.make_full_lineup('20261231-2359Z', {'new.nro': b'new'}, {}, {})
         (self.lineups / 'not-a-stamp').mkdir()
         (self.lineups / '20270101-0000Z').write_text('a file is not a stamp directory')
         result, output, up = self.run_go_without_up(self.go_args(lineup=True))
@@ -1390,10 +1411,57 @@ class EdenTestTests(unittest.TestCase):
         up.assert_called_once()
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertEqual(config['card_lineup'], {
-            'staged': True, 'dir': str(newest.resolve()), 'origin': str(newest.resolve()),
-            'sums_sha256': sha(newest / 'SHA256SUMS.txt'), 'files': 1})
+            'staged': True, 'dir': str(newest.resolve()), 'stamp': newest.name,
+            'origin': str(newest.resolve()), 'sums_sha256': sha(newest / 'plugins/SHA256SUMS.txt'), 'files': 1,
+            'mods_files': 0, 'arcropolis_config_files': 0, 'asset_bytes': 0,
+            'plugin_bytes': 3, 'payload_bytes': 3, 'profile_copy_bytes': 3})
         self.assertIn('Staged plugins [a]:', output)
         self.assertIn(f'card lineup {newest} (1 files verified)', output)
+
+    def test_full_card_lineup_stages_mods_and_arcropolis_configs_and_hardlinks_inputs(self):
+        old = self.make_full_lineup('20260101-1000Z', {'old.nro': b'old'},
+                                    {'same/mod.pak': b'shared mod'}, {'config.toml': b'arc config'})
+        newest = self.make_full_lineup('20261231-2359Z', {'new.nro': b'new'},
+                                       {'same/mod.pak': b'shared mod', 'other/mod.pak': b'other'},
+                                       {'config.toml': b'arc config', 'nested/extra.toml': b'extra'})
+        self.previous.write_text(json.dumps({
+            **json.loads(self.previous.read_text()),
+            'instances': [{**json.loads(self.previous.read_text())['instances'][0], 'files': []}] }))
+        first, output, _ = self.run_go_without_up(self.go_args(label='full-one', lineup=True))
+        second, _, _ = self.run_go_without_up(self.go_args(label='full-two', lineup=True))
+        self.assertEqual((first, second), (0, 0))
+        one = json.loads((eden_test.RUNS / 'full-one/config.json').read_text())
+        two = json.loads((eden_test.RUNS / 'full-two/config.json').read_text())
+        receipt = one['card_lineup']
+        self.assertEqual(receipt['stamp'], '20261231-2359Z')
+        self.assertEqual(receipt['dir'], str(newest.resolve()))
+        self.assertEqual(receipt['mods_files'], 2)
+        self.assertEqual(receipt['arcropolis_config_files'], 2)
+        self.assertEqual(receipt['asset_bytes'], sum(p.stat().st_size for p in
+                         [newest / 'ultimate/mods/same/mod.pak', newest / 'ultimate/mods/other/mod.pak',
+                          newest / 'ultimate/arcropolis/config.toml',
+                          newest / 'ultimate/arcropolis/nested/extra.toml']))
+        self.assertEqual(receipt['payload_bytes'], receipt['asset_bytes'] + 3)
+        self.assertEqual(receipt['profile_copy_bytes'], receipt['payload_bytes'])
+        file_pins = one['instances'][0]['files']
+        targets = {pin['to']: pin for pin in file_pins}
+        self.assertEqual(set(targets), {
+            'user/sdmc/ultimate/mods/same/mod.pak', 'user/sdmc/ultimate/mods/other/mod.pak',
+            'user/sdmc/ultimate/arcropolis/config.toml',
+            'user/sdmc/ultimate/arcropolis/nested/extra.toml'})
+        for rel, source in ((Path('ultimate/mods/same/mod.pak'), newest / 'ultimate/mods/same/mod.pak'),
+                            (Path('ultimate/arcropolis/config.toml'), newest / 'ultimate/arcropolis/config.toml')):
+            staged = eden_test.RUNS / 'full-one/inputs/card-lineup' / rel
+            staged2 = eden_test.RUNS / 'full-two/inputs/card-lineup' / rel
+            self.assertEqual(staged.stat().st_ino, source.stat().st_ino)
+            self.assertEqual(staged.stat().st_ino, staged2.stat().st_ino)
+        for target, pin in targets.items():
+            relative = Path(target.removeprefix('user/sdmc/'))
+            staged = eden_test.RUNS / 'full-one/inputs/card-lineup/ultimate' / relative.relative_to('ultimate')
+            self.assertEqual(pin['path'], str(staged))
+            self.assertEqual(pin['sha256'], sha(staged))
+        self.assertIn('20261231-2359Z', output)
+        self.assertFalse(any('ignored.log' in pin['to'] for pin in file_pins))
 
     def test_card_lineup_default_refuses_missing_newest_plugins_or_no_stamps(self):
         for label, older in (('no-stamps', False), ('missing-newest', True)):
@@ -1405,7 +1473,8 @@ class EdenTestTests(unittest.TestCase):
                 if older:
                     self.assertEqual(
                         message, f'newest card lineup {self.lineups / "20261231-2359Z"} has no plugins folder '
-                        '(older stamps are not used); pass --card-lineup <dir> or --no-card-lineup <reason>')
+                        '(older stamps are not used); refresh a complete card lineup or pass --card-lineup <dir> / '
+                        '--no-card-lineup <reason>')
                 else:
                     self.assertEqual(
                         message, f'no card lineup under {self.lineups} (no <YYYYMMDD-HHMM>Z folder; '
@@ -1480,18 +1549,20 @@ class EdenTestTests(unittest.TestCase):
         sums = folder / 'SHA256SUMS.txt'
         sums.write_text(f'{sha(folder / "z.nro")} *z.nro\n\n{sha(folder / "a.nro")} a.nro\n')
         self.assertEqual(eden_test.read_card_lineup(folder), {
-            'dir': str(folder.resolve()), 'sums_sha256': sha(sums),
-            'plugins': [{'name': name, 'sha256': sha(folder / name)} for name in ('a.nro', 'z.nro')]})
+            'dir': str(folder.resolve()), 'stamp': None, 'sums_sha256': sha(sums),
+            'plugins': [{'name': name, 'sha256': sha(folder / name)} for name in ('a.nro', 'z.nro')],
+            'assets': [], 'mods_files': 0, 'arcropolis_config_files': 0, 'asset_bytes': 0,
+            'plugin_bytes': 2, 'payload_bytes': 2})
 
     def test_card_lineup_copied_file_is_rehashed_before_up(self):
         card = self.make_lineup(self.dir / 'copied-card', {'one.nro': b'one'})
-        real_copy = shutil.copy2
-        def corrupt_card_copy(source, target, *args, **kwargs):
-            result = real_copy(source, target, *args, **kwargs)
-            if Path(source) == card / 'one.nro':
-                Path(target).write_bytes(b'corrupted copy')
-            return result
-        with mock.patch.object(eden_test.shutil, 'copy2', side_effect=corrupt_card_copy), \
+        real_link = os.link
+        def corrupt_card_link(source, target, *args, **kwargs):
+            if Path(target).name == 'one.nro':
+                Path(target).write_bytes(b'corrupted hard link')
+                return None
+            return real_link(source, target, *args, **kwargs)
+        with mock.patch.object(eden_test.os, 'link', side_effect=corrupt_card_link), \
              mock.patch.object(eden_test, 'cmd_up') as up:
             with self.assertRaises(SystemExit) as caught:
                 eden_test.main(self.go_args(lineup=True) + ['--card-lineup', str(card)])
@@ -1505,6 +1576,23 @@ class EdenTestTests(unittest.TestCase):
         config = json.loads((eden_test.RUNS / 'go-1/config.json').read_text())
         self.assertEqual(config['card_lineup']['dir'], str(card.resolve()))
         self.assertEqual(config['card_lineup']['origin'], '/original/card')
+
+    def test_remote_transfer_copy_is_removed_after_host_cache_links_are_staged(self):
+        staged = eden_test.RUNS / '_eden-test/stage/remote-run/card-lineup'
+        staged.mkdir(parents=True)
+        payload = staged / 'payload'
+        payload.write_text('temporary transfer copy')
+        payload.chmod(payload.stat().st_mode & ~0o222)
+        args = types.SimpleNamespace(label='remote-run', card_lineup=str(staged),
+                                     card_lineup_origin='/workspace/card-lineup/20261231-2359Z')
+        eden_test._discard_remote_lineup_stage(args)
+        self.assertFalse(staged.exists())
+        unrelated = eden_test.RUNS / '_eden-test/stage/other-run/card-lineup'
+        unrelated.mkdir(parents=True)
+        args.label = 'remote-run'
+        args.card_lineup = str(unrelated)
+        eden_test._discard_remote_lineup_stage(args)
+        self.assertTrue(unrelated.exists())
 
     def test_card_lineup_rejects_duplicate_nro_names_before_copying(self):
         card = self.make_lineup(self.dir / 'duplicate-card', {'one.nro': b'one'})
@@ -1584,6 +1672,10 @@ class EdenTestTests(unittest.TestCase):
             {'name': new.name, 'sha256': sha(new), 'source': 'nro',
              'replaces': {'source': 'card', 'sha256': sha(card / new.name)}},
             {'name': 'libssbu_hw_bridge.nro', 'sha256': base[1]['sha256'], 'source': 'base'}])
+        applied_card_plugin_bytes = sum(Path(pin['path']).stat().st_size for pin in pins
+                                        if pin['name'] in ('libother.nro', 'libssbu_tile_cursor.nro',
+                                                           'libtraining_rooms.nro'))
+        self.assertEqual(config['card_lineup']['profile_copy_bytes'], applied_card_plugin_bytes)
         self.assertEqual(config['superseded_base_pins'], [
             {'instance': 'a', 'name': base[i]['name'], 'base_path': base[i]['path'],
              'base_sha256': base[i]['sha256'], 'card_sha256': sha(card / base[i]['name'])}
@@ -1633,6 +1725,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertIn('- Card lineup: NOT STAGED — reason: test without the card lineup',
                       (run / 'REPORT.md').read_text())
 
+
     def test_card_lineup_opt_out_reason_and_mutual_exclusion_refuse_before_staging(self):
         for index, reason in enumerate(('', '   ', "cannot use operator's lineup", 'two\nlines', 'two\rlines')):
             label = f'bad-reason-{index}'
@@ -1650,7 +1743,7 @@ class EdenTestTests(unittest.TestCase):
         self.assertFalse((eden_test.RUNS / 'go-1').exists())
 
     def test_card_lineup_remote_verified_then_rsynced_before_ssh_with_origin(self):
-        folder = self.make_lineup(self.lineups / '20261231-2359Z/plugins', {'one.nro': b'one'})
+        folder = self.make_full_lineup('20261231-2359Z', {'one.nro': b'one'}, {}, {})
         stage = '/home/intpa/eden-runs/_eden-test/stage/go-1'
         token = 'd' * 32
         def fake_sh(command, log=None):
@@ -3949,6 +4042,40 @@ class EdenTestTests(unittest.TestCase):
         self.assertEqual(self.cleanup(run)['skipped'], 'lifecycle down failed (1)')
 
 
+class CardLineupSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix='card-lineup-snapshot-test-'))
+        self.addCleanup(shutil.rmtree, self.directory)
+        self.card = self.directory / 'card'
+        (self.card / card_lineup_snapshot.PLUGINS).mkdir(parents=True)
+        (self.card / card_lineup_snapshot.PLUGINS / 'libsample.nro').write_bytes(b'plugin')
+        (self.card / 'ultimate/mods/a/nested').mkdir(parents=True)
+        (self.card / 'ultimate/mods/a/nested/mod.pak').write_bytes(b'mod bytes')
+        (self.card / 'ultimate/arcropolis').mkdir(parents=True)
+        (self.card / 'ultimate/arcropolis/config.toml').write_text('enabled = true\n')
+        (self.card / 'ultimate/arcropolis/arcropolis.log').write_text('not snapshot content\n')
+        self.output = self.directory / 'card-lineup'
+
+    def test_snapshot_is_read_only_filters_logs_and_hardlinks_identical_stamps(self):
+        before = {path.relative_to(self.card).as_posix(): path.read_bytes()
+                  for path in self.card.rglob('*') if path.is_file()}
+        first = card_lineup_snapshot.snapshot(self.card, self.output, '20261127-0100Z')
+        second = card_lineup_snapshot.snapshot(self.card, self.output, '20261127-0200Z')
+        self.assertEqual({path.relative_to(self.card).as_posix(): path.read_bytes()
+                          for path in self.card.rglob('*') if path.is_file()}, before)
+        expected = ('plugins/libsample.nro', 'ultimate/mods/a/nested/mod.pak',
+                    'ultimate/arcropolis/config.toml')
+        for relative in expected:
+            self.assertEqual((first / relative).stat().st_ino, (second / relative).stat().st_ino)
+        self.assertFalse((first / 'ultimate/arcropolis/arcropolis.log').exists())
+        self.assertEqual((second / 'CARD-SHA256SUMS.txt').read_text().count('\n'), 2)
+        self.assertEqual((second / 'plugins/SHA256SUMS.txt').read_text().count('\n'), 1)
+
+    def test_snapshot_refuses_output_inside_card_root(self):
+        with self.assertRaisesRegex(ValueError, 'outside the card root'):
+            card_lineup_snapshot.snapshot(self.card, self.card / 'lineup', '20261127-0300Z')
+
+
 class DownProcessTests(unittest.TestCase):
     """_process_reason on a modelled /proc: which processes keep a path at Down."""
 
@@ -4117,7 +4244,7 @@ class ReportTests(unittest.TestCase):
                 shutil.rmtree(self.run / 'work')
             with self.subTest(pruned=pruned):
                 top = eden_test.report_md(self.run).split('| Row |')[0]
-                self.assertIn('- Card lineup: /surface/card (SHA256SUMS cccccccccccc…, 2 files verified)', top)
+                self.assertIn('- Card lineup: /surface/card (SHA256SUMS cccccccccccc…, 2 plugins verified', top)
                 self.assertIn('replace-card.nro (card aaaaaaaaaaaa… → ', top)
                 self.assertIn('base.nro (base)', top)
                 self.assertIn('added.nro (--nro)', top)

@@ -387,6 +387,29 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(life.load_cap({'host': host}), 300)
                 self.assertEqual(life.load_cap({'host': host, 'load_cap': 47}), 47)
 
+    def test_mods_and_arcropolis_toml_are_copied_to_private_sd_paths(self):
+        mod = self.base / 'card-mod.pak'
+        arc_config = self.base / 'card-arcropolis.toml'
+        mod.write_bytes(b'mod data')
+        arc_config.write_text('enabled = true\n')
+        self.config['instances'][0]['files'].extend([
+            {'path': str(mod), 'sha256': life.digest(mod), 'to': 'user/sdmc/ultimate/mods/sample/mod.pak'},
+            {'path': str(arc_config), 'sha256': life.digest(arc_config),
+             'to': 'user/sdmc/ultimate/arcropolis/config.toml'}])
+        c = self.controller()
+        c.up()
+        profile = Path(c.state['instances'][0]['profile'])
+        for source, relative in ((mod, 'user/sdmc/ultimate/mods/sample/mod.pak'),
+                                 (arc_config, 'user/sdmc/ultimate/arcropolis/config.toml')):
+            staged = profile / relative
+            self.assertEqual(staged.read_bytes(), source.read_bytes())
+            self.assertNotEqual(staged.stat().st_ino, source.stat().st_ino)
+            staged.write_bytes(b'changed by this run')
+            self.assertNotEqual(staged.read_bytes(), source.read_bytes())
+        self.assertEqual(mod.read_bytes(), b'mod data')
+        self.assertEqual(arc_config.read_text(), 'enabled = true\n')
+        c.down()
+
     def test_pair_gets_separate_staged_pins_and_one_tcp_namespace(self):
         self.pair()
         shared = self.base / 'port.txt'
@@ -401,6 +424,10 @@ class LifecycleTests(unittest.TestCase):
         for item in c.state['instances']:
             path = Path(item['profile']) / item['files'][-1]['to']
             self.assertEqual(int(path.read_text()), allocation[item['key']]['bridge'])
+            self.assertNotEqual(path.stat().st_ino, shared.stat().st_ino,
+                                'run-written SD files must be private copies, not shared hard links')
+            path.write_text('rewritten by this run')
+            self.assertEqual(shared.read_text(), '6793\n')
         self.assertEqual(shared.read_text(), '6793\n', 'do not overwrite a config input shared with another run')
         c.down()
 

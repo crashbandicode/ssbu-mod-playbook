@@ -33,14 +33,38 @@ The external `/home/intpa/eden-runs/_eden-test/hosts.json` must have
 
 On the Eden host, run the same command with its local host name:
 `/usr/bin/python3 -I -B tools/eden-test/eden_test.py go --host yoga --label my-run --owner "Claude devin-<lane>/my-run" --nro /path/libtraining_rooms.nro --elf /path/libtraining_rooms.so --trace-point libtraining_rooms.nro!edge_juggle_attempt --trace-point libtraining_rooms.nro!planner_chose --rows tools/eden-test/example`
-By default, `go` stages the full card lineup from the newest stamp and verifies its `SHA256SUMS.txt`.
-Each `--nro` replaces the card file of the same name; a new name is added.
-Base plugins not on the card, including the bridge, are added; card files supersede matching base pins.
-Use `--card-lineup <dir>` for another lineup or `--no-card-lineup <reason>` to opt out with a recorded reason.
-The receipt is in `config.json` (`card_lineup`, `staged_plugins`, `superseded_base_pins`) and `REPORT.md`.
+By default, `go` stages the newest complete stamped lineup. It contains
+`plugins/` with `SHA256SUMS.txt`, every regular file under `ultimate/mods/`,
+and only `.toml` files under `ultimate/arcropolis/`; ARCropolis logs are not
+staged. `CARD-SHA256SUMS.txt` verifies the recursive mods and TOML files. The
+read-only snapshot command for the next card mount is:
+
+```text
+/usr/bin/python3 -I -B tools/eden-test/card_lineup_snapshot.py --card-root '/run/media/intpa/SWITCH SD'
+```
+
+It writes `artifacts/phase23/card-lineup/<YYYYMMDD-HHMMZ>/`, leaves the card
+unchanged, and hard-links byte-identical payload files from earlier stamps.
+The newest stamp is the default. Each `--nro` replaces the card plugin of the
+same name; a new name is added. Base plugins not on the card, including the
+bridge, are added; card plugins supersede matching base pins. The run's
+`inputs/card-lineup/` links identical files through a host-local content cache
+shared across runs. Lifecycle copies every plugin, mod, and TOML file into
+each private SD profile, so a run can write those files without changing a
+snapshot or another run. `config.json` records the stamp, verified counts and
+hashes, payload size, and `profile_copy_bytes`; that byte count is the card
+payload copied for all instances in the run. The shared hard-linked inputs
+add no per-run payload bytes. `REPORT.md` includes the same stamp and size.
+
+Use `--card-lineup <dir>` for another stamped lineup or
+`--no-card-lineup <reason>` to opt out with a recorded reason. The receipt is
+in `config.json` (`card_lineup`, `staged_plugins`, `superseded_base_pins`) and
+`REPORT.md`.
 `go` and `up` need a `target` in the rows; see [Packet gate](../../docs/MACROS.md#packet-gate).
 `run` checks packet admission before it moves `STOP-INPUT` or earlier row evidence aside.
-On an Eden host the default folder does not exist, so `go` needs `--card-lineup <dir>`; remote dispatch copies the lineup and passes it.
+On an Eden host the workspace default folder does not exist, so `go` needs
+`--card-lineup <dir>`; remote dispatch copies the lineup and passes it. The
+host's content cache hard-links the staged files across later runs.
 Remote `go` also packs each named target commit without modifying its producer
 repository and stages a read-only checkout under the run's owned stage path.
 Transport failures in staging, remote go and result/report transfers are
