@@ -115,8 +115,11 @@ def windows_busy_path(root):
         path = pending.pop()
         if time.monotonic() >= until:
             raise OSError(f'open-file check did not finish under {root}')
-        # FILE_READ_DATA (FILE_LIST_DIRECTORY), no sharing, OPEN_EXISTING; never follow reparse points.
-        handle = kernel.CreateFileW(str(path), 1, 0, None, 3, 0x00200000 | 0x02000000, None)
+        info = path.lstat()
+        # A Windows current-directory handle denies DELETE sharing but need not request read-data access.
+        # Request access without changing anything: no delete-on-close and no disposition calls.
+        access = 0x10001 if stat.S_ISDIR(info.st_mode) else 1
+        handle = kernel.CreateFileW(str(path), access, 0, None, 3, 0x00200000 | 0x02000000, None)
         if handle == ctypes.c_void_p(-1).value:
             code = ctypes.get_last_error()
             if code == 32:  # ERROR_SHARING_VIOLATION
@@ -124,7 +127,6 @@ def windows_busy_path(root):
             raise ctypes.WinError(code)
         if not kernel.CloseHandle(handle):
             raise ctypes.WinError(ctypes.get_last_error())
-        info = path.lstat()
         if stat.S_ISDIR(info.st_mode) and not info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             pending.extend(path.iterdir())
     return None
