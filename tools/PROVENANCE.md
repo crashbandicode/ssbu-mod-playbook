@@ -384,6 +384,13 @@ of Training (`Loading 4/9`). The Training observer ran at 19.1/s, 19.4/s and 21.
 Ally-8, -9 and -10 respectively, and 28.8/s on Yoga-2 (32 ms sampling allows 31.2/s).
 Ally-8 and -9 used bridge `5917e54f…`; Ally-10 and Yoga-2 used `cd16ac8d…`.
 The previous settings-file and `tr.menu` attributions are withdrawn; why a read is inactive
-is not established. `tr_set` currently treats one inactive read as final. Whether to wait for
-loading or confirm an inactive read is undecided. The file-transfer re-read was reverted;
+is not established. In those boots, `tr_set` treated one inactive read as final. The file-transfer re-read was reverted;
 it never acted in a boot because each route step creates a fresh `BridgePickerIO`.
+
+2026-11-28, Training read: the menu owner wait retries validated inactive `ssbu.ui` reads
+within its existing cap and fails closed without an active observation. The host tests passed.
+With the deployed bridge `5917e54f…`, `xplat-yoga-3` passed boot, bridge and the diagnostic
+watch row, but training-route failed at `enter_training` with `bridge connection or replay
+continuity changed while input was unconfirmed`. Toggle did not run: there are no toggle
+read-backs or inactive-wait measurement, and there was no film row. Why reads become
+inactive remains unestablished; the raw observations are in the lane's files.

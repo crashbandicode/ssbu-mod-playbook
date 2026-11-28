@@ -28,8 +28,13 @@ already covered ([HARNESS-LESSONS](HARNESS-LESSONS.md)).
   `tr_set` failed on an inactive read 0.09 s before a fighter-loading notice.
   Its film row was omitted because Yoga had no ffmpeg. The upkeep change has
   green gates and unit tests, but no boot shows it was necessary; it is not
-  deployed to a shared input. `tr_set` takes one inactive read as final; whether
-  to wait for background fighter loading or confirm that read is undecided.
+  deployed to a shared input. At the time, `tr_set` took one inactive read as final.
+- **Training read boot** (2026-11-28 UTC): with the deployed bridge
+  `5917e54f…`, `xplat-yoga-3` passed boot, bridge and the diagnostic watch row,
+  but training-route failed at `enter_training` with `bridge connection or replay
+  continuity changed while input was unconfirmed`. Toggle did not run, so it has
+  no read-backs or inactive-wait measurement; there was no film row. The reason
+  for inactive reads remains open; the raw observations are in the lane's files.
 - **Not proven:** the CPU's coin on the CSS, damage cleared from above 0, and the online blocks.
 - **A lane's first proof boot** may reuse a route that already passed for it, verbatim; for TrainingRooms that is
   rc15-integration remaining-2's boot → Training (no CSS/SSS walk). Use the blocks for the rows after it, for
