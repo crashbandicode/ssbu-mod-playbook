@@ -4504,7 +4504,6 @@ def _bridge_on_skip_opening(ctx, block, state):
             raise
         state['sent'] = True
         state['sent_at'] = time.monotonic()
-        state['sent_active_s'] = state['active_s']
         state['sent_on'] = {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'],
                             **{key: values.get(key) for key in ('screen', 'screen.context', 'focus')}}
         try:
@@ -4515,7 +4514,7 @@ def _bridge_on_skip_opening(ctx, block, state):
 
     step = closed_loop.Step('opening skip', lambda obs: obs['kind'] == 'opening',
                             lambda obs: obs['kind'] == 'prompt', 'attract-cancel',
-                            cap=state['cap'], ready_cap=state['cap'], lost_after=state['cap'], sends=1)
+                            cap=10, ready_cap=10, lost_after=10, sends=1)
     try:
         closed_loop.run('bridge_on (stub on)', [step], observe, send, io.finish,
                         clock=time.monotonic, sleep=time.sleep, poll=.05,
@@ -4531,22 +4530,20 @@ def _bridge_on_skip_opening(ctx, block, state):
         raise RuntimeError(str(error)) from error
 
 
-def _bridge_on_stub_title(ctx, hello, start, cap, started):
+def _bridge_on_stub_title(ctx, hello, start):
     match = re.search(r'\bboot=(0x[0-9a-f]{16})\b', hello)
     if match is None:
         raise RuntimeError('bridge_on (stub on): the bridge greeting has no boot id')
     boot = match[1]
     log = instance_path(ctx, 'bridge_log')
-    until = started + cap
+    started = time.monotonic()
+    until = started + 10
     next_request = 0
     seen = 0
     last = None
     not_yet = []
     identities = set()
-    state = {'boot': boot, 'sent': False, 'prompt': None, 'opening_seen': False, 'fresh_non_opening': False,
-             'cap': cap, 'active_s': 0.0, 'sent_active_s': 0.0, 'still_s': 0.0, 'still_frame': None,
-             'previous_frame': None, 'previous_wall': None, 'accounted_s': 0.0,
-             'still_streak_s': 0.0, 'last_interval_still': False}
+    state = {'boot': boot, 'sent': False, 'prompt': None, 'opening_seen': False, 'fresh_non_opening': False}
     asked = []
 
     def timeout():
@@ -4555,25 +4552,6 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
                             f"rev={sent_on['rev']} frame={sent_on['frame']}, but the Title prompt was not "
                             f"observed within 10 s; last Title state: "
                             f"{last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
-
-    def window_error():
-        if state['sent']:
-            return timeout()
-        if state['opening_seen'] and not state['fresh_non_opening']:
-            return RuntimeError('bridge_on (stub on): the opening was seen but no fresh ssbu.ui reply confirmed it; '
-                                'nothing was sent')
-        if last is not None:
-            return RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within 10 s of the greeting; "
-                                f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
-        return RuntimeError('bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting')
-
-    def cap_error():
-        if state['last_interval_still']:
-            seconds = round(state['still_streak_s'], 3)
-            return RuntimeError(f"bridge_on (stub on): the game stood still after the greeting: the bridge's frame "
-                                f"counter stayed at {state['still_frame']} for {seconds} s (cap {cap} s); "
-                                "nothing was pressed")
-        return window_error()
 
     def read_blocks():
         blocks = list(_bridge_on_ui_blocks_since_hello(log.read_bytes(), hello, start))
@@ -4587,8 +4565,6 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
         return reply is not None and boundary <= reply < begin and boundary <= begin
 
     def check_current(block):
-        if time.monotonic() >= until:
-            raise cap_error()
         blocks = read_blocks()
         if not blocks or blocks[-1] != block:
             raise RuntimeError('bridge_on (stub on): the opening observation changed before Plus; nothing was sent')
@@ -4600,8 +4576,6 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
         before = log.stat().st_size
         asked.append(before)
         bridge_v2(ctx, 'providers', 'state ssbu.ui')
-        if time.monotonic() >= until:
-            raise cap_error()
         next_request = now + .1
         return before
 
@@ -4612,33 +4586,13 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
             index = seen
             seen += 1
             values = block['values']
-            if block['boot'] == boot and any(fresh(block, mark) for mark in asked):
-                now = time.monotonic()
-                frame = block['frame']
-                previous = state['previous_frame']
-                if previous is not None:
-                    elapsed = min(max(0.0, (block['wall'] - state['previous_wall']) / 1000),
-                                  max(0.0, now - started - state['accounted_s']))
-                    state['accounted_s'] += elapsed
-                    if frame < previous:
-                        raise RuntimeError('bridge_on (stub on): the bridge frame counter moved backwards')
-                    if frame == previous:
-                        state['still_s'] += elapsed
-                        state['still_streak_s'] += elapsed
-                        state['still_frame'] = frame
-                        state['last_interval_still'] = True
-                    else:
-                        state['active_s'] += elapsed
-                        state['still_streak_s'] = 0.0
-                        state['last_interval_still'] = False
-                state['previous_frame'], state['previous_wall'] = frame, block['wall']
-                if state['active_s'] - state['sent_active_s'] >= 10:
-                    raise window_error()
             if block['boot'] != boot or values.get('observation.active') != 'yes':
                 continue
             sample = native_picker.Sample(block, 0)
             if _fields_match(sample, TITLE_PROMPT):
                 native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
+                if state['sent'] and time.monotonic() >= state['sent_at'] + 10:
+                    raise timeout()
                 state['prompt'] = block
                 return {'kind': 'prompt', 'block': block}
             is_opening = _fields_match(sample, TITLE_OPENING)
@@ -4662,8 +4616,8 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
         return observation
 
     def poll():
-        if time.monotonic() >= until:
-            raise cap_error()
+        if state['sent'] and time.monotonic() >= state['sent_at'] + 10:
+            raise timeout()
         ctx.check_stop()
         if time.monotonic() >= next_request:
             request()
@@ -4677,21 +4631,16 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
         while time.monotonic() < deadline:
             ctx.check_stop()
             blocks = read_blocks()
-            seen_before = seen
             observation = consume(blocks)
             if state['prompt'] is not None:
                 return None
             if blocks and fresh(blocks[-1], before):
                 if observation['kind'] == 'opening':
                     block = observation['block']
-                    if block['frame'] > state['opening_frame']:
-                        return block, {'request_bytes_before': before,
-                                       'providers_reply_offset': block['providers_reply_offset'],
-                                       'block_begin_offset': block['begin_offset'], 'block_index': observation['index']}
-                elif seen > seen_before:
-                    return None
-                if time.monotonic() >= next_request:
-                    before = request()
+                    return block, {'request_bytes_before': before,
+                                   'providers_reply_offset': block['providers_reply_offset'],
+                                   'block_begin_offset': block['begin_offset'], 'block_index': observation['index']}
+                return None
             time.sleep(min(.05, max(0, deadline - time.monotonic())))
         return None
 
@@ -4699,7 +4648,6 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
     while (remaining := until - time.monotonic()) > 0:
         observation = poll()
         if observation['kind'] == 'opening':
-            state['opening_frame'] = observation['block']['frame']
             _bridge_on_skip_opening(ctx, observation['block'], state)
         if state['prompt'] is not None:
             block = state['prompt']
@@ -4709,15 +4657,18 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
                 skip = {'button': 'plus', 'sent_on': state['sent_on'], 'send': state['send'],
                         'prompt_after_s': round(time.monotonic() - state['sent_at'], 3),
                         'fresh': state['fresh']}
-            result = {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'], 'boot': block['boot'],
-                      **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
-                      'matched': 'prompt', 'not_yet': not_yet, 'waited_s': round(time.monotonic() - started, 3),
-                      'skip': skip}
-            if state['still_frame'] is not None:
-                result.update(still_s=round(state['still_s'], 3), still_frame=state['still_frame'])
-            return result
+            return {'rev': block['rev'], 'frame': block['frame'], 'wall': block['wall'], 'boot': block['boot'],
+                    **{key: values.get(key) for key in ('screen', 'screen.context', 'focus', 'observation.active')},
+                    'matched': 'prompt', 'not_yet': not_yet, 'waited_s': round(time.monotonic() - started, 3),
+                    'skip': skip}
         time.sleep(min(.05, max(0, until - time.monotonic())))
-    raise cap_error()
+    if state['opening_seen'] and not state['fresh_non_opening']:
+        raise RuntimeError('bridge_on (stub on): the opening was seen but no fresh ssbu.ui reply confirmed it; '
+                           'nothing was sent')
+    if last is not None:
+        raise RuntimeError(f"bridge_on (stub on): the Title prompt was not observed within 10 s of the greeting; "
+                           f"last Title state: {last['screen']}/{last['focus']} rev={last['rev']} frame={last['frame']}")
+    raise RuntimeError('bridge_on (stub on): no active ssbu.ui observation of this boot within 10 s of the greeting')
 
 
 def free_port(first=6980, last=7079, host='0.0.0.0'):
@@ -4855,17 +4806,11 @@ def bridge_on(ctx, port=None, cap=60):
     until = time.monotonic() + cap
     if trace is None:
         connection = None
-        greeting_identity = greeting_at = None
         while connection is None:
             if time.monotonic() > until:
                 raise RuntimeError(f'no bridge greeting within {cap} s: {text[-400:]!r}')
             time.sleep(0.2)
             text = log.read_text(errors='replace')
-            greeting = _bridge_on_latest_connection(text, require_install=False)
-            identity = (greeting[0], greeting[2]) if greeting is not None else None
-            if identity != greeting_identity:
-                greeting_identity = identity
-                greeting_at = time.monotonic() if identity is not None else None
             connection = _bridge_on_latest_connection(text)
         hello, install, start = connection
     else:
@@ -4900,7 +4845,7 @@ def bridge_on(ctx, port=None, cap=60):
                                    f"is boot {match[1]}: cannot show how this boot's bridge was enabled")
             title = {'checked': False, 'reason': 'bridge already On before this call', 'qualified_by': qualified}
         else:
-            title = _bridge_on_stub_title(ctx, hello, start, cap, greeting_at)
+            title = _bridge_on_stub_title(ctx, hello, start)
     backup = None
     until = time.monotonic() + 15
     while time.monotonic() < until:
