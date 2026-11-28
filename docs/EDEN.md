@@ -215,6 +215,16 @@ attribute use a copy if needed for safe deletion; shared attributes are never cl
 Each prepared instance records actual linked and copied pin bytes in its lifecycle
 journal; the report totals them. A plugins-only stamp is not a full lineup.
 
+**Temporary first-mount mode:** until the first full snapshot exists, an owner
+may explicitly pass `--plugins-only-interim` to `eden_test.py go` to use the
+newest stamped plugins-only snapshot. The mode refuses as soon as a stamped
+snapshot contains `ultimate/` or `CARD-SHA256SUMS.txt`, even if a plugin-only
+stamp is newer. No default or silent fallback is permitted, and
+`--no-card-lineup` remains refused. The run receipt and report record exactly
+`card_snapshot: plugins-only (awaiting first full snapshot)`. Once the operator
+creates the first full snapshot, remove the interim flag and use normal full
+card-lineup staging.
+
 The snapshot command is:
 
 ```text

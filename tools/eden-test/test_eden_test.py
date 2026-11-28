@@ -1631,6 +1631,157 @@ class EdenTestTests(unittest.TestCase):
                     eden_test.main(self.go_args(label=flags[0][2:], lineup=True) + flags)
                 up.assert_not_called()
 
+    def test_plugins_only_interim_requires_explicit_mode_and_records_receipt(self):
+        stamp = self.lineups / '20261125-1352Z'
+        self.make_lineup(stamp / 'plugins', {'one.nro': b'nro'})
+        args = self.go_args(label='plugins-only-interim', lineup=True) + ['--plugins-only-interim']
+        result, _, _ = self.run_go_without_up(args)
+        self.assertEqual(result, 0)
+        config = json.loads((eden_test.RUNS / 'plugins-only-interim/config.json').read_text())
+        self.assertEqual(config['card_lineup']['stamp'], stamp.name)
+        self.assertEqual(config['card_lineup']['card_snapshot'],
+                         'plugins-only (awaiting first full snapshot)')
+        self.assertEqual(config['card_lineup']['mods_files'], 0)
+        self.assertEqual(config['card_lineup']['arcropolis_config_files'], 0)
+        self.assertFalse((eden_test.RUNS / 'plugins-only-interim/inputs/card-lineup/CARD-SHA256SUMS.txt').exists())
+        self.assertIn('card_snapshot: plugins-only (awaiting first full snapshot)',
+                      eden_test.card_lineup_report(config))
+
+    def test_plugins_only_interim_closes_automatically_when_any_full_stamp_exists(self):
+        stamp = self.lineups / '20261125-1352Z'
+        self.make_lineup(stamp / 'plugins', {'one.nro': b'nro'})
+        self.make_full_lineup('20261126-1000Z', {'two.nro': b'full'}, {}, {})
+        label = 'plugins-only-closed'
+        message = self.assert_lineup_refused(
+            self.go_args(label=label, lineup=True) + ['--plugins-only-interim'], label)
+        self.assertIn('full card lineup snapshot exists', message)
+
+    def test_plugins_only_interim_is_never_an_implicit_fallback(self):
+        self.make_lineup(self.lineups / '20261125-1352Z' / 'plugins', {'one.nro': b'nro'})
+        message = self.assert_lineup_refused(self.go_args(label='plugins-only-default', lineup=True),
+                                             'plugins-only-default')
+        self.assertIn('plugin-only card lineup', message)
+
+    def test_interim_receipt_can_up_only_until_a_full_snapshot_appears(self):
+        stamp = self.lineups / '20261125-1352Z'
+        self.make_lineup(stamp / 'plugins', {'one.nro': b'nro'})
+        self.run_go_without_up(self.go_args(label='plugins-only-up', lineup=True) + ['--plugins-only-interim'])
+        run = eden_test.RUNS / 'plugins-only-up'
+        with mock.patch.object(eden_test, 'sh', return_value=0), \
+             mock.patch.object(eden_test, 'lifecycle', return_value=0) as lifecycle:
+            eden_test.cmd_up(run)
+        lifecycle.assert_called_once_with(run, 'up')
+
+        (run / 'state').mkdir(exist_ok=True)
+        self.make_full_lineup('20261126-1000Z', {'two.nro': b'full'}, {}, {})
+        with mock.patch.object(eden_test, 'sh', return_value=0) as sh, \
+             mock.patch.object(eden_test, 'lifecycle') as lifecycle:
+            with self.assertRaisesRegex(SystemExit, 'full card lineup snapshot exists'):
+                eden_test.cmd_up(run)
+        sh.assert_called_once()
+        lifecycle.assert_not_called()
+
+    def test_remote_plugins_only_interim_carries_its_stamp_and_mode(self):
+        folder = self.lineups / '20261125-1352Z'
+        self.make_lineup(folder / 'plugins', {'one.nro': b'nro'})
+        token = 'd' * 32
+
+        def fake_sh(command, log=None):
+            if command[0] == 'scp' and command[-2].endswith('/go-result.json'):
+                Path(command[-1]).write_text(json.dumps(
+                    {'token': token, 'code': 0, 'counts': {'PASS': 0, 'FAIL': 0, 'NOT RUN': 0}}))
+            return 0
+
+        with chdir(self.dir), mock.patch('uuid.uuid4', return_value=types.SimpleNamespace(hex=token)), \
+             mock.patch.object(eden_test, 'sh', side_effect=fake_sh) as sh, \
+             mock.patch.object(eden_test, '_relay_run', return_value=0) as relay:
+            self.assertEqual(eden_test.main(self.go_args(host='xps', lineup=True) +
+                                            ['--plugins-only-interim', '--ssh', 'xps-host']), 0)
+        commands = [call.args[0] for call in sh.call_args_list]
+        mirror = (f'/home/intpa/eden-runs/_eden-test/card-snapshots/'
+                  f'{sha(folder / "plugins/SHA256SUMS.txt")}-plugins-only/{folder.name}')
+        self.assertEqual(commands[1][-2:], [str(folder.resolve()) + '/', f'xps-host:{mirror}/'])
+        ssh = relay.call_args.args[0]
+        self.assertIn('EDEN_TEST_RELAY=1', ssh)
+        self.assertIn('--card-lineup-interim-relay', ssh)
+        self.assertIn(str(folder.resolve()), ssh)
+
+    def test_relay_cannot_stage_interim_with_a_full_controller_stamp(self):
+        older = self.make_full_lineup('20260101-0000Z', {'one.nro': b'full'}, {'m/a': b'mod'}, {})
+        plugin = self.lineups / '20261125-1352Z'
+        self.make_lineup(plugin / 'plugins', {'one.nro': b'nro'})
+        args = self.go_args(host='xps', lineup=True) + [
+            '--ssh', 'xps-host', '--card-lineup', str(plugin), '--card-lineup-origin', str(plugin),
+            '--card-lineup-interim-relay']
+        with mock.patch.object(eden_test, '_go_remote', return_value=0) as send:
+            with self.assertRaisesRegex(SystemExit, 'full card lineup snapshot exists'):
+                eden_test.main(args)
+        self.assertTrue((older / 'ultimate/mods/m/a').is_file())
+        send.assert_not_called()
+
+    def test_interim_host_up_must_recheck_controller_after_prepare(self):
+        plugin = self.lineups / '20261125-1352Z'
+        self.make_lineup(plugin / 'plugins', {'one.nro': b'nro'})
+        self.run_go_without_up(self.go_args(label='delayed', lineup=True) + ['--plugins-only-interim'])
+        run = eden_test.RUNS / 'delayed'
+        # The host only has the run's staged bytes. The controller alone saw the mount.
+        def controller(request):
+            message = {**request, 'id': 'probe'}
+            peer = types.SimpleNamespace(stdout=io.StringIO(eden_test.RELAY_PREFIX + json.dumps(message) + '\n'),
+                                         stdin=io.StringIO(), wait=lambda: 0)
+            with mock.patch.object(eden_test, 'CARD_LINEUPS', self.lineups):
+                eden_test._relay_run([], 'host', types.SimpleNamespace(host='yoga', label='delayed'),
+                                     popen=lambda *args, **kwargs: peer)
+            return json.loads(peer.stdin.getvalue())
+
+        with mock.patch.object(eden_test, 'CARD_LINEUPS', self.dir / 'not-on-host'), \
+                mock.patch.dict(os.environ, {'EDEN_TEST_RELAY': '1'}), \
+                mock.patch.object(eden_test, '_relay', side_effect=controller), \
+                mock.patch.object(eden_test, 'sh', return_value=0), \
+                mock.patch.object(eden_test, 'lifecycle', return_value=0) as life:
+            eden_test.cmd_up(run)
+            life.assert_called_once_with(run, 'up')
+            life.reset_mock()
+            self.make_full_lineup('20260101-0000Z', {'one.nro': b'full'}, {'m/a': b'mod'}, {})
+            with self.assertRaisesRegex(SystemExit, 'full card lineup snapshot exists'):
+                eden_test.cmd_up(run)
+        life.assert_not_called()
+
+    def test_linux_remote_up_and_fly_keep_the_cutoff_relay_open(self):
+        for mode in ('up', 'fly'):
+            with self.subTest(mode=mode), mock.patch.object(eden_test, '_go_sh') as direct, \
+                    mock.patch.object(eden_test, '_relay_run', return_value=0) as relay:
+                eden_test.main(['remote', '--host', 'xps', '--label', 'delayed', '--ssh', 'test-host', mode])
+            self.assertIn('EDEN_TEST_RELAY=1', relay.call_args.args[0])
+            direct.assert_not_called()
+
+    def test_interim_remote_receipt_requires_a_live_controller_at_up(self):
+        plugin = self.lineups / '20261125-1352Z'
+        self.make_lineup(plugin / 'plugins', {'one.nro': b'nro'})
+        args = self.go_args(label='relayed', lineup=True)
+        args = args[:args.index('--from')] + [
+            '--card-lineup', str(plugin), '--card-lineup-origin', str(plugin), '--token', 'probe',
+            '--card-lineup-interim-relay']
+        with mock.patch.object(eden_test, '_relay', return_value={'ok': True, 'result': True}) as relay, \
+                mock.patch.object(eden_test, 'CARD_LINEUPS', self.dir / 'not-on-host'):
+            self.run_go_without_up(args)
+        relay.assert_called_once()
+        run = eden_test.RUNS / 'relayed'
+        self.assertTrue(json.loads((run / 'config.json').read_text())['card_lineup']['controller_staged'])
+        with mock.patch.dict(os.environ, {'EDEN_TEST_RELAY': '0'}), \
+                mock.patch.object(eden_test, 'sh', return_value=0), \
+                mock.patch.object(eden_test, 'lifecycle') as life:
+            with self.assertRaisesRegex(SystemExit, 'controller'):
+                eden_test.cmd_up(run)
+        life.assert_not_called()
+
+    def test_report_names_card_snapshot_field_for_interim(self):
+        plugin = self.lineups / '20261125-1352Z'
+        self.make_lineup(plugin / 'plugins', {'one.nro': b'nro'})
+        self.run_go_without_up(self.go_args(label='receipt', lineup=True) + ['--plugins-only-interim'])
+        report = (eden_test.RUNS / 'receipt/REPORT.md').read_text()
+        self.assertIn('card_snapshot: plugins-only (awaiting first full snapshot)', report)
+
     def test_card_lineup_rejects_duplicate_nro_names_before_copying(self):
         card = self.make_full_lineup('20261231-2359Z', {'one.nro': b'one'}, {}, {})
         first = self.dir / 'plugin.nro'

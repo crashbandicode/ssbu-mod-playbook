@@ -78,6 +78,7 @@ NET_SYSFS = Path('/sys/class/net')
 X11_SOCKET_DIR = Path('/tmp/.X11-unix')
 WINDOWS_HOSTS = ('ally',)
 RELAY_PREFIX = '@@eden-test-relay@@ '
+INTERIM_SNAPSHOT = 'plugins-only (awaiting first full snapshot)'
 
 
 def sha256(path):
@@ -485,7 +486,7 @@ def default_card_lineup():
     return folder
 
 
-def read_card_lineup(folder):
+def read_card_lineup(folder, *, plugins_only=False):
     folder = Path(folder).resolve()
     if not folder.is_dir():
         raise SystemExit(f'card lineup folder missing or not a directory: {folder}')
@@ -546,8 +547,10 @@ def read_card_lineup(folder):
         errors.append(f'cannot list card lineup plugins {plugin_dir}: {error}')
     assets = []
     manifest = root / 'CARD-SHA256SUMS.txt'
-    full_layout = (root / 'plugins').is_dir() or manifest.exists()
-    if full_layout:
+    full_layout = (root / 'ultimate').exists() or manifest.exists()
+    if plugins_only and full_layout:
+        errors.append('plugins-only interim mode requires a plugin-only snapshot')
+    elif full_layout:
         if manifest.is_symlink() or not manifest.is_file():
             errors.append(f'CARD-SHA256SUMS.txt missing, not a regular file, or a symlink: {manifest}')
         else:
@@ -610,6 +613,10 @@ def read_card_lineup(folder):
         for path in root.iterdir():
             if path.name not in allowed_root:
                 errors.append(f'unexpected card lineup root entry: {path.name}')
+    elif plugins_only:
+        for path in root.iterdir():
+            if path.name != 'plugins':
+                errors.append(f'unexpected entry in plugin-only card lineup: {path.name}')
     else:
         errors.append('plugin-only card lineup; refresh the full mods and ARCropolis configuration snapshot')
     if errors:
@@ -617,7 +624,8 @@ def read_card_lineup(folder):
     stamp = root.name if re.fullmatch(r'\d{8}-\d{4}Z', root.name) else None
     plugin_bytes = sum((plugin_dir / name).stat().st_size for name in listed)
     asset_bytes = sum(asset['size'] for asset in assets)
-    return {'dir': str(root), 'stamp': stamp, 'sums_sha256': sums_digest, 'asset_sums_sha256': sha256(manifest),
+    return {'dir': str(root), 'stamp': stamp, 'sums_sha256': sums_digest,
+            'asset_sums_sha256': sha256(manifest) if manifest.is_file() else None,
             'plugins': [{'name': name, 'sha256': listed[name]} for name in sorted(listed)],
             'assets': sorted(assets, key=lambda item: item['path']),
             'mods_files': sum(asset['path'].startswith('ultimate/mods/') for asset in assets),
@@ -626,21 +634,54 @@ def read_card_lineup(folder):
             'payload_bytes': plugin_bytes + asset_bytes}
 
 
+def _require_interim_open():
+    if not CARD_LINEUPS.is_dir():
+        raise SystemExit('cannot verify the interim cutoff without the workspace card lineup directory')
+    for path in CARD_LINEUPS.iterdir():
+        if (re.fullmatch(r'\d{8}-\d{4}Z', path.name) and path.is_dir()
+                and ((path / 'ultimate').exists() or (path / 'CARD-SHA256SUMS.txt').exists())):
+            raise SystemExit(f'plugins-only interim mode is closed: a full card lineup snapshot exists ({path.name})')
+
+
+def _interim_admission(host, label, *, remote):
+    if not remote:
+        _require_interim_open()
+        return
+    reply = _relay({'kind': 'interim-snapshot', 'config': {'host': host, 'label': label}})
+    if not reply.get('ok') or reply.get('result') is not True:
+        raise SystemExit(reply.get('error') or 'no workspace confirmation for the interim snapshot')
+
+
 def _go_card_lineup(args):
     reason = getattr(args, 'no_card_lineup', None)
     if reason is not None:
         raise SystemExit('--no-card-lineup is not allowed: every Eden run requires a full card lineup')
+    interim = bool(getattr(args, 'plugins_only_interim', False))
+    relayed_interim = bool(getattr(args, 'card_lineup_interim_relay', False))
+    if relayed_interim and (not getattr(args, 'card_lineup', None)
+                            or not getattr(args, 'card_lineup_origin', None)):
+        raise SystemExit('interim card-lineup relay requires a staged directory and its source stamp')
+    if interim or relayed_interim:
+        received = bool(getattr(args, 'token', None))
+        if not (received and relayed_interim) or CARD_LINEUPS.is_dir():
+            _require_interim_open()
+        if relayed_interim:
+            if not received:
+                raise SystemExit('interim card-lineup relay is only for a go received from the controller')
+            _interim_admission(args.host, args.label, remote=True)
     folder = Path(args.card_lineup).resolve() if getattr(args, 'card_lineup', None) else default_card_lineup().resolve()
     if any(char in str(folder) for char in "'\r\n"):
         raise SystemExit(f'card lineup path {folder}: use a folder without apostrophes or line breaks')
-    lineup = read_card_lineup(folder)
+    lineup = read_card_lineup(folder, plugins_only=interim or relayed_interim)
     origin = getattr(args, 'card_lineup_origin', None)
     if origin and not lineup['stamp']:
         name = Path(origin).name
         if re.fullmatch(r'\d{8}-\d{4}Z', name):
             lineup['stamp'] = name
     if not lineup['stamp']:
-        raise SystemExit('full card lineup needs its YYYYMMDD-HHMMZ snapshot stamp')
+        raise SystemExit('card lineup needs its YYYYMMDD-HHMMZ snapshot stamp')
+    if interim or relayed_interim:
+        lineup['card_snapshot'] = INTERIM_SNAPSHOT
     return lineup
 
 
@@ -860,8 +901,10 @@ def go_new(args):
             plugin_dir = Path(lineup['dir'])
         _link_card_input(plugin_dir / 'SHA256SUMS.txt', card_inputs / 'SHA256SUMS.txt',
                          lineup['sums_sha256'])
-        asset_manifest = card_inputs / 'CARD-SHA256SUMS.txt'
-        _link_card_input(Path(lineup['dir']) / asset_manifest.name, asset_manifest, lineup['asset_sums_sha256'])
+        asset_manifest = None
+        if lineup['asset_sums_sha256']:
+            asset_manifest = card_inputs / 'CARD-SHA256SUMS.txt'
+            _link_card_input(Path(lineup['dir']) / asset_manifest.name, asset_manifest, lineup['asset_sums_sha256'])
         for pin in cards:
             _link_card_input(plugin_dir / pin['name'], card_inputs / pin['name'], pin['sha256'])
         for asset in lineup['assets']:
@@ -870,12 +913,17 @@ def go_new(args):
         config['card_lineup'] = {'staged': True, 'dir': lineup['dir'], 'stamp': lineup['stamp'],
                                  'origin': getattr(args, 'card_lineup_origin', None) or lineup['dir'],
                                  'sums_sha256': lineup['sums_sha256'], 'asset_sums_sha256': lineup['asset_sums_sha256'],
-                                 'asset_manifest': str(asset_manifest),
                                  'files': len(cards),
                                  'mods_files': lineup['mods_files'],
                                  'arcropolis_config_files': lineup['arcropolis_config_files'],
                                  'asset_bytes': lineup['asset_bytes'], 'plugin_bytes': lineup['plugin_bytes'],
                                  'payload_bytes': lineup['payload_bytes']}
+        if asset_manifest:
+            config['card_lineup']['asset_manifest'] = str(asset_manifest)
+        if lineup.get('card_snapshot'):
+            config['card_lineup']['card_snapshot'] = lineup['card_snapshot']
+            if getattr(args, 'card_lineup_interim_relay', False):
+                config['card_lineup']['controller_staged'] = True
         config['superseded_base_pins'] = []
     else:
         config['card_lineup'] = {'staged': False, 'reason': args.no_card_lineup}
@@ -958,7 +1006,7 @@ def _python():
 
 def _relay(request):
     if os.environ.get('EDEN_TEST_RELAY') != '1':
-        raise SystemExit('on a Windows host the lifecycle and the ledger are served by the Linux controller: '
+        raise SystemExit('this request must be served by the Linux controller: '
                          'start this through `eden_test.py go` or `eden_test.py remote` on the controller')
     request = {**request, 'id': uuid.uuid4().hex}
     print(RELAY_PREFIX + json.dumps(request), flush=True)
@@ -1222,20 +1270,31 @@ def cmd_up(run, skip_setup_plan=False, allow_volatile_pins=False):
         raise SystemExit('dry run failed; fix rows.json before Up')
     config = json.loads((run / 'config.json').read_text())
     lineup = config.get('card_lineup') or {}
-    manifest = Path(lineup.get('asset_manifest', ''))
-    if (not lineup.get('staged') or not re.fullmatch(r'\d{8}-\d{4}Z', lineup.get('stamp') or '')
-            or not manifest.is_file() or sha256(manifest) != lineup.get('asset_sums_sha256')):
-        raise SystemExit('Up needs a verified full card lineup; create a run with go and a full stamp')
-    expected = {}
-    for line in manifest.read_text(encoding='utf-8').splitlines():
-        if line.strip():
-            value, name = re.fullmatch(r'([0-9a-f]{64}) {1,2}\*?(.+)', line).groups()
-            expected['user/sdmc/' + name] = value
+    interim = lineup.get('card_snapshot') == INTERIM_SNAPSHOT
+    if interim:
+        if (not lineup.get('staged') or not re.fullmatch(r'\d{8}-\d{4}Z', lineup.get('stamp') or '')
+                or lineup.get('asset_manifest') is not None or lineup.get('asset_sums_sha256') is not None
+                or lineup.get('mods_files') != 0 or lineup.get('arcropolis_config_files') != 0):
+            raise SystemExit('Up needs a verified plugins-only interim snapshot with no card assets')
+        expected = {}
+    else:
+        manifest = Path(lineup.get('asset_manifest', ''))
+        if (not lineup.get('staged') or not re.fullmatch(r'\d{8}-\d{4}Z', lineup.get('stamp') or '')
+                or not manifest.is_file() or sha256(manifest) != lineup.get('asset_sums_sha256')):
+            raise SystemExit('Up needs a verified full card lineup; create a run with go and a full stamp')
+        expected = {}
+        for line in manifest.read_text(encoding='utf-8').splitlines():
+            if line.strip():
+                value, name = re.fullmatch(r'([0-9a-f]{64}) {1,2}\*?(.+)', line).groups()
+                expected['user/sdmc/' + name] = value
     for item in config['instances']:
         assets = {pin['to']: pin['sha256'] for pin in item.get('files', []) if pin['to'].startswith(
             ('user/sdmc/ultimate/mods/', 'user/sdmc/ultimate/arcropolis/'))}
         if assets != expected:
             raise SystemExit(f'full card asset pins differ from the snapshot for instance {item["key"]}')
+    if interim:
+        _interim_admission(config['host'], config['label'],
+                           remote=lineup.get('controller_staged') or os.environ.get('EDEN_TEST_RELAY') == '1')
     stamp(run, 'up_start')
     code = lifecycle(run, 'up')
     stamp(run, 'up_done')
@@ -1753,13 +1812,14 @@ def card_lineup_report(config):
                 if text not in additions:
                     additions.append(text)
     stamp = f', stamp {lineup["stamp"]}' if lineup.get('stamp') else ''
+    interim = f'\n- card_snapshot: {INTERIM_SNAPSHOT}' if lineup.get('card_snapshot') == INTERIM_SNAPSHOT else ''
     assets = (f', {lineup["mods_files"]} mod files and '
               f'{lineup["arcropolis_config_files"]} ARCropolis configs '
               f'({lineup["asset_bytes"]} asset bytes)'
               if 'mods_files' in lineup else '; payload size not recorded by this older run')
     return (f'- Card lineup: {lineup["origin"]}{stamp} (SHA256SUMS {lineup["sums_sha256"][:12]}…, '
             f'{lineup["files"]} plugins verified{assets}); replaced by --nro: {", ".join(replacements) or "none"}; '
-            f'added: {", ".join(additions) or "none"}')
+            f'added: {", ".join(additions) or "none"}{interim}')
 
 
 def row_report(run, row, history):
@@ -2087,7 +2147,12 @@ def _relay_run(command, host, args, popen=subprocess.Popen, forward=None, claims
             if not isinstance(config, dict) or config.get('host') != args.host or config.get('label') != args.label:
                 raise ValueError('relay: foreign run')
             kind = request.get('kind')
-            if kind == 'lifecycle':
+            if kind == 'interim-snapshot':
+                _require_interim_open()
+                result = True
+            elif args.host not in WINDOWS_HOSTS:
+                raise ValueError('only the interim snapshot check is relayed for a Linux host')
+            elif kind == 'lifecycle':
                 mode = request.get('mode')
                 if mode not in ('up', 'down', 'preflight', 'status'):
                     raise ValueError('relay: invalid lifecycle mode')
@@ -2099,7 +2164,7 @@ def _relay_run(command, host, args, popen=subprocess.Popen, forward=None, claims
             else:
                 raise ValueError('relay: unknown request')
             reply = {'id': request.get('id'), 'ok': True, 'result': result}
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             reply = {'id': request.get('id') if isinstance(request, dict) else None, 'ok': False, 'error': str(exc)}
         if not isinstance(request, dict):
             request = {}
@@ -2333,9 +2398,10 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     else:
         commands = [['rsync', '-a', '--delete', '--mkpath', str(PLAYBOOK / 'tools') + '/', f'{host}:{stage}/tools/']]
         if lineup:
-            # Each full manifest and stamp has its own mirror; rsync skips unchanged payload across runs.
+            # Content and stamp-specific mirrors let identical snapshots be reused across runs.
+            assets = lineup['asset_sums_sha256'] or 'plugins-only'
             mirror = (f'{kind["root"]}/_eden-test/card-snapshots/{lineup["sums_sha256"]}-'
-                      f'{lineup["asset_sums_sha256"]}/{lineup["stamp"]}')
+                      f'{assets}/{lineup["stamp"]}')
             commands.append(['rsync', '-a', '--mkpath', lineup['dir'] + '/', f'{host}:{mirror}/'])
         commands.extend([['rsync', '-a', '--mkpath', str(nro), f'{host}:{stage}/nro/'] for nro in args.nro])
         if args.elf:
@@ -2437,6 +2503,8 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     remote.extend(('--rows', f'{stage}/rows'))
     if lineup:
         remote.extend(('--card-lineup', mirror, '--card-lineup-origin', lineup['dir']))
+        if lineup.get('card_snapshot'):
+            remote.append('--card-lineup-interim-relay')
     else:
         remote.extend(('--no-card-lineup', args.no_card_lineup))
     if args.elf:
@@ -2459,8 +2527,11 @@ def _go_remote_with_mux(args, lineup, host, mux, targets=None, pack_dir=None):
     token = uuid.uuid4().hex
     remote.extend(('--token', token))
     mux.ensure()
+    interim = bool(lineup and lineup.get('card_snapshot'))
+    if interim and not windows:
+        remote = ['env', 'EDEN_TEST_RELAY=1', *remote]
     command = _remote_command(host, mux, remote, windows)
-    ssh_code = _relay_run(command, host, args) if windows else _go_sh(command)
+    ssh_code = _relay_run(command, host, args) if windows or interim else _go_sh(command)
     if ssh_code == 255 or _lifecycle_module.ssh_master_dead(mux):
         diagnosis = _go_diagnosis(mux, 'ssh', _ExitCode(255, getattr(ssh_code, 'stderr', '')), 'remote go')
         raise SystemExit(f'remote go failed (ssh exit {ssh_code}); the remote go may be running; '
@@ -2512,13 +2583,16 @@ def cmd_remote(args):
     stage = f'{kind["root"]}/_eden-test/stage/{args.label}'
     run = f'{kind["root"]}/{args.label}'
     command = [*kind['python'], f'{stage}/tools/eden-test/eden_test.py', args.remote_mode, run, *args.remote_args]
+    can_start = args.remote_mode in ('up', 'fly')
+    if can_start and not kind['windows']:
+        command = ['env', 'EDEN_TEST_RELAY=1', *command]
     options = ('-i', '/home/intpa/.ssh/id_rsa', '-o', 'IdentitiesOnly=yes') if kind['windows'] else ()
     receipt_dir = RUNS / '_eden-test' / 'ssh-diag' / args.label
     with SshMux(host, ssh_options=options, windows=kind['windows'], evidence_dir=receipt_dir,
                 receipt_dir=receipt_dir) as mux:
         mux.ensure()
         remote = _remote_command(host, mux, command, kind['windows'])
-        return _relay_run(remote, host, args) if kind['windows'] else _go_sh(remote)
+        return _relay_run(remote, host, args) if kind['windows'] or can_start else _go_sh(remote)
 
 
 def _unit(label):
@@ -3328,6 +3402,9 @@ def main(argv=None):
     lineup = p.add_mutually_exclusive_group()
     lineup.add_argument('--card-lineup', help='stamped card-lineup folder with plugins/, ultimate/, and manifests')
     lineup.add_argument('--no-card-lineup', metavar='REASON', help=argparse.SUPPRESS)
+    p.add_argument('--plugins-only-interim', action='store_true',
+                   help='temporarily stage a stamped plugin-only snapshot before the first full snapshot exists')
+    p.add_argument('--card-lineup-interim-relay', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--card-lineup-origin', help=argparse.SUPPRESS)
     p.add_argument('--rows', required=True, help='rows.json or a folder containing rows.json')
     p.add_argument('--elf')
