@@ -4570,9 +4570,10 @@ def _bridge_on_stub_title(ctx, hello, start, cap, started):
     def cap_error():
         if state['last_interval_still']:
             seconds = round(state['still_streak_s'], 3)
+            action = "Plus was sent once" if state['sent'] else "nothing was pressed"
             return RuntimeError(f"bridge_on (stub on): the game stood still after the greeting: the bridge's frame "
                                 f"counter stayed at {state['still_frame']} for {seconds} s (cap {cap} s); "
-                                "nothing was pressed")
+                                f"{action}")
         return window_error()
 
     def read_blocks():

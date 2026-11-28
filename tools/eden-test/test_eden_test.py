@@ -4986,6 +4986,11 @@ class WindowsHostTests(unittest.TestCase):
         with mock.patch.object(eden_test.host_os, 'windows_processes', return_value=[]):
             with leaf.open('rb'):
                 self.assertIsNotNone(eden_test._process_reason([path]))
+            with subprocess.Popen([sys.executable, '-c', 'input()'], cwd=path, stdin=subprocess.PIPE) as child:
+                try:
+                    self.assertIsNotNone(eden_test._process_reason([path]))
+                finally:
+                    child.communicate(b'\n', timeout=10)
             self.assertIsNone(eden_test._process_reason([path]))
 
     def test_report_uses_controller_follow_up_commands(self):

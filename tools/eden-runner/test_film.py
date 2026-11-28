@@ -6,8 +6,8 @@ import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
 from contextlib import chdir
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
