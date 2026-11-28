@@ -51,7 +51,7 @@ import tempfile
 import time
 import traceback
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 try:
     import fcntl
@@ -2683,6 +2683,17 @@ def _names_path(text, path):
     return re.search(re.escape(str(path)) + rf'(?!{_PATH_NAME_CHAR})', text) is not None
 
 
+def _pin_matches(value, path, absolute=False):
+    text = str(path)
+    if host_os.WINDOWS:
+        value, text = (s.replace('\\', '/').lower() for s in (value, text))
+        rooted = PureWindowsPath(value).is_absolute()
+    else:
+        rooted = value.startswith('/')
+    return ((not absolute or rooted) and _names_path(value, text)
+            or rooted and (absolute or len(value) > 1) and text.startswith(value.rstrip('/') + '/'))
+
+
 def _json_strings(node):
     """Yield run references, excluding ports_root: it bounds allocation scans, not an owned run's data."""
     if isinstance(node, str):
@@ -2753,6 +2764,9 @@ def _process_reason(paths, proc=Path('/proc')):
                 target = str(path).replace('\\', '/').lower().rstrip('/')
                 if any(_names_path(text, target) for text in texts):
                     return f'process {process["pid"]} ({process["name"]}) uses {path}'
+        for path in paths:
+            if _present(path) and (busy := host_os.windows_busy_path(path)) is not None:
+                return f'an open file or directory is in use: {busy}'
         return None
     skip, pid = set(), os.getpid()
     while pid > 1 and pid not in skip:
@@ -2877,15 +2891,12 @@ class _DownGuard:
         """Why `path` is kept, or None when nothing found needs it."""
         if self.blocked:
             return self.blocked
-        text = str(path)
         for name in self.keep:
-            if name == self.run.name or (name.startswith('/') and (_names_path(name, path)
-                                                                   or text.startswith(name.rstrip('/') + '/'))):
+            if name == self.run.name or _pin_matches(name, path, absolute=True):
                 return f'{self.runs / ".keep"} lists {name}'
         for source, strings in self.files:
             for value in strings:
-                above = len(value) > 1 and value.startswith('/') and text.startswith(value.rstrip('/') + '/')
-                if _names_path(value, path) or above:
+                if _pin_matches(value, path):
                     return f'{source} names {value if len(value) <= 120 else value[:117] + "..."}'
         try:
             return _process_reason([path], self.proc)

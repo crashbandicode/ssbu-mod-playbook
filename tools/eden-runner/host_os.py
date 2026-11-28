@@ -6,9 +6,11 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
-from pathlib import Path
+import time
 from ctypes import wintypes
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 WINDOWS = os.name == 'nt'
@@ -97,6 +99,37 @@ def windows_processes(run=subprocess.run):
                  'command': p['CommandLine'], 'exe': p['ExecutablePath']} for p in values]
     except (RuntimeError, ValueError, TypeError, KeyError) as exc:
         raise OSError(f'cannot read Windows processes: {exc}') from exc
+
+
+def windows_busy_path(root):
+    """Command lines do not include every open file or current directory. Probe sharing without changing the tree."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    until = time.monotonic() + 20
+    pending = [Path(root)]
+    while pending:
+        path = pending.pop()
+        if time.monotonic() >= until:
+            raise OSError(f'open-file check did not finish under {root}')
+        info = path.lstat()
+        # A Windows current-directory handle denies DELETE sharing but need not request read-data access.
+        # Request access without changing anything: no delete-on-close and no disposition calls.
+        access = 0x10001 if stat.S_ISDIR(info.st_mode) else 1
+        handle = kernel.CreateFileW(str(path), access, 0, None, 3, 0x00200000 | 0x02000000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            code = ctypes.get_last_error()
+            if code == 32:  # ERROR_SHARING_VIOLATION
+                return path
+            raise ctypes.WinError(code)
+        if not kernel.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if stat.S_ISDIR(info.st_mode) and not info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            pending.extend(path.iterdir())
+    return None
 
 
 def windows_interfaces(run=subprocess.run):

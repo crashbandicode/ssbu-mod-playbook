@@ -104,7 +104,8 @@ def _record(spec_path):
 
 class Recorder:
     def __init__(self, output, seconds, fps=60, display=None, ffmpeg=None):
-        self.output = Path(output)
+        # The interactive Windows task runs in the output directory, not the caller's cwd.
+        self.output = Path(output).absolute()
         self.seconds = seconds
         self.fps = fps
         self.display = display

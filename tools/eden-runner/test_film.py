@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import chdir
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -208,6 +209,22 @@ while time.monotonic() < end:
         self.assertEqual((cwd, limit, status['returncode']), (self.root, 63, 0))
         end.assert_called_once_with(name)
         self.assertFalse((self.root / f'{name}.task.xml').exists())
+
+    def test_windows_relative_smoke_output_is_readable_from_task_cwd(self):
+        out = self.root / 'takes'
+        out.mkdir()
+        def start(name, argv, cwd, limit_s):
+            with chdir(cwd):
+                spec = json.loads(Path(argv[-1]).read_text())
+                self.assertEqual(Path(spec['command'][-1]).resolve(), out / 'clip.mkv')
+                Path(spec['command'][-1]).write_bytes(b'movie')
+                Path(spec['status']).write_text('{"returncode": 0}')
+        with chdir(self.root), mock.patch.object(host_os, 'WINDOWS', True), \
+                mock.patch.object(host_os, 'interactive_task_start', side_effect=start), \
+                mock.patch.object(host_os, 'interactive_task_end'):
+            rec = film.Recorder('takes/clip.mkv', 3, ffmpeg='ffmpeg')
+            rec.start()
+            self.assertEqual(rec.finish(1)['returncode'], 0)
 
     def test_fullscreen_hook(self):
         class Ctx:
