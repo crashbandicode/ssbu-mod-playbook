@@ -15,8 +15,6 @@ UI_PROVIDER_GEN = re.compile(r'\[Bridge\] provider name=ssbu\.ui schema_id=\d+ v
 STALE_UI_REPLY = re.compile(r'\[Bridge\] state name=ssbu\.ui result=empty reason=stale_toggle boot=(0x[0-9a-f]{16})')
 STALE_UI = object()
 STALE_UI_RETRY_S = .1
-FILE_END = re.compile(r'\[Bridge\] file_end name=\S+ bytes=\d+ ')
-BUSY_UI_RECHECK_S = 2  # As routes.OPENING_RECHECK_S: how long an inactive read is asked again after a transfer.
 REPLAY = re.compile(r'\[Bridge\] since result=gap(?: |$)')
 EVENT_CLOCK = re.compile(r' ev=(\d+) frame=(\d+) wall=(\d+)$')
 EVENTS_ON = re.compile(r'\[Bridge\] req events result=ok on=1 latest=(\d+) frame=(\d+) wall=(\d+)$')
@@ -74,7 +72,6 @@ class BridgePickerIO:
         self.revisions = {}
         self.witness = {}
         self.in_flight = False
-        self.transfer_ended = False
         self._send_generation = 0
         self._send_lock = threading.Lock()
         self.stage_window = None
@@ -99,8 +96,6 @@ class BridgePickerIO:
             raise RuntimeError('bridge connection or replay continuity changed while input was unconfirmed')
         if self.stage_window is not None and any(RING_LOSS.search(line) for line in lines):
             raise RuntimeError('bridge event continuity was lost during Training launch')
-        if any(FILE_END.search(line) for line in lines):
-            self.transfer_ended = True
         return lines
 
     def _boundary(self, line):
@@ -255,27 +250,10 @@ class BridgePickerIO:
             return self._record(self._request(requests, cap, consume))
 
         until = time.monotonic() + cap
-        recheck_until = None
         while True:
             connection = None if retry_epoch is None else retry_epoch[1]
             answer = self._request(requests, cap, consume, until=until, connection=connection)
             if answer is not STALE_UI:
-                # After a long reply (a mirrored settings.json is about 400 lines) the bridge's ssbu.ui sample has
-                # expired and its next block is inactive; on the Ally such a reply takes about 1 s (xplat-ally-8,
-                # 2026-11-28). The capture log shows the transfer, so the read is asked again, bounded.
-                if self.transfer_ended and answer.values.get('observation.active') != 'yes':
-                    now = time.monotonic()
-                    if recheck_until is None:
-                        recheck_until = min(until, now + BUSY_UI_RECHECK_S)
-                    if now < recheck_until:
-                        time.sleep(min(STALE_UI_RETRY_S, recheck_until - now))
-                        self.ctx.check_stop()
-                        awaiting_retry = False
-                        fence = None
-                        catalog_generation = fence_generation = None
-                        if time.monotonic() < until:
-                            continue
-                self.transfer_ended = False
                 return self._record(answer)
             time.sleep(min(STALE_UI_RETRY_S, max(0, until - time.monotonic())))
             self.ctx.check_stop()

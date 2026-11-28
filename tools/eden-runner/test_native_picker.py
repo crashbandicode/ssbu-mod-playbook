@@ -5,7 +5,6 @@ import tempfile
 import threading
 import types
 import unittest
-import zlib
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1282,66 +1281,6 @@ class BridgeFramingTests(unittest.TestCase):
         'boot=0xc60856d64562c887 frame=24 wall=198155750\n'
     )
 
-    transfer_end = ('[Bridge] file_end name=settings.json bytes=60959 sha256=' + 'a' * 64
-                    + ' result=ok frame=1 wall=1 mirrored=true\n')
-
-    def transfer_ui_reply(self, active, rev):
-        boot = '0xc60856d64562c887'
-        payload = ['schema=ssbu.ui/1', f'rev={rev}', f'boot={boot}', f'observation={rev}',
-                   f'observation.active={"yes" if active else "no"}',
-                   f'screen={"training" if active else "unknown"}',
-                   f'focus={"training" if active else "unknown"}',
-                   f'input.owner={"native" if active else "unknown"}']
-        begin = (f'[Bridge] state begin name=ssbu.ui schema=ssbu.ui/1 rev={rev} boot={boot} '
-                 f'lines={len(payload)} filtered=0\n')
-        body = ''.join(f'[Bridge] state.{index} {value}\n' for index, value in enumerate(payload))
-        crc = zlib.crc32('\n'.join(payload).encode())
-        return self.stale_ui_fence + begin + body + f'[Bridge] state end name=ssbu.ui rev={rev} crc={crc:08x}\n'
-
-    def test_ui_read_after_a_file_transfer_is_read_again_until_active(self):
-        def check(bridge, _clock):
-            sample = bridge.read(picker.UI, 3)
-            self.assertEqual((sample.values['observation.active'], sample.values['screen']), ('yes', 'training'))
-
-        sent = self.replay_ui_exchange(check, lambda count: self.transfer_ui_reply(count > 1, count),
-                                       initial=self.transfer_end, assert_consumed=True)
-        self.assertEqual(sent, [0, .1])
-
-    def test_inactive_ui_read_without_a_transfer_is_returned_at_once(self):
-        def check(bridge, clock):
-            sample = bridge.read(picker.UI, 3)
-            self.assertEqual(sample.values['observation.active'], 'no')
-            self.assertEqual(clock.monotonic(), 0)
-
-        sent = self.replay_ui_exchange(check, lambda count: self.transfer_ui_reply(False, count),
-                                       assert_consumed=True)
-        self.assertEqual(sent, [0])
-
-    def test_ui_read_after_a_transfer_gives_up_after_the_bound(self):
-        for cap, expected in ((3, 2), (1, 1)):
-            with self.subTest(cap=cap):
-                def check(bridge, clock):
-                    sample = bridge.read(picker.UI, cap)
-                    self.assertEqual(sample.values['observation.active'], 'no')
-                    self.assertAlmostEqual(clock.monotonic(), expected)
-
-                sent = self.replay_ui_exchange(check, lambda count: self.transfer_ui_reply(False, count),
-                                               initial=self.transfer_end, assert_consumed=True)
-                self.assertGreater(len(sent), 1)
-                self.assertLessEqual(sent[-1], expected)
-
-    def test_an_active_ui_read_clears_the_transfer_mark(self):
-        def check(bridge, clock):
-            first = bridge.read(picker.UI, 3)
-            second = bridge.read(picker.UI, 3)
-            self.assertEqual(first.values['observation.active'], 'yes')
-            self.assertEqual(second.values['observation.active'], 'no')
-            self.assertEqual(clock.monotonic(), 0)
-
-        sent = self.replay_ui_exchange(check, lambda count: self.transfer_ui_reply(count == 1, count),
-                                       initial=self.transfer_end, assert_consumed=True)
-        self.assertEqual(sent, [0, 0])
-
     def test_captured_stale_ui_reply_requests_a_fresh_read(self):
         import zlib
 
@@ -1425,8 +1364,7 @@ class BridgeFramingTests(unittest.TestCase):
                     check, lambda count: first if count == 1 else second, during_sleep=during_sleep,
                 ), expected)
 
-    def replay_ui_exchange(self, check, response, *, provider='ssbu.ui', during_sleep=None,
-                           initial='', assert_consumed=False):
+    def replay_ui_exchange(self, check, response, *, provider='ssbu.ui', during_sleep=None):
         from pathlib import Path
         from tempfile import TemporaryDirectory
         from types import SimpleNamespace
@@ -1443,9 +1381,6 @@ class BridgeFramingTests(unittest.TestCase):
             ctx = SimpleNamespace(instance={'bridge_log': str(log)}, check_stop=lambda: None,
                                   runner=SimpleNamespace(), on='sw')
             bridge = native_picker_io.BridgePickerIO(ctx)
-            if initial:
-                with log.open('a') as dest:
-                    dest.write(initial)
 
             def sleep(seconds):
                 nonlocal elapsed
@@ -1455,8 +1390,6 @@ class BridgeFramingTests(unittest.TestCase):
 
             def spool(_ctx, *requests):
                 self.assertEqual(requests, ('providers', f'state {provider}'))
-                if assert_consumed and sent:
-                    self.assertEqual(bridge.cursor.offset, log.stat().st_size)
                 sent.append(elapsed)
                 with log.open('a') as dest:
                     dest.write(response(len(sent)))
