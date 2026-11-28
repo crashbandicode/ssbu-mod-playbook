@@ -998,6 +998,7 @@ class SetTests(OpenCloseTests):
         def observed(provider, cap):
             if provider == 'ssbu.ui' and inactive[0]:
                 io.rev = max(io.rev, 575)
+            deadline = self.clock.monotonic() + cap
             sample = read(provider, cap)
             if provider == 'ssbu.ui' and inactive[0]:
                 inactive[0] -= 1
@@ -1005,7 +1006,7 @@ class SetTests(OpenCloseTests):
                 sample.values.update({'observation.active': 'no', 'ack': '0', 'ack.result': 'unsupported'})
                 if malformed:
                     sample.block['schema'] = 'ssbu.ui/2'
-                self.clock.spend(min(cap, .1))
+                self.clock.spend(min(max(0, deadline - self.clock.monotonic()), .1))
             events.append(('read', provider, sample.block['rev'], sample.values.get('observation.active')))
             return sample
 
