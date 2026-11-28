@@ -3903,25 +3903,52 @@ def _tr_menu_gate(ctx, cap):
 
 
 def _active_ui(io, until, what):
-    """A fresh, active ssbu.ui sample. An inactive block is "not yet": the bridge publishes it while it cannot
-    observe the game's UI owner (seen while TrainingRooms loads fighters: xplat-yoga-2, xplat-ally-8/-9, 2026-11-28).
-    The next read is asked until `until`; then the route fails closed."""
+    """Return the active sample and whether an inactive read preceded it."""
     last = None
+    timeout = None
     while (remaining := until - time.monotonic()) > 0:
-        sample = io.read(native_picker.UI, remaining)
+        try:
+            sample = io.read(native_picker.UI, remaining)
+        except RuntimeError as error:
+            if (last is None or str(error) != 'no fenced bridge reply for state ssbu.ui'
+                    or time.monotonic() < until):
+                raise
+            timeout = error
+            break
         if sample.values.get('observation.active') == 'yes':
-            return native_picker.check_sample(sample, native_picker.UI)
+            native_picker.check_sample(sample, native_picker.UI)
+            if time.monotonic() < until:
+                return sample, last is not None
+            break
         last = native_picker.check_sample(sample, native_picker.UI, loading_ui=True)
     seen = f'; last inactive rev={last.block["rev"]}' if last is not None else ''
-    raise RuntimeError(f'{what}: no active ssbu.ui observation before the cap{seen}')
+    if timeout:
+        seen += f'; {timeout}'
+    raise RuntimeError(f'{what}: no active ssbu.ui observation before the cap{seen}') from timeout
+
+
+def _training_ui_pair(io, menu, until, what):
+    ui, recovered = _active_ui(io, until, what)
+    native_picker.same_epoch(menu, ui, in_flight=True)
+    if recovered:
+        # The menu, including its keyboard and wizard state, can change during the UI wait.
+        menu = _tr_current(io, until)
+        native_picker.same_epoch(ui, menu, in_flight=True)
+        if time.monotonic() >= until:
+            raise RuntimeError(f'{what}: deadline expired while rechecking tr.menu')
+    return menu, _remember(io, ui)
 
 
 def _wait_training_owner(io, menu, until, owner):
     expected = {**TRAINING_SCREEN, 'input.owner': owner}
     ui = None
     while time.monotonic() < until:
-        ui = _remember(io, _active_ui(io, until, 'Training Mod owner'))
-        native_picker.same_epoch(menu, ui, in_flight=True)
+        waiting = (f'expected input owner {owner}; saw {ui.values.get("input.owner")}'
+                   if ui is not None else 'Training Mod owner')
+        current, ui = _training_ui_pair(io, menu, until, waiting)
+        if current is not menu and any(current.values.get(k) != menu.values.get(k) for k in
+                                       ('open', 'page', 'depth', 'focus', 'cursor', 'row', 'row_id', 'action', 'ack')):
+            raise RuntimeError('Training Mod owner: menu changed while ssbu.ui was inactive')
         if _fields_match(ui, expected):
             return ui
     raise RuntimeError(f'expected input owner {owner}; saw {ui.values.get("input.owner") if ui else "unknown"}')
@@ -5281,8 +5308,7 @@ def _tr_idle(ctx, cap, metrics):
     while time.monotonic() < until:
         ctx.check_stop()
         menu = _tr_current(io, until)
-        ui = _remember(io, _active_ui(io, until, 'tr_idle'))
-        native_picker.same_epoch(menu, ui, in_flight=True)
+        menu, ui = _training_ui_pair(io, menu, until, 'tr_idle')
         last = {'open': menu.values.get('open'), 'game.running': menu.values.get('game.running'),
                 'notice.header': menu.values.get('notice.header'), 'input.owner': ui.values.get('input.owner')}
         if last == {'open': '0', 'game.running': '0', 'notice.header': '', 'input.owner': 'native'}:
