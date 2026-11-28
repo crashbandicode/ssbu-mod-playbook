@@ -360,3 +360,14 @@ bridge and training-route rows passed; toggle failed before input with
 `settings.json` kept the bridge busy about 1 s; the next `ssbu.ui` block was inactive.
 In `-9`, boot, bridge and training-route passed; toggle failed before input with
 `ssbu.ui: incomplete, inactive or wrong-schema observation`, and film did not run.
+
+2026-11-28, bridge upkeep: `ssbu-hw-bridge` commit `b5f9d9f` refreshes the native-UI
+mapping and polls its publisher between reply lines and during settle, with a separate
+clock deadline for between-line publication. Its release NRO SHA-256 is
+`cd16ac8d08292c7d1802bda06755e2596b8e5aaa66510ca35fe2eb24e6c43b90`.
+With that NRO, `xplat-ally-10` passed boot, bridge, training-route, toggle and film.
+The Crouch toggle stored `[1, 0]` from `[0, 1]`, then `[0, 1]` from `[1, 0]`.
+`xplat-yoga-2` passed boot, bridge and training-route; its first Crouch change
+stored `[1, 0]` from `[0, 1]`, but the second failed with
+`ssbu.ui: incomplete, inactive or wrong-schema observation`. Film was omitted there:
+Yoga had no ffmpeg on PATH or in its staged location.
