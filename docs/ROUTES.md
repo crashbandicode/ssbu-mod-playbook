@@ -675,8 +675,15 @@ Training input owner).
   (19 frames each; the ones flown in the room).
 - **Receipt:** `routes-tr-menu-in-room.json` with `verified` `{scene, open, page, depth, focus, action, row, ack}`,
   `pressed` after a press, and `game.running` when the menu publishes it.
+- **Known limit of `then: "press"`:** it is for starting a drill and toggling a row. A press whose own effect opens
+  the recording pop-up or the keyboard is handled by the game, but the block then reports an error, because the room
+  menu no longer owns input.
+- **Needs** a TrainingRooms build that publishes `recording.popup.open` in `tr.menu` (rc.15 or later); on an older
+  build the block stops before any input.
 - **Not covered:** changing a value (use `tr_settings` before the room), the result of a press beyond its ACK
   (gate the next step on what the press should cause), leaving the room, and choosing the room's fighter.
+- **Not flown yet** (2026-11-28): the inputs and the gating flew with a packet's own hooks; this block's first
+  flight is its first consumer's row.
 
 ```json
 {"run": "routes:tr_menu_in_room", "args": {"page": "fighters_stages", "path": ["game.6", "start.6"], "then": "press"}}
