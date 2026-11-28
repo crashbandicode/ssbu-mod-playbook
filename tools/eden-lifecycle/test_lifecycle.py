@@ -2223,10 +2223,18 @@ print(json.dumps(c.down()))
             reserved = json.loads(stdout.getvalue())
         self.assertTrue(reserved['line'].endswith('exclusive_host=true'))
 
+        token = life.RESERVATION.fullmatch(reserved['line'])['token']
+        before = self.ledger_path.read_bytes()
+        with patch('sys.stderr', new_callable=io.StringIO):
+            self.assertNotEqual(life.main(['cancel', str(config_path), '--execute']), 0)
+        self.assertEqual(self.ledger_path.read_bytes(), before)
         with patch('sys.stdout', new_callable=io.StringIO) as stdout:
-            self.assertEqual(life.main(['cancel', str(config_path), '--execute']), 0)
+            self.assertEqual(life.main(['cancel', str(config_path), '--reservation-token', token, '--execute']), 0)
             cancelled = json.loads(stdout.getvalue())
         self.assertTrue(cancelled['cancelled'])
+        self.assertEqual(cancelled['line'].split(' RELEASED: ', 1)[1],
+                         f"{config['owner']} host=surface lifecycle={token} Eden reservation cancelled by owner")
+        self.assertEqual(self.ledger_path.read_bytes()[len(before):], ('\n' + cancelled['line'] + '\n').encode())
         self.assertEqual(life.active_claims(self.ledger_path.read_text(), 'surface'), [])
 
         next_owner = life.Ledger(self.ledger_path, 'surface', 'Codex next/run', 'b' * 32,
@@ -2234,6 +2242,37 @@ print(json.dumps(c.down()))
         next_reservation = next_owner.operate('reserve', approver='tr-primary-2',
                                               admission={'foreign_processes': []})
         self.assertTrue(next_reservation['line'].endswith('exclusive_host=true'))
+
+    def test_stale_cancel_cannot_release_a_new_reservation_with_the_same_label(self):
+        def ledger(token, **overrides):
+            args = dict(host='surface', owner=self.config['owner'], label=self.config['label'], exclusive_host=True)
+            return life.Ledger(self.ledger_path, token=token, **(args | overrides))
+        old, new = 'a' * 32, 'b' * 32
+        def reserve(token):
+            ledger(token).operate('reserve', approver='tr-primary-2', admission={'foreign_processes': []})
+        reserve(old)
+        ledger(old).operate('cancel')
+        reserve(new)
+        before = self.ledger_path.read_bytes()
+        for caller in (ledger(old), ledger(new, owner='Codex other/lane'), ledger(new, label='other-label'),
+                       ledger(new, host='xps'), ledger(new, exclusive_host=False)):
+            with self.assertRaises(life.Refused):
+                caller.operate('cancel')
+            self.assertEqual(self.ledger_path.read_bytes(), before)
+        self.assertTrue(ledger(new).operate('cancel')['cancelled'])
+
+    def test_cancel_after_up_cannot_release_the_converted_claim(self):
+        config = dict(self.config, exclusive_host=True)
+        owner = life.Lifecycle(config, self.host)
+        reservation = owner.reserve_exclusive('tr-primary-2')
+        token = life.RESERVATION.fullmatch(reservation['line'])['token']
+        self.assertEqual(owner.up()['phase'], 'up')
+        before = self.ledger_path.read_bytes()
+        for value in (token, owner.state['token']):
+            with self.assertRaises(life.Refused):
+                owner.ledger(value).operate('cancel')
+            self.assertEqual(self.ledger_path.read_bytes(), before)
+        self.assertEqual(owner.down()['phase'], 'down')
 
     def test_reservation_rejects_multiline_owner_before_append(self):
         before = self.ledger_path.read_bytes()
@@ -2322,7 +2361,9 @@ print(json.dumps(c.down()))
             self.assertTrue(reserved['line'].endswith('exclusive_host=true'))
             stdout.seek(0)
             stdout.truncate()
-            self.assertEqual(life.main(['cancel', str(config_path), '--ssh', 'executor', '--execute']), 0)
+            token = life.RESERVATION.fullmatch(reserved['line'])['token']
+            self.assertEqual(life.main(['cancel', str(config_path), '--ssh', 'executor',
+                                        '--reservation-token', token, '--execute']), 0)
             cancelled = json.loads(stdout.getvalue())
 
         self.assertTrue(cancelled['cancelled'])
